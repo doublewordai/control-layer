@@ -432,6 +432,8 @@ pub struct PoolSpec {
     /// property of the alias.
     #[serde(default)]
     pub serving_classes: ServingPresets,
+    #[serde(default)]
+    pub class_identity: Option<crate::serving::ClassRouteIdentity>,
 
     /// Per-account overrides on this alias, keyed by account id (the value of
     /// a key's `account` label). See [`crate::serving::ServingOverlay`].
@@ -559,6 +561,7 @@ pub struct PoolConfig {
     pub trusted: bool,
     pub routing_rules: Vec<RoutingRule>,
     pub serving_classes: ServingPresets,
+    pub class_identity: Option<crate::serving::ClassRouteIdentity>,
     pub overlays: HashMap<String, ServingOverlay>,
     pub providers: Vec<ProviderSpec>,
 }
@@ -576,6 +579,7 @@ impl From<PoolSpec> for PoolConfig {
             trusted: pool.trusted,
             routing_rules: pool.routing_rules,
             serving_classes: pool.serving_classes,
+            class_identity: pool.class_identity,
             overlays: pool.overlays,
             providers: pool.providers,
         }
@@ -722,6 +726,7 @@ impl TargetSpecOrList {
                     trusted,
                     routing_rules: Vec::new(),
                     serving_classes: ServingPresets::new(),
+                    class_identity: None,
                     overlays: HashMap::new(),
                     providers,
                 })
@@ -763,6 +768,7 @@ impl TargetSpecOrList {
                     trusted,
                     routing_rules: Vec::new(),
                     serving_classes: ServingPresets::new(),
+                    class_identity: None,
                     overlays: HashMap::new(),
                     providers: vec![provider],
                 })
@@ -1482,7 +1488,8 @@ fn build_pool(
         pool_config.trusted,
         pool_config.routing_rules,
     )
-    .with_serving(pool_config.serving_classes, pool_config.overlays))
+    .with_serving(pool_config.serving_classes, pool_config.overlays)
+    .with_class_identity(pool_config.class_identity))
 }
 
 impl Targets {
@@ -2818,6 +2825,7 @@ mod tests {
                 kind: Default::default(),
             }],
             serving_classes: Default::default(),
+            class_identity: None,
             overlays: Default::default(),
         };
 

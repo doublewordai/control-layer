@@ -1391,6 +1391,46 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn class_route_without_rewrite_keeps_priority_and_rejects_legacy_suffixes() {
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::serving::{ClassRouteIdentity, ProviderKind};
+        let mut targets = fallback_targets("example/model", 1, vec![]);
+        targets.strict_mode = false;
+        let target = target::Target::builder()
+            .url("https://gateway.example.com/".parse().unwrap())
+            .kind(ProviderKind::Dynamo)
+            .accepts_scheduling_priority(true)
+            .build();
+        let pool = ProviderPool::new(vec![Provider::new(target, 1)]).with_class_identity(Some(
+            ClassRouteIdentity {
+                model_id: uuid::Uuid::new_v4(),
+                class_id: uuid::Uuid::new_v4(),
+                canonical_alias: "example/model".into(),
+                class_key: "standard".into(),
+                endpoint_id: uuid::Uuid::new_v4(),
+                upstream_model_name: "example/model".into(),
+            },
+        ));
+        targets.targets.insert("example/model".into(), pool.into());
+        let mock = MockHttpClient::new(StatusCode::OK, "{}");
+        let server =
+            TestServer::new(build_router(AppState::with_client(targets, mock.clone()))).unwrap();
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({"model":"example/model","messages":[]}))
+            .await;
+        response.assert_status_ok();
+        let sent: serde_json::Value = serde_json::from_slice(&mock.get_requests()[0].body).unwrap();
+        assert_eq!(sent["nvext"]["agent_hints"]["priority"], 0);
+        let rejected = server
+            .post("/v1/chat/completions")
+            .json(&json!({"model":"example/model:interactive","messages":[]}))
+            .await;
+        rejected.assert_status_bad_request();
+        assert_eq!(mock.get_requests().len(), 1);
+    }
+
     /// Retry on an upstream 429. Used by the embedded-error tests below.
     fn embedded_error_targets(alias: &str, n: usize) -> target::Targets {
         fallback_targets(alias, n, vec![429])

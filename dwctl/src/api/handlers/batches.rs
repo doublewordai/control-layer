@@ -502,7 +502,7 @@ async fn fetch_creator_email(db: &sqlx::PgPool, batch: &fusillade::Batch) -> Opt
 /// Metadata keys the server owns. A caller-supplied value for any of these is dropped at
 /// creation rather than merged: they are either injected server-side during response
 /// enrichment, or they are provenance, which is worth nothing if the caller can set it.
-const RESERVED_METADATA_KEYS: [&str; 7] = [
+const RESERVED_METADATA_KEYS: [&str; 8] = [
     "created_by_email",
     "context_name",
     "context_type",
@@ -510,6 +510,7 @@ const RESERVED_METADATA_KEYS: [&str; 7] = [
     "created_by",
     "dw_user_agent",
     "dw_model",
+    "dw_submitted_model",
 ];
 
 /// Whether a caller-supplied metadata key collides with a reserved one, comparing the
@@ -2794,6 +2795,8 @@ mod tests {
                 // so it has to be stripped by the same rule rather than by exact match.
                 ("dw-user-agent".to_string(), "spoofed-hyphenated/9.9.9".to_string()),
                 ("DW_USER_AGENT".to_string(), "spoofed-shouty/9.9.9".to_string()),
+                ("dw_submitted_model".to_string(), "spoofed-model".to_string()),
+                ("DW-SUBMITTED-MODEL".to_string(), "spoofed-model".to_string()),
                 ("team".to_string(), "research".to_string()),
             ])),
             api_key_id: None,
@@ -2833,7 +2836,7 @@ mod tests {
             "the wire User-Agent should be stored for fusillade to replay on dispatch"
         );
         assert_eq!(metadata["team"], "research", "caller metadata should survive alongside it");
-        for spelling in ["dw-user-agent", "DW_USER_AGENT"] {
+        for spelling in ["dw-user-agent", "DW_USER_AGENT", "dw_submitted_model", "DW-SUBMITTED-MODEL"] {
             assert!(
                 metadata.get(spelling).is_none(),
                 "a reserved key must be stripped in every spelling that normalises to it, not just the exact one ({spelling} survived)"
@@ -2855,6 +2858,9 @@ mod tests {
             "dw_model",
             "dw-model",
             "DW_MODEL",
+            "dw_submitted_model",
+            "DW-SUBMITTED-MODEL",
+            "Dw_Submitted-Model",
         ] {
             assert!(is_reserved_metadata_key(reserved), "{reserved} should be reserved");
         }

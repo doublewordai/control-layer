@@ -914,6 +914,15 @@ impl<'c> ApiKeys<'c> {
         &mut self,
         deployment_id: DeploymentId,
     ) -> Result<Vec<ApiKeyDBResponse>> {
+        self.get_api_keys_for_class_with_sufficient_credit(deployment_id, "standard").await
+    }
+
+    /// Class-scoped equivalent of the legacy model admission lookup.
+    pub async fn get_api_keys_for_class_with_sufficient_credit(
+        &mut self,
+        deployment_id: DeploymentId,
+        class_key: &str,
+    ) -> Result<Vec<ApiKeyDBResponse>> {
         let api_keys = sqlx::query_as!(
             ApiKey,
             r#"
@@ -977,12 +986,26 @@ impl<'c> ApiKeys<'c> {
                 )
                 OR (NOT EXISTS (
                     SELECT 1 FROM model_tariffs mt
-                    WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL AND mt.serving_class IS NULL
-                      AND mt.valid_until IS NULL
+                    WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL
+                      AND ((mt.serving_class IS NULL AND mt.valid_until IS NULL
+                            AND NOT EXISTS (
+                                SELECT 1 FROM model_tariffs class_price
+                                WHERE dm.routing_mode = 'class_routes'
+                                  AND class_price.deployed_model_id = mt.deployed_model_id
+                                  AND class_price.user_id IS NULL AND class_price.serving_class = $3
+                                  AND (class_price.api_key_purpose = mt.api_key_purpose
+                                       OR (mt.api_key_purpose = 'playground' AND class_price.api_key_purpose = 'realtime'))
+                                  AND class_price.completion_window IS NOT DISTINCT FROM mt.completion_window
+                                  AND class_price.valid_from <= NOW()
+                                  AND (class_price.valid_until IS NULL OR class_price.valid_until > NOW())
+                            ))
+                        OR (dm.routing_mode = 'class_routes' AND mt.serving_class = $3
+                            AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())))
                       AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                 ) AND NOT EXISTS (
                     SELECT 1 FROM model_tariffs mt
                     WHERE mt.deployed_model_id = dm.id AND mt.user_id = ak.user_id
+                      AND (dm.routing_mode = 'legacy' OR mt.serving_class IS NULL OR mt.serving_class = $3)
                       AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())
                       AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                 ))
@@ -1027,19 +1050,34 @@ impl<'c> ApiKeys<'c> {
                 )
                 OR (NOT EXISTS (
                     SELECT 1 FROM model_tariffs mt
-                    WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL AND mt.serving_class IS NULL
-                      AND mt.valid_until IS NULL
+                    WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL
+                      AND ((mt.serving_class IS NULL AND mt.valid_until IS NULL
+                            AND NOT EXISTS (
+                                SELECT 1 FROM model_tariffs class_price
+                                WHERE dm.routing_mode = 'class_routes'
+                                  AND class_price.deployed_model_id = mt.deployed_model_id
+                                  AND class_price.user_id IS NULL AND class_price.serving_class = $3
+                                  AND (class_price.api_key_purpose = mt.api_key_purpose
+                                       OR (mt.api_key_purpose = 'playground' AND class_price.api_key_purpose = 'realtime'))
+                                  AND class_price.completion_window IS NOT DISTINCT FROM mt.completion_window
+                                  AND class_price.valid_from <= NOW()
+                                  AND (class_price.valid_until IS NULL OR class_price.valid_until > NOW())
+                            ))
+                        OR (dm.routing_mode = 'class_routes' AND mt.serving_class = $3
+                            AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())))
                       AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                 ) AND NOT EXISTS (
                     SELECT 1 FROM model_tariffs mt
                     WHERE mt.deployed_model_id = dm.id AND mt.user_id = ak.user_id
+                      AND (dm.routing_mode = 'legacy' OR mt.serving_class IS NULL OR mt.serving_class = $3)
                       AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())
                       AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                 ))
             )
             "#,
             deployment_id,
-            Uuid::nil() // System user ID
+            Uuid::nil(), // System user ID
+            class_key
         )
         .fetch_all(&mut *self.db)
         .await?;

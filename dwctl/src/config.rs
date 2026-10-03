@@ -2019,6 +2019,7 @@ pub struct DaemonConfig {
     pub model_escalations: HashMap<String, fusillade::ModelEscalationConfig>,
 
     /// Batch table column names to include as request headers.
+    /// Control Layer always adds `dw_submitted_model` for queued response identity.
     /// These values are sent as `x-fusillade-batch-{column}` headers with each request.
     /// Example: ["id", "created_by", "endpoint"] produces headers like:
     ///   - x-fusillade-batch-id
@@ -2567,7 +2568,15 @@ impl DaemonConfig {
             claim_timeout_ms: self.claim_timeout_ms,
             processing_timeout_ms: self.processing_timeout_ms,
             pending_request_counts_timeout_ms: self.pending_request_counts_timeout_ms,
-            batch_metadata_fields: self.batch_metadata_fields.clone(),
+            batch_metadata_fields: {
+                let mut fields = self.batch_metadata_fields.clone();
+                // Required for response compatibility after queued aliases are normalized,
+                // even when installations customize the optional metadata allow-list.
+                if !fields.iter().any(|field| field == "dw_submitted_model") {
+                    fields.push("dw_submitted_model".to_owned());
+                }
+                fields
+            },
             purge_interval_ms: self.purge_interval_ms,
             purge_batch_size: self.purge_batch_size,
             purge_throttle_ms: self.purge_throttle_ms,
@@ -4241,6 +4250,18 @@ mod tests {
                 forwarded.contains(&key.to_string()),
                 "batch metadata key '{key}' is not forwarded, so http_analytics.{column} will never be populated for batch requests"
             );
+        }
+    }
+
+    #[test]
+    fn submitted_model_forwarding_survives_custom_metadata_configuration() {
+        for fields in [vec![], vec!["dw_submitted_model".to_owned()]] {
+            let daemon = DaemonConfig {
+                batch_metadata_fields: fields,
+                ..Default::default()
+            };
+            let forwarded = daemon.to_fusillade_config().batch_metadata_fields;
+            assert_eq!(forwarded.iter().filter(|field| *field == "dw_submitted_model").count(), 1);
         }
     }
 

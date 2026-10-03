@@ -282,6 +282,11 @@ impl IntoResponse for OnwardsErrorResponse {
                 HeaderValue::from_static(CONCURRENCY_RETRY_AFTER_SECS),
             );
         }
+        // Let embedding middleware distinguish a specific policy rejection from
+        // generic key admission without consuming or reparsing the response body.
+        if let Some(body) = self.body {
+            response.extensions_mut().insert(body);
+        }
         if let Some(outcome) = self.serving_outcome {
             response.extensions_mut().insert(outcome);
         }

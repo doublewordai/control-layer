@@ -1,0 +1,44 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT a.alias, a.deployed_model_id, a.serving_class_id,\n                   dm.alias AS canonical_alias, c.class_key\n            FROM model_aliases a\n            JOIN deployed_models dm ON dm.id = a.deployed_model_id\n            JOIN model_serving_classes c\n              ON c.id = a.serving_class_id AND c.deployed_model_id = a.deployed_model_id\n            WHERE NOT dm.deleted\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "alias",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "deployed_model_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "serving_class_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "canonical_alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "class_key",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "aedb90aa855fad834c679e9197bd8f341256f6d810c0db24859b1bac3479a568"
+}

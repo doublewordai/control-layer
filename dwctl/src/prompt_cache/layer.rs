@@ -299,6 +299,7 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
 
     // Fork classify, parallel with the upstream call. Owns its inputs so the task is
     // `'static`; this is the one body clone (a future parse-once refactor would remove it).
+    let class_route = parts.extensions.get::<onwards::serving::ClassRouteIdentity>().cloned();
     let classify_handle = virtual_model.map(|model| {
         let classifier = state.classifier.clone();
         let body = body_bytes.to_vec();
@@ -306,6 +307,7 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
             classifier
                 .classify(ClassifyRequest {
                     virtual_model: &model,
+                    class_route: class_route.as_ref(),
                     body: &body,
                     api_key: api_key.as_deref(),
                     // Serving always has the bearer token; only historical replay pre-resolves.

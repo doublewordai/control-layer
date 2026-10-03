@@ -28,11 +28,14 @@
 
 use crate::config::{Config, ONWARDS_CONFIG_CHANGED_CHANNEL};
 
+use crate::db::handlers::InferenceEndpoints;
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::metrics::MetricsRecorder;
 use crate::metrics::errors::component::ANALYTICS_BATCHER;
+#[cfg(test)]
+use crate::pricing::CacheTariffRow;
 use crate::pricing::{
-    CacheTariffRow, ModelInfo, TariffInfo, TokenCounts, charged_cost, clamp_implicit_read_multiplier, find_best_tariff, list_price,
+    ModelInfo, ModelPricingKey, TariffInfo, TokenCounts, charged_cost, clamp_implicit_read_multiplier, find_best_tariff, list_price,
     resolve_cache_multipliers,
 };
 use crate::request_logging::serializers::{HttpAnalyticsRow, RequestParams};
@@ -119,6 +122,13 @@ pub struct RawAnalyticsRecord {
     pub requested_serving_class: Option<String>,
     #[serde(default)]
     pub resolved_serving_class: Option<String>,
+    /// Captured dispatch semantics: survives activation rollback and alias edits.
+    #[serde(default)]
+    pub class_route: Option<onwards::serving::ClassRouteIdentity>,
+    #[serde(default)]
+    pub upstream_model_name: Option<String>,
+    #[serde(default)]
+    pub submitted_model: Option<String>,
 
     // === Auth ===
     /// Stable key identity attached by Onwards after successful authentication.
@@ -554,19 +564,40 @@ where
             .into_iter()
             .collect();
 
+        let class_models: Vec<Uuid> = buffer
+            .iter()
+            .filter_map(|r| r.class_route.as_ref().map(|c| c.model_id))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
         // Batch lookup: model alias → (model_id, provider_name, tariffs)
         let model_map = if !models.is_empty() {
-            self.batch_lookup_models_with_tariffs(tx, &models, &accounts).await?
+            self.batch_lookup_models_with_tariffs(tx, &models, &accounts, &class_models).await?
         } else {
             HashMap::new()
         };
 
         // Batch lookup: model alias → cache tariffs (per tier), for the cache multipliers.
         let cache_tariff_map = if !models.is_empty() {
-            self.batch_lookup_cache_tariffs(tx, &models, &accounts).await?
+            crate::pricing::lookup_cache_tariffs_for_models(
+                &mut **tx,
+                &models.iter().map(|m| m.to_string()).collect::<Vec<_>>(),
+                &accounts,
+                &class_models,
+            )
+            .await?
         } else {
             HashMap::new()
         };
+
+        let endpoint_ids: Vec<Uuid> = buffer
+            .iter()
+            .filter_map(|record| record.class_route.as_ref().map(|route| route.endpoint_id))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let endpoint_names = InferenceEndpoints::new(tx).names_by_ids(&endpoint_ids).await?;
 
         // Enrich each record
         let mut enriched = Vec::with_capacity(buffer.len());
@@ -600,7 +631,12 @@ where
             // Price batch requests as of batch creation, not processing time.
             let pricing_timestamp = raw.batch_created_at.unwrap_or(raw.timestamp);
 
-            let (provider_name, input_price, output_price) = if let Some(ref model_alias) = raw.request_model {
+            let pricing_model = raw
+                .class_route
+                .as_ref()
+                .map(|c| ModelPricingKey::Canonical(c.model_id))
+                .or_else(|| raw.request_model.clone().map(ModelPricingKey::Alias));
+            let (provider_name, input_price, output_price) = if let Some(ref model_alias) = pricing_model {
                 if let Some(model_info) = model_map.get(model_alias) {
                     // Find best matching tariff
                     // The billed account's own tariffs (an organisation's deal) come first.
@@ -621,14 +657,20 @@ where
                 (None, None, None)
             };
 
+            // Class records retain their actual endpoint even after routing changes.
+            // Never attribute them to the canonical model's dormant legacy host.
+            let provider_name = match &raw.class_route {
+                Some(route) => endpoint_names.get(&route.endpoint_id).cloned(),
+                None => provider_name,
+            };
+
             // Resolve cache multipliers from the tariff row valid at inference time. `None`
             // for the normal non-cache model (no tariff) and for the dead anomaly path below.
             // Resolve the cache multipliers from the tariff row valid at inference time. `None`
             // means this model was NOT dwctl-cache-enabled then (the lookup is as-of inference
             // against an append-only ledger, so a tariff that was active then always resolves).
-            let cache_mults_resolved = raw
-                .request_model
-                .as_deref()
+            let cache_mults_resolved = pricing_model
+                .as_ref()
                 .and_then(|alias| cache_tariff_map.get(alias))
                 .and_then(|rows| resolve_cache_multipliers(rows, pricing_timestamp, user_id, raw.resolved_serving_class.as_deref()));
 
@@ -738,10 +780,12 @@ where
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         aliases: &[&str],
         accounts: &[Uuid],
-    ) -> Result<HashMap<String, ModelInfo>, sqlx::Error> {
+        class_models: &[Uuid],
+    ) -> Result<HashMap<ModelPricingKey, ModelInfo>, sqlx::Error> {
         let aliases_vec: Vec<String> = aliases.iter().map(|s| s.to_string()).collect();
 
         struct ModelRow {
+            model_id: Uuid,
             alias: String,
             provider_name: Option<String>,
             tariff_id: Option<Uuid>,
@@ -761,6 +805,7 @@ where
             ModelRow,
             r#"
             SELECT
+                dm.id AS model_id,
                 dm.alias,
                 ie.name as "provider_name?",
                 mt.id as "tariff_id?",
@@ -776,43 +821,53 @@ where
             LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id
             LEFT JOIN model_tariffs mt ON mt.deployed_model_id = dm.id
                 AND (mt.user_id IS NULL OR mt.user_id = ANY($2))
-                AND (mt.user_id IS NOT NULL OR mt.serving_class IS NULL)
-            WHERE dm.alias = ANY($1)
+                AND (mt.user_id IS NOT NULL OR mt.serving_class IS NULL OR dm.id = ANY($3))
+            WHERE dm.alias = ANY($1) OR dm.id = ANY($3)
             ORDER BY dm.alias, mt.valid_from DESC
             "#,
             &aliases_vec,
-            accounts
+            accounts,
+            class_models
         )
         .fetch_all(&mut **tx)
         .await?;
 
-        // Group by alias
-        let mut map: HashMap<String, ModelInfo> = HashMap::new();
+        // Keep membership checks constant-time when a batch spans many models.
+        let class_model_ids: std::collections::HashSet<_> = class_models.iter().copied().collect();
+        // Group by alias and captured canonical identity.
+        let mut map: HashMap<ModelPricingKey, ModelInfo> = HashMap::new();
         for row in rows {
-            let entry = map.entry(row.alias.clone()).or_insert_with(|| ModelInfo {
-                provider_name: row.provider_name.unwrap_or_default(),
-                tariffs: Vec::new(),
-            });
-
-            // Add tariff if present
-            if let (Some(id), Some(purpose), Some(valid_from), Some(input_price), Some(output_price)) = (
-                row.tariff_id,
-                row.tariff_purpose,
-                row.tariff_valid_from,
-                row.tariff_input_price,
-                row.tariff_output_price,
-            ) {
-                entry.tariffs.push(TariffInfo {
-                    id,
-                    serving_class: row.tariff_class,
-                    purpose: parse_api_key_purpose(&purpose),
-                    effective_from: valid_from,
-                    valid_until: row.tariff_valid_until,
-                    input_price_per_token: input_price,
-                    output_price_per_token: output_price,
-                    completion_window: row.tariff_completion_window,
-                    account: row.tariff_account,
+            let mut keys = Vec::with_capacity(2);
+            if class_model_ids.contains(&row.model_id) {
+                keys.push(ModelPricingKey::Canonical(row.model_id));
+            }
+            if row.tariff_account.is_some() || row.tariff_class.is_none() {
+                keys.push(ModelPricingKey::Alias(row.alias));
+            }
+            for key in keys {
+                let entry = map.entry(key).or_insert_with(|| ModelInfo {
+                    provider_name: row.provider_name.clone().unwrap_or_default(),
+                    tariffs: Vec::new(),
                 });
+                if let (Some(id), Some(purpose), Some(valid_from), Some(input_price), Some(output_price)) = (
+                    row.tariff_id,
+                    row.tariff_purpose.as_ref(),
+                    row.tariff_valid_from,
+                    row.tariff_input_price,
+                    row.tariff_output_price,
+                ) {
+                    entry.tariffs.push(TariffInfo {
+                        id,
+                        serving_class: row.tariff_class.clone(),
+                        purpose: parse_api_key_purpose(purpose),
+                        effective_from: valid_from,
+                        valid_until: row.tariff_valid_until,
+                        input_price_per_token: input_price,
+                        output_price_per_token: output_price,
+                        completion_window: row.tariff_completion_window.clone(),
+                        account: row.tariff_account,
+                    });
+                }
             }
         }
 
@@ -826,6 +881,7 @@ where
     /// of their creation time, like `batch_lookup_models_with_tariffs`. Models without cache tariffs
     /// simply don't appear (the resolver then falls back to safe defaults).
     #[tracing::instrument(skip_all)]
+    #[cfg(test)]
     async fn batch_lookup_cache_tariffs(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -911,6 +967,11 @@ where
         let mut total_cost_vec: Vec<Option<Decimal>> = Vec::with_capacity(records.len());
         let mut uncached_cost_vec: Vec<Option<Decimal>> = Vec::with_capacity(records.len());
         let mut served_by_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
+        let mut canonical_models: Vec<Option<Uuid>> = Vec::with_capacity(records.len());
+        let mut class_ids: Vec<Option<Uuid>> = Vec::with_capacity(records.len());
+        let mut destination_endpoints: Vec<Option<Uuid>> = Vec::with_capacity(records.len());
+        let mut upstream_models: Vec<Option<String>> = Vec::with_capacity(records.len());
+        let mut submitted_models: Vec<Option<String>> = Vec::with_capacity(records.len());
         let mut requested_class_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
         let mut resolved_class_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
         let mut finish_reason_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
@@ -988,6 +1049,11 @@ where
             n_vec.push(p.n);
             tool_count_vec.push(p.tool_count);
             message_count_vec.push(p.message_count);
+            canonical_models.push(record.raw.class_route.as_ref().map(|c| c.model_id));
+            class_ids.push(record.raw.class_route.as_ref().map(|c| c.class_id));
+            destination_endpoints.push(record.raw.class_route.as_ref().map(|c| c.endpoint_id));
+            upstream_models.push(record.raw.upstream_model_name.clone());
+            submitted_models.push(record.raw.submitted_model.clone());
         }
 
         let rows = sqlx::query!(
@@ -1002,7 +1068,8 @@ where
                 cache_creation_5m_input_tokens, cache_creation_1h_input_tokens, cache_creation_24h_input_tokens,
                 total_cost, uncached_cost, served_by, finish_reason, user_agent, submitted_at,
                 engine_cached_tokens, stream, max_tokens, temperature, top_p, n, tool_count, message_count,
-                cache_read_source, requested_serving_class, resolved_serving_class, gateway_span_id
+                cache_read_source, requested_serving_class, resolved_serving_class, gateway_span_id,
+                canonical_model_id, serving_class_id, destination_endpoint_id, upstream_model_name, submitted_model
             )
             SELECT * FROM UNNEST(
                 $1::uuid[], $2::bigint[], $3::timestamptz[], $4::text[], $5::text[], $6::text[],
@@ -1015,7 +1082,7 @@ where
                 $32::numeric[], $33::numeric[], $34::text[], $35::text[], $36::text[],
                 $37::timestamptz[],
                 $38::bigint[], $39::boolean[], $40::bigint[], $41::real[], $42::real[], $43::int[], $44::int[], $45::int[],
-                $46::text[], $47::text[], $48::text[], $49::text[]
+                $46::text[], $47::text[], $48::text[], $49::text[], $50::uuid[], $51::uuid[], $52::uuid[], $53::text[], $54::text[]
             )
             ON CONFLICT DO NOTHING
             RETURNING id, instance_id, correlation_id
@@ -1069,6 +1136,11 @@ where
             &requested_class_vec as &[Option<String>],
             &resolved_class_vec as &[Option<String>],
             &gateway_span_ids as &[Option<String>],
+            &canonical_models as &[Option<Uuid>],
+            &class_ids as &[Option<Uuid>],
+            &destination_endpoints as &[Option<Uuid>],
+            &upstream_models as &[Option<String>],
+            &submitted_models as &[Option<String>],
         )
         .fetch_all(&mut **tx)
         .await?;
@@ -1805,6 +1877,9 @@ mod tests {
             served_by: None,
             requested_serving_class: None,
             resolved_serving_class: None,
+            class_route: None,
+            upstream_model_name: None,
+            submitted_model: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 123,
             timestamp: chrono::Utc::now(),
@@ -1872,6 +1947,9 @@ mod tests {
             served_by: None,
             requested_serving_class: None,
             resolved_serving_class: None,
+            class_route: None,
+            upstream_model_name: None,
+            submitted_model: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 1,
             timestamp: chrono::Utc::now(),
@@ -2170,6 +2248,9 @@ mod integration_tests {
             served_by: None,
             requested_serving_class: None,
             resolved_serving_class: None,
+            class_route: None,
+            upstream_model_name: None,
+            submitted_model: None,
             instance_id: Uuid::new_v4(),
             correlation_id: rand::random::<i64>().abs(),
             timestamp: chrono::Utc::now(),
@@ -2221,6 +2302,134 @@ mod integration_tests {
     }
 
     #[dwctl_test_macros::test]
+    async fn class_billing_snapshot_survives_rollback_and_keeps_legacy_receipts_separate(pool: sqlx::PgPool) {
+        let model = create_test_model(&pool, "example/billing").await;
+        setup_tariff(&pool, model, Decimal::new(1, 3), Decimal::new(1, 3), ApiKeyPurpose::Realtime).await;
+        sqlx::query("INSERT INTO model_tariffs (deployed_model_id,serving_class,name,api_key_purpose,input_price_per_token,output_price_per_token) VALUES ($1,'fast','Fast','realtime',0.002,0.002)")
+            .bind(model).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE model_tariffs SET valid_from=now()-interval '1 minute' WHERE deployed_model_id=$1")
+            .bind(model)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let account = setup_user_with_balance(&pool, Decimal::from(10)).await;
+        let key = create_api_key_for_user(&pool, account, ApiKeyPurpose::Realtime).await;
+        let legacy = create_raw_record("example/billing", Some(key), 10, 0);
+        let mut fast = create_raw_record("example/billing", Some(key), 10, 0);
+        fast.resolved_serving_class = Some("fast".into());
+        fast.class_route = Some(onwards::serving::ClassRouteIdentity {
+            model_id: model,
+            class_id: Uuid::new_v4(),
+            canonical_alias: "example/billing".into(),
+            class_key: "fast".into(),
+            endpoint_id: Uuid::new_v4(),
+            upstream_model_name: "gateway/fast".into(),
+        });
+        fast.upstream_model_name = Some("gateway/fast".into());
+        fast.submitted_model = Some("example/billing-fast".into());
+        // The model remains legacy at projection time, as after an operator rollback.
+        run_batcher_with_records(&pool, vec![legacy, fast]).await;
+        let rows: Vec<(Option<Uuid>, Option<String>, Decimal, Option<String>)> = sqlx::query_as(
+            "SELECT canonical_model_id,resolved_serving_class,input_price_per_token,submitted_model FROM http_analytics WHERE model='example/billing' ORDER BY input_price_per_token"
+        ).fetch_all(&pool).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, None);
+        assert_eq!(rows[0].2, Decimal::new(1, 3));
+        assert_eq!(rows[1].0, Some(model));
+        assert_eq!(rows[1].1.as_deref(), Some("fast"));
+        assert_eq!(rows[1].2, Decimal::new(2, 3));
+        assert_eq!(rows[1].3.as_deref(), Some("example/billing-fast"));
+    }
+
+    #[dwctl_test_macros::test]
+    async fn class_provider_attribution_uses_each_captured_endpoint(pool: sqlx::PgPool) {
+        let model = create_test_model(&pool, "example/provider").await;
+        setup_tariff(&pool, model, Decimal::new(1, 3), Decimal::new(1, 3), ApiKeyPurpose::Realtime).await;
+        let legacy_provider: String =
+            sqlx::query_scalar("SELECT ie.name FROM deployed_models dm JOIN inference_endpoints ie ON ie.id=dm.hosted_on WHERE dm.id=$1")
+                .bind(model)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let mut records = vec![create_raw_record("example/provider", None, 10, 0)];
+        for name in ["standard-gateway", "fast-gateway", "deleted-gateway"] {
+            let endpoint = Uuid::new_v4();
+            if name != "deleted-gateway" {
+                sqlx::query("INSERT INTO inference_endpoints (id,name,url,created_by) VALUES ($1,$2,'http://gateway.test',$3)")
+                    .bind(endpoint)
+                    .bind(name)
+                    .bind(Uuid::nil())
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            let mut raw = create_raw_record("example/provider", None, 10, 0);
+            raw.class_route = Some(onwards::serving::ClassRouteIdentity {
+                model_id: model,
+                class_id: Uuid::new_v4(),
+                canonical_alias: "example/provider".into(),
+                class_key: if name == "standard-gateway" { "standard" } else { "fast" }.into(),
+                endpoint_id: endpoint,
+                upstream_model_name: "gateway/model".into(),
+            });
+            records.push(raw);
+        }
+        // There are no current class rows: attribution uses the receipt, including
+        // when an operator has rolled back or subsequently removed the destination.
+        let (batcher, _) =
+            AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), crate::test::utils::create_test_config(), None);
+        let mut tx = pool.begin().await.unwrap();
+        let enriched = batcher.enrich_batch(&mut tx, &records).await.unwrap();
+        assert_eq!(enriched[0].provider_name.as_deref(), Some(legacy_provider.as_str()));
+        assert_eq!(enriched[1].provider_name.as_deref(), Some("standard-gateway"));
+        assert_eq!(enriched[2].provider_name.as_deref(), Some("fast-gateway"));
+        assert_eq!(enriched[3].provider_name, None);
+        assert!(
+            enriched
+                .iter()
+                .all(|record| record.input_price_per_token == enriched[0].input_price_per_token)
+        );
+    }
+
+    #[dwctl_test_macros::test]
+    async fn canonical_uuid_cannot_collide_with_a_legacy_alias_in_pricing(pool: sqlx::PgPool) {
+        let canonical = create_test_model(&pool, "example/canonical").await;
+        let alias = canonical.to_string();
+        let legacy = create_test_model(&pool, &alias).await;
+        for (model, price, read) in [(canonical, Decimal::new(1, 3), "0.1"), (legacy, Decimal::new(9, 3), "0.9")] {
+            setup_tariff(&pool, model, price, price, ApiKeyPurpose::Realtime).await;
+            sqlx::query("INSERT INTO model_cache_tariffs (deployed_model_id,write_multiplier_5m,write_multiplier_1h,write_multiplier_24h,read_multiplier,min_prefix_tokens) VALUES ($1,1,1,1,$2,1024)")
+                .bind(model).bind(read.parse::<Decimal>().unwrap()).execute(&pool).await.unwrap();
+        }
+        let mut class = create_raw_record("example/canonical", None, 10, 0);
+        class.class_route = Some(onwards::serving::ClassRouteIdentity {
+            model_id: canonical,
+            class_id: Uuid::new_v4(),
+            canonical_alias: "example/canonical".into(),
+            class_key: "standard".into(),
+            endpoint_id: Uuid::new_v4(),
+            upstream_model_name: "gateway/model".into(),
+        });
+        let (batcher, _) =
+            AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), crate::test::utils::create_test_config(), None);
+        let mut tx = pool.begin().await.unwrap();
+        let records = batcher
+            .enrich_batch(&mut tx, &[class, create_raw_record(&alias, None, 10, 0)])
+            .await
+            .unwrap();
+        assert_eq!(records[0].input_price_per_token, Some(Decimal::new(1, 3)));
+        assert_eq!(records[1].input_price_per_token, Some(Decimal::new(9, 3)));
+        let tariffs = crate::pricing::lookup_cache_tariffs_for_models(&mut *tx, &[alias.clone()], &[], &[canonical])
+            .await
+            .unwrap();
+        assert_eq!(
+            tariffs[&ModelPricingKey::Canonical(canonical)][0].read_multiplier,
+            Decimal::new(1, 1)
+        );
+        assert_eq!(tariffs[&ModelPricingKey::Alias(alias)][0].read_multiplier, Decimal::new(9, 1));
+    }
+
+    #[dwctl_test_macros::test]
     async fn tariff_lookups_scope_accounts_without_losing_history_or_unpriced_models(pool: sqlx::PgPool) {
         let model = create_test_model(&pool, "scoped-history").await;
         let private_only = create_test_model(&pool, "other-account-only").await;
@@ -2257,18 +2466,18 @@ mod integration_tests {
         let mut tx = pool.begin().await.unwrap();
         for (accounts, count) in [(vec![], 2), (vec![a], 6), (vec![a, b], 8)] {
             let models = batcher
-                .batch_lookup_models_with_tariffs(&mut tx, &["scoped-history", "other-account-only"], &accounts)
+                .batch_lookup_models_with_tariffs(&mut tx, &["scoped-history", "other-account-only"], &accounts, &[])
                 .await
                 .unwrap();
-            assert_eq!(models["scoped-history"].tariffs.len(), count);
+            assert_eq!(models[&ModelPricingKey::Alias("scoped-history".into())].tariffs.len(), count);
             assert!(
-                models["scoped-history"]
+                models[&ModelPricingKey::Alias("scoped-history".into())]
                     .tariffs
                     .iter()
                     .all(|t| t.account.is_none_or(|id| accounts.contains(&id)))
             );
             assert!(
-                models["other-account-only"].tariffs.is_empty(),
+                models[&ModelPricingKey::Alias("other-account-only".into())].tariffs.is_empty(),
                 "LEFT JOIN must retain models with no applicable price"
             );
             let cache = batcher

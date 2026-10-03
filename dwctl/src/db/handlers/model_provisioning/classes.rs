@@ -61,13 +61,16 @@ impl ModelProvisioning<'_> {
             .fetch_all(&mut *self.db)
             .await?;
         let managed: HashSet<&str> = catalog.models.iter().map(|m| m.clay.alias.as_str()).collect();
-        // Activation is intentionally unsupported until every runtime reader/writer
-        // understands class routing. In particular, never overwrite an active route.
+        // The operator owns activation; reconciliation must retain both entry points.
         for (_, alias, mode) in &models {
-            ensure!(
-                !managed.contains(alias.as_str()) || mode == "legacy",
-                "model {alias:?} uses class_routes; this catalog writer cannot edit activated models yet"
-            );
+            if mode == "class_routes"
+                && let Some(model) = catalog.models.iter().find(|m| m.clay.alias == *alias)
+            {
+                ensure!(
+                    model.clay.class_routes.contains_key("standard") && model.clay.class_routes.contains_key("fast"),
+                    "activated model {alias:?} requires standard and fast class routes"
+                );
+            }
         }
         let managed_ids: HashSet<Uuid> = models
             .iter()

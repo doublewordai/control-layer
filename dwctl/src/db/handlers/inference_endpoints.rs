@@ -1,5 +1,7 @@
 //! Database repository for inference endpoints.
 
+use std::collections::HashMap;
+
 use crate::db::errors::{DbError, Result};
 use crate::db::handlers::repository::Repository;
 use crate::db::models::inference_endpoints::{
@@ -249,6 +251,21 @@ impl<'c> Repository for InferenceEndpoints<'c> {
 impl<'c> InferenceEndpoints<'c> {
     pub fn new(db: &'c mut PgConnection) -> Self {
         Self { db }
+    }
+
+    /// Resolve captured endpoint identities in bulk for request attribution.
+    /// Missing endpoints remain unknown rather than falling back to a model's old host.
+    pub async fn names_by_ids(
+        &mut self,
+        ids: &[InferenceEndpointId],
+    ) -> std::result::Result<HashMap<InferenceEndpointId, String>, sqlx::Error> {
+        if ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let rows = sqlx::query!("SELECT id, name FROM inference_endpoints WHERE id = ANY($1)", ids)
+            .fetch_all(&mut *self.db)
+            .await?;
+        Ok(rows.into_iter().map(|row| (row.id, row.name)).collect())
     }
 
     /// Returns the ID of the default inference endpoint

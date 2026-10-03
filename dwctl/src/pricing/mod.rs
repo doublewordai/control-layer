@@ -143,6 +143,7 @@ pub(crate) struct TariffInfo {
 /// resolving as-of a request's time yields the exact multipliers the live path billed
 /// with — and both callers must load it the same way or their answers drift. Models with
 /// no tariff history simply don't appear.
+#[cfg(test)]
 pub(crate) async fn lookup_cache_tariffs<'e, E>(
     executor: E,
     aliases: &[String],
@@ -151,7 +152,35 @@ pub(crate) async fn lookup_cache_tariffs<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
+    Ok(lookup_cache_tariffs_for_models(executor, aliases, accounts, &[])
+        .await?
+        .into_iter()
+        .filter_map(|(key, rows)| match key {
+            ModelPricingKey::Alias(alias) => Some((alias, rows)),
+            ModelPricingKey::Canonical(_) => None,
+        })
+        .collect())
+}
+
+/// Aliases are arbitrary strings and may themselves be UUIDs. Keep the two
+/// lookup domains distinct when projecting mixed legacy and class receipts.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum ModelPricingKey {
+    Alias(String),
+    Canonical(uuid::Uuid),
+}
+
+pub(crate) async fn lookup_cache_tariffs_for_models<'e, E>(
+    executor: E,
+    aliases: &[String],
+    accounts: &[uuid::Uuid],
+    class_models: &[uuid::Uuid],
+) -> Result<std::collections::HashMap<ModelPricingKey, Vec<CacheTariffRow>>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     struct Row {
+        model_id: uuid::Uuid,
         alias: String,
         write_multiplier_5m: Decimal,
         write_multiplier_1h: Decimal,
@@ -167,6 +196,7 @@ where
         Row,
         r#"
         SELECT
+            dm.id AS model_id,
             dm.alias,
             mct.write_multiplier_5m,
             mct.write_multiplier_1h,
@@ -178,29 +208,40 @@ where
             mct.serving_class
         FROM deployed_models dm
         JOIN model_cache_tariffs mct ON mct.deployed_model_id = dm.id
-        WHERE dm.alias = ANY($1)
+        WHERE (dm.alias = ANY($1) OR dm.id = ANY($3))
           AND (mct.user_id IS NULL OR mct.user_id = ANY($2))
-          AND (mct.user_id IS NOT NULL OR mct.serving_class IS NULL)
+          AND (mct.user_id IS NOT NULL OR mct.serving_class IS NULL OR dm.id = ANY($3))
         ORDER BY dm.alias, mct.valid_from DESC
         "#,
         aliases,
-        accounts
+        accounts,
+        class_models
     )
     .fetch_all(executor)
     .await?;
 
-    let mut map: std::collections::HashMap<String, Vec<CacheTariffRow>> = std::collections::HashMap::new();
+    let class_model_ids: std::collections::HashSet<_> = class_models.iter().copied().collect();
+    let mut map: std::collections::HashMap<ModelPricingKey, Vec<CacheTariffRow>> = std::collections::HashMap::new();
     for row in rows {
-        map.entry(row.alias).or_default().push(CacheTariffRow {
-            write_multiplier_5m: row.write_multiplier_5m,
-            write_multiplier_1h: row.write_multiplier_1h,
-            write_multiplier_24h: row.write_multiplier_24h,
-            read_multiplier: row.read_multiplier,
-            valid_from: row.valid_from,
-            valid_until: row.valid_until,
-            account: row.account,
-            serving_class: row.serving_class,
-        });
+        let mut keys = Vec::with_capacity(2);
+        if class_model_ids.contains(&row.model_id) {
+            keys.push(ModelPricingKey::Canonical(row.model_id));
+        }
+        if row.account.is_some() || row.serving_class.is_none() {
+            keys.push(ModelPricingKey::Alias(row.alias));
+        }
+        for key in keys {
+            map.entry(key).or_default().push(CacheTariffRow {
+                write_multiplier_5m: row.write_multiplier_5m,
+                write_multiplier_1h: row.write_multiplier_1h,
+                write_multiplier_24h: row.write_multiplier_24h,
+                read_multiplier: row.read_multiplier,
+                valid_from: row.valid_from,
+                valid_until: row.valid_until,
+                account: row.account,
+                serving_class: row.serving_class.clone(),
+            });
+        }
     }
     Ok(map)
 }

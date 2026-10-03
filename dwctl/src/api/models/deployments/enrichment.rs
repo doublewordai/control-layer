@@ -507,6 +507,7 @@ mod tests {
 
     fn create_test_model() -> DeployedModelResponse {
         DeployedModelResponse {
+            class_routes: None,
             id: Uuid::new_v4(),
             model_name: "test-model".to_string(),
             alias: "test-alias".to_string(),

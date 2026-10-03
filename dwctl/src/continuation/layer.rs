@@ -282,6 +282,11 @@ pub async fn continuation_middleware(State(state): State<ContinuationState>, req
         .map(str::to_string);
     let token = bearer(&request);
 
+    // Class routing has no completions pool. This synchronous gate also covers
+    // the interval before the legacy continuation route poller observes activation.
+    if request.extensions().get::<onwards::serving::ClassRouteIdentity>().is_some() {
+        return next.run(request).await;
+    }
     let (parts, body) = request.into_parts();
     let body_bytes = match axum::body::to_bytes(body, state.body_limit).await {
         Ok(b) => b,

@@ -64,6 +64,21 @@ pub async fn error_enrichment_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response<Body> {
+    let class = request.extensions().get::<onwards::serving::ClassRouteIdentity>().cloned();
+    let submitted = request.extensions().get::<onwards::serving::SubmittedModel>().cloned();
+    let mut response = enrich_response(pools, request, next).await;
+    if response.extensions().get::<onwards::serving::ClassRouteIdentity>().is_none()
+        && let Some(class) = class
+    {
+        response.extensions_mut().insert(class);
+    }
+    if let Some(submitted) = submitted {
+        response.extensions_mut().insert(submitted);
+    }
+    response
+}
+
+async fn enrich_response(pools: sqlx_pool_router::DynPools, request: Request<Body>, next: Next) -> Response<Body> {
     // Extract API key from request headers before passing to onwards
     let api_key = request
         .headers()
@@ -83,13 +98,27 @@ pub async fn error_enrichment_middleware(
         }
     };
 
-    let model_name = serde_json::from_slice::<ChatRequest>(&bytes).ok().map(|req| req.model);
+    let model_name = parts
+        .extensions
+        .get::<onwards::serving::ClassRouteIdentity>()
+        .map(|c| c.canonical_alias.clone())
+        .or_else(|| serde_json::from_slice::<ChatRequest>(&bytes).ok().map(|req| req.model));
 
     // Reconstruct the request with the body
     let reconstructed = Request::from_parts(parts, Body::from(bytes));
 
     // Let the request proceed through onwards
     let response = next.run(reconstructed).await;
+
+    // This is an explicit policy refusal, not a missing key/credit diagnosis.
+    // In particular a free-model account must not receive a spurious 402 here.
+    if response
+        .extensions()
+        .get::<onwards::errors::ErrorResponseBody>()
+        .is_some_and(|error| error.code == "hosting_restriction_unavailable")
+    {
+        return response;
+    }
 
     // Only enrich 403 errors when we have an API key
     // Note: This middleware is applied only to the onwards router (AI proxy paths),

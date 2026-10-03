@@ -80,6 +80,10 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     /// Read by [`super::zdr::is_zdr_request`] on the submit path. Defaults to
     /// empty (every key reads as non-ZDR) when the sync is not wired.
     pub key_policy_cache: crate::sync::key_policy::KeyPolicyCache,
+    /// Startup identity lookup shared with batch ingestion. Consumers must still
+    /// check the live class route and authorization before accepting a synonym.
+    pub model_aliases: super::model_aliases::ModelAliasMap,
+    pub model_targets: onwards::target::Targets,
 }
 
 /// Middleware that routes inference requests based on service_tier and background.
@@ -104,16 +108,18 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         return next.run(req).await;
     }
 
-    // Skip if this is a fusillade daemon request (already tracked)
-    if let Some(request_id) = req.headers().get("x-fusillade-request-id") {
-        if let Some(request_id) = request_id.to_str().ok().and_then(|s| s.parse::<uuid::Uuid>().ok()) {
-            tracing::Span::current().set_attribute("doubleword.request_id", request_id.to_string());
-        }
-        return next.run(req).await;
+    let daemon_request = req.headers().contains_key("x-fusillade-request-id");
+    if let Some(request_id) = req
+        .headers()
+        .get("x-fusillade-request-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<uuid::Uuid>().ok())
+    {
+        tracing::Span::current().set_attribute("doubleword.request_id", request_id.to_string());
     }
 
     // Read and parse the request body
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
     let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -121,6 +127,52 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             return Response::builder().status(StatusCode::BAD_REQUEST).body(Body::empty()).unwrap();
         }
     };
+
+    if daemon_request {
+        // Read only the model field; serde skips queued prompt values without
+        // constructing a second full JSON tree. Parse a full tree only to rewrite.
+        #[derive(serde::Deserialize)]
+        struct QueuedModel {
+            model: Option<String>,
+        }
+        let selected: QueuedModel = match serde_json::from_slice(&body_bytes) {
+            Ok(value) => value,
+            Err(_) => return invalid_request_response("Request body must be valid JSON", "invalid_json", "model"),
+        };
+        let route = match selected
+            .model
+            .as_deref()
+            .map(|name| super::model_aliases::resolve_class_route(&state.model_aliases, &state.model_targets, name, true))
+            .transpose()
+        {
+            Ok(route) => route.flatten(),
+            Err(error) => return class_route_error_response(error),
+        };
+        // The execution body stays canonical even across a routing rollback.
+        // Echo metadata is trusted only on the daemon loopback, like its deadline.
+        let submitted = parts
+            .headers
+            .get("x-fusillade-batch-dw-submitted-model")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .or_else(|| route.as_ref().and(selected.model.clone()));
+        if let Some(submitted) = submitted {
+            parts.extensions.insert(onwards::serving::SubmittedModel(submitted));
+        }
+        let mut bytes = body_bytes;
+        if let Some((name, identity)) = route {
+            parts.extensions.insert(identity);
+            if selected.model.as_deref() != Some(name.as_str()) {
+                let mut value: serde_json::Value = serde_json::from_slice(&bytes).expect("validated JSON");
+                value["model"] = name.into();
+                bytes = bytes::Bytes::from(value.to_string());
+                parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+                parts.headers.remove(axum::http::header::TRANSFER_ENCODING);
+            }
+        }
+        // Deadline priority is trusted on loopback; do not reapply ingress scrubbing.
+        return next.run(Request::from_parts(parts, Body::from(bytes))).await;
+    }
 
     let mut request_value: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
@@ -142,6 +194,25 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     };
     let is_daemon_processed = matches!(service_tier, ServiceTier::Flex | ServiceTier::Background);
 
+    let submitted_model = request_value["model"].as_str().map(str::to_owned);
+    let class_route = match submitted_model
+        .as_deref()
+        .map(|model| super::model_aliases::resolve_class_route(&state.model_aliases, &state.model_targets, model, is_daemon_processed))
+        .transpose()
+    {
+        Ok(route) => route.flatten(),
+        Err(error) => return class_route_error_response(error),
+    };
+    let class_route_changed = class_route
+        .as_ref()
+        .is_some_and(|(name, _)| Some(name.as_str()) != submitted_model.as_deref());
+    if let Some((name, identity)) = &class_route {
+        request_value["model"] = name.clone().into();
+        parts.extensions.insert(identity.clone());
+        parts
+            .extensions
+            .insert(onwards::serving::SubmittedModel(submitted_model.clone().unwrap()));
+    }
     // Strip client-supplied completion/response id fields before the request is
     // re-serialised and forwarded. dwctl owns the single parse-and-shape now, so
     // onwards forwards the bytes verbatim (COR-522); this preserves the guarantee
@@ -156,7 +227,11 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // so analytics, the prompt cache and billing all key on the bare alias,
     // and hand the class to onwards as a request extension. An unknown class
     // is a 400 (a typo must not silently change how a request is served).
-    let (requested_class, scrubbed_class) = match strip_serving_class_suffix(&mut request_value, is_daemon_processed) {
+    let (requested_class, scrubbed_class) = match if class_route.is_some() {
+        Ok((None, false))
+    } else {
+        strip_serving_class_suffix(&mut request_value, is_daemon_processed)
+    } {
         Ok(result) => result,
         Err(err) => {
             return Response::builder()
@@ -175,7 +250,9 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // `request_value` only stays removed if the bytes are rebuilt from it.
     // Every scrubber reports whether it changed something; the common case
     // (nothing to scrub, no suffix) keeps the caller's bytes untouched.
-    let body_bytes = if scrubbed_class || scrubbed_ids || scrubbed_scheduling {
+    let body_bytes = if class_route_changed || scrubbed_class || scrubbed_ids || scrubbed_scheduling {
+        parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+        parts.headers.remove(axum::http::header::TRANSFER_ENCODING);
         bytes::Bytes::from(request_value.to_string())
     } else {
         body_bytes
@@ -633,6 +710,14 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 obj.remove("stream_options");
             }
 
+            // Persist the standard execution name, not a fast/synonym spelling
+            // that may disappear during rollback. Keep response echo in metadata.
+            let response_model = if class_route.is_some() {
+                submitted_model.as_deref().unwrap_or(model)
+            } else {
+                model
+            };
+
             // For ZDR, encrypt the body and store the per-request keys; any
             // failure fails the request rather than falling back to plaintext.
             let flex_body = if zdr {
@@ -675,13 +760,16 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             // here the analytics row for the dispatch has no client at all. Same key and
             // same 256-char truncation as the batch path (`batches::create_batch`), so both
             // arrive as `x-fusillade-batch-dw-user-agent` and read identically downstream.
-            let queued_metadata = parts
+            let mut queued_metadata = parts
                 .headers
                 .get(axum::http::header::USER_AGENT)
                 .and_then(|value| value.to_str().ok())
                 .map(|ua| ua.chars().take(256).collect::<String>())
                 .filter(|ua| !ua.is_empty())
                 .map(|ua| serde_json::json!({ "dw_user_agent": ua }));
+            if class_route.is_some() {
+                queued_metadata.get_or_insert_with(|| serde_json::json!({}))["dw_submitted_model"] = response_model.into();
+            }
             if is_background_tier {
                 let background_input = fusillade::CreateBackgroundInput {
                     request_id,
@@ -694,7 +782,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                     created_by: queued_created_by,
                     metadata: queued_metadata,
                 };
-                return handle_background(&state, background_input, &resp_id, model).await;
+                return handle_background(&state, background_input, &resp_id, response_model).await;
             }
 
             // INVARIANT: the daemon dispatches this job back through the loopback
@@ -724,9 +812,21 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 (true, false) => handle_chat_completion_flex(&state, flex_input, request_id).await,
                 // Responses (embeddings flex was downgraded to realtime above).
                 (false, true) => handle_responses_flex_streaming(&state, flex_input, request_id).await,
-                (false, false) => handle_flex(&state, flex_input, &resp_id, model, background).await,
+                (false, false) => handle_flex(&state, flex_input, &resp_id, response_model, background).await,
             }
         }
+    }
+}
+
+fn class_route_error_response(error: super::model_aliases::ClassRouteError) -> Response {
+    match error {
+        super::model_aliases::ClassRouteError::UnknownClass => invalid_request_response(&error.to_string(), "model_not_found", "model"),
+        super::model_aliases::ClassRouteError::Unavailable(message) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, "1")],
+            Json(serde_json::json!({"error": {"message": message, "type": "server_error", "code": "model_route_unavailable"}})),
+        )
+            .into_response(),
     }
 }
 

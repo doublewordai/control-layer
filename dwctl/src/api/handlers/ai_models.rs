@@ -191,12 +191,21 @@ pub async fn list_ai_models<P: PoolProvider>(
     let mut models_query = QueryBuilder::new(
         r#"
         SELECT DISTINCT
-            dm.alias,
+            dm.alias AS canonical_alias,
+            CASE WHEN class.class_key IS NULL OR class.class_key = 'standard' THEN dm.alias
+                 ELSE dm.alias || ':' || class.class_key END AS alias,
             EXTRACT(EPOCH FROM dm.created_at)::BIGINT AS created
         FROM deployed_models dm
+        LEFT JOIN model_serving_classes class
+          ON class.deployed_model_id = dm.id AND dm.routing_mode = 'class_routes'
         INNER JOIN deployment_groups dg ON dg.deployment_id = dm.id
         WHERE dm.deleted = FALSE
           AND dm.status = 'active'
+          AND (dm.routing_mode='legacy' OR (
+                  EXISTS (SELECT 1 FROM model_serving_classes s WHERE s.deployed_model_id=dm.id AND s.class_key='standard')
+                  AND EXISTS (SELECT 1 FROM model_serving_classes f WHERE f.deployed_model_id=dm.id AND f.class_key='fast')
+                  AND NOT EXISTS (SELECT 1 FROM model_traffic_rules r WHERE r.action='redirect'
+                                  AND (r.deployed_model_id=dm.id OR r.redirect_target_id=dm.id))))
           AND (
               dg.group_id = "#,
     );
@@ -244,7 +253,9 @@ pub async fn list_ai_models<P: PoolProvider>(
         }
     }
 
-    models_query.push(" ORDER BY dm.alias");
+    // Only primary class names are discoverable. Never enumerate model_aliases:
+    // synonyms (including future private compatibility names) are ingress only.
+    models_query.push(" ORDER BY alias");
 
     let rows = models_query
         .build()

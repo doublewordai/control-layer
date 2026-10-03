@@ -526,6 +526,20 @@ pub async fn list_deployed_models<P: PoolProvider>(
         Default::default()
     };
 
+    if can_read_all_models {
+        let ids = models.iter().map(|m| m.id).collect::<Vec<_>>();
+        let routes = crate::db::handlers::model_class_routes::ModelClassRoutes::new(&mut conn)
+            .list_for_models(&ids)
+            .await?;
+        let mut routes_by_model: std::collections::HashMap<_, Vec<_>> = std::collections::HashMap::new();
+        for route in routes {
+            routes_by_model.entry(route.model_id).or_default().push(route);
+        }
+        for model in &mut models {
+            model.class_routes = Some(routes_by_model.remove(&model.id).unwrap_or_default());
+        }
+    }
+
     // Use ModelEnricher to add requested data
     let enricher = DeployedModelEnricher {
         db: &state.db.read(),
@@ -561,7 +575,7 @@ pub async fn list_deployed_models<P: PoolProvider>(
     // as the model list.
     let include_facets = includes.contains(&"facets");
     let facets = if include_facets {
-        let (providers, capabilities, model_types) = repo.facets(&filter).await?;
+        let (providers, capabilities, model_types) = Deployments::new(&mut conn).facets(&filter).await?;
         Some(ModelFacets {
             providers,
             capabilities,
@@ -1293,6 +1307,14 @@ pub async fn get_deployed_model<P: PoolProvider>(
         can_read_composite_info: can_read_all_models,
         pricing_account: Some(current_user.active_organization.unwrap_or(current_user.id)),
     };
+
+    if can_read_all_models {
+        response.class_routes = Some(
+            crate::db::handlers::model_class_routes::ModelClassRoutes::new(&mut pool_conn)
+                .list_for_models(&[response.id])
+                .await?,
+        );
+    }
 
     response = enricher.enrich_one(response).await?;
 

@@ -545,7 +545,7 @@ pub async fn target_message_handler<T: HttpClient>(
     // base alias (e.g. turn nonexistent `model:interactive` into `model`). A
     // Model-Override header is a separate selector and still needs resolution.
     let has_model_override = req.headers().get("model-override").and_then(|value| value.to_str().ok()).is_some();
-    let selected_model = if suffix_class.is_some() && !has_model_override {
+    let selected_model = if state.targets.targets.contains_key(&model_name) || (suffix_class.is_some() && !has_model_override) {
         Ok((model_name.as_str(), None))
     } else {
         serving::split_class_suffix(&model_name)
@@ -570,8 +570,8 @@ pub async fn target_message_handler<T: HttpClient>(
     tracing::Span::current().record("gen_ai.request.model", &model_name);
 
     // Store original model in request extensions for response sanitization
-    req.extensions_mut()
-        .insert(OriginalModel(model_name.clone()));
+    let submitted_model = req.extensions().get::<serving::SubmittedModel>().map(|m| m.0.clone()).unwrap_or_else(|| model_name.clone());
+    req.extensions_mut().insert(OriginalModel(submitted_model));
 
     trace!("Received request for model: {}", model_name);
     trace!(
@@ -732,23 +732,56 @@ pub async fn target_message_handler<T: HttpClient>(
     // against the pool that will serve it. Strict: a class named on the
     // request that the account does not hold, or the alias does not offer,
     // is refused rather than quietly downgraded.
-    let serving_resolution: ServingResolution = {
-        let (account_id, key_purpose) = bearer_token
-            .as_ref()
-            .and_then(|token| state.targets.key_labels.get(token))
-            .map(|labels| {
-                (
-                    labels.get(serving::ACCOUNT_LABEL).cloned(),
-                    labels.get("purpose").cloned(),
-                )
-            })
-            .unwrap_or((None, None));
-        let account = account_id
-            .as_deref()
-            .and_then(|id| state.targets.accounts.get(id).map(|r| r.value().clone()));
-        let overlay = account_id
-            .as_deref()
-            .and_then(|id| alias_serving.overlays().get(id).cloned());
+    let class_identity = pool.class_identity().cloned();
+    if class_identity.is_some() && suffix_class.is_some() {
+        record_response_status(400);
+        return Err(OnwardsErrorResponse::bad_request("Model class is not configured", Some("model")));
+    }
+    // Ingress has already used this identity for cache classification. A reload
+    // between layers may change routing, but must not change the product/class
+    // under an accepted request. Ask the client to retry across that boundary.
+    if let Some(expected) = req.extensions().get::<serving::ClassRouteIdentity>() {
+        if class_identity.as_ref().is_none_or(|actual| actual.model_id != expected.model_id || actual.class_id != expected.class_id) {
+            record_response_status(503);
+            return Err(OnwardsErrorResponse::service_unavailable());
+        }
+    }
+    let (account_id, key_purpose) = bearer_token
+        .as_ref()
+        .and_then(|token| state.targets.key_labels.get(token))
+        .map(|labels| {
+            (
+                labels.get(serving::ACCOUNT_LABEL).cloned(),
+                labels.get("purpose").cloned(),
+            )
+        })
+        .unwrap_or((None, None));
+    let account = account_id
+        .as_deref()
+        .and_then(|id| state.targets.accounts.get(id).map(|r| r.value().clone()));
+    let overlay = account_id
+        .as_deref()
+        .and_then(|id| alias_serving.overlays().get(id).cloned());
+    let serving_resolution: ServingResolution = if class_identity.is_some() {
+        // The gateway's endpoint kind cannot prove where its workers run.
+        // Until worker restrictions are propagated, refuse restricted accounts
+        // rather than silently allowing external spillover.
+        let restricted = overlay.as_ref().and_then(|o| o.self_hosted_only)
+            .unwrap_or_else(|| account.as_ref().is_some_and(|a| a.self_hosted_only));
+        if restricted {
+            record_response_status(403);
+            return Err(OnwardsErrorResponse::builder()
+                .body(ErrorResponseBody {
+                    message: "This model route cannot enforce the account's hosting restriction".into(),
+                    r#type: "invalid_request_error".into(),
+                    param: Some("model".into()),
+                    code: "hosting_restriction_unavailable".into(),
+                })
+                .status(StatusCode::FORBIDDEN)
+                .build());
+        }
+        ServingResolution { requested: None, resolved: serving::ServingClass::Standard, targets: None, self_hosted_only: false }
+    } else {
         let resolution = match serving::resolve(
             suffix_class,
             account.as_ref(),
@@ -791,6 +824,10 @@ pub async fn target_message_handler<T: HttpClient>(
         .increment(1);
         resolution
     };
+
+    if let Some(identity) = &class_identity {
+        metrics::counter!("onwards_class_requests_total", "model" => identity.canonical_alias.clone(), "class" => identity.class_key.clone(), "upstream" => identity.upstream_model_name.clone()).increment(1);
+    }
 
     let canonical_reasoning = if let Some(reasoning) = req
         .extensions()
@@ -1101,6 +1138,7 @@ pub async fn target_message_handler<T: HttpClient>(
         // attempt, so it can say whether this member refused the request.
         let mut attempt_upstream_status: Option<u16> = None;
 
+        let submitted = req.extensions().get::<serving::SubmittedModel>().cloned();
         let action = async {
 
         // Check provider-level rate limit (skip to next if configured for rate limit fallback)
@@ -1179,6 +1217,12 @@ pub async fn target_message_handler<T: HttpClient>(
                     return LoopAction::Done(Err(error.clone()));
                 }
             }
+            // On the class path, combine the model rewrite and trusted default
+            // priority in one transformation. Numeric targets no longer apply.
+            if class_identity.is_some() && target.kind == ProviderKind::Dynamo && !scheduling_fields_refused
+                && let Some(object) = body_serialized.as_object_mut() {
+                serving::stamp_default_priority(object);
+            }
             attempt_body = match serde_json::to_vec(&body_serialized) {
                 Ok(bytes) => axum::body::Bytes::from(bytes),
                 Err(_) => return LoopAction::Done(Err(OnwardsErrorResponse::internal())),
@@ -1226,7 +1270,7 @@ pub async fn target_message_handler<T: HttpClient>(
         // what the first hop set. Client-supplied targets are scrubbed at
         // dwctl's ingress, alongside the body priority (the same perimeter
         // the priority strip relies on).
-        if target.kind == ProviderKind::Dynamo && !attempt_body.is_empty() {
+        if target.kind == ProviderKind::Dynamo && (class_identity.is_none() || target.onwards_model.is_none()) && !attempt_body.is_empty() {
             match serde_json::from_slice::<serde_json::Value>(&attempt_body) {
                 Ok(mut body) => {
                     if let Some(object) = body.as_object_mut() {
@@ -2031,6 +2075,10 @@ pub async fn target_message_handler<T: HttpClient>(
         response
             .extensions_mut()
             .insert(ResolvedTrust(resolved_trust));
+        if let Some(identity) = class_identity.clone() { response.extensions_mut().insert(identity); }
+        if let Some(submitted) = submitted.clone() {
+            response.extensions_mut().insert(submitted);
+        }
         response.extensions_mut().insert(ServedBy {
             url: target.url.to_string(),
             onwards_model: target.onwards_model.clone(),

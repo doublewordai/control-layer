@@ -77,6 +77,22 @@ pub const SUFFIX_SEPARATOR: char = ':';
 /// both keyed by its value.
 pub const ACCOUNT_LABEL: &str = "account";
 
+/// Stable product identity attached to an explicitly activated class route.
+/// Kept on the pool so identity and forwarding configuration reload together.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClassRouteIdentity {
+    pub model_id: uuid::Uuid,
+    pub class_id: uuid::Uuid,
+    pub canonical_alias: String,
+    pub class_key: String,
+    pub endpoint_id: uuid::Uuid,
+    pub upstream_model_name: String,
+}
+
+/// Original ingress spelling, retained separately from canonical routing/cache keys.
+#[derive(Debug, Clone)]
+pub struct SubmittedModel(pub String);
+
 /// The dispatch mode a request is served under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

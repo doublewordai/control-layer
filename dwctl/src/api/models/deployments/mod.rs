@@ -529,6 +529,9 @@ pub struct ModelProbeStatus {
 /// API response for a deployed model
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DeployedModelResponse {
+    /// Additive, manager-only route configuration; legacy fields keep their meaning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class_routes: Option<Vec<crate::db::handlers::model_class_routes::ClassRouteView>>,
     #[schema(value_type = String, format = "uuid")]
     pub id: DeploymentId,
     pub model_name: String,
@@ -666,6 +669,7 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
         });
 
         Self {
+            class_routes: None,
             id: db.id,
             model_name: db.model_name,
             alias: db.alias,

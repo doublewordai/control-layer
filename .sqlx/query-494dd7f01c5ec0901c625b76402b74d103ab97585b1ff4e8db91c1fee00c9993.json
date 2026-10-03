@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT min_prefix_tokens FROM model_cache_tariffs\n               WHERE deployed_model_id=$1 AND user_id IS NULL\n                 AND (serving_class=$2 OR serving_class IS NULL)\n                 AND valid_from<=now() AND (valid_until IS NULL OR valid_until>now())\n                 AND EXISTS (\n                     SELECT 1 FROM model_cache_tariffs general\n                     WHERE general.deployed_model_id=$1 AND general.user_id IS NULL\n                       AND general.serving_class IS NULL AND general.valid_from<=now()\n                       AND (general.valid_until IS NULL OR general.valid_until>now())\n                 )\n               ORDER BY (serving_class IS NOT NULL) DESC, valid_from DESC LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "min_prefix_tokens",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "494dd7f01c5ec0901c625b76402b74d103ab97585b1ff4e8db91c1fee00c9993"
+}

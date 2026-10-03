@@ -783,6 +783,30 @@ const ModelInfo: React.FC = () => {
           )}
         </div>
         <TabsContent value="overview">
+          {canManageModels && !!model.class_routes?.length && (
+            <Card className="mb-4">
+              <CardHeader>
+                <CardTitle>Class destinations</CardTitle>
+                <CardDescription>
+                  {model.class_routes[0].routing_mode === "class_routes"
+                    ? "Class routing is active. Edit destinations and class prices in the model catalog."
+                    : "Class configuration is staged. Legacy routing still serves requests."}
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                {model.class_routes.map((route) => (
+                  <div key={route.class_id} className="rounded border p-3">
+                    <div className="font-medium">{route.display_name}</div>
+                    <div className="text-sm break-all">
+                      {route.class_key === "standard" ? model.alias : `${model.alias}:${route.class_key}`}
+                      {" → "}{route.upstream_model_name}
+                    </div>
+                    <div className="text-xs text-muted-foreground">Endpoint: {route.inference_endpoint_id}</div>
+                  </div>
+                ))}
+              </CardContent>
+            </Card>
+          )}
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
             {/* Main Content */}
             <div className="lg:col-span-2 space-y-6">
