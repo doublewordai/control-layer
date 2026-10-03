@@ -127,7 +127,7 @@ mod tests {
         (model_a, model_b)
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_insert_and_sum_active_reservations(pool: PgPool) {
         let (model_a, model_b) = setup_models(&pool).await;
@@ -155,7 +155,7 @@ mod tests {
         assert_eq!(map.get(&model_b).copied().unwrap_or(0), 20);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_release_reservations_excluded_from_sum(pool: PgPool) {
         let (model_a, _) = setup_models(&pool).await;
@@ -176,7 +176,7 @@ mod tests {
         assert_eq!(sum, 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_expired_reservations_excluded_from_sum(pool: PgPool) {
         let (model_a, _) = setup_models(&pool).await;
@@ -195,7 +195,7 @@ mod tests {
         assert_eq!(sum, 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_reservations_released_since_are_counted(pool: PgPool) {
         let (model_a, _) = setup_models(&pool).await;

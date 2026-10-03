@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::test::utils::setup_fusillade_pool;
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn shutdown_marks_onwards_daemon_dead_and_releases_rows(pool: PgPool) {
     let pool = setup_fusillade_pool(&pool).await;
 
@@ -84,7 +84,7 @@ async fn shutdown_marks_onwards_daemon_dead_and_releases_rows(pool: PgPool) {
     assert_eq!(row.2, None, "started_at should be cleared");
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn drain_with_no_owned_rows_is_a_noop(pool: PgPool) {
     let pool = setup_fusillade_pool(&pool).await;
     let daemon_id = Uuid::new_v4();
@@ -108,7 +108,7 @@ async fn drain_with_no_owned_rows_is_a_noop(pool: PgPool) {
     assert_eq!(status, "dead");
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn drain_does_not_touch_other_daemons_rows(pool: PgPool) {
     let pool = setup_fusillade_pool(&pool).await;
     let our_daemon = Uuid::new_v4();

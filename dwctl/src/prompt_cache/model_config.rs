@@ -155,7 +155,7 @@ mod tests {
         .unwrap();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn disabled_without_tariff_and_unknown_model(pool: sqlx::PgPool) {
         let user = create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
         let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
@@ -168,7 +168,7 @@ mod tests {
         assert_eq!(r.resolve("nope").await.unwrap(), ModelCacheConfig::DISABLED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn active_tariff_enables_with_its_floor(pool: sqlx::PgPool) {
         let user = create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
         let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
@@ -180,7 +180,7 @@ mod tests {
         assert_eq!(cfg.min_prefix_tokens, 2048);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn expired_tariff_is_disabled(pool: sqlx::PgPool) {
         let user = create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
         let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
@@ -190,7 +190,7 @@ mod tests {
         let cfg = ModelConfigResolver::new(pool).resolve("alias-expired").await.unwrap();
         assert!(!cfg.enabled, "an expired tariff version no longer enables caching");
     }
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn alias_and_class_configuration_cache_keys_cannot_collide(pool: sqlx::PgPool) {
         let user = create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
         let endpoint = create_test_endpoint(&pool, "gateway", user.id).await;
@@ -211,7 +211,7 @@ mod tests {
         assert_eq!(resolver.resolve(&collision).await.unwrap(), ModelCacheConfig::DISABLED);
         assert!(resolver.resolve_class(&class).await.unwrap().enabled);
     }
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn class_cache_overrides_require_active_general_enablement(pool: sqlx::PgPool) {
         use crate::db::handlers::model_class_routes::ModelClassRoutes;
         let user = create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;

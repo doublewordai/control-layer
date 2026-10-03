@@ -157,7 +157,9 @@ jobs:
 
     # Each partition has an isolated PostgreSQL instance. SQLx tests create
     # their own databases, pools, and listeners, so retain the raised
-    # connection limit from the unpartitioned job.
+    # connection limit from the unpartitioned job. Durability is disabled, as
+    # in `just db-start`: every template clone uses `STRATEGY FILE_COPY`, whose
+    # checkpoints are cheap without fsync and slower than `WAL_LOG` with it.
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -171,7 +173,10 @@ jobs:
             -e POSTGRES_HOST_AUTH_METHOD=trust \
             -p 5432:5432 \
             postgres:latest \
-            -c max_connections=300
+            -c max_connections=300 \
+            -c fsync=off \
+            -c full_page_writes=off \
+            -c synchronous_commit=off
           for _ in $(seq 1 30); do
             docker exec postgres pg_isready -U postgres && break
             sleep 1
@@ -219,9 +224,15 @@ jobs:
           source <(cargo llvm-cov show-env --export-prefix)
           export LLVM_PROFILE_FILE="$PWD/target/dwctl-${{ matrix.partition }}-%32m.profraw"
 
+          BUILD_START=$(date +%s)
+          cargo nextest run --package dwctl --cargo-profile ci --no-run
+          BUILD_END=$(date +%s)
+          echo "dwctl compile/link: $((BUILD_END - BUILD_START))s"
           cargo nextest run --package dwctl \
             --cargo-profile ci \
             --partition "count:${{ matrix.partition }}/4"
+          TEST_END=$(date +%s)
+          echo "dwctl test execution: $((TEST_END - BUILD_END))s"
           cargo llvm-cov report --profile ci \
             --lcov \
             --output-path "lcov-dwctl-${{ matrix.partition }}.info"
@@ -231,6 +242,15 @@ jobs:
           echo "dwctl partition ${{ matrix.partition }}/4 completed in ${CI_DURATION}s"
           curl -X POST \
             "https://charts.somnial.co/doubleword-control-layer/backend-dwctl-partition-${{ matrix.partition }}-ci-duration?value=${CI_DURATION}" || true
+
+      - name: Upload dwctl partition ${{ matrix.partition }} timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-test-timings-dwctl-${{ matrix.partition }}
+          path: target/nextest/default/junit.xml
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Upload dwctl partition ${{ matrix.partition }} coverage
         uses: actions/upload-artifact@v4

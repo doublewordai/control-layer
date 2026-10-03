@@ -1647,7 +1647,7 @@ mod tests {
     use serde_json::json;
     use sqlx::PgPool;
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn aimd_api_create_patch_clear_and_validate(pool: PgPool) {
         let (app, _bg) = create_test_app(pool.clone(), false).await;
         let user = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -1735,7 +1735,7 @@ mod tests {
         assert!(stored.first_token_timeout_ms.is_none());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn realtime_fallback_statuses_default_patch_and_validate(pool: PgPool) {
         let (app, _bg) = create_test_app(pool.clone(), false).await;
         let user = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -1788,7 +1788,7 @@ mod tests {
         assert_eq!(model.fallback.unwrap().realtime_on_status, vec![529]);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn affinity_api_create_patch_clear_and_validate(pool: PgPool) {
         let (app, _bg) = create_test_app(pool.clone(), false).await;
         let user = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -1872,7 +1872,7 @@ mod tests {
         response.data.iter().find(|model| model.id == id)
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_deployments(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1891,7 +1891,7 @@ mod tests {
         assert!(response_body.data.is_empty() || !response_body.data.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn admin_models_include_pricing_exposes_cache_tariffs(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1974,7 +1974,7 @@ mod tests {
         assert!(model.get("cache_pricing").is_none());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn customer_model_prices_hide_class_details_but_managers_keep_them(pool: PgPool) {
         let (app, _services) = create_test_app(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -2048,7 +2048,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_deployments_with_nonexistent_endpoint(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2064,7 +2064,7 @@ mod tests {
         response.assert_status_not_found();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_model_operations(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2142,7 +2142,7 @@ mod tests {
         response.assert_status_ok(); // Admin can see deleted model with deleted=true
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_composite_model_patch_rejects_reasoning_translation_overrides(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2183,7 +2183,7 @@ mod tests {
         assert_eq!(stored, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_deployments_with_groups_include(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2253,7 +2253,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_deployments_with_reasoning_capabilities_include(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2316,7 +2316,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_role_based_visibility_for_deleted_models(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2374,7 +2374,7 @@ mod tests {
         // Verify the API behavior is consistent with soft deletion
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_role_based_list_filtering(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2445,7 +2445,7 @@ mod tests {
         assert!(!user_models.data.iter().any(|it| it.id == deployment2.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_role_based_update_access_for_deleted_models(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2491,7 +2491,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_soft_delete_preserves_model_accessibility_for_admin(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2563,7 +2563,7 @@ mod tests {
         assert_eq!(updated_model.alias, "updated-after-deletion");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn invalid_tariffs_are_rejected_atomically_on_create_and_update(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -2612,7 +2612,7 @@ mod tests {
         assert_eq!(count, 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn negative_tariff_prices_are_rejected_before_model_or_ledger_changes(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -2679,7 +2679,7 @@ mod tests {
         assert_eq!(count, 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn zero_tariff_prices_remain_valid_on_create_and_update(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -2718,7 +2718,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn customer_tariff_windows_are_normalized_on_create_and_update(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2770,7 +2770,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn unchanged_legacy_tariff_allows_metadata_edits_but_not_repricing(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -2814,7 +2814,7 @@ mod tests {
         assert_eq!(billable, 0, "preserving legacy metadata must not make it billable");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_deployed_model(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2849,7 +2849,7 @@ mod tests {
         assert_eq!(created_model.created_by, Some(admin_user.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_deployed_model_with_defaults(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2880,7 +2880,7 @@ mod tests {
         assert_eq!(created_model.created_by, Some(admin_user.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_deployed_model_non_admin_forbidden(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2903,7 +2903,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_deployed_model_nonexistent_endpoint(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2925,7 +2925,7 @@ mod tests {
         response.assert_status_not_found();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_include_groups_admin_only(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2996,7 +2996,7 @@ mod tests {
         assert!(test_model.groups.is_none(), "Regular user should NOT see groups included");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_accessible_parameter_filtering(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3089,7 +3089,7 @@ mod tests {
         assert!(get_model_by_id(deployment1.id, &admin_accessible).is_some());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_include_metrics_parameter(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3172,7 +3172,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_sees_all_models_by_default(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3241,7 +3241,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_can_request_accessible_filtering(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3305,7 +3305,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_request_viewer_role_gets_filtered(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3370,7 +3370,7 @@ mod tests {
         assert!(pm_models.data.iter().any(|m| m.id == deployment2.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_can_see_newly_created_models(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3417,7 +3417,7 @@ mod tests {
         assert_eq!(found_model.alias, "Platform Manager New Model");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_standard_user_cannot_see_ungrouped_models(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3458,7 +3458,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_request_viewer_cannot_modify_models(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3505,7 +3505,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_standard_user_cannot_modify_models(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3552,7 +3552,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_multi_role_user_cannot_modify_models_without_platform_manager(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3600,7 +3600,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_plus_standard_user_can_modify_models(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3649,7 +3649,7 @@ mod tests {
         response.assert_status_ok();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_accessibility_filtering_permissions(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3716,7 +3716,7 @@ mod tests {
         assert!(pm_models.data.iter().any(|m| m.id == inaccessible_deployment.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_groups_include_permission_enforcement(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3779,7 +3779,7 @@ mod tests {
         assert!(rv_model.groups.is_none(), "RequestViewer should NOT see groups even when requested");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_rate_limits_permission_gating(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3853,7 +3853,7 @@ mod tests {
         assert_eq!(rv_model.burst_size, None, "RequestViewer should NOT see burst size");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_metrics_permission_gating(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3917,7 +3917,7 @@ mod tests {
         assert!(rv_model.metrics.is_some(), "RequestViewer should see metrics when requested");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_models_pagination(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4004,7 +4004,7 @@ mod tests {
         assert_eq!(empty_page.data.len(), 0, "Offset beyond available models should return empty array");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_models_with_group_filter(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4100,7 +4100,7 @@ mod tests {
         assert!(all_models.data.len() >= 3, "Empty group list should return all models");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_models_with_available_for_realtime_filter(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4168,7 +4168,7 @@ mod tests {
 
     // ===== Traffic Routing Rules Tests =====
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_model_with_traffic_rules(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4225,7 +4225,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_model_includes_traffic_rules(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4269,7 +4269,7 @@ mod tests {
         ));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_models_includes_traffic_rules(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4309,7 +4309,7 @@ mod tests {
         assert_eq!(rules[0].api_key_purpose, crate::db::models::api_keys::ApiKeyPurpose::Playground);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_model_set_traffic_rules(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4347,7 +4347,7 @@ mod tests {
         assert_eq!(fetched.traffic_routing_rules.unwrap().len(), 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_model_clear_traffic_rules(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4399,7 +4399,7 @@ mod tests {
         assert!(fetched.traffic_routing_rules.is_none());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_model_no_change_to_traffic_rules(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4441,7 +4441,7 @@ mod tests {
         assert_eq!(rules.len(), 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_model_self_redirect_rejected(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4466,7 +4466,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_model_nonexistent_redirect_target(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4491,7 +4491,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_model_empty_redirect_target(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4516,7 +4516,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_redirect_target_cascades(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4565,7 +4565,7 @@ mod tests {
             "traffic rules should be cleared after cascade delete of redirect target"
         );
     }
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn tariff_replacement_rejects_future_schedule_without_partial_updates(pool: PgPool) {
         let (app, _services) = create_test_app(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;

@@ -192,7 +192,7 @@ onwards:
         std::fs::write(path, config).expect("failed to write test config");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_config_returns_metadata(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
@@ -216,7 +216,7 @@ onwards:
     /// decides whether to advertise the promotion at all. Defaulting it off and
     /// leaving the dashboard to assume a figure is how you end up promising a
     /// match that `grant_first_payment_match` then declines to pay.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_config_exposes_the_first_payment_match_ceiling(pool: PgPool) {
         let mut config = create_test_config();
         config.credits.first_payment_match_up_to = rust_decimal::Decimal::new(50, 0);
@@ -238,7 +238,7 @@ onwards:
 
     /// Off is the default, and it must be legible as off rather than absent -
     /// a missing field reads as "old server" to a client, not "promo disabled".
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_config_reports_a_disabled_promotion_as_zero(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
@@ -256,7 +256,7 @@ onwards:
         assert_eq!(json.get("first_payment_match_up_to").and_then(|v| v.as_f64()), Some(0.0));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_config_requires_authentication(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
 
@@ -265,7 +265,7 @@ onwards:
         response.assert_status(StatusCode::UNAUTHORIZED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_config_includes_batch_slas(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
@@ -301,7 +301,7 @@ onwards:
         assert!(url_paths.iter().any(|v| v.as_str() == Some("/v1/chat/completions")));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_config_reflects_live_config_file_changes(pool: PgPool) {
         let tempdir = tempdir().expect("failed to create tempdir");
         let config_path = tempdir.path().join("config.yaml");

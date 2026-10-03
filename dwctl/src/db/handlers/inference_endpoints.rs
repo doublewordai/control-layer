@@ -348,7 +348,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn persists_and_clears_reasoning_translation(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -395,7 +395,7 @@ mod tests {
         assert_eq!(cleared.reasoning_translation, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_empty_ids(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
@@ -404,7 +404,7 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_single_endpoint(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -434,7 +434,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_multiple_endpoints(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -463,7 +463,7 @@ mod tests {
         assert_eq!(result[&endpoint3.id].name, "bulk-endpoint-3");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_nonexistent_ids(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -484,7 +484,7 @@ mod tests {
         assert!(!result.contains_key(&fake_id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_existing_endpoint(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -508,7 +508,7 @@ mod tests {
         assert!(found_endpoint.is_none());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_nonexistent_endpoint(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
@@ -520,7 +520,7 @@ mod tests {
         assert!(!deleted);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_apply_update_all_fields(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -567,7 +567,7 @@ mod tests {
         assert_eq!(updated_endpoint.created_at, created_endpoint.created_at);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_endpoint_kind_round_trips_through_create_and_update(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -607,7 +607,7 @@ mod tests {
         assert_eq!(untouched.kind, EndpointKind::Hosted);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_apply_update_partial_fields(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -790,7 +790,7 @@ mod tests {
         assert!(updated_response.updated_at >= original_response.updated_at);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_nonexistent_endpoint_returns_not_found(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
@@ -821,7 +821,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_endpoint_name_conflict(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -844,7 +844,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_endpoint_name_unique(pool: PgPool) {
         let user = create_test_user(&pool).await;

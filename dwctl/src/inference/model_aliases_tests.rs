@@ -61,7 +61,7 @@ async fn targets(pool: &PgPool) -> onwards::target::Targets {
         .unwrap()
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn activation_selects_classes_without_replacing_model_and_rollback_restores_legacy(pool: PgPool) {
     let (model, _) = active_model(&pool).await;
     let aliases = ModelAliasMap::load(&pool).await.unwrap();
@@ -106,7 +106,7 @@ async fn activation_selects_classes_without_replacing_model_and_rollback_restore
     assert_eq!(kept, 2);
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn batch_and_flex_force_standard_for_fast_and_synonym(pool: PgPool) {
     active_model(&pool).await;
     let aliases = ModelAliasMap::load(&pool).await.unwrap();
@@ -121,7 +121,7 @@ async fn batch_and_flex_force_standard_for_fast_and_synonym(pool: PgPool) {
     }
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn live_destination_edits_do_not_reload_synonym_snapshot(pool: PgPool) {
     let (model, _) = active_model(&pool).await;
     let aliases = ModelAliasMap::load(&pool).await.unwrap();
@@ -144,7 +144,7 @@ async fn live_destination_edits_do_not_reload_synonym_snapshot(pool: PgPool) {
     assert_eq!(new.upstream_model_name, "another-upstream");
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn incomplete_activation_is_quarantined_without_failing_sync(pool: PgPool) {
     let (model, _) = add_fast_alias(&pool).await;
     sqlx::query("UPDATE deployed_models SET routing_mode='class_routes' WHERE id=$1")
@@ -157,7 +157,7 @@ async fn incomplete_activation_is_quarantined_without_failing_sync(pool: PgPool)
     assert!(!view.targets.contains_key("example/model:fast"));
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn discovery_lists_primary_classes_without_synonyms_or_inaccessible_models(pool: PgPool) {
     use crate::test::utils::{create_test_api_key_for_user, create_test_user};
     let (model, _) = active_model(&pool).await;
@@ -217,7 +217,7 @@ async fn discovery_lists_primary_classes_without_synonyms_or_inaccessible_models
     );
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn class_requests_translate_once_keep_public_responses_and_preserve_deadline_priority(pool: PgPool) {
     use axum::http::StatusCode;
     use serde_json::json;
@@ -328,7 +328,7 @@ async fn class_requests_translate_once_keep_public_responses_and_preserve_deadli
     assert_eq!(response.json::<serde_json::Value>()["model"], "example/model-fast");
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn class_reasoning_capabilities_and_async_validation_use_the_selected_route(pool: PgPool) {
     use crate::db::handlers::Deployments;
     use crate::test::utils::{create_test_api_key_for_user, create_test_user_with_roles};
@@ -429,7 +429,7 @@ async fn class_reasoning_capabilities_and_async_validation_use_the_selected_rout
     }
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn unconfigured_suffixes_do_not_fall_back_to_an_active_standard_class(pool: PgPool) {
     active_model(&pool).await;
     let aliases = ModelAliasMap::load(&pool).await.unwrap();
@@ -449,7 +449,7 @@ async fn unconfigured_suffixes_do_not_fall_back_to_an_active_standard_class(pool
     }
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn credit_repository_scopes_class_prices_and_their_effective_time(pool: PgPool) {
     use crate::db::handlers::api_keys::ApiKeys;
     use crate::test::utils::{create_test_api_key_for_user, create_test_user};
@@ -486,7 +486,7 @@ async fn credit_repository_scopes_class_prices_and_their_effective_time(pool: Pg
     }
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn activated_model_delete_returns_catalog_guard_without_removing_identity(pool: PgPool) {
     use crate::db::handlers::{Deployments, Repository};
     let (model, _) = active_model(&pool).await;
@@ -501,7 +501,7 @@ async fn activated_model_delete_returns_catalog_guard_without_removing_identity(
     assert!(exists);
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn class_activation_serializes_with_model_edits(pool: PgPool) {
     use crate::db::handlers::{Deployments, Repository};
     use crate::db::models::deployments::DeploymentUpdateDBRequest;
@@ -567,7 +567,7 @@ async fn class_activation_serializes_with_model_edits(pool: PgPool) {
     }
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn class_routes_refuse_hosting_restrictions_until_worker_filtering_exists(pool: PgPool) {
     use serde_json::json;
     let (model, _) = active_model(&pool).await;

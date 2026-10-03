@@ -1,4 +1,6 @@
 //! Test utilities for integration testing
+use std::time::Instant;
+
 use crate::config::{
     BatchConfig, DaemonConfig, DaemonEnabled, FileLimitsConfig, FilesConfig, LeaderElectionConfig, LimitsConfig, NativeAuthConfig,
     OnwardsSyncConfig, PasswordConfig, PoolSettings, ProbeSchedulerConfig, ProxyHeaderAuthConfig, SecurityConfig,
@@ -182,14 +184,7 @@ pub async fn create_test_app_state_with_database_pools(
 }
 
 pub async fn create_test_app(pool: PgPool, _enable_sync: bool) -> (TestServer, crate::BackgroundServices) {
-    let config = create_test_config();
-
-    let app = crate::Application::new_with_pool(config, Some(pool), None)
-        .await
-        .expect("Failed to create application");
-
-    // Convert to test server (sync is always enabled in new())
-    app.into_test_server()
+    create_test_app_with_config(pool, create_test_config(), _enable_sync).await
 }
 
 pub async fn create_test_app_with_config(
@@ -197,9 +192,14 @@ pub async fn create_test_app_with_config(
     config: crate::config::Config,
     _enable_sync: bool,
 ) -> (TestServer, crate::BackgroundServices) {
+    let start = Instant::now();
     let app = crate::Application::new_with_pool(config, Some(pool), None)
         .await
         .expect("Failed to create application");
+
+    if std::env::var_os("DW_TEST_TIMINGS").is_some() {
+        eprintln!("test-app-startup {:?}", start.elapsed());
+    }
 
     // Convert to test server (sync is always enabled in new())
     app.into_test_server()

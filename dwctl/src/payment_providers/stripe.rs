@@ -1374,7 +1374,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_stripe_idempotency_fast_path(pool: PgPool) {
         // Test the fast path: transaction already exists in DB
         let user_id = create_test_user(&pool).await;
@@ -1501,7 +1501,7 @@ mod tests {
         assert_eq!(event.session_id, Some("cs_test_123".to_string()));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_payment_description_self(pool: PgPool) {
         // Test that when a user pays for themselves, description is just "Stripe payment"
         let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
@@ -1540,7 +1540,7 @@ mod tests {
         assert_eq!(description, "Stripe payment", "Self-payment should not include 'from' attribution");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_payment_description_other(pool: PgPool) {
         // Test that when a user pays for someone else, description includes "from {name}"
         let payer = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;

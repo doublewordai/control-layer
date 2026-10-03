@@ -704,7 +704,7 @@ mod tests {
     use serde_json::json;
     use sqlx::PgPool;
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_groups_with_pagination(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -770,7 +770,7 @@ mod tests {
         assert_eq!(paginated_response.data.len(), 6); // Should return all 6 groups (5 test groups + Everyone group)
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_add_user_to_group(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -808,7 +808,7 @@ mod tests {
         assert!(user_ids.contains(&user2.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_remove_user_from_group(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -854,7 +854,7 @@ mod tests {
         assert!(!user_ids.contains(&user2.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_group_users(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -899,7 +899,7 @@ mod tests {
         assert!(user_ids.contains(&user3.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_user_groups(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -944,7 +944,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_duplicate_membership_prevention(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -990,7 +990,7 @@ mod tests {
         assert_eq!(user2_count, 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_symmetric_group_user_endpoints(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1052,7 +1052,7 @@ mod tests {
         assert!(!user_ids.contains(&user.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_add_deployment_to_group_api(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1123,7 +1123,7 @@ mod tests {
         assert!(groups.contains(&group.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_remove_deployment_from_group_api(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1203,7 +1203,7 @@ mod tests {
         assert!(!groups.contains(&group.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_deployment_group_access_control(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1271,7 +1271,7 @@ mod tests {
         response.assert_status(StatusCode::FORBIDDEN);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_groups_with_include_parameters(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1398,7 +1398,7 @@ mod tests {
         assert!(found_group.models.is_some());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_can_see_other_user_groups(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1511,7 +1511,7 @@ mod tests {
         response.assert_status(StatusCode::FORBIDDEN); // This should be forbidden
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_multiple_roles_with_platform_manager_can_see_user_groups(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1551,7 +1551,7 @@ mod tests {
         assert!(groups.iter().any(|g| g.id == group.id), "Should see the created group");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_user_group_access_permissions(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1630,7 +1630,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_deployment_group_management_permissions(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1761,7 +1761,7 @@ mod tests {
         response.assert_status_ok();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_groups_list_permission_filtering(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1804,7 +1804,7 @@ mod tests {
     }
 
     // Add a new test for the intended layered role behavior:
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_layered_roles_platform_manager_plus_request_viewer(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;

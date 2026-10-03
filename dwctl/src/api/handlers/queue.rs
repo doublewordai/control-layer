@@ -323,7 +323,7 @@ mod tests {
     use axum_test::TestServer;
     use sqlx::PgPool;
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_demand_endpoint_requires_system_permission(pool: sqlx::PgPool) {
         let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
 
@@ -346,7 +346,7 @@ mod tests {
         response.assert_status_ok();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_demand_returns_empty_when_no_requests(pool: PgPool) {
         let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -365,7 +365,7 @@ mod tests {
         assert_eq!(counts.len(), 0, "Should have no pending requests");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_demand_defaults_to_batch_tier_only(pool: PgPool) {
         use fusillade::{BatchInput, RequestTemplateInput, Storage};
         use sqlx::postgres::PgConnectOptions;
@@ -469,7 +469,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_demand_service_tiers_query_includes_requested_tiers(pool: PgPool) {
         use fusillade::{BatchInput, RequestTemplateInput, Storage};
         use sqlx::postgres::PgConnectOptions;
@@ -600,7 +600,7 @@ mod tests {
         Ok(())
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_demand_requires_system_permission(pool: sqlx::PgPool) {
         let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
 
@@ -621,7 +621,7 @@ mod tests {
         response.assert_status_ok();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_demand_rejects_missing_window(pool: PgPool) {
         let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -634,7 +634,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_demand_rejects_empty_window(pool: PgPool) {
         let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -647,7 +647,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_demand_accepts_arbitrary_windows(pool: PgPool) {
         // Caller-supplied windows don't need to match
         // config.batches.allowed_completion_windows — the point of this
@@ -666,7 +666,7 @@ mod tests {
         assert_eq!(counts.len(), 0, "no pending requests exist in a clean database");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_demand_accepts_zero_start(pool: PgPool) {
         // `0s:1h` must parse `0s` as zero seconds (not coerce to 24h like
         // the lenient batch-window parser does). Regression guard.
@@ -681,7 +681,7 @@ mod tests {
         response.assert_status_ok();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_demand_accepts_service_tiers(pool: PgPool) {
         // scouter sends `none,flex` today and must keep working via /demand.
         let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
@@ -695,7 +695,7 @@ mod tests {
         response.assert_status_ok();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_demand_rejects_malformed_window(pool: PgPool) {
         let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -743,7 +743,7 @@ mod tests {
         assert!(parse_demand_window("-").is_err());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_demand_trailing_windows_and_cube(pool: PgPool) {
         use fusillade::{BatchInput, PersistCompletedRealtimeInput, RequestTemplateInput, Storage};
         use sqlx::postgres::PgConnectOptions;

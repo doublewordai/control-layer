@@ -1343,7 +1343,7 @@ mod tests {
             .unwrap()
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_user(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
@@ -1367,7 +1367,7 @@ mod tests {
         assert_eq!(user.roles, vec![Role::StandardUser]);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_user_hard_deletes_api_keys(pool: PgPool) {
         use crate::db::models::api_keys::ApiKeyCreateDBRequest;
@@ -1438,7 +1438,7 @@ mod tests {
         assert!(!again);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_user_soft_deletes_attributed_keys_preserving_audit_trail(pool: PgPool) {
         use crate::db::{
@@ -1523,7 +1523,7 @@ mod tests {
         assert!(retained_key_is_active, "keys attributed to other users must remain active");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_user_by_email(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
@@ -1548,7 +1548,7 @@ mod tests {
         assert_eq!(found_user.roles, vec![Role::StandardUser]);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_system_user(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
@@ -1559,7 +1559,7 @@ mod tests {
         assert!(admin_user.is_admin);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_user_roles_always_includes_standard_user(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
@@ -1675,7 +1675,7 @@ mod tests {
         user.id
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_users_with_threshold_skips_users_without_threshold(pool: PgPool) {
         create_user_with_balance(&pool, "1.00", None).await;
@@ -1686,7 +1686,7 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_users_with_threshold_returns_user_with_checkpoint(pool: PgPool) {
         let user_id = create_user_with_balance(&pool, "1.50", Some(2.0)).await;
@@ -1701,7 +1701,7 @@ mod tests {
         assert_eq!(result[0].checkpoint_balance, Some(Decimal::from_str("1.50").unwrap()));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_users_with_threshold_returns_user_without_credits(pool: PgPool) {
         // Create user with threshold but no credits: the read model is total,
@@ -1716,7 +1716,7 @@ mod tests {
         assert_eq!(result[0].checkpoint_balance, Some(Decimal::ZERO));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_mark_and_clear_low_balance_notification(pool: PgPool) {
         let user_id = create_user_with_balance(&pool, "1.00", Some(2.0)).await;
@@ -1747,7 +1747,7 @@ mod tests {
         assert_eq!(low.len(), 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_poll_low_balance_clears_flag_after_topup(pool: PgPool) {
         let user_id = create_user_with_balance(&pool, "1.00", Some(2.0)).await;
@@ -1779,7 +1779,7 @@ mod tests {
         assert!(!user.low_balance_notification_sent);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_poll_low_balance_full_cycle(pool: PgPool) {
         // 1. Create user with $100, threshold $2
@@ -1856,7 +1856,7 @@ mod tests {
         assert_eq!(low[0].id, user_id);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_poll_low_balance_negative_balance(pool: PgPool) {
         // User with negative balance should still be returned
@@ -1884,7 +1884,7 @@ mod tests {
         assert_eq!(low[0].id, user_id);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_low_balance_threshold_resets_flag(pool: PgPool) {
         let user_id = create_user_with_balance(&pool, "1.00", Some(2.0)).await;
@@ -1920,7 +1920,7 @@ mod tests {
         assert!(!result[0].low_balance_notification_sent);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_users_with_auto_topup_enabled(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
 
@@ -1960,7 +1960,7 @@ mod tests {
         assert_eq!(result[0].payment_provider_id, "cus_test_456");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_set_verified_flips_flag_idempotently(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
 
@@ -1996,7 +1996,7 @@ mod tests {
         assert!(!changed_again, "second call should be a no-op since user is already verified");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_users_with_auto_topup_enabled_excludes_incomplete(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
 
@@ -2030,7 +2030,7 @@ mod tests {
         assert!(result.is_empty(), "Should not include user with missing payment_provider_id");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_auto_topup_decline_first_soft_failure_pauses_for_24_hours(pool: PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         sqlx::query!(
@@ -2076,7 +2076,7 @@ mod tests {
         assert!(candidates.iter().all(|candidate| candidate.id != user.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_auto_topup_decline_second_soft_failure_disables_with_compare_and_set(pool: PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         sqlx::query!(
@@ -2124,7 +2124,7 @@ mod tests {
         assert_eq!(row.auto_topup_retry_after, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_auto_topup_decline_hard_failure_disables_immediately(pool: PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         sqlx::query!(
@@ -2158,7 +2158,7 @@ mod tests {
         assert_eq!(row.auto_topup_monthly_limit, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_auto_topup_decline_reset_clears_failure_state(pool: PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         sqlx::query!(
@@ -2188,7 +2188,7 @@ mod tests {
         assert_eq!(row.auto_topup_retry_after, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_users_excludes_organizations(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
@@ -2226,7 +2226,7 @@ mod tests {
         assert!(!users.iter().any(|u| u.username == "acme-org"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_count_users_excludes_organizations(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();

@@ -280,7 +280,7 @@ fn usage_frames(frames: &[Value]) -> Vec<&Value> {
 
 // ── mode 1: cut between frames → resumed ─────────────────────────────────────
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn configured_sse_limit_accepts_fragmented_events_on_both_legs(pool: PgPool) {
     fn fragmented(chunk: Chunk) -> Vec<Chunk> {
         let Chunk::Data(data) = chunk else { unreachable!() };
@@ -312,7 +312,7 @@ async fn configured_sse_limit_accepts_fragmented_events_on_both_legs(pool: PgPoo
 /// The headline case. Leg 1 dies after two content deltas with no finish_reason
 /// and no `[DONE]`; the resume leg finishes the sentence. The client sees one
 /// continuous stream: both legs' text, exactly one usage frame, one `[DONE]`.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn a_cut_stream_is_resumed_into_one_seamless_response(pool: PgPool) {
     let fake = Fake::new(
         vec![content("chatcmpl-1", "Hello"), content("chatcmpl-1", ", wor")],
@@ -363,7 +363,7 @@ async fn a_cut_stream_is_resumed_into_one_seamless_response(pool: PgPool) {
 /// while the BODY still says nothing about streaming (the outbound middleware
 /// forces `stream: true` below this layer). The header alone must arm the tee,
 /// or batch-origin streams — the largest death population — can never resume.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn a_fusillade_stream_header_arms_the_tee_without_body_stream(pool: PgPool) {
     let fake = Fake::new(
         vec![content("chatcmpl-1", "Hello"), content("chatcmpl-1", ", wor")],
@@ -401,7 +401,7 @@ async fn a_fusillade_stream_header_arms_the_tee_without_body_stream(pool: PgPool
 /// token-id prompt (no re-templating downstream), the global key (immune to the
 /// customer's credit state), the priority hint (jump the dynamo queue), usage
 /// reporting (the merge depends on it) and the decremented cap.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn the_resume_leg_asks_for_exactly_the_right_thing(pool: PgPool) {
     let fake = Fake::new(
         vec![content("chatcmpl-1", "Hello")],
@@ -437,7 +437,7 @@ async fn the_resume_leg_asks_for_exactly_the_right_thing(pool: PgPool) {
 /// leg must be dispatched with the stripped path too. Asserted through a real
 /// nest so a future change to the nesting breaks this test rather than
 /// production.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn the_resume_leg_re_enters_at_the_path_the_inner_router_expects(pool: PgPool) {
     let fake = Fake::new(
         vec![content("chatcmpl-1", "Hello")],
@@ -464,7 +464,7 @@ async fn the_resume_leg_re_enters_at_the_path_the_inner_router_expects(pool: PgP
 /// A transport reset (mode 3) and an error envelope inside a 200 stream (mode 5,
 /// the OpenRouter family) and dynamo's worker-cancellation 499 (mode 9) all
 /// resume, and none of them leaks its death to the client.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn resumable_death_signatures_all_recover_without_leaking_the_error(pool: PgPool) {
     let deaths = vec![
         ("transport reset", vec![content("chatcmpl-1", "Hi"), Chunk::Reset]),
@@ -502,7 +502,7 @@ async fn resumable_death_signatures_all_recover_without_leaking_the_error(pool: 
 
 /// Mode 4: the upstream stops sending without closing. The stall deadline turns
 /// silence into a death at the last frame boundary, and the stream is resumed.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn a_stalled_stream_is_resumed_at_the_last_frame_boundary(pool: PgPool) {
     let fake = Fake::new(
         vec![content("chatcmpl-1", "Hel"), Chunk::Hang],
@@ -527,7 +527,7 @@ async fn a_stalled_stream_is_resumed_at_the_last_frame_boundary(pool: PgPool) {
 /// anywhere, and nothing has been generated to resume). Before this fix the
 /// stall timer wrapped the FIRST read too and turned every slow-TTFT stream
 /// into a fabricated empty 200 at exactly the deadline.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn a_slow_first_token_is_never_severed(pool: PgPool) {
     let finished = frame(json!({
         "id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 1_700_000_000, "model": MODEL,
@@ -589,7 +589,7 @@ async fn a_slow_first_token_is_never_severed(pool: PgPool) {
 /// frame is bounded by the ATTEMPT deadline, not the minutes-scale stall
 /// timer: headers are not a token, and the seam budget must hold even against
 /// a held-open-empty leg. With attempts exhausted the ORIGINAL death surfaces.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn a_headers_only_leg_is_bounded_by_the_attempt_deadline(pool: PgPool) {
     let fake = Fake::new(
         vec![content("chatcmpl-1", "partial"), Chunk::Reset],
@@ -623,7 +623,7 @@ async fn a_headers_only_leg_is_bounded_by_the_attempt_deadline(pool: PgPool) {
 /// never arrives) is a LOST TRAILER, not a death: resuming would append output
 /// past a valid stop. The stream completes with a synthesized usage frame and
 /// `[DONE]`, and no leg is ever dispatched.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn a_stall_after_finish_reason_is_a_lost_trailer_not_a_resume(pool: PgPool) {
     let finished = frame(json!({
         "id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 1_700_000_000, "model": MODEL,
@@ -653,7 +653,7 @@ async fn a_stall_after_finish_reason_is_a_lost_trailer_not_a_resume(pool: PgPool
 /// prefix would silently drop content the client already saw and stitch the
 /// continuation onto the wrong place. Before this fix the frame was skipped in
 /// silence and the resume went ahead anyway.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn an_unparseable_frame_reaches_the_client_and_disarms_resume(pool: PgPool) {
     let fake = Fake::new(
         vec![
@@ -692,7 +692,7 @@ async fn an_unparseable_frame_reaches_the_client_and_disarms_resume(pool: PgPool
 
 /// A resume leg that itself dies re-enters the same flow: its output is appended
 /// to the same accumulated generation and the next leg continues from there.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn a_resume_leg_that_dies_is_itself_resumed(pool: PgPool) {
     let fake = Fake::new(
         vec![content("chatcmpl-1", "one ")],
@@ -721,7 +721,7 @@ async fn a_resume_leg_that_dies_is_itself_resumed(pool: PgPool) {
 /// The attempt budget is per logical stream. When it runs out the client sees
 /// exactly what an unresumed death would have given them — no fabricated usage,
 /// no invented finish.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn an_exhausted_chain_ends_the_stream_like_an_unresumed_death(pool: PgPool) {
     let fake = Fake::new(
         vec![
@@ -752,7 +752,7 @@ async fn an_exhausted_chain_ends_the_stream_like_an_unresumed_death(pool: PgPool
 
 /// A leg that cannot even be dispatched (the target is out of capacity) consumes
 /// an attempt rather than hanging the client.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn a_leg_the_target_refuses_consumes_an_attempt(pool: PgPool) {
     // No scripted legs at all: the fake answers 503.
     let fake = Fake::new(vec![content("chatcmpl-1", "partial"), Chunk::Reset], vec![]);
@@ -766,7 +766,7 @@ async fn a_leg_the_target_refuses_consumes_an_attempt(pool: PgPool) {
 
 /// A tokenizer-svc outage costs attempts, not correctness: no leg is dispatched
 /// without a rendered prefix.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn a_render_failure_never_dispatches_a_leg(pool: PgPool) {
     let fake = Fake::new(
         vec![content("chatcmpl-1", "partial"), Chunk::Reset],
@@ -796,7 +796,7 @@ async fn a_render_failure_never_dispatches_a_leg(pool: PgPool) {
 /// client status. Genuine bad input self-corrects — the leg is rejected too,
 /// attempts exhaust, and the original error surfaces (the exhausted-chain
 /// test pins that path).
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn a_4xx_envelope_after_partial_output_is_resumed(pool: PgPool) {
     let death = json!({"error": {"code": 400, "message": "input too long", "type": "invalid_request_error"}});
     let fake = Fake::new(
@@ -820,7 +820,7 @@ async fn a_4xx_envelope_after_partial_output_is_resumed(pool: PgPool) {
 /// was generated, so there is no prefix — the error surfaces unchanged and no
 /// leg is ever dispatched (resume-from-zero is a plain retry, not this
 /// feature's job).
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn a_first_frame_4xx_surfaces_with_no_resume(pool: PgPool) {
     let death = json!({"error": {"code": 400, "message": "input too long", "type": "invalid_request_error"}});
     let fake = Fake::new(vec![frame(death)], vec![]);
@@ -839,7 +839,7 @@ async fn a_first_frame_4xx_surfaces_with_no_resume(pool: PgPool) {
 /// A death we refuse to resume surfaces WITH leg 1's trailing frames: the
 /// close is byte-identical to a stream this layer never touched. Before this
 /// fix the loop broke without draining, eating the trailing `[DONE]`.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn a_refused_death_drains_leg_ones_trailer(pool: PgPool) {
     let death = json!({"error": {"code": 499, "message": "client disconnected", "type": "client_disconnected"}});
     let fake = Fake::new(vec![content("chatcmpl-1", "partial"), frame(death), done()], vec![]);
@@ -859,7 +859,7 @@ async fn a_refused_death_drains_leg_ones_trailer(pool: PgPool) {
 /// Modes 7/8: the generation finished but its trailer was lost. Nothing needs
 /// resuming — the missing usage frame is synthesized from a render so the
 /// request still bills, and `[DONE]` is supplied.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn a_finished_stream_with_a_lost_trailer_is_completed_not_resumed(pool: PgPool) {
     let finished = frame(json!({
         "id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 1_700_000_000, "model": MODEL,
@@ -884,7 +884,7 @@ async fn a_finished_stream_with_a_lost_trailer_is_completed_not_resumed(pool: Pg
 /// A stream carrying deltas we cannot reconstruct byte-exactly (reasoning, tool
 /// calls) disarms: it is forwarded untouched and never resumed. Guessing at the
 /// prefix would condition the model on text the model never emitted.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn a_stream_with_unreconstructable_deltas_is_never_resumed(pool: PgPool) {
     let reasoning = frame(json!({
         "id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 1_700_000_000, "model": MODEL,
@@ -909,7 +909,7 @@ async fn a_stream_with_unreconstructable_deltas_is_never_resumed(pool: PgPool) {
 /// The per-model in-flight cap: during an incident the resume budget is finite,
 /// and deaths beyond it surface as plain errors instead of stampeding the
 /// continuation provider.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn a_saturated_model_does_not_stampede_the_continuation_target(pool: PgPool) {
     let fake = Fake::new(
         vec![content("chatcmpl-1", "partial"), Chunk::Reset],
@@ -930,7 +930,7 @@ async fn a_saturated_model_does_not_stampede_the_continuation_target(pool: PgPoo
 /// Nobody is listening: when the client drops the response, the chain — which
 /// lives entirely inside that response's body stream — goes with it. No resume
 /// leg generates tokens into a closed socket.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn a_client_disconnect_cancels_the_chain_before_any_leg_is_dispatched(pool: PgPool) {
     let fake = Fake::new(
         vec![content("chatcmpl-1", "partial"), Chunk::Reset],
@@ -957,7 +957,7 @@ async fn a_client_disconnect_cancels_the_chain_before_any_leg_is_dispatched(pool
 /// Each gate short-circuits into an untouched pass-through. The assertion in
 /// every case is the same and is the one that matters: the dying stream reaches
 /// the client unchanged and no resume work is done.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn ineligible_requests_pass_through_untouched(pool: PgPool) {
     let structured = {
         let mut b = streaming_body();
@@ -1030,7 +1030,7 @@ async fn ineligible_requests_pass_through_untouched(pool: PgPool) {
 
 /// Failures before the first byte are error enrichment's business, not ours:
 /// nothing was generated, so there is nothing to continue.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn non_2xx_and_non_streaming_responses_are_left_alone(pool: PgPool) {
     let fake = Fake::new(vec![], vec![]);
     let tokenizer = render_stub(vec![1], 1, 1).await;
@@ -1061,7 +1061,7 @@ async fn non_2xx_and_non_streaming_responses_are_left_alone(pool: PgPool) {
 /// analytics row, a second billing record and a second cache classify. The
 /// counting layer here stands in for those: it must see the customer's request
 /// exactly once, however many legs it took to serve it.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn a_resume_leg_never_re_enters_the_layers_above_this_one(pool: PgPool) {
     let fake = Fake::new(
         vec![content("chatcmpl-1", "one "), Chunk::Reset],
@@ -1100,7 +1100,7 @@ async fn a_resume_leg_never_re_enters_the_layers_above_this_one(pool: PgPool) {
 /// mode, while tokenizer-svc renders that family in thinking mode by default.
 /// Without the route's kwargs the render would open a `<think>` the leg never
 /// had — and the reconstructor would close one the model never opened.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn the_route_config_reaches_the_render_call_and_the_leg_body(pool: PgPool) {
     let fake = Fake::new(
         vec![content("chatcmpl-1", "Hello"), Chunk::Reset],
@@ -1163,7 +1163,7 @@ async fn the_route_config_reaches_the_render_call_and_the_leg_body(pool: PgPool)
 /// The client's own `chat_template_kwargs` describe how leg 1 was actually
 /// templated downstream, so they win over the route's defaults key by key —
 /// reproducing leg 1's prompt is the whole objective.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn request_template_kwargs_override_the_route_defaults_on_a_live_resume(pool: PgPool) {
     let fake = Fake::new(
         vec![content("chatcmpl-1", "Hi"), Chunk::Reset],

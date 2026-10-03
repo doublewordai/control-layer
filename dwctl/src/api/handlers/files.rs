@@ -2256,7 +2256,7 @@ mod tests {
             .await
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn validates_reasoning_controls_during_upload(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2327,7 +2327,7 @@ mod tests {
         assert!(missing_budget_limit.text().contains("max_completion_tokens is not set"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_and_download_file_content(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2391,7 +2391,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_missing_model_field(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2419,7 +2419,7 @@ mod tests {
         assert!(error_body.contains("model"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_invalid_purpose_returns_400(pool: PgPool) {
         // Any unsupported purpose must be a 400 — and must NOT write a file.
@@ -2470,7 +2470,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_model_access_denied(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2505,7 +2505,7 @@ mod tests {
         assert!(error_body.contains("has not been configured or is not available to user"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_missing_custom_id(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2534,7 +2534,7 @@ mod tests {
         assert!(error_body.contains("custom_id"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_custom_id_with_control_characters(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2565,7 +2565,7 @@ mod tests {
         assert!(error_body.contains("invalid characters"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_custom_id_too_long(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2600,7 +2600,7 @@ mod tests {
         assert!(error_body.contains("exceeds maximum length"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_invalid_json_body(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2628,7 +2628,7 @@ mod tests {
         assert!(error_body.contains("model"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_malformed_jsonl(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2654,7 +2654,7 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_empty_file(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2680,7 +2680,7 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_with_metadata_after_file_field(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2730,7 +2730,7 @@ mod tests {
         assert_eq!(retrieved_file.purpose, crate::api::models::files::Purpose::Batch);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_file_cost_estimate(pool: PgPool) {
         use rust_decimal::Decimal;
@@ -2867,7 +2867,7 @@ mod tests {
         assert_eq!(estimate.total_estimated_output_tokens, total_output);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_file_cost_estimate_with_different_slas(pool: PgPool) {
         use rust_decimal::Decimal;
@@ -2987,7 +2987,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_invalid_http_method(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3020,7 +3020,7 @@ mod tests {
         assert!(error_body.contains("GET"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_invalid_url_path(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3056,7 +3056,7 @@ mod tests {
         assert!(error_body.contains("/v1/responses"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_accepts_responses_url_path(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3085,7 +3085,7 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_accepts_messages_url_path(pool: PgPool) {
         // The Anthropic Messages ingress (/v1/messages) is an allowed batch URL
@@ -3117,7 +3117,7 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_strips_priority_field(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3183,7 +3183,7 @@ mod tests {
     }
 
     /// Test that X-Incomplete is false for static batch input files (no pagination)
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_x_incomplete_false_for_batch_input_file(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3234,7 +3234,7 @@ mod tests {
     }
 
     /// Test that X-Incomplete is true when pagination indicates more data
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_x_incomplete_true_with_pagination(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3304,7 +3304,7 @@ mod tests {
     }
 
     /// Test that X-Incomplete reflects batch running status for output files
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_x_incomplete_for_batch_output_file_running(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3368,7 +3368,7 @@ mod tests {
     }
 
     /// Test that X-Incomplete is false for output file when batch is complete
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_x_incomplete_false_for_batch_output_file_complete(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3506,7 +3506,7 @@ mod tests {
         let _ = handle.await;
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_with_rate_limiter_configured(pool: PgPool) {
         // Create app with rate limiting enabled
@@ -3544,7 +3544,7 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_rejects_file_exceeding_max_requests(pool: PgPool) {
         // Create app with max_requests_per_file = 2
@@ -3588,7 +3588,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_allows_file_at_max_requests(pool: PgPool) {
         // Create app with max_requests_per_file = 2
@@ -3633,7 +3633,7 @@ mod tests {
     /// 2. Unlimited responses use streaming (no content-length header)
     /// 3. Paginated downloads return correct subset and headers
     /// 4. Each line is valid JSON
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_file_content_streaming(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4011,7 +4011,7 @@ mod tests {
     }
 
     /// Test that Content-Length header triggers early rejection for oversized files
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_content_length_early_rejection(pool: PgPool) {
         // Create app with a small file size limit
@@ -4046,7 +4046,7 @@ mod tests {
     }
 
     /// Test that files exceeding size limit during streaming return 413
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_streaming_size_limit_returns_413(pool: PgPool) {
         // Use a limit large enough for multipart overhead but small enough
@@ -4089,7 +4089,7 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_invalid_utf8(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4144,7 +4144,7 @@ mod tests {
         assert_error::<LengthLimitError>();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_rejects_request_exceeding_max_body_size(pool: PgPool) {
         // Create app with a small per-request body size limit
@@ -4188,7 +4188,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_allows_request_within_max_body_size(pool: PgPool) {
         // Create app with a generous per-request body size limit
@@ -4222,7 +4222,7 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_rejects_embeddings_model_on_chat_endpoint(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4261,7 +4261,7 @@ mod tests {
         assert!(body.contains("/v1/chat/completions"), "Expected endpoint in error, got: {}", body);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_rejects_chat_model_on_embeddings_endpoint(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4301,7 +4301,7 @@ mod tests {
         assert!(body.contains("/v1/embeddings"), "Expected endpoint in error, got: {}", body);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_allows_matching_endpoint_and_model_type(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4353,7 +4353,7 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_skips_validation_for_untyped_models(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4385,7 +4385,7 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_files_member_id_rejected_outside_org_context(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4407,7 +4407,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_files_member_id_no_key_returns_empty(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4428,7 +4428,7 @@ mod tests {
         assert_eq!(body["data"].as_array().unwrap().len(), 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_files_enrichment_in_personal_context(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;

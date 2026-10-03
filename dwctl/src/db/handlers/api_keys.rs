@@ -1224,7 +1224,7 @@ mod tests {
     use rust_decimal::Decimal;
     use sqlx::{Acquire, PgPool};
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_api_key(pool: PgPool) {
         let api_key;
@@ -1306,7 +1306,7 @@ mod tests {
             .unwrap()
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_child_hidden_key_upsert_and_scoping(pool: PgPool) {
         // Org-context shape: key owned by the org, created by the member.
@@ -1352,7 +1352,7 @@ mod tests {
         assert!(ids.contains(&child_id) && ids.contains(&shared_id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_resolve_batch_execution_key(pool: PgPool) {
         let user = create_user(&pool, "cap-resolve").await;
@@ -1384,7 +1384,7 @@ mod tests {
         assert_eq!(session_id, shared_id);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_parent_cascades_to_child(pool: PgPool) {
         let user = create_user(&pool, "cap-delete").await;
@@ -1404,7 +1404,7 @@ mod tests {
         assert!(!repo.delete(key.id).await.unwrap());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_child_creation_guard_rejects_non_root_parents(pool: PgPool) {
         let user = create_user(&pool, "cap-guard").await;
@@ -1429,7 +1429,7 @@ mod tests {
         ));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_user_api_keys(pool: PgPool) {
         let user;
@@ -1499,7 +1499,7 @@ mod tests {
         assert!(keys.iter().any(|k| k.name == "Key 2"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_api_key(pool: PgPool) {
         let api_key;
@@ -1544,7 +1544,7 @@ mod tests {
         assert!(found_key.is_none());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_repository_trait_methods(pool: PgPool) {
         let api_key;
         let user;
@@ -1610,7 +1610,7 @@ mod tests {
 
     // Tests for group-based API key access control
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_api_key_access_through_group_membership(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
         let admin_user;
@@ -1742,7 +1742,7 @@ mod tests {
         assert!(api_key.model_access.contains(&deployment.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_api_key_loses_access_when_removed_from_group(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -1888,7 +1888,7 @@ mod tests {
         assert!(api_key_details.model_access.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_api_key_loses_access_when_deployment_removed_from_group(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -2035,7 +2035,7 @@ mod tests {
         assert!(api_key_details.model_access.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_multiple_api_keys_same_deployment_through_different_groups(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -2237,7 +2237,7 @@ mod tests {
         assert_eq!(keys_for_deployment.len(), 3 + 1); // 3 keys for user2 + 1 system = 4
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_api_key_access_multiple_deployments_same_group(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -2415,7 +2415,7 @@ mod tests {
         assert_eq!(api_key_details.model_access.len(), 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_dynamic_api_key_access_after_group_membership_changes(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -2575,7 +2575,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_api_key_access_through_everyone_group(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -2770,7 +2770,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_api_keys_pagination_with_filter(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -2889,7 +2889,7 @@ mod tests {
 
     // Also add a test to exercise both arms of the static SQL query
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_api_keys_filter_arms(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -2989,7 +2989,7 @@ mod tests {
 
     // Tests for bulk API key operations
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_api_keys_with_valid_ids(pool: PgPool) {
         let mut user_conn = pool.acquire().await.unwrap();
@@ -3072,7 +3072,7 @@ mod tests {
         assert_eq!(retrieved_key3.description, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_api_keys_with_some_invalid_ids(pool: PgPool) {
         let mut user_conn = pool.acquire().await.unwrap();
@@ -3124,7 +3124,7 @@ mod tests {
         assert_eq!(retrieved_key.user_id, user.id);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_api_keys_with_empty_ids(pool: PgPool) {
         let mut pool_conn = pool.acquire().await.unwrap();
@@ -3139,7 +3139,7 @@ mod tests {
         assert!(bulk_results.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_api_keys_with_all_invalid_ids(pool: PgPool) {
         let mut pool_conn = pool.acquire().await.unwrap();
@@ -3154,7 +3154,7 @@ mod tests {
         assert!(bulk_results.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_api_keys_with_duplicate_ids(pool: PgPool) {
         let mut user_conn = pool.acquire().await.unwrap();
@@ -3199,7 +3199,7 @@ mod tests {
         assert_eq!(retrieved_key.user_id, user.id);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_api_keys_includes_model_access(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -3309,7 +3309,7 @@ mod tests {
         assert_eq!(retrieved_key2.model_access.len(), 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_api_keys_from_different_users(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -3482,7 +3482,7 @@ mod tests {
         CreditFilteringTestSetup { deployment, group }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_api_keys_filtered_by_insufficient_credits(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -3710,7 +3710,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_api_keys_filtered_by_credits(pool: PgPool) {
         let setup = setup_credit_filtering_test(&pool).await;
@@ -3806,7 +3806,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_users_without_credit_transactions_excluded(pool: PgPool) {
         let setup = setup_credit_filtering_test(&pool).await;
@@ -3871,7 +3871,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_negative_balance_user_excluded(pool: PgPool) {
         let setup = setup_credit_filtering_test(&pool).await;
@@ -3965,7 +3965,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_user_regains_access_after_adding_credits(pool: PgPool) {
         let setup = setup_credit_filtering_test(&pool).await;
@@ -4059,7 +4059,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_zero_credit_user_can_access_free_model(pool: PgPool) {
         // This test will FAIL initially - demonstrating that zero-credit users
@@ -4179,7 +4179,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_zero_credit_user_cannot_access_paid_model(pool: PgPool) {
         // This test should PASS - demonstrating that zero-credit users
@@ -4319,7 +4319,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_zero_credit_user_can_access_zero_price_model(pool: PgPool) {
         // This test verifies that models with explicit $0.00 pricing (not NULL)
@@ -4459,7 +4459,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_user_id_by_secret_success(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -4509,7 +4509,7 @@ mod tests {
         assert_eq!(result, Some(user.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_user_id_by_secret_not_found(pool: PgPool) {
         let mut pool_conn = pool.acquire().await.unwrap();
@@ -4524,7 +4524,7 @@ mod tests {
 
     // ── Soft-delete tests ─────────────────────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_is_soft_delete(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -4581,7 +4581,7 @@ mod tests {
         assert!(row.is_deleted);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_soft_deleted_key_excluded_from_list(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -4652,7 +4652,7 @@ mod tests {
 
     // ── created_by tracking tests ─────────────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_created_by_stored_on_api_key(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -4711,7 +4711,7 @@ mod tests {
 
     // ── Per-member hidden key tests ───────────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_hidden_key_per_member_isolation(pool: PgPool) {
         // Two members each get their own hidden key for the same org user
@@ -4780,7 +4780,7 @@ mod tests {
         assert_eq!(secret_a, secret_a_again);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_hidden_key_individual_user_backward_compatible(pool: PgPool) {
         // For individual users, created_by = user_id — should behave like before
@@ -4824,7 +4824,7 @@ mod tests {
         assert_ne!(secret1, secret_playground);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_soft_deleted_hidden_key_not_reused(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -4871,7 +4871,7 @@ mod tests {
 
     // ── created_by filter tests ───────────────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_filters_by_created_by(pool: PgPool) {
         // Simulate org scenario: two members create keys for the same org user_id
@@ -5003,7 +5003,7 @@ mod tests {
         assert_eq!(all_keys.len(), 3);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_count_filters_by_created_by(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();

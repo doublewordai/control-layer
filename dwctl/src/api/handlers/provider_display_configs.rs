@@ -898,7 +898,7 @@ mod tests {
         deployment_id
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_standard_user_can_read_all_provider_display_configs(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -939,7 +939,7 @@ mod tests {
         assert!(provider_keys.contains(&"openai"), "Should see config-only provider");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_admin_sees_all_providers(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -964,7 +964,7 @@ mod tests {
         assert!(provider_keys.contains(&"openai"), "Admin should see OpenAI");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_standard_user_sees_everyone_group_providers(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;

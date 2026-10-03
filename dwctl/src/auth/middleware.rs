@@ -135,7 +135,7 @@ mod tests {
         test::utils::{create_test_config, create_test_user},
     };
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_playground_body_limit_precedes_model_parsing(pool: PgPool) {
         let mut config = create_test_config();
         config.limits.requests.max_body_size = 4;
@@ -179,7 +179,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_user_no_access_auth_error(pool: PgPool) {
         let config = create_test_config();
         let mut inference_conn = pool.acquire().await.unwrap();
@@ -237,7 +237,7 @@ mod tests {
         assert!(request.headers().get("authorization").is_some());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_user_access_no_auth_error(pool: PgPool) {
         let config = create_test_config();
         let user = create_test_user(&pool, Role::StandardUser).await;
@@ -318,7 +318,7 @@ mod tests {
         assert!(request.headers().get("authorization").is_some());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_header_must_be_supplied(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -337,7 +337,7 @@ mod tests {
         assert_eq!(err.status_code().as_u16(), 401);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_unknown_user_no_access(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -359,7 +359,7 @@ mod tests {
         assert!(request.headers().get("authorization").is_some());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_unknown_model_not_found(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -384,7 +384,7 @@ mod tests {
         assert!(request.headers().get("authorization").is_some());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_ignored_paths(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -407,7 +407,7 @@ mod tests {
         assert_eq!(err.uri().path(), "/nonsense/admin/api/v1/ai/v1/chat/completions");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_user_access_through_everyone_group(pool: PgPool) {
         let config = create_test_config();
         let user = create_test_user(&pool, Role::StandardUser).await;
@@ -476,7 +476,7 @@ mod tests {
         assert!(request.headers().get("authorization").is_some());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_jwt_session_authentication(pool: PgPool) {
         let mut config = create_test_config();
         // Enable native auth for JWT tests
@@ -589,7 +589,7 @@ mod tests {
         assert!(request.headers().get("authorization").is_some());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_auth_method_priority_jwt_over_header(pool: PgPool) {
         let mut config = create_test_config();
         // Enable native auth for JWT priority tests
@@ -709,7 +709,7 @@ mod tests {
         assert!(request.headers().get("authorization").is_some());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_disabled_auth_methods(pool: PgPool) {
         let mut config = create_test_config();
         // Disable native auth but keep proxy header enabled
@@ -827,7 +827,7 @@ mod tests {
         assert!(request.headers().get("authorization").is_some());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_auto_user_creation_via_current_user(pool: PgPool) {
         let config = create_test_config();
         // Config should have auto_create_users = true by default in test config
@@ -911,7 +911,7 @@ mod tests {
         assert_eq!(db_user.auth_source, "proxy-header");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_invalid_jwt_fallback_to_header(pool: PgPool) {
         let mut config = create_test_config();
         // Enable native auth for JWT fallback tests
@@ -1015,7 +1015,7 @@ mod tests {
         assert!(request.headers().get("authorization").is_some());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_invalid_api_key_with_valid_jwt(pool: PgPool) {
         let mut config = create_test_config();
         // Enable native auth for JWT tests

@@ -590,7 +590,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn apply_materialises_and_prunes_owned_rows(pool: PgPool) {
         let org_id: Uuid = sqlx::query_scalar(
             "INSERT INTO users (username, email, display_name, auth_source, user_type) VALUES ('acme', 'acme@example.com', 'Acme', 'test', 'organization') RETURNING id",
@@ -791,7 +791,7 @@ mod tests {
         assert_ne!(remaining[0].0, org_id);
         assert_eq!(remaining[0].1, None);
     }
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn removing_last_catalog_file_retires_class_deals_but_preserves_hand_rows(pool: PgPool) {
         let org: Uuid = sqlx::query_scalar("INSERT INTO users (username,email,auth_source,user_type) VALUES ('class-org','class-org@example.com','test','organization') RETURNING id").fetch_one(&pool).await.unwrap();
         let model: Uuid = sqlx::query_scalar("INSERT INTO deployed_models (model_name,alias,is_composite,created_by) VALUES ('class-model','class-model',true,$1) RETURNING id").bind(org).fetch_one(&pool).await.unwrap();
@@ -856,7 +856,7 @@ models:
             .unwrap();
         assert_eq!(owners, vec![Uuid::nil()]);
     }
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn catalog_rejects_future_manual_price_collisions_atomically(pool: PgPool) {
         let org: Uuid = sqlx::query_scalar("INSERT INTO users (username,email,auth_source,user_type) VALUES ('future-org','future@example.com','test','organization') RETURNING id").fetch_one(&pool).await.unwrap();
         let directory = tempdir().unwrap();
@@ -971,7 +971,7 @@ models:
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn catalog_adopts_declared_prices_and_preserves_undeclared_models(pool: PgPool) {
         let org: Uuid = sqlx::query_scalar("INSERT INTO users (username,email,auth_source,user_type) VALUES ('manual-org','manual@example.com','test','organization') RETURNING id").fetch_one(&pool).await.unwrap();
         let mut models = Vec::new();
@@ -1055,7 +1055,7 @@ models:
         (org, model)
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn waiting_replica_uses_time_after_org_catalog_lock(pool: PgPool) {
         review_org_model(&pool).await;
         let directory = tempdir().unwrap();
@@ -1090,7 +1090,7 @@ models:
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn price_only_catalog_adopts_overlay_and_inherits_omitted_routing(pool: PgPool) {
         let (org, model) = review_org_model(&pool).await;
         sqlx::query("INSERT INTO model_overlays(user_id,deployed_model_id,self_hosted_only) VALUES ($1,$2,true)")
@@ -1122,7 +1122,7 @@ models:
         apply(&pool, &catalog).await.unwrap();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn class_prices_version_and_adopt_unchanged_manual_rows(pool: PgPool) {
         let (org, model) = review_org_model(&pool).await;
         let directory = tempdir().unwrap();

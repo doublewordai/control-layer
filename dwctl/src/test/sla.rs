@@ -45,7 +45,7 @@ async fn get_realtime_api_key(pool: &PgPool, user_id: Uuid) -> String {
 ///
 /// This test verifies that when a batch is within `escalation_threshold_seconds`
 /// of expiry, requests are routed to the escalation model at claim time.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_route_at_claim_time_escalation(pool: PgPool) {
     tracing::info!("🚀 Starting Route-at-Claim-Time Escalation Test");
@@ -344,7 +344,7 @@ async fn test_route_at_claim_time_escalation(pool: PgPool) {
 }
 
 /// Test that requests are NOT escalated when batch has plenty of time remaining
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_no_escalation_when_not_near_expiry(pool: PgPool) {
     tracing::info!("🚀 Starting No-Escalation Test (batch not near expiry)");

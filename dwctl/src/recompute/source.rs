@@ -224,7 +224,6 @@ mod tests {
     use crate::prompt_cache::TokenizerClient;
     use crate::recompute::cache_fields::CreationTier;
     use crate::recompute::recompute_corpus;
-    use crate::test::utils::setup_fusillade_pool;
     use sqlx::PgPool;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -346,10 +345,8 @@ mod tests {
 
     /// The property the whole feature rests on, end to end against a real database: pointed
     /// at traffic with nothing wrong with it, the recompute proposes no change.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn healthy_traffic_recomputes_to_zero_delta(pool: PgPool) {
-        // The corpus query joins the fusillade schema, which #[sqlx::test] does not create.
-        setup_fusillade_pool(&pool).await;
         // prompt 1000 @ 1e-6 + completion 100 @ 2e-6 = 0.0012, no caching.
         let (user_id, _) = seed(
             &pool,
@@ -376,9 +373,8 @@ mod tests {
     /// The August incident, end to end: analytics stored Anthropic's `input_tokens` verbatim
     /// and dropped creation entirely. The recompute must recover the total, recover the
     /// creation from the FLAT field, and flag that the tier was assigned rather than read.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn anthropic_incident_row_is_detected_and_corrected(pool: PgPool) {
-        setup_fusillade_pool(&pool).await;
         let (user_id, analytics_id) = seed(
             &pool,
             "/messages?beta=true",
@@ -410,10 +406,8 @@ mod tests {
     /// A dwctl-cached request re-prices with the tariff version valid at its time — not the
     /// config defaults, and not a version that superseded it. Using either can
     /// incorrectly report a billing discrepancy on correctly charged requests.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn cached_row_reprices_with_the_tariff_valid_at_its_time(pool: PgPool) {
-        setup_fusillade_pool(&pool).await;
-
         // The model behind alias 'm', with a superseded tariff version and the live one.
         // Neither matches the config defaults, so resolving wrongly cannot pass by luck.
         let creator = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
@@ -462,9 +456,8 @@ mod tests {
     /// arithmetic runs past 8dp (here read ×0.5714 on 1e-6/tok) otherwise shows every
     /// healthy row as "changed" by a sub-cent phantom. Measured: 194 phantom rows on a
     /// healthy 400-row Nemotron corpus before this rounding existed.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn cost_is_compared_at_the_stored_column_scale(pool: PgPool) {
-        setup_fusillade_pool(&pool).await;
         let creator = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
         let endpoint = crate::test::utils::create_test_endpoint(&pool, "ep-scale", creator.id).await;
         let model_id = crate::test::utils::create_test_model(&pool, "m", "m", endpoint, creator.id).await;
@@ -507,9 +500,8 @@ mod tests {
     /// The July incident shape, end to end: the backend answered `"usage": null` and the
     /// row was billed nothing. The recompute has nothing to re-read, so the row must surface
     /// as not-replayable — NOT as "unchanged", which would certify a broken row as healthy.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn july_null_usage_row_surfaces_as_not_replayable(pool: PgPool) {
-        setup_fusillade_pool(&pool).await;
         let (user_id, _) = seed(
             &pool,
             "/chat/completions",
@@ -542,9 +534,8 @@ mod tests {
     /// tokenizer contradicts stays UNCHANGED — the disagreement is a per-row finding, not a
     /// correction. Adopting "agreeing" renders instead would replace every healthy count
     /// with ours ± template drift and destroy the no-op guarantee.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn render_disagreement_is_annotated_but_never_adopted(pool: PgPool) {
-        setup_fusillade_pool(&pool).await;
         let (user_id, _) = seed(
             &pool,
             "/chat/completions",
@@ -573,9 +564,8 @@ mod tests {
     }
 
     /// An agreeing render annotates the row and moves nothing.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn render_agreement_is_annotated(pool: PgPool) {
-        setup_fusillade_pool(&pool).await;
         let (user_id, _) = seed(
             &pool,
             "/chat/completions",
@@ -605,9 +595,8 @@ mod tests {
     /// The July shape WITH a tokenizer: the row is rescued instead of refused — prompt from
     /// the exact render, completion estimated from the response text, priced, and gated
     /// (`completion_token_source: "estimated"`) so the apply step demands an opt-in.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn usage_less_row_is_rescued_by_the_tokenizer(pool: PgPool) {
-        setup_fusillade_pool(&pool).await;
         let (user_id, analytics_id) = seed(
             &pool,
             "/chat/completions",
@@ -646,9 +635,8 @@ mod tests {
 
     /// A request with no stored body cannot be checked at all. It must be reported as such
     /// rather than dropped, and must not be counted as a change.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn a_row_without_a_body_is_reported_as_columns_only(pool: PgPool) {
-        setup_fusillade_pool(&pool).await;
         let user_id = Uuid::new_v4();
         sqlx::query!(
             "INSERT INTO users (id, username, email, is_admin, auth_source) VALUES ($1,$2,$3,false,'test')",

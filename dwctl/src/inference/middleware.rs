@@ -1750,7 +1750,7 @@ mod tests {
         assert_eq!(background_contract_error(ServiceTier::Realtime, false, false), None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn resolve_flex_batch_key_uses_hidden_batch_key_for_key_owner(pool: sqlx::PgPool) {
         use crate::api::models::{api_keys::ApiKeyCreate, users::Role};
         use crate::db::{
@@ -1813,7 +1813,7 @@ mod tests {
         assert!(row_hidden);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn background_role_is_resolved_from_organization_key_creator(pool: sqlx::PgPool) {
         use crate::api::models::{api_keys::ApiKeyCreate, users::Role};
         use crate::db::{
@@ -1864,7 +1864,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn background_role_rejects_api_key_creator_without_capability(pool: sqlx::PgPool) {
         use crate::api::models::{api_keys::ApiKeyCreate, users::Role};
         use crate::db::{

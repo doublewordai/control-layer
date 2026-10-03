@@ -2301,7 +2301,7 @@ mod integration_tests {
         while batcher.project_outbox_batch().await.unwrap() > 0 {}
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn class_billing_snapshot_survives_rollback_and_keeps_legacy_receipts_separate(pool: sqlx::PgPool) {
         let model = create_test_model(&pool, "example/billing").await;
         setup_tariff(&pool, model, Decimal::new(1, 3), Decimal::new(1, 3), ApiKeyPurpose::Realtime).await;
@@ -2341,7 +2341,7 @@ mod integration_tests {
         assert_eq!(rows[1].3.as_deref(), Some("example/billing-fast"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn class_provider_attribution_uses_each_captured_endpoint(pool: sqlx::PgPool) {
         let model = create_test_model(&pool, "example/provider").await;
         setup_tariff(&pool, model, Decimal::new(1, 3), Decimal::new(1, 3), ApiKeyPurpose::Realtime).await;
@@ -2391,7 +2391,7 @@ mod integration_tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn canonical_uuid_cannot_collide_with_a_legacy_alias_in_pricing(pool: sqlx::PgPool) {
         let canonical = create_test_model(&pool, "example/canonical").await;
         let alias = canonical.to_string();
@@ -2429,7 +2429,7 @@ mod integration_tests {
         assert_eq!(tariffs[&ModelPricingKey::Alias(alias)][0].read_multiplier, Decimal::new(9, 1));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn tariff_lookups_scope_accounts_without_losing_history_or_unpriced_models(pool: sqlx::PgPool) {
         let model = create_test_model(&pool, "scoped-history").await;
         let private_only = create_test_model(&pool, "other-account-only").await;
@@ -2535,7 +2535,7 @@ mod integration_tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn projector_writes_gateway_span_id(pool: sqlx::PgPool) {
         create_test_model(&pool, "cor678").await;
         let config = crate::test::utils::create_test_config();
@@ -2565,7 +2565,7 @@ mod integration_tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_writer_checkpoints_raw_record_before_enrichment(pool: sqlx::PgPool) {
         let config = crate::test::utils::create_test_config();
         let (_projector, writer) = AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
@@ -2589,7 +2589,7 @@ mod integration_tests {
         assert!(payload.get("total_cost").is_none());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_outbox_observation_reports_backlog(pool: sqlx::PgPool) {
         assert_eq!(read_outbox_observation(&pool).await.unwrap(), (0, 0.0));
 
@@ -2625,7 +2625,7 @@ mod integration_tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_projector_accepts_deployed_and_raw_outbox_payloads(pool: sqlx::PgPool) {
         let model_id = create_test_model(&pool, "mixed-outbox-payload-test").await;
         setup_tariff(
@@ -2695,7 +2695,7 @@ mod integration_tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_batcher_credit_deduction_successful(pool: sqlx::PgPool) {
         // Setup: Create model with tariff
@@ -2735,7 +2735,7 @@ mod integration_tests {
         assert_eq!(usage_tx.unwrap().amount, expected_cost);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn failed_response_is_analytic_but_not_billed(pool: sqlx::PgPool) {
         let model_id = create_test_model(&pool, "failed-response-test").await;
@@ -2779,7 +2779,7 @@ mod integration_tests {
         assert_eq!(outbox_depth, 0, "projection must delete the durable row after committing analytics");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_batcher_cache_discount_applied(pool: sqlx::PgPool) {
         // Model with a base tariff + a cache tariff (presence = enabled): 1h write ×2.0,
@@ -2849,7 +2849,7 @@ mod integration_tests {
         assert_eq!(row.uncached_cost.unwrap(), expected_list, "uncached_cost = list price");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_batcher_different_tariffs_for_batch_and_realtime(pool: sqlx::PgPool) {
         // Setup: Create model with different tariffs for batch and realtime
@@ -2920,7 +2920,7 @@ mod integration_tests {
         assert!(amounts.contains(&expected_realtime_cost), "Should have realtime cost transaction");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_batcher_folds_batch_analytics_into_aggregates(pool: sqlx::PgPool) {
         // Three requests of one batch fold their tokens / latency / list-cost into
@@ -3003,7 +3003,7 @@ mod integration_tests {
         assert!(agg.analytics_backfilled_at.is_none(), "live fold leaves the backfill marker null");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_batcher_denormalizes_fusillade_request_id_onto_credits(pool: sqlx::PgPool) {
         // A batched request's credit row carries its fusillade_request_id (migration 120), so the
@@ -3042,7 +3042,7 @@ mod integration_tests {
         assert_eq!(row.amount, Decimal::from_str("0.10").unwrap(), "1000*5e-5 + 500*1e-4");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_fusillade_success_index_gates_billing_and_aggregation(pool: sqlx::PgPool) {
         let model_id = create_test_model(&pool, "fusillade-billing-idempotency").await;
@@ -3138,7 +3138,7 @@ mod integration_tests {
         assert_eq!(aggregate.total_amount, Decimal::from_str("0.10").unwrap());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_batchless_flex_success_index_gates_billing(pool: sqlx::PgPool) {
         let model_id = create_test_model(&pool, "flex-billing-idempotency").await;
@@ -3191,7 +3191,7 @@ mod integration_tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_legacy_fusillade_duplicates_remain_reconcilable_during_rollout(pool: sqlx::PgPool) {
         let user_id = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
@@ -3238,7 +3238,7 @@ mod integration_tests {
         assert!(rows.iter().all(|row| row.fusillade_request_id == Some(request_id)));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_shared_fusillade_id_does_not_suppress_realtime_billing(pool: sqlx::PgPool) {
         let model_id = create_test_model(&pool, "spoofed-fusillade-id").await;
@@ -3278,7 +3278,7 @@ mod integration_tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn playground_customer_fallback_matches_quotes_and_actual_charges(pool: sqlx::PgPool) {
         use crate::db::handlers::Tariffs;
         for (alias, class, rate, org_playground) in [
@@ -3353,7 +3353,7 @@ mod integration_tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn realtime_org_deal_leaves_batch_charges_at_the_model_batch_price(pool: sqlx::PgPool) {
         let model = create_test_model(&pool, "purpose-isolation").await;
         setup_tariff(&pool, model, Decimal::new(10, 6), Decimal::new(20, 6), ApiKeyPurpose::Realtime).await;
@@ -3373,7 +3373,7 @@ mod integration_tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_batcher_charges_realtime_when_all_batch_scopes_are_missing(pool: sqlx::PgPool) {
         // Setup: Create model with ONLY realtime tariff
@@ -3406,7 +3406,7 @@ mod integration_tests {
         assert_eq!(cost, Some(Decimal::new(3, 1)), "analytics and balance use the same fallback charge");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_batcher_skip_deduction_when_no_pricing(pool: sqlx::PgPool) {
         // Setup: Create model WITHOUT any tariff
@@ -3449,7 +3449,7 @@ mod integration_tests {
     /// forwarding the key on claim, emitting the header, reading it back off the request —
     /// is worth nothing if the column ends up empty, and this is the column every dashboard
     /// reads.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn batcher_persists_the_user_agent_to_http_analytics(pool: sqlx::PgPool) {
         create_test_model(&pool, "ua-persist-test").await;
@@ -3473,7 +3473,7 @@ mod integration_tests {
     /// Worth testing rather than assuming, because NULL here does not necessarily stay
     /// NULL for downstream consumers — a missing value can surface as the Unix epoch, and
     /// any duration computed from it then reads as decades of queue delay.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn batcher_persists_the_submitted_at_to_http_analytics(pool: sqlx::PgPool) {
         create_test_model(&pool, "submitted-at-test").await;
@@ -3528,7 +3528,7 @@ mod integration_tests {
     /// extension into this struct upstream, so the only thing that can break is the
     /// write — a dropped bind or a misordered UNNEST array would leave the column
     /// silently NULL (or misaligned) on every row.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn batcher_persists_the_cache_read_source_to_http_analytics(pool: sqlx::PgPool) {
         create_test_model(&pool, "cache-source-test").await;
@@ -3561,7 +3561,7 @@ mod integration_tests {
     /// moment and the column must stay NULL rather than being backfilled from `timestamp`.
     /// Writing one would invent a zero-length queue for a request that never queued, and
     /// "no submitted_at" is how a consumer tells deferred work from immediate.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn realtime_rows_have_no_submitted_at(pool: sqlx::PgPool) {
         create_test_model(&pool, "realtime-no-submit").await;
@@ -3578,7 +3578,7 @@ mod integration_tests {
         assert!(stored.is_none(), "realtime should leave submitted_at NULL, got {stored:?}");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_batcher_skip_deduction_for_unauthenticated_requests(pool: sqlx::PgPool) {
         // Setup: Create model with tariff
@@ -3614,7 +3614,7 @@ mod integration_tests {
     }
 
     /// Test that the batcher sends pg_notify when a user's balance is depleted (crosses zero downward)
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_batcher_balance_depleted_notification(pool: sqlx::PgPool) {
         use sqlx::postgres::PgListener;
@@ -3692,7 +3692,7 @@ mod integration_tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn organization_class_charges_fold_into_the_owning_keys_cap(pool: sqlx::PgPool) {
         use crate::db::handlers::api_keys::ApiKeys;
         let model = create_test_model(&pool, "org-class-cap").await;
@@ -3752,7 +3752,7 @@ mod integration_tests {
     /// child's batch row fold into ONE checkpoint row keyed by the scope root,
     /// uncapped keys produce no row, the crossing NOTIFY fires exactly once
     /// (edge-triggered), and further over-cap flushes fold silently.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_batcher_folds_cap_scope_and_notifies_on_crossing(pool: sqlx::PgPool) {
         use crate::db::handlers::api_keys::ApiKeys;
@@ -3835,7 +3835,7 @@ mod integration_tests {
     /// REPLACES window_spend instead of accumulating, advances
     /// window_started_at, keeps total_spend monotonic, and does not fire a
     /// crossing NOTIFY when the fresh window is under the cap.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_batcher_cap_window_rollover(pool: sqlx::PgPool) {
         use sqlx::postgres::PgListener;
@@ -3904,7 +3904,7 @@ mod integration_tests {
         assert_no_cap_notification(&mut listener).await;
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_flush_emits_single_notification_for_multiple_depletions(pool: sqlx::PgPool) {
         use sqlx::postgres::PgListener;

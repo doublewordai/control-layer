@@ -620,7 +620,7 @@ mod tests {
     }
 
     /// Integration test: Error enrichment middleware enriches 403 with balance info
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_error_enrichment_middleware_enriches_403_with_balance(pool: PgPool) {
         use crate::test::utils::{add_deployment_to_group, add_user_to_group, create_test_group};
@@ -742,7 +742,7 @@ mod tests {
     /// `spend_cap_exceeded` envelope, the balance-supersedes-cap ordering,
     /// and the rolled-window fallthrough (no false "cap exceeded" during the
     /// post-boundary readmission lag).
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_error_enrichment_spend_cap_arms(pool: PgPool) {
         use crate::db::handlers::api_keys::ApiKeys as ApiKeysRepo;
@@ -963,7 +963,7 @@ mod tests {
     }
 
     /// Integration test: Error enrichment middleware passes through 403 when user has access
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_error_enrichment_middleware_passes_through_legitimate_403(pool: PgPool) {
         use crate::test::utils::{add_deployment_to_group, add_user_to_group, create_test_group};
@@ -1055,7 +1055,7 @@ mod tests {
     }
 
     /// Integration test: Error enrichment middleware only affects /ai/ paths
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_error_enrichment_middleware_ignores_non_ai_paths(pool: PgPool) {
         let router = axum::Router::new()
@@ -1083,7 +1083,7 @@ mod tests {
     }
 
     /// Integration test: Error enrichment middleware ignores non-403 responses
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_error_enrichment_middleware_ignores_non_403_errors(pool: PgPool) {
         let router = axum::Router::new()
@@ -1117,7 +1117,7 @@ mod tests {
 
     /// Integration test: Error enrichment middleware enriches 403 when a routing
     /// rule denies the API key's purpose (e.g. batch/realtime/playground) for the model.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_error_enrichment_middleware_enriches_403_with_modality_block(pool: PgPool) {
         use crate::test::utils::{add_deployment_to_group, add_user_to_group, create_test_group};
@@ -1213,7 +1213,7 @@ mod tests {
     /// onwards and execute as `batch` (via the owner's hidden batch key), so this
     /// function must fail them fast — otherwise a Flex request could reach a model where
     /// batch/async access is denied, which onwards would have blocked on dispatch.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_validate_api_key_model_access_rejects_modality_blocked(pool: PgPool) {
         use crate::test::utils::{add_deployment_to_group, add_user_to_group, create_test_group};
@@ -1272,7 +1272,7 @@ mod tests {
     /// executes as `batch` — so `validate_api_key_model_access` (the Flex pre-dispatch
     /// gate) must allow it. Previously the check matched the caller's own key purpose
     /// and wrongly returned "Real-time access ... is blocked by a routing rule".
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_validate_flex_allowed_despite_realtime_deny_rule(pool: PgPool) {
         use crate::test::utils::{add_deployment_to_group, add_user_to_group, create_test_group};
@@ -1320,7 +1320,7 @@ mod tests {
     /// Companion to the regression test: a Flex request submitted with a **realtime**
     /// key IS blocked when the model carries a **batch** deny rule, because Flex runs
     /// as `batch`. This mirrors what onwards would enforce on daemon dispatch.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_validate_flex_blocked_by_batch_deny_rule_with_realtime_key(pool: PgPool) {
         use crate::test::utils::{add_deployment_to_group, add_user_to_group, create_test_group};
@@ -1370,7 +1370,7 @@ mod tests {
 
     /// Direct unit test: `validate_api_key_model_access` rejects a non-inference
     /// (platform) key on the Flex path, before any model-access check.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_validate_api_key_model_access_rejects_platform_purpose(pool: PgPool) {
         let user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -1402,7 +1402,7 @@ mod tests {
     /// The system key is purpose 'platform' but is exempt from the inference
     /// purpose gate on the Flex path (it is used internally for inference),
     /// mirroring the onwards key-sync exemption.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_validate_api_key_model_access_exempts_system_key_from_purpose_gate(pool: PgPool) {
         let mut api_key_conn = pool.acquire().await.unwrap();
         let mut api_keys_repo = ApiKeys::new(&mut api_key_conn);
@@ -1433,7 +1433,7 @@ mod tests {
     }
 
     /// Integration test: Error enrichment middleware passes through when no auth header
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_error_enrichment_middleware_without_auth_header(pool: PgPool) {
         let router = axum::Router::new()
