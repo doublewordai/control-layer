@@ -2692,6 +2692,8 @@ pub async fn build_router(
                 .0
         };
 
+        crate::metrics::error_series::register_documented_routes();
+
         // Get the GenAI registry from the metrics recorder (already initialized earlier)
         let gen_ai_registry = if let Some(ref recorder) = state.metrics_recorder {
             recorder.registry().clone()
