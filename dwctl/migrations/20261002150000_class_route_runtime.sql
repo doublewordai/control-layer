@@ -1,5 +1,7 @@
 -- Nullable snapshots preserve legacy analytics and mixed-version writers.
 -- No FK: deleting a route must not delete or reinterpret accepted requests.
+SET LOCAL lock_timeout = '5s';
+
 ALTER TABLE http_analytics
     ADD COLUMN canonical_model_id UUID,
     ADD COLUMN serving_class_id UUID,
