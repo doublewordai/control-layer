@@ -126,31 +126,39 @@ async fn setup_ai_test(
     (server, api_key, bg_services)
 }
 
-/// Mount a wiremock mock for chat completions
+/// Mount a wiremock mock for chat completions.
+///
+/// Strict-mode forwards `/v1/chat/completions` (the handler re-adds the `/v1`
+/// prefix stripped by the `/ai/v1` nest), while non-strict mode forwards the
+/// nest-stripped `/chat/completions`. Both paths are mounted so the shared
+/// helper works regardless of `strict_mode`.
 async fn mount_chat_completions_mock(mock_server: &wiremock::MockServer) {
-    wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/chat/completions"))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-test123",
-            "object": "chat.completion",
-            "created": 1700000000,
-            "model": "gpt-4o",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": "Hello from the test!"
-                },
-                "finish_reason": "stop"
-            }],
-            "usage": {
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "total_tokens": 15
-            }
-        })))
-        .mount(mock_server)
-        .await;
+    let body = serde_json::json!({
+        "id": "chatcmpl-test123",
+        "object": "chat.completion",
+        "created": 1700000000,
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "Hello from the test!"
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15
+        }
+    });
+    for path in ["/v1/chat/completions", "/chat/completions"] {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(path))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body.clone()))
+            .mount(mock_server)
+            .await;
+    }
 }
 
 /// Test that POST /v1/chat/completions with service_tier=priority creates a fusillade row
