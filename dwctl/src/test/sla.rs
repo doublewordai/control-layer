@@ -31,16 +31,6 @@ async fn get_batch_api_key(pool: &PgPool, user_id: Uuid) -> String {
         .expect("Failed to get batch API key")
 }
 
-/// Helper to get or create a realtime API key for a user (for actual inference requests)
-async fn get_realtime_api_key(pool: &PgPool, user_id: Uuid) -> String {
-    let mut conn = pool.acquire().await.expect("Failed to acquire connection");
-    let mut api_keys_repo = ApiKeys::new(&mut conn);
-    api_keys_repo
-        .get_or_create_hidden_key(user_id, ApiKeyPurpose::Realtime, user_id)
-        .await
-        .expect("Failed to get realtime API key")
-}
-
 /// Test route-at-claim-time escalation when batch is near expiry
 ///
 /// This test verifies that when a batch is within `escalation_threshold_seconds`
@@ -58,9 +48,8 @@ async fn test_route_at_claim_time_escalation(pool: PgPool) {
 
     // Create batch API key for the user
     let user_batch_api_key = get_batch_api_key(&pool, user.id).await;
-    let _user_realtime_api_key = get_realtime_api_key(&pool, user.id).await;
 
-    tracing::info!("✅ Created batch and realtime API keys for user");
+    tracing::info!("✅ Created batch API key for user");
 
     // Setup mock server that always returns 200 OK
     let mock_server = MockServer::start().await;
@@ -354,7 +343,6 @@ async fn test_no_escalation_when_not_near_expiry(pool: PgPool) {
     add_user_to_group(&pool, user.id, uuid::Uuid::nil()).await;
 
     let user_batch_api_key = get_batch_api_key(&pool, user.id).await;
-    let _user_realtime_api_key = get_realtime_api_key(&pool, user.id).await;
 
     // Setup mock server
     let mock_server = MockServer::start().await;
