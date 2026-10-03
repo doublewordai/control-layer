@@ -2724,7 +2724,8 @@ pub async fn build_router(
                     axum_metrics
                 }),
             )
-            .layer(prometheus_layer);
+            .layer(prometheus_layer)
+            .layer(middleware::from_fn(crate::metrics::error_series::register_error_series));
     }
 
     // Add tracing layer with OTel-compatible span names and HTTP semantic conventions.
