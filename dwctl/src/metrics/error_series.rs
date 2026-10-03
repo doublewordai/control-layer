@@ -3,7 +3,9 @@
 //! axum-prometheus creates each `{prefix}_http_requests_total` series on its first increment, and
 //! PromQL `increase()` cannot see a series go from absent to 1. A route's first 5xx on a pod is
 //! therefore invisible to rate-based alerts. This middleware registers the 500 and 503 series at
-//! 0 when a management route serves a request, so a first error is a visible 0 -> 1 step.
+//! 0 when a management route serves a request, so a first error is a visible 0 -> 1 step. The
+//! series exist from a route's first request on, so an error on the very first request a route
+//! serves on a pod is still created at 1 and missed.
 
 use axum::extract::{MatchedPath, Request};
 use axum::middleware::Next;
