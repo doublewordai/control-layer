@@ -332,6 +332,7 @@ pub async fn run_allocator_metrics_sampler(config: AllocatorMetricsConfig, shutd
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
     use serial_test::serial;
 
     /// Parse the value of a rendered Prometheus metric by name, ignoring the

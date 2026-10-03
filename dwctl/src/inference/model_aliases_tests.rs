@@ -218,6 +218,76 @@ async fn discovery_lists_primary_classes_without_synonyms_or_inaccessible_models
 }
 
 #[dwctl_test_macros::test]
+async fn discovery_and_batch_names_exclude_quarantined_class_routes(pool: PgPool) {
+    use crate::db::handlers::model_aliases::ModelAliases;
+    use crate::test::utils::{create_test_api_key_for_user, create_test_user};
+    let (model, _) = active_model(&pool).await;
+    sqlx::query("INSERT INTO deployment_groups (deployment_id,group_id,granted_by) VALUES ($1,$2,$2)")
+        .bind(model)
+        .bind(Uuid::nil())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let app = crate::Application::new_with_pool(crate::test::utils::create_test_config(), Some(pool.clone()), None)
+        .await
+        .unwrap();
+    let (server, _background) = app.into_test_server();
+    let user = create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+    let key = create_test_api_key_for_user(&pool, user.id).await;
+    // Missing standard, complete, outgoing redirect, incoming redirect, repaired.
+    for state in ["incomplete", "complete", "outgoing", "incoming", "repaired"] {
+        match state {
+            "incomplete" => {
+                sqlx::query("DELETE FROM model_serving_classes WHERE deployed_model_id=$1 AND class_key='standard'")
+                    .bind(model)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            "complete" => {
+                sqlx::query("INSERT INTO model_serving_classes (deployed_model_id,class_key,display_name,inference_endpoint_id,upstream_model_name) SELECT id,'standard','Standard',hosted_on,'gateway/standard' FROM deployed_models WHERE id=$1")
+                .bind(model).execute(&pool).await.unwrap();
+            }
+            "outgoing" => {
+                sqlx::query("INSERT INTO deployed_models (model_name,alias,hosted_on,created_by) SELECT 'legacy','legacy',hosted_on,created_by FROM deployed_models WHERE id=$1")
+                    .bind(model).execute(&pool).await.unwrap();
+                sqlx::query("INSERT INTO model_traffic_rules (deployed_model_id,api_key_purpose,action,redirect_target_id) SELECT $1,'realtime','redirect',id FROM deployed_models WHERE alias='legacy'")
+                    .bind(model).execute(&pool).await.unwrap();
+            }
+            "incoming" => {
+                sqlx::query("UPDATE model_traffic_rules SET deployed_model_id=redirect_target_id,redirect_target_id=deployed_model_id WHERE deployed_model_id=$1")
+                .bind(model).execute(&pool).await.unwrap();
+            }
+            "repaired" => {
+                sqlx::query("DELETE FROM model_traffic_rules WHERE redirect_target_id=$1")
+                    .bind(model)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let advertised = matches!(state, "complete" | "repaired");
+        let response = server
+            .get("/ai/v1/models")
+            .add_header("Authorization", format!("Bearer {}", key.secret))
+            .await;
+        response.assert_status_ok();
+        let data = response.json::<serde_json::Value>();
+        for name in ["example/model", "example/model:fast"] {
+            assert_eq!(
+                data["data"].as_array().unwrap().iter().any(|m| m["id"] == name),
+                advertised,
+                "{state}: {name}"
+            );
+        }
+        let mut conn = pool.acquire().await.unwrap();
+        let names = ModelAliases::new(&mut conn).active_primary_names().await.unwrap();
+        assert_eq!(names.iter().any(|m| m.deployed_model_id == model), advertised, "batch {state}");
+    }
+}
+
+#[dwctl_test_macros::test]
 async fn class_requests_translate_once_keep_public_responses_and_preserve_deadline_priority(pool: PgPool) {
     use axum::http::StatusCode;
     use serde_json::json;
@@ -426,6 +496,19 @@ async fn class_reasoning_capabilities_and_async_validation_use_the_selected_rout
             ))
             .await;
         response.assert_status(axum::http::StatusCode::CREATED);
+        let file_id = Uuid::parse_str(response.json::<serde_json::Value>()["id"].as_str().unwrap()).unwrap();
+        let (stored_model, stored_body, metadata): (String, String, serde_json::Value) =
+            sqlx::query_as("SELECT model,body,metadata FROM fusillade.request_templates_all WHERE file_id=$1")
+                .bind(file_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored_model, "example/model");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&stored_body).unwrap()["model"],
+            "example/model"
+        );
+        assert_eq!(metadata["dw_submitted_model"], alias);
     }
 }
 

@@ -1786,7 +1786,8 @@ async fn load_targets_from_snapshot(
                                     SELECT 1 FROM model_tariffs class_price
                                     WHERE class_price.deployed_model_id = mt.deployed_model_id
                                       AND class_price.user_id IS NULL AND class_price.serving_class = c.class_key
-                                      AND class_price.api_key_purpose = mt.api_key_purpose
+                                      AND (class_price.api_key_purpose = mt.api_key_purpose
+                                       OR (mt.api_key_purpose = 'playground' AND class_price.api_key_purpose = 'realtime'))
                                       AND class_price.completion_window IS NOT DISTINCT FROM mt.completion_window
                                       AND class_price.valid_from <= NOW()
                                       AND (class_price.valid_until IS NULL OR class_price.valid_until > NOW())
@@ -1834,7 +1835,8 @@ async fn load_targets_from_snapshot(
                                     SELECT 1 FROM model_tariffs class_price
                                     WHERE class_price.deployed_model_id = mt.deployed_model_id
                                       AND class_price.user_id IS NULL AND class_price.serving_class = c.class_key
-                                      AND class_price.api_key_purpose = mt.api_key_purpose
+                                      AND (class_price.api_key_purpose = mt.api_key_purpose
+                                       OR (mt.api_key_purpose = 'playground' AND class_price.api_key_purpose = 'realtime'))
                                       AND class_price.completion_window IS NOT DISTINCT FROM mt.completion_window
                                       AND class_price.valid_from <= NOW()
                                       AND (class_price.valid_until IS NULL OR class_price.valid_until > NOW())
@@ -1978,7 +1980,7 @@ async fn load_targets_from_snapshot(
     // Load traffic routing rules for all non-deleted models (regular + composite)
     let traffic_rule_rows = sqlx::query!(
         r#"
-        SELECT mtr.deployed_model_id, mtr.api_key_purpose, mtr.action,
+        SELECT mtr.deployed_model_id, mtr.api_key_purpose, mtr.action, mtr.redirect_target_id,
                dm.alias as "redirect_target_alias?"
         FROM model_traffic_rules mtr
         LEFT JOIN deployed_models dm ON dm.id = mtr.redirect_target_id
@@ -1998,6 +2000,9 @@ async fn load_targets_from_snapshot(
             match_labels: HashMap::from([("purpose".to_string(), rule_row.api_key_purpose)]),
             action: match rule_row.action.as_str() {
                 "deny" => RoutingAction::Deny,
+                // Preserve the purpose restriction without a dangling target or
+                // silently falling back to the source's default provider.
+                "redirect" if rule_row.redirect_target_id.is_some_and(|id| invalid_ids.contains(&id)) => RoutingAction::Deny,
                 "redirect" => RoutingAction::Redirect {
                     target: rule_row.redirect_target_alias.unwrap_or_default(),
                 },

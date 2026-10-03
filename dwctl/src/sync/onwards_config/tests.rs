@@ -2915,7 +2915,7 @@ async fn free_public_class_overrides_paid_general_admission(pool: sqlx::PgPool) 
             .fetch_one(&pool)
             .await
             .unwrap();
-    sqlx::query("INSERT INTO model_tariffs (deployed_model_id,name,api_key_purpose,input_price_per_token,output_price_per_token) VALUES ($1,'General','realtime',0.01,0.01)")
+    sqlx::query("INSERT INTO model_tariffs (deployed_model_id,name,api_key_purpose,input_price_per_token,output_price_per_token) VALUES ($1,'General','realtime',0.01,0.01), ($1,'Playground','playground',0.01,0.01)")
         .bind(model).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO model_tariffs (deployed_model_id,serving_class,name,api_key_purpose,input_price_per_token,output_price_per_token) VALUES ($1,'fast','Free fast','realtime',0,0)")
         .bind(model).execute(&pool).await.unwrap();
@@ -3043,4 +3043,36 @@ async fn invalid_class_activation_does_not_freeze_key_revocations(pool: sqlx::Pg
     assert!(!after.targets.contains_key("regular-private"));
     assert!(!pool_has_key(&after.targets.get("regular-public").unwrap(), KEY_A_SECRET));
     assert!(pool_has_key(&after.targets.get("regular-public").unwrap(), KEY_B_SECRET));
+}
+
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_traffic_routing_rules")))]
+async fn quarantined_redirect_targets_deny_only_the_affected_purpose(pool: sqlx::PgPool) {
+    // Both legacy regular and composite sources must retain their restrictions.
+    sqlx::query("UPDATE deployed_models SET routing_mode='class_routes' WHERE alias IN ('regular-public','escalation-private')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let config = super::load_targets_from_db(&pool, &[], false, &Default::default()).await.unwrap();
+    for name in ["regular-public", "escalation-private"] {
+        assert!(!config.targets.contains_key(name));
+    }
+    for (source, affected) in [("regular-private", "realtime"), ("composite-priority", "batch")] {
+        let target = config.targets.get(source).unwrap();
+        let rules = target.default_pool().routing_rules();
+        assert_eq!(rules.len(), 2);
+        let rule = rules
+            .iter()
+            .find(|r| r.match_labels.get("purpose").map(String::as_str) == Some(affected))
+            .unwrap();
+        assert!(
+            matches!(rule.action, RoutingAction::Deny),
+            "{source} must not leave a dangling redirect"
+        );
+        assert!(
+            target
+                .default_pool()
+                .evaluate_routing_rules(&std::collections::HashMap::from([("purpose".into(), "playground".into())]))
+                .is_none()
+        );
+    }
 }

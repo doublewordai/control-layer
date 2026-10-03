@@ -981,7 +981,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         claimed_at: DateTime<Utc>,
     ) -> Vec<Request<Claimed>> {
         let mut parsed_metadata_cache: std::collections::HashMap<
-            Uuid,
+            String,
             Option<Arc<serde_json::Value>>,
         > = std::collections::HashMap::new();
 
@@ -994,11 +994,17 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                         .map(Arc::new)
                 };
                 let parsed_metadata = match row.batch_id {
-                    // One batch, many requests: parse its metadata once per claim.
-                    Some(batch_uuid) => parsed_metadata_cache
-                        .entry(batch_uuid)
-                        .or_insert_with(|| parse_metadata(row.batch_metadata.as_deref()))
-                        .clone(),
+                    // File templates can override individual fields, so batch ID alone
+                    // cannot key this cache. Reuse parsing only for identical merged
+                    // metadata, including multiple spellings within the same batch.
+                    Some(_) => row.batch_metadata.as_deref().and_then(|raw| {
+                        if let Some(parsed) = parsed_metadata_cache.get(raw) {
+                            return parsed.clone();
+                        }
+                        let parsed = parse_metadata(Some(raw));
+                        parsed_metadata_cache.insert(raw.to_owned(), parsed.clone());
+                        parsed
+                    }),
                     // Batchless (flex, background): the metadata is the request's own, off
                     // its template, so there is nothing to dedupe against and no batch id
                     // to key a cache by. Parsed per row - 1:1 with the request.
@@ -3012,10 +3018,10 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                       COALESCE(b.endpoint, t.endpoint) as "batch_endpoint!",
                       'background'::TEXT as "batch_completion_window?",
                       -- This query claims both batched and batchless background rows, so
-                      -- take the batch's metadata when there is a batch and the template's
-                      -- when there isn't. b.metadata is NULL for batchless rows and
-                      -- t.metadata is NULL for file-ingested ones, so the two never race.
-                      COALESCE(b.metadata, t.metadata)::TEXT as "batch_metadata",
+                      -- preserve batch context while allowing trusted per-template fields
+                      -- (such as the submitted model spelling) to take precedence.
+                      (CASE WHEN t.metadata IS NULL THEN b.metadata
+                            ELSE COALESCE(b.metadata, '{}'::jsonb) || t.metadata END)::TEXT as "batch_metadata",
                       b.output_file_id::TEXT as "batch_output_file_id",
                       b.error_file_id::TEXT as "batch_error_file_id",
                       COALESCE(b.created_by, r.created_by, '') as "batch_created_by!",
@@ -3973,7 +3979,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         let mut template_buffer = Vec::with_capacity(batch_size);
 
         while let Some(item) = stream.next().await {
-            match item {
+            let (template, template_metadata) = match item {
                 FileStreamItem::Metadata(meta) => {
                     if meta.filename.is_some() {
                         metadata.filename = meta.filename;
@@ -4005,50 +4011,11 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                     if meta.source_external_key.is_some() {
                         metadata.source_external_key = meta.source_external_key;
                     }
+                    continue;
                 }
-                FileStreamItem::Template(template) => {
-                    // Ensure we have a file ID (create stub if needed)
-                    if file_id.is_none() {
-                        let new_id = Uuid::new_v4();
-                        let stub_name = metadata
-                            .filename
-                            .clone()
-                            .unwrap_or_else(|| format!("upload-{}", new_id));
-                        let status = crate::batch::FileStatus::Processed.to_string();
-
-                        sqlx::query!(
-                            r#"
-                            INSERT INTO files (id, name, status, created_at, updated_at)
-                            VALUES ($1, $2, $3, NOW(), NOW())
-                            "#,
-                            new_id,
-                            stub_name,
-                            status,
-                        )
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| {
-                            FusilladeError::Other(anyhow!("Failed to create file stub: {}", e))
-                        })?;
-
-                        file_id = Some(new_id);
-                    }
-
-                    // Add to buffer
-                    template_buffer.push((template, template_count));
-                    template_count += 1;
-
-                    // Flush buffer if it reaches batch size
-                    if template_buffer.len() >= batch_size {
-                        Self::insert_template_batch(
-                            &mut tx,
-                            file_id.unwrap(),
-                            &template_buffer,
-                            self.template_generation_writes_enabled,
-                        )
-                        .await?;
-                        template_buffer.clear();
-                    }
+                FileStreamItem::Template(template) => (template, None),
+                FileStreamItem::TemplateWithMetadata { template, metadata } => {
+                    (template, Some(metadata))
                 }
                 FileStreamItem::Abort => {
                     // Roll back explicitly so the DB work is finished before we return and the
@@ -4066,6 +4033,46 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                     tracing::warn!("FileStreamItem::Error is deprecated; use Abort instead");
                     return Err(FusilladeError::ValidationError(err));
                 }
+            };
+            // Ensure we have a file ID (create stub if needed)
+            if file_id.is_none() {
+                let new_id = Uuid::new_v4();
+                let stub_name = metadata
+                    .filename
+                    .clone()
+                    .unwrap_or_else(|| format!("upload-{}", new_id));
+                let status = crate::batch::FileStatus::Processed.to_string();
+
+                sqlx::query!(
+                    r#"
+                    INSERT INTO files (id, name, status, created_at, updated_at)
+                    VALUES ($1, $2, $3, NOW(), NOW())
+                    "#,
+                    new_id,
+                    stub_name,
+                    status,
+                )
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to create file stub: {}", e)))?;
+
+                file_id = Some(new_id);
+            }
+
+            // Add to buffer
+            template_buffer.push((template, template_count, template_metadata));
+            template_count += 1;
+
+            // Flush buffer if it reaches batch size
+            if template_buffer.len() >= batch_size {
+                Self::insert_template_batch(
+                    &mut tx,
+                    file_id.unwrap(),
+                    &template_buffer,
+                    self.template_generation_writes_enabled,
+                )
+                .await?;
+                template_buffer.clear();
             }
         }
 
@@ -7207,7 +7214,8 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                       COALESCE(b.file_id::TEXT, '') as "batch_file_id!",
                       b.endpoint as "batch_endpoint!",
                       b.completion_window as "batch_completion_window?",
-                      b.metadata::TEXT as "batch_metadata",
+                      (CASE WHEN t.metadata IS NULL THEN b.metadata
+                            ELSE COALESCE(b.metadata, '{}'::jsonb) || t.metadata END)::TEXT as "batch_metadata",
                       b.output_file_id::TEXT as "batch_output_file_id",
                       b.error_file_id::TEXT as "batch_error_file_id",
                       COALESCE(b.created_by, '') as "batch_created_by!",
@@ -7622,7 +7630,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     async fn insert_template_batch(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         file_id: Uuid,
-        templates: &[(RequestTemplateInput, i32)],
+        templates: &[(RequestTemplateInput, i32, Option<serde_json::Value>)],
         generation_two: bool,
     ) -> Result<()> {
         if templates.is_empty() {
@@ -7632,23 +7640,35 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         // Prepare parallel arrays for UNNEST
         let custom_ids: Vec<Option<&str>> = templates
             .iter()
-            .map(|(t, _)| t.custom_id.as_deref())
+            .map(|(t, _, _)| t.custom_id.as_deref())
             .collect();
-        let endpoints: Vec<&str> = templates.iter().map(|(t, _)| t.endpoint.as_str()).collect();
-        let methods: Vec<&str> = templates.iter().map(|(t, _)| t.method.as_str()).collect();
-        let paths: Vec<&str> = templates.iter().map(|(t, _)| t.path.as_str()).collect();
+        let endpoints: Vec<&str> = templates
+            .iter()
+            .map(|(t, _, _)| t.endpoint.as_str())
+            .collect();
+        let methods: Vec<&str> = templates
+            .iter()
+            .map(|(t, _, _)| t.method.as_str())
+            .collect();
+        let paths: Vec<&str> = templates.iter().map(|(t, _, _)| t.path.as_str()).collect();
         // Borrow when the body is already clean (the common case); only the
         // rows that actually carry service_tier / background pay an
         // allocation here.
         let stored_bodies: Vec<std::borrow::Cow<'_, str>> = templates
             .iter()
-            .map(|(t, _)| sanitize_outbound_body(&t.body))
+            .map(|(t, _, _)| sanitize_outbound_body(&t.body))
             .collect();
         let bodies: Vec<&str> = stored_bodies.iter().map(AsRef::as_ref).collect();
-        let models: Vec<&str> = templates.iter().map(|(t, _)| t.model.as_str()).collect();
-        let api_keys: Vec<&str> = templates.iter().map(|(t, _)| t.api_key.as_str()).collect();
-        let line_numbers: Vec<i32> = templates.iter().map(|(_, line)| *line).collect();
+        let models: Vec<&str> = templates.iter().map(|(t, _, _)| t.model.as_str()).collect();
+        let api_keys: Vec<&str> = templates
+            .iter()
+            .map(|(t, _, _)| t.api_key.as_str())
+            .collect();
+        let line_numbers: Vec<i32> = templates.iter().map(|(_, line, _)| *line).collect();
         let body_byte_sizes: Vec<i64> = stored_bodies.iter().map(|b| b.len() as i64).collect();
+
+        let metadata: Vec<Option<serde_json::Value>> =
+            templates.iter().map(|(_, _, m)| m.clone()).collect();
 
         if generation_two {
             // Lazily guarantee this UTC week's partition. The fast path is a
@@ -7674,16 +7694,16 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 WITH inserted AS (
                     INSERT INTO request_templates_g2 (
                         created_on, file_id, custom_id, endpoint, method, path,
-                        body, model, api_key, line_number, body_byte_size
+                        body, model, api_key, line_number, body_byte_size, metadata
                     )
                     SELECT (statement_timestamp() AT TIME ZONE 'UTC')::date,
                            $1, custom_id, endpoint, method, path, body, model,
-                           api_key, line_number, body_byte_size
+                           api_key, line_number, body_byte_size, metadata
                     FROM UNNEST(
                         $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
-                        $7::text[], $8::text[], $9::int[], $10::bigint[]
+                        $7::text[], $8::text[], $9::int[], $10::bigint[], $11::jsonb[]
                     ) AS t(custom_id, endpoint, method, path, body, model, api_key,
-                           line_number, body_byte_size)
+                           line_number, body_byte_size, metadata)
                     RETURNING id, created_on
                 )
                 INSERT INTO request_template_routes (template_id, week_start)
@@ -7700,6 +7720,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             .bind(&api_keys as &[&str])
             .bind(&line_numbers as &[i32])
             .bind(&body_byte_sizes as &[i64])
+            .bind(&metadata)
             .execute(&mut **tx)
             .await
             .map_err(|e| {
@@ -7712,15 +7733,15 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             r#"
             INSERT INTO request_templates (
                 file_id, custom_id, endpoint, method, path, body, model,
-                api_key, line_number, body_byte_size
+                api_key, line_number, body_byte_size, metadata
             )
             SELECT $1, custom_id, endpoint, method, path, body, model, api_key,
-                   line_number, body_byte_size
+                   line_number, body_byte_size, metadata
             FROM UNNEST(
                 $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
-                $7::text[], $8::text[], $9::int[], $10::bigint[]
+                $7::text[], $8::text[], $9::int[], $10::bigint[], $11::jsonb[]
             ) AS t(custom_id, endpoint, method, path, body, model, api_key,
-                   line_number, body_byte_size)
+                   line_number, body_byte_size, metadata)
             "#,
             file_id,
             &custom_ids as &[Option<&str>],
@@ -7732,6 +7753,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             &api_keys as &[&str],
             &line_numbers as &[i32],
             &body_byte_sizes as &[i64],
+            &metadata as &[Option<serde_json::Value>],
         )
         .execute(&mut **tx)
         .await
@@ -12065,6 +12087,117 @@ mod tests {
             !metadata.contains_key("dw_unlisted"),
             "an unlisted key must not be forwarded: the allow-list is the contract"
         );
+    }
+
+    #[sqlx::test]
+    async fn file_template_metadata_survives_both_claim_paths_and_generations(pool: sqlx::PgPool) {
+        for generation_two in [false, true] {
+            for background in [false, true] {
+                let manager = PostgresRequestManager::with_client(
+                    TestDbPools::new(pool.clone()).await.unwrap(),
+                    Arc::new(MockHttpClient::new()),
+                )
+                .with_template_generation_writes(generation_two)
+                .with_config(PostgresStorageConfig {
+                    batch_metadata_fields: vec![
+                        "id".into(),
+                        "client".into(),
+                        "submitted_model".into(),
+                    ],
+                    background_concurrency_limit: 100,
+                    ..Default::default()
+                });
+                let mut items = vec![FileStreamItem::Metadata(FileMetadata {
+                    filename: Some("aliases.jsonl".into()),
+                    ..Default::default()
+                })];
+                for alias in ["test:fast", "test-fast"] {
+                    items.push(FileStreamItem::TemplateWithMetadata {
+                        template: RequestTemplateInput {
+                            custom_id: Some(alias.into()),
+                            endpoint: "https://api.example.com".into(),
+                            method: "POST".into(),
+                            path: "/v1/chat/completions".into(),
+                            body: r#"{"model":"test"}"#.into(),
+                            model: "test".into(),
+                            api_key: "key".into(),
+                        },
+                        metadata: serde_json::json!({"submitted_model": alias, "unlisted": "ignored"}),
+                    });
+                }
+                let FileStreamResult::Success(file_id) = manager
+                    .create_file_stream(futures::stream::iter(items))
+                    .await
+                    .unwrap()
+                else {
+                    panic!("upload aborted")
+                };
+                let metadata = Some(
+                    serde_json::json!({"client": "test-client", "submitted_model": "must-not-override-line"}),
+                );
+                if background {
+                    manager
+                        .create_background_batch(crate::batch::BackgroundBatchInput {
+                            file_id,
+                            endpoint: "/v1/chat/completions".into(),
+                            metadata,
+                            created_by: None,
+                            api_key_id: None,
+                            api_key: None,
+                            total_requests: None,
+                        })
+                        .await
+                        .unwrap();
+                } else {
+                    manager
+                        .create_batch(crate::batch::BatchInput {
+                            file_id,
+                            endpoint: "/v1/chat/completions".into(),
+                            completion_window: "24h".into(),
+                            metadata,
+                            created_by: None,
+                            api_key_id: None,
+                            api_key: None,
+                            total_requests: None,
+                        })
+                        .await
+                        .unwrap();
+                }
+                mark_models_live_for_test(&manager, ["test"]).await;
+                let capacity = HashMap::from([("test".to_string(), 100)]);
+                let daemon = DaemonId::from(Uuid::new_v4());
+                let claimed = if background {
+                    manager
+                        .claim_background_requests(10, 10, daemon, &capacity, &HashMap::new())
+                        .await
+                        .unwrap()
+                } else {
+                    manager
+                        .claim_batch_requests(10, 10, daemon, &capacity, &HashMap::new())
+                        .await
+                        .unwrap()
+                };
+                assert_eq!(
+                    claimed.len(),
+                    2,
+                    "generation_two={generation_two}, background={background}"
+                );
+                for request in claimed {
+                    assert_eq!(request.data.model, "test");
+                    let metadata = &request.data.batch_metadata;
+                    assert_eq!(
+                        metadata.get("submitted_model"),
+                        request.data.custom_id.as_ref()
+                    );
+                    assert_eq!(
+                        metadata.get("client").map(String::as_str),
+                        Some("test-client")
+                    );
+                    assert!(metadata.contains_key("id"));
+                    assert!(!metadata.contains_key("unlisted"));
+                }
+            }
+        }
     }
 
     /// Batchless metadata is optional, and the common case (no metadata at all) must not

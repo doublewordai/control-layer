@@ -24,7 +24,11 @@ impl<'c> ModelAliases<'c> {
                    dm.id AS deployed_model_id, c.id AS serving_class_id,
                    dm.alias AS canonical_alias, c.class_key
                FROM deployed_models dm JOIN model_serving_classes c ON c.deployed_model_id=dm.id
-               WHERE NOT dm.deleted AND dm.routing_mode='class_routes'"#
+               WHERE NOT dm.deleted AND dm.routing_mode='class_routes'
+                  AND EXISTS (SELECT 1 FROM model_serving_classes s WHERE s.deployed_model_id=dm.id AND s.class_key='standard')
+                  AND EXISTS (SELECT 1 FROM model_serving_classes f WHERE f.deployed_model_id=dm.id AND f.class_key='fast')
+                  AND NOT EXISTS (SELECT 1 FROM model_traffic_rules r WHERE r.action='redirect'
+                                  AND (r.deployed_model_id=dm.id OR r.redirect_target_id=dm.id))"#
         )
         .fetch_all(&mut *self.db)
         .await?)

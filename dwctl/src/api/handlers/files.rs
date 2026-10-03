@@ -969,7 +969,14 @@ fn create_file_stream(
 
                                                     line_count += 1;
                                                     incomplete_line.clear();
-                                                    if tx.send(fusillade::FileStreamItem::Template(template)).await.is_err() {
+                                                    if tx
+                                                        .send(fusillade::FileStreamItem::TemplateWithMetadata {
+                                                            template,
+                                                            metadata: serde_json::json!({"dw_submitted_model": openai_req.body["model"]}),
+                                                        })
+                                                        .await
+                                                        .is_err()
+                                                    {
                                                         return;
                                                     }
                                                 }
@@ -1055,7 +1062,14 @@ fn create_file_stream(
                                             }
 
                                             line_count += 1;
-                                            if tx.send(fusillade::FileStreamItem::Template(template)).await.is_err() {
+                                            if tx
+                                                .send(fusillade::FileStreamItem::TemplateWithMetadata {
+                                                    template,
+                                                    metadata: serde_json::json!({"dw_submitted_model": openai_req.body["model"]}),
+                                                })
+                                                .await
+                                                .is_err()
+                                            {
                                                 return;
                                             }
                                         }

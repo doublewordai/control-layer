@@ -993,7 +993,8 @@ impl<'c> ApiKeys<'c> {
                                 WHERE dm.routing_mode = 'class_routes'
                                   AND class_price.deployed_model_id = mt.deployed_model_id
                                   AND class_price.user_id IS NULL AND class_price.serving_class = $3
-                                  AND class_price.api_key_purpose = mt.api_key_purpose
+                                  AND (class_price.api_key_purpose = mt.api_key_purpose
+                                       OR (mt.api_key_purpose = 'playground' AND class_price.api_key_purpose = 'realtime'))
                                   AND class_price.completion_window IS NOT DISTINCT FROM mt.completion_window
                                   AND class_price.valid_from <= NOW()
                                   AND (class_price.valid_until IS NULL OR class_price.valid_until > NOW())
@@ -1056,7 +1057,8 @@ impl<'c> ApiKeys<'c> {
                                 WHERE dm.routing_mode = 'class_routes'
                                   AND class_price.deployed_model_id = mt.deployed_model_id
                                   AND class_price.user_id IS NULL AND class_price.serving_class = $3
-                                  AND class_price.api_key_purpose = mt.api_key_purpose
+                                  AND (class_price.api_key_purpose = mt.api_key_purpose
+                                       OR (mt.api_key_purpose = 'playground' AND class_price.api_key_purpose = 'realtime'))
                                   AND class_price.completion_window IS NOT DISTINCT FROM mt.completion_window
                                   AND class_price.valid_from <= NOW()
                                   AND (class_price.valid_until IS NULL OR class_price.valid_until > NOW())

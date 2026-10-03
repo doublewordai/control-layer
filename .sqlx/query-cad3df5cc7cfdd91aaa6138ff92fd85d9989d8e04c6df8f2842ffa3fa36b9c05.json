@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO request_templates (\n                file_id, custom_id, endpoint, method, path, body, model,\n                api_key, line_number, body_byte_size, metadata\n            )\n            SELECT $1, custom_id, endpoint, method, path, body, model, api_key,\n                   line_number, body_byte_size, metadata\n            FROM UNNEST(\n                $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],\n                $7::text[], $8::text[], $9::int[], $10::bigint[], $11::jsonb[]\n            ) AS t(custom_id, endpoint, method, path, body, model, api_key,\n                   line_number, body_byte_size, metadata)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "Int4Array",
+        "Int8Array",
+        "JsonbArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cad3df5cc7cfdd91aaa6138ff92fd85d9989d8e04c6df8f2842ffa3fa36b9c05"
+}
