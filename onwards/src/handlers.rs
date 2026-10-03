@@ -2000,8 +2000,11 @@ pub async fn target_message_handler<T: HttpClient>(
             && (200..300).contains(&status)
             && let Some(override_id) =
                 crate::response_id::extract_override_id(&original_headers, header_name)
+            && let Err(e) =
+                crate::response_id::patch_response_body_id(&mut response, override_id).await
         {
-            crate::response_id::patch_response_body_id(&mut response, override_id).await;
+            error!("Failed to buffer response body for ID override: {}", e);
+            return LoopAction::Done(Err(OnwardsErrorResponse::internal()));
         }
 
         // Add custom response headers
