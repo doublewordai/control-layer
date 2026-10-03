@@ -1136,6 +1136,170 @@ describe("API Keys Component - Functional Tests", () => {
       ).toBeInTheDocument();
     });
 
+    it("PM who is only a plain org member gets the bulk-select column and can bulk-delete a foreign key", async () => {
+      // Regression guard for the showSelect divergence: the default mock
+      // current user is a PlatformManager, and enterOrgContext("member",
+      // false) makes them an org "member" in a managed-keys org
+      // (can_manage_keys=false). canSelfManage is therefore false, but the
+      // PM may still manage every org key (canManageKey's isPlatformManager
+      // branch). showSelect must follow the same disjunction — otherwise the
+      // per-row Delete renders while the bulk-select column (and thus
+      // "Rotate Selected" / "Delete Selected") is dropped entirely.
+      const user = userEvent.setup();
+      enterOrgContext("member", false);
+
+      let keys = [
+        {
+          id: "foreign-key",
+          name: "Foreign Key",
+          purpose: "realtime",
+          created_at: "2026-01-01T00:00:00Z",
+          // Created by another member — canManageKey on this row can only
+          // be true via the isPlatformManager branch (canSelfManage is false
+          // here, and the current user isn't an org manager).
+          created_by: memberId,
+          secret_revealed_at: "2026-01-01T00:00:00Z",
+        },
+      ];
+      const deleteCalls: { userId: string; keyId: string }[] = [];
+
+      server.use(
+        http.get("/admin/api/v1/users/:userId/api-keys", () => {
+          return HttpResponse.json({
+            data: keys,
+            total_count: keys.length,
+            skip: 0,
+            limit: 10,
+          });
+        }),
+        http.delete(
+          "/admin/api/v1/users/:userId/api-keys/:keyId",
+          ({ params }) => {
+            deleteCalls.push({
+              userId: String(params.userId),
+              keyId: String(params.keyId),
+            });
+            keys = keys.filter((k) => k.id !== params.keyId);
+            return HttpResponse.json(null, { status: 204 });
+          },
+        ),
+      );
+
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
+      await within(container).findByText("Foreign Key");
+
+      // (a) The fix: the bulk-select column now renders for a PM-plain-member,
+      // so the header "Select all" checkbox is present. Before the fix this
+      // was dropped because showSelect was gated on canSelfManage.
+      expect(
+        within(container).getByRole("checkbox", { name: /select all/i }),
+      ).toBeInTheDocument();
+
+      // (b) End-to-end bulk delete: select the foreign key, open the bulk
+      // action bar, confirm, and prove the same DELETE the per-row path
+      // issues fires with {userId: orgId, keyId} — i.e. the bulk path the
+      // server authorizes for a PlatformManager is now reachable.
+      await user.click(
+        within(container).getByRole("checkbox", { name: /select all/i }),
+      );
+      await user.click(
+        within(container).getByRole("button", {
+          name: /delete 1 selected api key/i,
+        }),
+      );
+      await waitFor(() => {
+        expect(
+          screen.getByRole("heading", { name: /delete api keys/i }),
+        ).toBeInTheDocument();
+      });
+      await user.click(
+        screen.getByRole("button", { name: /delete 1 key/i }),
+      );
+
+      await waitFor(() => {
+        expect(deleteCalls).toHaveLength(1);
+      });
+      expect(deleteCalls[0]).toEqual({ userId: orgId, keyId: "foreign-key" });
+    });
+
+    it("PM who is only a plain org member can bulk-rotate a foreign key", async () => {
+      // Symmetric guard for the rotate half of the bulk path (Evidence 2 in
+      // the bug report: the server authorizes rotation for a PlatformManager
+      // via can_update_all_resources, independent of can_manage_keys). Same
+      // PM-plain-member cross-product as the bulk-delete test above.
+      const user = userEvent.setup();
+      enterOrgContext("member", false);
+
+      const rotateCalls: { userId: string; keyId: string }[] = [];
+      server.use(
+        http.get("/admin/api/v1/users/:userId/api-keys", () => {
+          return HttpResponse.json({
+            data: [
+              {
+                id: "foreign-key",
+                name: "Foreign Key",
+                purpose: "realtime",
+                created_at: "2026-01-01T00:00:00Z",
+                created_by: memberId,
+                secret_revealed_at: "2026-01-01T00:00:00Z",
+              },
+            ],
+            total_count: 1,
+            skip: 0,
+            limit: 10,
+          });
+        }),
+        http.post(
+          "/admin/api/v1/users/:userId/api-keys/:keyId/rotate",
+          ({ params }) => {
+            rotateCalls.push({
+              userId: String(params.userId),
+              keyId: String(params.keyId),
+            });
+            return HttpResponse.json({ key: `sk-bulk-${params.keyId}` });
+          },
+        ),
+      );
+
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
+      await within(container).findByText("Foreign Key");
+
+      // Select-all → bulk action bar → Rotate Selected.
+      await user.click(
+        within(container).getByRole("checkbox", { name: /select all/i }),
+      );
+      await user.click(
+        within(container).getByRole("button", {
+          name: /rotate 1 selected api key/i,
+        }),
+      );
+
+      // Confirmation modal, then one rotation per key.
+      await waitFor(() => {
+        expect(
+          screen.getByRole("heading", { name: /rotate api keys/i }),
+        ).toBeInTheDocument();
+      });
+      await user.click(
+        screen.getByRole("button", { name: /^rotate 1 key$/i }),
+      );
+
+      // The bulk-rotate loop issues the same POST …/rotate the per-row
+      // Rotate menu item uses, with {userId: orgId, keyId}.
+      await waitFor(() => {
+        expect(rotateCalls).toHaveLength(1);
+      });
+      expect(rotateCalls[0]).toEqual({ userId: orgId, keyId: "foreign-key" });
+
+      // One-time multi-secret display.
+      await waitFor(() => {
+        expect(
+          screen.getByRole("heading", { name: /api keys rotated/i }),
+        ).toBeInTheDocument();
+      });
+      expect(screen.getByText("sk-bulk-foreign-key")).toBeInTheDocument();
+    });
+
     it("shows scope tabs, member filter, and assignee column to an org manager", async () => {
       enterOrgContext("owner");
 

@@ -438,7 +438,10 @@ export const ApiKeys: React.FC = () => {
     // own keys, so the column would only ever echo their own name.
     showAssignee: isOrgContext && (isOrgManager || isPlatformManager),
     resolveAssignee: isOrgContext ? resolveAssignee : undefined,
-    showSelect: canSelfManage,
+    // Lockstep with canManageKey's management-rights disjunction (not the
+    // creation-rights canSelfManage flag): a PM or org manager may bulk-
+    // manage any org key they can see, even when can_manage_keys is false.
+    showSelect: isPlatformManager || isOrgManager || canSelfManage,
   });
 
   if (isLoading) {
