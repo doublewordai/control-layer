@@ -138,6 +138,29 @@ describe("canAccessRoute", () => {
     expect(canAccessRoute(["StandardUser"], "/unknown-route")).toBe(true);
     expect(canAccessRoute([], "/some-new-page")).toBe(true);
   });
+
+  it("gates /organizations/:organizationId with the organizations permission", () => {
+    // Roles granted "organizations" may access the org-detail route.
+    expect(
+      canAccessRoute(["PlatformManager"], "/organizations/:organizationId"),
+    ).toBe(true);
+    expect(
+      canAccessRoute(["StandardUser"], "/organizations/:organizationId"),
+    ).toBe(true);
+    // Roles denied "organizations" are redirected away from the org-detail
+    // route, matching the gate already enforced on /organization and
+    // /users-groups. Previously the parameterized route was unmapped in
+    // ROUTE_PERMISSIONS and fell into the "unknown route -> allow" branch.
+    expect(
+      canAccessRoute(["RequestViewer"], "/organizations/:organizationId"),
+    ).toBe(false);
+    expect(
+      canAccessRoute(["BillingManager"], "/organizations/:organizationId"),
+    ).toBe(false);
+    expect(
+      canAccessRoute(["ConnectionsUser"], "/organizations/:organizationId"),
+    ).toBe(false);
+  });
 });
 
 describe("getFirstAccessibleRoute", () => {

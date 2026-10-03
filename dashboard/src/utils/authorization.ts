@@ -86,6 +86,7 @@ export const ROUTE_PERMISSIONS: Record<string, PagePermission> = {
   "/cost-management": "cost-management",
   "/users-groups": "users-groups",
   "/organization": "my-organization",
+  "/organizations/:organizationId": "organizations",
   "/api-keys": "api-keys",
   "/settings": "settings",
   "/system": "settings",
