@@ -246,7 +246,8 @@ async fn strict_handler_keeps_gateway_ancestry(#[case] path: &str, #[case] body:
         *req.uri_mut() = path.parse().unwrap();
         *req.body_mut() = Body::from(body.to_owned());
         let response = app.oneshot(req).instrument(span).await.unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // The provider's 503 is a capacity refusal, answered as 529.
+        assert_eq!(response.status().as_u16(), 529);
         axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();

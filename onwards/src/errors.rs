@@ -17,10 +17,32 @@ use uuid::Uuid;
 
 use crate::reasoning::ReasoningError;
 
-/// Error code for a request refused because every provider is full.
+/// Error code for a request refused because the caller's own concurrency
+/// limit is reached.
 const CONCURRENCY_LIMIT_CODE: &str = "concurrency_limit_exceeded";
-/// Seconds a caller is told to wait after [`CONCURRENCY_LIMIT_CODE`].
-const CONCURRENCY_RETRY_AFTER_SECS: &str = "1";
+/// Error code for a request refused because the model's providers are full.
+const OVERLOADED_CODE: &str = "overloaded";
+/// Error code for a request refused because the model has no provider
+/// serving it right now.
+const NO_CAPACITY_CODE: &str = "no_capacity";
+
+/// Seconds a caller is told to wait before retrying a refusal with `code`.
+fn retry_after_secs(code: &str) -> Option<&'static str> {
+    match code {
+        // Room frees as in-flight requests finish.
+        CONCURRENCY_LIMIT_CODE | OVERLOADED_CODE => Some("1"),
+        // A provider has to be placed and start before anything is served.
+        NO_CAPACITY_CODE => Some("30"),
+        _ => None,
+    }
+}
+
+/// 529: the platform refused the request for capacity. Distinct from 503,
+/// which generic infrastructure sends when a backend is down, and from 429,
+/// which is the caller's own limit.
+fn overload_status() -> StatusCode {
+    StatusCode::from_u16(529).expect("529 is a valid status code")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponseBody {
@@ -113,6 +135,37 @@ impl OnwardsErrorResponse {
                 code: CONCURRENCY_LIMIT_CODE.to_string(),
             }),
             status: StatusCode::TOO_MANY_REQUESTS,
+            serving_outcome: None,
+            authenticated_api_key_id: None,
+        }
+    }
+
+    /// The model's providers are full right now.
+    pub fn overloaded() -> Self {
+        OnwardsErrorResponse {
+            body: Some(ErrorResponseBody {
+                message: "The model is at capacity. Please retry shortly.".to_string(),
+                r#type: "overloaded_error".to_string(),
+                param: None,
+                code: OVERLOADED_CODE.to_string(),
+            }),
+            status: overload_status(),
+            serving_outcome: None,
+            authenticated_api_key_id: None,
+        }
+    }
+
+    /// The model has no provider serving it right now.
+    pub fn no_capacity() -> Self {
+        OnwardsErrorResponse {
+            body: Some(ErrorResponseBody {
+                message: "The model has no capacity available right now. Please retry later."
+                    .to_string(),
+                r#type: "overloaded_error".to_string(),
+                param: None,
+                code: NO_CAPACITY_CODE.to_string(),
+            }),
+            status: overload_status(),
             serving_outcome: None,
             authenticated_api_key_id: None,
         }
@@ -270,17 +323,15 @@ impl IntoResponse for OnwardsErrorResponse {
             Some(ref body) => (self.status, Json(ErrorEnvelope { error: body })).into_response(),
             None => self.status.into_response(), // No body, just status
         };
-        // Capacity frees as in-flight requests finish, so a short wait is the
-        // right advice; SDKs that honour Retry-After wait this long.
-        if self
+        // SDKs that honour Retry-After wait this long before retrying.
+        if let Some(secs) = self
             .body
             .as_ref()
-            .is_some_and(|body| body.code == CONCURRENCY_LIMIT_CODE)
+            .and_then(|body| retry_after_secs(&body.code))
         {
-            response.headers_mut().insert(
-                RETRY_AFTER,
-                HeaderValue::from_static(CONCURRENCY_RETRY_AFTER_SECS),
-            );
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_static(secs));
         }
         if let Some(outcome) = self.serving_outcome {
             response.extensions_mut().insert(outcome);
