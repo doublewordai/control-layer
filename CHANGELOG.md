@@ -1,5 +1,12 @@
 # Changelog
 
+## [12.11.2](https://github.com/doublewordai/control-layer/compare/v12.11.1...v12.11.2) (2026-10-03)
+
+
+### Bug Fixes
+
+* **files:** ride out brief image-store outages during upload ([#1910](https://github.com/doublewordai/control-layer/issues/1910)) ([0468610](https://github.com/doublewordai/control-layer/commit/0468610f797dab33e388b5e6bc2c04f954de8969))
+
 ## [12.11.1](https://github.com/doublewordai/control-layer/compare/v12.11.0...v12.11.1) (2026-10-03)
 
 
