@@ -822,6 +822,16 @@ pub async fn target_message_handler<T: HttpClient>(
         }
     }
 
+    // Realtime traffic is everything the batch dispatcher did not stamp with
+    // the exempt header.
+    let is_realtime = !state
+        .first_token_timeout_exempt_header
+        .as_deref()
+        .is_some_and(|header| req.headers().contains_key(header));
+    // Labels failure outcomes, so a realtime outage can be told apart from a
+    // batch backlog retrying against the same model.
+    let traffic = if is_realtime { "realtime" } else { "dispatched" };
+
     // Check if pool has no providers (e.g., composite model with no enabled components).
     // This runs after routing rules so that redirects get a chance to replace the pool.
     if pool.is_empty() {
@@ -834,6 +844,7 @@ pub async fn target_message_handler<T: HttpClient>(
             "reason" => "no_providers",
             "status" => "503",
             "model" => model_name.to_string(),
+            "traffic" => traffic,
         )
         .increment(1);
         record_response_status(503);
@@ -972,14 +983,9 @@ pub async fn target_message_handler<T: HttpClient>(
     // headers only arrive once the whole completion is done, so a deadline
     // would cut off legitimately long answers. So is traffic carrying the
     // configured exempt header (e.g. batch dispatch, which runs its own retries).
-    // Realtime traffic is everything the batch dispatcher did not stamp with
-    // the exempt header. Only realtime gets the first-token deadline, AIMD
-    // observation and the realtime-only fallback statuses: dispatched traffic
-    // tolerates latency and runs its own retries.
-    let is_realtime = !state
-        .first_token_timeout_exempt_header
-        .as_deref()
-        .is_some_and(|header| original_headers.contains_key(header));
+    // Only realtime traffic (see `is_realtime`) gets the first-token deadline,
+    // AIMD observation and the realtime-only fallback statuses: dispatched
+    // traffic tolerates latency and runs its own retries.
     let first_token_timeout = pool
         .fallback()
         .filter(|f| f.enabled)
@@ -1089,6 +1095,11 @@ pub async fn target_message_handler<T: HttpClient>(
             .extensions()
             .get::<OriginalModel>()
             .map(|m| m.0.to_string());
+
+        // The upstream status THIS attempt received, if it got that far.
+        // Unlike `last_upstream_status` it never carries over from an earlier
+        // attempt, so it can say whether this member refused the request.
+        let mut attempt_upstream_status: Option<u16> = None;
 
         let action = async {
 
@@ -1429,6 +1440,7 @@ pub async fn target_message_handler<T: HttpClient>(
 
         let status = response.status().as_u16();
         last_upstream_status = Some(status);
+        attempt_upstream_status = Some(status);
         upstream_span.record("http.response.status_code", status);
         tracing::Span::current().record("http.response.status_code", status);
         // An error status settles the attempt's observation now: overload
@@ -1447,8 +1459,14 @@ pub async fn target_message_handler<T: HttpClient>(
                 status, target.url
             );
             tracing::Span::current().record("onwards.fallback", "status_fallback");
+            // A 529 means the provider is full, not broken. If it is the last
+            // word, answer as this gateway does when every member is at its
+            // concurrency limit, so callers back off rather than reading a
+            // 502 as an outage.
             let error = if status == 429 {
                 OnwardsErrorResponse::upstream_rate_limited(state.upstream_rate_limit_message.as_deref())
+            } else if status == 529 {
+                OnwardsErrorResponse::concurrency_limited()
             } else {
                 OnwardsErrorResponse::bad_gateway()
             };
@@ -1754,14 +1772,18 @@ pub async fn target_message_handler<T: HttpClient>(
                 // A 200 carrying an embedded error IS that error for our
                 // purposes, so it overrides the 200 recorded above.
                 last_upstream_status = Some(embedded);
+                attempt_upstream_status = Some(embedded);
 
                 let retryable = fails_over_on(embedded, attempt_number)
                     || (embedded == 429 && pool.should_fallback_on_rate_limit());
                 if retryable {
                     tracing::Span::current().record("onwards.fallback", "embedded_error");
-                    // Retain rate-limit semantics if all attempts are exhausted.
+                    // Retain rate-limit and overload semantics if all attempts
+                    // are exhausted.
                     let error = if embedded == 429 {
                         OnwardsErrorResponse::upstream_rate_limited(state.upstream_rate_limit_message.as_deref())
+                    } else if embedded == 529 {
+                        OnwardsErrorResponse::concurrency_limited()
                     } else {
                         OnwardsErrorResponse::service_unavailable()
                     };
@@ -2040,6 +2062,12 @@ pub async fn target_message_handler<T: HttpClient>(
         match action {
             LoopAction::Continue(err) => {
                 last_error = err;
+                // A member that refused for overload is full right now: trying
+                // it again within this request cannot succeed, so it sits out
+                // the rest of the request.
+                if matches!(attempt_upstream_status, Some(429 | 529)) {
+                    providers.mark_refused(member_idx);
+                }
                 // Sleep here — *after* the current connection_guard has gone
                 // out of scope but *before* select_iter().next() grabs the
                 // next one — so we don't pin a concurrency slot while waiting.
@@ -2103,6 +2131,7 @@ pub async fn target_message_handler<T: HttpClient>(
             // when no attempt got far enough to see one.
             "status" => last_upstream_status.unwrap_or(status).to_string(),
             "model" => model_name.to_string(),
+            "traffic" => traffic,
         )
         .increment(1);
         record_response_status(status);
@@ -2119,6 +2148,7 @@ pub async fn target_message_handler<T: HttpClient>(
             "reason" => "no_eligible_provider",
             "status" => "503",
             "model" => model_name.to_string(),
+            "traffic" => traffic,
         )
         .increment(1);
         record_response_status(503);
@@ -2139,6 +2169,7 @@ pub async fn target_message_handler<T: HttpClient>(
             "reason" => "all_at_capacity",
             "status" => "429",
             "model" => model_name.to_string(),
+            "traffic" => traffic,
         )
         .increment(1);
         record_response_status(429);
@@ -2152,6 +2183,7 @@ pub async fn target_message_handler<T: HttpClient>(
             "reason" => "empty_pool_late",
             "status" => status.to_string(),
             "model" => model_name.to_string(),
+            "traffic" => traffic,
         )
         .increment(1);
         record_response_status(status);

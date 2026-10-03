@@ -291,6 +291,7 @@ impl ProviderPool {
             pool: self,
             excluded: HashSet::new(),
             ineligible: HashSet::new(),
+            refused: HashSet::new(),
             max_attempts,
             attempts: 0,
             with_replacement,
@@ -735,6 +736,10 @@ pub struct SelectIter<'a> {
     /// account's external members). Never cleared: the attempt budget is
     /// spent on eligible members only, whatever the strategy.
     ineligible: HashSet<usize>,
+    /// Members that refused this request for overload. Never cleared: a
+    /// member that has just said it is full is not retried within the same
+    /// request, so a new pass cannot spend the budget re-asking it.
+    refused: HashSet<usize>,
     max_attempts: usize,
     attempts: usize,
     with_replacement: bool,
@@ -750,9 +755,20 @@ impl SelectIter<'_> {
         self
     }
 
-    /// The tried set plus the permanently ineligible members.
+    /// Take a member that refused this request for overload out of the rest
+    /// of the request, including later passes.
+    pub(crate) fn mark_refused(&mut self, member: usize) {
+        self.refused.insert(member);
+    }
+
+    /// The tried set plus the members out for the whole request.
     fn exclusions(&self) -> HashSet<usize> {
-        self.excluded.union(&self.ineligible).copied().collect()
+        self.excluded
+            .iter()
+            .chain(&self.ineligible)
+            .chain(&self.refused)
+            .copied()
+            .collect()
     }
 
     /// Whether a different, untried member can currently accept a failover.
@@ -769,6 +785,7 @@ impl SelectIter<'_> {
                 .any(|(index, provider)| {
                     index != current_member
                         && !self.ineligible.contains(&index)
+                        && !self.refused.contains(&index)
                         && !self.excluded.contains(&index)
                         && !provider.limiter.at_capacity()
                 })
@@ -1800,6 +1817,47 @@ mod tests {
         assert_eq!(order.len(), 2);
         assert_eq!(order[0].1.url.as_str(), "https://primary.example.com/");
         assert_eq!(order[1].1.url.as_str(), "https://secondary.example.com/");
+    }
+
+    #[test]
+    fn test_select_iter_refused_member_sits_out_later_passes() {
+        use crate::target::{FallbackConfig, LoadBalanceStrategy};
+
+        let providers = vec![
+            Provider::new(create_test_target("https://primary.example.com"), 1),
+            Provider::new(create_test_target("https://secondary.example.com"), 1),
+        ];
+        let pool = ProviderPool::with_config(
+            providers,
+            None,
+            None,
+            None,
+            Some(FallbackConfig {
+                enabled: true,
+                max_attempts: Some(6),
+                ..Default::default()
+            }),
+            LoadBalanceStrategy::Priority,
+            false,
+            Vec::new(),
+        );
+
+        let mut iter = pool.select_iter();
+        let (first, _, guard) = iter.next().unwrap();
+        drop(guard);
+        assert_eq!(first, 0);
+        iter.mark_refused(first);
+
+        // The second pass re-includes members that merely failed, but never
+        // the refused one: only the secondary is left, again and again.
+        let rest: Vec<usize> = std::iter::from_fn(|| iter.next().map(|(idx, _, _)| idx)).collect();
+        assert_eq!(rest, vec![1, 1, 1, 1, 1]);
+
+        // With every member refused, the request ends instead of re-asking.
+        let mut iter = pool.select_iter();
+        iter.mark_refused(0);
+        iter.mark_refused(1);
+        assert!(iter.next().is_none());
     }
 
     #[test]
