@@ -941,6 +941,12 @@ pub async fn update_deployed_model<P: PoolProvider>(
         });
     }
 
+    if !is_composite && update.realtime_inflight_limit.is_some() {
+        return Err(Error::BadRequest {
+            message: "realtime_inflight_limit is only supported for composite models".to_string(),
+        });
+    }
+
     // Validate the backoff state the update would *result in*, merging
     // incoming fields over the stored values. Without merging, a one-sided
     // partial update (e.g. only raising initial_ms above the stored max_ms)
@@ -2159,6 +2165,30 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(stored, None);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_standard_model_patch_rejects_realtime_inflight_limit(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let model = create_test_deployment(&pool, user.id, "inflight-standard", "inflight-standard").await;
+
+        let response = app
+            .patch(&format!("/admin/api/v1/models/{}", model.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .json(&json!({ "realtime_inflight_limit": 500 }))
+            .await;
+
+        response.assert_status_bad_request();
+
+        let stored = sqlx::query_scalar::<_, i32>("SELECT realtime_inflight_limit FROM deployed_models WHERE id = $1")
+            .bind(model.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, 100);
     }
 
     #[dwctl_test_macros::test]
