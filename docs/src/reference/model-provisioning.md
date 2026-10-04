@@ -254,7 +254,8 @@ models. Two values are exceptions:
   virtual model; setting it on a deployment is an error. Per-account
   overrides are set through the admin API
   (`/admin/api/v1/models/{id}/realtime-inflight-limits/{account_id}`), not in
-  YAML.
+  YAML. A request that a traffic rule redirects to another model counts
+  against the limit of the model it named.
 
 The retired settings `requests_per_second`, `burst_size` and `capacity` are
 still accepted so older catalogs load, but they are ignored.

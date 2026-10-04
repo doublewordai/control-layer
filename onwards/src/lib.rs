@@ -3428,13 +3428,17 @@ mod tests {
     }
 
     fn limited_chat_request(key: &str) -> axum::extract::Request {
+        inflight_chat_request("limited-model", key)
+    }
+
+    fn inflight_chat_request(model: &str, key: &str) -> axum::extract::Request {
         axum::extract::Request::builder()
             .uri("/v1/chat/completions")
             .method("POST")
             .header("content-type", "application/json")
             .header("authorization", format!("Bearer {key}"))
             .body(axum::body::Body::from(
-                r#"{"model":"limited-model","messages":[]}"#,
+                json!({"model": model, "messages": []}).to_string(),
             ))
             .unwrap()
     }
@@ -3547,6 +3551,108 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(realtime.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_inflight_limit_counts_a_redirected_request_against_the_model_it_named() {
+        use crate::target::{LoadBalanceStrategy, RoutingAction, RoutingRule};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let provider = || {
+            Provider::new(
+                Target::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .build(),
+                1,
+            )
+        };
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "named-model".to_string(),
+            ProviderPool::with_config(
+                vec![provider()],
+                None,
+                None,
+                None,
+                None,
+                LoadBalanceStrategy::default(),
+                false,
+                vec![RoutingRule {
+                    match_labels: std::collections::HashMap::from([(
+                        "purpose".to_string(),
+                        "realtime".to_string(),
+                    )]),
+                    action: RoutingAction::Redirect {
+                        target: "served-model".to_string(),
+                    },
+                }],
+            )
+            .with_inflight_limits(Some(inflight::InflightLimits {
+                default: 1,
+                accounts: std::collections::HashMap::new(),
+            }))
+            .into(),
+        );
+        targets_map.insert(
+            "served-model".to_string(),
+            ProviderPool::new(vec![provider()])
+                .with_inflight_limits(Some(inflight::InflightLimits {
+                    default: 5,
+                    accounts: std::collections::HashMap::new(),
+                }))
+                .into(),
+        );
+        let key_labels = Arc::new(DashMap::new());
+        key_labels.insert(
+            "sk-acct-a".to_string(),
+            std::collections::HashMap::from([
+                (serving::ACCOUNT_LABEL.to_string(), "acct-a".to_string()),
+                ("purpose".to_string(), "realtime".to_string()),
+            ]),
+        );
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels,
+            accounts: Arc::new(DashMap::new()),
+            strict_mode: false,
+            http_pool_config: None,
+        };
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let router = build_router(AppState::with_client(targets, mock_client.clone()));
+
+        let redirected = router
+            .clone()
+            .oneshot(inflight_chat_request("named-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(redirected.status(), StatusCode::OK);
+
+        let refused = router
+            .clone()
+            .oneshot(inflight_chat_request("named-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        let refused_body: serde_json::Value =
+            serde_json::from_slice(&refused.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert!(
+            refused_body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("'named-model'")
+        );
+
+        let direct = router
+            .clone()
+            .oneshot(inflight_chat_request("served-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(direct.status(), StatusCode::OK);
+        assert_eq!(mock_client.get_requests().len(), 2);
     }
 
     mod metrics {

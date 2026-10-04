@@ -83,8 +83,10 @@ overrides it for named accounts:
 }
 ```
 
-The slot is taken after routing rules, held across failover attempts, and
-released when the response body finishes or the client disconnects. A request
+The slot is taken after routing rules and counts against the alias the request
+named, even when a rule redirects it to another alias, so the named alias's
+limits apply. It is held across failover attempts and released when the
+response body finishes or the client disconnects. A request
 over the limit receives `429` with code `inflight_limit_exceeded`. Requests
 carrying the `first_token_timeout_exempt_header` (dispatched batch work) and
 requests from keys with no `account` label are not counted. Counts are per

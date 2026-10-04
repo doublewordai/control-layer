@@ -604,7 +604,7 @@ pub async fn target_message_handler<T: HttpClient>(
     let request_class = RequestClass::from_path(&canonical_request_path);
     // The alias's serving policy (presets, overlays) is declared on its
     // default pool and applies whichever pool serves this request's class.
-    let (mut resolved_pool_name, mut pool, mut alias_serving, mut alias_inflight, mut inflight_model) = match state.targets.targets.get(&model_name) {
+    let (mut resolved_pool_name, mut pool, mut alias_serving, alias_inflight) = match state.targets.targets.get(&model_name) {
         Some(pools) => {
             // Now that the model is known to be a configured target, tag the
             // in-flight guard so `onwards_model_inflight{model=…}` tracks this
@@ -620,7 +620,6 @@ pub async fn target_message_handler<T: HttpClient>(
                 pools.resolve(request_class).clone(),
                 pools.default_pool().alias_serving().clone(),
                 pools.default_pool().inflight_limits().cloned(),
-                model_name.to_string(),
             )
         }
         None => {
@@ -719,8 +718,6 @@ pub async fn target_message_handler<T: HttpClient>(
                             Some(p) => {
                                 resolved_pool_name = p.resolved_name(request_class);
                                 alias_serving = p.default_pool().alias_serving().clone();
-                                alias_inflight = p.default_pool().inflight_limits().cloned();
-                                inflight_model = redirect_alias.clone();
                                 p.resolve(request_class).clone()
                             }
                             None => {
@@ -869,22 +866,22 @@ pub async fn target_message_handler<T: HttpClient>(
             let limit = limits.for_account(account);
             match state
                 .inflight_limiter
-                .try_acquire(account, &inflight_model, limit)
+                .try_acquire(account, &model_name, limit)
                 .await
             {
                 Some(slot) => Some(slot),
                 None => {
                     debug!(
                         "In-flight limit of {} reached for account {} on model {}",
-                        limit, account, inflight_model
+                        limit, account, model_name
                     );
                     metrics::counter!(
                         "onwards_inflight_limit_refusals_total",
-                        "model" => inflight_model.clone(),
+                        "model" => model_name.clone(),
                     )
                     .increment(1);
                     record_response_status(429);
-                    return Err(OnwardsErrorResponse::inflight_limited(&inflight_model, limit));
+                    return Err(OnwardsErrorResponse::inflight_limited(&model_name, limit));
                 }
             }
         }
