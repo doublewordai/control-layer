@@ -569,6 +569,24 @@ metadata:
 | `docs_url` | string | `"https://doublewordai.github.io/control-layer/"` | Documentation link in header. |
 | `docs_jsonl_url` | string | - | JSONL docs link in batch upload modal. |
 
+## Realtime In-Flight Limits
+
+Each virtual model has a default number of realtime requests one account may
+have in flight on it (`realtime_inflight_limit`), and platform managers can
+override it per account. Replicas share their counts through Redis:
+
+```yaml
+limits:
+  realtime_inflight:
+    redis_url: rediss://:password@limits-redis.example:6379
+```
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `limits.realtime_inflight.redis_url` | unset | Redis holding the shared counts. Unset, or unreachable, each replica counts only its own requests. |
+
+`auth.rate_limits` is no longer used and is ignored if present.
+
 ## Observability
 
 ### Metrics

@@ -494,6 +494,10 @@ batches:
 #     # Default: 10MB (10485760)
 #     # Changing this limit requires a restart to rebuild all routing layers.
 #     max_body_size: 10485760
+#   realtime_inflight:
+#     # Redis that holds the realtime in-flight counts every replica shares.
+#     # Unset or unreachable: each replica counts only its own requests.
+#     redis_url: rediss://:password@limits-redis.example:6379
 
 # External data source connections (S3, etc.)
 # Allows users to connect external storage and sync files for batch processing.

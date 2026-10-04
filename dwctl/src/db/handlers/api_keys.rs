@@ -51,8 +51,6 @@ struct ApiKey {
     pub created_by: UserId,
     pub created_at: DateTime<Utc>,
     pub last_used: Option<DateTime<Utc>>,
-    pub requests_per_second: Option<f32>,
-    pub burst_size: Option<i32>,
     pub hidden: bool,
     pub is_deleted: bool,
     pub spend_limit: Option<Decimal>,
@@ -93,8 +91,6 @@ impl From<(Vec<DeploymentId>, ApiKey)> for ApiKeyDBResponse {
             created_at: api_key.created_at,
             last_used: api_key.last_used,
             model_access,
-            requests_per_second: api_key.requests_per_second,
-            burst_size: api_key.burst_size,
             spend_limit: api_key.spend_limit,
             spend_limit_interval: api_key.spend_limit_interval,
             parent_api_key_id: api_key.parent_api_key_id,
@@ -132,9 +128,9 @@ impl<'c> Repository for ApiKeys<'c> {
         let api_key = sqlx::query_as!(
             ApiKey,
             r#"
-            INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, requests_per_second, burst_size, hidden, spend_limit, spend_limit_interval)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, $9, $10)
-            RETURNING id, name, description, secret, user_id, created_at, last_used, requests_per_second, burst_size, purpose, hidden, is_deleted, created_by, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at
+            INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden, spend_limit, spend_limit_interval)
+            VALUES ($1, $2, $3, $4, $5, $6, false, $7, $8)
+            RETURNING id, name, description, secret, user_id, created_at, last_used, purpose, hidden, is_deleted, created_by, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at
             "#,
             request.name,
             request.description,
@@ -142,8 +138,6 @@ impl<'c> Repository for ApiKeys<'c> {
             purpose_str,
             request.user_id,
             request.created_by,
-            request.requests_per_second,
-            request.burst_size,
             request.spend_limit,
             request.spend_limit_interval
         )
@@ -157,7 +151,7 @@ impl<'c> Repository for ApiKeys<'c> {
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let api_key = sqlx::query_as!(
             ApiKey,
-            "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at FROM api_keys WHERE id = $1 AND is_deleted = false",
+            "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at FROM api_keys WHERE id = $1 AND is_deleted = false",
             id
         )
             .fetch_optional(&mut *self.db)
@@ -173,7 +167,7 @@ impl<'c> Repository for ApiKeys<'c> {
     async fn get_bulk(&mut self, ids: Vec<Self::Id>) -> Result<HashMap<Self::Id, Self::Response>> {
         let api_keys = sqlx::query_as!(
             ApiKey,
-            "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at FROM api_keys WHERE id = ANY($1) AND is_deleted = false",
+            "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at FROM api_keys WHERE id = ANY($1) AND is_deleted = false",
             &ids
         )
             .fetch_all(&mut *self.db)
@@ -191,7 +185,7 @@ impl<'c> Repository for ApiKeys<'c> {
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
         let api_keys = sqlx::query_as!(
             ApiKey,
-            r#"SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at
+            r#"SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at
             FROM api_keys
             WHERE hidden = false AND is_deleted = false
               AND ($1::uuid IS NULL OR user_id = $1)
@@ -252,23 +246,13 @@ impl<'c> Repository for ApiKeys<'c> {
                 description = CASE
                     WHEN $3::text IS NOT NULL THEN $3
                     ELSE description
-                END,
-                requests_per_second = CASE
-                    WHEN $4::real IS NOT NULL THEN $4
-                    ELSE requests_per_second
-                END,
-                burst_size = CASE
-                    WHEN $5::integer IS NOT NULL THEN $5
-                    ELSE burst_size
                 END
             WHERE id = $1
-            RETURNING id, name, description, secret, user_id, created_at, last_used, requests_per_second, burst_size, purpose, hidden, is_deleted, created_by, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at
+            RETURNING id, name, description, secret, user_id, created_at, last_used, purpose, hidden, is_deleted, created_by, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at
             "#,
             id,
             request.name,
-            request.description,
-            request.requests_per_second.unwrap_or(None),
-            request.burst_size.unwrap_or(None)
+            request.description
         )
         .fetch_optional(&mut *self.db)
         .await?
@@ -927,8 +911,6 @@ impl<'c> ApiKeys<'c> {
                 ak.created_by as "created_by!",
                 ak.created_at as "created_at!",
                 ak.last_used,
-                ak.requests_per_second,
-                ak.burst_size,
                 ak.hidden as "hidden!",
                 ak.is_deleted as "is_deleted!",
                 ak.spend_limit,
@@ -950,8 +932,6 @@ impl<'c> ApiKeys<'c> {
                 ak.created_by as "created_by!",
                 ak.created_at as "created_at!",
                 ak.last_used,
-                ak.requests_per_second,
-                ak.burst_size,
                 ak.hidden as "hidden!",
                 ak.is_deleted as "is_deleted!",
                 ak.spend_limit,
@@ -1000,8 +980,6 @@ impl<'c> ApiKeys<'c> {
                 ak.created_by as "created_by!",
                 ak.created_at as "created_at!",
                 ak.last_used,
-                ak.requests_per_second,
-                ak.burst_size,
                 ak.hidden as "hidden!",
                 ak.is_deleted as "is_deleted!",
                 ak.spend_limit,
@@ -1217,8 +1195,6 @@ mod tests {
                     name: "Test API Key".to_string(),
                     description: Some("Test description".to_string()),
                     purpose: ApiKeyPurpose::Realtime,
-                    requests_per_second: None,
-                    burst_size: None,
                     created_by: userid,
                     spend_limit: None,
                     spend_limit_interval: None,
@@ -1260,8 +1236,6 @@ mod tests {
                 name: format!("key-{}", &uuid::Uuid::new_v4().to_string()[..8]),
                 description: None,
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -1420,8 +1394,6 @@ mod tests {
                 name: "Key 1".to_string(),
                 description: None,
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -1431,8 +1403,6 @@ mod tests {
                 name: "Key 2".to_string(),
                 description: Some("Key 2 description".to_string()),
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -1489,8 +1459,6 @@ mod tests {
                 name: "Delete Me".to_string(),
                 description: None,
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -1535,8 +1503,6 @@ mod tests {
                 name: "Trait Test Key".to_string(),
                 description: Some("Test trait description".to_string()),
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -1560,8 +1526,6 @@ mod tests {
         let update = ApiKeyUpdateDBRequest {
             name: Some("Updated Key Name".to_string()),
             description: Some("Updated description".to_string()),
-            requests_per_second: None,
-            burst_size: None,
         };
         let updated_key = api_repo.update(api_key.id, &update).await.unwrap();
         assert_eq!(updated_key.name, "Updated Key Name");
@@ -1662,8 +1626,6 @@ mod tests {
                 name: "Test API Key".to_string(),
                 description: Some("API key for testing group access".to_string()),
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -1795,8 +1757,6 @@ mod tests {
                 name: "Test API Key".to_string(),
                 description: Some("API key for testing access removal".to_string()),
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -1942,8 +1902,6 @@ mod tests {
                 name: "Test API Key".to_string(),
                 description: Some("API key for testing deployment removal".to_string()),
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -2115,8 +2073,6 @@ mod tests {
                 name: "User 1 Key".to_string(),
                 description: Some("API key for user 1".to_string()),
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user1.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -2128,8 +2084,6 @@ mod tests {
                 name: "User 2 Key".to_string(),
                 description: Some("API key for user 2".to_string()),
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user2.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -2305,8 +2259,6 @@ mod tests {
                 name: "Multi Access Key".to_string(),
                 description: Some("API key for multiple deployments".to_string()),
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -2450,8 +2402,6 @@ mod tests {
                 name: "Dynamic Access Key".to_string(),
                 description: Some("API key for testing dynamic access".to_string()),
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -2674,8 +2624,6 @@ mod tests {
                 name: "Test API Key".to_string(),
                 description: Some("API key for testing Everyone group access".to_string()),
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -2761,8 +2709,6 @@ mod tests {
                     name: format!("Pagination Key {i}"),
                     description: Some(format!("Key {i} for pagination testing")),
                     purpose: ApiKeyPurpose::Realtime,
-                    requests_per_second: None,
-                    burst_size: None,
                     created_by: user.id,
                     spend_limit: None,
                     spend_limit_interval: None,
@@ -2896,8 +2842,6 @@ mod tests {
                 name: "User1 Key".to_string(),
                 description: None,
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user1.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -2907,8 +2851,6 @@ mod tests {
                 name: "User2 Key".to_string(),
                 description: None,
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user2.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -2975,8 +2917,6 @@ mod tests {
             name: "Bulk Key 1".to_string(),
             description: Some("First bulk key".to_string()),
             purpose: ApiKeyPurpose::Realtime,
-            requests_per_second: None,
-            burst_size: None,
             created_by: user.id,
             spend_limit: None,
             spend_limit_interval: None,
@@ -2986,8 +2926,6 @@ mod tests {
             name: "Bulk Key 2".to_string(),
             description: Some("Second bulk key".to_string()),
             purpose: ApiKeyPurpose::Realtime,
-            requests_per_second: None,
-            burst_size: None,
             created_by: user.id,
             spend_limit: None,
             spend_limit_interval: None,
@@ -2997,8 +2935,6 @@ mod tests {
             name: "Bulk Key 3".to_string(),
             description: None,
             purpose: ApiKeyPurpose::Realtime,
-            requests_per_second: None,
-            burst_size: None,
             created_by: user.id,
             spend_limit: None,
             spend_limit_interval: None,
@@ -3057,8 +2993,6 @@ mod tests {
             name: "Valid Key".to_string(),
             description: Some("Only valid key".to_string()),
             purpose: ApiKeyPurpose::Realtime,
-            requests_per_second: None,
-            burst_size: None,
             created_by: user.id,
             spend_limit: None,
             spend_limit_interval: None,
@@ -3139,8 +3073,6 @@ mod tests {
             name: "Duplicate Test Key".to_string(),
             description: Some("Key for testing duplicates".to_string()),
             purpose: ApiKeyPurpose::Realtime,
-            requests_per_second: None,
-            burst_size: None,
             created_by: user.id,
             spend_limit: None,
             spend_limit_interval: None,
@@ -3230,8 +3162,6 @@ mod tests {
             name: "Bulk Access Key 1".to_string(),
             description: Some("First key with model access".to_string()),
             purpose: ApiKeyPurpose::Realtime,
-            requests_per_second: None,
-            burst_size: None,
             created_by: user.id,
             spend_limit: None,
             spend_limit_interval: None,
@@ -3241,8 +3171,6 @@ mod tests {
             name: "Bulk Access Key 2".to_string(),
             description: Some("Second key with model access".to_string()),
             purpose: ApiKeyPurpose::Realtime,
-            requests_per_second: None,
-            burst_size: None,
             created_by: user.id,
             spend_limit: None,
             spend_limit_interval: None,
@@ -3304,8 +3232,6 @@ mod tests {
             name: "User1 Bulk Key".to_string(),
             description: Some("Key for user 1".to_string()),
             purpose: ApiKeyPurpose::Realtime,
-            requests_per_second: None,
-            burst_size: None,
             created_by: user1.id,
             spend_limit: None,
             spend_limit_interval: None,
@@ -3315,8 +3241,6 @@ mod tests {
             name: "User2 Bulk Key".to_string(),
             description: Some("Key for user 2".to_string()),
             purpose: ApiKeyPurpose::Realtime,
-            requests_per_second: None,
-            burst_size: None,
             created_by: user2.id,
             spend_limit: None,
             spend_limit_interval: None,
@@ -3563,8 +3487,6 @@ mod tests {
                 name: "Key with credits".to_string(),
                 description: Some("Has sufficient credits".to_string()),
                 user_id: user_with_credits.id,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user_with_credits.id,
                 purpose: ApiKeyPurpose::Realtime,
                 spend_limit: None,
@@ -3578,8 +3500,6 @@ mod tests {
                 name: "Key without credits".to_string(),
                 description: Some("Has insufficient credits".to_string()),
                 user_id: user_without_credits.id,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user_without_credits.id,
                 purpose: ApiKeyPurpose::Realtime,
                 spend_limit: None,
@@ -3709,8 +3629,6 @@ mod tests {
                     user_id: platform_manager.id,
                     name: "Platform Manager Key".to_string(),
                     description: None,
-                    requests_per_second: None,
-                    burst_size: None,
                     created_by: platform_manager.id,
                     purpose: ApiKeyPurpose::Realtime,
                     spend_limit: None,
@@ -3805,8 +3723,6 @@ mod tests {
                     user_id: user_no_transactions.id,
                     name: "No Transactions Key".to_string(),
                     description: None,
-                    requests_per_second: None,
-                    burst_size: None,
                     created_by: user_no_transactions.id,
                     purpose: ApiKeyPurpose::Realtime,
                     spend_limit: None,
@@ -3870,8 +3786,6 @@ mod tests {
                     user_id: user_negative.id,
                     name: "Negative Balance Key".to_string(),
                     description: None,
-                    requests_per_second: None,
-                    burst_size: None,
                     created_by: user_negative.id,
                     purpose: ApiKeyPurpose::Realtime,
                     spend_limit: None,
@@ -3964,8 +3878,6 @@ mod tests {
                     user_id: user.id,
                     name: "Regains Access Key".to_string(),
                     description: None,
-                    requests_per_second: None,
-                    burst_size: None,
                     created_by: user.id,
                     purpose: ApiKeyPurpose::Realtime,
                     spend_limit: None,
@@ -4108,8 +4020,6 @@ mod tests {
                 name: "Zero Credits Key".to_string(),
                 description: Some("User with no credits".to_string()),
                 user_id: user_no_credits.id,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user_no_credits.id,
                 purpose: ApiKeyPurpose::Realtime,
                 spend_limit: None,
@@ -4248,8 +4158,6 @@ mod tests {
                 name: "Zero Credits Key".to_string(),
                 description: Some("User with no credits".to_string()),
                 user_id: user_no_credits.id,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user_no_credits.id,
                 purpose: ApiKeyPurpose::Realtime,
                 spend_limit: None,
@@ -4388,8 +4296,6 @@ mod tests {
                 name: "Zero Credits Key".to_string(),
                 description: Some("User with no credits".to_string()),
                 user_id: user_no_credits.id,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user_no_credits.id,
                 purpose: ApiKeyPurpose::Realtime,
                 spend_limit: None,
@@ -4452,8 +4358,6 @@ mod tests {
                 name: "Test Secret Key".to_string(),
                 description: Some("Key for testing secret lookup".to_string()),
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -4515,8 +4419,6 @@ mod tests {
                     name: "Soft Delete Key".to_string(),
                     description: None,
                     purpose: ApiKeyPurpose::Realtime,
-                    requests_per_second: None,
-                    burst_size: None,
                     created_by: user.id,
                     spend_limit: None,
                     spend_limit_interval: None,
@@ -4572,8 +4474,6 @@ mod tests {
                     name: "To Delete".to_string(),
                     description: None,
                     purpose: ApiKeyPurpose::Realtime,
-                    requests_per_second: None,
-                    burst_size: None,
                     created_by: user.id,
                     spend_limit: None,
                     spend_limit_interval: None,
@@ -4587,8 +4487,6 @@ mod tests {
                     name: "Keep Me".to_string(),
                     description: None,
                     purpose: ApiKeyPurpose::Realtime,
-                    requests_per_second: None,
-                    burst_size: None,
                     created_by: user.id,
                     spend_limit: None,
                     spend_limit_interval: None,
@@ -4656,8 +4554,6 @@ mod tests {
                 name: "Org Key".to_string(),
                 description: None,
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: member.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -4885,8 +4781,6 @@ mod tests {
                     name: "A-Key-1".to_string(),
                     description: None,
                     purpose: ApiKeyPurpose::Realtime,
-                    requests_per_second: None,
-                    burst_size: None,
                     created_by: member_a.id,
                     spend_limit: None,
                     spend_limit_interval: None,
@@ -4899,8 +4793,6 @@ mod tests {
                     name: "A-Key-2".to_string(),
                     description: None,
                     purpose: ApiKeyPurpose::Realtime,
-                    requests_per_second: None,
-                    burst_size: None,
                     created_by: member_a.id,
                     spend_limit: None,
                     spend_limit_interval: None,
@@ -4914,8 +4806,6 @@ mod tests {
                     name: "B-Key-1".to_string(),
                     description: None,
                     purpose: ApiKeyPurpose::Realtime,
-                    requests_per_second: None,
-                    burst_size: None,
                     created_by: member_b.id,
                     spend_limit: None,
                     spend_limit_interval: None,
@@ -5016,8 +4906,6 @@ mod tests {
                         name: format!("A-Key-{i}"),
                         description: None,
                         purpose: ApiKeyPurpose::Realtime,
-                        requests_per_second: None,
-                        burst_size: None,
                         created_by: member_a.id,
                         spend_limit: None,
                         spend_limit_interval: None,
@@ -5031,8 +4919,6 @@ mod tests {
                     name: "B-Key".to_string(),
                     description: None,
                     purpose: ApiKeyPurpose::Realtime,
-                    requests_per_second: None,
-                    burst_size: None,
                     created_by: member_b.id,
                     spend_limit: None,
                     spend_limit_interval: None,

@@ -218,13 +218,7 @@ pub struct StandardModelCreate {
     pub model_type: Option<ModelType>,
     /// Optional array of model capabilities
     pub capabilities: Option<Vec<String>>,
-    /// Global per-model rate limit: requests per second (null = no limit)
-    pub requests_per_second: Option<f32>,
-    /// Global per-model rate limit: maximum burst size (null = no limit)
-    pub burst_size: Option<i32>,
-    /// Maximum number of concurrent requests allowed for this model (null = no limit)
-    pub capacity: Option<i32>,
-    /// Maximum number of concurrent batch requests allowed for this model (null = defaults to capacity or no limit)
+    /// Maximum number of concurrent batch requests allowed for this model (null = the batch daemon default)
     pub batch_capacity: Option<i32>,
     /// Throughput in requests/second for batch capacity calculations (null = use config default)
     pub throughput: Option<f32>,
@@ -292,13 +286,8 @@ pub struct CompositeModelCreate {
     pub model_type: Option<ModelType>,
     /// Optional array of model capabilities
     pub capabilities: Option<Vec<String>>,
-    /// Global per-model rate limit: requests per second (null = no limit)
-    pub requests_per_second: Option<f32>,
-    /// Global per-model rate limit: maximum burst size (null = no limit)
-    pub burst_size: Option<i32>,
-    /// Maximum number of concurrent requests allowed for this model (null = no limit)
-    pub capacity: Option<i32>,
-    /// Maximum number of concurrent batch requests allowed for this model (null = defaults to capacity or no limit)
+    pub realtime_inflight_limit: Option<i32>,
+    /// Maximum number of concurrent batch requests allowed for this model (null = the batch daemon default)
     pub batch_capacity: Option<i32>,
     /// Throughput in requests/second for batch capacity calculations (null = use config default)
     pub throughput: Option<f32>,
@@ -413,15 +402,8 @@ pub struct DeployedModelUpdate {
     pub description: Option<Option<String>>,
     pub model_type: Option<Option<ModelType>>,
     pub capabilities: Option<Option<Vec<String>>>,
-    /// Global per-model rate limit: requests per second (null = no change, Some(None) = remove limit)
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
-    pub requests_per_second: Option<Option<f32>>,
-    /// Global per-model rate limit: maximum burst size (null = no change, Some(None) = remove limit)
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
-    pub burst_size: Option<Option<i32>>,
-    /// Maximum concurrent requests (null = no change, Some(None) = remove limit, Some(Some(n)) = set limit)
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
-    pub capacity: Option<Option<i32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realtime_inflight_limit: Option<i32>,
     /// Maximum concurrent batch requests (null = no change, Some(None) = remove limit, Some(Some(n)) = set limit)
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub batch_capacity: Option<Option<i32>>,
@@ -548,16 +530,9 @@ pub struct DeployedModelResponse {
     pub hosted_on: Option<InferenceEndpointId>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    /// Global per-model rate limit: requests per second (null = no limit)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub requests_per_second: Option<f32>,
-    /// Global per-model rate limit: maximum burst size (null = no limit)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub burst_size: Option<i32>,
-    /// Maximum number of concurrent requests allowed for this model (null = no limit)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub capacity: Option<i32>,
-    /// Maximum number of concurrent batch requests allowed for this model (null = defaults to capacity or no limit)
+    pub realtime_inflight_limit: Option<i32>,
+    /// Maximum number of concurrent batch requests allowed for this model (null = the batch daemon default)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_capacity: Option<i32>,
     /// Throughput in requests/second for batch capacity calculations (null = use config default)
@@ -677,9 +652,7 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             hosted_on: db.hosted_on,
             created_at: db.created_at,
             updated_at: db.updated_at,
-            requests_per_second: db.requests_per_second,
-            burst_size: db.burst_size,
-            capacity: db.capacity,
+            realtime_inflight_limit: db.is_composite.then_some(db.realtime_inflight_limit),
             batch_capacity: db.batch_capacity,
             throughput: db.throughput,
             groups: None,           // By default, relationships are not included
@@ -761,14 +734,12 @@ impl DeployedModelResponse {
 
     /// Mask rate limiting information (sets to None for users without permission)
     pub fn mask_rate_limiting(mut self) -> Self {
-        self.requests_per_second = None;
-        self.burst_size = None;
+        self.realtime_inflight_limit = None;
         self
     }
 
     /// Mask capacity information (sets to None for users without permission)
     pub fn mask_capacity(mut self) -> Self {
-        self.capacity = None;
         self.batch_capacity = None;
         self.throughput = None;
         self

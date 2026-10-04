@@ -1,0 +1,59 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT o.user_id AS account_id, u.username AS account_name, o.inflight_limit, o.reason, o.set_by,\n                   o.valid_from, o.valid_until\n            FROM realtime_inflight_limit_overrides o\n            INNER JOIN users u ON u.id = o.user_id\n            WHERE o.deployed_model_id = $1\n              AND o.user_id = $2\n            ORDER BY o.valid_from DESC, o.valid_until DESC NULLS FIRST\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "account_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "account_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "inflight_limit",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "reason",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "set_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "valid_from",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "valid_until",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "b708d9f23eea27f45bad7e3314322f4a0b5a21c83ea9cdd321c3491bf1d64ec8"
+}

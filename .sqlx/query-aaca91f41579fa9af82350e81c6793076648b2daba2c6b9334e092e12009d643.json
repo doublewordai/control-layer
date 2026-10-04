@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE realtime_inflight_limit_overrides\n            SET valid_until = NOW()\n            WHERE deployed_model_id = $1 AND user_id = $2 AND valid_until IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "aaca91f41579fa9af82350e81c6793076648b2daba2c6b9334e092e12009d643"
+}

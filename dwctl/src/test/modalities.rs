@@ -27,8 +27,6 @@ async fn create_org_api_key(pool: &PgPool, org_id: UserId, member_id: UserId) ->
                 name: "org key".to_string(),
                 description: None,
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 member_id: None,
                 spend_limit: None,
                 spend_limit_interval: None,

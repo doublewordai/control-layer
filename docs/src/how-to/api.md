@@ -18,9 +18,6 @@ API keys inherit your user permissions. You can only access models assigned to y
 When creating a key, you can optionally set:
 
 - **Description**: Notes about what this key is for
-- **Rate limit**: Maximum requests per second (1–10,000) and burst size (1–50,000)
-
-Leave rate limits empty for unlimited requests.
 
 ## Configure your client
 
@@ -119,6 +116,6 @@ Create separate keys for different applications so you can revoke one without af
 
 **404 Model not found**: The model name doesn't match any available model. Check the exact name on the Models page.
 
-**429 Too Many Requests**: You've hit the rate limit configured on your API key. Wait and retry, or ask your admin to increase the limit.
+**429 Too Many Requests** with code `inflight_limit_exceeded`: your account already has as many realtime requests in flight on that model as its limit allows. Every key on the account shares the limit. Retry once a request completes, or ask your admin to raise the limit. Batch and async requests are not counted.
 
 **502/503 errors**: The upstream model provider is having issues. Check the provider's status page.

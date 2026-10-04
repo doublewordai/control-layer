@@ -166,9 +166,7 @@ const ModelInfo: React.FC = () => {
     sanitize_responses: false,
     trusted: false,
     reasoning_translation_overrides: null as ReasoningTranslationOverrides | null,
-    requests_per_second: null as number | null,
-    burst_size: null as number | null,
-    capacity: null as number | null,
+    realtime_inflight_limit: null as number | null,
     batch_capacity: null as number | null,
     throughput: null as number | null,
     allowed_batch_completion_windows: null as string[] | null,
@@ -291,9 +289,7 @@ const ModelInfo: React.FC = () => {
           normalizeReasoningTranslationOverrides(
             model.reasoning_translation_overrides ?? null,
           ),
-        requests_per_second: model.requests_per_second || null,
-        burst_size: model.burst_size || null,
-        capacity: model.capacity || null,
+        realtime_inflight_limit: model.realtime_inflight_limit ?? null,
         batch_capacity: model.batch_capacity || null,
         throughput: model.throughput || null,
         allowed_batch_completion_windows:
@@ -392,11 +388,10 @@ const ModelInfo: React.FC = () => {
                   ),
               }
             : {}),
-          // Always include rate limiting and capacity fields to handle clearing properly
           // Send null as the actual value when clearing (not undefined)
-          requests_per_second: updateData.requests_per_second,
-          burst_size: updateData.burst_size,
-          capacity: updateData.capacity,
+          ...(isStandard
+            ? {}
+            : { realtime_inflight_limit: updateData.realtime_inflight_limit }),
           batch_capacity: updateData.batch_capacity,
           throughput: updateData.throughput,
           allowed_batch_completion_windows:
@@ -440,9 +435,7 @@ const ModelInfo: React.FC = () => {
           normalizeReasoningTranslationOverrides(
             model.reasoning_translation_overrides ?? null,
           ),
-        requests_per_second: model.requests_per_second || null,
-        burst_size: model.burst_size || null,
-        capacity: model.capacity || null,
+        realtime_inflight_limit: model.realtime_inflight_limit ?? null,
         batch_capacity: model.batch_capacity || null,
         throughput: model.throughput || null,
         allowed_batch_completion_windows:
@@ -1631,121 +1624,47 @@ const ModelInfo: React.FC = () => {
                         })()}
                       </div>
 
-                      {/* Rate Limiting Section */}
+                      {/* Limits and Capacity Section */}
                       <div className="border-t pt-4">
                         <div className="flex items-center gap-1 mb-3">
                           <label className="text-sm text-gray-600 font-medium">
-                            Global Rate Limiting
+                            Limits and Capacity
                           </label>
-                          <InfoTip>
-                            <p className="text-sm text-muted-foreground">
-                              Set system-wide rate limits for this model.
-                              These apply to all users and override individual
-                              API key limits. Leave fields blank for no
-                              limits/defaults.
-                            </p>
-                          </InfoTip>
                         </div>
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                          <div>
-                            <label className="text-sm text-gray-600 mb-2 flex items-center gap-1">
-                              Requests per Second
-                              <InfoTip>
-                                <p className="text-sm text-muted-foreground">
-                                  Sustained request rate limit. Temporary
-                                  bursts can exceed this up to the burst size.
-                                  Exceeding this limit returns 429 errors.
-                                </p>
-                              </InfoTip>
-                            </label>
-                            <Input
-                              type="number"
-                              min="1"
-                              max="10000"
-                              step="1"
-                              value={updateData.requests_per_second || ""}
-                              onChange={(e) =>
-                                setUpdateData((prev) => ({
-                                  ...prev,
-                                  requests_per_second:
-                                    e.target.value === ""
-                                      ? null
-                                      : Number(e.target.value),
-                                }))
-                              }
-                              placeholder={
-                                updateData.requests_per_second !== null
-                                  ? updateData.requests_per_second?.toString() ||
-                                    "None"
-                                  : "None"
-                              }
-                            />
-                          </div>
-                          <div>
-                            <label className="text-sm text-gray-600 mb-2 flex items-center gap-1">
-                              Burst Size
-                              <InfoTip>
-                                <p className="text-sm text-muted-foreground">
-                                  Maximum number of requests allowed in a
-                                  temporary burst above the sustained rate.
-                                </p>
-                              </InfoTip>
-                            </label>
-                            <Input
-                              type="number"
-                              min="1"
-                              max="50000"
-                              step="1"
-                              value={updateData.burst_size || ""}
-                              onChange={(e) =>
-                                setUpdateData((prev) => ({
-                                  ...prev,
-                                  burst_size:
-                                    e.target.value === ""
-                                      ? null
-                                      : Number(e.target.value),
-                                }))
-                              }
-                              placeholder={
-                                updateData.burst_size !== null
-                                  ? updateData.burst_size?.toString() || "None"
-                                  : "None"
-                              }
-                            />
-                          </div>
-                          <div>
-                            <label className="text-sm text-gray-600 mb-2 flex items-center gap-1">
-                              Maximum Concurrent Requests
-                              <InfoTip>
-                                <p className="text-sm text-muted-foreground">
-                                  Maximum number of requests that can be
-                                  processed concurrently. Exceeding this limit
-                                  returns 429 errors.
-                                </p>
-                              </InfoTip>
-                            </label>
-                            <Input
-                              type="number"
-                              min="1"
-                              max="10000"
-                              step="1"
-                              value={updateData.capacity || ""}
-                              onChange={(e) =>
-                                setUpdateData((prev) => ({
-                                  ...prev,
-                                  capacity:
-                                    e.target.value === ""
-                                      ? null
-                                      : Number(e.target.value),
-                                }))
-                              }
-                              placeholder={
-                                updateData.capacity !== null
-                                  ? updateData.capacity?.toString() || "None"
-                                  : "None"
-                              }
-                            />
-                          </div>
+                          {model.is_composite && (
+                            <div>
+                              <label className="text-sm text-gray-600 mb-2 flex items-center gap-1">
+                                Realtime In-Flight Limit
+                                <InfoTip>
+                                  <p className="text-sm text-muted-foreground">
+                                    Default number of realtime requests one
+                                    account can have in flight on this model.
+                                    Requests over the limit get a 429. Batch
+                                    and async requests are not counted.
+                                    Per-account overrides are set through the
+                                    admin API.
+                                  </p>
+                                </InfoTip>
+                              </label>
+                              <Input
+                                type="number"
+                                min="1"
+                                step="1"
+                                aria-label="Realtime In-Flight Limit"
+                                value={updateData.realtime_inflight_limit ?? ""}
+                                onChange={(e) =>
+                                  setUpdateData((prev) => ({
+                                    ...prev,
+                                    realtime_inflight_limit:
+                                      e.target.value === ""
+                                        ? null
+                                        : Number(e.target.value),
+                                  }))
+                                }
+                              />
+                            </div>
+                          )}
                           <div>
                             <label className="text-sm text-gray-600 mb-2 flex items-center gap-1">
                               Per-Daemon Batch Concurrency
@@ -1828,10 +1747,7 @@ const ModelInfo: React.FC = () => {
                             />
                           </div>
                         </div>
-                        {(updateData.requests_per_second ||
-                          updateData.burst_size ||
-                          updateData.capacity ||
-                          updateData.batch_capacity ||
+                        {(updateData.batch_capacity ||
                           updateData.throughput) && (
                           <div className="mt-3">
                             <Button
@@ -1841,51 +1757,16 @@ const ModelInfo: React.FC = () => {
                               onClick={() =>
                                 setUpdateData((prev) => ({
                                   ...prev,
-                                  requests_per_second: null,
-                                  burst_size: null,
-                                  capacity: null,
                                   batch_capacity: null,
                                   throughput: null,
                                 }))
                               }
                               className="text-xs"
                             >
-                              Clear Rate Limits & Capacity
+                              Clear Batch Capacity
                             </Button>
                           </div>
                         )}
-                        {updateData.burst_size &&
-                          !updateData.requests_per_second && (
-                            <div className="mt-2 p-2 bg-yellow-50 border border-yellow-200 rounded-md">
-                              <p className="text-xs text-yellow-700">
-                                ⚠️ Burst size will be ignored without requests
-                                per second. Set requests per second to enable
-                                rate limiting.
-                              </p>
-                            </div>
-                          )}
-                        {updateData.batch_capacity &&
-                          updateData.capacity &&
-                          runningDaemonCount > 0 &&
-                          updateData.batch_capacity * runningDaemonCount >
-                            updateData.capacity && (
-                            <div className="mt-2 p-2 bg-yellow-50 border border-yellow-200 rounded-md">
-                              <p className="text-xs text-yellow-700">
-                                ⚠️ Total batch capacity (
-                                {(
-                                  updateData.batch_capacity * runningDaemonCount
-                                ).toLocaleString()}{" "}
-                                = {updateData.batch_capacity.toLocaleString()} ×{" "}
-                                {runningDaemonCount}{" "}
-                                {runningDaemonCount === 1
-                                  ? "daemon"
-                                  : "daemons"}
-                                ) exceeds the maximum concurrent requests limit
-                                ({updateData.capacity.toLocaleString()}). Batch
-                                requests may be rate limited.
-                              </p>
-                            </div>
-                          )}
                       </div>
 
                       {/* Retry Backoff Section */}
@@ -2464,78 +2345,38 @@ const ModelInfo: React.FC = () => {
                         onEditCache={() => setShowCachePricingModal(true)}
                       />
 
-                      {/* Rate Limiting & Capacity Display - only show for Platform Managers */}
+                      {/* Limits & Capacity Display - only show for Platform Managers */}
                       {canManageGroups &&
-                        (model.requests_per_second !== undefined ||
-                          model.burst_size !== undefined ||
-                          model.capacity !== undefined ||
+                        (model.realtime_inflight_limit !== undefined ||
                           model.batch_capacity !== undefined ||
                           model.throughput !== undefined) && (
                           <div className="border-t pt-6">
                             <div className="flex items-center gap-1 mb-1">
                               <p className="text-sm text-gray-600">
-                                Rate Limiting & Capacity
+                                Limits & Capacity
                               </p>
-                              <InfoTip>
-                                <p className="text-sm text-muted-foreground">
-                                  Rate limits control request throughput.
-                                  Capacity limits control concurrent requests.
-                                </p>
-                              </InfoTip>
                             </div>
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                              <div>
-                                <p className="text-xs text-gray-500 mb-1 flex items-center gap-1">
-                                  Requests per Second
-                                  <InfoTip>
-                                    <p className="text-sm text-muted-foreground">
-                                      Sustained request rate limit. Temporary
-                                      bursts can exceed this up to the burst
-                                      size. Exceeding this limit returns 429
-                                      errors.
-                                    </p>
-                                  </InfoTip>
-                                </p>
-                                <p className="font-medium">
-                                  {model.requests_per_second
-                                    ? `${model.requests_per_second} req/s`
-                                    : "No limit"}
-                                </p>
-                              </div>
-                              <div>
-                                <p className="text-xs text-gray-500 mb-1 flex items-center gap-1">
-                                  Burst Size
-                                  <InfoTip>
-                                    <p className="text-sm text-muted-foreground">
-                                      Maximum number of requests allowed in a
-                                      temporary burst above the sustained
-                                      rate.
-                                    </p>
-                                  </InfoTip>
-                                </p>
-                                <p className="font-medium">
-                                  {model.burst_size
-                                    ? model.burst_size.toLocaleString()
-                                    : "No limit"}
-                                </p>
-                              </div>
-                              <div>
-                                <p className="text-xs text-gray-500 mb-1 flex items-center gap-1">
-                                  Maximum Concurrent Requests
-                                  <InfoTip>
-                                    <p className="text-sm text-muted-foreground">
-                                      Maximum number of requests that can be
-                                      processed concurrently. Exceeding this
-                                      limit returns 429 errors.
-                                    </p>
-                                  </InfoTip>
-                                </p>
-                                <p className="font-medium">
-                                  {model.capacity
-                                    ? `${model.capacity.toLocaleString()} concurrent`
-                                    : "No limit"}
-                                </p>
-                              </div>
+                              {model.is_composite && (
+                                <div>
+                                  <p className="text-xs text-gray-500 mb-1 flex items-center gap-1">
+                                    Realtime In-Flight Limit
+                                    <InfoTip>
+                                      <p className="text-sm text-muted-foreground">
+                                        Default number of realtime requests one
+                                        account can have in flight on this
+                                        model. Batch and async requests are not
+                                        counted.
+                                      </p>
+                                    </InfoTip>
+                                  </p>
+                                  <p className="font-medium">
+                                    {model.realtime_inflight_limit != null
+                                      ? `${model.realtime_inflight_limit.toLocaleString()} per account`
+                                      : "Not visible"}
+                                  </p>
+                                </div>
+                              )}
                               <div>
                                 <p className="text-xs text-gray-500 mb-1 flex items-center gap-1">
                                   Per-Daemon Batch Concurrency
@@ -2582,37 +2423,6 @@ const ModelInfo: React.FC = () => {
                                 </p>
                               </div>
                             </div>
-                            {model.burst_size && !model.requests_per_second && (
-                              <div className="mt-4 p-2 bg-yellow-50 border border-yellow-200 rounded-md">
-                                <p className="text-xs text-yellow-700">
-                                  ⚠️ Burst size will be ignored without requests
-                                  per second. Set requests per second to enable
-                                  rate limiting.
-                                </p>
-                              </div>
-                            )}
-                            {model.batch_capacity &&
-                              model.capacity &&
-                              runningDaemonCount > 0 &&
-                              model.batch_capacity * runningDaemonCount >
-                                model.capacity && (
-                                <div className="mt-4 p-2 bg-yellow-50 border border-yellow-200 rounded-md">
-                                  <p className="text-xs text-yellow-700">
-                                    ⚠️ Total batch capacity (
-                                    {(
-                                      model.batch_capacity * runningDaemonCount
-                                    ).toLocaleString()}{" "}
-                                    = {model.batch_capacity.toLocaleString()} ×{" "}
-                                    {runningDaemonCount}{" "}
-                                    {runningDaemonCount === 1
-                                      ? "daemon"
-                                      : "daemons"}
-                                    ) exceeds the maximum concurrent requests
-                                    limit ({model.capacity.toLocaleString()}).
-                                    Batch requests may be rate limited.
-                                  </p>
-                                </div>
-                              )}
                           </div>
                         )}
                     </div>

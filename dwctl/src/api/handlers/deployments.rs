@@ -3759,76 +3759,65 @@ mod tests {
 
     #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn test_rate_limits_permission_gating(pool: PgPool) {
+    async fn test_realtime_inflight_limit_permission_gating(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager = create_test_admin_user(&pool, Role::PlatformManager).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
+        let auth = |user| add_auth_headers(user);
 
-        // Create a deployment with rate limits
-        let deployment = create_test_deployment(&pool, platform_manager.id, "rate-limit-test", "rate-limit-alias").await;
-
-        // Set rate limits on the deployment
-        let update = json!({
-            "requests_per_second": 100.0,
-            "burst_size": 200
-        });
+        let manager_auth = auth(&platform_manager);
         let response = app
-            .patch(&format!("/admin/api/v1/models/{}", deployment.id))
-            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
-            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
-            .json(&update)
+            .post("/admin/api/v1/models")
+            .add_header(&manager_auth[0].0, &manager_auth[0].1)
+            .add_header(&manager_auth[1].0, &manager_auth[1].1)
+            .json(&json!({
+                "type": "composite",
+                "model_name": "inflight-composite",
+                "alias": "inflight-composite",
+                "realtime_inflight_limit": 40
+            }))
+            .await;
+        response.assert_status_ok();
+        let created: DeployedModelResponse = response.json();
+        assert_eq!(created.realtime_inflight_limit, Some(40));
+
+        let response = app
+            .patch(&format!("/admin/api/v1/models/{}", created.id))
+            .add_header(&manager_auth[0].0, &manager_auth[0].1)
+            .add_header(&manager_auth[1].0, &manager_auth[1].1)
+            .json(&json!({ "realtime_inflight_limit": 60 }))
             .await;
         response.assert_status_ok();
 
-        // Create a group and add users to it so they can see the deployment
         let mut pool_conn = pool.acquire().await.unwrap();
         let mut group_repo = Groups::new(&mut pool_conn);
-        let group_create = GroupCreateDBRequest {
-            name: "Rate Limit Test Group".to_string(),
-            description: Some("Test group for rate limit permissions".to_string()),
-            created_by: platform_manager.id,
-        };
-        let group = group_repo.create(&group_create).await.unwrap();
+        let group = group_repo
+            .create(&GroupCreateDBRequest {
+                name: "In-flight Limit Test Group".to_string(),
+                description: None,
+                created_by: platform_manager.id,
+            })
+            .await
+            .unwrap();
         group_repo.add_user_to_group(standard_user.id, group.id).await.unwrap();
         group_repo.add_user_to_group(request_viewer.id, group.id).await.unwrap();
         group_repo
-            .add_deployment_to_group(deployment.id, group.id, platform_manager.id)
+            .add_deployment_to_group(created.id, group.id, platform_manager.id)
             .await
             .unwrap();
 
-        // PlatformManager should see rate limits (has ModelRateLimits::ReadAll)
-        let response = app
-            .get(&format!("/admin/api/v1/models/{}", deployment.id))
-            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
-            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
-            .await;
-        response.assert_status_ok();
-        let pm_model: DeployedModelResponse = response.json();
-        assert_eq!(pm_model.requests_per_second, Some(100.0), "PlatformManager should see rate limits");
-        assert_eq!(pm_model.burst_size, Some(200), "PlatformManager should see burst size");
-
-        // StandardUser should NOT see rate limits (masked)
-        let response = app
-            .get(&format!("/admin/api/v1/models/{}", deployment.id))
-            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
-            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
-            .await;
-        response.assert_status_ok();
-        let user_model: DeployedModelResponse = response.json();
-        assert_eq!(user_model.requests_per_second, None, "StandardUser should NOT see rate limits");
-        assert_eq!(user_model.burst_size, None, "StandardUser should NOT see burst size");
-
-        // RequestViewer should NOT see rate limits (masked)
-        let response = app
-            .get(&format!("/admin/api/v1/models/{}", deployment.id))
-            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
-            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
-            .await;
-        response.assert_status_ok();
-        let rv_model: DeployedModelResponse = response.json();
-        assert_eq!(rv_model.requests_per_second, None, "RequestViewer should NOT see rate limits");
-        assert_eq!(rv_model.burst_size, None, "RequestViewer should NOT see burst size");
+        for (user, expected) in [(&platform_manager, Some(60)), (&standard_user, None), (&request_viewer, None)] {
+            let headers = auth(user);
+            let response = app
+                .get(&format!("/admin/api/v1/models/{}", created.id))
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .await;
+            response.assert_status_ok();
+            let model: DeployedModelResponse = response.json();
+            assert_eq!(model.realtime_inflight_limit, expected);
+        }
     }
 
     #[dwctl_test_macros::test]

@@ -173,6 +173,7 @@ pub mod pricing;
 mod probes;
 pub mod profiling;
 pub mod prompt_cache;
+pub mod realtime_inflight;
 pub mod reasoning;
 mod recompute;
 mod request_logging;
@@ -612,9 +613,6 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
                             description: None,
                             model_type: None,
                             capabilities: None,
-                            requests_per_second: None,
-                            burst_size: None,
-                            capacity: None,
                             batch_capacity: None,
                             throughput: None,
                             tariffs: None,
@@ -2003,6 +2001,19 @@ pub async fn build_router(
         .route("/models/{id}", patch(api::handlers::deployments::update_deployed_model))
         .route("/models/{id}", delete(api::handlers::deployments::delete_deployed_model))
         .route("/models/{id}/overlays", get(api::handlers::serving::list_model_overlays))
+        .route(
+            "/models/{id}/realtime-inflight-limits",
+            get(api::handlers::realtime_inflight_limits::list_realtime_inflight_limits),
+        )
+        .route(
+            "/models/{id}/realtime-inflight-limits/{account_id}",
+            put(api::handlers::realtime_inflight_limits::set_realtime_inflight_override)
+                .delete(api::handlers::realtime_inflight_limits::clear_realtime_inflight_override),
+        )
+        .route(
+            "/models/{id}/realtime-inflight-limits/{account_id}/history",
+            get(api::handlers::realtime_inflight_limits::get_realtime_inflight_override_history),
+        )
         .route("/models/{id}/cache-pricing", get(api::handlers::cache_pricing::get_cache_pricing))
         .route(
             "/models/{id}/cache-pricing",
@@ -3085,9 +3096,7 @@ impl BackgroundServices {
 
         // Use the same load function as the automatic sync
         // Note: escalation_models is empty for tests - individual tests can set up their own
-        let new_targets =
-            crate::sync::onwards_config::load_targets_from_db(pool, &[], self.strict_mode, &crate::config::RateLimitTiersConfig::default())
-                .await?;
+        let new_targets = crate::sync::onwards_config::load_targets_from_db(pool, &[], self.strict_mode).await?;
 
         // Snapshot the routing table this update should produce, before the
         // config is handed to the channel.
@@ -3433,7 +3442,6 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
             config.background_services.batch_daemon.default_model_concurrency,
             escalation_models,
             config.onwards.strict_mode,
-            config.auth.rate_limits.clone(),
         )
         .await?;
 
@@ -4365,7 +4373,10 @@ impl Application {
             // Realtime traffic never carries it (the realtime path only adds
             // `x-fusillade-request-id`), so it exempts exactly the daemon
             // traffic, which tolerates latency and runs its own retries.
-            .with_first_token_timeout_exempt_header("x-fusillade-batch-created-at");
+            .with_first_token_timeout_exempt_header("x-fusillade-batch-created-at")
+            .with_inflight_limiter(Arc::new(crate::realtime_inflight::RealtimeInflightLimiter::from_config(
+                &config.limits.realtime_inflight,
+            )?));
         if config.onwards.first_token_timeout_ms > 0 {
             onwards_app_state =
                 onwards_app_state.with_first_token_timeout(std::time::Duration::from_millis(config.onwards.first_token_timeout_ms));

@@ -368,8 +368,6 @@ mod tests {
             name: format!("Org key {}", uuid::Uuid::new_v4().simple()),
             description: None,
             purpose: ApiKeyPurpose::Realtime,
-            requests_per_second: None,
-            burst_size: None,
             member_id: None,
             spend_limit: None,
             spend_limit_interval: None,
