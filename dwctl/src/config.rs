@@ -1153,6 +1153,7 @@ pub struct LimitsConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RealtimeInflightLimitsConfig {
+    pub enforce: bool,
     pub redis_url: Option<String>,
 }
 

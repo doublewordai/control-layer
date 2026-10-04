@@ -578,11 +578,13 @@ override it per account. Replicas share their counts through Redis:
 ```yaml
 limits:
   realtime_inflight:
+    enforce: true
     redis_url: rediss://:password@limits-redis.example:6379
 ```
 
 | Setting | Default | Description |
 |---------|---------|-------------|
+| `limits.realtime_inflight.enforce` | `false` | Refuse requests over the limit. Off, every request is admitted, so defaults and overrides can be set before the limit takes effect. |
 | `limits.realtime_inflight.redis_url` | unset | Redis holding the shared counts. Unset, or unreachable, each replica counts only its own requests. |
 
 `auth.rate_limits` is no longer used and is ignored if present.

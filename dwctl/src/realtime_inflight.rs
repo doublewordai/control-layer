@@ -34,6 +34,7 @@ return 1
 ";
 
 pub struct RealtimeInflightLimiter {
+    enforce: bool,
     redis: Option<Pool>,
     local: LocalInflightLimiter,
     exempt_account: String,
@@ -42,6 +43,7 @@ pub struct RealtimeInflightLimiter {
 impl fmt::Debug for RealtimeInflightLimiter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RealtimeInflightLimiter")
+            .field("enforce", &self.enforce)
             .field("redis", &self.redis.is_some())
             .finish()
     }
@@ -55,6 +57,7 @@ impl RealtimeInflightLimiter {
             .map(|url| RedisConfig::from_url(url.clone()).create_pool(Some(Runtime::Tokio1)))
             .transpose()?;
         Ok(Self {
+            enforce: config.enforce,
             redis,
             local: LocalInflightLimiter::default(),
             exempt_account: Uuid::nil().to_string(),
@@ -69,7 +72,7 @@ impl RealtimeInflightLimiter {
 impl InflightLimiter for RealtimeInflightLimiter {
     fn try_acquire<'a>(&'a self, account: &'a str, model: &'a str, limit: u32) -> BoxFuture<'a, Option<InflightSlot>> {
         Box::pin(async move {
-            if account == self.exempt_account {
+            if !self.enforce || account == self.exempt_account {
                 return Some(InflightSlot::new(()));
             }
             let Some(pool) = &self.redis else {
@@ -183,7 +186,7 @@ mod tests {
     }
 
     fn limiter(redis_url: Option<String>) -> RealtimeInflightLimiter {
-        RealtimeInflightLimiter::from_config(&RealtimeInflightLimitsConfig { redis_url }).unwrap()
+        RealtimeInflightLimiter::from_config(&RealtimeInflightLimitsConfig { enforce: true, redis_url }).unwrap()
     }
 
     async fn in_flight(pool: &Pool, key: &str) -> i64 {
@@ -199,6 +202,15 @@ mod tests {
         assert!(limiter.try_acquire("acct", "model", 1).await.is_none());
         drop(held);
         assert!(limiter.try_acquire("acct", "model", 1).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn nothing_is_limited_until_enforcement_is_switched_on() {
+        let limiter = RealtimeInflightLimiter::from_config(&RealtimeInflightLimitsConfig::default()).unwrap();
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            held.push(limiter.try_acquire("acct", "model", 1).await.expect("admitted while not enforcing"));
+        }
     }
 
     #[tokio::test]
