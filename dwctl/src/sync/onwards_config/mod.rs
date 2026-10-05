@@ -214,12 +214,10 @@ async fn load_overlays_from_db(db: &PgPool) -> Result<OverlaysByAlias, anyhow::E
 async fn load_inflight_overrides_from_db(db: &PgPool) -> Result<InflightOverridesByAlias, anyhow::Error> {
     let rows = sqlx::query!(
         r#"
-        SELECT dm.alias, o.user_id, o.inflight_limit AS "inflight_limit!"
+        SELECT dm.alias, o.user_id, o.inflight_limit
         FROM realtime_inflight_limit_overrides o
         INNER JOIN deployed_models dm ON dm.id = o.deployed_model_id
-        WHERE o.valid_until IS NULL
-          AND o.inflight_limit IS NOT NULL
-          AND dm.deleted = FALSE
+        WHERE dm.deleted = FALSE
         "#
     )
     .fetch_all(db)

@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT o.user_id AS account_id, u.username AS account_name, o.inflight_limit\n            FROM realtime_inflight_limit_overrides o\n            INNER JOIN users u ON u.id = o.user_id\n            WHERE o.deployed_model_id = $1\n            ORDER BY u.username\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "account_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "account_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "inflight_limit",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "356cac6a4ef677d01aa6159a05d1aece7b2a340827075f0ef70ab476dcfc338b"
+}

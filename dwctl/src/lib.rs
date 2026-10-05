@@ -140,6 +140,7 @@ fn install_crypto_provider() {
     rustls::crypto::aws_lc_rs::default_provider().install_default().ok();
 }
 
+pub mod account_limits;
 pub mod api;
 pub mod auth;
 pub mod clickhouse;
@@ -1596,14 +1597,16 @@ async fn setup_database(
     seed_database(&config.model_sources, &main.pooled.write()).await?;
 
     if config.model_provisioning.enabled {
-        // Both catalogs are parsed and validated before either is applied, so
+        // Every catalog is parsed and validated before any is applied, so
         // a malformed overlay file fails startup without a half-applied model
-        // catalog. Overlays reference the model catalog's aliases, so they are
-        // applied after it.
+        // catalog. Overlays and account limits reference the model catalog's
+        // aliases, so they are applied after it.
         let catalog = model_provisioning::Catalog::load(&config.model_provisioning.directory)?;
         let overlays = org_overlays::OrgCatalog::load(&config.model_provisioning.org_overlays_directory)?;
+        let account_limits = account_limits::AccountLimitsCatalog::load(&config.model_provisioning.account_limits_directory)?;
         model_provisioning::apply(&main.pooled.write(), &catalog).await?;
         org_overlays::apply(&main.pooled.write(), &overlays).await?;
+        account_limits::apply(&main.pooled.write(), &account_limits).await?;
     }
 
     Ok((
@@ -2004,15 +2007,6 @@ pub async fn build_router(
         .route(
             "/models/{id}/realtime-inflight-limits",
             get(api::handlers::realtime_inflight_limits::list_realtime_inflight_limits),
-        )
-        .route(
-            "/models/{id}/realtime-inflight-limits/{account_id}",
-            put(api::handlers::realtime_inflight_limits::set_realtime_inflight_override)
-                .delete(api::handlers::realtime_inflight_limits::clear_realtime_inflight_override),
-        )
-        .route(
-            "/models/{id}/realtime-inflight-limits/{account_id}/history",
-            get(api::handlers::realtime_inflight_limits::get_realtime_inflight_override_history),
         )
         .route("/models/{id}/cache-pricing", get(api::handlers::cache_pricing::get_cache_pricing))
         .route(
