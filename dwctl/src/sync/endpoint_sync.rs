@@ -768,7 +768,7 @@ mod tests {
                 status: mock.status,
                 last_sync: mock.last_sync,
                 deleted: false,
-                realtime_inflight_limit: 100,
+                realtime_inflight_limit: 14,
                 batch_capacity: None,
                 throughput: None,
                 provider_pricing: None,

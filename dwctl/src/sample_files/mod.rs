@@ -179,7 +179,7 @@ mod tests {
             model_type: Some(model_type),
             capabilities,
             hosted_on: Some(uuid::Uuid::new_v4()),
-            realtime_inflight_limit: 100,
+            realtime_inflight_limit: 14,
             batch_capacity: None,
             throughput: None,
             status: crate::db::models::deployments::ModelStatus::Active,

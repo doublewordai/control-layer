@@ -518,7 +518,7 @@ mod tests {
             hosted_on: Some(Uuid::new_v4()),
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            realtime_inflight_limit: Some(100),
+            realtime_inflight_limit: Some(14),
             batch_capacity: None,
             throughput: None,
             groups: None,

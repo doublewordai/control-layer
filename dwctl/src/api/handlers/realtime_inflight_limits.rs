@@ -219,7 +219,7 @@ mod tests {
         assert_eq!(set.set_by, manager.id);
 
         let listed: RealtimeInflightLimitsResponse = send(&server, "GET", &base, &manager, None).await.json();
-        assert_eq!(listed.default_limit, 100);
+        assert_eq!(listed.default_limit, 14);
         assert_eq!(listed.overrides.len(), 1);
         assert_eq!(listed.overrides[0].account_id, org.id);
         assert_eq!(listed.overrides[0].limit, Some(250));
@@ -230,9 +230,9 @@ mod tests {
             .get("inflight/virtual")
             .and_then(|pools| pools.default_pool().inflight_limits().cloned())
             .expect("a virtual model always carries its in-flight limits");
-        assert_eq!(limits.default, 100);
+        assert_eq!(limits.default, 14);
         assert_eq!(limits.for_account(&org.id.to_string()), 250);
-        assert_eq!(limits.for_account(&manager.id.to_string()), 100);
+        assert_eq!(limits.for_account(&manager.id.to_string()), 14);
 
         send(&server, "DELETE", &account, &manager, Some(json!({ "reason": "contract ended" })))
             .await

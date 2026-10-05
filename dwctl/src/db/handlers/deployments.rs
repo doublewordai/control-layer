@@ -2119,7 +2119,7 @@ mod tests {
         assert_eq!(model.created_by, user.id);
         assert_eq!(model.model_type, None);
         assert_eq!(model.capabilities, None);
-        assert_eq!(model.realtime_inflight_limit, 100);
+        assert_eq!(model.realtime_inflight_limit, 14);
         assert_eq!(model.batch_capacity, None);
     }
 

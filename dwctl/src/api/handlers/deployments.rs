@@ -2188,7 +2188,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(stored, 100);
+        assert_eq!(stored, 14);
     }
 
     #[dwctl_test_macros::test]

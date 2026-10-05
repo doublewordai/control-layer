@@ -250,7 +250,7 @@ models. Two values are exceptions:
   disable it through the admin API or dashboard.
 - `settings.realtime_inflight_limit` on the virtual model (the default number
   of realtime requests one account may have in flight on it): when omitted,
-  the stored value is kept, and a new model starts at 100. It belongs to the
+  the stored value is kept, and a new model starts at 14. It belongs to the
   virtual model; setting it on a deployment is an error. Per-account
   overrides are set through the admin API
   (`/admin/api/v1/models/{id}/realtime-inflight-limits/{account_id}`), not in

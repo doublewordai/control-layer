@@ -1237,7 +1237,7 @@ clay:
         );
         write(directory.path(), "model.yaml", &retired);
         apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
-        assert_eq!(limits().await, (100, None, None));
+        assert_eq!(limits().await, (14, None, None));
 
         let declared = omitted.replace(
             "  settings:\n    sanitize_responses: true\n  deployments:",
