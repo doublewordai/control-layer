@@ -1,5 +1,21 @@
 # Changelog
 
+## [13.0.0](https://github.com/doublewordai/control-layer/compare/v12.11.3...v13.0.0) (2026-10-06)
+
+
+### ⚠ BREAKING CHANGES
+
+* **limits:** replace gateway rate limits with per-account realtime in-flight limits ([#1915](https://github.com/doublewordai/control-layer/issues/1915))
+
+### Features
+
+* **limits:** replace gateway rate limits with per-account realtime in-flight limits ([#1915](https://github.com/doublewordai/control-layer/issues/1915)) ([be53043](https://github.com/doublewordai/control-layer/commit/be530434b6d2fec1c5c2cfa0c366c9ced6954a5e))
+
+
+### Bug Fixes
+
+* **deps:** resolve patched js-yaml in dashboard lockfile ([#1918](https://github.com/doublewordai/control-layer/issues/1918)) ([5b53b45](https://github.com/doublewordai/control-layer/commit/5b53b45eb742367d27e2a3cb20615541aa274459))
+
 ## [12.11.3](https://github.com/doublewordai/control-layer/compare/v12.11.2...v12.11.3) (2026-10-03)
 
 
