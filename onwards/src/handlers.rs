@@ -885,6 +885,8 @@ pub async fn target_message_handler<T: HttpClient>(
     } else {
         None
     };
+    // Not needed past here; don't hold the parsed body while the upstream works.
+    drop(body_json);
 
     if let Some(reasoning) = canonical_reasoning.as_ref() {
         for provider in pool.providers() {

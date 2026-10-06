@@ -1,9 +1,15 @@
 use std::sync::LazyLock;
 
-use axum::http::StatusCode;
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
 use axum_prometheus::metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use axum_test::TestServer;
-use onwards::{AppState, strict::build_strict_router, target::Targets, test_utils::MockHttpClient};
+use onwards::{
+    AppState,
+    strict::{build_strict_router, handlers::responses_handler},
+    target::Targets,
+    test_utils::MockHttpClient,
+};
 use serde_json::{Value, json};
 
 static METRICS: LazyLock<PrometheusHandle> = LazyLock::new(|| {
@@ -192,6 +198,47 @@ async fn batch_traffic_is_counted_as_dispatched() {
         count_with(alias, &[("param", "n"), ("traffic", "realtime")]),
         Some(1.0)
     );
+}
+
+#[tokio::test]
+async fn messages_route_is_checked() {
+    let alias = "messages-model";
+    let mock = MockHttpClient::new(StatusCode::OK, COMPLETION);
+    let server = server(alias, mock.clone(), &["n"]);
+    let body = request(alias, json!({"n": 2}));
+
+    let response = server.post("/messages").json(&body).await;
+
+    response.assert_status(StatusCode::BAD_REQUEST);
+    assert!(mock.get_requests().is_empty());
+    assert_eq!(count(alias, "n", "rejected"), Some(1.0));
+}
+
+/// dwctl translates a Responses request into Chat Completions and normalises
+/// the path, but the request still arrives on the `/responses` route, so this
+/// drives the handler directly with the normalised path.
+#[tokio::test]
+async fn edge_translated_responses_requests_are_checked() {
+    let alias = "translated-responses-model";
+    let mock = MockHttpClient::new(StatusCode::OK, COMPLETION);
+    LazyLock::force(&METRICS);
+    let state = AppState::with_client(targets(alias), mock.clone())
+        .with_rejected_params(["top_logprobs"])
+        .unwrap();
+    let body = request(alias, json!({"logprobs": true, "top_logprobs": 3}));
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/chat/completions")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap();
+
+    let response = responses_handler(State(state), HeaderMap::new(), req).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(mock.get_requests().is_empty());
+    assert_eq!(count(alias, "top_logprobs", "rejected"), Some(1.0));
+    assert_eq!(count(alias, "logprobs", "logged"), Some(1.0));
 }
 
 #[tokio::test]
