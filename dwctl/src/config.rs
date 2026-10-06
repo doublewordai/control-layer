@@ -4094,9 +4094,9 @@ mod tests {
     #[test]
     fn rejected_params_must_be_known() {
         let mut config = Config::default();
+        config.secret_key = Some("test-secret-key".to_string());
         config.onwards.rejected_params = vec!["logprobs".to_string()];
-        let error = config.validate().err().map(|error| error.to_string()).unwrap_or_default();
-        assert!(!error.contains("rejected_params"));
+        config.validate().unwrap();
 
         config.onwards.rejected_params.push("top_k".to_string());
         let error = config.validate().unwrap_err().to_string();
