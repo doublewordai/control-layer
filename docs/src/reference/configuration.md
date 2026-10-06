@@ -592,6 +592,35 @@ limits:
 
 `auth.rate_limits` is no longer used and is ignored if present.
 
+## Batch In-Flight Limits
+
+A virtual model's `batch_capacity` also caps how many **batch** requests may be
+in flight on it at once. Unlike the realtime limit, this is a single global
+count for the model, not a per-account one: batch traffic is dispatched by
+worker pods, so the cap has to hold across all of them. It reuses the same
+Redis as the realtime limit but has its own switch:
+
+```yaml
+limits:
+  realtime_inflight:
+    enforce: true
+    redis_url: rediss://:password@limits-redis.example:6379
+  batch_inflight:
+    enforce: true
+```
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `limits.batch_inflight.enforce` | `false` | Refuse batch requests that would exceed a virtual model's `batch_capacity`. Off, every batch request is admitted and no shared count is touched. |
+
+The Redis connection is shared with `limits.realtime_inflight.redis_url`;
+reachability and per-replica fallback behave the same way. The two limits are
+independent and use separate key spaces, so realtime `realtime_inflight_limit`
+and batch `batch_capacity` can be enforced in any combination. A batch request
+over the cap is refused with `529` and code `batch_capacity_exceeded` (never
+`429`), naming the model and its cap, so the batch dispatcher backs off instead
+of treating it as a per-account rate limit.
+
 ## Observability
 
 ### Metrics

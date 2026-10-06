@@ -8,7 +8,7 @@ use crate::affinity;
 use crate::auth;
 use crate::client::HttpClient;
 use crate::errors::{ErrorResponseBody, OnwardsErrorResponse};
-use crate::inflight::InflightSlot;
+use crate::inflight::{BATCH_INFLIGHT_SCOPE, InflightSlot};
 use crate::models::ListModelResponse;
 use crate::serving::{
     self, ProviderKind, RequestedServingClass, ServingClassOutcome, ServingResolution,
@@ -292,6 +292,7 @@ struct GuardedStream<S> {
     _guard: ConcurrencyGuard,
     _inflight_guard: InflightGuard,
     _inflight_slot: Option<InflightSlot>,
+    _batch_inflight_slot: Option<InflightSlot>,
 }
 
 impl<S, E> futures_util::Stream for GuardedStream<S>
@@ -604,7 +605,7 @@ pub async fn target_message_handler<T: HttpClient>(
     let request_class = RequestClass::from_path(&canonical_request_path);
     // The alias's serving policy (presets, overlays) is declared on its
     // default pool and applies whichever pool serves this request's class.
-    let (mut resolved_pool_name, mut pool, mut alias_serving, alias_inflight) = match state.targets.targets.get(&model_name) {
+    let (mut resolved_pool_name, mut pool, mut alias_serving, alias_inflight, alias_batch_inflight) = match state.targets.targets.get(&model_name) {
         Some(pools) => {
             // Now that the model is known to be a configured target, tag the
             // in-flight guard so `onwards_model_inflight{model=…}` tracks this
@@ -620,6 +621,7 @@ pub async fn target_message_handler<T: HttpClient>(
                 pools.resolve(request_class).clone(),
                 pools.default_pool().alias_serving().clone(),
                 pools.default_pool().inflight_limits().cloned(),
+                pools.default_pool().batch_inflight_limit(),
             )
         }
         None => {
@@ -886,6 +888,40 @@ pub async fn target_message_handler<T: HttpClient>(
             }
         }
         _ => None,
+    };
+
+    // Batch (dispatched) traffic gets its own per-model ceiling, held in the
+    // same shared limiter under a reserved scope so it is counted globally on
+    // the alias the request named. Realtime requests skip it; batch requests
+    // skip the per-account realtime limit above. A refusal is a 529, not a
+    // 429, so the batch dispatcher backs off instead of treating it as a
+    // per-key rate limit.
+    let mut batch_inflight_slot = if !is_realtime
+        && state.batch_inflight_enforce
+        && let Some(limit) = alias_batch_inflight
+    {
+        match state
+            .batch_inflight_limiter
+            .try_acquire(BATCH_INFLIGHT_SCOPE, &model_name, limit)
+            .await
+        {
+            Some(slot) => Some(slot),
+            None => {
+                debug!(
+                    "Batch in-flight cap of {} reached for model {}",
+                    limit, model_name
+                );
+                metrics::counter!(
+                    "onwards_batch_inflight_refusals_total",
+                    "model" => model_name.clone(),
+                )
+                .increment(1);
+                record_response_status(529);
+                return Err(OnwardsErrorResponse::batch_capacity_exceeded(&model_name, limit));
+            }
+        }
+    } else {
+        None
     };
 
     // Check pool-level rate limit before selecting a provider
@@ -2114,6 +2150,7 @@ pub async fn target_message_handler<T: HttpClient>(
             _guard: connection_guard,
             _inflight_guard: inflight_guard.take().expect("inflight_guard taken once on success path"),
             _inflight_slot: inflight_slot.take(),
+            _batch_inflight_slot: batch_inflight_slot.take(),
         };
         let response = Response::from_parts(parts, axum::body::Body::from_stream(guarded));
 
@@ -3164,6 +3201,10 @@ mod tests {
             first_token_timeout: None,
             first_token_timeout_exempt_header: None,
             inflight_limiter: std::sync::Arc::new(crate::inflight::LocalInflightLimiter::default()),
+            batch_inflight_enforce: false,
+            batch_inflight_limiter: std::sync::Arc::new(
+                crate::inflight::LocalInflightLimiter::default(),
+            ),
         };
 
         // Create a simple POST request

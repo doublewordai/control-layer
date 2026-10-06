@@ -2576,3 +2576,47 @@ async fn failed_reload_retries_without_another_notification_or_fallback(pool: sq
     timeout(Duration::from_secs(10), task).await.unwrap().unwrap().unwrap();
     query_pool.close().await;
 }
+
+/// The per-model batch in-flight cap is the virtual (composite) model's
+/// `batch_capacity`, copied onto the composite's `default` pool. Regular
+/// deployments keep `batch_capacity` for the daemon's own concurrency but must
+/// not expose it to onwards as an in-flight cap.
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn batch_capacity_syncs_to_the_composite_default_pool(pool: sqlx::PgPool) {
+    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let composite = targets.targets.get("composite-priority").unwrap();
+    assert_eq!(
+        composite.value().default_pool().batch_inflight_limit(),
+        None,
+        "NULL batch_capacity means uncapped"
+    );
+
+    sqlx::query("UPDATE deployed_models SET batch_capacity = 4 WHERE alias = 'composite-priority'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let reloaded = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let composite = reloaded.targets.get("composite-priority").unwrap();
+    assert_eq!(
+        composite.value().default_pool().batch_inflight_limit(),
+        Some(4),
+        "the composite's batch_capacity becomes the alias's batch in-flight cap"
+    );
+
+    sqlx::query("UPDATE deployed_models SET batch_capacity = 4 WHERE alias = 'regular-public'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let reloaded = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    assert_eq!(
+        reloaded
+            .targets
+            .get("regular-public")
+            .unwrap()
+            .value()
+            .default_pool()
+            .batch_inflight_limit(),
+        None,
+        "only virtual (composite) models carry a batch in-flight cap"
+    );
+}

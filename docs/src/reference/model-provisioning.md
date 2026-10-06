@@ -255,6 +255,12 @@ models. Two values are exceptions:
   are declared in [account limit files](#account-limits), not in the model
   catalog. A request that a traffic rule redirects to another model counts
   against the limit of the model it named.
+- `settings.batch_capacity` on the virtual model is the global cap on batch
+  requests in flight on it, enforced by onwards when
+  [`limits.batch_inflight.enforce`](./configuration.md#batch-in-flight-limits)
+  is on. It belongs to the virtual model, not its deployments; unset means
+  batch is uncapped. Over the cap, batch requests are refused with `529` and
+  code `batch_capacity_exceeded`, never `429`.
 
 The retired settings `requests_per_second`, `burst_size` and `capacity` are
 still accepted so older catalogs load, but they are ignored.

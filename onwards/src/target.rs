@@ -442,6 +442,13 @@ pub struct PoolSpec {
     #[serde(default)]
     pub inflight_limit: Option<u32>,
 
+    /// The alias's global batch in-flight cap. Distinct from `inflight_limit`,
+    /// which applies to realtime traffic only: batch requests are counted on
+    /// the named alias across every replica, and over the cap are refused with
+    /// 529 so the batch dispatcher backs off.
+    #[serde(default)]
+    pub batch_inflight_limit: Option<u32>,
+
     #[serde(default)]
     #[builder(default)]
     pub account_inflight_limits: HashMap<String, u32>,
@@ -569,6 +576,7 @@ pub struct PoolConfig {
     pub serving_classes: ServingPresets,
     pub overlays: HashMap<String, ServingOverlay>,
     pub inflight_limit: Option<u32>,
+    pub batch_inflight_limit: Option<u32>,
     pub account_inflight_limits: HashMap<String, u32>,
     pub providers: Vec<ProviderSpec>,
 }
@@ -588,6 +596,7 @@ impl From<PoolSpec> for PoolConfig {
             serving_classes: pool.serving_classes,
             overlays: pool.overlays,
             inflight_limit: pool.inflight_limit,
+            batch_inflight_limit: pool.batch_inflight_limit,
             account_inflight_limits: pool.account_inflight_limits,
             providers: pool.providers,
         }
@@ -736,6 +745,7 @@ impl TargetSpecOrList {
                     serving_classes: ServingPresets::new(),
                     overlays: HashMap::new(),
                     inflight_limit: None,
+                    batch_inflight_limit: None,
                     account_inflight_limits: HashMap::new(),
                     providers,
                 })
@@ -779,6 +789,7 @@ impl TargetSpecOrList {
                     serving_classes: ServingPresets::new(),
                     overlays: HashMap::new(),
                     inflight_limit: None,
+                    batch_inflight_limit: None,
                     account_inflight_limits: HashMap::new(),
                     providers: vec![provider],
                 })
@@ -1502,7 +1513,8 @@ fn build_pool(
     .with_inflight_limits(pool_config.inflight_limit.map(|default| InflightLimits {
         default,
         accounts: pool_config.account_inflight_limits,
-    })))
+    }))
+    .with_batch_inflight_limit(pool_config.batch_inflight_limit))
 }
 
 impl Targets {
@@ -2818,6 +2830,7 @@ mod tests {
             "targets": {
                 "gpt-4": {
                     "inflight_limit": 20,
+                    "batch_inflight_limit": 7,
                     "account_inflight_limits": { "acme": 200 },
                     "providers": [{ "url": "https://api.openai.com", "onwards_key": "sk-upstream" }]
                 },
@@ -2836,6 +2849,15 @@ mod tests {
             .unwrap();
         assert_eq!(limits.for_account("acme"), 200);
         assert_eq!(limits.for_account("someone-else"), 20);
+        assert_eq!(
+            targets
+                .targets
+                .get("gpt-4")
+                .unwrap()
+                .default_pool()
+                .batch_inflight_limit(),
+            Some(7)
+        );
         assert!(
             targets
                 .targets
@@ -2843,6 +2865,15 @@ mod tests {
                 .unwrap()
                 .default_pool()
                 .inflight_limits()
+                .is_none()
+        );
+        assert!(
+            targets
+                .targets
+                .get("unlimited")
+                .unwrap()
+                .default_pool()
+                .batch_inflight_limit()
                 .is_none()
         );
     }
@@ -2881,6 +2912,7 @@ mod tests {
             serving_classes: Default::default(),
             overlays: Default::default(),
             inflight_limit: None,
+            batch_inflight_limit: None,
             account_inflight_limits: Default::default(),
         };
 

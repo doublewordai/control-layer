@@ -97,6 +97,53 @@ plugged-in limiter can admit others without counting them. Counts are per
 process by default; `AppState::with_inflight_limiter` plugs in a shared
 counter so several instances enforce one limit.
 
+## Batch in-flight cap
+
+A pool can also cap how many **batch** (dispatched) requests are in flight on
+its alias. Unlike the per-account limit above, this is one global count for the
+alias, shared across every dispatcher and proxy instance, so it is a ceiling on
+batch traffic rather than a per-tenant one. It is configured with
+`batch_inflight_limit`:
+
+```json
+{
+  "targets": {
+    "gpt-4": {
+      "inflight_limit": 20,
+      "batch_inflight_limit": 8,
+      "providers": [{ "url": "https://api.openai.com", "onwards_key": "sk-your-openai-key" }]
+    }
+  }
+}
+```
+
+A batch request is one onwards classifies as dispatched: it carries the header
+set with `AppState::with_first_token_timeout_exempt_header`. Realtime requests
+are never counted against this cap, and batch requests are never counted
+against the per-account `inflight_limit`. The two counts are independent, so an
+alias can serve realtime traffic while its batch slots are full. `None` (or an
+absent field) means batch is uncapped.
+
+The cap is read from the alias's default pool and counts against the alias the
+request named, even when a routing rule redirects it, so a redirected request
+still consumes a slot on the model it asked for. The slot is held across
+failover attempts for the life of the response body and released when the body
+finishes or the client disconnects.
+
+A request over the cap receives `529` (the shared overload status) with
+type `overloaded_error`, code `batch_capacity_exceeded`, and a
+`Retry-After: 1` header. It is deliberately not a `429`: the dispatcher treats
+`529` as a downstream overload and reduces its adaptive concurrency, whereas a
+`429` is a per-key rate limit and would not. The refusal is counted in
+`onwards_batch_inflight_refusals_total{model}`.
+
+Counts are per process by default. `AppState::with_batch_inflight_limiter`
+plugs in a shared counter (the control layer passes the same Redis-backed
+limiter used for realtime `inflight_limit`, under a reserved `__batch__` scope
+so the two key spaces never collide). Enforcement is switched with
+`AppState::with_batch_inflight_enforce`; when it is off, batch requests are
+never refused and the limiter is not consulted at all.
+
 ## Combining rate limiting and concurrency limiting
 
 You can use both rate limiting and concurrency limiting together:

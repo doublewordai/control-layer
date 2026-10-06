@@ -51,13 +51,18 @@ impl fmt::Debug for RealtimeInflightLimiter {
 
 impl RealtimeInflightLimiter {
     pub fn from_config(config: &RealtimeInflightLimitsConfig) -> anyhow::Result<Self> {
-        let redis = config
-            .redis_url
-            .as_ref()
-            .map(|url| RedisConfig::from_url(url.clone()).create_pool(Some(Runtime::Tokio1)))
+        Self::from_parts(config.enforce, config.redis_url.clone())
+    }
+
+    /// Build a limiter from an explicit switch and Redis URL. The batch
+    /// in-flight cap reuses this type and the realtime Redis, but has its own
+    /// switch and counts under a reserved scope.
+    pub fn from_parts(enforce: bool, redis_url: Option<String>) -> anyhow::Result<Self> {
+        let redis = redis_url
+            .map(|url| RedisConfig::from_url(url).create_pool(Some(Runtime::Tokio1)))
             .transpose()?;
         Ok(Self {
-            enforce: config.enforce,
+            enforce,
             redis,
             local: LocalInflightLimiter::default(),
             exempt_account: Uuid::nil().to_string(),
@@ -69,6 +74,13 @@ impl RealtimeInflightLimiter {
     }
 }
 
+/// Key for a shared in-flight count. Realtime scopes by account id; batch uses
+/// the reserved [`onwards::inflight::BATCH_INFLIGHT_SCOPE`] account, so batch
+/// keys and realtime keys can never collide.
+fn inflight_key(model: &str, account: &str) -> String {
+    format!("dwctl:inflight:{model}:{account}")
+}
+
 impl InflightLimiter for RealtimeInflightLimiter {
     fn try_acquire<'a>(&'a self, account: &'a str, model: &'a str, limit: u32) -> BoxFuture<'a, Option<InflightSlot>> {
         Box::pin(async move {
@@ -78,7 +90,7 @@ impl InflightLimiter for RealtimeInflightLimiter {
             let Some(pool) = &self.redis else {
                 return self.acquire_locally(account, model, limit);
             };
-            let key = format!("dwctl:inflight:{model}:{account}");
+            let key = inflight_key(model, account);
             let member = Uuid::new_v4().to_string();
             match tokio::time::timeout(REDIS_TIMEOUT, claim(pool, &key, &member, limit)).await {
                 Ok(Ok(true)) => Some(InflightSlot::new(RedisSlot::hold(pool.clone(), key, member))),
@@ -197,6 +209,16 @@ mod tests {
         std::env::var("INFLIGHT_TEST_REDIS_URL").expect("INFLIGHT_TEST_REDIS_URL names a Redis server")
     }
 
+    #[test]
+    fn batch_and_realtime_count_under_distinct_keys() {
+        let account = "11111111-1111-1111-1111-111111111111";
+        let realtime = inflight_key("model", account);
+        let batch = inflight_key("model", onwards::inflight::BATCH_INFLIGHT_SCOPE);
+        assert_ne!(realtime, batch);
+        assert!(batch.ends_with(&format!(":{}", onwards::inflight::BATCH_INFLIGHT_SCOPE)));
+        assert!(!batch.contains(account), "batch keys are not account-scoped");
+    }
+
     fn limiter(redis_url: Option<String>) -> RealtimeInflightLimiter {
         RealtimeInflightLimiter::from_config(&RealtimeInflightLimitsConfig { enforce: true, redis_url }).unwrap()
     }
@@ -248,7 +270,7 @@ mod tests {
     async fn pods_sharing_redis_share_one_count() {
         let url = redis_url();
         let account = Uuid::new_v4().to_string();
-        let key = format!("dwctl:inflight:model:{account}");
+        let key = inflight_key("model", &account);
         let first_pod = limiter(Some(url.clone()));
         let second_pod = limiter(Some(url));
         let pool = first_pod.redis.clone().unwrap();
@@ -277,7 +299,7 @@ mod tests {
     async fn an_expired_lease_no_longer_counts() {
         let url = redis_url();
         let account = Uuid::new_v4().to_string();
-        let key = format!("dwctl:inflight:model:{account}");
+        let key = inflight_key("model", &account);
         let limiter = limiter(Some(url));
         let pool = limiter.redis.clone().unwrap();
         {
@@ -294,5 +316,38 @@ mod tests {
         let held = limiter.try_acquire(&account, "model", 1).await;
         assert!(held.is_some());
         assert_eq!(in_flight(&pool, &key).await, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a Redis server at INFLIGHT_TEST_REDIS_URL"]
+    async fn batch_and_realtime_counts_do_not_share_a_bucket() {
+        let url = redis_url();
+        let account = Uuid::new_v4().to_string();
+        let realtime = limiter(Some(url.clone()));
+        let batch = RealtimeInflightLimiter::from_parts(true, Some(url)).unwrap();
+        let pool = realtime.redis.clone().unwrap();
+
+        // Both caps are 1, yet one realtime request and one batch request can
+        // be in flight at once: they occupy different Redis keys.
+        let _realtime_slot = realtime.try_acquire(&account, "model", 1).await.expect("realtime slot");
+        let batch_slot = batch
+            .try_acquire(onwards::inflight::BATCH_INFLIGHT_SCOPE, "model", 1)
+            .await
+            .expect("batch slot");
+
+        assert_eq!(in_flight(&pool, &inflight_key("model", &account)).await, 1);
+        assert_eq!(
+            in_flight(&pool, &inflight_key("model", onwards::inflight::BATCH_INFLIGHT_SCOPE)).await,
+            1
+        );
+        assert!(
+            batch
+                .try_acquire(onwards::inflight::BATCH_INFLIGHT_SCOPE, "model", 1)
+                .await
+                .is_none()
+        );
+        // ...and the realtime scope is still held independently.
+        assert!(realtime.try_acquire(&account, "model", 1).await.is_none());
+        drop(batch_slot);
     }
 }

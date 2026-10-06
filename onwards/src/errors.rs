@@ -21,6 +21,11 @@ use crate::reasoning::ReasoningError;
 /// limit is reached.
 const CONCURRENCY_LIMIT_CODE: &str = "concurrency_limit_exceeded";
 const INFLIGHT_LIMIT_CODE: &str = "inflight_limit_exceeded";
+/// Error code for a batch request refused because the model's global batch
+/// in-flight cap is reached. A 529, never a 429: the batch dispatcher cuts its
+/// adaptive concurrency on overload, so it must back off rather than treat the
+/// refusal as a per-key rate limit.
+const BATCH_CAPACITY_CODE: &str = "batch_capacity_exceeded";
 /// Error code for a request refused because the model's providers are full.
 const OVERLOADED_CODE: &str = "overloaded";
 /// Error code for a request refused because the model has no provider
@@ -31,7 +36,9 @@ const NO_CAPACITY_CODE: &str = "no_capacity";
 fn retry_after_secs(code: &str) -> Option<&'static str> {
     match code {
         // Room frees as in-flight requests finish.
-        CONCURRENCY_LIMIT_CODE | INFLIGHT_LIMIT_CODE | OVERLOADED_CODE => Some("1"),
+        CONCURRENCY_LIMIT_CODE | INFLIGHT_LIMIT_CODE | BATCH_CAPACITY_CODE | OVERLOADED_CODE => {
+            Some("1")
+        }
         // A provider has to be placed and start before anything is served.
         NO_CAPACITY_CODE => Some("30"),
         _ => None,
@@ -152,6 +159,26 @@ impl OnwardsErrorResponse {
                 code: INFLIGHT_LIMIT_CODE.to_string(),
             }),
             status: StatusCode::TOO_MANY_REQUESTS,
+            serving_outcome: None,
+            authenticated_api_key_id: None,
+        }
+    }
+
+    /// A batch request refused because the model's global batch in-flight cap is
+    /// reached. Deliberately a 529 (`overloaded_error`), not a 429: the cap is a
+    /// ceiling on batch traffic so it cannot crowd out realtime, and the batch
+    /// dispatcher cuts its adaptive concurrency on 529.
+    pub fn batch_capacity_exceeded(model: &str, limit: u32) -> Self {
+        OnwardsErrorResponse {
+            body: Some(ErrorResponseBody {
+                message: format!(
+                    "The batch in-flight cap of {limit} for model '{model}' is reached; retry once a batch request completes."
+                ),
+                r#type: "overloaded_error".to_string(),
+                param: None,
+                code: BATCH_CAPACITY_CODE.to_string(),
+            }),
+            status: overload_status(),
             serving_outcome: None,
             authenticated_api_key_id: None,
         }

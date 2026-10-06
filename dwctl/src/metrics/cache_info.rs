@@ -198,6 +198,9 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets, state: 
 
         if row.is_composite {
             gauge!("dwctl_model_realtime_inflight_limit", "model" => alias.clone()).set(row.realtime_inflight_limit as f64);
+            // The batch cap applies to virtual (composite) models; 0 means
+            // uncapped. Mirrors the realtime gauge above.
+            gauge!("dwctl_model_batch_inflight_limit", "model" => alias.clone()).set(row.batch_capacity.unwrap_or(0) as f64);
         }
 
         // Batch capacity gauge
@@ -312,6 +315,7 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets, state: 
             // (not just a metadata change like is_metered flipping)
             if !current_aliases.contains(m.alias.as_str()) {
                 gauge!("dwctl_model_realtime_inflight_limit", "model" => m.alias.clone()).set(0.0);
+                gauge!("dwctl_model_batch_inflight_limit", "model" => m.alias.clone()).set(0.0);
                 gauge!("dwctl_model_batch_capacity", "model" => m.alias.clone()).set(0.0);
                 gauge!("dwctl_model_throughput_rps", "model" => m.alias.clone()).set(0.0);
                 gauge!("dwctl_model_api_key_count", "model" => m.alias.clone()).set(0.0);

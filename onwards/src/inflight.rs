@@ -7,6 +7,15 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use dashmap::DashMap;
 use futures_util::future::BoxFuture;
 
+/// Reserved count scope for the per-model batch in-flight cap.
+///
+/// The limiter keys a count by `(scope, model)`. Realtime counts use the
+/// requesting account id as the scope, and account ids are UUIDs, so this
+/// constant can never collide with a realtime key (or a real account). Batch
+/// requests are counted globally on the alias they named, across every daemon
+/// pod and control-layer replica sharing the configured Redis.
+pub const BATCH_INFLIGHT_SCOPE: &str = "__batch__";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InflightLimits {
     pub default: u32,

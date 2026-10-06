@@ -1147,7 +1147,14 @@ pub struct LimitsConfig {
     pub files: FileLimitsConfig,
     /// Request limits (per-request body size within batch files)
     pub requests: RequestLimitsConfig,
+    /// Realtime (interactive) per-account in-flight limits, counted per key
+    /// account.
     pub realtime_inflight: RealtimeInflightLimitsConfig,
+    /// Global per-model batch in-flight cap. Reuses
+    /// [`RealtimeInflightLimitsConfig::redis_url`] for its shared counter, so
+    /// the cap holds across replicas; it is a separate switch because batch and
+    /// realtime limits can be rolled out independently.
+    pub batch_inflight: BatchInflightLimitsConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -1155,6 +1162,21 @@ pub struct LimitsConfig {
 pub struct RealtimeInflightLimitsConfig {
     pub enforce: bool,
     pub redis_url: Option<String>,
+}
+
+/// Per-model batch in-flight cap.
+///
+/// When enforced, each virtual (composite) model's `batch_capacity` becomes a
+/// ceiling on how many batch (dispatched) requests may be in flight against
+/// that alias at once, counted globally across replicas in the same Redis used
+/// by [`RealtimeInflightLimitsConfig`]. `realtime_inflight` traffic is not
+/// affected. `redis_url` is intentionally not duplicated here: batch reuses
+/// `limits.realtime_inflight.redis_url`. With `enforce` false (the default)
+/// nothing is refused and no shared count is touched.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BatchInflightLimitsConfig {
+    pub enforce: bool,
 }
 
 /// Request limits configuration.
@@ -3994,6 +4016,17 @@ mod tests {
     #[test]
     fn default_auth_roles_include_background_inference() {
         assert!(AuthConfig::default().default_user_roles.contains(&Role::BackgroundInferenceUser));
+    }
+
+    #[test]
+    fn batch_inflight_enforcement_defaults_off_and_parses_on() {
+        assert!(!LimitsConfig::default().batch_inflight.enforce);
+
+        let parsed: LimitsConfig = serde_json::from_value(serde_json::json!({
+            "batch_inflight": { "enforce": true }
+        }))
+        .unwrap();
+        assert!(parsed.batch_inflight.enforce);
     }
 
     #[test]

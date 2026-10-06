@@ -3840,6 +3840,27 @@ mod tests {
         }
     }
 
+    /// The gateway's per-model batch in-flight cap refuses with 529 and body
+    /// code `batch_capacity_exceeded`. That is a downstream overload signal, so
+    /// the dispatcher backs off rather than treating it as a per-key 429.
+    #[test]
+    fn batch_capacity_exceeded_529_is_an_overload_signal() {
+        for reason in [
+            FailureReason::RetriableHttpStatus {
+                status: 529,
+                body: r#"{"error":{"type":"overloaded_error","code":"batch_capacity_exceeded"}}"#
+                    .to_string(),
+            },
+            FailureReason::NonRetriableHttpStatus {
+                status: 529,
+                body: r#"{"error":{"type":"overloaded_error","code":"batch_capacity_exceeded"}}"#
+                    .to_string(),
+            },
+        ] {
+            assert!(is_downstream_overload(&reason), "{reason:?}");
+        }
+    }
+
     /// Everything else must leave the limit alone. A bare 429 is a provider rate
     /// limit, usually tokens per minute, which fewer concurrent requests does not
     /// necessarily reduce; timeouts and resets happened to a request the model had

@@ -682,6 +682,9 @@ struct OnwardsCompositeModel {
     id: DeploymentId,
     alias: String,
     realtime_inflight_limit: i32,
+    /// Per-model batch in-flight cap. `None` means batch is uncapped on this
+    /// alias. See `deployed_models.batch_capacity`.
+    batch_capacity: Option<i32>,
     /// Load balancing strategy (weighted_random or priority)
     lb_strategy: LoadBalancingStrategy,
     /// Fallback enabled
@@ -927,6 +930,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             id as composite_model_id,
             alias,
             realtime_inflight_limit,
+            batch_capacity,
             lb_strategy,
             fallback_enabled,
             fallback_on_rate_limit,
@@ -970,6 +974,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 id: row.composite_model_id,
                 alias: row.alias,
                 realtime_inflight_limit: row.realtime_inflight_limit,
+                batch_capacity: row.batch_capacity,
                 lb_strategy,
                 fallback_enabled: row.fallback_enabled.unwrap_or(true),
                 fallback_on_rate_limit: row.fallback_on_rate_limit.unwrap_or(true),
@@ -1277,6 +1282,14 @@ fn convert_composite_to_target_spec(
             HashMap::new()
         },
         inflight_limit: (pool_name == DEFAULT_COMPONENT_POOL).then_some(composite.realtime_inflight_limit as u32),
+        // Batch requests are counted on the named alias globally; only the
+        // composite's default pool carries the cap. A NULL `batch_capacity`
+        // means batch is uncapped. Realtime traffic is unaffected.
+        batch_inflight_limit: if pool_name == DEFAULT_COMPONENT_POOL {
+            composite.batch_capacity.and_then(|c| u32::try_from(c).ok())
+        } else {
+            None
+        },
         account_inflight_limits: if pool_name == DEFAULT_COMPONENT_POOL {
             inflight_overrides.get(&composite.alias).cloned().unwrap_or_default()
         } else {
@@ -1423,6 +1436,7 @@ fn convert_to_config_file(
                 serving_classes: target.serving_classes,
                 overlays: overlays.get(&target.alias).cloned().unwrap_or_default(),
                 inflight_limit: None,
+                batch_inflight_limit: None,
                 account_inflight_limits: HashMap::new(),
             };
 

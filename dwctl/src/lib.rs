@@ -4370,7 +4370,15 @@ impl Application {
             .with_first_token_timeout_exempt_header("x-fusillade-batch-created-at")
             .with_inflight_limiter(Arc::new(crate::realtime_inflight::RealtimeInflightLimiter::from_config(
                 &config.limits.realtime_inflight,
-            )?));
+            )?))
+            // The batch cap shares the realtime Redis but has its own switch and
+            // reserved count scope. Off, the handler never consults this
+            // limiter, so no shared count is touched.
+            .with_batch_inflight_limiter(Arc::new(crate::realtime_inflight::RealtimeInflightLimiter::from_parts(
+                true,
+                config.limits.realtime_inflight.redis_url.clone(),
+            )?))
+            .with_batch_inflight_enforce(config.limits.batch_inflight.enforce);
         if config.onwards.first_token_timeout_ms > 0 {
             onwards_app_state =
                 onwards_app_state.with_first_token_timeout(std::time::Duration::from_millis(config.onwards.first_token_timeout_ms));
