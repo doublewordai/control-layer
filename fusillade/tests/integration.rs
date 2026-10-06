@@ -1554,6 +1554,136 @@ async fn test_daemon_retries_configured_and_default_statuses(pool: sqlx::PgPool)
     );
 }
 
+/// A 529 carrying `batch_capacity_exceeded` is admission control, not a failed
+/// attempt: with `max_retries: Some(0)` the request would fail terminally on
+/// any ordinary failure, but the capacity refusals must be rescheduled until a
+/// slot opens.
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+async fn test_batch_capacity_529_does_not_spend_a_retry_attempt(pool: sqlx::PgPool) {
+    let http_client = Arc::new(MockHttpClient::new());
+
+    for _ in 0..3 {
+        http_client.add_response(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 529,
+                body: r#"{"error":{"message":"at capacity","type":"overloaded_error","code":"batch_capacity_exceeded"}}"#
+                    .to_string(),
+            }),
+        );
+    }
+    http_client.add_response(
+        "POST /v1/test",
+        Ok(HttpResponse {
+            status: 200,
+            body: r#"{"result":"success after capacity refusals"}"#.to_string(),
+        }),
+    );
+
+    let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
+    model_concurrency_limits.insert("test-model".to_string(), 10);
+
+    let config = DaemonConfig {
+        claim_batch_size: 10,
+        claim_interval_ms: 10,
+        model_concurrency_limits,
+        // No retries for ordinary failures: only the non-spending path can
+        // keep going past a capacity refusal.
+        max_retries: Some(0),
+        stop_before_deadline_ms: None,
+        backoff_ms: 5,
+        backoff_factor: 1,
+        max_backoff_ms: 5,
+        status_log_interval_ms: None,
+        heartbeat_interval_ms: 10000,
+        should_retry: Arc::new(default_should_retry),
+        claim_timeout_ms: 60000,
+        processing_timeout_ms: 600000,
+        cancellation_poll_interval_ms: 100,
+        ..Default::default()
+    };
+
+    let manager = postgres_store(pool.clone(), &config).await;
+
+    let file_id = manager
+        .create_file(
+            "test-file".to_string(),
+            Some("batch capacity".to_string()),
+            vec![fusillade::RequestTemplateInput {
+                custom_id: None,
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/test".to_string(),
+                body: r#"{"prompt":"test"}"#.to_string(),
+                model: "test-model".to_string(),
+                api_key: "test-key".to_string(),
+            }],
+        )
+        .await
+        .expect("Failed to create file");
+
+    let batch = manager
+        .create_batch(fusillade::batch::BatchInput {
+            file_id,
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+            created_by: None,
+            api_key_id: None,
+            api_key: None,
+            total_requests: None,
+        })
+        .await
+        .expect("Failed to create batch");
+    mark_models_live_for_test(manager.as_ref(), &["test-model"]).await;
+
+    let requests = manager
+        .get_batch_requests(batch.id)
+        .await
+        .expect("Failed to get batch requests");
+    let request_id = requests[0].id();
+
+    let shutdown_token = CancellationToken::new();
+    postgres_daemon(manager.clone(), http_client.clone(), config)
+        .run(shutdown_token.clone())
+        .expect("Failed to start daemon");
+
+    let start = tokio::time::Instant::now();
+    let timeout = Duration::from_secs(5);
+    let mut completed = false;
+    while start.elapsed() < timeout {
+        let results = manager
+            .get_requests(vec![request_id])
+            .await
+            .expect("get requests");
+        if let Some(Ok(any_request)) = results.first() {
+            match any_request {
+                fusillade::AnyRequest::Completed(req) => {
+                    assert_eq!(req.state.response_status, 200);
+                    completed = true;
+                    break;
+                }
+                fusillade::AnyRequest::Failed(_) => {
+                    panic!("capacity refusal failed terminally instead of rescheduling");
+                }
+                _ => {}
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    shutdown_token.cancel();
+    assert!(
+        completed,
+        "Request should have completed after capacity opened"
+    );
+    assert_eq!(
+        http_client.call_count(),
+        4,
+        "three refusals plus the success are four dispatch attempts"
+    );
+}
+
 #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
 async fn test_daemon_dynamically_updates_concurrency_limits(pool: sqlx::PgPool) {
     // Setup: Create HTTP client with triggered responses

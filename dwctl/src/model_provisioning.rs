@@ -191,6 +191,12 @@ pub struct ModelSettings {
     #[schemars(extend("deprecated" = true))]
     pub ignored_capacity: Option<i32>,
     pub realtime_inflight_limit: Option<i32>,
+    /// Dual-purpose batch concurrency. It seeds fusillade's **starting**
+    /// per-daemon concurrency for the model (adaptive concurrency may grow past
+    /// it), and, once `limits.batch_inflight.enforce` is on, it is also the
+    /// **global** onwards cap on batch requests in flight on the alias. Raise it
+    /// to the intended global ceiling before enabling enforcement. The cap is
+    /// shared by file batches, flex and background requests.
     pub batch_capacity: Option<i32>,
     pub throughput: Option<f32>,
     pub sanitize_responses: bool,

@@ -4,7 +4,6 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use axum::http::StatusCode;
 use axum::{Router, body::Body, extract::Request, http::HeaderMap, response::Response};
 use onwards::{
     AppState, build_router, client::HttpClient, strict::build_strict_router, target::Targets,

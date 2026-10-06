@@ -78,6 +78,19 @@ struct TariffInfo {
     output_price: f64,
 }
 
+/// Register help text for the cache-info gauges. Must run after the Prometheus
+/// recorder is installed, alongside the other metric initialisers.
+pub fn describe_cache_info_metrics() {
+    metrics::describe_gauge!(
+        "dwctl_model_batch_inflight_limit",
+        "Global per-model batch in-flight cap for virtual models. Reported even when limits.batch_inflight.enforce is off; 0 means the model is uncapped, so a zero does not imply the cap is enforced."
+    );
+    metrics::describe_gauge!(
+        "dwctl_model_realtime_inflight_limit",
+        "Default per-account realtime in-flight limit for virtual models; 0 means unlimited."
+    );
+}
+
 /// Update Prometheus gauges reflecting the current cache state.
 ///
 /// Queries PostgreSQL for model metadata (groups, components, tariffs) and
@@ -198,8 +211,9 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets, state: 
 
         if row.is_composite {
             gauge!("dwctl_model_realtime_inflight_limit", "model" => alias.clone()).set(row.realtime_inflight_limit as f64);
-            // The batch cap applies to virtual (composite) models; 0 means
-            // uncapped. Mirrors the realtime gauge above.
+            // The batch cap applies to virtual (composite) models. Reported even
+            // when enforcement is off; 0 means uncapped, so a zero does not
+            // imply the cap is enforced. Mirrors the realtime gauge above.
             gauge!("dwctl_model_batch_inflight_limit", "model" => alias.clone()).set(row.batch_capacity.unwrap_or(0) as f64);
         }
 

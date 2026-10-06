@@ -213,6 +213,14 @@ pub struct Completed {
 
 impl RequestState for Completed {}
 
+/// Body code the gateway's onwards layer sends when it refuses a batch
+/// request because the model's global in-flight cap is reached. It is a 529
+/// (`overloaded_error`), not a per-key 429, so the dispatcher reduces its
+/// adaptive concurrency instead of treating it as a rate limit. Because the
+/// refusal is admission control rather than a failure, a failure carrying it
+/// reschedules without spending a retry attempt.
+pub const BATCH_CAPACITY_EXCEEDED_CODE: &str = "batch_capacity_exceeded";
+
 /// Reason why a request failed.
 ///
 /// This enum distinguishes between different types of failures to determine
@@ -262,6 +270,29 @@ impl FailureReason {
             FailureReason::RequestBuilderError { .. } => false,
             FailureReason::BatchTerminated => false,
         }
+    }
+
+    /// True when the failure is the gateway's admission-control refusal for the
+    /// per-model batch in-flight cap: a 529 whose body carries
+    /// [`BATCH_CAPACITY_EXCEEDED_CODE`]. This is not a failure of the request —
+    /// the batch simply has to wait for a slot — so it reschedules without
+    /// spending a retry attempt.
+    pub fn is_batch_capacity_exceeded(&self) -> bool {
+        let body = match self {
+            FailureReason::RetriableHttpStatus { status: 529, body }
+            | FailureReason::NonRetriableHttpStatus { status: 529, body } => body,
+            _ => return false,
+        };
+        serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")?
+                    .get("code")?
+                    .as_str()
+                    .map(|code| code == BATCH_CAPACITY_EXCEEDED_CODE)
+            })
+            .unwrap_or(false)
     }
 
     /// Returns a short, stable label for use in metrics.

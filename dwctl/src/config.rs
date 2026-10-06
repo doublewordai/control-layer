@@ -1173,6 +1173,13 @@ pub struct RealtimeInflightLimitsConfig {
 /// affected. `redis_url` is intentionally not duplicated here: batch reuses
 /// `limits.realtime_inflight.redis_url`. With `enforce` false (the default)
 /// nothing is refused and no shared count is touched.
+///
+/// Enabling this changes the meaning of `batch_capacity`: without it the value
+/// is only fusillade's per-daemon *starting* concurrency (adaptive concurrency
+/// can grow past it), while with it the same value is also the *global*
+/// ceiling. Raise `batch_capacity` to the intended global cap before turning
+/// enforcement on. File batches, flex and background requests all share this
+/// single per-model ceiling.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BatchInflightLimitsConfig {
@@ -5038,6 +5045,30 @@ secret_key: "test-secret-key"
 
             let config = Config::load(&args)?;
             assert_eq!(config.batches.default_throughput, 75.5);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_batch_inflight_enforce_env_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            assert!(!Config::load(&args)?.limits.batch_inflight.enforce, "default is off");
+
+            jail.set_env("DWCTL_LIMITS__BATCH_INFLIGHT__ENFORCE", "true");
+            let config = Config::load(&args)?;
+            assert!(config.limits.batch_inflight.enforce);
 
             Ok(())
         });

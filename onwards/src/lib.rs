@@ -3730,6 +3730,105 @@ mod tests {
         request
     }
 
+    /// An unauthenticated dispatched request, for pools whose key labels are
+    /// empty (the fallback targets).
+    fn dispatched_request(model: &str) -> axum::extract::Request {
+        axum::extract::Request::builder()
+            .uri("/v1/chat/completions")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-dispatched", "1")
+            .body(axum::body::Body::from(
+                json!({"model": model, "messages": []}).to_string(),
+            ))
+            .unwrap()
+    }
+
+    /// Records every `try_acquire` so a test can assert the batch limiter was
+    /// (or was not) consulted and how many slots it was asked for.
+    #[derive(Debug, Default)]
+    struct CountingBatchLimiter {
+        calls: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl CountingBatchLimiter {
+        fn calls(&self) -> Vec<(String, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl inflight::InflightLimiter for CountingBatchLimiter {
+        fn try_acquire<'a>(
+            &'a self,
+            account: &'a str,
+            model: &'a str,
+            _limit: u32,
+        ) -> futures_util::future::BoxFuture<'a, Option<inflight::InflightSlot>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((account.to_owned(), model.to_owned()));
+            Box::pin(std::future::ready(Some(inflight::InflightSlot::new(()))))
+        }
+    }
+
+    fn batch_router_with_limiter(
+        targets: Targets,
+        mock_client: MockHttpClient,
+        enforce: bool,
+        limiter: Arc<dyn inflight::InflightLimiter>,
+    ) -> Router {
+        build_router(
+            AppState::with_client(targets, mock_client)
+                .with_first_token_timeout_exempt_header("x-dispatched")
+                .with_batch_inflight_enforce(enforce)
+                .with_batch_inflight_limiter(limiter),
+        )
+    }
+
+    /// Fallback targets carrying a global batch cap, for failover tests.
+    fn fallback_batch_targets(
+        alias: &str,
+        n: usize,
+        fallback: target::FallbackConfig,
+        batch_limit: Option<u32>,
+    ) -> target::Targets {
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::{LoadBalanceStrategy, Target};
+
+        let providers = (0..n)
+            .map(|i| {
+                let t = Target::builder()
+                    .url(format!("https://p{i}.example.com/").parse().unwrap())
+                    .request_timeout_secs(5)
+                    .build();
+                Provider::new(t, 1)
+            })
+            .collect();
+        let pool = ProviderPool::with_config(
+            providers,
+            None,
+            None,
+            None,
+            Some(fallback),
+            LoadBalanceStrategy::Priority,
+            false,
+            Vec::new(),
+        )
+        .with_batch_inflight_limit(batch_limit);
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(alias.to_string(), pool.into());
+        target::Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        }
+    }
+
     fn batch_router(targets: Targets, mock_client: MockHttpClient, enforce: bool) -> Router {
         build_router(
             AppState::with_client(targets, mock_client)
@@ -3914,6 +4013,177 @@ mod tests {
             held.push(response);
         }
         assert_eq!(mock_client.get_requests().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_batch_inflight_enforcement_off_does_not_consult_the_limiter() {
+        use tower::ServiceExt;
+
+        // Enforcement on proves the mock is wired in and counts.
+        let on_limiter = Arc::new(CountingBatchLimiter::default());
+        let on_router = batch_router_with_limiter(
+            batch_limited_targets(Some(1), None),
+            MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#),
+            true,
+            on_limiter.clone(),
+        );
+        let _held = on_router
+            .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(
+            on_limiter.calls().len(),
+            1,
+            "enforcement on consults the limiter"
+        );
+
+        // Off, the limiter must not be touched at all, so a request cannot be
+        // refused even when it is over the configured cap.
+        let off_limiter = Arc::new(CountingBatchLimiter::default());
+        let off_router = batch_router_with_limiter(
+            batch_limited_targets(Some(1), None),
+            MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#),
+            false,
+            off_limiter.clone(),
+        );
+        for _ in 0..3 {
+            let response = off_router
+                .clone()
+                .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert!(
+            off_limiter.calls().is_empty(),
+            "enforcement off must never call try_acquire: {:?}",
+            off_limiter.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_inflight_counts_a_redirected_request_against_the_model_it_named() {
+        use crate::target::{LoadBalanceStrategy, RoutingAction, RoutingRule};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let provider = || {
+            Provider::new(
+                Target::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .build(),
+                1,
+            )
+        };
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "named-model".to_string(),
+            ProviderPool::with_config(
+                vec![provider()],
+                None,
+                None,
+                None,
+                None,
+                LoadBalanceStrategy::default(),
+                false,
+                vec![RoutingRule {
+                    match_labels: std::collections::HashMap::from([(
+                        "purpose".to_string(),
+                        "batch".to_string(),
+                    )]),
+                    action: RoutingAction::Redirect {
+                        target: "served-model".to_string(),
+                    },
+                }],
+            )
+            .with_batch_inflight_limit(Some(1))
+            .into(),
+        );
+        targets_map.insert(
+            "served-model".to_string(),
+            ProviderPool::new(vec![provider()])
+                .with_batch_inflight_limit(Some(5))
+                .into(),
+        );
+        let key_labels = Arc::new(DashMap::new());
+        key_labels.insert(
+            "sk-acct-a".to_string(),
+            std::collections::HashMap::from([
+                (serving::ACCOUNT_LABEL.to_string(), "acct-a".to_string()),
+                ("purpose".to_string(), "batch".to_string()),
+            ]),
+        );
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels,
+            accounts: Arc::new(DashMap::new()),
+            strict_mode: false,
+            http_pool_config: None,
+        };
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let router = batch_router(targets, mock_client.clone(), true);
+
+        let redirected = router
+            .clone()
+            .oneshot(dispatched_chat_request("named-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(redirected.status(), StatusCode::OK);
+
+        // The named model's cap is 1, so the second request must be refused
+        // even though it is served by `served-model` (cap 5).
+        let refused = router
+            .clone()
+            .oneshot(dispatched_chat_request("named-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::from_u16(529).unwrap());
+        let refused_body: serde_json::Value =
+            serde_json::from_slice(&refused.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(refused_body["error"]["code"], "batch_capacity_exceeded");
+        assert!(
+            refused_body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("'named-model'")
+        );
+
+        // A request naming `served-model` uses that model's own cap and is
+        // admitted while the redirected one holds its slot on `named-model`.
+        let direct = router
+            .clone()
+            .oneshot(dispatched_chat_request("served-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(direct.status(), StatusCode::OK);
+        assert_eq!(mock_client.get_requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_batch_failover_acquires_only_one_slot() {
+        use tower::ServiceExt;
+
+        let targets = fallback_batch_targets("gpt-4", 2, retrying_fallback(vec![502], 2), Some(1));
+        let mock_client =
+            MockHttpClient::new(StatusCode::BAD_GATEWAY, r#"{"error":{"message":"bad"}}"#);
+        let limiter = Arc::new(CountingBatchLimiter::default());
+        let router = batch_router_with_limiter(targets, mock_client.clone(), true, limiter.clone());
+
+        let response = router.oneshot(dispatched_request("gpt-4")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            mock_client.get_requests().len(),
+            2,
+            "the request failed over to the second provider"
+        );
+        assert_eq!(
+            limiter.calls().len(),
+            1,
+            "one slot is held across failover, not one per attempt"
+        );
     }
 
     #[tokio::test]

@@ -2747,8 +2747,24 @@ where
                             let reason_label = failed.state.reason.metric_label();
                             let status_code_label = failed.state.reason.status_code_label();
                             if failed.state.reason.is_retriable() {
-                                match failed.can_retry(retry_attempt, retry_config.clone()) {
+                                // The gateway's per-model batch in-flight cap
+                                // refuses with a 529 carrying
+                                // `batch_capacity_exceeded`. That is admission
+                                // control, not a failed attempt: it still backs
+                                // off (and still counts as downstream overload
+                                // above), but must not spend a retry attempt.
+                                let spends_attempt = !failed.state.reason.is_batch_capacity_exceeded();
+                                let retry_result = if spends_attempt {
+                                    failed.can_retry(retry_attempt, retry_config.clone())
+                                } else {
+                                    failed.can_retry_without_spending_attempt(
+                                        retry_attempt,
+                                        retry_config.clone(),
+                                    )
+                                };
+                                match retry_result {
                                     Ok(pending) => {
+                                        let new_attempt = pending.state.retry_attempt;
                                         let rescheduled = storage
                                             .reschedule_for_retry(
                                                 request_id,
@@ -2773,7 +2789,7 @@ where
                                             counter!(
                                                 "fusillade_requests_retried_total",
                                                 "model" => model_clone.clone(),
-                                                "attempt" => (retry_attempt + 1).to_string(),
+                                                "attempt" => new_attempt.to_string(),
                                                 "reason" => reason_label,
                                                 "status_code" => status_code_label.clone()
                                             )
@@ -2781,7 +2797,7 @@ where
                                             tracing::info!(
                                                 request_id = %request_id,
                                                 batch_id = ?batch_id,
-                                                retry_attempt = retry_attempt + 1,
+                                                retry_attempt = new_attempt,
                                                 "request.retry_persisted"
                                             );
                                         } else {
@@ -2793,7 +2809,7 @@ where
                                             tracing::warn!(
                                                 request_id = %request_id,
                                                 batch_id = ?batch_id,
-                                                retry_attempt = retry_attempt + 1,
+                                                retry_attempt = new_attempt,
                                                 "request.retry_skipped_lost_ownership"
                                             );
                                         }

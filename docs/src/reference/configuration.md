@@ -613,13 +613,41 @@ limits:
 |---------|---------|-------------|
 | `limits.batch_inflight.enforce` | `false` | Refuse batch requests that would exceed a virtual model's `batch_capacity`. Off, every batch request is admitted and no shared count is touched. |
 
+### Why realtime and batch differ
+
+Realtime has per-account limits and no per-model cap: when a model is full,
+the downstream answers `529`, and realtime traffic may grow into whatever
+capacity exists (the per-account limit keeps one tenant from consuming it
+all). Batch instead has a per-model cap, because batch must never crowd out
+realtime and can always be processed later — a refused batch request is
+rescheduled, not lost.
+
+### `batch_capacity` means two things
+
+The same `settings.batch_capacity` value now has two roles:
+
+- fusillade's **starting** per-daemon concurrency for the model, which
+  adaptive concurrency may grow beyond, and
+- the **global** onwards cap on batch requests in flight on the alias, once
+  `limits.batch_inflight.enforce` is on.
+
+Enabling enforcement therefore turns `batch_capacity` from a per-pod starting
+point into a global ceiling. Raise the value to the intended global cap
+**before** turning enforcement on, or the first batch requests will be refused
+against the old, smaller starting point.
+
+The cap is shared by every kind of dispatched request: file batches, flex
+requests and background requests all count against the same per-model ceiling.
+
+### Behaviour over the cap
+
 The Redis connection is shared with `limits.realtime_inflight.redis_url`;
 reachability and per-replica fallback behave the same way. The two limits are
 independent and use separate key spaces, so realtime `realtime_inflight_limit`
 and batch `batch_capacity` can be enforced in any combination. A batch request
 over the cap is refused with `529` and code `batch_capacity_exceeded` (never
-`429`), naming the model and its cap, so the batch dispatcher backs off instead
-of treating it as a per-account rate limit.
+`429`), naming the model and its cap, so the batch dispatcher backs off without
+spending a retry attempt and reschedules the request later.
 
 ## Observability
 
@@ -630,6 +658,11 @@ enable_metrics: true
 ```
 
 Exposes Prometheus metrics at `/internal/metrics`.
+
+`dwctl_model_batch_inflight_limit` reports each virtual model's global batch
+cap. It reports even when `limits.batch_inflight.enforce` is off, and an
+uncapped model (no `batch_capacity`) reports `0`, so a zero does not by itself
+mean the cap is enforced — check the config switch.
 
 ### Request Logging
 

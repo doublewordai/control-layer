@@ -277,6 +277,31 @@ impl Request<Failed> {
         retry_attempt: u32,
         config: RetryConfig,
     ) -> std::result::Result<Request<Pending>, Box<Self>> {
+        self.reschedule_retry(retry_attempt, config, true)
+    }
+
+    /// Reschedule this failure without spending a retry attempt.
+    ///
+    /// Used for the gateway's batch admission-control refusal
+    /// ([`FailureReason::is_batch_capacity_exceeded`]): the request was not
+    /// attempted against a provider, it was only asked to wait for a slot, so
+    /// it must not be charged an attempt. Backoff and the deadline cut-off are
+    /// the same as [`Self::can_retry`], so a request that can no longer finish
+    /// in its window still fails here.
+    pub fn can_retry_without_spending_attempt(
+        self,
+        retry_attempt: u32,
+        config: RetryConfig,
+    ) -> std::result::Result<Request<Pending>, Box<Self>> {
+        self.reschedule_retry(retry_attempt, config, false)
+    }
+
+    fn reschedule_retry(
+        self,
+        retry_attempt: u32,
+        config: RetryConfig,
+        spend_attempt: bool,
+    ) -> std::result::Result<Request<Pending>, Box<Self>> {
         // Calculate exponential backoff: backoff_ms * (backoff_factor ^ retry_attempt)
         let backoff_duration = {
             let exponential = config
@@ -288,7 +313,10 @@ impl Request<Failed> {
         let now = chrono::Utc::now();
         let not_before = now + chrono::Duration::milliseconds(backoff_duration as i64);
 
-        if let Some(max_retries) = config.max_retries
+        // Admission-control reschedules do not spend attempts, so they are not
+        // bounded by `max_retries`; the deadline below still stops them.
+        if spend_attempt
+            && let Some(max_retries) = config.max_retries
             && retry_attempt >= max_retries
         {
             return Err(Box::new(self));
@@ -314,7 +342,11 @@ impl Request<Failed> {
         let request = Request {
             data: self.data,
             state: Pending {
-                retry_attempt: retry_attempt + 1,
+                retry_attempt: if spend_attempt {
+                    retry_attempt + 1
+                } else {
+                    retry_attempt
+                },
                 not_before: Some(not_before),
                 batch_expires_at: self.state.batch_expires_at,
             },
@@ -595,5 +627,109 @@ mod background_tests {
     #[test]
     fn background_retry_still_honors_retry_count() {
         assert!(failed_request(None).can_retry(2, retry_config()).is_err());
+    }
+
+    fn failed_request_with_reason(
+        reason: FailureReason,
+        retry_attempt: u32,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Request<Failed> {
+        let mut request = failed_request(deadline);
+        request.state.reason = reason;
+        request.state.retry_attempt = retry_attempt;
+        request
+    }
+
+    fn batch_capacity_body() -> String {
+        format!(
+            r#"{{"error":{{"type":"overloaded_error","code":"{}"}}}}"#,
+            crate::request::types::BATCH_CAPACITY_EXCEEDED_CODE
+        )
+    }
+
+    #[test]
+    fn batch_capacity_529_reschedules_without_spending_an_attempt() {
+        let request = failed_request_with_reason(
+            FailureReason::RetriableHttpStatus {
+                status: 529,
+                body: batch_capacity_body(),
+            },
+            2,
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        );
+        assert!(request.state.reason.is_batch_capacity_exceeded());
+
+        let pending = request
+            .can_retry_without_spending_attempt(2, retry_config())
+            .expect("admission control is rescheduled");
+        assert_eq!(
+            pending.state.retry_attempt, 2,
+            "the refusal must not consume a retry attempt"
+        );
+        assert!(pending.state.not_before.is_some(), "normal backoff applies");
+    }
+
+    #[test]
+    fn ordinary_529_still_spends_an_attempt() {
+        let request = failed_request_with_reason(
+            FailureReason::RetriableHttpStatus {
+                status: 529,
+                body: r#"{"error":{"type":"overloaded_error"}}"#.to_string(),
+            },
+            1,
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        );
+        assert!(!request.state.reason.is_batch_capacity_exceeded());
+
+        let pending = request.can_retry(1, retry_config()).expect("rescheduled");
+        assert_eq!(pending.state.retry_attempt, 2);
+    }
+
+    #[test]
+    fn batch_capacity_529_still_honours_the_deadline_cutoff() {
+        // The effective deadline is in the past, so even an admission-control
+        // reschedule must fail rather than keep waiting.
+        let expired = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let request = failed_request_with_reason(
+            FailureReason::RetriableHttpStatus {
+                status: 529,
+                body: batch_capacity_body(),
+            },
+            2,
+            Some(expired),
+        );
+        assert!(
+            request
+                .can_retry_without_spending_attempt(2, retry_config())
+                .is_err(),
+            "the request can no longer finish in its window"
+        );
+    }
+
+    #[test]
+    fn batch_capacity_recognition_requires_a_529_with_the_code() {
+        for reason in [
+            FailureReason::RetriableHttpStatus {
+                status: 429,
+                body: batch_capacity_body(),
+            },
+            FailureReason::NonRetriableHttpStatus {
+                status: 529,
+                body: "not json".to_string(),
+            },
+            FailureReason::Timeout {
+                error: "timed out".to_string(),
+            },
+        ] {
+            assert!(!reason.is_batch_capacity_exceeded(), "{reason:?}");
+        }
+
+        assert!(
+            FailureReason::NonRetriableHttpStatus {
+                status: 529,
+                body: batch_capacity_body(),
+            }
+            .is_batch_capacity_exceeded()
+        );
     }
 }

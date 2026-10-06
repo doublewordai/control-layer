@@ -99,6 +99,13 @@ counter so several instances enforce one limit.
 
 ## Batch in-flight cap
 
+Realtime and batch are deliberately asymmetric. Realtime has only per-account
+limits and no per-model cap: a full downstream answers `529`, and realtime
+traffic is allowed to grow into whatever capacity exists, with the per-account
+limit stopping one tenant from taking it all. Batch instead gets a per-model
+cap, because batch must never crowd realtime out of a model and can always be
+processed later — a refused batch request is rescheduled, not lost.
+
 A pool can also cap how many **batch** (dispatched) requests are in flight on
 its alias. Unlike the per-account limit above, this is one global count for the
 alias, shared across every dispatcher and proxy instance, so it is a ceiling on
@@ -134,7 +141,10 @@ A request over the cap receives `529` (the shared overload status) with
 type `overloaded_error`, code `batch_capacity_exceeded`, and a
 `Retry-After: 1` header. It is deliberately not a `429`: the dispatcher treats
 `529` as a downstream overload and reduces its adaptive concurrency, whereas a
-`429` is a per-key rate limit and would not. The refusal is counted in
+`429` is a per-key rate limit and would not. A `batch_capacity_exceeded` `529`
+is admission control rather than a failed attempt, so the dispatcher
+reschedules it with normal backoff without spending a retry attempt; an
+ordinary `529` still spends one. The refusal is counted in
 `onwards_batch_inflight_refusals_total{model}`.
 
 Counts are per process by default. `AppState::with_batch_inflight_limiter`

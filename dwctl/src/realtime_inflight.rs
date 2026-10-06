@@ -34,6 +34,11 @@ return 1
 ";
 
 pub struct RealtimeInflightLimiter {
+    /// Which limit class this limiter serves, as a stable metric/log label:
+    /// `"realtime"` for per-account realtime limits, `"batch"` for the global
+    /// per-model batch cap. Both share the type and Redis but are constructed
+    /// separately.
+    scope: &'static str,
     enforce: bool,
     redis: Option<Pool>,
     local: LocalInflightLimiter,
@@ -43,6 +48,7 @@ pub struct RealtimeInflightLimiter {
 impl fmt::Debug for RealtimeInflightLimiter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RealtimeInflightLimiter")
+            .field("scope", &self.scope)
             .field("enforce", &self.enforce)
             .field("redis", &self.redis.is_some())
             .finish()
@@ -51,22 +57,34 @@ impl fmt::Debug for RealtimeInflightLimiter {
 
 impl RealtimeInflightLimiter {
     pub fn from_config(config: &RealtimeInflightLimitsConfig) -> anyhow::Result<Self> {
-        Self::from_parts(config.enforce, config.redis_url.clone())
+        Ok(Self::from_parts(
+            "realtime",
+            config.enforce,
+            Self::redis_pool(config.redis_url.as_deref())?,
+        ))
     }
 
-    /// Build a limiter from an explicit switch and Redis URL. The batch
-    /// in-flight cap reuses this type and the realtime Redis, but has its own
-    /// switch and counts under a reserved scope.
-    pub fn from_parts(enforce: bool, redis_url: Option<String>) -> anyhow::Result<Self> {
-        let redis = redis_url
+    /// Build the shared Redis pool once so the realtime and batch limiters use
+    /// the same connections. `None` when no URL is configured, in which case
+    /// each limiter counts in this pod.
+    pub(crate) fn redis_pool(redis_url: Option<&str>) -> anyhow::Result<Option<Pool>> {
+        redis_url
             .map(|url| RedisConfig::from_url(url).create_pool(Some(Runtime::Tokio1)))
-            .transpose()?;
-        Ok(Self {
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    /// Build a limiter from an explicit scope, switch and shared Redis pool.
+    /// The batch in-flight cap reuses this type and the realtime Redis, but has
+    /// its own scope and counts under a reserved key space.
+    pub fn from_parts(scope: &'static str, enforce: bool, redis: Option<Pool>) -> Self {
+        Self {
+            scope,
             enforce,
             redis,
             local: LocalInflightLimiter::default(),
             exempt_account: Uuid::nil().to_string(),
-        })
+        }
     }
 
     fn acquire_locally(&self, account: &str, model: &str, limit: u32) -> Option<InflightSlot> {
@@ -93,16 +111,16 @@ impl InflightLimiter for RealtimeInflightLimiter {
             let key = inflight_key(model, account);
             let member = Uuid::new_v4().to_string();
             match tokio::time::timeout(REDIS_TIMEOUT, claim(pool, &key, &member, limit)).await {
-                Ok(Ok(true)) => Some(InflightSlot::new(RedisSlot::hold(pool.clone(), key, member))),
+                Ok(Ok(true)) => Some(InflightSlot::new(RedisSlot::hold(self.scope, pool.clone(), key, member))),
                 Ok(Ok(false)) => None,
                 Ok(Err(error)) => {
-                    tracing::warn!(error = %error, "Realtime in-flight claim failed; counting in this pod instead");
-                    metrics::counter!("dwctl_realtime_inflight_redis_fallbacks_total").increment(1);
+                    tracing::warn!(scope = self.scope, error = %error, "In-flight claim failed; counting in this pod instead");
+                    metrics::counter!("dwctl_realtime_inflight_redis_fallbacks_total", "scope" => self.scope).increment(1);
                     self.acquire_locally(account, model, limit)
                 }
                 Err(_) => {
-                    tracing::warn!("Realtime in-flight claim timed out; counting in this pod instead");
-                    metrics::counter!("dwctl_realtime_inflight_redis_fallbacks_total").increment(1);
+                    tracing::warn!(scope = self.scope, "In-flight claim timed out; counting in this pod instead");
+                    metrics::counter!("dwctl_realtime_inflight_redis_fallbacks_total", "scope" => self.scope).increment(1);
                     self.acquire_locally(account, model, limit)
                 }
             }
@@ -144,6 +162,7 @@ async fn release(pool: &Pool, key: &str, member: &str) -> anyhow::Result<()> {
 }
 
 struct RedisSlot {
+    scope: &'static str,
     pool: Pool,
     key: String,
     member: String,
@@ -151,7 +170,7 @@ struct RedisSlot {
 }
 
 impl RedisSlot {
-    fn hold(pool: Pool, key: String, member: String) -> Self {
+    fn hold(scope: &'static str, pool: Pool, key: String, member: String) -> Self {
         let renewal = tokio::spawn({
             let pool = pool.clone();
             let key = key.clone();
@@ -165,14 +184,16 @@ impl RedisSlot {
                             crate::metrics::errors::component::REALTIME_INFLIGHT,
                             "lease_renew",
                             Warning,
+                            scope = scope,
                             error = %error,
-                            "Failed to renew a realtime in-flight lease"
+                            "Failed to renew an in-flight lease"
                         );
                     }
                 }
             }
         });
         Self {
+            scope,
             pool,
             key,
             member,
@@ -184,6 +205,7 @@ impl RedisSlot {
 impl Drop for RedisSlot {
     fn drop(&mut self) {
         self.renewal.abort();
+        let scope = self.scope;
         let pool = self.pool.clone();
         let key = std::mem::take(&mut self.key);
         let member = std::mem::take(&mut self.member);
@@ -193,8 +215,9 @@ impl Drop for RedisSlot {
                     crate::metrics::errors::component::REALTIME_INFLIGHT,
                     "lease_release",
                     Warning,
+                    scope = scope,
                     error = %error,
-                    "Failed to release a realtime in-flight slot; its lease will expire"
+                    "Failed to release an in-flight slot; its lease will expire"
                 );
             }
         });
@@ -324,7 +347,7 @@ mod tests {
         let url = redis_url();
         let account = Uuid::new_v4().to_string();
         let realtime = limiter(Some(url.clone()));
-        let batch = RealtimeInflightLimiter::from_parts(true, Some(url)).unwrap();
+        let batch = RealtimeInflightLimiter::from_parts("batch", true, RealtimeInflightLimiter::redis_pool(Some(&url)).unwrap());
         let pool = realtime.redis.clone().unwrap();
 
         // Both caps are 1, yet one realtime request and one batch request can
