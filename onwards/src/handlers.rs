@@ -14,6 +14,7 @@ use crate::serving::{
 };
 use crate::sse::SseBufferedStream;
 use crate::target::{ConcurrencyGuard, RequestClass, RoutingAction, Target};
+use crate::unsupported_params::{FlaggedParams, rejection_message};
 use axum::{
     Json,
     extract::Request,
@@ -26,7 +27,7 @@ use axum::{
 };
 use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
 use serde_json::map::Entry;
-use tracing::{Instrument, debug, error, instrument, trace, warn};
+use tracing::{Instrument, debug, error, info, instrument, trace, warn};
 use uuid::Uuid;
 
 /// Adapter to extract W3C trace context from an axum HeaderMap.
@@ -838,6 +839,48 @@ pub async fn target_message_handler<T: HttpClient>(
     // Labels failure outcomes, so a realtime outage can be told apart from a
     // batch backlog retrying against the same model.
     let traffic = if is_realtime { "realtime" } else { "dispatched" };
+
+    // Parameters the strict handler found that not every worker can serve.
+    // Each is logged and counted; the configured ones are refused here.
+    if let Some(FlaggedParams(params)) = req.extensions().get::<FlaggedParams>() {
+        let rejected: Vec<&'static str> = params
+            .iter()
+            .copied()
+            .filter(|param| state.rejected_params.contains(param))
+            .collect();
+        for param in params {
+            let action = if rejected.contains(param) { "rejected" } else { "logged" };
+            metrics::counter!(
+                "onwards_unsupported_params_total",
+                "param" => *param,
+                "model" => model_name.to_string(),
+                "traffic" => traffic,
+                "action" => action,
+            )
+            .increment(1);
+        }
+        let account = bearer_token
+            .as_deref()
+            .and_then(|token| state.targets.key_labels.get(token))
+            .and_then(|labels| labels.get(serving::ACCOUNT_LABEL).cloned());
+        info!(
+            params = %params.join(","),
+            rejected = %rejected.join(","),
+            model = %model_name,
+            account = account.as_deref().unwrap_or(""),
+            api_key_id = ?authenticated_api_key_id,
+            traffic,
+            "Request uses parameters not every worker supports"
+        );
+        if let Some(first) = rejected.first() {
+            record_response_status(400);
+            return Err(OnwardsErrorResponse::invalid_request(
+                &rejection_message(&rejected),
+                Some(first),
+                "unsupported_parameter",
+            ));
+        }
+    }
 
     // Check if pool has no providers (e.g., composite model with no enabled components).
     // This runs after routing rules so that redirects get a chance to replace the pool.
@@ -3132,6 +3175,7 @@ mod tests {
             sse_buffer_limit: crate::sse::DEFAULT_SSE_BUFFER_LIMIT,
             first_token_timeout: None,
             first_token_timeout_exempt_header: None,
+            rejected_params: Vec::new(),
         };
 
         // Create a simple POST request

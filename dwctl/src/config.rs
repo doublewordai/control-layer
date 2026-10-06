@@ -1219,6 +1219,12 @@ pub struct OnwardsConfig {
     /// breach without cutting it off; once breaches exceed the controller's
     /// target rate, later requests shift to the alternates. Set to 0 to disable.
     pub first_token_timeout_ms: u64,
+    /// Strict-mode chat parameters that get a 400 instead of being forwarded.
+    /// Every parameter onwards flags as not servable by every worker is logged
+    /// and counted (`onwards_unsupported_params_total`); only the ones listed
+    /// here are refused. Names must come from `onwards::unsupported_params::PARAMS`.
+    /// Default: empty (log only).
+    pub rejected_params: Vec<String>,
 }
 
 impl Default for OnwardsConfig {
@@ -1230,6 +1236,7 @@ impl Default for OnwardsConfig {
                 "This is a shared best-effort endpoint, rate limited under load – retry with backoff. For production workloads that aren't latency-sensitive, try our async or batch tiers (https://docs.doubleword.ai/inference-api/batch-inference); for a dedicated real-time endpoint with SLAs, higher rate limits, and volume pricing, contact support@doubleword.ai."
                     .to_string(),
             first_token_timeout_ms: 20_000,
+            rejected_params: Vec::new(),
         }
     }
 }

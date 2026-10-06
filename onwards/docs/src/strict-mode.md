@@ -147,6 +147,18 @@ All supported endpoints include:
 
 Requests to unsupported endpoints will return `404 Not Found` when strict mode is enabled.
 
+## Parameters not every backend supports
+
+Some chat parameters are engine extensions or options that not every backend behind a model can honour, for example `n` greater than 1, `logprobs`, `guided_json` or `min_tokens`. The full list, with the values that count as absent (such as `n: 1`, `logprobs: false` or `top_logprobs: 0`), is `PARAMS` in `onwards::unsupported_params`.
+
+Strict mode checks every chat request against that list before forwarding it:
+
+- Each matching parameter increments `onwards_unsupported_params_total{param, model, traffic, action}`. `action` is `logged` or `rejected`.
+- The request is logged at `info` with the parameter names, model, account and API key ID. Values and request bodies are never logged.
+- A parameter in the gateway's reject list gets a `400` with code `unsupported_parameter`, for example ``Unsupported parameter(s): `logprobs` ``, and the request is not forwarded. Every other parameter is forwarded unchanged.
+
+The reject list is empty by default, so the check only observes. Set it with `AppState::with_rejected_params`; in dwctl, use `onwards.rejected_params`. A name outside `PARAMS` is a configuration error.
+
 ## Comparison with response sanitization
 
 | Feature | Response Sanitization | Strict Mode |
