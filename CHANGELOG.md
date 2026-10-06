@@ -1,5 +1,17 @@
 # Changelog
 
+## [13.1.0](https://github.com/doublewordai/control-layer/compare/v13.0.0...v13.1.0) (2026-10-06)
+
+
+### Features
+
+* **onwards:** flag chat parameters not every backend supports ([#1925](https://github.com/doublewordai/control-layer/issues/1925)) ([b2271fb](https://github.com/doublewordai/control-layer/commit/b2271fb2b626d760937cfaf7ed77b0b0a6fe5ecb))
+
+
+### Bug Fixes
+
+* **security:** avoid raw HTML in chart styles (DW-927) ([#1926](https://github.com/doublewordai/control-layer/issues/1926)) ([312e7a3](https://github.com/doublewordai/control-layer/commit/312e7a3e991fe57629b92da4aaf10fd9619368ba))
+
 ## [13.0.0](https://github.com/doublewordai/control-layer/compare/v12.11.3...v13.0.0) (2026-10-06)
 
 
