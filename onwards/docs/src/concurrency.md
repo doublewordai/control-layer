@@ -87,9 +87,13 @@ The slot is taken after routing rules and counts against the alias the request
 named, even when a rule redirects it to another alias, so the named alias's
 limits apply. It is held across failover attempts and released when the
 response body finishes or the client disconnects. A request
-over the limit receives `429` with code `inflight_limit_exceeded`. Requests
-carrying the `first_token_timeout_exempt_header` (dispatched batch work) and
-requests from keys with no `account` label are not counted. Counts are per
+over the limit receives `429` with code `inflight_limit_exceeded` and a
+`Retry-After: 1` header. The limits belong to the alias as a whole: they are
+read from its default pool, whichever request-class pool serves the request.
+Requests carrying the header set with
+`AppState::with_first_token_timeout_exempt_header` (dispatched batch and async
+work) and requests from keys with no `account` label are not counted, and the
+plugged-in limiter can admit others without counting them. Counts are per
 process by default; `AppState::with_inflight_limiter` plugs in a shared
 counter so several instances enforce one limit.
 

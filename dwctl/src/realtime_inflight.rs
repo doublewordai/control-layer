@@ -149,7 +149,13 @@ impl RedisSlot {
                 loop {
                     ticks.tick().await;
                     if let Err(error) = renew(&pool, &key, &member).await {
-                        tracing::warn!(error = %error, "Failed to renew a realtime in-flight lease");
+                        crate::background_error!(
+                            crate::metrics::errors::component::REALTIME_INFLIGHT,
+                            "lease_renew",
+                            Warning,
+                            error = %error,
+                            "Failed to renew a realtime in-flight lease"
+                        );
                     }
                 }
             }
@@ -171,7 +177,13 @@ impl Drop for RedisSlot {
         let member = std::mem::take(&mut self.member);
         tokio::spawn(async move {
             if let Err(error) = release(&pool, &key, &member).await {
-                tracing::warn!(error = %error, "Failed to release a realtime in-flight slot; its lease will expire");
+                crate::background_error!(
+                    crate::metrics::errors::component::REALTIME_INFLIGHT,
+                    "lease_release",
+                    Warning,
+                    error = %error,
+                    "Failed to release a realtime in-flight slot; its lease will expire"
+                );
             }
         });
     }

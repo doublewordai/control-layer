@@ -580,6 +580,15 @@ pub async fn list_deployed_models<P: PoolProvider>(
     }))
 }
 
+fn validate_realtime_inflight_limit(limit: Option<i32>) -> Result<()> {
+    if limit.is_some_and(|limit| limit < 1) {
+        return Err(Error::BadRequest {
+            message: "realtime_inflight_limit must be at least 1".to_string(),
+        });
+    }
+    Ok(())
+}
+
 #[utoipa::path(
     post,
     path = "/models",
@@ -688,6 +697,7 @@ pub async fn create_deployed_model<P: PoolProvider>(
     validate_backoff(Some(b_initial), Some(b_max), Some(b_factor), b_total)?;
     if let DeployedModelCreate::Composite(c) = &create {
         validate_realtime_fallback_statuses(Some(&c.fallback_realtime_on_status))?;
+        validate_realtime_inflight_limit(c.realtime_inflight_limit)?;
     }
     match &create {
         DeployedModelCreate::Standard(s) => validate_aimd(s.first_token_timeout_ms, s.aimd.as_ref(), false, false, s.backoff_enabled)?,
@@ -946,6 +956,7 @@ pub async fn update_deployed_model<P: PoolProvider>(
             message: "realtime_inflight_limit is only supported for composite models".to_string(),
         });
     }
+    validate_realtime_inflight_limit(update.realtime_inflight_limit)?;
 
     // Validate the backoff state the update would *result in*, merging
     // incoming fields over the stored values. Without merging, a one-sided
@@ -2165,6 +2176,36 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(stored, None);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_realtime_inflight_limit_below_one_is_rejected(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let auth = add_auth_headers(&user);
+
+        app.post("/admin/api/v1/models")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .json(&json!({ "type": "composite", "model_name": "inflight-zero", "alias": "inflight-zero", "realtime_inflight_limit": 0 }))
+            .await
+            .assert_status_bad_request();
+
+        let response = app
+            .post("/admin/api/v1/models")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .json(&json!({ "type": "composite", "model_name": "inflight-one", "alias": "inflight-one" }))
+            .await;
+        response.assert_status_ok();
+        let created: DeployedModelResponse = response.json();
+        app.patch(&format!("/admin/api/v1/models/{}", created.id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .json(&json!({ "realtime_inflight_limit": 0 }))
+            .await
+            .assert_status_bad_request();
     }
 
     #[dwctl_test_macros::test]

@@ -27,6 +27,7 @@ impl<'c> RealtimeInflightLimits<'c> {
             FROM realtime_inflight_limit_overrides o
             INNER JOIN users u ON u.id = o.user_id
             WHERE o.deployed_model_id = $1
+              AND u.is_deleted = FALSE
             ORDER BY u.username
             "#,
             deployed_model_id

@@ -347,6 +347,16 @@ const ModelInfo: React.FC = () => {
       return;
     }
 
+    const inflightLimit = updateData.realtime_inflight_limit;
+    if (
+      model.is_composite &&
+      ((inflightLimit === null && model.realtime_inflight_limit != null) ||
+        (inflightLimit !== null && inflightLimit < 1))
+    ) {
+      setSettingsError("Enter a realtime in-flight limit of 1 or more.");
+      return;
+    }
+
     try {
       // For standard (single-provider) models, the backoff toggle implicitly
       // controls fallback + with_replacement too — otherwise SelectIter
@@ -388,10 +398,10 @@ const ModelInfo: React.FC = () => {
                   ),
               }
             : {}),
-          // Send null as the actual value when clearing (not undefined)
-          ...(isStandard
+          ...(isStandard || updateData.realtime_inflight_limit === null
             ? {}
             : { realtime_inflight_limit: updateData.realtime_inflight_limit }),
+          // Send null as the actual value when clearing (not undefined)
           batch_capacity: updateData.batch_capacity,
           throughput: updateData.throughput,
           allowed_batch_completion_windows:
@@ -1642,8 +1652,8 @@ const ModelInfo: React.FC = () => {
                                     account can have in flight on this model.
                                     Requests over the limit get a 429. Batch
                                     and async requests are not counted.
-                                    Per-account overrides are set through the
-                                    admin API.
+                                    Accounts can have their own limits in
+                                    account limit files.
                                   </p>
                                 </InfoTip>
                               </label>

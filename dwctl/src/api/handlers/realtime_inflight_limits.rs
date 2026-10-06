@@ -31,7 +31,7 @@ pub async fn list_realtime_inflight_limits<P: PoolProvider>(
     Path(id): Path<DeploymentId>,
     _: RequiresPermission<resource::ModelRateLimits, operation::ReadAll>,
 ) -> Result<Json<RealtimeInflightLimitsResponse>> {
-    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let default_limit = match Deployments::new(&mut conn).get_by_id(id).await? {
         Some(model) if model.is_composite && !model.deleted => model.realtime_inflight_limit,
         _ => {

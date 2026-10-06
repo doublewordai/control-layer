@@ -50,7 +50,9 @@ impl AccountLimitsCatalog {
         let mut files = Vec::new();
         for path in paths {
             let contents = fs::read_to_string(&path).with_context(|| format!("read account limits file {}", path.display()))?;
-            let document = serde_yaml::from_str(&contents).with_context(|| format!("parse account limits file {}", path.display()))?;
+            let value: serde_yaml::Value =
+                serde_yaml::from_str(&contents).with_context(|| format!("parse account limits file {}", path.display()))?;
+            let document = serde_yaml::from_value(value).with_context(|| format!("parse account limits file {}", path.display()))?;
             files.push(AccountLimitsFile {
                 source: path.display().to_string(),
                 document,
@@ -273,6 +275,10 @@ mod tests {
                 "must be positive",
             ),
             (vec![("a.yaml", "account: acme\nrealtime:\n  org/model: 10\n")], "unknown field"),
+            (
+                vec![("a.yaml", "account: acme\nrealtime_inflight:\n  org/model: 10\n  org/model: 20\n")],
+                "duplicate entry",
+            ),
             (
                 vec![
                     ("a.yaml", "account: acme\nrealtime_inflight:\n  org/model: 10\n"),

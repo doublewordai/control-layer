@@ -373,7 +373,8 @@ replaces every stored per-account limit with what the files declare. Removing
 a line or a file returns that account to the model's default on the next
 start. An empty directory clears every per-account limit; a missing directory
 changes nothing. An unknown account, or a model that is not a live virtual
-model, fails startup before anything is written.
+model, fails startup before any per-account limit is written; the model catalog
+and organisation overlays have already been applied by then.
 
 Run the same offline validation used by deployment CI:
 
