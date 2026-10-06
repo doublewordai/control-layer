@@ -72,6 +72,7 @@ pub mod model_provisioning;
 pub mod organizations;
 pub mod password_reset_tokens;
 pub mod provider_display_configs;
+pub mod realtime_inflight_limits;
 pub mod repository;
 pub mod tariffs;
 pub mod users;

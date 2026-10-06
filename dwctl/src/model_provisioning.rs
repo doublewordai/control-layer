@@ -181,9 +181,16 @@ impl ModelKind {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelSettings {
-    pub requests_per_second: Option<f32>,
-    pub burst_size: Option<i32>,
-    pub capacity: Option<i32>,
+    #[serde(rename = "requests_per_second")]
+    #[schemars(extend("deprecated" = true))]
+    pub ignored_requests_per_second: Option<f32>,
+    #[serde(rename = "burst_size")]
+    #[schemars(extend("deprecated" = true))]
+    pub ignored_burst_size: Option<i32>,
+    #[serde(rename = "capacity")]
+    #[schemars(extend("deprecated" = true))]
+    pub ignored_capacity: Option<i32>,
+    pub realtime_inflight_limit: Option<i32>,
     pub batch_capacity: Option<i32>,
     pub throughput: Option<f32>,
     pub sanitize_responses: bool,
@@ -196,9 +203,10 @@ pub struct ModelSettings {
 impl Default for ModelSettings {
     fn default() -> Self {
         Self {
-            requests_per_second: None,
-            burst_size: None,
-            capacity: None,
+            ignored_requests_per_second: None,
+            ignored_burst_size: None,
+            ignored_capacity: None,
+            realtime_inflight_limit: None,
             batch_capacity: None,
             throughput: None,
             sanitize_responses: false,
@@ -529,6 +537,12 @@ impl Catalog {
                 ensure_nonempty(&deployment.model_name, &model.source, "deployment.model_name")?;
                 ensure_nonempty(&deployment.endpoint, &model.source, "deployment.endpoint")?;
                 validate_settings(&deployment.settings, &model.source, "deployment.settings")?;
+                ensure!(
+                    deployment.settings.realtime_inflight_limit.is_none(),
+                    "{}: deployment.settings.realtime_inflight_limit is set on {:?}; the limit belongs to the virtual model in clay.settings",
+                    model.source,
+                    deployment.alias
+                );
                 validate_provider_pricing(deployment.provider_pricing.as_ref(), &model.source, &deployment.alias)?;
                 deployments.insert(deployment.alias.clone());
             }
@@ -784,14 +798,8 @@ fn validate_alias<'a>(
 }
 
 fn validate_settings(settings: &ModelSettings, source: &str, field: &str) -> Result<()> {
-    if let Some(value) = settings.requests_per_second {
-        ensure!(value > 0.0, "{source}: {field}.requests_per_second must be positive");
-    }
-    if let Some(value) = settings.burst_size {
-        ensure!(value > 0, "{source}: {field}.burst_size must be positive");
-    }
-    if let Some(value) = settings.capacity {
-        ensure!(value > 0, "{source}: {field}.capacity must be positive");
+    if let Some(value) = settings.realtime_inflight_limit {
+        ensure!(value > 0, "{source}: {field}.realtime_inflight_limit must be positive");
     }
     if let Some(value) = settings.batch_capacity {
         ensure!(value > 0, "{source}: {field}.batch_capacity must be positive");
@@ -1207,6 +1215,53 @@ clay:
             .await
             .unwrap();
         assert_eq!(disabled, Some(serde_json::json!({"enabled":false})));
+    }
+
+    #[dwctl_test_macros::test]
+    async fn catalog_sets_the_realtime_inflight_limit_and_ignores_retired_limits(pool: PgPool) {
+        sqlx::query("INSERT INTO inference_endpoints (name, url, created_by) VALUES ('onwards', 'http://onwards.test', '00000000-0000-0000-0000-000000000000')")
+            .execute(&pool).await.unwrap();
+        let limits = || async {
+            sqlx::query_as::<_, (i32, Option<i32>, Option<f32>)>(
+                "SELECT realtime_inflight_limit, capacity, requests_per_second FROM deployed_models WHERE alias = 'org/model'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        let directory = tempdir().unwrap();
+        let omitted = catalog_yaml("0.50", false, "0.1");
+        let retired = omitted.replace(
+            "  settings:\n    sanitize_responses: true\n  deployments:",
+            "  settings:\n    sanitize_responses: true\n    capacity: 12\n    requests_per_second: 5\n    burst_size: 10\n  deployments:",
+        );
+        write(directory.path(), "model.yaml", &retired);
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        assert_eq!(limits().await, (14, None, None));
+
+        let declared = omitted.replace(
+            "  settings:\n    sanitize_responses: true\n  deployments:",
+            "  settings:\n    sanitize_responses: true\n    realtime_inflight_limit: 250\n  deployments:",
+        );
+        write(directory.path(), "model.yaml", &declared);
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        assert_eq!(limits().await, (250, None, None));
+
+        write(directory.path(), "model.yaml", &omitted);
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        assert_eq!(limits().await.0, 250);
+    }
+
+    #[test]
+    fn the_realtime_inflight_limit_belongs_to_the_virtual_model() {
+        let directory = tempdir().unwrap();
+        let on_component = catalog_yaml("0.50", false, "0.1").replace(
+            "      settings:\n        sanitize_responses: true",
+            "      settings:\n        sanitize_responses: true\n        realtime_inflight_limit: 5",
+        );
+        write(directory.path(), "model.yaml", &on_component);
+        let error = Catalog::load(directory.path()).unwrap_err().to_string();
+        assert!(error.contains("realtime_inflight_limit"), "{error}");
     }
 
     #[dwctl_test_macros::test]

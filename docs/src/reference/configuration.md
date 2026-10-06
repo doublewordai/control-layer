@@ -72,6 +72,7 @@ model_provisioning:
   enabled: true
   directory: /app/model-provisioning.d
   org_overlays_directory: /app/org-overlays.d
+  account_limits_directory: /app/account-limits.d
 ```
 
 | Field | Type | Default | Description |
@@ -79,6 +80,7 @@ model_provisioning:
 | `enabled` | boolean | `false` | Apply the declarative model catalog during startup. |
 | `directory` | path | `/app/model-provisioning.d` | Directory containing one `.yaml` or `.yml` document per canonical model. |
 | `org_overlays_directory` | path | `/app/org-overlays.d` | Directory containing one `.yaml` or `.yml` document per organisation with per-model serving overrides (`default_class` or explicit `targets`, `self_hosted_only`). Applied after the model catalog when `enabled` is set. A missing directory is an empty catalog, so a deployment that does not mount one applies no overlays; an existing path that is not a directory fails startup. |
+| `account_limits_directory` | path | `/app/account-limits.d` | Directory containing one `.yaml` or `.yml` document per account with its own realtime in-flight limits on virtual models. Applied after the model catalog when `enabled` is set, replacing every stored per-account limit. A missing directory changes nothing; an empty one clears every per-account limit. See [Account limits](./model-provisioning.md#account-limits). |
 
 When enabled, the directory must exist. Startup fails before any provisioning
 writes if loading, validation, or a referenced endpoint/group lookup fails.
@@ -568,6 +570,27 @@ metadata:
 | `title` | string | - | Custom browser tab title. |
 | `docs_url` | string | `"https://doublewordai.github.io/control-layer/"` | Documentation link in header. |
 | `docs_jsonl_url` | string | - | JSONL docs link in batch upload modal. |
+
+## Realtime In-Flight Limits
+
+Each virtual model has a default number of realtime requests one account may
+have in flight on it (`realtime_inflight_limit`), and an
+[account limit file](./model-provisioning.md#account-limits) can give one
+account a different limit. Replicas share their counts through Redis:
+
+```yaml
+limits:
+  realtime_inflight:
+    enforce: true
+    redis_url: rediss://:password@limits-redis.example:6379
+```
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `limits.realtime_inflight.enforce` | `false` | Refuse requests over the limit. Off, every request is admitted, so defaults and account limits can be in place before the limit takes effect. |
+| `limits.realtime_inflight.redis_url` | unset | Redis holding the shared counts. Unset, or unreachable, each replica counts only its own requests. |
+
+`auth.rate_limits` is no longer used and is ignored if present.
 
 ## Observability
 

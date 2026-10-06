@@ -329,6 +329,7 @@
             "burst_size": null,
             "capacity": null,
             "metadata": {},
+            "realtime_inflight_limit": null,
             "reasoning_translation_overrides": null,
             "requests_per_second": null,
             "sanitize_responses": false,
@@ -525,7 +526,8 @@
             "null"
           ],
           "format": "int32",
-          "default": null
+          "default": null,
+          "deprecated": true
         },
         "capacity": {
           "type": [
@@ -533,10 +535,19 @@
             "null"
           ],
           "format": "int32",
-          "default": null
+          "default": null,
+          "deprecated": true
         },
         "metadata": {
           "default": {}
+        },
+        "realtime_inflight_limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32",
+          "default": null
         },
         "reasoning_translation_overrides": {
           "default": null
@@ -547,7 +558,8 @@
             "null"
           ],
           "format": "float",
-          "default": null
+          "default": null,
+          "deprecated": true
         },
         "sanitize_responses": {
           "type": "boolean",
@@ -623,6 +635,7 @@
             "burst_size": null,
             "capacity": null,
             "metadata": {},
+            "realtime_inflight_limit": null,
             "reasoning_translation_overrides": null,
             "requests_per_second": null,
             "sanitize_responses": false,

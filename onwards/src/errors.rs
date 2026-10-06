@@ -20,6 +20,7 @@ use crate::reasoning::ReasoningError;
 /// Error code for a request refused because the caller's own concurrency
 /// limit is reached.
 const CONCURRENCY_LIMIT_CODE: &str = "concurrency_limit_exceeded";
+const INFLIGHT_LIMIT_CODE: &str = "inflight_limit_exceeded";
 /// Error code for a request refused because the model's providers are full.
 const OVERLOADED_CODE: &str = "overloaded";
 /// Error code for a request refused because the model has no provider
@@ -30,7 +31,7 @@ const NO_CAPACITY_CODE: &str = "no_capacity";
 fn retry_after_secs(code: &str) -> Option<&'static str> {
     match code {
         // Room frees as in-flight requests finish.
-        CONCURRENCY_LIMIT_CODE | OVERLOADED_CODE => Some("1"),
+        CONCURRENCY_LIMIT_CODE | INFLIGHT_LIMIT_CODE | OVERLOADED_CODE => Some("1"),
         // A provider has to be placed and start before anything is served.
         NO_CAPACITY_CODE => Some("30"),
         _ => None,
@@ -133,6 +134,22 @@ impl OnwardsErrorResponse {
                 r#type: "rate_limit_error".to_string(),
                 param: None,
                 code: CONCURRENCY_LIMIT_CODE.to_string(),
+            }),
+            status: StatusCode::TOO_MANY_REQUESTS,
+            serving_outcome: None,
+            authenticated_api_key_id: None,
+        }
+    }
+
+    pub fn inflight_limited(model: &str, limit: u32) -> Self {
+        OnwardsErrorResponse {
+            body: Some(ErrorResponseBody {
+                message: format!(
+                    "Too many realtime requests in flight for model '{model}'. Your account's limit is {limit}; retry once one completes."
+                ),
+                r#type: "rate_limit_error".to_string(),
+                param: None,
+                code: INFLIGHT_LIMIT_CODE.to_string(),
             }),
             status: StatusCode::TOO_MANY_REQUESTS,
             serving_outcome: None,

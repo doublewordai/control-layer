@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at FROM api_keys WHERE id = ANY($1) AND is_deleted = false",
+  "query": "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at\n            FROM api_keys\n            WHERE hidden = false AND is_deleted = false\n              AND ($1::uuid IS NULL OR user_id = $1)\n              AND ($4::uuid IS NULL OR created_by = $4)\n            ORDER BY created_at DESC\n            LIMIT $2 OFFSET $3",
   "describe": {
     "columns": [
       {
@@ -50,48 +50,41 @@
       },
       {
         "ordinal": 9,
-        "name": "requests_per_second",
-        "type_info": "Float4"
-      },
-      {
-        "ordinal": 10,
-        "name": "burst_size",
-        "type_info": "Int4"
-      },
-      {
-        "ordinal": 11,
         "name": "hidden",
         "type_info": "Bool"
       },
       {
-        "ordinal": 12,
+        "ordinal": 10,
         "name": "is_deleted",
         "type_info": "Bool"
       },
       {
-        "ordinal": 13,
+        "ordinal": 11,
         "name": "spend_limit",
         "type_info": "Numeric"
       },
       {
-        "ordinal": 14,
+        "ordinal": 12,
         "name": "spend_limit_interval",
         "type_info": "Text"
       },
       {
-        "ordinal": 15,
+        "ordinal": 13,
         "name": "parent_api_key_id",
         "type_info": "Uuid"
       },
       {
-        "ordinal": 16,
+        "ordinal": 14,
         "name": "secret_revealed_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "UuidArray"
+        "Uuid",
+        "Int8",
+        "Int8",
+        "Uuid"
       ]
     },
     "nullable": [
@@ -104,8 +97,6 @@
       false,
       false,
       true,
-      true,
-      true,
       false,
       false,
       true,
@@ -114,5 +105,5 @@
       true
     ]
   },
-  "hash": "b6987355a760fe6684313dd9fd04202f94e6d3356bdd3b611336cd18a38cf04f"
+  "hash": "8bb069abffdaf7e36a43ad3d68f1ef2c1ab73857dca8fe4dd8f603a0b307ee1c"
 }

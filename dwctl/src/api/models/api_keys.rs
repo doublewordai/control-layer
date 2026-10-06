@@ -23,10 +23,6 @@ pub struct ApiKeyCreate {
     /// 'continuation' are reserved for internal system use.
     #[serde(default = "default_api_key_purpose")]
     pub purpose: ApiKeyPurpose,
-    /// Per-API-key rate limit: requests per second (null = no limit)
-    pub requests_per_second: Option<f32>,
-    /// Per-API-key rate limit: maximum burst size (null = no limit)
-    pub burst_size: Option<i32>,
     /// Organization member to attribute this key to. Only usable when the caller has
     /// permission to create keys for any member of the organization (e.g. PlatformManagers
     /// or admins). The specified user must be a member of the org.
@@ -50,10 +46,6 @@ pub struct ApiKeyCreate {
 pub struct ApiKeyUpdate {
     pub name: Option<String>,
     pub description: Option<String>,
-    /// Per-API-key rate limit: requests per second (null = no limit, Some(None) = remove limit)
-    pub requests_per_second: Option<Option<f32>>,
-    /// Per-API-key rate limit: maximum burst size (null = no limit, Some(None) = remove limit)
-    pub burst_size: Option<Option<i32>>,
     /// Spending cap (credits). Absent = unchanged; explicit null = remove the
     /// cap; a value = set/change it. Setting a cap where none existed resets
     /// the spend window and provisions cap-scope execution for batch/flex.
@@ -90,10 +82,6 @@ pub struct ApiKeyResponse {
     pub last_used: Option<DateTime<Utc>>,
     #[schema(value_type = Vec<String>)]
     pub model_access: Vec<DeploymentId>,
-    /// Per-API-key rate limit: requests per second (null = no limit)
-    pub requests_per_second: Option<f32>,
-    /// Per-API-key rate limit: maximum burst size (null = no limit)
-    pub burst_size: Option<i32>,
     /// When the key's holder first fetched the secret. Null = an issued key
     /// whose holder has not yet used their one-off reveal (POST
     /// .../api-keys/{id}/reveal); self-created keys are born revealed.
@@ -130,10 +118,6 @@ pub struct ApiKeyInfoResponse {
     pub last_used: Option<DateTime<Utc>>,
     #[schema(value_type = Vec<String>)]
     pub model_access: Vec<DeploymentId>,
-    /// Per-API-key rate limit: requests per second (null = no limit)
-    pub requests_per_second: Option<f32>,
-    /// Per-API-key rate limit: maximum burst size (null = no limit)
-    pub burst_size: Option<i32>,
     /// When the key's holder first fetched the secret. Null = an issued key
     /// whose holder has not yet used their one-off reveal (POST
     /// .../api-keys/{id}/reveal); self-created keys are born revealed.
@@ -192,8 +176,6 @@ impl From<ApiKeyDBResponse> for ApiKeyResponse {
             created_at: db.created_at,
             last_used: db.last_used,
             model_access: db.model_access,
-            requests_per_second: db.requests_per_second,
-            burst_size: db.burst_size,
             secret_revealed_at: db.secret_revealed_at,
             spend_limit: db.spend_limit,
             spend_limit_interval: db.spend_limit_interval,
@@ -230,8 +212,6 @@ impl From<ApiKeyDBResponse> for ApiKeyInfoResponse {
             created_at: db.created_at,
             last_used: db.last_used,
             model_access: db.model_access,
-            requests_per_second: db.requests_per_second,
-            burst_size: db.burst_size,
             secret_revealed_at: db.secret_revealed_at,
             spend_limit: db.spend_limit,
             spend_limit_interval: db.spend_limit_interval,

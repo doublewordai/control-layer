@@ -169,9 +169,7 @@ struct DeployedModel {
     pub deleted: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    pub requests_per_second: Option<f32>,
-    pub burst_size: Option<i32>,
-    pub capacity: Option<i32>,
+    pub realtime_inflight_limit: i32,
     pub batch_capacity: Option<i32>,
     pub throughput: Option<f32>,
     // Provider pricing (flexible)
@@ -246,9 +244,7 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             deleted: m.deleted,
             created_at: m.created_at,
             updated_at: m.updated_at,
-            requests_per_second: m.requests_per_second,
-            burst_size: m.burst_size,
-            capacity: m.capacity,
+            realtime_inflight_limit: m.realtime_inflight_limit,
             batch_capacity: m.batch_capacity,
             throughput: m.throughput,
             provider_pricing,
@@ -332,7 +328,7 @@ impl<'c> Repository for Deployments<'c> {
             r#"
             INSERT INTO deployed_models (
                 model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, created_at, updated_at,
-                requests_per_second, burst_size, capacity, batch_capacity, throughput,
+                batch_capacity, throughput,
                 downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token,
                 downstream_hourly_rate, downstream_input_token_cost_ratio,
                 is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status,
@@ -342,11 +338,11 @@ impl<'c> Repository for Deployments<'c> {
                 backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms,
                 reasoning_translation_overrides, first_token_timeout_ms, aimd, fallback_realtime_on_status, affinity
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, COALESCE($41, '{}'), $42)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, COALESCE($38, '{}'), $39)
             RETURNING id, model_name, alias, display_name, description,
                 type, capabilities, created_by, hosted_on, status,
-                last_sync, deleted, created_at, updated_at, requests_per_second,
-                burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode,
+                last_sync, deleted, created_at, updated_at, realtime_inflight_limit,
+                batch_capacity, throughput, downstream_pricing_mode,
                 downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite,
                 lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_realtime_on_status, fallback_with_replacement,
                 fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor,
@@ -364,9 +360,6 @@ impl<'c> Repository for Deployments<'c> {
         .bind(request.hosted_on)
         .bind(created_at)
         .bind(updated_at)
-        .bind(request.requests_per_second)
-        .bind(request.burst_size)
-        .bind(request.capacity)
         .bind(request.batch_capacity)
         .bind(request.throughput)
         .bind(pricing_fields.mode)
@@ -405,6 +398,16 @@ impl<'c> Repository for Deployments<'c> {
         .fetch_one(&mut *tx)
         .await?;
 
+        let mut model = model;
+        if let Some(limit) = request.realtime_inflight_limit {
+            sqlx::query("UPDATE deployed_models SET realtime_inflight_limit = $1 WHERE id = $2")
+                .bind(limit)
+                .bind(model.id)
+                .execute(&mut *tx)
+                .await?;
+            model.realtime_inflight_limit = limit;
+        }
+
         let model_type = model.r#type.as_ref().and_then(|s| match s.as_str() {
             "CHAT" => Some(ModelType::Chat),
             "EMBEDDINGS" => Some(ModelType::Embeddings),
@@ -419,7 +422,7 @@ impl<'c> Repository for Deployments<'c> {
     #[instrument(skip(self), fields(deployment_id = %abbrev_uuid(&id)), err)]
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let model = sqlx::query_as::<_, DeployedModel>(
-            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_realtime_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, first_token_timeout_ms, aimd, affinity, sanitize_responses, trusted, allowed_batch_completion_windows, metadata, reasoning_translation_overrides, provisioning_source, serving_classes FROM deployed_models WHERE id = $1",
+            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, realtime_inflight_limit, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_realtime_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, first_token_timeout_ms, aimd, affinity, sanitize_responses, trusted, allowed_batch_completion_windows, metadata, reasoning_translation_overrides, provisioning_source, serving_classes FROM deployed_models WHERE id = $1",
         )
             .bind(id)
             .fetch_optional(&mut *self.db)
@@ -444,7 +447,7 @@ impl<'c> Repository for Deployments<'c> {
         }
 
         let deployments = sqlx::query_as::<_, DeployedModel>(
-            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_realtime_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, first_token_timeout_ms, aimd, affinity, sanitize_responses, trusted, allowed_batch_completion_windows, metadata, reasoning_translation_overrides, provisioning_source, serving_classes FROM deployed_models WHERE id = ANY($1)",
+            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, realtime_inflight_limit, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_realtime_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, first_token_timeout_ms, aimd, affinity, sanitize_responses, trusted, allowed_batch_completion_windows, metadata, reasoning_translation_overrides, provisioning_source, serving_classes FROM deployed_models WHERE id = ANY($1)",
         )
             .bind(ids.as_slice())
             .fetch_all(&mut *self.db)
@@ -520,14 +523,6 @@ impl<'c> Repository for Deployments<'c> {
             .transpose()
             .map_err(anyhow::Error::from)?;
 
-        // Info logging for rate limiting
-        tracing::info!(
-            "Updating deployment {} - requests_per_second: {:?}, burst_size: {:?}",
-            id,
-            request.requests_per_second,
-            request.burst_size
-        );
-
         let model = sqlx::query_as::<_, DeployedModel>(
             r#"
         UPDATE deployed_models SET
@@ -557,107 +552,93 @@ impl<'c> Repository for Deployments<'c> {
             END,
             deleted    = COALESCE($13, deleted),
 
-            -- Three-state update for rate limiting
-            requests_per_second = CASE
-                WHEN $14 THEN $15
-                ELSE requests_per_second
-            END,
-            burst_size = CASE
-                WHEN $16 THEN $17
-                ELSE burst_size
-            END,
-
-            -- Three-state update for capacity
-            capacity = CASE
-                WHEN $18 THEN $19
-                ELSE capacity
-            END,
+            realtime_inflight_limit = COALESCE($14, realtime_inflight_limit),
             batch_capacity = CASE
-                WHEN $20 THEN $21
+                WHEN $15 THEN $16
                 ELSE batch_capacity
             END,
 
             -- Three-state update for throughput
             throughput = CASE
-                WHEN $37 THEN $38
+                WHEN $32 THEN $33
                 ELSE throughput
             END,
 
             -- Individual field updates for provider/downstream pricing
             downstream_pricing_mode = CASE
-                WHEN $22 THEN $23
+                WHEN $17 THEN $18
                 ELSE downstream_pricing_mode
             END,
             downstream_input_price_per_token = CASE
-                WHEN $24 THEN $25
+                WHEN $19 THEN $20
                 ELSE downstream_input_price_per_token
             END,
             downstream_output_price_per_token = CASE
-                WHEN $26 THEN $27
+                WHEN $21 THEN $22
                 ELSE downstream_output_price_per_token
             END,
             downstream_hourly_rate = CASE
-                WHEN $28 THEN $29
+                WHEN $23 THEN $24
                 ELSE downstream_hourly_rate
             END,
             downstream_input_token_cost_ratio = CASE
-                WHEN $30 THEN $31
+                WHEN $25 THEN $26
                 ELSE downstream_input_token_cost_ratio
             END,
 
             -- Composite model fields
-            lb_strategy = COALESCE($32, lb_strategy),
-            fallback_enabled = COALESCE($33, fallback_enabled),
-            fallback_on_rate_limit = COALESCE($34, fallback_on_rate_limit),
-            fallback_on_status = COALESCE($35, fallback_on_status),
-            sanitize_responses = COALESCE($36, sanitize_responses),
-            fallback_with_replacement = COALESCE($39, fallback_with_replacement),
+            lb_strategy = COALESCE($27, lb_strategy),
+            fallback_enabled = COALESCE($28, fallback_enabled),
+            fallback_on_rate_limit = COALESCE($29, fallback_on_rate_limit),
+            fallback_on_status = COALESCE($30, fallback_on_status),
+            sanitize_responses = COALESCE($31, sanitize_responses),
+            fallback_with_replacement = COALESCE($34, fallback_with_replacement),
             fallback_max_attempts = CASE
-                WHEN $40 THEN $41
+                WHEN $35 THEN $36
                 ELSE fallback_max_attempts
             END,
-            trusted = COALESCE($42, trusted),
+            trusted = COALESCE($37, trusted),
 
             -- Batch completion windows
             allowed_batch_completion_windows = CASE
-                WHEN $43 THEN $44
+                WHEN $38 THEN $39
                 ELSE allowed_batch_completion_windows
             END,
 
             -- Catalog metadata
             metadata = CASE
-                WHEN $45 THEN $46
+                WHEN $40 THEN $41
                 ELSE metadata
             END,
 
-            display_name = COALESCE($47, display_name),
+            display_name = COALESCE($42, display_name),
 
             -- Inter-attempt backoff
-            backoff_enabled = COALESCE($48, backoff_enabled),
-            backoff_initial_ms = COALESCE($49, backoff_initial_ms),
-            backoff_max_ms = COALESCE($50, backoff_max_ms),
-            backoff_factor = COALESCE($51, backoff_factor),
-            backoff_jitter = COALESCE($52, backoff_jitter),
+            backoff_enabled = COALESCE($43, backoff_enabled),
+            backoff_initial_ms = COALESCE($44, backoff_initial_ms),
+            backoff_max_ms = COALESCE($45, backoff_max_ms),
+            backoff_factor = COALESCE($46, backoff_factor),
+            backoff_jitter = COALESCE($47, backoff_jitter),
             backoff_max_total_ms = CASE
-                WHEN $53 THEN $54
+                WHEN $48 THEN $49
                 ELSE backoff_max_total_ms
             END,
 
             reasoning_translation_overrides = CASE
-                WHEN $55 THEN $56
+                WHEN $50 THEN $51
                 ELSE reasoning_translation_overrides
             END,
 
-            first_token_timeout_ms = CASE WHEN $57 THEN $58 ELSE first_token_timeout_ms END,
-            aimd = CASE WHEN $59 THEN $60 ELSE aimd END,
-            fallback_realtime_on_status = COALESCE($61, fallback_realtime_on_status),
-            affinity = CASE WHEN $62 THEN $63 ELSE affinity END,
+            first_token_timeout_ms = CASE WHEN $52 THEN $53 ELSE first_token_timeout_ms END,
+            aimd = CASE WHEN $54 THEN $55 ELSE aimd END,
+            fallback_realtime_on_status = COALESCE($56, fallback_realtime_on_status),
+            affinity = CASE WHEN $57 THEN $58 ELSE affinity END,
             updated_at = NOW()
         WHERE id = $1
         RETURNING id, model_name, alias, display_name, description,
                 type, capabilities, created_by, hosted_on, status,
-                last_sync, deleted, created_at, updated_at, requests_per_second,
-                burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode,
+                last_sync, deleted, created_at, updated_at, realtime_inflight_limit,
+                batch_capacity, throughput, downstream_pricing_mode,
                 downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite,
                 lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_realtime_on_status, fallback_with_replacement,
                 fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor,
@@ -678,12 +659,7 @@ impl<'c> Repository for Deployments<'c> {
         .bind(request.last_sync.is_some())
         .bind(request.last_sync.as_ref().and_then(Option::as_ref))
         .bind(request.deleted)
-        .bind(request.requests_per_second.is_some())
-        .bind(request.requests_per_second.as_ref().and_then(Option::as_ref))
-        .bind(request.burst_size.is_some())
-        .bind(request.burst_size.as_ref().and_then(Option::as_ref))
-        .bind(request.capacity.is_some())
-        .bind(request.capacity.as_ref().and_then(Option::as_ref))
+        .bind(request.realtime_inflight_limit)
         .bind(request.batch_capacity.is_some())
         .bind(request.batch_capacity.as_ref().and_then(Option::as_ref))
         .bind(pricing_params.should_update_mode)
@@ -757,8 +733,8 @@ impl<'c> Repository for Deployments<'c> {
         let mut query = QueryBuilder::new(
             "SELECT dm.id, dm.model_name, dm.alias, dm.display_name, dm.description,
                 dm.type, dm.capabilities, dm.created_by, dm.hosted_on, dm.status,
-                dm.last_sync, dm.deleted, dm.created_at, dm.updated_at, dm.requests_per_second,
-                dm.burst_size, dm.capacity, dm.batch_capacity, dm.throughput, dm.downstream_pricing_mode,
+                dm.last_sync, dm.deleted, dm.created_at, dm.updated_at, dm.realtime_inflight_limit,
+                dm.batch_capacity, dm.throughput, dm.downstream_pricing_mode,
                 dm.downstream_input_price_per_token, dm.downstream_output_price_per_token, dm.downstream_hourly_rate, dm.downstream_input_token_cost_ratio, dm.is_composite,
                 dm.lb_strategy, dm.fallback_enabled, dm.fallback_on_rate_limit, dm.fallback_on_status, dm.fallback_realtime_on_status, dm.fallback_with_replacement,
                 dm.fallback_max_attempts, dm.backoff_enabled, dm.backoff_initial_ms, dm.backoff_max_ms, dm.backoff_factor,
@@ -1987,7 +1963,7 @@ mod tests {
                     .hosted_on(test_endpoint_id)
                     .model_type(ModelType::Chat)
                     .capabilities(vec!["text-generation".to_string(), "streaming".to_string()])
-                    .capacity(100)
+                    .realtime_inflight_limit(40)
                     .batch_capacity(50)
                     .build();
 
@@ -2003,7 +1979,7 @@ mod tests {
             model.capabilities,
             Some(vec!["text-generation".to_string(), "streaming".to_string()])
         );
-        assert_eq!(model.capacity, Some(100));
+        assert_eq!(model.realtime_inflight_limit, 40);
         assert_eq!(model.batch_capacity, Some(50));
     }
 
@@ -2086,7 +2062,7 @@ mod tests {
                     .description(Some("Updated description".to_string()))
                     .model_type(Some(ModelType::Embeddings))
                     .capabilities(Some(vec!["embeddings".to_string(), "similarity".to_string()]))
-                    .capacity(Some(200))
+                    .realtime_inflight_limit(200)
                     .batch_capacity(Some(75))
                     .build();
 
@@ -2101,7 +2077,7 @@ mod tests {
             updated_model.capabilities,
             Some(vec!["embeddings".to_string(), "similarity".to_string()])
         );
-        assert_eq!(updated_model.capacity, Some(200));
+        assert_eq!(updated_model.realtime_inflight_limit, 200);
         assert_eq!(updated_model.batch_capacity, Some(75));
     }
 
@@ -2143,7 +2119,7 @@ mod tests {
         assert_eq!(model.created_by, user.id);
         assert_eq!(model.model_type, None);
         assert_eq!(model.capabilities, None);
-        assert_eq!(model.capacity, None);
+        assert_eq!(model.realtime_inflight_limit, 14);
         assert_eq!(model.batch_capacity, None);
     }
 
@@ -2179,7 +2155,6 @@ mod tests {
                 model_create.hosted_on = Some(test_endpoint_id);
                 model_create.model_type = Some(ModelType::Chat);
                 model_create.capabilities = Some(vec!["test-capability".to_string()]);
-                model_create.capacity = Some(150);
                 model_create.batch_capacity = Some(60);
 
                 created_model = repo.create(&model_create).await.unwrap();
@@ -2188,7 +2163,6 @@ mod tests {
                 let update = DeploymentUpdateDBRequest::builder()
                     .maybe_model_type(Some(None))
                     .maybe_capabilities(Some(None))
-                    .maybe_capacity(Some(None))
                     .maybe_batch_capacity(Some(None))
                     .build();
 
@@ -2198,11 +2172,9 @@ mod tests {
         }
         assert_eq!(created_model.model_type, Some(ModelType::Chat));
         assert_eq!(created_model.capabilities, Some(vec!["test-capability".to_string()]));
-        assert_eq!(created_model.capacity, Some(150));
         assert_eq!(created_model.batch_capacity, Some(60));
         assert_eq!(updated_model.model_type, None);
         assert_eq!(updated_model.capabilities, None);
-        assert_eq!(updated_model.capacity, None);
         assert_eq!(updated_model.batch_capacity, None);
     }
 

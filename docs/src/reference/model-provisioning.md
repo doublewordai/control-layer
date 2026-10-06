@@ -23,9 +23,7 @@ clay:
   capabilities: [reasoning]
 
   settings:
-    requests_per_second: 100
-    burst_size: 200
-    capacity: 64
+    realtime_inflight_limit: 64
     batch_capacity: 16
     throughput: 8
     sanitize_responses: true
@@ -250,6 +248,16 @@ models. Two values are exceptions:
 - A component's `enabled` is applied when provisioning creates the component.
   An existing component keeps its stored value across restarts; enable or
   disable it through the admin API or dashboard.
+- `settings.realtime_inflight_limit` on the virtual model (the default number
+  of realtime requests one account may have in flight on it): when omitted,
+  the stored value is kept, and a new model starts at 14. It belongs to the
+  virtual model; setting it on a deployment is an error. Per-account limits
+  are declared in [account limit files](#account-limits), not in the model
+  catalog. A request that a traffic rule redirects to another model counts
+  against the limit of the model it named.
+
+The retired settings `requests_per_second`, `burst_size` and `capacity` are
+still accepted so older catalogs load, but they are ignored.
 
 Models omitted from YAML are not deleted or otherwise rewritten. Their
 `provisioning_source` becomes `NULL`, which makes them manually managed again.
@@ -343,3 +351,40 @@ A pre-existing future-dated general tariff is different: it already reserves a
 future interval. Model tariff replacement returns an explicit bad-request error
 until an operator resolves that schedule; it neither cancels the schedule nor
 leaves partial model edits. Metadata-only edits are still permitted.
+
+## Account limits
+
+An account limit file gives one account its own realtime in-flight limit on
+some virtual models, in place of each model's
+`settings.realtime_inflight_limit`. The account is a user or an organisation,
+named by its username, and an organisation's limit covers every key the
+organisation owns. One file per account, mounted at
+`model_provisioning.account_limits_directory`:
+
+```yaml
+account: acme
+realtime_inflight:
+  example/chat-model: 200
+  example/fast-model: 40
+```
+
+Startup applies the files after the model catalog, in one transaction, and
+replaces every stored per-account limit with what the files declare. Removing
+a line or a file returns that account to the model's default on the next
+start. An empty directory clears every per-account limit; a missing directory
+changes nothing. An unknown account, or a model that is not a live virtual
+model, fails startup before any per-account limit is written; the model catalog
+and organisation overlays have already been applied by then.
+
+Run the same offline validation used by deployment CI:
+
+```sh
+dwctl-model-provisioning validate-account-limits ./account-limits.d --models ./model-provisioning.d
+```
+
+It rejects unknown fields, limits below 1, an account declared in two files and
+models absent from the model catalog. Whether each account exists can only be
+checked against the database, at startup.
+
+`GET /admin/api/v1/models/{id}/realtime-inflight-limits` returns a virtual
+model's default and its per-account limits, for platform managers.

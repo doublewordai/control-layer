@@ -10,6 +10,7 @@
 use crate::affinity::{self, AffinityConfig, Tracker};
 use crate::aimd::{AimdConfig, Controller, Observation};
 use crate::auth::KeySet;
+use crate::inflight::InflightLimits;
 use crate::serving::{ServingOverlay, ServingPresets};
 use crate::target::{
     ConcurrencyGuard, ConcurrencyLimiter, FallbackConfig, LoadBalanceStrategy, RateLimiter,
@@ -101,6 +102,7 @@ pub struct ProviderPool {
     /// per-account overlays. Shared, so cloning the pool per request is
     /// cheap however many organisations have overlays on the alias.
     serving: AliasServing,
+    inflight: Option<Arc<InflightLimits>>,
 }
 
 /// The serving policy declared on an alias: the presets it offers and its
@@ -184,6 +186,7 @@ impl ProviderPool {
             trusted: false,
             routing_rules: Vec::new(),
             serving: AliasServing::default(),
+            inflight: None,
         }
     }
 
@@ -218,6 +221,7 @@ impl ProviderPool {
             trusted,
             routing_rules,
             serving: AliasServing::default(),
+            inflight: None,
         }
     }
 
@@ -230,6 +234,15 @@ impl ProviderPool {
     ) -> Self {
         self.serving = AliasServing::new(serving_classes, overlays);
         self
+    }
+
+    pub fn with_inflight_limits(mut self, limits: Option<InflightLimits>) -> Self {
+        self.inflight = limits.map(Arc::new);
+        self
+    }
+
+    pub fn inflight_limits(&self) -> Option<&Arc<InflightLimits>> {
+        self.inflight.as_ref()
     }
 
     /// Elevated serving classes the alias offers.
