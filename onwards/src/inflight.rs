@@ -75,11 +75,21 @@ impl LocalInflightLimiter {
             .entry((account.to_owned(), model.to_owned()))
             .or_default()
             .clone();
-        count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current < limit).then_some(current + 1)
-            })
-            .ok()?;
+        let mut current = count.load(Ordering::Acquire);
+        loop {
+            if current >= limit {
+                return None;
+            }
+            match count.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
         Some(InflightSlot::new(LocalSlot(count)))
     }
 
