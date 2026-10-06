@@ -1211,7 +1211,7 @@ pub struct OnwardsConfig {
     /// Strict-mode chat parameters that get a 400 instead of being forwarded.
     /// Every parameter onwards flags as not servable by every worker is logged
     /// and counted (`onwards_unsupported_params_total`); only the ones listed
-    /// here are refused. Names must come from `onwards::unsupported_params::PARAMS`.
+    /// here are refused. Names must come from `onwards::unsupported_params::params()`.
     /// Default: empty (log only).
     pub rejected_params: Vec<String>,
 }
@@ -3527,6 +3527,16 @@ impl Config {
                 operation: format!("Config validation: prompt-cache retention is invalid: {error}"),
             });
         }
+        if let Some(name) = self
+            .onwards
+            .rejected_params
+            .iter()
+            .find(|name| onwards::unsupported_params::known_param(name).is_none())
+        {
+            return Err(Error::Internal {
+                operation: format!("Config validation: onwards.rejected_params names an unknown parameter: {name}"),
+            });
+        }
         if self.background_services.batch_daemon.retention.expire_files
             || self.background_services.batch_daemon.retention.terminal_batch_seconds.is_some()
         {
@@ -4079,6 +4089,18 @@ mod tests {
             .insert("unknown".to_string(), 60);
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("unsupported service tier"));
+    }
+
+    #[test]
+    fn rejected_params_must_be_known() {
+        let mut config = Config::default();
+        config.onwards.rejected_params = vec!["logprobs".to_string()];
+        let error = config.validate().err().map(|error| error.to_string()).unwrap_or_default();
+        assert!(!error.contains("rejected_params"));
+
+        config.onwards.rejected_params.push("top_k".to_string());
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("onwards.rejected_params names an unknown parameter: top_k"));
     }
 
     #[test]

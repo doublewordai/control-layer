@@ -26,9 +26,12 @@ fn targets(alias: &str) -> Targets {
     .unwrap()
 }
 
+const EXEMPT_HEADER: &str = "x-batch-created-at";
+
 fn server(alias: &str, mock: MockHttpClient, rejected: &[&str]) -> TestServer {
     LazyLock::force(&METRICS);
     let state = AppState::with_client(targets(alias), mock)
+        .with_first_token_timeout_exempt_header(EXEMPT_HEADER)
         .with_rejected_params(rejected)
         .unwrap();
     TestServer::new(build_strict_router(state)).unwrap()
@@ -46,17 +49,29 @@ fn request(alias: &str, fields: Value) -> Value {
 }
 
 fn count(alias: &str, param: &str, action: &str) -> Option<f64> {
+    count_with(alias, &[("param", param), ("action", action)])
+}
+
+fn count_with(alias: &str, labels: &[(&str, &str)]) -> Option<f64> {
     METRICS
         .render()
         .lines()
         .find(|line| {
             line.starts_with("onwards_unsupported_params_total{")
                 && line.contains(&format!("model=\"{alias}\""))
-                && line.contains(&format!("param=\"{param}\""))
-                && line.contains(&format!("action=\"{action}\""))
+                && labels
+                    .iter()
+                    .all(|(name, value)| line.contains(&format!("{name}=\"{value}\"")))
         })
         .and_then(|line| line.rsplit(' ').next())
         .and_then(|value| value.parse().ok())
+}
+
+fn counted(alias: &str) -> bool {
+    METRICS.render().lines().any(|line| {
+        line.starts_with("onwards_unsupported_params_total{")
+            && line.contains(&format!("model=\"{alias}\""))
+    })
 }
 
 #[tokio::test]
@@ -109,13 +124,92 @@ async fn neutral_values_are_neither_counted_nor_rejected() {
 
     response.assert_status_ok();
     assert_eq!(mock.get_requests().len(), 1);
-    assert!(
-        !METRICS
-            .render()
-            .lines()
-            .any(|line| line.starts_with("onwards_unsupported_params_total{")
-                && line.contains(&format!("model=\"{alias}\"")))
+    assert!(!counted(alias));
+}
+
+#[tokio::test]
+async fn thinking_only_template_args_are_forwarded_uncounted() {
+    let alias = "thinking-args-model";
+    let mock = MockHttpClient::new(StatusCode::OK, COMPLETION);
+    let server = server(alias, mock.clone(), &["chat_template_args"]);
+    let body = request(
+        alias,
+        json!({"chat_template_args": {"enable_thinking": false}}),
     );
+
+    let response = server.post("/chat/completions").json(&body).await;
+
+    response.assert_status_ok();
+    assert_eq!(mock.get_requests().len(), 1);
+    assert!(!counted(alias));
+}
+
+#[tokio::test]
+async fn params_are_counted_before_reasoning_validation_refuses_the_request() {
+    let alias = "kwargs-model";
+    let mock = MockHttpClient::new(StatusCode::OK, COMPLETION);
+    let server = server(alias, mock.clone(), &[]);
+    let body = request(
+        alias,
+        json!({"logprobs": true, "chat_template_kwargs": {"custom_flag": 1}}),
+    );
+
+    let response = server.post("/chat/completions").json(&body).await;
+
+    response.assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.json::<Value>()["error"]["param"],
+        "chat_template_kwargs"
+    );
+    assert!(mock.get_requests().is_empty());
+    assert_eq!(count(alias, "logprobs", "logged"), Some(1.0));
+}
+
+#[tokio::test]
+async fn batch_traffic_is_counted_as_dispatched() {
+    let alias = "dispatched-model";
+    let mock = MockHttpClient::new(StatusCode::OK, COMPLETION);
+    let server = server(alias, mock.clone(), &[]);
+    let body = request(alias, json!({"n": 2}));
+
+    server
+        .post("/chat/completions")
+        .add_header(EXEMPT_HEADER, "1700000000")
+        .json(&body)
+        .await
+        .assert_status_ok();
+    server
+        .post("/chat/completions")
+        .json(&body)
+        .await
+        .assert_status_ok();
+
+    assert_eq!(
+        count_with(alias, &[("param", "n"), ("traffic", "dispatched")]),
+        Some(1.0)
+    );
+    assert_eq!(
+        count_with(alias, &[("param", "n"), ("traffic", "realtime")]),
+        Some(1.0)
+    );
+}
+
+#[tokio::test]
+async fn native_responses_requests_are_not_checked() {
+    let alias = "native-responses-model";
+    let mock = MockHttpClient::new(StatusCode::OK, "{}");
+    let server = server(alias, mock.clone(), &["top_logprobs"]);
+    let body = json!({
+        "model": alias,
+        "input": "Hello",
+        "include": ["message.output_text.logprobs"],
+        "top_logprobs": 3
+    });
+
+    server.post("/responses").json(&body).await;
+
+    assert_eq!(mock.get_requests().len(), 1);
+    assert!(!counted(alias));
 }
 
 #[test]

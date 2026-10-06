@@ -149,15 +149,17 @@ Requests to unsupported endpoints will return `404 Not Found` when strict mode i
 
 ## Parameters not every backend supports
 
-Some chat parameters are engine extensions or options that not every backend behind a model can honour, for example `n` greater than 1, `logprobs`, `guided_json` or `min_tokens`. The full list, with the values that count as absent (such as `n: 1`, `logprobs: false` or `top_logprobs: 0`), is `PARAMS` in `onwards::unsupported_params`.
+Some chat parameters are engine extensions or options that not every backend behind a model can honour, for example `n` greater than 1, `logprobs`, `guided_json` or `min_tokens`. The full list, with the values that count as absent (such as `n: 1`, `logprobs: false` or `top_logprobs: 0`), is the catalog in `onwards::unsupported_params`. `chat_template_kwargs` isn't in it: strict mode refuses that field outright and points to `reasoning_effort` instead.
 
-Strict mode checks every chat request against that list before forwarding it:
+Strict mode checks every Chat Completions request against that list before any other check on the request body:
 
-- Each matching parameter increments `onwards_unsupported_params_total{param, model, traffic, action}`. `action` is `logged` or `rejected`.
+- Each matching parameter increments `onwards_unsupported_params_total{param, model, traffic, action}`. `action` is `logged` or `rejected`. A `logged` request can still be refused by a later check, such as reasoning validation.
 - The request is logged at `info` with the parameter names, model, account and API key ID. Values and request bodies are never logged.
 - A parameter in the gateway's reject list gets a `400` with code `unsupported_parameter`, for example ``Unsupported parameter(s): `logprobs` ``, and the request is not forwarded. Every other parameter is forwarded unchanged.
 
-The reject list is empty by default, so the check only observes. Set it with `AppState::with_rejected_params`; in dwctl, use `onwards.rejected_params`. A name outside `PARAMS` is a configuration error.
+The check covers Chat Completions requests, including Responses and Messages requests that an edge such as dwctl has translated into Chat Completions before they reach onwards. Native `/v1/responses` requests are forwarded to an upstream that speaks the Responses API itself and aren't checked.
+
+The reject list is empty by default, so the check only observes. Set it with `AppState::with_rejected_params`; in dwctl, use `onwards.rejected_params`. A name outside the catalog is a configuration error.
 
 ## Comparison with response sanitization
 

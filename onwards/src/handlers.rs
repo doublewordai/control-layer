@@ -15,7 +15,6 @@ use crate::serving::{
 };
 use crate::sse::SseBufferedStream;
 use crate::target::{ConcurrencyGuard, RequestClass, RoutingAction, Target};
-use crate::unsupported_params::{FlaggedParams, rejection_message};
 use axum::{
     Json,
     extract::Request,
@@ -803,20 +802,84 @@ pub async fn target_message_handler<T: HttpClient>(
         resolution
     };
 
+    // Realtime traffic is everything the batch dispatcher did not stamp with
+    // the exempt header.
+    let is_realtime = !state
+        .first_token_timeout_exempt_header
+        .as_deref()
+        .is_some_and(|header| req.headers().contains_key(header));
+    // Labels failure outcomes, so a realtime outage can be told apart from a
+    // batch backlog retrying against the same model.
+    let traffic = if is_realtime { "realtime" } else { "dispatched" };
+
+    let body_json = if !body_bytes.is_empty()
+        && crate::reasoning::uses_reasoning_contract(&canonical_request_path)
+    {
+        Some(serde_json::from_slice::<serde_json::Value>(&body_bytes).map_err(|_| {
+            OnwardsErrorResponse::bad_request("Request body must be valid JSON.", None)
+        })?)
+    } else {
+        None
+    };
+
+    // Chat parameters not every worker can serve. Each is logged and counted;
+    // the configured ones are refused here.
+    let flagged_params = match body_json.as_ref() {
+        Some(body)
+            if state.targets.strict_mode
+                && canonical_request_path
+                    .trim_end_matches('/')
+                    .ends_with("/chat/completions") =>
+        {
+            crate::unsupported_params::chat_request_params(body)
+        }
+        _ => Vec::new(),
+    };
+    if !flagged_params.is_empty() {
+        let rejected: Vec<&'static str> = flagged_params
+            .iter()
+            .copied()
+            .filter(|param| state.rejected_params.contains(param))
+            .collect();
+        for param in &flagged_params {
+            let action = if rejected.contains(param) { "rejected" } else { "logged" };
+            metrics::counter!(
+                "onwards_unsupported_params_total",
+                "param" => *param,
+                "model" => model_name.to_string(),
+                "traffic" => traffic,
+                "action" => action,
+            )
+            .increment(1);
+        }
+        info!(
+            params = %flagged_params.join(","),
+            rejected = %rejected.join(","),
+            model = %model_name,
+            account = account_id.as_deref().unwrap_or(""),
+            api_key_id = ?authenticated_api_key_id,
+            traffic,
+            "Request uses parameters not every worker supports"
+        );
+        if let Some(first) = rejected.first() {
+            record_response_status(400);
+            return Err(OnwardsErrorResponse::invalid_request(
+                &crate::unsupported_params::rejection_message(&rejected),
+                Some(first),
+                "unsupported_parameter",
+            ));
+        }
+    }
+
     let canonical_reasoning = if let Some(reasoning) = req
         .extensions()
         .get::<crate::reasoning::CanonicalReasoningRequest>()
     {
         Some(reasoning.clone())
-    } else if !body_bytes.is_empty()
-        && crate::reasoning::uses_reasoning_contract(&canonical_request_path)
-    {
-        let body: serde_json::Value = serde_json::from_slice(&body_bytes).map_err(|_| {
-            OnwardsErrorResponse::bad_request("Request body must be valid JSON.", None)
-        })?;
+    } else if let Some(body) = body_json.as_ref() {
         crate::reasoning::parse_reasoning_request(
             &canonical_request_path,
-            &body,
+            body,
             state.targets.strict_mode,
         ).map_err(|error| OnwardsErrorResponse::reasoning(&error))?
     } else {
@@ -830,58 +893,6 @@ pub async fn target_message_handler<T: HttpClient>(
                     .validate_request(&canonical_request_path, reasoning)
                     .map_err(|error| OnwardsErrorResponse::reasoning(&error))?;
             }
-        }
-    }
-
-    // Realtime traffic is everything the batch dispatcher did not stamp with
-    // the exempt header.
-    let is_realtime = !state
-        .first_token_timeout_exempt_header
-        .as_deref()
-        .is_some_and(|header| req.headers().contains_key(header));
-    // Labels failure outcomes, so a realtime outage can be told apart from a
-    // batch backlog retrying against the same model.
-    let traffic = if is_realtime { "realtime" } else { "dispatched" };
-
-    // Parameters the strict handler found that not every worker can serve.
-    // Each is logged and counted; the configured ones are refused here.
-    if let Some(FlaggedParams(params)) = req.extensions().get::<FlaggedParams>() {
-        let rejected: Vec<&'static str> = params
-            .iter()
-            .copied()
-            .filter(|param| state.rejected_params.contains(param))
-            .collect();
-        for param in params {
-            let action = if rejected.contains(param) { "rejected" } else { "logged" };
-            metrics::counter!(
-                "onwards_unsupported_params_total",
-                "param" => *param,
-                "model" => model_name.to_string(),
-                "traffic" => traffic,
-                "action" => action,
-            )
-            .increment(1);
-        }
-        let account = bearer_token
-            .as_deref()
-            .and_then(|token| state.targets.key_labels.get(token))
-            .and_then(|labels| labels.get(serving::ACCOUNT_LABEL).cloned());
-        info!(
-            params = %params.join(","),
-            rejected = %rejected.join(","),
-            model = %model_name,
-            account = account.as_deref().unwrap_or(""),
-            api_key_id = ?authenticated_api_key_id,
-            traffic,
-            "Request uses parameters not every worker supports"
-        );
-        if let Some(first) = rejected.first() {
-            record_response_status(400);
-            return Err(OnwardsErrorResponse::invalid_request(
-                &rejection_message(&rejected),
-                Some(first),
-                "unsupported_parameter",
-            ));
         }
     }
 

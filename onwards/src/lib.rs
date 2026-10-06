@@ -168,7 +168,7 @@ pub struct AppState<T: HttpClient> {
     /// failover timeout — e.g. a marker a batch dispatcher stamps on traffic
     /// that tolerates latency and runs its own retry policy.
     pub first_token_timeout_exempt_header: Option<String>,
-    /// Parameters from [`unsupported_params::PARAMS`] that get a 400 instead of
+    /// Parameters from [`unsupported_params::params`] that get a 400 instead of
     /// being forwarded. Every other flagged parameter is only logged and counted.
     pub rejected_params: Vec<&'static str>,
     pub inflight_limiter: Arc<dyn inflight::InflightLimiter>,
@@ -280,7 +280,7 @@ impl<T: HttpClient> AppState<T> {
 
     /// Set the parameters that are rejected with a 400 instead of being
     /// forwarded (builder pattern). Names outside
-    /// [`unsupported_params::PARAMS`] are an error, so a typo in configuration
+    /// [`unsupported_params::params`] are an error, so a typo in configuration
     /// can't silently disable a rejection.
     pub fn with_rejected_params<I, S>(mut self, params: I) -> Result<Self, String>
     where

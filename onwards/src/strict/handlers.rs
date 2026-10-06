@@ -120,7 +120,7 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
     req: Request<Body>,
 ) -> Response {
     let headers = req.headers().clone();
-    let mut extensions = req.extensions().clone();
+    let extensions = req.extensions().clone();
     let body_bytes = match axum::body::to_bytes(req.into_body(), state.body_limit).await {
         Ok(bytes) => bytes,
         Err(_) => return OnwardsErrorResponse::payload_too_large(state.body_limit).into_response(),
@@ -138,13 +138,6 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
 
     let original_model = request.model.clone();
     let is_streaming = request.stream.unwrap_or(false);
-
-    // The forwarding handler logs, counts and (if configured) rejects these,
-    // once it knows the caller.
-    let flagged = crate::unsupported_params::chat_request_params(&request);
-    if !flagged.0.is_empty() {
-        extensions.insert(flagged);
-    }
 
     debug!(
         model = %original_model,
