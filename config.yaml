@@ -548,6 +548,12 @@ onwards:
   # Priority composites with fallback enabled use AIMD by default in strict mode.
   # Override through the model API's aimd object, or set aimd.enabled=false to opt out.
   # See onwards/docs/src/load-aware-failover.md for coverage and tuning.
+  # Strict-mode chat parameters refused with a 400 instead of forwarded.
+  # Onwards logs and counts every parameter not every worker can serve
+  # (onwards_unsupported_params_total); only the ones listed here are refused.
+  # Names come from onwards::unsupported_params::params(), e.g. [n, logprobs].
+  # Set via environment: DWCTL_ONWARDS__REJECTED_PARAMS='[n,logprobs]'
+  rejected_params: []
 
 # Cached-input pricing (the dwctl-owned cache layer)
 cache:

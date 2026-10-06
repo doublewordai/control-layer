@@ -65,6 +65,7 @@ pub mod sse;
 pub mod strict;
 pub mod target;
 pub mod telemetry;
+pub mod unsupported_params;
 
 use client::{HttpClient, HyperClient};
 pub use handlers::{AuthenticatedApiKeyId, HeaderExtractor, ServedBy};
@@ -167,6 +168,9 @@ pub struct AppState<T: HttpClient> {
     /// failover timeout — e.g. a marker a batch dispatcher stamps on traffic
     /// that tolerates latency and runs its own retry policy.
     pub first_token_timeout_exempt_header: Option<String>,
+    /// Parameters from [`unsupported_params::params`] that get a 400 instead of
+    /// being forwarded. Every other flagged parameter is only logged and counted.
+    pub rejected_params: Vec<&'static str>,
     pub inflight_limiter: Arc<dyn inflight::InflightLimiter>,
 }
 
@@ -198,6 +202,7 @@ impl<T: HttpClient> std::fmt::Debug for AppState<T> {
                 "first_token_timeout_exempt_header",
                 &self.first_token_timeout_exempt_header,
             )
+            .field("rejected_params", &self.rejected_params)
             .field("inflight_limiter", &self.inflight_limiter)
             .finish()
     }
@@ -223,6 +228,7 @@ impl AppState<HyperClient> {
             sse_buffer_limit: sse::DEFAULT_SSE_BUFFER_LIMIT,
             first_token_timeout: None,
             first_token_timeout_exempt_header: None,
+            rejected_params: Vec::new(),
             inflight_limiter: Arc::new(inflight::LocalInflightLimiter::default()),
         }
     }
@@ -241,6 +247,7 @@ impl<T: HttpClient> AppState<T> {
             sse_buffer_limit: sse::DEFAULT_SSE_BUFFER_LIMIT,
             first_token_timeout: None,
             first_token_timeout_exempt_header: None,
+            rejected_params: Vec::new(),
             inflight_limiter: Arc::new(inflight::LocalInflightLimiter::default()),
         }
     }
@@ -269,6 +276,28 @@ impl<T: HttpClient> AppState<T> {
     pub fn with_first_token_timeout_exempt_header(mut self, header: impl Into<String>) -> Self {
         self.first_token_timeout_exempt_header = Some(header.into());
         self
+    }
+
+    /// Set the parameters that are rejected with a 400 instead of being
+    /// forwarded (builder pattern). Names outside
+    /// [`unsupported_params::params`] are an error, so a typo in configuration
+    /// can't silently disable a rejection.
+    pub fn with_rejected_params<I, S>(mut self, params: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut rejected = Vec::new();
+        for name in params {
+            let name = name.as_ref();
+            let param = unsupported_params::known_param(name)
+                .ok_or_else(|| format!("unknown parameter in the reject list: {name}"))?;
+            if !rejected.contains(&param) {
+                rejected.push(param);
+            }
+        }
+        self.rejected_params = rejected;
+        Ok(self)
     }
 
     pub fn with_inflight_limiter(mut self, limiter: Arc<dyn inflight::InflightLimiter>) -> Self {
