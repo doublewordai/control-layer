@@ -1069,6 +1069,8 @@ pub async fn target_message_handler<T: HttpClient>(
     // lowest active_connections/weight ratio, skipping providers at their
     // concurrency limit. The returned guard tracks the active connection.
     let mut any_attempted = false;
+    // Why the first failed-over attempt failed, for rescue attribution.
+    let mut first_failover_cause: Option<String> = None;
     let mut attempt_number: u32 = 0;
     let mut total_backoff_ms: u64 = 0;
     let pool_max_attempts = if pool.fallback().is_some_and(|f| f.with_replacement) {
@@ -1209,6 +1211,9 @@ pub async fn target_message_handler<T: HttpClient>(
         // Unlike `last_upstream_status` it never carries over from an earlier
         // attempt, so it can say whether this member refused the request.
         let mut attempt_upstream_status: Option<u16> = None;
+        // Why this attempt was failed over: the upstream status, or the
+        // failure kind when there is no status to report.
+        let mut failover_cause: Option<String> = None;
 
         let action = async {
 
@@ -1220,6 +1225,7 @@ pub async fn target_message_handler<T: HttpClient>(
             tracing::Span::current().record("onwards.fallback", "rate_limited");
             if pool.should_fallback_on_rate_limit() {
                 debug!("Fallback on rate limit enabled, trying next provider");
+                failover_cause = Some("rate_limited".to_string());
                 return LoopAction::Continue(Some(OnwardsErrorResponse::rate_limited()));
             } else {
                 return LoopAction::Done(Err(OnwardsErrorResponse::rate_limited()));
@@ -1525,6 +1531,7 @@ pub async fn target_message_handler<T: HttpClient>(
                 };
                 tracing::Span::current().record("onwards.fallback", reason);
                 if pool.fallback_enabled() {
+                    failover_cause = Some(reason.to_string());
                     return LoopAction::Continue(Some(OnwardsErrorResponse::gateway_timeout()));
                 } else {
                     record_response_status(504);
@@ -1539,6 +1546,7 @@ pub async fn target_message_handler<T: HttpClient>(
                 tracing::Span::current().record("onwards.fallback", "network_error");
                 // Only continue to next provider if fallback is enabled
                 if pool.fallback_enabled() {
+                    failover_cause = Some("network_error".to_string());
                     return LoopAction::Continue(Some(OnwardsErrorResponse::bad_gateway()));
                 } else {
                     return LoopAction::Done(Err(OnwardsErrorResponse::bad_gateway()));
@@ -1568,6 +1576,7 @@ pub async fn target_message_handler<T: HttpClient>(
                 status, target.url
             );
             tracing::Span::current().record("onwards.fallback", "status_fallback");
+            failover_cause = Some(status.to_string());
             // A 503 or 529 means the provider is full, not broken. If it is
             // the last word, the caller is told to retry shortly rather than
             // handed a 502 that reads as an outage.
@@ -1760,6 +1769,7 @@ pub async fn target_message_handler<T: HttpClient>(
                             "No first token before the failover deadline; trying the next provider"
                         );
                         tracing::Span::current().record("onwards.fallback", "first_token_timeout");
+                        failover_cause = Some("first_token_timeout".to_string());
                         // A breach is a CENSORED observation: it establishes only
                         // that the first token took longer than the deadline, not
                         // how long it would have taken. Counted separately so the
@@ -1891,6 +1901,7 @@ pub async fn target_message_handler<T: HttpClient>(
                     || (embedded == 429 && pool.should_fallback_on_rate_limit());
                 if retryable {
                     tracing::Span::current().record("onwards.fallback", "embedded_error");
+                    failover_cause = Some(embedded.to_string());
                     // Retain rate-limit and overload semantics if all attempts
                     // are exhausted.
                     let error = if embedded == 429 {
@@ -1957,6 +1968,7 @@ pub async fn target_message_handler<T: HttpClient>(
 
                 if pool.should_fallback_on_status(502) {
                     tracing::Span::current().record("onwards.fallback", "empty_body");
+                    failover_cause = Some("empty_body".to_string());
                     // Retry internally; on exhaustion the loop's final-error handling
                     // surfaces the sanitized 503 carried below.
                     return LoopAction::Continue(Some(OnwardsErrorResponse::service_unavailable()));
@@ -2180,6 +2192,15 @@ pub async fn target_message_handler<T: HttpClient>(
         match action {
             LoopAction::Continue(err) => {
                 last_error = err;
+                let cause = failover_cause.unwrap_or_else(|| "unknown".to_string());
+                metrics::counter!(
+                    "onwards_failovers_total",
+                    "model" => model_name.to_string(),
+                    "cause" => cause.clone(),
+                    "traffic" => traffic,
+                )
+                .increment(1);
+                first_failover_cause.get_or_insert(cause);
                 // A member that refused for overload is full right now: trying
                 // it again within this request cannot succeed, so it sits out
                 // the rest of the request.
@@ -2224,7 +2245,32 @@ pub async fn target_message_handler<T: HttpClient>(
                 }
                 continue;
             }
-            LoopAction::Done(result) => return result,
+            LoopAction::Done(result) => {
+                // A rescue: another attempt answered after the pool failed
+                // over. Logged at info so rescues can be attributed to an
+                // account; failovers alone stay at debug.
+                if let (Ok(response), Some(cause)) = (&result, first_failover_cause.as_deref())
+                    && response.status().is_success()
+                {
+                    metrics::counter!(
+                        "onwards_fallback_rescues_total",
+                        "model" => model_name.to_string(),
+                        "cause" => cause.to_string(),
+                        "traffic" => traffic,
+                    )
+                    .increment(1);
+                    info!(
+                        model = %model_name,
+                        cause,
+                        attempts = attempt_number,
+                        account = account_id.as_deref().unwrap_or(""),
+                        api_key_id = ?authenticated_api_key_id,
+                        traffic,
+                        "Request served after failing over"
+                    );
+                }
+                return result;
+            }
         }
     }
 

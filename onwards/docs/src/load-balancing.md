@@ -49,6 +49,18 @@ Status code wildcards:
 
 When fallback triggers, the next provider is selected based on strategy (weighted random resamples from remaining pool; priority uses definition order).
 
+### Fallback metrics
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `onwards_failovers_total` | Counter | Attempts the pool failed over from, whether or not another provider was left to try |
+| `onwards_fallback_rescues_total` | Counter | Requests answered with a 2xx after at least one failover |
+| `onwards_upstream_failed_total` | Counter | Requests that ended without an answer, by reason and the last upstream status |
+
+The first two have `model`, `cause` and `traffic` labels. `cause` is the upstream status that triggered the failover (for example `400` or `529`), or the failure kind when there is none: `timeout`, `first_token_timeout`, `network_error`, `empty_body` or `rate_limited`. On a rescue, `cause` is that of the first failed attempt. `traffic` is `dispatched` for requests carrying the header set with `AppState::with_first_token_timeout_exempt_header`, and `realtime` otherwise.
+
+Each rescue is also logged at `info` ("Request served after failing over") with the model, cause, attempt count, account and API key ID, so rescued traffic can be attributed to callers. Individual failovers stay at `debug`.
+
 ### First-token failover
 
 A provider can accept a streamed request and then stall: the headers arrive, but no token ever does. `first_token_timeout_ms` bounds that wait, so the request fails over instead of hanging. Set a proxy-wide default with `AppState::with_first_token_timeout`; a pool's own value overrides it.
