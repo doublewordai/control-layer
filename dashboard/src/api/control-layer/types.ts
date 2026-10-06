@@ -321,7 +321,19 @@ export interface ProviderDisplayConfigUpdateRequest {
 }
 
 // Base model types
+export interface ModelClassRoute {
+  cache_pricing: CachePricing;
+  model_id: string;
+  class_id: string;
+  class_key: string;
+  display_name: string;
+  routing_mode: "legacy" | "class_routes";
+  inference_endpoint_id: string;
+  upstream_model_name: string;
+}
+
 export interface Model {
+  class_routes?: ModelClassRoute[];
   id: string;
   alias: string;
   display_name?: string | null;

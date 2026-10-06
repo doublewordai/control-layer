@@ -748,6 +748,49 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
+    async fn class_route_runtime_times_out_on_busy_analytics_and_retries(pool: PgPool) {
+        const VERSION: i64 = 20261002150000;
+        let target = Target::main();
+        let previous = target
+            .migrator
+            .iter()
+            .filter(|m| m.version < VERSION)
+            .map(|m| m.version)
+            .max()
+            .unwrap();
+        target.run_to(previous, &pool).await.unwrap();
+
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE http_analytics IN ACCESS SHARE MODE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(20), apply(&target, &pool))
+            .await
+            .expect("migration must not wait indefinitely for the analytics table");
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("lock timeout"), "{error}");
+        assert!(started.elapsed() >= Duration::from_secs(5));
+        let recorded: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM _sqlx_migrations WHERE version = $1)")
+            .bind(VERSION)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(!recorded, "a timed-out transactional migration must not be recorded");
+        let added: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'http_analytics' AND column_name = 'canonical_model_id')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!added, "failed DDL must be rolled back");
+        blocker.rollback().await.unwrap();
+        apply(&target, &pool).await.unwrap();
+        check(&target, &pool).await.unwrap();
+    }
+
+    #[sqlx::test(migrations = false)]
     async fn check_accepts_a_database_that_is_ahead(pool: PgPool) {
         let target = Target::main();
         apply(&target, &pool).await.unwrap();

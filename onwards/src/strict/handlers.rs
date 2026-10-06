@@ -146,8 +146,12 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
         "Chat completions request validated"
     );
 
-    let resolved_model =
-        extract_model_from_request(&headers, &body_bytes).unwrap_or(original_model.clone());
+    let resolved_model = extensions
+        .get::<crate::serving::SubmittedModel>()
+        .map(|name| name.0.clone())
+        .unwrap_or_else(|| {
+            extract_model_from_request(&headers, &body_bytes).unwrap_or(original_model.clone())
+        });
     let sse_buffer_limit = state.sse_buffer_limit;
     let ForwardResult {
         response,
@@ -293,8 +297,12 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         }
     };
 
-    let resolved_model =
-        extract_model_from_request(&headers, &body_bytes).unwrap_or(original_model.clone());
+    let resolved_model = extensions
+        .get::<crate::serving::SubmittedModel>()
+        .map(|name| name.0.clone())
+        .unwrap_or_else(|| {
+            extract_model_from_request(&headers, &body_bytes).unwrap_or(original_model.clone())
+        });
     let ForwardResult {
         response,
         trusted,
@@ -357,8 +365,12 @@ pub async fn embeddings_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         "Embeddings request validated"
     );
 
-    let resolved_model =
-        extract_model_from_request(&headers, &body_bytes).unwrap_or(original_model.clone());
+    let resolved_model = extensions
+        .get::<crate::serving::SubmittedModel>()
+        .map(|name| name.0.clone())
+        .unwrap_or_else(|| {
+            extract_model_from_request(&headers, &body_bytes).unwrap_or(original_model.clone())
+        });
     let ForwardResult {
         response,
         trusted,
@@ -444,8 +456,12 @@ pub async fn completions_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         "Completions request validated"
     );
 
-    let resolved_model =
-        extract_model_from_request(&headers, &body_bytes).unwrap_or(original_model);
+    let resolved_model = extensions
+        .get::<crate::serving::SubmittedModel>()
+        .map(|name| name.0.clone())
+        .unwrap_or_else(|| {
+            extract_model_from_request(&headers, &body_bytes).unwrap_or(original_model)
+        });
     let sse_buffer_limit = state.sse_buffer_limit;
     let ForwardResult {
         response,

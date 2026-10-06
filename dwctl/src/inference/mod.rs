@@ -23,6 +23,7 @@ pub mod body_limit;
 pub mod handler;
 pub mod image_normalizer_middleware;
 pub mod middleware;
+pub mod model_aliases;
 pub mod outbound_request;
 pub mod response_store;
 pub mod store;
@@ -31,3 +32,6 @@ pub mod streaming;
 pub mod engine;
 pub mod translation;
 pub mod zdr;
+
+#[cfg(test)]
+mod model_aliases_tests;

@@ -4,7 +4,7 @@ use crate::db::models::deployments::DEFAULT_COMPONENT_POOL;
 use crate::metrics::errors::component::ONWARDS_SYNC;
 use crate::types::UserId;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     num::NonZeroU32,
     sync::Arc,
 };
@@ -19,7 +19,7 @@ use onwards::target::{
     inheritable_routing_rules,
 };
 use onwards::{AccountServing, ProviderKind, ServingClass, ServingOverlay, ServingPresets, ServingTargets};
-use sqlx::{PgPool, postgres::PgListener};
+use sqlx::{PgConnection, PgPool, postgres::PgListener};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
@@ -75,6 +75,7 @@ struct OnwardsTarget {
     /// Serving classes this alias offers, each a preset of targets
     /// (`deployed_models.serving_classes`).
     serving_classes: ServingPresets,
+    class_identity: Option<onwards::serving::ClassRouteIdentity>,
 
     // Fallback / backoff config. Standard (single-provider) models only retry
     // when fallback is on AND `with_replacement` is true (otherwise the
@@ -192,7 +193,7 @@ fn parse_stored_targets(value: Option<serde_json::Value>) -> Option<ServingTarge
 }
 
 /// Loads every alias's overlays, keyed by alias then account id.
-async fn load_overlays_from_db(db: &PgPool) -> Result<OverlaysByAlias, anyhow::Error> {
+async fn load_overlays_from_db(db: &mut PgConnection) -> Result<OverlaysByAlias, anyhow::Error> {
     let rows = sqlx::query!(
         r#"
         SELECT mo.user_id, dm.alias, mo.default_serving_class, mo.targets, mo.self_hosted_only
@@ -203,7 +204,7 @@ async fn load_overlays_from_db(db: &PgPool) -> Result<OverlaysByAlias, anyhow::E
           AND u.is_deleted = FALSE
         "#
     )
-    .fetch_all(db)
+    .fetch_all(&mut *db)
     .await?;
 
     let mut overlays: OverlaysByAlias = HashMap::new();
@@ -223,7 +224,7 @@ async fn load_overlays_from_db(db: &PgPool) -> Result<OverlaysByAlias, anyhow::E
 /// Loads the serving account settings of every account that has any. An
 /// account with nothing set is absent, so the config for everyone else is
 /// byte-identical to before serving classes existed.
-async fn load_accounts_from_db(db: &PgPool) -> Result<AccountsById, anyhow::Error> {
+async fn load_accounts_from_db(db: &mut PgConnection) -> Result<AccountsById, anyhow::Error> {
     let rows = sqlx::query!(
         r#"
         SELECT id, granted_serving_classes, default_serving_class, self_hosted_only
@@ -232,7 +233,7 @@ async fn load_accounts_from_db(db: &PgPool) -> Result<AccountsById, anyhow::Erro
           AND (granted_serving_classes <> '{}' OR default_serving_class IS NOT NULL OR self_hosted_only)
         "#
     )
-    .fetch_all(db)
+    .fetch_all(&mut *db)
     .await?;
 
     Ok(rows
@@ -723,7 +724,10 @@ struct OnwardsCompositeModel {
 /// General paid admission deliberately includes future/internal-purpose open-ended
 /// tariffs, preserving existing free-model access rules independently of billing.
 #[tracing::instrument(skip(db, escalation_models))]
-async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]) -> Result<Vec<OnwardsCompositeModel>, anyhow::Error> {
+async fn load_composite_models_from_db(
+    db: &mut PgConnection,
+    escalation_models: &[String],
+) -> Result<Vec<OnwardsCompositeModel>, anyhow::Error> {
     debug!(
         "Loading composite models from database (escalation_models: {:?})",
         escalation_models
@@ -771,7 +775,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
         INNER JOIN deployed_model_components dmc ON cm.id = dmc.composite_model_id
         INNER JOIN deployed_models dm ON dmc.deployed_model_id = dm.id
         INNER JOIN inference_endpoints ie ON dm.hosted_on = ie.id
-        WHERE cm.is_composite = TRUE
+        WHERE cm.is_composite = TRUE AND cm.routing_mode = 'legacy'
           AND cm.deleted = FALSE
           AND dmc.enabled = TRUE
           AND dm.deleted = FALSE
@@ -783,7 +787,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
         ORDER BY cm.id, dmc.pool, dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC
         "#
     )
-    .fetch_all(db)
+    .fetch_all(&mut *db)
     .await?;
 
     // Query API keys with access to composite models (uses deployment_groups since composites are in deployed_models)
@@ -917,13 +921,13 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 OR ak.purpose IN ('realtime', 'batch', 'playground', 'continuation')
             )
         ) ak
-        WHERE cm.is_composite = TRUE
+        WHERE cm.is_composite = TRUE AND cm.routing_mode = 'legacy'
           AND cm.deleted = FALSE
         ORDER BY cm.id, ak.id
         "#,
         escalation_models
     )
-    .fetch_all(db)
+    .fetch_all(&mut *db)
     .await?;
 
     // Query all composite model metadata (regardless of component status).
@@ -958,10 +962,11 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             serving_classes
         FROM deployed_models
         WHERE is_composite = TRUE
+          AND routing_mode = 'legacy'
           AND deleted = FALSE
         "#
     )
-    .fetch_all(db)
+    .fetch_all(&mut *db)
     .await?;
 
     // Seed the composite map with all composite models (even those with no enabled components)
@@ -1039,7 +1044,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                         row.model_reasoning_translation_overrides,
                         &row.deployment_alias,
                     ),
-                    routing_rules: Vec::new(),              // Components don't have their own routing rules
+                    routing_rules: Vec::new(), // Components don't have their own routing rules
+                    class_identity: None,
                     serving_classes: ServingPresets::new(), // Activation is the composite's, not a member's
                     // Components don't surface their own fallback/backoff —
                     // the composite's PoolSpec.fallback drives retries across
@@ -1307,6 +1313,7 @@ fn convert_composite_to_target_spec(
     // per-model in the schema, so every pool we emit here is an inheriting
     // pool; there is no such thing yet as a pool with rules of its own.
     let make_pool = |pool_name: &str, providers: Vec<ProviderSpec>| PoolSpec {
+        class_identity: None,
         keys: keys.clone(),
         rate_limit: rate_limit.clone(),
         concurrency_limit: concurrency_limit.clone(),
@@ -1550,7 +1557,16 @@ fn convert_to_config_file(
                 trusted: false,
                 routing_rules: target.routing_rules,
                 serving_classes: target.serving_classes,
-                overlays: overlays.get(&target.alias).cloned().unwrap_or_default(),
+                overlays: overlays
+                    .get(
+                        target
+                            .class_identity
+                            .as_ref()
+                            .map_or(target.alias.as_str(), |identity| identity.canonical_alias.as_str()),
+                    )
+                    .cloned()
+                    .unwrap_or_default(),
+                class_identity: target.class_identity,
             };
 
             (target.alias, TargetSpecOrList::Pool(pool_spec))
@@ -1607,8 +1623,47 @@ pub async fn load_targets_from_db(
     strict_mode: bool,
     rate_limit_tiers: &RateLimitTiersConfig,
 ) -> Result<Targets, anyhow::Error> {
+    // A mode switch can commit while this loader is reading. All route, key and
+    // policy queries must see the same snapshot: otherwise neither builder (or
+    // both builders) could claim a model during the legacy/class handover.
+    let mut tx = db.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    let targets = load_targets_from_snapshot(&mut tx, escalation_models, strict_mode, rate_limit_tiers).await?;
+    tx.commit().await?;
+    Ok(targets)
+}
+
+async fn load_targets_from_snapshot(
+    db: &mut PgConnection,
+    escalation_models: &[String],
+    strict_mode: bool,
+    rate_limit_tiers: &RateLimitTiersConfig,
+) -> Result<Targets, anyhow::Error> {
     let query_start = std::time::Instant::now();
     debug!("Loading onwards targets from database (with composite models)");
+
+    // Quarantine malformed activations without freezing key revocations and
+    // balance changes for every other model. Never fall back to legacy routing.
+    let invalid = sqlx::query!(
+        r#"SELECT dm.id, dm.alias FROM deployed_models dm
+        WHERE dm.routing_mode='class_routes' AND NOT dm.deleted
+          AND (NOT EXISTS (SELECT 1 FROM model_serving_classes c WHERE c.deployed_model_id=dm.id AND c.class_key='standard')
+            OR NOT EXISTS (SELECT 1 FROM model_serving_classes c WHERE c.deployed_model_id=dm.id AND c.class_key='fast')
+            OR EXISTS (SELECT 1 FROM model_traffic_rules r WHERE r.action='redirect'
+                       AND (r.deployed_model_id=dm.id OR r.redirect_target_id=dm.id)))"#
+    )
+    .fetch_all(&mut *db)
+    .await?;
+    let invalid_ids: HashSet<_> = invalid.iter().map(|model| model.id).collect();
+    for model in invalid {
+        crate::background_error!(
+            ONWARDS_SYNC, "invalid_class_activation", Error,
+            model_id = %model.id, model = %model.alias,
+            "Model quarantined: class activation requires standard/fast routes and no legacy redirects"
+        );
+    }
 
     // Load regular deployed models (existing logic)
     // Note: We pass escalation_models to grant batch API keys access to escalation models
@@ -1616,8 +1671,12 @@ pub async fn load_targets_from_db(
         r#"
         SELECT
             dm.id as deployment_id,
-            dm.model_name,
-            dm.alias,
+            COALESCE(c.upstream_model_name, dm.model_name) AS "model_name!",
+            CASE WHEN c.class_key IS NULL OR c.class_key = 'standard' THEN dm.alias
+                 ELSE dm.alias || ':' || c.class_key END AS "alias!",
+            dm.alias AS canonical_alias,
+            c.id AS "class_id?",
+            c.class_key AS "class_key?",
             dm.hosted_on,
             dm.requests_per_second as deployment_requests_per_second,
             dm.burst_size as deployment_burst_size,
@@ -1657,7 +1716,10 @@ pub async fn load_targets_from_db(
             ak.user_id as "api_key_user_id?",
             dm.serving_classes
         FROM deployed_models dm
-        INNER JOIN inference_endpoints ie ON dm.hosted_on = ie.id
+        LEFT JOIN model_serving_classes c
+          ON c.deployed_model_id = dm.id AND dm.routing_mode = 'class_routes'
+        INNER JOIN inference_endpoints ie ON ie.id = CASE WHEN dm.routing_mode = 'class_routes'
+          THEN c.inference_endpoint_id ELSE dm.hosted_on END
         LEFT JOIN LATERAL (
             SELECT DISTINCT
                 ak.id,
@@ -1718,12 +1780,25 @@ pub async fn load_targets_from_db(
                     -- positive deal can require credit on an otherwise free model.
                     NOT EXISTS (
                         SELECT 1 FROM model_tariffs mt
-                        WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL AND mt.serving_class IS NULL
-                          AND mt.valid_until IS NULL
+                        WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL
+                          AND ((mt.serving_class IS NULL AND mt.valid_until IS NULL
+                                AND NOT EXISTS (
+                                    SELECT 1 FROM model_tariffs class_price
+                                    WHERE class_price.deployed_model_id = mt.deployed_model_id
+                                      AND class_price.user_id IS NULL AND class_price.serving_class = c.class_key
+                                      AND (class_price.api_key_purpose = mt.api_key_purpose
+                                       OR (mt.api_key_purpose = 'playground' AND class_price.api_key_purpose = 'realtime'))
+                                      AND class_price.completion_window IS NOT DISTINCT FROM mt.completion_window
+                                      AND class_price.valid_from <= NOW()
+                                      AND (class_price.valid_until IS NULL OR class_price.valid_until > NOW())
+                                ))
+                            OR (mt.serving_class = c.class_key AND mt.valid_from <= NOW()
+                                AND (mt.valid_until IS NULL OR mt.valid_until > NOW())))
                           AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                     ) AND NOT EXISTS (
                         SELECT 1 FROM model_tariffs mt
                         WHERE mt.deployed_model_id = dm.id AND mt.user_id = ak.user_id
+                          AND (c.class_key IS NULL OR mt.serving_class IS NULL OR mt.serving_class = c.class_key)
                           AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())
                           AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                     )
@@ -1754,12 +1829,25 @@ pub async fn load_targets_from_db(
                       AND ck.window_spend >= root.spend_limit
                       AND (EXISTS (
                         SELECT 1 FROM model_tariffs mt
-                        WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL AND mt.serving_class IS NULL
-                          AND mt.valid_until IS NULL
+                        WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL
+                          AND ((mt.serving_class IS NULL AND mt.valid_until IS NULL
+                                AND NOT EXISTS (
+                                    SELECT 1 FROM model_tariffs class_price
+                                    WHERE class_price.deployed_model_id = mt.deployed_model_id
+                                      AND class_price.user_id IS NULL AND class_price.serving_class = c.class_key
+                                      AND (class_price.api_key_purpose = mt.api_key_purpose
+                                       OR (mt.api_key_purpose = 'playground' AND class_price.api_key_purpose = 'realtime'))
+                                      AND class_price.completion_window IS NOT DISTINCT FROM mt.completion_window
+                                      AND class_price.valid_from <= NOW()
+                                      AND (class_price.valid_until IS NULL OR class_price.valid_until > NOW())
+                                ))
+                            OR (mt.serving_class = c.class_key AND mt.valid_from <= NOW()
+                                AND (mt.valid_until IS NULL OR mt.valid_until > NOW())))
                           AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                       ) OR EXISTS (
                         SELECT 1 FROM model_tariffs mt
                         WHERE mt.deployed_model_id = dm.id AND mt.user_id = ak.user_id
+                          AND (c.class_key IS NULL OR mt.serving_class IS NULL OR mt.serving_class = c.class_key)
                           AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())
                           AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                       ))
@@ -1776,12 +1864,12 @@ pub async fn load_targets_from_db(
             )
         ) ak ON true
         WHERE dm.deleted = FALSE
-          AND dm.is_composite = FALSE
+          AND (dm.routing_mode = 'class_routes' OR dm.is_composite = FALSE)
         ORDER BY dm.id, ak.id
         "#,
         escalation_models
     )
-    .fetch_all(db)
+    .fetch_all(&mut *db)
     .await?;
 
     let query_duration = query_start.elapsed();
@@ -1792,12 +1880,23 @@ pub async fn load_targets_from_db(
     );
 
     // Group results into targets
-    let mut targets_map: HashMap<DeploymentId, OnwardsTarget> = HashMap::new();
+    let mut targets_map: HashMap<(DeploymentId, Option<uuid::Uuid>), OnwardsTarget> = HashMap::new();
     for row in rows {
+        if invalid_ids.contains(&row.deployment_id) {
+            continue;
+        }
         let deployment_id = row.deployment_id;
         let aimd = row.aimd.map(serde_json::from_value).transpose()?;
-        let target = targets_map.entry(deployment_id).or_insert_with(|| {
+        let target = targets_map.entry((deployment_id, row.class_id)).or_insert_with(|| {
             OnwardsTarget {
+                class_identity: row.class_id.map(|class_id| onwards::serving::ClassRouteIdentity {
+                    model_id: deployment_id,
+                    class_id,
+                    canonical_alias: row.canonical_alias.clone(),
+                    class_key: row.class_key.clone().expect("class row has a key"),
+                    endpoint_id: row.endpoint_id,
+                    upstream_model_name: row.model_name.clone(),
+                }),
                 model_name: row.model_name.clone(),
                 alias: row.alias.clone(),
                 requests_per_second: row.deployment_requests_per_second,
@@ -1811,7 +1910,11 @@ pub async fn load_targets_from_db(
                     &row.alias,
                 ),
                 routing_rules: Vec::new(), // Populated from separate query below
-                serving_classes: parse_stored_presets(&row.serving_classes, &row.alias),
+                serving_classes: if row.class_id.is_some() {
+                    ServingPresets::new()
+                } else {
+                    parse_stored_presets(&row.serving_classes, &row.alias)
+                },
                 fallback_enabled: row.fallback_enabled.unwrap_or(true),
                 fallback_on_rate_limit: row.fallback_on_rate_limit.unwrap_or(true),
                 fallback_on_status: row.fallback_on_status.clone().unwrap_or_else(|| vec![429, 499, 500, 502, 503, 504]),
@@ -1877,7 +1980,7 @@ pub async fn load_targets_from_db(
     // Load traffic routing rules for all non-deleted models (regular + composite)
     let traffic_rule_rows = sqlx::query!(
         r#"
-        SELECT mtr.deployed_model_id, mtr.api_key_purpose, mtr.action,
+        SELECT mtr.deployed_model_id, mtr.api_key_purpose, mtr.action, mtr.redirect_target_id,
                dm.alias as "redirect_target_alias?"
         FROM model_traffic_rules mtr
         LEFT JOIN deployed_models dm ON dm.id = mtr.redirect_target_id
@@ -1887,7 +1990,7 @@ pub async fn load_targets_from_db(
         ORDER BY mtr.deployed_model_id, mtr.api_key_purpose
         "#
     )
-    .fetch_all(db)
+    .fetch_all(&mut *db)
     .await?;
 
     // Build a map of deployment_id → routing rules
@@ -1897,6 +2000,9 @@ pub async fn load_targets_from_db(
             match_labels: HashMap::from([("purpose".to_string(), rule_row.api_key_purpose)]),
             action: match rule_row.action.as_str() {
                 "deny" => RoutingAction::Deny,
+                // Preserve the purpose restriction without a dangling target or
+                // silently falling back to the source's default provider.
+                "redirect" if rule_row.redirect_target_id.is_some_and(|id| invalid_ids.contains(&id)) => RoutingAction::Deny,
                 "redirect" => RoutingAction::Redirect {
                     target: rule_row.redirect_target_alias.unwrap_or_default(),
                 },
@@ -1907,9 +2013,9 @@ pub async fn load_targets_from_db(
     }
 
     // Attach routing rules to regular targets
-    for (deployment_id, target) in &mut targets_map {
-        if let Some(rules) = routing_rules_map.remove(deployment_id) {
-            target.routing_rules = rules;
+    for ((deployment_id, _), target) in &mut targets_map {
+        if let Some(rules) = routing_rules_map.get(deployment_id) {
+            target.routing_rules = rules.clone();
         }
     }
 

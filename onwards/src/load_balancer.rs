@@ -101,6 +101,7 @@ pub struct ProviderPool {
     /// per-account overlays. Shared, so cloning the pool per request is
     /// cheap however many organisations have overlays on the alias.
     serving: AliasServing,
+    class_identity: Option<Arc<crate::serving::ClassRouteIdentity>>,
 }
 
 /// The serving policy declared on an alias: the presets it offers and its
@@ -184,6 +185,7 @@ impl ProviderPool {
             trusted: false,
             routing_rules: Vec::new(),
             serving: AliasServing::default(),
+            class_identity: None,
         }
     }
 
@@ -218,6 +220,7 @@ impl ProviderPool {
             trusted,
             routing_rules,
             serving: AliasServing::default(),
+            class_identity: None,
         }
     }
 
@@ -230,6 +233,18 @@ impl ProviderPool {
     ) -> Self {
         self.serving = AliasServing::new(serving_classes, overlays);
         self
+    }
+
+    pub fn with_class_identity(
+        mut self,
+        identity: Option<crate::serving::ClassRouteIdentity>,
+    ) -> Self {
+        self.class_identity = identity.map(Arc::new);
+        self
+    }
+
+    pub fn class_identity(&self) -> Option<&crate::serving::ClassRouteIdentity> {
+        self.class_identity.as_deref()
     }
 
     /// Elevated serving classes the alias offers.

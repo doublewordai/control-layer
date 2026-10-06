@@ -1,0 +1,44 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT CASE WHEN c.class_key='standard' THEN dm.alias\n                   ELSE dm.alias || ':' || c.class_key END AS \"alias!\",\n                   dm.id AS deployed_model_id, c.id AS serving_class_id,\n                   dm.alias AS canonical_alias, c.class_key\n               FROM deployed_models dm JOIN model_serving_classes c ON c.deployed_model_id=dm.id\n               WHERE NOT dm.deleted AND dm.routing_mode='class_routes'\n                  AND EXISTS (SELECT 1 FROM model_serving_classes s WHERE s.deployed_model_id=dm.id AND s.class_key='standard')\n                  AND EXISTS (SELECT 1 FROM model_serving_classes f WHERE f.deployed_model_id=dm.id AND f.class_key='fast')\n                  AND NOT EXISTS (SELECT 1 FROM model_traffic_rules r WHERE r.action='redirect'\n                                  AND (r.deployed_model_id=dm.id OR r.redirect_target_id=dm.id))",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "alias!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "deployed_model_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "serving_class_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "canonical_alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "class_key",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "a0a3b4aa0033e3515b2db4d7903a3b74a44d2a4926c4a932ced6116e8210f6d9"
+}

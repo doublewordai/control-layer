@@ -279,7 +279,7 @@ fn class_catalog_schema_restricts_class_keys() {
 }
 
 #[sqlx::test]
-async fn catalog_refuses_activated_models_without_resetting_operator_mode(pool: PgPool) {
+async fn catalog_updates_activated_models_without_resetting_operator_mode(pool: PgPool) {
     setup(&pool).await;
     let c = catalog(&fixture()).unwrap();
     apply(&pool, &c).await.unwrap();
@@ -287,8 +287,12 @@ async fn catalog_refuses_activated_models_without_resetting_operator_mode(pool: 
         .execute(&pool)
         .await
         .unwrap();
-    let error = apply(&pool, &c).await.unwrap_err();
-    assert!(error.to_string().contains("activated"));
+    let mut updated = fixture();
+    updated["clay"]["class_routes"]["fast"]["upstream_model_name"] = "gateway/updated-fast".into();
+    apply(&pool, &catalog(&updated).unwrap()).await.unwrap();
+    let upstream: String = sqlx::query_scalar("SELECT upstream_model_name FROM model_serving_classes c JOIN deployed_models dm ON dm.id=c.deployed_model_id WHERE dm.alias='example/model' AND c.class_key='fast'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(upstream, "gateway/updated-fast");
     let mode: String = sqlx::query_scalar("SELECT routing_mode FROM deployed_models WHERE alias='example/model'")
         .fetch_one(&pool)
         .await

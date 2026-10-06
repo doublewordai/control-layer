@@ -25,7 +25,9 @@ use axum::{
     routing::get,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+#[cfg(target_os = "linux")]
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 

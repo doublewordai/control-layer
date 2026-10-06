@@ -32,6 +32,7 @@ fn test_balance_eligibility_reads_read_model_and_filters_deleted_users() {
 // Helper function to create a test target
 fn create_test_target(model_name: &str, alias: &str, endpoint_url: &str) -> OnwardsTarget {
     OnwardsTarget {
+        class_identity: None,
         model_name: model_name.to_string(),
         alias: alias.to_string(),
         requests_per_second: None,
@@ -2818,4 +2819,260 @@ async fn failed_reload_retries_without_another_notification_or_fallback(pool: sq
     shutdown.cancel();
     timeout(Duration::from_secs(10), task).await.unwrap().unwrap().unwrap();
     query_pool.close().await;
+}
+
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn class_route_admission_checks_public_price_per_class_and_never_grants_private_access(pool: sqlx::PgPool) {
+    sqlx::query("INSERT INTO model_serving_classes (deployed_model_id,class_key,display_name,inference_endpoint_id,upstream_model_name) SELECT id,k,k,hosted_on,'gateway/'||k FROM deployed_models CROSS JOIN unnest(ARRAY['standard','fast']) k WHERE alias IN ('regular-public','regular-private')")
+        .execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO model_tariffs (deployed_model_id,serving_class,name,api_key_purpose,input_price_per_token,output_price_per_token) SELECT id,'fast','Fast','realtime',0.01,0.01 FROM deployed_models WHERE alias='regular-public'")
+        .execute(&pool).await.unwrap();
+    let dormant = super::load_targets_from_db(&pool, &[], false, &Default::default()).await.unwrap();
+    assert!(pool_has_key(&dormant.targets.get("regular-public").unwrap(), KEY_A_SECRET));
+    assert!(!dormant.targets.contains_key("regular-public:fast"));
+    sqlx::query("UPDATE deployed_models SET routing_mode='class_routes' WHERE alias IN ('regular-public','regular-private')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let active = super::load_targets_from_db(&pool, &[], false, &Default::default()).await.unwrap();
+    assert!(
+        pool_has_key(&active.targets.get("regular-public").unwrap(), KEY_A_SECRET),
+        "generally free standard remains accessible"
+    );
+    assert!(
+        !pool_has_key(&active.targets.get("regular-public:fast").unwrap(), KEY_A_SECRET),
+        "paid public class requires credit"
+    );
+    assert!(
+        !pool_has_key(&active.targets.get("regular-private:fast").unwrap(), KEY_B_SECRET),
+        "classes do not broaden model grants"
+    );
+}
+
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn class_admission_validity_windows_agree_across_credit_and_spend_cap_gates(pool: sqlx::PgPool) {
+    use crate::db::handlers::api_keys::ApiKeys;
+    sqlx::query("INSERT INTO model_serving_classes (deployed_model_id,class_key,display_name,inference_endpoint_id,upstream_model_name) SELECT id,k,k,hosted_on,'gateway/'||k FROM deployed_models CROSS JOIN unnest(ARRAY['standard','fast']) k WHERE alias='regular-public'")
+        .execute(&pool).await.unwrap();
+    let model: uuid::Uuid =
+        sqlx::query_scalar("UPDATE deployed_models SET routing_mode='class_routes' WHERE alias='regular-public' RETURNING id")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let tariff: uuid::Uuid = sqlx::query_scalar("INSERT INTO model_tariffs (deployed_model_id,serving_class,name,api_key_purpose,input_price_per_token,output_price_per_token) VALUES ($1,'fast','Fast','realtime',0.01,0.01) RETURNING id")
+        .bind(model).fetch_one(&pool).await.unwrap();
+    // A has no credit; B has a credit exemption but has exhausted its spend cap.
+    sqlx::query("INSERT INTO user_feature_flags (user_id,feature_flag,enabled) SELECT id,'ALLOW_NEGATIVE_BALANCE',true FROM users WHERE username='cache_user_b'")
+        .execute(&pool).await.unwrap();
+    sqlx::query("UPDATE api_keys SET spend_limit=1 WHERE secret=$1")
+        .bind(KEY_B_SECRET)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO api_key_spend_checkpoints (api_key_id,total_spend,window_spend) SELECT id,1,1 FROM api_keys WHERE secret=$1")
+        .bind(KEY_B_SECRET)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for (start, end, paid) in [
+        ("1 hour", None, false),
+        ("-2 hours", Some("1 hour"), true),
+        ("-2 hours", Some("-1 hour"), false),
+        ("-1 hour", None, true),
+    ] {
+        sqlx::query("UPDATE model_tariffs SET valid_from=now()+$2::interval,valid_until=now()+$3::interval WHERE id=$1")
+            .bind(tariff)
+            .bind(start)
+            .bind(end)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let targets = super::load_targets_from_db(&pool, &[], false, &Default::default()).await.unwrap();
+        for secret in [KEY_A_SECRET, KEY_B_SECRET] {
+            assert!(pool_has_key(&targets.targets.get("regular-public").unwrap(), secret));
+            assert_eq!(
+                pool_has_key(&targets.targets.get("regular-public:fast").unwrap(), secret),
+                !paid,
+                "{secret}: start={start}, end={end:?}"
+            );
+        }
+        let mut conn = pool.acquire().await.unwrap();
+        let keys = ApiKeys::new(&mut conn)
+            .get_api_keys_for_class_with_sufficient_credit(model, "fast")
+            .await
+            .unwrap();
+        assert_eq!(keys.iter().any(|key| key.secret == KEY_A_SECRET), !paid);
+    }
+}
+
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn free_public_class_overrides_paid_general_admission(pool: sqlx::PgPool) {
+    use crate::db::handlers::api_keys::ApiKeys;
+    sqlx::query("INSERT INTO model_serving_classes (deployed_model_id,class_key,display_name,inference_endpoint_id,upstream_model_name) SELECT id,k,k,hosted_on,'gateway/'||k FROM deployed_models CROSS JOIN unnest(ARRAY['standard','fast']) k WHERE alias='regular-public'")
+        .execute(&pool).await.unwrap();
+    let model: uuid::Uuid =
+        sqlx::query_scalar("UPDATE deployed_models SET routing_mode='class_routes' WHERE alias='regular-public' RETURNING id")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    sqlx::query("INSERT INTO model_tariffs (deployed_model_id,name,api_key_purpose,input_price_per_token,output_price_per_token) VALUES ($1,'General','realtime',0.01,0.01), ($1,'Playground','playground',0.01,0.01)")
+        .bind(model).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO model_tariffs (deployed_model_id,serving_class,name,api_key_purpose,input_price_per_token,output_price_per_token) VALUES ($1,'fast','Free fast','realtime',0,0)")
+        .bind(model).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO user_feature_flags (user_id,feature_flag,enabled) SELECT id,'ALLOW_NEGATIVE_BALANCE',true FROM users WHERE username='cache_user_b'")
+        .execute(&pool).await.unwrap();
+    sqlx::query("UPDATE api_keys SET spend_limit=1 WHERE secret=$1")
+        .bind(KEY_B_SECRET)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO api_key_spend_checkpoints (api_key_id,total_spend,window_spend) SELECT id,1,1 FROM api_keys WHERE secret=$1")
+        .bind(KEY_B_SECRET)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &Default::default()).await.unwrap();
+    for secret in [KEY_A_SECRET, KEY_B_SECRET] {
+        assert!(!pool_has_key(&targets.targets.get("regular-public").unwrap(), secret));
+        assert!(pool_has_key(&targets.targets.get("regular-public:fast").unwrap(), secret));
+    }
+    let mut conn = pool.acquire().await.unwrap();
+    let keys = ApiKeys::new(&mut conn)
+        .get_api_keys_for_class_with_sufficient_credit(model, "fast")
+        .await
+        .unwrap();
+    assert!(keys.iter().any(|key| key.secret == KEY_A_SECRET));
+    // A private zero deal must not turn the generally paid standard class free.
+    sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,api_key_purpose,input_price_per_token,output_price_per_token) SELECT $1,id,'standard','Deal','realtime',0,0 FROM users WHERE username='cache_user_a'")
+        .bind(model).execute(&pool).await.unwrap();
+    let keys = ApiKeys::new(&mut conn)
+        .get_api_keys_for_class_with_sufficient_credit(model, "standard")
+        .await
+        .unwrap();
+    assert!(!keys.iter().any(|key| key.secret == KEY_A_SECRET));
+}
+
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn route_loader_snapshot_keeps_activation_atomic(pool: sqlx::PgPool) {
+    sqlx::query("INSERT INTO model_serving_classes (deployed_model_id,class_key,display_name,inference_endpoint_id,upstream_model_name) SELECT id,k,k,hosted_on,'gateway/'||k FROM deployed_models CROSS JOIN unnest(ARRAY['standard','fast']) k WHERE alias='regular-public'")
+        .execute(&pool).await.unwrap();
+    let mut snapshot = pool.begin().await.unwrap();
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *snapshot)
+        .await
+        .unwrap();
+    let mode: String = sqlx::query_scalar("SELECT routing_mode FROM deployed_models WHERE alias='regular-public'")
+        .fetch_one(&mut *snapshot)
+        .await
+        .unwrap();
+    assert_eq!(mode, "legacy");
+    // Commit activation on a different connection after the reader's snapshot.
+    sqlx::query("UPDATE deployed_models SET routing_mode='class_routes' WHERE alias='regular-public'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let before = super::load_targets_from_snapshot(&mut snapshot, &[], false, &Default::default())
+        .await
+        .unwrap();
+    assert!(
+        before
+            .targets
+            .get("regular-public")
+            .unwrap()
+            .default_pool()
+            .class_identity()
+            .is_none()
+    );
+    assert!(!before.targets.contains_key("regular-public:fast"));
+    snapshot.commit().await.unwrap();
+    let after = super::load_targets_from_db(&pool, &[], false, &Default::default()).await.unwrap();
+    assert!(
+        after
+            .targets
+            .get("regular-public")
+            .unwrap()
+            .default_pool()
+            .class_identity()
+            .is_some()
+    );
+    assert!(after.targets.contains_key("regular-public:fast"));
+}
+
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn class_route_edits_notify_but_zero_row_catalog_writes_do_not(pool: sqlx::PgPool) {
+    use std::time::Duration;
+    let mut listener = sqlx::postgres::PgListener::connect_with(&pool).await.unwrap();
+    listener.listen(crate::config::ONWARDS_CONFIG_CHANGED_CHANNEL).await.unwrap();
+    sqlx::query("UPDATE model_serving_classes SET upstream_model_name='unchanged' WHERE false")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(100), listener.recv()).await.is_err());
+    sqlx::query("INSERT INTO model_serving_classes (deployed_model_id,class_key,display_name,inference_endpoint_id,upstream_model_name) SELECT id,k,k,hosted_on,'gateway/'||k FROM deployed_models CROSS JOIN unnest(ARRAY['standard','fast']) k WHERE alias='regular-public'")
+        .execute(&pool).await.unwrap();
+    let notification = tokio::time::timeout(Duration::from_secs(2), listener.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(notification.payload(), "model_serving_classes");
+    assert!(
+        parse_notify_payload(notification.payload()).is_none(),
+        "transaction age must not be reported as notification lag"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.recv()).await.is_err(),
+        "one notification per transaction, not per class row"
+    );
+}
+
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn invalid_class_activation_does_not_freeze_key_revocations(pool: sqlx::PgPool) {
+    sqlx::query("UPDATE deployed_models SET routing_mode='class_routes' WHERE alias='regular-private'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let before = super::load_targets_from_db(&pool, &[], false, &Default::default()).await.unwrap();
+    assert!(!before.targets.contains_key("regular-private"));
+    assert!(pool_has_key(&before.targets.get("regular-public").unwrap(), KEY_A_SECRET));
+    sqlx::query("UPDATE api_keys SET is_deleted=true WHERE secret=$1")
+        .bind(KEY_A_SECRET)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let after = super::load_targets_from_db(&pool, &[], false, &Default::default()).await.unwrap();
+    assert!(!after.targets.contains_key("regular-private"));
+    assert!(!pool_has_key(&after.targets.get("regular-public").unwrap(), KEY_A_SECRET));
+    assert!(pool_has_key(&after.targets.get("regular-public").unwrap(), KEY_B_SECRET));
+}
+
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_traffic_routing_rules")))]
+async fn quarantined_redirect_targets_deny_only_the_affected_purpose(pool: sqlx::PgPool) {
+    // Both legacy regular and composite sources must retain their restrictions.
+    sqlx::query("UPDATE deployed_models SET routing_mode='class_routes' WHERE alias IN ('regular-public','escalation-private')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let config = super::load_targets_from_db(&pool, &[], false, &Default::default()).await.unwrap();
+    for name in ["regular-public", "escalation-private"] {
+        assert!(!config.targets.contains_key(name));
+    }
+    for (source, affected) in [("regular-private", "realtime"), ("composite-priority", "batch")] {
+        let target = config.targets.get(source).unwrap();
+        let rules = target.default_pool().routing_rules();
+        assert_eq!(rules.len(), 2);
+        let rule = rules
+            .iter()
+            .find(|r| r.match_labels.get("purpose").map(String::as_str) == Some(affected))
+            .unwrap();
+        assert!(
+            matches!(rule.action, RoutingAction::Deny),
+            "{source} must not leave a dangling redirect"
+        );
+        assert!(
+            target
+                .default_pool()
+                .evaluate_routing_rules(&std::collections::HashMap::from([("purpose".into(), "playground".into())]))
+                .is_none()
+        );
+    }
 }

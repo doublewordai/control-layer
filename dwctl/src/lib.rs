@@ -298,6 +298,10 @@ where
     /// Database pools (primary + optional replica).
     /// Use `.read()` for read-only queries, `.write()` for writes.
     pub db: P,
+    /// Optional ingress synonyms loaded after catalog reconciliation. Identity
+    /// only; routing, activation and authorization remain live in Onwards.
+    #[builder(default)]
+    pub model_aliases: crate::inference::model_aliases::ModelAliasMap,
     pub config: SharedConfig,
     /// Outlet database pools for request logging. Always uses DbPools (production type).
     /// In tests, this uses DbPools without read-only enforcement (outlet is write-heavy).
@@ -4091,6 +4095,11 @@ impl Application {
         let fusillade_pools = pools.fusillade.pooled.clone();
         let outlet_pools = pools.outlet.as_ref().map(|p| p.pooled.clone());
 
+        // setup_database has applied both catalogs. Load synonyms once from the
+        // primary before any daemon starts or the server becomes ready. Keep this
+        // separate from the much more frequent Onwards auth/routing reloads.
+        let model_aliases = crate::inference::model_aliases::ModelAliasMap::load(&db_pools.write()).await?;
+
         // Install Prometheus recorder BEFORE background services start
         // This ensures metrics set during background service initialization are captured
         if config.enable_metrics {
@@ -4337,6 +4346,8 @@ impl Application {
             flex_completion_window: config.batches.async_requests.completion_window.clone(),
             keystore: bg_services.keystore.clone(),
             key_policy_cache: bg_services.key_policy_cache.clone(),
+            model_aliases: model_aliases.clone(),
+            model_targets: bg_services.onwards_targets.clone(),
         };
 
         // Build onwards router from targets with body transform + response sanitization.
@@ -4384,6 +4395,7 @@ impl Application {
         // Build app state and router
         let mut app_state = AppState::builder()
             .db(db_pools.clone())
+            .model_aliases(model_aliases)
             .config(shared_config.clone())
             .is_leader(bg_services.is_leader)
             .request_manager(bg_services.request_manager.clone())

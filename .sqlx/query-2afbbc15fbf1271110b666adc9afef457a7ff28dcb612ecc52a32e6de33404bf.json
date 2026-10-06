@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    INSERT INTO files (id, name, status, created_at, updated_at)\n                    VALUES ($1, $2, $3, NOW(), NOW())\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2afbbc15fbf1271110b666adc9afef457a7ff28dcb612ecc52a32e6de33404bf"
+}

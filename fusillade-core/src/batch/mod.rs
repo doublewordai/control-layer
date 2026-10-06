@@ -412,6 +412,12 @@ pub enum FileStreamItem {
     Metadata(FileMetadata),
     /// A request template parsed from JSONL
     Template(RequestTemplateInput),
+    /// A template with trusted per-request metadata, separate from its outbound body.
+    /// Listed keys override batch metadata when the request is claimed.
+    TemplateWithMetadata {
+        template: RequestTemplateInput,
+        metadata: serde_json::Value,
+    },
     /// Producer is aborting the stream. Fusillade should rollback and stop processing.
     Abort,
     /// Deprecated compatibility path for callers that still surface producer parse errors here.

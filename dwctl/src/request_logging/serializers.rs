@@ -173,16 +173,16 @@ pub struct UsageMetrics {
     pub cache_read_source: Option<String>,
     /// Content-free request parameters read off the parsed request body.
     pub request_params: RequestParams,
-    /// Serving class the request asked for (suffix > overlay default >
-    /// account default), from the onwards `ServingClassOutcome` response
-    /// extension. `None` when nothing named a class, or when the request
-    /// never reached onwards' resolver.
+    /// Stable class key selected by the ingress alias on the class-routing path.
+    /// Legacy requests use `ServingClassOutcome` (suffix / overlay / account default).
     pub requested_serving_class: Option<String>,
-    /// Serving class the request was dispatched under (interactive |
-    /// throughput | standard, or custom for an overlay's explicit targets)
-    /// after entitlement. `None` only when the request never reached the
-    /// resolver.
+    /// Class used for tariff resolution and usage attribution: the stable class
+    /// key for class routes, or the entitled outcome of the legacy resolver.
+    /// The new `fast` class must not inherit the legacy resolver's standard result.
     pub resolved_serving_class: Option<String>,
+    pub class_route: Option<onwards::serving::ClassRouteIdentity>,
+    pub upstream_model_name: Option<String>,
+    pub submitted_model: Option<String>,
 }
 
 /// Content-free request parameters, read off the parsed request body.
@@ -592,7 +592,11 @@ impl UsageMetrics {
             timestamp: chrono::DateTime::<chrono::Utc>::from(request_data.timestamp),
             method: request_data.method.to_string(),
             uri: request_data.uri.to_string(),
-            request_model,
+            request_model: response_data
+                .extensions
+                .get::<onwards::serving::ClassRouteIdentity>()
+                .map(|c| c.canonical_alias.clone())
+                .or_else(|| request_model.clone()),
             response_model: metrics.response_model,
             status_code,
             duration_ms: response_data.duration.as_millis() as i64,
@@ -615,13 +619,35 @@ impl UsageMetrics {
             request_params,
             requested_serving_class: response_data
                 .extensions
-                .get::<onwards::ServingClassOutcome>()
-                .and_then(|o| o.requested)
-                .map(|c| c.as_str().to_string()),
+                .get::<onwards::serving::ClassRouteIdentity>()
+                .map(|c| c.class_key.clone())
+                .or_else(|| {
+                    response_data
+                        .extensions
+                        .get::<onwards::ServingClassOutcome>()
+                        .and_then(|o| o.requested)
+                        .map(|c| c.as_str().to_string())
+                }),
+            upstream_model_name: response_data
+                .extensions
+                .get::<onwards::ServedBy>()
+                .and_then(|s| s.onwards_model.clone()),
+            submitted_model: response_data
+                .extensions
+                .get::<onwards::serving::SubmittedModel>()
+                .map(|s| s.0.clone())
+                .or_else(|| request_model.clone()),
+            class_route: response_data.extensions.get::<onwards::serving::ClassRouteIdentity>().cloned(),
             resolved_serving_class: response_data
                 .extensions
-                .get::<onwards::ServingClassOutcome>()
-                .map(|o| o.resolved.as_str().to_string()),
+                .get::<onwards::serving::ClassRouteIdentity>()
+                .map(|c| c.class_key.clone())
+                .or_else(|| {
+                    response_data
+                        .extensions
+                        .get::<onwards::ServingClassOutcome>()
+                        .map(|o| o.resolved.as_str().to_string())
+                }),
         }
     }
 }
@@ -1734,6 +1760,52 @@ mod tests {
         );
         assert_eq!(metrics.total_tokens, 0);
         assert_eq!(metrics.response_type, "chat_completion_stream");
+    }
+
+    #[test]
+    fn class_route_usage_keeps_fast_identity_instead_of_legacy_standard_outcome() {
+        let request = RequestData {
+            correlation_id: 42,
+            timestamp: SystemTime::now(),
+            method: Method::POST,
+            uri: "/v1/chat/completions".parse().unwrap(),
+            headers: HashMap::new(),
+            body: Some(Bytes::from_static(br#"{"model":"example/model:fast","messages":[]}"#)),
+            trace_id: None,
+            span_id: None,
+        };
+        let identity = onwards::serving::ClassRouteIdentity {
+            model_id: uuid::Uuid::new_v4(),
+            class_id: uuid::Uuid::new_v4(),
+            canonical_alias: "example/model".into(),
+            class_key: "fast".into(),
+            endpoint_id: uuid::Uuid::new_v4(),
+            upstream_model_name: "gateway/fast".into(),
+        };
+        let mut response = ResponseData {
+            extensions: Default::default(),
+            correlation_id: 42,
+            timestamp: SystemTime::now(),
+            status: StatusCode::OK,
+            headers: HashMap::new(),
+            body: None,
+            duration: Duration::from_millis(100),
+            duration_to_first_byte: Duration::from_millis(50),
+        };
+        response.extensions.insert(onwards::ServingClassOutcome {
+            requested: None,
+            resolved: onwards::serving::ServingClass::Standard,
+        });
+        response.extensions.insert(identity.clone());
+        let parsed = parse_ai_response(&request, &response).unwrap();
+        let metrics = UsageMetrics::extract(uuid::Uuid::nil(), &request, &response, &parsed, &crate::config::Config::default());
+        assert_eq!(metrics.requested_serving_class.as_deref(), Some("fast"));
+        assert_eq!(metrics.resolved_serving_class.as_deref(), Some("fast"));
+        assert_eq!(metrics.class_route, Some(identity));
+        response.extensions.remove::<onwards::serving::ClassRouteIdentity>();
+        let legacy = UsageMetrics::extract(uuid::Uuid::nil(), &request, &response, &parsed, &crate::config::Config::default());
+        assert_eq!(legacy.requested_serving_class, None);
+        assert_eq!(legacy.resolved_serving_class.as_deref(), Some("standard"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id as composite_model_id,\n            alias,\n            requests_per_second,\n            burst_size,\n            capacity,\n            lb_strategy,\n            fallback_enabled,\n            fallback_on_rate_limit,\n            fallback_on_status,\n            fallback_realtime_on_status,\n            fallback_with_replacement,\n            fallback_max_attempts,\n            backoff_enabled,\n            backoff_initial_ms,\n            backoff_max_ms,\n            backoff_factor,\n            backoff_jitter,\n            backoff_max_total_ms,\n            first_token_timeout_ms,\n            aimd,\n            affinity,\n            sanitize_responses,\n            trusted,\n            serving_classes\n        FROM deployed_models\n        WHERE is_composite = TRUE\n          AND deleted = FALSE\n        ",
+  "query": "\n        SELECT\n            id as composite_model_id,\n            alias,\n            requests_per_second,\n            burst_size,\n            capacity,\n            lb_strategy,\n            fallback_enabled,\n            fallback_on_rate_limit,\n            fallback_on_status,\n            fallback_realtime_on_status,\n            fallback_with_replacement,\n            fallback_max_attempts,\n            backoff_enabled,\n            backoff_initial_ms,\n            backoff_max_ms,\n            backoff_factor,\n            backoff_jitter,\n            backoff_max_total_ms,\n            first_token_timeout_ms,\n            aimd,\n            affinity,\n            sanitize_responses,\n            trusted,\n            serving_classes\n        FROM deployed_models\n        WHERE is_composite = TRUE\n          AND routing_mode = 'legacy'\n          AND deleted = FALSE\n        ",
   "describe": {
     "columns": [
       {
@@ -154,5 +154,5 @@
       false
     ]
   },
-  "hash": "e10a2087d261109966ebae39cc91502f1c305344a54d33729b374d2776569a93"
+  "hash": "23e400e810fed53d235de3fc0499a9794453159dc49d22caadb52233bb3e88b3"
 }

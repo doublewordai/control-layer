@@ -314,3 +314,32 @@ describe("model pricing selector", () => {
     expect(useOrganizationServing).toHaveBeenCalledWith("", { enabled: false });
   });
 });
+
+  it("keeps dormant class prices out of the effective general pricing view", () => {
+    const { container } = render(<MemoryRouter><ModelPricing
+      model={{ ...model, class_routes: [{
+        model_id: model.id, class_id: "fast-class", class_key: "fast", display_name: "Fast",
+        routing_mode: "legacy", inference_endpoint_id: "gateway", upstream_model_name: "gateway/fast",
+        cache_pricing: { enabled: false, write_multiplier_5m: null, write_multiplier_1h: null, write_multiplier_24h: null, read_multiplier: null, min_prefix_tokens: null, valid_from: null, valid_until: null },
+      }], tariffs: [...model.tariffs!, tariff("fast-price", {serving_class: "fast", input_price_per_token:"0.000099"})] }}
+      manager onEditPrices={vi.fn()} onEditCache={vi.fn()} />
+    </MemoryRouter>);
+    expect(within(container).getAllByText("All classes").length).toBeGreaterThan(0);
+    expect(within(container).queryByText("fast", {exact:true})).not.toBeInTheDocument();
+  });
+
+  it("does not enable caching from a class-only tariff", () => {
+    vi.mocked(useModelCachePricing).mockReturnValue({
+      data: { enabled: false }, isLoading: false, isError: false,
+    } as unknown as ReturnType<typeof useModelCachePricing>);
+    const { container } = render(<MemoryRouter><ModelPricing
+      model={{ ...model, class_routes: [{
+        model_id: model.id, class_id: "fast-class", class_key: "fast", display_name: "Fast",
+        routing_mode: "class_routes", inference_endpoint_id: "gateway", upstream_model_name: "gateway/fast",
+        cache_pricing: { enabled: true, write_multiplier_5m: "1", write_multiplier_1h: "2", write_multiplier_24h: "3", read_multiplier: "0.5", min_prefix_tokens: 2048, valid_from: "2020-01-01", valid_until: null },
+      }] }} manager onEditPrices={vi.fn()} onEditCache={vi.fn()} />
+    </MemoryRouter>);
+    const cache = within(within(container).getByRole("region", {name: "Cache pricing"}));
+    expect(cache.getByText(/Cache pricing is disabled on this model/)).toBeInTheDocument();
+    expect(cache.queryByText("0.5×")).not.toBeInTheDocument();
+  });

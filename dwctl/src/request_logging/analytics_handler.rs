@@ -284,6 +284,27 @@ impl RequestHandler for AnalyticsHandler {
 
             let api_key_id = response_data.extensions.get::<AuthenticatedApiKeyId>().map(|id| id.0);
 
+            // Product/class and destination are separate dimensions. These labels
+            // are configured model/class/destination identities, never account IDs
+            // or submitted synonyms. Keep endpoint identity: upstream names are
+            // only unique within an endpoint, and recreating it is a new destination.
+            if let Some(class) = &metrics.class_route {
+                let labels = [
+                    ("model", class.canonical_alias.clone()),
+                    ("class", class.class_key.clone()),
+                    ("endpoint", class.endpoint_id.to_string()),
+                    ("upstream", class.upstream_model_name.clone()),
+                    ("status", metrics.status_code.to_string()),
+                ];
+                metrics::counter!("dwctl_class_requests_total", &labels).increment(1);
+                metrics::histogram!("dwctl_class_request_duration_seconds", &labels).record(metrics.duration_ms as f64 / 1000.0);
+                if let Some(ttfb) = metrics.duration_to_first_byte_ms {
+                    metrics::histogram!("dwctl_class_time_to_first_byte_seconds", &labels).record(ttfb as f64 / 1000.0);
+                }
+                metrics::counter!("dwctl_class_prompt_tokens_total", &labels).increment(metrics.prompt_tokens.max(0) as u64);
+                metrics::counter!("dwctl_class_completion_tokens_total", &labels).increment(metrics.completion_tokens.max(0) as u64);
+            }
+
             // Build the raw record (no DB enrichment)
             // Note: request_origin is computed in the batcher after api_key_purpose is resolved
             let record = RawAnalyticsRecord {
@@ -318,6 +339,9 @@ impl RequestHandler for AnalyticsHandler {
                 served_by: metrics.served_by,
                 requested_serving_class: metrics.requested_serving_class,
                 resolved_serving_class: metrics.resolved_serving_class,
+                class_route: metrics.class_route,
+                upstream_model_name: metrics.upstream_model_name,
+                submitted_model: metrics.submitted_model,
                 api_key_id,
                 fusillade_batch_id,
                 fusillade_request_id,
