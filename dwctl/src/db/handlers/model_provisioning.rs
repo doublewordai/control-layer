@@ -324,7 +324,7 @@ impl<'c> ModelProvisioning<'c> {
         sqlx::query(
             r#"INSERT INTO deployed_models (
                    model_name, alias, display_name, description, type, capabilities, created_by, hosted_on,
-                   requests_per_second, burst_size, capacity, batch_capacity, throughput,
+                   batch_capacity, throughput,
                    downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token,
                    downstream_hourly_rate, downstream_input_token_cost_ratio,
                    is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status,
@@ -335,9 +335,9 @@ impl<'c> ModelProvisioning<'c> {
                    fallback_realtime_on_status, affinity
                ) VALUES (
                    $1,$2,$3,$4,$5,$6,'00000000-0000-0000-0000-000000000000',$7,
-                   $8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,
-                   $27,$28,$29,$30,$31,$32,$33,$34,$35,$36,FALSE,$37,$38,
-                   COALESCE($39::INTEGER[], '{}'), $40::JSONB
+                   $8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,
+                   $24,$25,$26,$27,$28,$29,$30,$31,$32,$33,FALSE,$34,$35,
+                   COALESCE($36::INTEGER[], '{}'), $37::JSONB
                )
                ON CONFLICT (alias) DO UPDATE SET
                    model_name = EXCLUDED.model_name,
@@ -346,9 +346,6 @@ impl<'c> ModelProvisioning<'c> {
                    type = EXCLUDED.type,
                    capabilities = EXCLUDED.capabilities,
                    hosted_on = EXCLUDED.hosted_on,
-                   requests_per_second = EXCLUDED.requests_per_second,
-                   burst_size = EXCLUDED.burst_size,
-                   capacity = EXCLUDED.capacity,
                    batch_capacity = EXCLUDED.batch_capacity,
                    throughput = EXCLUDED.throughput,
                    downstream_pricing_mode = EXCLUDED.downstream_pricing_mode,
@@ -364,7 +361,7 @@ impl<'c> ModelProvisioning<'c> {
                    -- A declared catalog value replaces the stored one; an omitted one keeps
                    -- it while the routing stays compatible.
                    affinity = CASE
-                       WHEN EXCLUDED.is_composite AND $40::JSONB IS NOT NULL THEN $40::JSONB
+                       WHEN EXCLUDED.is_composite AND $37::JSONB IS NOT NULL THEN $37::JSONB
                        WHEN EXCLUDED.is_composite
                            AND (EXCLUDED.lb_strategy <> 'priority' OR NOT EXCLUDED.fallback_enabled)
                            AND COALESCE(deployed_models.affinity->'enabled' = 'false'::JSONB, FALSE) IS FALSE
@@ -375,7 +372,7 @@ impl<'c> ModelProvisioning<'c> {
                    fallback_on_rate_limit = CASE WHEN EXCLUDED.is_composite THEN EXCLUDED.fallback_on_rate_limit ELSE deployed_models.fallback_on_rate_limit END,
                    fallback_on_status = CASE WHEN EXCLUDED.is_composite THEN EXCLUDED.fallback_on_status ELSE deployed_models.fallback_on_status END,
                    -- An omitted catalog value keeps the stored one.
-                   fallback_realtime_on_status = CASE WHEN EXCLUDED.is_composite AND $39::INTEGER[] IS NOT NULL
+                   fallback_realtime_on_status = CASE WHEN EXCLUDED.is_composite AND $36::INTEGER[] IS NOT NULL
                        THEN EXCLUDED.fallback_realtime_on_status ELSE deployed_models.fallback_realtime_on_status END,
                    fallback_with_replacement = CASE WHEN EXCLUDED.is_composite THEN EXCLUDED.fallback_with_replacement ELSE deployed_models.fallback_with_replacement END,
                    fallback_max_attempts = CASE WHEN EXCLUDED.is_composite THEN EXCLUDED.fallback_max_attempts ELSE deployed_models.fallback_max_attempts END,
@@ -396,7 +393,6 @@ impl<'c> ModelProvisioning<'c> {
                    updated_at = CASE WHEN ROW(
                        deployed_models.model_name, deployed_models.display_name, deployed_models.description,
                        deployed_models.type, deployed_models.capabilities, deployed_models.hosted_on,
-                       deployed_models.requests_per_second, deployed_models.burst_size, deployed_models.capacity,
                        deployed_models.batch_capacity, deployed_models.throughput, deployed_models.downstream_pricing_mode,
                        deployed_models.downstream_input_price_per_token, deployed_models.downstream_output_price_per_token,
                        deployed_models.downstream_hourly_rate, deployed_models.downstream_input_token_cost_ratio,
@@ -414,7 +410,6 @@ impl<'c> ModelProvisioning<'c> {
                    ) IS DISTINCT FROM ROW(
                        EXCLUDED.model_name, EXCLUDED.display_name, EXCLUDED.description,
                        EXCLUDED.type, EXCLUDED.capabilities, EXCLUDED.hosted_on,
-                       EXCLUDED.requests_per_second, EXCLUDED.burst_size, EXCLUDED.capacity,
                        EXCLUDED.batch_capacity, EXCLUDED.throughput, EXCLUDED.downstream_pricing_mode,
                        EXCLUDED.downstream_input_price_per_token, EXCLUDED.downstream_output_price_per_token,
                        EXCLUDED.downstream_hourly_rate, EXCLUDED.downstream_input_token_cost_ratio,
@@ -433,16 +428,16 @@ impl<'c> ModelProvisioning<'c> {
                        EXCLUDED.sanitize_responses, EXCLUDED.trusted, EXCLUDED.allowed_batch_completion_windows,
                        EXCLUDED.metadata, EXCLUDED.reasoning_translation_overrides, FALSE,
                        EXCLUDED.serving_classes,
-                       CASE WHEN EXCLUDED.is_composite AND $39::INTEGER[] IS NOT NULL
+                       CASE WHEN EXCLUDED.is_composite AND $36::INTEGER[] IS NOT NULL
                            THEN EXCLUDED.fallback_realtime_on_status ELSE deployed_models.fallback_realtime_on_status END,
                        CASE
-                           WHEN EXCLUDED.is_composite AND $40::JSONB IS NOT NULL THEN $40::JSONB
+                           WHEN EXCLUDED.is_composite AND $37::JSONB IS NOT NULL THEN $37::JSONB
                            WHEN EXCLUDED.is_composite
                                AND (EXCLUDED.lb_strategy <> 'priority' OR NOT EXCLUDED.fallback_enabled)
                                AND COALESCE(deployed_models.affinity->'enabled' = 'false'::JSONB, FALSE) IS FALSE
                                THEN NULL
                            ELSE deployed_models.affinity END
-                   ) THEN $37 ELSE deployed_models.updated_at END"#,
+                   ) THEN $34 ELSE deployed_models.updated_at END"#,
         )
         .bind(model_name)
         .bind(alias)
@@ -451,9 +446,6 @@ impl<'c> ModelProvisioning<'c> {
         .bind(model_type.map(|kind| kind.as_db_str()))
         .bind(capabilities)
         .bind(hosted_on)
-        .bind(settings.requests_per_second)
-        .bind(settings.burst_size)
-        .bind(settings.capacity)
         .bind(settings.batch_capacity)
         .bind(settings.throughput)
         .bind(pricing.mode)
@@ -487,6 +479,19 @@ impl<'c> ModelProvisioning<'c> {
         .execute(&mut *self.db)
         .await
         .with_context(|| format!("upsert model alias {alias:?}"))?;
+
+        if let Some(limit) = settings.realtime_inflight_limit {
+            sqlx::query(
+                "UPDATE deployed_models SET realtime_inflight_limit = $1, updated_at = $2 \
+                 WHERE alias = $3 AND realtime_inflight_limit <> $1",
+            )
+            .bind(limit)
+            .bind(effective_at)
+            .bind(alias)
+            .execute(&mut *self.db)
+            .await
+            .with_context(|| format!("set realtime in-flight limit for model alias {alias:?}"))?;
+        }
 
         sqlx::query_scalar("SELECT id FROM deployed_models WHERE alias = $1")
             .bind(alias)

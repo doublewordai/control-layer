@@ -57,6 +57,46 @@ You can set different concurrency limits for different API keys:
 }
 ```
 
+## Per-account in-flight limits
+
+A pool can cap how many realtime requests each account has in flight on its
+alias. A key's account is its `account` label, so every key of an account shares
+one count. `inflight_limit` is the default and `account_inflight_limits`
+overrides it for named accounts:
+
+```json
+{
+  "auth": {
+    "global_keys": [],
+    "key_definitions": {
+      "acme_backend": { "key": "sk-acme-1", "labels": { "account": "acme" } },
+      "acme_batch": { "key": "sk-acme-2", "labels": { "account": "acme" } }
+    }
+  },
+  "targets": {
+    "gpt-4": {
+      "inflight_limit": 20,
+      "account_inflight_limits": { "acme": 200 },
+      "providers": [{ "url": "https://api.openai.com", "onwards_key": "sk-your-openai-key" }]
+    }
+  }
+}
+```
+
+The slot is taken after routing rules and counts against the alias the request
+named, even when a rule redirects it to another alias, so the named alias's
+limits apply. It is held across failover attempts and released when the
+response body finishes or the client disconnects. A request
+over the limit receives `429` with code `inflight_limit_exceeded` and a
+`Retry-After: 1` header. The limits belong to the alias as a whole: they are
+read from its default pool, whichever request-class pool serves the request.
+Requests carrying the header set with
+`AppState::with_first_token_timeout_exempt_header` (dispatched batch and async
+work) and requests from keys with no `account` label are not counted, and the
+plugged-in limiter can admit others without counting them. Counts are per
+process by default; `AppState::with_inflight_limiter` plugs in a shared
+counter so several instances enforce one limit.
+
 ## Combining rate limiting and concurrency limiting
 
 You can use both rate limiting and concurrency limiting together:

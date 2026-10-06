@@ -50,9 +50,13 @@
             "Sophisticated coding",
             "Max performance tasks"
           ],
-          "deployment_providers": ["snowflake", "onwards"]
+          "deployment_providers": [
+            "snowflake",
+            "onwards"
+          ]
         }
-      }
+      },
+      "realtime_inflight_limit": 14
     },
     {
       "id": "d2a3b4c5-e6f7-4a8b-9c0d-1e2f3a4b5c6d",
@@ -103,16 +107,19 @@
             "Reasoning tasks",
             "Cost-effective intelligence"
           ],
-          "deployment_providers": ["snowflake"]
+          "deployment_providers": [
+            "snowflake"
+          ]
         }
-      }
+      },
+      "realtime_inflight_limit": 14
     },
     {
       "id": "d3a4b5c6-e7f8-4a9b-0c1d-2e3f4a5b6c7d",
       "alias": "openai/gpt-oss-20b",
       "display_name": "GPT-oss 20B",
       "model_name": "openai/gpt-oss-20b",
-      "description": "Meet gpt-oss-20b \u2014 for lower latency, and local or specialized use cases (21B parameters with 3.6B active parameters).",
+      "description": "Meet gpt-oss-20b — for lower latency, and local or specialized use cases (21B parameters with 3.6B active parameters).",
       "model_type": "CHAT",
       "capabilities": [
         "reasoning"
@@ -158,9 +165,12 @@
             "Specialized use cases",
             "Cost-sensitive workloads"
           ],
-          "deployment_providers": ["openai"]
+          "deployment_providers": [
+            "openai"
+          ]
         }
-      }
+      },
+      "realtime_inflight_limit": 14
     },
     {
       "id": "d4a5b6c7-e8f9-4a0b-1c2d-3e4f5a6b7c8d",
@@ -214,7 +224,8 @@
             "Max performance tasks"
           ]
         }
-      }
+      },
+      "realtime_inflight_limit": 14
     },
     {
       "id": "d5a6b7c8-e9f0-4a1b-2c3d-4e5f6a7b8c9d",
@@ -268,7 +279,8 @@
             "Code generation"
           ]
         }
-      }
+      },
+      "realtime_inflight_limit": 14
     },
     {
       "id": "d6a7b8c9-e0f1-4a2b-3c4d-5e6f7a8b9c0d",
@@ -323,7 +335,8 @@
             "Summarization"
           ]
         }
-      }
+      },
+      "realtime_inflight_limit": 14
     },
     {
       "id": "d7a8b9c0-e1f2-4a3b-4c5d-6e7f8a9b0c1d",
@@ -362,7 +375,8 @@
             "Multilingual embeddings"
           ]
         }
-      }
+      },
+      "realtime_inflight_limit": 14
     },
     {
       "id": "d8b9c0d1-e2f3-4a4b-5c6d-7e8f9a0b1c2d",
@@ -404,7 +418,8 @@
             "Cost-efficient intelligence"
           ]
         }
-      }
+      },
+      "realtime_inflight_limit": 14
     },
     {
       "id": "h1000001-aaaa-4bbb-8ccc-ddddeeee0012",
@@ -417,9 +432,7 @@
       ],
       "hosted_on": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
       "is_composite": false,
-      "sanitize_responses": false,
-      "requests_per_second": 120,
-      "capacity": 256
+      "sanitize_responses": false
     },
     {
       "id": "h1000001-aaaa-4bbb-8ccc-ddddeeee0013",
@@ -432,9 +445,7 @@
       ],
       "hosted_on": "f6a7b8c9-0123-4567-8901-bcdef0123456",
       "is_composite": false,
-      "sanitize_responses": false,
-      "requests_per_second": 80,
-      "capacity": 128
+      "sanitize_responses": false
     },
     {
       "id": "h1000001-aaaa-4bbb-8ccc-ddddeeee0001",
@@ -445,9 +456,7 @@
       "capabilities": [],
       "hosted_on": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
       "is_composite": false,
-      "sanitize_responses": false,
-      "requests_per_second": 20,
-      "capacity": 32
+      "sanitize_responses": false
     },
     {
       "id": "h1000001-aaaa-4bbb-8ccc-ddddeeee0002",
@@ -458,9 +467,7 @@
       "capabilities": [],
       "hosted_on": "f6a7b8c9-0123-4567-8901-bcdef0123456",
       "is_composite": false,
-      "sanitize_responses": false,
-      "requests_per_second": 10,
-      "capacity": 16
+      "sanitize_responses": false
     },
     {
       "id": "h1000001-aaaa-4bbb-8ccc-ddddeeee0003",
@@ -471,9 +478,7 @@
       "capabilities": [],
       "hosted_on": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
       "is_composite": false,
-      "sanitize_responses": false,
-      "requests_per_second": 50,
-      "capacity": 64
+      "sanitize_responses": false
     },
     {
       "id": "h1000001-aaaa-4bbb-8ccc-ddddeeee0004",
@@ -484,9 +489,7 @@
       "capabilities": [],
       "hosted_on": "f6a7b8c9-0123-4567-8901-bcdef0123456",
       "is_composite": false,
-      "sanitize_responses": false,
-      "requests_per_second": 30,
-      "capacity": 32
+      "sanitize_responses": false
     },
     {
       "id": "h1000001-aaaa-4bbb-8ccc-ddddeeee0005",
@@ -497,9 +500,7 @@
       "capabilities": [],
       "hosted_on": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
       "is_composite": false,
-      "sanitize_responses": false,
-      "requests_per_second": 80,
-      "capacity": 128
+      "sanitize_responses": false
     },
     {
       "id": "h1000001-aaaa-4bbb-8ccc-ddddeeee0006",
@@ -512,9 +513,7 @@
       ],
       "hosted_on": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
       "is_composite": false,
-      "sanitize_responses": false,
-      "requests_per_second": 15,
-      "capacity": 24
+      "sanitize_responses": false
     },
     {
       "id": "h1000001-aaaa-4bbb-8ccc-ddddeeee0007",
@@ -527,9 +526,7 @@
       ],
       "hosted_on": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
       "is_composite": false,
-      "sanitize_responses": false,
-      "requests_per_second": 40,
-      "capacity": 48
+      "sanitize_responses": false
     },
     {
       "id": "h1000001-aaaa-4bbb-8ccc-ddddeeee0008",
@@ -542,9 +539,7 @@
       ],
       "hosted_on": "f6a7b8c9-0123-4567-8901-bcdef0123456",
       "is_composite": false,
-      "sanitize_responses": false,
-      "requests_per_second": 20,
-      "capacity": 24
+      "sanitize_responses": false
     },
     {
       "id": "h1000001-aaaa-4bbb-8ccc-ddddeeee0009",
@@ -555,9 +550,7 @@
       "capabilities": [],
       "hosted_on": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
       "is_composite": false,
-      "sanitize_responses": false,
-      "requests_per_second": 100,
-      "capacity": 128
+      "sanitize_responses": false
     },
     {
       "id": "h1000001-aaaa-4bbb-8ccc-ddddeeee0010",
@@ -568,9 +561,7 @@
       "capabilities": [],
       "hosted_on": "f6a7b8c9-0123-4567-8901-bcdef0123456",
       "is_composite": false,
-      "sanitize_responses": false,
-      "requests_per_second": 60,
-      "capacity": 64
+      "sanitize_responses": false
     },
     {
       "id": "h1000001-aaaa-4bbb-8ccc-ddddeeee0011",
@@ -581,9 +572,7 @@
       "capabilities": [],
       "hosted_on": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
       "is_composite": false,
-      "sanitize_responses": false,
-      "requests_per_second": 200,
-      "capacity": 256
+      "sanitize_responses": false
     }
   ]
 }

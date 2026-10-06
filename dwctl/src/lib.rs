@@ -140,6 +140,7 @@ fn install_crypto_provider() {
     rustls::crypto::aws_lc_rs::default_provider().install_default().ok();
 }
 
+pub mod account_limits;
 pub mod api;
 pub mod auth;
 pub mod clickhouse;
@@ -173,6 +174,7 @@ pub mod pricing;
 mod probes;
 pub mod profiling;
 pub mod prompt_cache;
+pub mod realtime_inflight;
 pub mod reasoning;
 mod recompute;
 mod request_logging;
@@ -612,9 +614,6 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
                             description: None,
                             model_type: None,
                             capabilities: None,
-                            requests_per_second: None,
-                            burst_size: None,
-                            capacity: None,
                             batch_capacity: None,
                             throughput: None,
                             tariffs: None,
@@ -1598,14 +1597,16 @@ async fn setup_database(
     seed_database(&config.model_sources, &main.pooled.write()).await?;
 
     if config.model_provisioning.enabled {
-        // Both catalogs are parsed and validated before either is applied, so
+        // Every catalog is parsed and validated before any is applied, so
         // a malformed overlay file fails startup without a half-applied model
-        // catalog. Overlays reference the model catalog's aliases, so they are
-        // applied after it.
+        // catalog. Overlays and account limits reference the model catalog's
+        // aliases, so they are applied after it.
         let catalog = model_provisioning::Catalog::load(&config.model_provisioning.directory)?;
         let overlays = org_overlays::OrgCatalog::load(&config.model_provisioning.org_overlays_directory)?;
+        let account_limits = account_limits::AccountLimitsCatalog::load(&config.model_provisioning.account_limits_directory)?;
         model_provisioning::apply(&main.pooled.write(), &catalog).await?;
         org_overlays::apply(&main.pooled.write(), &overlays).await?;
+        account_limits::apply(&main.pooled.write(), &account_limits).await?;
     }
 
     Ok((
@@ -2003,6 +2004,10 @@ pub async fn build_router(
         .route("/models/{id}", patch(api::handlers::deployments::update_deployed_model))
         .route("/models/{id}", delete(api::handlers::deployments::delete_deployed_model))
         .route("/models/{id}/overlays", get(api::handlers::serving::list_model_overlays))
+        .route(
+            "/models/{id}/realtime-inflight-limits",
+            get(api::handlers::realtime_inflight_limits::list_realtime_inflight_limits),
+        )
         .route("/models/{id}/cache-pricing", get(api::handlers::cache_pricing::get_cache_pricing))
         .route(
             "/models/{id}/cache-pricing",
@@ -3085,9 +3090,7 @@ impl BackgroundServices {
 
         // Use the same load function as the automatic sync
         // Note: escalation_models is empty for tests - individual tests can set up their own
-        let new_targets =
-            crate::sync::onwards_config::load_targets_from_db(pool, &[], self.strict_mode, &crate::config::RateLimitTiersConfig::default())
-                .await?;
+        let new_targets = crate::sync::onwards_config::load_targets_from_db(pool, &[], self.strict_mode).await?;
 
         // Snapshot the routing table this update should produce, before the
         // config is handed to the channel.
@@ -3433,7 +3436,6 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
             config.background_services.batch_daemon.default_model_concurrency,
             escalation_models,
             config.onwards.strict_mode,
-            config.auth.rate_limits.clone(),
         )
         .await?;
 
@@ -4366,6 +4368,9 @@ impl Application {
             // `x-fusillade-request-id`), so it exempts exactly the daemon
             // traffic, which tolerates latency and runs its own retries.
             .with_first_token_timeout_exempt_header("x-fusillade-batch-created-at")
+            .with_inflight_limiter(Arc::new(crate::realtime_inflight::RealtimeInflightLimiter::from_config(
+                &config.limits.realtime_inflight,
+            )?))
             .with_rejected_params(&config.onwards.rejected_params)
             .map_err(|error| anyhow::anyhow!("onwards.rejected_params: {error}"))?;
         if config.onwards.first_token_timeout_ms > 0 {

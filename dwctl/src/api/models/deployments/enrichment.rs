@@ -518,9 +518,7 @@ mod tests {
             hosted_on: Some(Uuid::new_v4()),
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            requests_per_second: Some(100.0),
-            burst_size: Some(200),
-            capacity: None,
+            realtime_inflight_limit: Some(14),
             batch_capacity: None,
             throughput: None,
             groups: None,
@@ -679,17 +677,13 @@ mod tests {
     #[test]
     fn test_mask_rate_limiting() {
         let mut model = create_test_model();
-        model.requests_per_second = Some(100.0);
-        model.burst_size = Some(200);
-        model.capacity = Some(50);
+        model.realtime_inflight_limit = Some(40);
+        model.batch_capacity = Some(50);
 
         let masked = model.mask_rate_limiting();
 
-        // Rate limits should be masked
-        assert_eq!(masked.requests_per_second, None);
-        assert_eq!(masked.burst_size, None);
-        // Capacity is not a rate limit, should remain
-        assert_eq!(masked.capacity, Some(50));
+        assert_eq!(masked.realtime_inflight_limit, None);
+        assert_eq!(masked.batch_capacity, Some(50));
     }
 
     #[test]

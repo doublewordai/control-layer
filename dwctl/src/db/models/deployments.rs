@@ -612,9 +612,7 @@ pub struct DeploymentCreateDBRequest {
     pub capabilities: Option<Vec<String>>,
     /// Inference endpoint for regular models. Must be None for composite models.
     pub hosted_on: Option<InferenceEndpointId>,
-    pub requests_per_second: Option<f32>,
-    pub burst_size: Option<i32>,
-    pub capacity: Option<i32>,
+    pub realtime_inflight_limit: Option<i32>,
     pub batch_capacity: Option<i32>,
     pub throughput: Option<f32>,
     // Provider/downstream pricing
@@ -687,9 +685,6 @@ impl DeploymentCreateDBRequest {
                     .maybe_model_type(standard.model_type)
                     .maybe_capabilities(standard.capabilities)
                     .hosted_on(standard.hosted_on)
-                    .maybe_requests_per_second(standard.requests_per_second)
-                    .maybe_burst_size(standard.burst_size)
-                    .maybe_capacity(standard.capacity)
                     .maybe_batch_capacity(standard.batch_capacity)
                     .maybe_throughput(standard.throughput)
                     .maybe_provider_pricing(standard.provider_pricing)
@@ -720,9 +715,7 @@ impl DeploymentCreateDBRequest {
                 .maybe_description(composite.description)
                 .maybe_model_type(composite.model_type)
                 .maybe_capabilities(composite.capabilities)
-                .maybe_requests_per_second(composite.requests_per_second)
-                .maybe_burst_size(composite.burst_size)
-                .maybe_capacity(composite.capacity)
+                .maybe_realtime_inflight_limit(composite.realtime_inflight_limit)
                 .maybe_batch_capacity(composite.batch_capacity)
                 .maybe_throughput(composite.throughput)
                 .is_composite(true)
@@ -763,9 +756,7 @@ pub struct DeploymentUpdateDBRequest {
     pub status: Option<ModelStatus>,
     pub last_sync: Option<Option<DateTime<Utc>>>,
     pub deleted: Option<bool>,
-    pub requests_per_second: Option<Option<f32>>,
-    pub burst_size: Option<Option<i32>>,
-    pub capacity: Option<Option<i32>>,
+    pub realtime_inflight_limit: Option<i32>,
     pub batch_capacity: Option<Option<i32>>,
     pub throughput: Option<Option<f32>>,
     // Provider pricing updates
@@ -811,9 +802,7 @@ impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
             .maybe_description(update.description)
             .maybe_model_type(update.model_type)
             .maybe_capabilities(update.capabilities)
-            .maybe_requests_per_second(update.requests_per_second)
-            .maybe_burst_size(update.burst_size)
-            .maybe_capacity(update.capacity)
+            .maybe_realtime_inflight_limit(update.realtime_inflight_limit)
             .maybe_batch_capacity(update.batch_capacity)
             .maybe_throughput(update.throughput)
             .maybe_provider_pricing(update.provider_pricing)
@@ -878,9 +867,7 @@ pub struct DeploymentDBResponse {
     pub deleted: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    pub requests_per_second: Option<f32>,
-    pub burst_size: Option<i32>,
-    pub capacity: Option<i32>,
+    pub realtime_inflight_limit: i32,
     pub batch_capacity: Option<i32>,
     /// Throughput in requests/second for batch capacity calculations
     pub throughput: Option<f32>,

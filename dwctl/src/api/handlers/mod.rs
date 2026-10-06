@@ -65,6 +65,7 @@ pub mod payments;
 pub mod probes;
 pub mod provider_display_configs;
 pub mod queue;
+pub mod realtime_inflight_limits;
 pub mod recompute;
 pub mod requests;
 pub mod serving;

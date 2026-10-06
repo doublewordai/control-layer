@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Result, ensure};
 use clap::{Parser, Subcommand};
-use dwctl::{model_provisioning::Catalog, org_overlays::OrgCatalog};
+use dwctl::{account_limits::AccountLimitsCatalog, model_provisioning::Catalog, org_overlays::OrgCatalog};
 
 #[derive(Debug, Parser)]
 #[command(about = "Validate and describe dwctl model provisioning catalogs")]
@@ -17,6 +17,12 @@ enum Command {
     Validate { directory: PathBuf },
     /// Validate org overlays and references against the complete model catalog, without a database.
     ValidateOrgOverlays {
+        directory: PathBuf,
+        #[arg(long)]
+        models: PathBuf,
+    },
+    #[command(about = "Validate account limits and their model references against the complete model catalog, without a database")]
+    ValidateAccountLimits {
         directory: PathBuf,
         #[arg(long)]
         models: PathBuf,
@@ -39,6 +45,15 @@ fn main() -> Result<()> {
             let overlays = OrgCatalog::load(&directory)?;
             overlays.validate_models(&Catalog::load(&models)?)?;
             println!("org overlay catalog is valid: {}", directory.display());
+        }
+        Command::ValidateAccountLimits { directory, models } => {
+            ensure!(
+                directory.is_dir(),
+                "account limits directory does not exist: {}",
+                directory.display()
+            );
+            AccountLimitsCatalog::load(&directory)?.validate_models(&Catalog::load(&models)?)?;
+            println!("account limits are valid: {}", directory.display());
         }
         Command::OrgSchema => println!("{}", OrgCatalog::json_schema()?),
         Command::Schema => println!("{}", Catalog::json_schema()?),

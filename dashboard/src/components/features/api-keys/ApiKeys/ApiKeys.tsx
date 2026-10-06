@@ -6,7 +6,6 @@ import {
   Copy,
   Loader2,
   Check,
-  ChevronDown,
   Eye,
   Info,
   RefreshCw,
@@ -54,16 +53,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "../../../ui/select";
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from "../../../ui/collapsible";
-import {
-  HoverCard,
-  HoverCardContent,
-  HoverCardTrigger,
-} from "../../../ui/hover-card";
 import { Tabs, TabsList, TabsTrigger } from "../../../ui/tabs";
 import { useServerPagination } from "@/hooks/useServerPagination";
 import { useOrganizationContext } from "@/contexts";
@@ -86,10 +75,6 @@ export const ApiKeys: React.FC = () => {
   const [newKeyDescription, setNewKeyDescription] = useState("");
   const [newKeyPurpose, setNewKeyPurpose] = useState<ApiKeyPurpose>("realtime");
   const [newKeyAssignee, setNewKeyAssignee] = useState<string>("self");
-  const [newKeyRequestsPerSecond, setNewKeyRequestsPerSecond] = useState<
-    number | ""
-  >("");
-  const [newKeyBurstSize, setNewKeyBurstSize] = useState<number | "">("");
   const [newKeyCapAmount, setNewKeyCapAmount] = useState("");
   const [newKeyCapInterval, setNewKeyCapInterval] = useState<
     SpendLimitInterval | "none"
@@ -114,7 +99,6 @@ export const ApiKeys: React.FC = () => {
   const [bulkRotatedKeys, setBulkRotatedKeys] = useState<
     { id: string; name: string; key: string }[] | null
   >(null);
-  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [rotateModal, setRotateModal] = useState<ApiKey | null>(null);
   const [revealModal, setRevealModal] = useState<ApiKey | null>(null);
   // One-time secret display, shared by rotation and the one-off reveal —
@@ -202,12 +186,9 @@ export const ApiKeys: React.FC = () => {
     setNewKeyDescription("");
     setNewKeyPurpose("realtime");
     setNewKeyAssignee("self");
-    setNewKeyRequestsPerSecond("");
-    setNewKeyBurstSize("");
     setNewKeyCapAmount("");
     setNewKeyCapInterval("none");
     setNewKeyResponse(null);
-    setAdvancedOpen(false);
   };
 
   const handleCreateApiKey = async (e: React.FormEvent) => {
@@ -231,11 +212,6 @@ export const ApiKeys: React.FC = () => {
         description: newKeyDescription.trim() || undefined,
         purpose: newKeyPurpose,
         member_id: assignedMemberId,
-        requests_per_second:
-          newKeyRequestsPerSecond === ""
-            ? null
-            : Number(newKeyRequestsPerSecond),
-        burst_size: newKeyBurstSize === "" ? null : Number(newKeyBurstSize),
         spend_limit: newKeyCapAmount.trim() === "" ? null : newKeyCapAmount.trim(),
         spend_limit_interval:
           newKeyCapAmount.trim() === "" || newKeyCapInterval === "none"
@@ -909,121 +885,6 @@ export const ApiKeys: React.FC = () => {
                   </p>
                 </div>
 
-                {/* Advanced Settings (Rate Limiting, PM-only) - Collapsible */}
-                {isPlatformManager && (
-                  <Collapsible
-                    open={advancedOpen}
-                    onOpenChange={setAdvancedOpen}
-                  >
-                    <CollapsibleTrigger asChild>
-                      <button
-                        type="button"
-                        className="flex items-center gap-2 w-full text-sm font-medium text-gray-700 hover:text-gray-900 transition-colors group"
-                      >
-                        <ChevronDown
-                          className={`h-4 w-4 text-gray-400 transition-transform duration-200 ${
-                            advancedOpen ? "transform rotate-180" : ""
-                          }`}
-                        />
-                        <span>Advanced Settings</span>
-                        <div className="flex-1 h-px bg-gray-200 group-hover:bg-gray-300 transition-colors" />
-                      </button>
-                    </CollapsibleTrigger>
-                    <CollapsibleContent className="space-y-3 pt-4">
-                      {/* Rate Limiting */}
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                        <div className="space-y-2">
-                          <div className="flex items-center gap-1">
-                            <Label htmlFor="requestsPerSecond">
-                              Requests/Second
-                            </Label>
-                            <HoverCard openDelay={200} closeDelay={100}>
-                              <HoverCardTrigger asChild>
-                                <button
-                                  type="button"
-                                  className="text-gray-400 hover:text-gray-600 transition-colors"
-                                  onFocus={(e) => e.preventDefault()}
-                                  tabIndex={-1}
-                                >
-                                  <Info className="h-4 w-4" />
-                                  <span className="sr-only">
-                                    Requests per second information
-                                  </span>
-                                </button>
-                              </HoverCardTrigger>
-                              <HoverCardContent className="w-80" sideOffset={5}>
-                                <p className="text-sm text-muted-foreground">
-                                  Maximum number of requests allowed per second
-                                  for this API key. Leave blank for no limit.
-                                </p>
-                              </HoverCardContent>
-                            </HoverCard>
-                          </div>
-                          <Input
-                            id="requestsPerSecond"
-                            type="number"
-                            min="1"
-                            max="10000"
-                            step="1"
-                            value={newKeyRequestsPerSecond}
-                            onChange={(e) =>
-                              setNewKeyRequestsPerSecond(
-                                e.target.value === ""
-                                  ? ""
-                                  : Number(e.target.value),
-                              )
-                            }
-                            placeholder="None"
-                          />
-                        </div>
-
-                        <div className="space-y-2">
-                          <div className="flex items-center gap-1">
-                            <Label htmlFor="burstSize">Burst Size</Label>
-                            <HoverCard openDelay={200} closeDelay={100}>
-                              <HoverCardTrigger asChild>
-                                <button
-                                  type="button"
-                                  className="text-gray-400 hover:text-gray-600 transition-colors"
-                                  onFocus={(e) => e.preventDefault()}
-                                  tabIndex={-1}
-                                >
-                                  <Info className="h-4 w-4" />
-                                  <span className="sr-only">
-                                    Burst size information
-                                  </span>
-                                </button>
-                              </HoverCardTrigger>
-                              <HoverCardContent className="w-80" sideOffset={5}>
-                                <p className="text-sm text-muted-foreground">
-                                  Maximum burst capacity for rate limiting. This
-                                  allows temporary spikes above the per-second
-                                  rate. Leave blank for no limit.
-                                </p>
-                              </HoverCardContent>
-                            </HoverCard>
-                          </div>
-                          <Input
-                            id="burstSize"
-                            type="number"
-                            min="1"
-                            max="50000"
-                            step="1"
-                            value={newKeyBurstSize}
-                            onChange={(e) =>
-                              setNewKeyBurstSize(
-                                e.target.value === ""
-                                  ? ""
-                                  : Number(e.target.value),
-                              )
-                            }
-                            placeholder="None"
-                          />
-                        </div>
-                      </div>
-                    </CollapsibleContent>
-                  </Collapsible>
-                )}
               </form>
 
               <DialogFooter>

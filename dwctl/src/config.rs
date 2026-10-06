@@ -846,10 +846,8 @@ pub struct AuthConfig {
     /// Applies to user registration and proxy header auth auto-creation
     /// StandardUser role is always guaranteed to be present even if not specified
     pub default_user_roles: Vec<Role>,
-    /// Default rate-limit tiers applied to API keys based on the owning user's
-    /// `verified` flag. Only used when the api_key has no explicit per-key
-    /// override. Leaving either tier as `None` means "no limit for that tier".
-    pub rate_limits: RateLimitTiersConfig,
+    #[serde(rename = "rate_limits", skip_serializing)]
+    pub ignored_rate_limits: serde::de::IgnoredAny,
     /// Extra email domains to treat as personal, on top of the built-in list
     /// in `auth::utils`.
     ///
@@ -889,27 +887,10 @@ impl Default for AuthConfig {
             proxy_header: ProxyHeaderAuthConfig::default(),
             security: SecurityConfig::default(),
             default_user_roles: vec![Role::StandardUser, Role::BackgroundInferenceUser],
-            rate_limits: RateLimitTiersConfig::default(),
+            ignored_rate_limits: serde::de::IgnoredAny,
             personal_email_domains: Vec::new(),
         }
     }
-}
-
-/// Per-tier defaults for API key rate limits. A `None` tier means no default
-/// limit is applied, preserving the legacy "unlimited unless overridden"
-/// behaviour for that tier.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct RateLimitTiersConfig {
-    pub verified: Option<RateLimitTierConfig>,
-    pub unverified: Option<RateLimitTierConfig>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RateLimitTierConfig {
-    pub requests_per_second: f32,
-    pub burst_size: Option<i32>,
 }
 
 /// Native username/password authentication configuration.
@@ -1166,6 +1147,14 @@ pub struct LimitsConfig {
     pub files: FileLimitsConfig,
     /// Request limits (per-request body size within batch files)
     pub requests: RequestLimitsConfig,
+    pub realtime_inflight: RealtimeInflightLimitsConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RealtimeInflightLimitsConfig {
+    pub enforce: bool,
+    pub redis_url: Option<String>,
 }
 
 /// Request limits configuration.
@@ -3299,6 +3288,7 @@ pub struct ModelProvisioningConfig {
     /// Directory containing per-organisation overlay YAML documents (see
     /// `org_overlays`). A missing directory is an empty catalog.
     pub org_overlays_directory: PathBuf,
+    pub account_limits_directory: PathBuf,
 }
 
 impl Default for ModelProvisioningConfig {
@@ -3307,6 +3297,7 @@ impl Default for ModelProvisioningConfig {
             enabled: false,
             directory: PathBuf::from("/app/model-provisioning.d"),
             org_overlays_directory: PathBuf::from("/app/org-overlays.d"),
+            account_limits_directory: PathBuf::from("/app/account-limits.d"),
         }
     }
 }

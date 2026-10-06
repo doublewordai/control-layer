@@ -330,9 +330,7 @@ export interface Model {
   model_type?: ModelType | null;
   capabilities?: string[] | null;
   hosted_on?: string | null; // endpoint ID (UUID) - null for virtual models
-  requests_per_second?: number | null; // Global rate limiting: requests per second
-  burst_size?: number | null; // Global rate limiting: burst capacity
-  capacity?: number | null; // Maximum concurrent requests allowed
+  realtime_inflight_limit?: number | null; // Virtual models: default realtime requests in flight per account
   batch_capacity?: number | null; // Maximum concurrent batch requests allowed
   throughput?: number | null; // Throughput in requests/second for batch SLA capacity calculations
   groups?: Group[]; // array of group IDs - only present when include=groups
@@ -405,9 +403,6 @@ export interface StandardModelCreate {
   description?: string;
   model_type?: ModelType;
   capabilities?: string[];
-  requests_per_second?: number;
-  burst_size?: number;
-  capacity?: number;
   batch_capacity?: number;
   throughput?: number;
   trusted?: boolean;
@@ -426,9 +421,7 @@ export interface VirtualModelCreate {
   description?: string;
   model_type?: ModelType;
   capabilities?: string[];
-  requests_per_second?: number;
-  burst_size?: number;
-  capacity?: number;
+  realtime_inflight_limit?: number;
   batch_capacity?: number;
   throughput?: number;
   lb_strategy?: LoadBalancingStrategy;
@@ -542,8 +535,6 @@ export interface ApiKey {
   purpose: ApiKeyPurpose; // Purpose of the key; see ApiKeyPurpose for allowed values
   created_at: string; // ISO 8601 timestamp
   last_used?: string; // ISO 8601 timestamp
-  requests_per_second?: number | null; // Rate limiting: requests per second
-  burst_size?: number | null; // Rate limiting: burst capacity
   created_by: string; // UUID of the user who created the key (always present in API responses)
   spend_limit?: string | null; // Spending cap in credits (decimal string); null = no cap
   spend_limit_interval?: SpendLimitInterval | null; // null = one-off cap
@@ -659,8 +650,6 @@ export interface ApiKeyCreateRequest {
   name: string;
   description?: string;
   purpose: ApiKeyPurpose; // Required: purpose of the key
-  requests_per_second?: number | null;
-  burst_size?: number | null;
   spend_limit?: string | null; // Spending cap in credits (decimal string)
   spend_limit_interval?: SpendLimitInterval | null; // Requires spend_limit; null = one-off
   // Issue the key to another org member (org targets only; PlatformManager or
@@ -714,9 +703,7 @@ export interface ModelUpdateRequest {
   description?: string | null;
   model_type?: ModelType | null;
   capabilities?: string[] | null;
-  requests_per_second?: number | null;
-  burst_size?: number | null;
-  capacity?: number | null;
+  realtime_inflight_limit?: number | null;
   batch_capacity?: number | null;
   throughput?: number | null;
   tariffs?: TariffDefinition[];
