@@ -215,6 +215,7 @@ use axum::response::Response;
 use axum::{
     Router, ServiceExt, http, middleware,
     routing::{delete, get, patch, post, put},
+    serve::ListenerExt,
 };
 use axum_prometheus::PrometheusMetricLayerBuilder;
 use bon::Builder;
@@ -4388,7 +4389,9 @@ impl Application {
                 true,
                 limits_redis,
             )))
-            .with_batch_inflight_enforce(config.limits.batch_inflight.enforce);
+            .with_batch_inflight_enforce(config.limits.batch_inflight.enforce)
+            .with_rejected_params(&config.onwards.rejected_params)
+            .map_err(|error| anyhow::anyhow!("onwards.rejected_params: {error}"))?;
         if config.onwards.first_token_timeout_ms > 0 {
             onwards_app_state =
                 onwards_app_state.with_first_token_timeout(std::time::Duration::from_millis(config.onwards.first_token_timeout_ms));
@@ -4496,6 +4499,14 @@ impl Application {
             shutdown.await;
             shutdown_token.cancel();
         };
+
+        // Streamed responses are many small writes; send each one immediately
+        // rather than waiting for the client to acknowledge the previous one.
+        let listener = listener.tap_io(|tcp| {
+            if let Err(err) = tcp.set_nodelay(true) {
+                warn!(%err, "failed to set TCP_NODELAY on an accepted connection");
+            }
+        });
 
         // Race the server against background task failures (fail-fast)
         let server_error: Option<anyhow::Error> = tokio::select! {

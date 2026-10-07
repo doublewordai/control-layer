@@ -261,7 +261,7 @@ async fn reassemble_stream(response: Response, timeouts: StreamTimeouts) -> Resp
                 Err(_) => return Collected::Stalled(sink.seen),
             }
         }
-        Collected::Done(sink)
+        Collected::Done(Box::new(sink))
     })
     .await;
 
@@ -272,7 +272,7 @@ async fn reassemble_stream(response: Response, timeouts: StreamTimeouts) -> Resp
             return timeout_response("chunk");
         }
         Ok(Collected::ParseError(e)) => return sse_parse_error(&e),
-        Ok(Collected::Done(sink)) => sink,
+        Ok(Collected::Done(sink)) => *sink,
     };
 
     // Some providers answer 200 with an error envelope inside the stream. Surface
@@ -319,7 +319,7 @@ async fn reassemble_stream(response: Response, timeouts: StreamTimeouts) -> Resp
 
 /// How the collection phase ended.
 enum Collected {
-    Done(Sink),
+    Done(Box<Sink>),
     /// Idle for longer than the per-event budget, carrying the events seen so far
     /// for the diagnostic.
     Stalled(usize),
@@ -447,6 +447,18 @@ mod tests {
         let body = serde_json::json!({"model": "gpt-4", "messages": [], "stream": true});
         let out = run(&body, false).expect("should transform");
         assert_eq!(out["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn injecting_usage_keeps_key_order() {
+        let body = Bytes::from_static(
+            br#"{"model":"m","stream":true,"response_format":{"type":"json_schema","json_schema":{"name":"a","schema":{"type":"object","properties":{"z":{"type":"string"},"a":{"type":"string"}}}}},"messages":[]}"#,
+        );
+        let out = transform(&body, false, true).expect("should transform");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            r#"{"model":"m","stream":true,"response_format":{"type":"json_schema","json_schema":{"name":"a","schema":{"type":"object","properties":{"z":{"type":"string"},"a":{"type":"string"}}}}},"messages":[],"stream_options":{"include_usage":true}}"#
+        );
     }
 
     #[test]

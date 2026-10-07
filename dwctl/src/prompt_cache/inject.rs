@@ -95,7 +95,7 @@ fn remove_cache_control(body: &mut Value, telemetry: &TelemetryPolicy) -> (bool,
     // Automatic-caching marker: a top-level `cache_control` field (Anthropic-style). Strip it so it
     // never leaks upstream — OpenAI-compatible backends reject unknown top-level fields — and count a
     // non-null one as adoption, exactly like a block/tool marker.
-    if let Some(removed) = obj.remove("cache_control") {
+    if let Some(removed) = obj.shift_remove("cache_control") {
         rewrote = true;
         had_marker |= !removed.is_null();
     }
@@ -154,7 +154,7 @@ fn remove_cache_control(body: &mut Value, telemetry: &TelemetryPolicy) -> (bool,
 /// whether the body changed and whether the marker was non-null.
 fn strip_block_marker(value: &mut Value, rewrote: &mut bool, had_marker: &mut bool) {
     if let Some(obj) = value.as_object_mut()
-        && let Some(removed) = obj.remove("cache_control")
+        && let Some(removed) = obj.shift_remove("cache_control")
     {
         *rewrote = true;
         *had_marker |= !removed.is_null();
@@ -219,7 +219,7 @@ const PROVIDER_CACHE_FIELDS: [&str; 6] = [
 pub(crate) fn scrub_provider_cache_fields(usage: &mut serde_json::Map<String, Value>) -> bool {
     let mut changed = false;
     for key in PROVIDER_CACHE_FIELDS {
-        changed |= usage.remove(key).is_some();
+        changed |= usage.shift_remove(key).is_some();
     }
     // Any present value that isn't already the canonical integer 0 gets overwritten — including
     // non-numeric shapes (string/float), for which `as_u64()` is `None` and the `!= Some(0)`
@@ -749,6 +749,17 @@ mod tests {
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert!(!out.windows(13).any(|w| w == b"cache_control"));
         assert_eq!(v["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn strip_keeps_key_order() {
+        let body = r#"{"tools":[{"type":"function","cache_control":{"type":"ephemeral"},"function":{"name":"f","parameters":{"type":"object","properties":{"z":{"type":"string"},"a":{"type":"string"}}}}}],"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+        let (out, had_markers) = strip_cache_control(body.as_bytes(), &TelemetryPolicy::default());
+        assert!(had_markers);
+        assert_eq!(
+            String::from_utf8(out.expect("changed").to_vec()).unwrap(),
+            r#"{"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{"z":{"type":"string"},"a":{"type":"string"}}}}}],"stream":true,"messages":[{"role":"user","content":"hi"}],"stream_options":{"include_usage":true}}"#
+        );
     }
 
     #[test]

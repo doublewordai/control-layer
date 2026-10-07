@@ -65,6 +65,7 @@ pub mod sse;
 pub mod strict;
 pub mod target;
 pub mod telemetry;
+pub mod unsupported_params;
 
 use client::{HttpClient, HyperClient};
 pub use handlers::{AuthenticatedApiKeyId, HeaderExtractor, ServedBy};
@@ -167,6 +168,9 @@ pub struct AppState<T: HttpClient> {
     /// failover timeout — e.g. a marker a batch dispatcher stamps on traffic
     /// that tolerates latency and runs its own retry policy.
     pub first_token_timeout_exempt_header: Option<String>,
+    /// Parameters from [`unsupported_params::params`] that get a 400 instead of
+    /// being forwarded. Every other flagged parameter is only logged and counted.
+    pub rejected_params: Vec<&'static str>,
     pub inflight_limiter: Arc<dyn inflight::InflightLimiter>,
     /// Enforces the per-model batch in-flight cap. Off, dispatched batch
     /// requests are never refused and the batch limiter is never consulted, so
@@ -206,6 +210,7 @@ impl<T: HttpClient> std::fmt::Debug for AppState<T> {
                 "first_token_timeout_exempt_header",
                 &self.first_token_timeout_exempt_header,
             )
+            .field("rejected_params", &self.rejected_params)
             .field("inflight_limiter", &self.inflight_limiter)
             .field("batch_inflight_enforce", &self.batch_inflight_enforce)
             .field("batch_inflight_limiter", &self.batch_inflight_limiter)
@@ -233,6 +238,7 @@ impl AppState<HyperClient> {
             sse_buffer_limit: sse::DEFAULT_SSE_BUFFER_LIMIT,
             first_token_timeout: None,
             first_token_timeout_exempt_header: None,
+            rejected_params: Vec::new(),
             inflight_limiter: Arc::new(inflight::LocalInflightLimiter::default()),
             batch_inflight_enforce: false,
             batch_inflight_limiter: Arc::new(inflight::LocalInflightLimiter::default()),
@@ -253,6 +259,7 @@ impl<T: HttpClient> AppState<T> {
             sse_buffer_limit: sse::DEFAULT_SSE_BUFFER_LIMIT,
             first_token_timeout: None,
             first_token_timeout_exempt_header: None,
+            rejected_params: Vec::new(),
             inflight_limiter: Arc::new(inflight::LocalInflightLimiter::default()),
             batch_inflight_enforce: false,
             batch_inflight_limiter: Arc::new(inflight::LocalInflightLimiter::default()),
@@ -283,6 +290,28 @@ impl<T: HttpClient> AppState<T> {
     pub fn with_first_token_timeout_exempt_header(mut self, header: impl Into<String>) -> Self {
         self.first_token_timeout_exempt_header = Some(header.into());
         self
+    }
+
+    /// Set the parameters that are rejected with a 400 instead of being
+    /// forwarded (builder pattern). Names outside
+    /// [`unsupported_params::params`] are an error, so a typo in configuration
+    /// can't silently disable a rejection.
+    pub fn with_rejected_params<I, S>(mut self, params: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut rejected = Vec::new();
+        for name in params {
+            let name = name.as_ref();
+            let param = unsupported_params::known_param(name)
+                .ok_or_else(|| format!("unknown parameter in the reject list: {name}"))?;
+            if !rejected.contains(&param) {
+                rejected.push(param);
+            }
+        }
+        self.rejected_params = rejected;
+        Ok(self)
     }
 
     pub fn with_inflight_limiter(mut self, limiter: Arc<dyn inflight::InflightLimiter>) -> Self {
@@ -2701,6 +2730,51 @@ mod tests {
         assert_eq!(forwarded_body["model"], "test-model");
         assert_eq!(forwarded_body["messages"][0]["content"], "Hello!");
         assert_eq!(forwarded_body["temperature"], 0.7);
+    }
+
+    #[tokio::test]
+    async fn test_rewritten_body_keeps_key_order() {
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "test-model".to_string(),
+            pool(
+                Target::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .onwards_model("upstream-model".to_string())
+                    .build(),
+            ),
+        );
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
+            strict_mode: false,
+            http_pool_config: None,
+        };
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"choices": []}"#);
+        let app_state = AppState::with_client(targets, mock_client.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let schema = r#"{"type":"object","properties":{"reasoning":{"type":"string"},"answer":{"type":"string"}},"required":["reasoning","answer"],"additionalProperties":false}"#;
+        let body = format!(
+            r#"{{"model":"test-model","messages":[{{"role":"user","content":"Hello!"}}],"response_format":{{"type":"json_schema","json_schema":{{"name":"answer","strict":true,"schema":{schema}}}}},"temperature":0.7}}"#
+        );
+        let response = server
+            .post("/v1/chat/completions")
+            .content_type("application/json")
+            .bytes(body.clone().into())
+            .await;
+        assert_eq!(response.status_code(), 200);
+
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1);
+        let forwarded = String::from_utf8(requests[0].body.clone()).unwrap();
+        assert_eq!(
+            forwarded,
+            body.replace(r#""model":"test-model""#, r#""model":"upstream-model""#)
+        );
     }
 
     #[tokio::test]

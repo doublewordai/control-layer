@@ -1237,6 +1237,12 @@ pub struct OnwardsConfig {
     /// breach without cutting it off; once breaches exceed the controller's
     /// target rate, later requests shift to the alternates. Set to 0 to disable.
     pub first_token_timeout_ms: u64,
+    /// Strict-mode chat parameters that get a 400 instead of being forwarded.
+    /// Every parameter onwards flags as not servable by every worker is logged
+    /// and counted (`onwards_unsupported_params_total`); only the ones listed
+    /// here are refused. Names must come from `onwards::unsupported_params::params()`.
+    /// Default: empty (log only).
+    pub rejected_params: Vec<String>,
 }
 
 impl Default for OnwardsConfig {
@@ -1248,6 +1254,7 @@ impl Default for OnwardsConfig {
                 "This is a shared best-effort endpoint, rate limited under load – retry with backoff. For production workloads that aren't latency-sensitive, try our async or batch tiers (https://docs.doubleword.ai/inference-api/batch-inference); for a dedicated real-time endpoint with SLAs, higher rate limits, and volume pricing, contact support@doubleword.ai."
                     .to_string(),
             first_token_timeout_ms: 20_000,
+            rejected_params: Vec::new(),
         }
     }
 }
@@ -3549,6 +3556,16 @@ impl Config {
                 operation: format!("Config validation: prompt-cache retention is invalid: {error}"),
             });
         }
+        if let Some(name) = self
+            .onwards
+            .rejected_params
+            .iter()
+            .find(|name| onwards::unsupported_params::known_param(name).is_none())
+        {
+            return Err(Error::Internal {
+                operation: format!("Config validation: onwards.rejected_params names an unknown parameter: {name}"),
+            });
+        }
         if self.background_services.batch_daemon.retention.expire_files
             || self.background_services.batch_daemon.retention.terminal_batch_seconds.is_some()
         {
@@ -4112,6 +4129,18 @@ mod tests {
             .insert("unknown".to_string(), 60);
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("unsupported service tier"));
+    }
+
+    #[test]
+    fn rejected_params_must_be_known() {
+        let mut config = Config::default();
+        config.secret_key = Some("test-secret-key".to_string());
+        config.onwards.rejected_params = vec!["logprobs".to_string()];
+        config.validate().unwrap();
+
+        config.onwards.rejected_params.push("top_k".to_string());
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("onwards.rejected_params names an unknown parameter: top_k"));
     }
 
     #[test]

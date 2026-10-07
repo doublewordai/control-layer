@@ -147,6 +147,20 @@ All supported endpoints include:
 
 Requests to unsupported endpoints will return `404 Not Found` when strict mode is enabled.
 
+## Parameters not every backend supports
+
+Some chat parameters are engine extensions or options that not every backend behind a model can honour, for example `n` greater than 1, `logprobs`, `guided_json` or `min_tokens`. The full list, with the values that count as absent (such as `n: 1`, `logprobs: false` or `top_logprobs: 0`), is the catalog in `onwards::unsupported_params`. `chat_template_kwargs` isn't in it: strict mode refuses that field outright and points to `reasoning_effort` instead.
+
+Strict mode checks every Chat Completions request against that list after schema validation and before reasoning validation:
+
+- Each matching parameter increments `onwards_unsupported_params_total{param, model, traffic, action}`. `action` is `logged` or `rejected`. A `logged` request can still be refused by a later check, such as reasoning validation.
+- The request is logged at `info` with the parameter names, model, account and API key ID. Values and request bodies are never logged.
+- If any parameter is in the gateway's reject list, the whole request gets a `400` with code `unsupported_parameter` naming the rejected parameters, for example ``Unsupported parameter(s): `logprobs` ``, and is not forwarded. A request whose flagged parameters are all outside the reject list is forwarded unchanged.
+
+The check covers Chat Completions requests, including Responses and Messages requests that an edge such as dwctl has translated into Chat Completions before they reach onwards. Native `/v1/responses` requests are forwarded to an upstream that speaks the Responses API itself and aren't checked.
+
+The reject list is empty by default, so the check only observes. Set it with `AppState::with_rejected_params`; in dwctl, use `onwards.rejected_params`. A name outside the catalog is a configuration error.
+
 ## Comparison with response sanitization
 
 | Feature | Response Sanitization | Strict Mode |

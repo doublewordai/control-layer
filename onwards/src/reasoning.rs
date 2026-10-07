@@ -736,14 +736,14 @@ fn remove_json_pointer_segments(current: &mut Value, segments: &[String]) -> boo
         return false;
     };
     if segments.len() == 1 {
-        return object.remove(&segments[0]).is_some() && object.is_empty();
+        return object.shift_remove(&segments[0]).is_some() && object.is_empty();
     }
 
     let child_is_empty = object
         .get_mut(&segments[0])
         .is_some_and(|child| remove_json_pointer_segments(child, &segments[1..]));
     if child_is_empty {
-        object.remove(&segments[0]);
+        object.shift_remove(&segments[0]);
         return object.is_empty();
     }
     false

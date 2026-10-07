@@ -3,6 +3,10 @@
   "title": "ModelDocument",
   "type": "object",
   "properties": {
+    "model": {
+      "description": "Canonical Hugging Face model identifier.",
+      "type": "string"
+    },
     "backend": {
       "description": "Reserved for the inference deployment automation. Ignored by dwctl.",
       "default": null
@@ -18,10 +22,6 @@
         }
       ],
       "default": null
-    },
-    "model": {
-      "description": "Canonical Hugging Face model identifier.",
-      "type": "string"
     }
   },
   "additionalProperties": false,
@@ -29,201 +29,38 @@
     "model"
   ],
   "$defs": {
-    "AffinityConfig": {
-      "description": "Priority-only conversation affinity: the preferred provider keeps about\n`target_conversations` of the active conversations, decided per\nconversation rather than per request. Missing/null keeps per-request\nselection.",
+    "ClayModel": {
       "type": "object",
       "properties": {
-        "active_window_ms": {
-          "description": "A conversation stays active this long after its last request.",
-          "type": "integer",
-          "format": "uint64",
-          "default": 600000,
-          "minimum": 0
+        "alias": {
+          "type": "string"
         },
-        "enabled": {
-          "type": "boolean",
-          "default": true
-        },
-        "margin": {
-          "description": "Drift allowed around the target before the share moves; defaults to a\ntenth of the target.",
+        "model_name": {
+          "description": "Defaults to the document's top-level `model` value.",
           "type": [
-            "integer",
+            "string",
             "null"
-          ],
-          "format": "uint",
-          "default": null,
-          "minimum": 0
-        },
-        "max_tracked": {
-          "description": "Upper bound on conversations tracked per gateway process.",
-          "type": "integer",
-          "format": "uint",
-          "default": 100000,
-          "minimum": 0
-        },
-        "target_conversations": {
-          "description": "Conversations to keep on the preferred provider. Size it to the\npreferred provider's concurrency.",
-          "type": "integer",
-          "format": "uint",
-          "default": 0,
-          "minimum": 0
-        },
-        "update_interval_ms": {
-          "description": "The share is recomputed at multiples of this much wall-clock time.",
-          "type": "integer",
-          "format": "uint64",
-          "default": 60000,
-          "minimum": 0
-        }
-      },
-      "additionalProperties": false
-    },
-    "Backoff": {
-      "type": "object",
-      "properties": {
-        "factor": {
-          "type": "number",
-          "format": "double"
-        },
-        "initial_ms": {
-          "type": "integer",
-          "format": "int32"
-        },
-        "jitter": {
-          "$ref": "#/$defs/Jitter",
-          "default": "full"
-        },
-        "max_ms": {
-          "type": "integer",
-          "format": "int32"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "initial_ms",
-        "max_ms",
-        "factor"
-      ]
-    },
-    "CachePrices": {
-      "description": "Scoped cache tariffs change multipliers only. The model owns enablement and\nthe minimum prefix length used by the classifier.",
-      "type": "object",
-      "properties": {
-        "read_multiplier": {
-          "type": "string"
-        },
-        "write_multiplier_1h": {
-          "type": "string"
-        },
-        "write_multiplier_24h": {
-          "type": "string"
-        },
-        "write_multiplier_5m": {
-          "type": "string"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "write_multiplier_5m",
-        "write_multiplier_1h",
-        "write_multiplier_24h",
-        "read_multiplier"
-      ]
-    },
-    "CacheTariff": {
-      "type": "object",
-      "properties": {
-        "min_prefix_tokens": {
-          "type": "integer",
-          "format": "int32"
-        },
-        "read_multiplier": {
-          "type": "string",
-          "default": "0.1"
-        },
-        "write_multiplier_1h": {
-          "type": "string"
-        },
-        "write_multiplier_24h": {
-          "type": "string"
-        },
-        "write_multiplier_5m": {
-          "type": "string"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "write_multiplier_5m",
-        "write_multiplier_1h",
-        "write_multiplier_24h",
-        "min_prefix_tokens"
-      ]
-    },
-    "ClassRoute": {
-      "description": "Complete catalog declaration for a stable class of the existing public model.",
-      "type": "object",
-      "properties": {
-        "aliases": {
-          "description": "Optional exact ingress spellings, never additional discovery entries.",
-          "type": "array",
-          "default": [],
-          "items": {
-            "type": "string"
-          }
-        },
-        "cache_tariff": {
-          "description": "Omit to inherit the model's all-class multipliers; does not enable caching.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/CachePrices"
-            },
-            {
-              "type": "null"
-            }
           ],
           "default": null
         },
         "display_name": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         },
-        "endpoint": {
-          "type": "string"
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         },
-        "tariffs": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Tariff"
-          }
-        },
-        "upstream_model_name": {
-          "type": "string"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "display_name",
-        "endpoint",
-        "upstream_model_name",
-        "tariffs"
-      ]
-    },
-    "ClayModel": {
-      "type": "object",
-      "properties": {
-        "access_groups": {
-          "type": "array",
-          "default": [],
-          "items": {
-            "type": "string"
-          }
-        },
-        "alias": {
-          "type": "string"
-        },
-        "cache_tariff": {
+        "type": {
           "anyOf": [
             {
-              "$ref": "#/$defs/CacheTariff"
+              "$ref": "#/$defs/ModelKind"
             },
             {
               "type": "null"
@@ -236,59 +73,40 @@
             "array",
             "null"
           ],
-          "default": null,
           "items": {
             "type": "string"
-          }
-        },
-        "class_routes": {
-          "description": "Explicit class destinations and prices, staged independently of legacy routing.\nDeclaring these does not activate routes or advertise additional model names.",
-          "type": "object",
-          "additionalProperties": {
-            "$ref": "#/$defs/ClassRoute"
           },
-          "default": {},
-          "propertyNames": {
-            "pattern": "^[a-z][a-z0-9_-]*$"
+          "default": null
+        },
+        "settings": {
+          "$ref": "#/$defs/ModelSettings",
+          "default": {
+            "requests_per_second": null,
+            "burst_size": null,
+            "capacity": null,
+            "realtime_inflight_limit": null,
+            "batch_capacity": null,
+            "throughput": null,
+            "sanitize_responses": false,
+            "trusted": false,
+            "allowed_batch_completion_windows": null,
+            "metadata": {},
+            "reasoning_translation_overrides": null
           }
         },
         "deployments": {
           "type": "array",
-          "default": [],
           "items": {
             "$ref": "#/$defs/PhysicalDeployment"
-          }
-        },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "display_name": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "model_name": {
-          "description": "Defaults to the document's top-level `model` value.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
+          },
+          "default": []
         },
         "routing": {
           "$ref": "#/$defs/Routing",
           "default": {
+            "strategy": "weighted_random",
             "fallback": {
-              "backoff": null,
               "enabled": true,
-              "max_attempts": null,
-              "max_total_backoff_ms": null,
               "on_rate_limit": true,
               "on_status": [
                 429,
@@ -298,11 +116,45 @@
                 503,
                 504
               ],
-              "with_replacement": false
+              "with_replacement": false,
+              "max_attempts": null,
+              "backoff": null,
+              "max_total_backoff_ms": null
             },
-            "pools": {},
-            "strategy": "weighted_random"
+            "pools": {}
           }
+        },
+        "tariffs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Tariff"
+          },
+          "default": []
+        },
+        "cache_tariff": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CacheTariff"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "access_groups": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "traffic_rules": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TrafficRule"
+          },
+          "default": []
         },
         "serving_classes": {
           "description": "The serving classes this model offers, each a preset of targets the\nserving stack's router maps onto a pool. Declaring `interactive` or\n`throughput` is what makes an organisation that holds that class get\nit on this model; declare them once the serving side has pools for the\nmodel. A `standard` preset is optional and pins what unclassed traffic\nasks for; without one, standard sends no targets. Empty = standard only.",
@@ -321,174 +173,21 @@
           "additionalProperties": false,
           "default": {}
         },
-        "settings": {
-          "$ref": "#/$defs/ModelSettings",
-          "default": {
-            "allowed_batch_completion_windows": null,
-            "batch_capacity": null,
-            "burst_size": null,
-            "capacity": null,
-            "metadata": {},
-            "realtime_inflight_limit": null,
-            "reasoning_translation_overrides": null,
-            "requests_per_second": null,
-            "sanitize_responses": false,
-            "throughput": null,
-            "trusted": false
+        "class_routes": {
+          "description": "Explicit class destinations and prices, staged independently of legacy routing.\nDeclaring these does not activate routes or advertise additional model names.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ClassRoute"
+          },
+          "default": {},
+          "propertyNames": {
+            "pattern": "^[a-z][a-z0-9_-]*$"
           }
-        },
-        "tariffs": {
-          "type": "array",
-          "default": [],
-          "items": {
-            "$ref": "#/$defs/Tariff"
-          }
-        },
-        "traffic_rules": {
-          "type": "array",
-          "default": [],
-          "items": {
-            "$ref": "#/$defs/TrafficRule"
-          }
-        },
-        "type": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ModelKind"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
         }
       },
       "additionalProperties": false,
       "required": [
         "alias"
-      ]
-    },
-    "Component": {
-      "type": "object",
-      "properties": {
-        "deployment": {
-          "type": "string"
-        },
-        "enabled": {
-          "description": "Applied when the component is created. An existing component keeps its\nstored value.",
-          "type": "boolean",
-          "default": true
-        },
-        "render_kwargs": {
-          "default": null
-        },
-        "sort_order": {
-          "type": "integer",
-          "format": "int32",
-          "default": 0
-        },
-        "strip_leading_bos": {
-          "type": "boolean",
-          "default": false
-        },
-        "weight": {
-          "type": "integer",
-          "format": "int32",
-          "default": 1
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "deployment"
-      ]
-    },
-    "Fallback": {
-      "type": "object",
-      "properties": {
-        "affinity": {
-          "description": "Conversation affinity (priority strategy only). Omit to keep the value\nalready stored for the model. `target_conversations` must match what\nthe preferred member can serve concurrently.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/AffinityConfig"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "backoff": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Backoff"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "enabled": {
-          "type": "boolean",
-          "default": true
-        },
-        "max_attempts": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "int32",
-          "default": null
-        },
-        "max_total_backoff_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "int32",
-          "default": null
-        },
-        "on_rate_limit": {
-          "type": "boolean",
-          "default": true
-        },
-        "on_status": {
-          "type": "array",
-          "default": [
-            429,
-            499,
-            500,
-            502,
-            503,
-            504
-          ],
-          "items": {
-            "type": "integer",
-            "format": "int32"
-          }
-        },
-        "realtime_on_status": {
-          "description": "Extra statuses that fail over realtime traffic only. Omit to keep the\nvalue already stored for the model.",
-          "type": [
-            "array",
-            "null"
-          ],
-          "items": {
-            "type": "integer",
-            "format": "int32"
-          }
-        },
-        "with_replacement": {
-          "type": "boolean",
-          "default": false
-        }
-      },
-      "additionalProperties": false
-    },
-    "Jitter": {
-      "type": "string",
-      "enum": [
-        "none",
-        "full"
       ]
     },
     "ModelKind": {
@@ -502,24 +201,14 @@
     "ModelSettings": {
       "type": "object",
       "properties": {
-        "allowed_batch_completion_windows": {
+        "requests_per_second": {
           "type": [
-            "array",
+            "number",
             "null"
           ],
+          "format": "float",
           "default": null,
-          "items": {
-            "type": "string"
-          }
-        },
-        "batch_capacity": {
-          "description": "Dual-purpose batch concurrency. It seeds fusillade's **starting**\nper-daemon concurrency for the model (adaptive concurrency may grow past\nit), and, once `limits.batch_inflight.enforce` is on, it is also the\n**global** onwards cap on batch requests in flight on the alias. Raise it\nto the intended global ceiling before enabling enforcement. The cap is\nshared by file batches, flex and background requests.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "int32",
-          "default": null
+          "deprecated": true
         },
         "burst_size": {
           "type": [
@@ -539,9 +228,6 @@
           "default": null,
           "deprecated": true
         },
-        "metadata": {
-          "default": {}
-        },
         "realtime_inflight_limit": {
           "type": [
             "integer",
@@ -550,21 +236,14 @@
           "format": "int32",
           "default": null
         },
-        "reasoning_translation_overrides": {
-          "default": null
-        },
-        "requests_per_second": {
+        "batch_capacity": {
+          "description": "Dual-purpose batch concurrency. It seeds fusillade's **starting**\nper-daemon concurrency for the model (adaptive concurrency may grow past\nit), and, once `limits.batch_inflight.enforce` is on, it is also the\n**global** onwards cap on batch requests in flight on the alias. Raise it\nto the intended global ceiling before enabling enforcement. The cap is\nshared by file batches, flex and background requests.",
           "type": [
-            "number",
+            "integer",
             "null"
           ],
-          "format": "float",
-          "default": null,
-          "deprecated": true
-        },
-        "sanitize_responses": {
-          "type": "boolean",
-          "default": false
+          "format": "int32",
+          "default": null
         },
         "throughput": {
           "type": [
@@ -574,9 +253,29 @@
           "format": "float",
           "default": null
         },
+        "sanitize_responses": {
+          "type": "boolean",
+          "default": false
+        },
         "trusted": {
           "type": "boolean",
           "default": false
+        },
+        "allowed_batch_completion_windows": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "default": null
+        },
+        "metadata": {
+          "default": {}
+        },
+        "reasoning_translation_overrides": {
+          "default": null
         }
       },
       "additionalProperties": false
@@ -587,22 +286,11 @@
         "alias": {
           "type": "string"
         },
-        "capabilities": {
-          "type": [
-            "array",
-            "null"
-          ],
-          "default": null,
-          "items": {
-            "type": "string"
-          }
+        "model_name": {
+          "type": "string"
         },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
+        "endpoint": {
+          "type": "string"
         },
         "display_name": {
           "type": [
@@ -611,16 +299,17 @@
           ],
           "default": null
         },
-        "endpoint": {
-          "type": "string"
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         },
-        "model_name": {
-          "type": "string"
-        },
-        "provider_pricing": {
+        "type": {
           "anyOf": [
             {
-              "$ref": "#/$defs/ProviderPricing"
+              "$ref": "#/$defs/ModelKind"
             },
             {
               "type": "null"
@@ -628,26 +317,36 @@
           ],
           "default": null
         },
+        "capabilities": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "default": null
+        },
         "settings": {
           "$ref": "#/$defs/ModelSettings",
           "default": {
-            "allowed_batch_completion_windows": null,
-            "batch_capacity": null,
+            "requests_per_second": null,
             "burst_size": null,
             "capacity": null,
-            "metadata": {},
             "realtime_inflight_limit": null,
-            "reasoning_translation_overrides": null,
-            "requests_per_second": null,
-            "sanitize_responses": false,
+            "batch_capacity": null,
             "throughput": null,
-            "trusted": false
+            "sanitize_responses": false,
+            "trusted": false,
+            "allowed_batch_completion_windows": null,
+            "metadata": {},
+            "reasoning_translation_overrides": null
           }
         },
-        "type": {
+        "provider_pricing": {
           "anyOf": [
             {
-              "$ref": "#/$defs/ModelKind"
+              "$ref": "#/$defs/ProviderPricing"
             },
             {
               "type": "null"
@@ -675,16 +374,16 @@
               ],
               "default": null
             },
-            "mode": {
-              "type": "string",
-              "const": "per_token"
-            },
             "output_per_million_tokens": {
               "type": [
                 "string",
                 "null"
               ],
               "default": null
+            },
+            "mode": {
+              "type": "string",
+              "const": "per_token"
             }
           },
           "additionalProperties": false,
@@ -695,15 +394,15 @@
         {
           "type": "object",
           "properties": {
+            "rate": {
+              "type": "string"
+            },
             "input_token_cost_ratio": {
               "type": "string"
             },
             "mode": {
               "type": "string",
               "const": "hourly"
-            },
-            "rate": {
-              "type": "string"
             }
           },
           "additionalProperties": false,
@@ -715,26 +414,17 @@
         }
       ]
     },
-    "Purpose": {
-      "type": "string",
-      "enum": [
-        "platform",
-        "realtime",
-        "batch",
-        "playground",
-        "continuation"
-      ]
-    },
     "Routing": {
       "type": "object",
       "properties": {
+        "strategy": {
+          "$ref": "#/$defs/RoutingStrategy",
+          "default": "weighted_random"
+        },
         "fallback": {
           "$ref": "#/$defs/Fallback",
           "default": {
-            "backoff": null,
             "enabled": true,
-            "max_attempts": null,
-            "max_total_backoff_ms": null,
             "on_rate_limit": true,
             "on_status": [
               429,
@@ -744,7 +434,10 @@
               503,
               504
             ],
-            "with_replacement": false
+            "with_replacement": false,
+            "max_attempts": null,
+            "backoff": null,
+            "max_total_backoff_ms": null
           }
         },
         "pools": {
@@ -757,10 +450,6 @@
             }
           },
           "default": {}
-        },
-        "strategy": {
-          "$ref": "#/$defs/RoutingStrategy",
-          "default": "weighted_random"
         }
       },
       "additionalProperties": false
@@ -772,38 +461,214 @@
         "priority"
       ]
     },
-    "ServingPreset": {
-      "description": "The objective targets a class maps to on a model, or an organisation's\nexplicit targets on one model. Milliseconds; `priority` is the serving\nstack's scheduling priority (higher wins, 0 = today's realtime value).",
+    "Fallback": {
       "type": "object",
       "properties": {
-        "itl_ms": {
-          "description": "Inter-token-latency target, milliseconds.",
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 1
+        "enabled": {
+          "type": "boolean",
+          "default": true
         },
-        "priority": {
-          "description": "Scheduling priority; omit for 0.",
-          "type": "integer",
+        "on_rate_limit": {
+          "type": "boolean",
+          "default": true
+        },
+        "on_status": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "default": [
+            429,
+            499,
+            500,
+            502,
+            503,
+            504
+          ]
+        },
+        "realtime_on_status": {
+          "description": "Extra statuses that fail over realtime traffic only. Omit to keep the\nvalue already stored for the model.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "integer",
+            "format": "int32"
+          }
+        },
+        "affinity": {
+          "description": "Conversation affinity (priority strategy only). Omit to keep the value\nalready stored for the model. `target_conversations` must match what\nthe preferred member can serve concurrently.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AffinityConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "with_replacement": {
+          "type": "boolean",
+          "default": false
+        },
+        "max_attempts": {
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "int32",
+          "default": null
+        },
+        "backoff": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Backoff"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "max_total_backoff_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32",
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "AffinityConfig": {
+      "description": "Priority-only conversation affinity: the preferred provider keeps about\n`target_conversations` of the active conversations, decided per\nconversation rather than per request. Missing/null keeps per-request\nselection.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "target_conversations": {
+          "description": "Conversations to keep on the preferred provider. Size it to the\npreferred provider's concurrency.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
           "default": 0
         },
-        "ttft_ms": {
-          "description": "Time-to-first-token target, milliseconds.",
+        "margin": {
+          "description": "Drift allowed around the target before the share moves; defaults to a\ntenth of the target.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": null
+        },
+        "active_window_ms": {
+          "description": "A conversation stays active this long after its last request.",
           "type": "integer",
-          "format": "uint32",
-          "minimum": 1
+          "format": "uint64",
+          "minimum": 0,
+          "default": 600000
+        },
+        "update_interval_ms": {
+          "description": "The share is recomputed at multiples of this much wall-clock time.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 60000
+        },
+        "max_tracked": {
+          "description": "Upper bound on conversations tracked per gateway process.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 100000
+        }
+      },
+      "additionalProperties": false
+    },
+    "Backoff": {
+      "type": "object",
+      "properties": {
+        "initial_ms": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "max_ms": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "factor": {
+          "type": "number",
+          "format": "double"
+        },
+        "jitter": {
+          "$ref": "#/$defs/Jitter",
+          "default": "full"
         }
       },
       "additionalProperties": false,
       "required": [
-        "ttft_ms",
-        "itl_ms"
+        "initial_ms",
+        "max_ms",
+        "factor"
+      ]
+    },
+    "Jitter": {
+      "type": "string",
+      "enum": [
+        "none",
+        "full"
+      ]
+    },
+    "Component": {
+      "type": "object",
+      "properties": {
+        "deployment": {
+          "type": "string"
+        },
+        "enabled": {
+          "description": "Applied when the component is created. An existing component keeps its\nstored value.",
+          "type": "boolean",
+          "default": true
+        },
+        "weight": {
+          "type": "integer",
+          "format": "int32",
+          "default": 1
+        },
+        "sort_order": {
+          "type": "integer",
+          "format": "int32",
+          "default": 0
+        },
+        "strip_leading_bos": {
+          "type": "boolean",
+          "default": false
+        },
+        "render_kwargs": {
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "deployment"
       ]
     },
     "Tariff": {
       "type": "object",
       "properties": {
+        "name": {
+          "type": "string"
+        },
+        "purpose": {
+          "$ref": "#/$defs/TariffPurpose"
+        },
         "completion_window": {
           "type": [
             "string",
@@ -814,14 +679,8 @@
         "input_per_million_tokens": {
           "type": "string"
         },
-        "name": {
-          "type": "string"
-        },
         "output_per_million_tokens": {
           "type": "string"
-        },
-        "purpose": {
-          "$ref": "#/$defs/TariffPurpose"
         }
       },
       "additionalProperties": false,
@@ -841,17 +700,46 @@
         "playground"
       ]
     },
+    "CacheTariff": {
+      "type": "object",
+      "properties": {
+        "write_multiplier_5m": {
+          "type": "string"
+        },
+        "write_multiplier_1h": {
+          "type": "string"
+        },
+        "write_multiplier_24h": {
+          "type": "string"
+        },
+        "read_multiplier": {
+          "type": "string",
+          "default": "0.1"
+        },
+        "min_prefix_tokens": {
+          "type": "integer",
+          "format": "int32"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "write_multiplier_5m",
+        "write_multiplier_1h",
+        "write_multiplier_24h",
+        "min_prefix_tokens"
+      ]
+    },
     "TrafficRule": {
       "oneOf": [
         {
           "type": "object",
           "properties": {
+            "purpose": {
+              "$ref": "#/$defs/Purpose"
+            },
             "action": {
               "type": "string",
               "const": "deny"
-            },
-            "purpose": {
-              "$ref": "#/$defs/Purpose"
             }
           },
           "additionalProperties": false,
@@ -863,15 +751,15 @@
         {
           "type": "object",
           "properties": {
-            "action": {
-              "type": "string",
-              "const": "redirect"
-            },
             "purpose": {
               "$ref": "#/$defs/Purpose"
             },
             "target": {
               "type": "string"
+            },
+            "action": {
+              "type": "string",
+              "const": "redirect"
             }
           },
           "additionalProperties": false,
@@ -881,6 +769,118 @@
             "target"
           ]
         }
+      ]
+    },
+    "Purpose": {
+      "type": "string",
+      "enum": [
+        "platform",
+        "realtime",
+        "batch",
+        "playground",
+        "continuation"
+      ]
+    },
+    "ServingPreset": {
+      "description": "The objective targets a class maps to on a model, or an organisation's\nexplicit targets on one model. Milliseconds; `priority` is the serving\nstack's scheduling priority (higher wins, 0 = today's realtime value).",
+      "type": "object",
+      "properties": {
+        "ttft_ms": {
+          "description": "Time-to-first-token target, milliseconds.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "itl_ms": {
+          "description": "Inter-token-latency target, milliseconds.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "priority": {
+          "description": "Scheduling priority; omit for 0.",
+          "type": "integer",
+          "format": "int32",
+          "default": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "ttft_ms",
+        "itl_ms"
+      ]
+    },
+    "ClassRoute": {
+      "description": "Complete catalog declaration for a stable class of the existing public model.",
+      "type": "object",
+      "properties": {
+        "display_name": {
+          "type": "string"
+        },
+        "endpoint": {
+          "type": "string"
+        },
+        "upstream_model_name": {
+          "type": "string"
+        },
+        "aliases": {
+          "description": "Optional exact ingress spellings, never additional discovery entries.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "tariffs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Tariff"
+          }
+        },
+        "cache_tariff": {
+          "description": "Omit to inherit the model's all-class multipliers; does not enable caching.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CachePrices"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "display_name",
+        "endpoint",
+        "upstream_model_name",
+        "tariffs"
+      ]
+    },
+    "CachePrices": {
+      "description": "Scoped cache tariffs change multipliers only. The model owns enablement and\nthe minimum prefix length used by the classifier.",
+      "type": "object",
+      "properties": {
+        "write_multiplier_5m": {
+          "type": "string"
+        },
+        "write_multiplier_1h": {
+          "type": "string"
+        },
+        "write_multiplier_24h": {
+          "type": "string"
+        },
+        "read_multiplier": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "write_multiplier_5m",
+        "write_multiplier_1h",
+        "write_multiplier_24h",
+        "read_multiplier"
       ]
     }
   }

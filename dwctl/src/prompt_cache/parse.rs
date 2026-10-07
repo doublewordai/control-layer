@@ -209,7 +209,7 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy, telemetry: &Tele
             // than silently caching an empty tool and undercounting its tokens.
             let text = serde_json::to_string(&stripped)?;
 
-            let canonical = canonical_block_bytes(TOOL_DEFINITION_ROLE, &stripped);
+            let canonical = canonical_block_bytes(TOOL_DEFINITION_ROLE, stripped);
             hasher.update(&canonical);
             cumulative_hashes.push(hasher.clone().finalize().to_vec());
 
@@ -258,7 +258,7 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy, telemetry: &Tele
             match msg.get("content") {
                 // String content: one implicit text block, no marker possible.
                 Some(serde_json::Value::String(s)) => {
-                    let canonical = canonical_block_bytes(&role, &serde_json::json!({ "type": "text", "text": s }));
+                    let canonical = canonical_block_bytes(&role, serde_json::json!({ "type": "text", "text": s }));
                     hasher.update(&canonical);
                     cumulative_hashes.push(hasher.clone().finalize().to_vec());
                     blocks.push(Block {
@@ -295,7 +295,7 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy, telemetry: &Tele
                         let stripped = strip_cache_control(block);
                         let text = stripped.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
 
-                        let canonical = canonical_block_bytes(&role, &stripped);
+                        let canonical = canonical_block_bytes(&role, stripped);
                         hasher.update(&canonical);
                         cumulative_hashes.push(hasher.clone().finalize().to_vec());
 
@@ -347,7 +347,7 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy, telemetry: &Tele
                     };
                     let stripped = strip_cache_control(call);
                     let text = serde_json::to_string(&stripped)?;
-                    let canonical = canonical_block_bytes(TOOL_CALL_ROLE, &stripped);
+                    let canonical = canonical_block_bytes(TOOL_CALL_ROLE, stripped);
                     hasher.update(&canonical);
                     cumulative_hashes.push(hasher.clone().finalize().to_vec());
 
@@ -614,7 +614,7 @@ pub fn validate_markers(body: &serde_json::Value, policy: &TierPolicy, telemetry
 fn strip_cache_control(block: &serde_json::Value) -> serde_json::Value {
     let mut b = block.clone();
     if let Some(obj) = b.as_object_mut() {
-        obj.remove("cache_control");
+        obj.shift_remove("cache_control");
     }
     b
 }
@@ -679,22 +679,22 @@ pub(crate) const TELEMETRY_ROLE: &str = "system";
 /// `role` + canonical JSON of the marker-stripped block. The role is included so the
 /// same text under different roles hashes differently.
 ///
-/// "Canonical" here relies on `serde_json` being built **without** the `preserve_order`
-/// feature: `Value::Object` is then a `BTreeMap`, so `to_vec` emits keys in sorted order
-/// and two blocks that differ only in key insertion order (common across SDKs/languages)
-/// hash identically. If a dependency ever enables `preserve_order` (→ `IndexMap`,
-/// insertion order), this would need explicit key-sorting to keep the cache-hit rate up.
+/// "Canonical" means every object's keys are sorted before serializing, so two blocks
+/// that differ only in key order (common across SDKs/languages) hash identically.
 ///
 /// An image block whose URL is a stored image token (`dw-img://{sha256}.{upload_id}`) is hashed
 /// without the upload ID: the upload ID only picks which stored copy of the bytes to sign,
 /// so two requests carrying the same image must share the prefix. Only the image URL field
 /// is rewritten — token-shaped strings anywhere else hash as written.
-fn canonical_block_bytes(role: &str, stripped_block: &serde_json::Value) -> Vec<u8> {
+fn canonical_block_bytes(role: &str, mut stripped_block: serde_json::Value) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(role.as_bytes());
     out.push(0x00);
-    let content_only = image_block_without_upload_id(stripped_block);
-    out.extend_from_slice(&serde_json::to_vec(content_only.as_ref().unwrap_or(stripped_block)).unwrap_or_default());
+    if let Some(content_only) = image_block_without_upload_id(&stripped_block) {
+        stripped_block = content_only;
+    }
+    stripped_block.sort_all_objects();
+    out.extend_from_slice(&serde_json::to_vec(&stripped_block).unwrap_or_default());
     out
 }
 
@@ -2018,5 +2018,26 @@ mod tests {
             candidates.contains(&turn1.cumulative_hashes[1]),
             "prior write reachable by walk-back"
         );
+    }
+
+    #[test]
+    fn canonical_block_bytes_sorts_object_keys() {
+        let block: serde_json::Value = serde_json::from_str(r#"{"type":"text","text":"hi","meta":{"z":1,"a":2}}"#).unwrap();
+        let mut expected = b"user\0".to_vec();
+        expected.extend_from_slice(br#"{"meta":{"a":2,"z":1},"text":"hi","type":"text"}"#);
+        assert_eq!(canonical_block_bytes("user", block), expected);
+    }
+
+    #[test]
+    fn key_order_does_not_change_hashes() {
+        let a = r#"{"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{"b":{"type":"string"},"a":{"type":"string"}}}}}],
+            "messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}]}"#;
+        let b = r#"{"messages":[{"content":[{"cache_control":{"type":"ephemeral"},"text":"hi","type":"text"}],"role":"user"}],
+            "tools":[{"function":{"parameters":{"properties":{"a":{"type":"string"},"b":{"type":"string"}},"type":"object"},"name":"f"},"type":"function"}]}"#;
+        let policy = TierPolicy::from_config(&["5m".to_string()], "5m");
+        let pa = parse_chat_completions(a.as_bytes(), &policy, &TelemetryPolicy::default()).unwrap();
+        let pb = parse_chat_completions(b.as_bytes(), &policy, &TelemetryPolicy::default()).unwrap();
+        assert_eq!(pa.cumulative_hashes.len(), 2);
+        assert_eq!(pa.cumulative_hashes, pb.cumulative_hashes);
     }
 }

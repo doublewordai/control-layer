@@ -5710,6 +5710,18 @@ mod tests {
     }
 
     #[test]
+    fn priority_injection_keeps_key_order() {
+        let mut body = r#"{"model":"m","response_format":{"type":"json_schema","json_schema":{"name":"n","schema":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"string"}}}}},"messages":[]}"#.to_string();
+
+        inject_dynamo_priority(&mut body, 7);
+
+        assert_eq!(
+            body,
+            r#"{"model":"m","response_format":{"type":"json_schema","json_schema":{"name":"n","schema":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"string"}}}}},"messages":[],"nvext":{"agent_hints":{"priority":7}}}"#
+        );
+    }
+
+    #[test]
     fn background_priority_is_reserved_and_preserves_nvext_siblings() {
         let mut body = serde_json::json!({
             "input": "hello",

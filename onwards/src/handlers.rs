@@ -27,7 +27,7 @@ use axum::{
 };
 use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
 use serde_json::map::Entry;
-use tracing::{Instrument, debug, error, instrument, trace, warn};
+use tracing::{Instrument, debug, error, info, instrument, trace, warn};
 use uuid::Uuid;
 
 /// Adapter to extract W3C trace context from an axum HeaderMap.
@@ -804,25 +804,91 @@ pub async fn target_message_handler<T: HttpClient>(
         resolution
     };
 
+    // Realtime traffic is everything the batch dispatcher did not stamp with
+    // the exempt header.
+    let is_realtime = !state
+        .first_token_timeout_exempt_header
+        .as_deref()
+        .is_some_and(|header| req.headers().contains_key(header));
+    // Labels failure outcomes, so a realtime outage can be told apart from a
+    // batch backlog retrying against the same model.
+    let traffic = if is_realtime { "realtime" } else { "dispatched" };
+
+    let body_json = if !body_bytes.is_empty()
+        && crate::reasoning::uses_reasoning_contract(&canonical_request_path)
+    {
+        Some(serde_json::from_slice::<serde_json::Value>(&body_bytes).map_err(|_| {
+            OnwardsErrorResponse::bad_request("Request body must be valid JSON.", None)
+        })?)
+    } else {
+        None
+    };
+
+    // Chat parameters not every worker can serve. Each is logged and counted;
+    // the configured ones are refused here.
+    let flagged_params = match body_json.as_ref() {
+        Some(body)
+            if state.targets.strict_mode
+                && canonical_request_path
+                    .trim_end_matches('/')
+                    .ends_with("/chat/completions") =>
+        {
+            crate::unsupported_params::chat_request_params(body)
+        }
+        _ => Vec::new(),
+    };
+    if !flagged_params.is_empty() {
+        let rejected: Vec<&'static str> = flagged_params
+            .iter()
+            .copied()
+            .filter(|param| state.rejected_params.contains(param))
+            .collect();
+        for param in &flagged_params {
+            let action = if rejected.contains(param) { "rejected" } else { "logged" };
+            metrics::counter!(
+                "onwards_unsupported_params_total",
+                "param" => *param,
+                "model" => model_name.to_string(),
+                "traffic" => traffic,
+                "action" => action,
+            )
+            .increment(1);
+        }
+        info!(
+            params = %flagged_params.join(","),
+            rejected = %rejected.join(","),
+            model = %model_name,
+            account = account_id.as_deref().unwrap_or(""),
+            api_key_id = ?authenticated_api_key_id,
+            traffic,
+            "Request uses parameters not every worker supports"
+        );
+        if let Some(first) = rejected.first() {
+            record_response_status(400);
+            return Err(OnwardsErrorResponse::invalid_request(
+                &crate::unsupported_params::rejection_message(&rejected),
+                Some(first),
+                "unsupported_parameter",
+            ));
+        }
+    }
+
     let canonical_reasoning = if let Some(reasoning) = req
         .extensions()
         .get::<crate::reasoning::CanonicalReasoningRequest>()
     {
         Some(reasoning.clone())
-    } else if !body_bytes.is_empty()
-        && crate::reasoning::uses_reasoning_contract(&canonical_request_path)
-    {
-        let body: serde_json::Value = serde_json::from_slice(&body_bytes).map_err(|_| {
-            OnwardsErrorResponse::bad_request("Request body must be valid JSON.", None)
-        })?;
+    } else if let Some(body) = body_json.as_ref() {
         crate::reasoning::parse_reasoning_request(
             &canonical_request_path,
-            &body,
+            body,
             state.targets.strict_mode,
         ).map_err(|error| OnwardsErrorResponse::reasoning(&error))?
     } else {
         None
     };
+    // Not needed past here; don't hold the parsed body while the upstream works.
+    drop(body_json);
 
     if let Some(reasoning) = canonical_reasoning.as_ref() {
         for provider in pool.providers() {
@@ -833,16 +899,6 @@ pub async fn target_message_handler<T: HttpClient>(
             }
         }
     }
-
-    // Realtime traffic is everything the batch dispatcher did not stamp with
-    // the exempt header.
-    let is_realtime = !state
-        .first_token_timeout_exempt_header
-        .as_deref()
-        .is_some_and(|header| req.headers().contains_key(header));
-    // Labels failure outcomes, so a realtime outage can be told apart from a
-    // batch backlog retrying against the same model.
-    let traffic = if is_realtime { "realtime" } else { "dispatched" };
 
     // Check if pool has no providers (e.g., composite model with no enabled components).
     // This runs after routing rules so that redirects get a chance to replace the pool.
@@ -1233,7 +1289,7 @@ pub async fn target_message_handler<T: HttpClient>(
             && let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&attempt_body)
             && let Some(obj) = parsed.as_object_mut()
         {
-            let removed = [obj.remove("priority"), obj.remove("nvext")];
+            let removed = [obj.shift_remove("priority"), obj.shift_remove("nvext")];
             if removed.iter().any(Option::is_some)
                 && let Ok(stripped) = serde_json::to_vec(&parsed)
             {
@@ -3200,6 +3256,7 @@ mod tests {
             sse_buffer_limit: crate::sse::DEFAULT_SSE_BUFFER_LIMIT,
             first_token_timeout: None,
             first_token_timeout_exempt_header: None,
+            rejected_params: Vec::new(),
             inflight_limiter: std::sync::Arc::new(crate::inflight::LocalInflightLimiter::default()),
             batch_inflight_enforce: false,
             batch_inflight_limiter: std::sync::Arc::new(

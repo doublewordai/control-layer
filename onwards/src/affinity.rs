@@ -184,10 +184,16 @@ fn split_opening<'a>(
     None
 }
 
+/// Message content as hashed: a string as-is, anything else as JSON with every
+/// object's keys sorted, so content that differs only in key order hashes the same.
 fn canonical(content: &Value) -> String {
     match content {
         Value::String(s) => s.clone(),
-        other => other.to_string(),
+        other => {
+            let mut sorted = other.clone();
+            sorted.sort_all_objects();
+            sorted.to_string()
+        }
     }
 }
 
@@ -561,5 +567,18 @@ mod tests {
             serde_json::from_value(json!({"target_conversations": 50})).unwrap();
         assert!(parsed.enabled && parsed.validate().is_ok());
         assert!(serde_json::from_value::<AffinityConfig>(json!({"target": 5})).is_err());
+    }
+
+    #[test]
+    fn structured_content_hashes_with_sorted_keys() {
+        let body = json!({
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+        });
+        let reordered = json!({
+            "messages": [{"role": "user", "content": [{"text": "hi", "type": "text"}]}]
+        });
+        let expected = hash(&[b"open", b"user", br#"[{"text":"hi","type":"text"}]"#]);
+        assert_eq!(conversation_key(None, &body), Some(expected));
+        assert_eq!(conversation_key(None, &reordered), Some(expected));
     }
 }
