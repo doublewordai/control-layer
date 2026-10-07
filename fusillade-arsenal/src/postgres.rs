@@ -10633,6 +10633,7 @@ mod tests {
         );
 
         // Create templates with varying body sizes
+        let unicode_body = r#"{"data":"hé🌍"}"#;
         let templates = vec![
             RequestTemplateInput {
                 custom_id: Some("small".to_string()),
@@ -10652,6 +10653,15 @@ mod tests {
                 model: "gpt-4".to_string(),
                 api_key: "key".to_string(),
             },
+            RequestTemplateInput {
+                custom_id: Some("unicode".to_string()),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/completions".to_string(),
+                body: unicode_body.to_string(),
+                model: "gpt-4".to_string(),
+                api_key: "key".to_string(),
+            },
         ];
 
         let file_id = manager
@@ -10664,7 +10674,7 @@ mod tests {
             r#"
             SELECT custom_id,
                    body_byte_size AS "body_byte_size!",
-                   LENGTH(body) as actual_length
+                   octet_length(body) as actual_bytes
             FROM request_templates_all
             WHERE file_id = $1
             ORDER BY line_number ASC
@@ -10675,20 +10685,22 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
 
         // Verify small body
         assert_eq!(rows[0].custom_id, Some("small".to_string()));
         assert_eq!(rows[0].body_byte_size, 7);
-        assert_eq!(rows[0].actual_length, Some(7));
+        assert_eq!(rows[0].actual_bytes, Some(7));
 
         // Verify large body
         assert_eq!(rows[1].custom_id, Some("large".to_string()));
-        assert_eq!(
-            rows[1].body_byte_size,
-            rows[1].actual_length.unwrap() as i64
-        );
+        assert_eq!(rows[1].body_byte_size, rows[1].actual_bytes.unwrap() as i64);
         assert!(rows[1].body_byte_size > 5000);
+
+        // Multibyte characters must count as their UTF-8 byte length.
+        assert_eq!(rows[2].custom_id, Some("unicode".to_string()));
+        assert_eq!(rows[2].body_byte_size, unicode_body.len() as i64);
+        assert_eq!(rows[2].body_byte_size, rows[2].actual_bytes.unwrap() as i64);
     }
 
     #[sqlx::test]
