@@ -1121,11 +1121,19 @@ fn effective_batch_inflight_limit(batch_capacity: Option<i32>, default_batch_inf
     match batch_capacity {
         Some(capacity) if capacity > 0 => Some(capacity as u32),
         Some(capacity) => {
-            warn!(
-                alias = %alias,
-                batch_capacity = capacity,
-                "Invalid non-positive batch_capacity on a virtual model; using the configured default batch in-flight cap"
-            );
+            match default_batch_inflight_capacity {
+                Some(default) => warn!(
+                    alias = %alias,
+                    batch_capacity = capacity,
+                    default_capacity = default,
+                    "Invalid non-positive batch_capacity on a virtual model; capping batch at the default instead"
+                ),
+                None => warn!(
+                    alias = %alias,
+                    batch_capacity = capacity,
+                    "Invalid non-positive batch_capacity on a virtual model and no default cap is configured; batch is uncapped"
+                ),
+            }
             default_batch_inflight_capacity
         }
         None => default_batch_inflight_capacity,

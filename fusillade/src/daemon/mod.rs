@@ -3881,7 +3881,18 @@ mod tests {
             },
         ] {
             assert!(is_downstream_overload(&reason), "{reason:?}");
+            assert!(
+                reason.is_batch_capacity_exceeded(),
+                "a batch_capacity_exceeded 529 must be recognised as admission control: {reason:?}"
+            );
         }
+        // An ordinary 529 is overload but not admission control, so it still spends an attempt.
+        let plain = FailureReason::RetriableHttpStatus {
+            status: 529,
+            body: String::new(),
+        };
+        assert!(is_downstream_overload(&plain));
+        assert!(!plain.is_batch_capacity_exceeded());
     }
 
     /// Everything else must leave the limit alone. A bare 429 is a provider rate

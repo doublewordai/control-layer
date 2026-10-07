@@ -335,9 +335,20 @@ impl<T: HttpClient> AppState<T> {
 
     /// Switch enforcement of the per-model batch in-flight cap on or off.
     ///
-    /// The standalone `onwards` binary never enables this, so the cap is inert
-    /// there; see [`AppState::with_batch_inflight_limiter`].
+    /// Batch requests are recognised by the header set with
+    /// [`AppState::with_first_token_timeout_exempt_header`], which the batch
+    /// dispatcher stamps on every request it sends. Without that header
+    /// configured no request counts as batch, so the cap never applies; enabling
+    /// enforcement without it logs a warning. The standalone `onwards` binary
+    /// never enables this, so the cap is inert there; see
+    /// [`AppState::with_batch_inflight_limiter`].
     pub fn with_batch_inflight_enforce(mut self, enforce: bool) -> Self {
+        if enforce && self.first_token_timeout_exempt_header.is_none() {
+            tracing::warn!(
+                "batch in-flight cap enforcement is on, but no batch marker header is configured \
+                 (with_first_token_timeout_exempt_header); no request will be counted as batch"
+            );
+        }
         self.batch_inflight_enforce = enforce;
         self
     }
