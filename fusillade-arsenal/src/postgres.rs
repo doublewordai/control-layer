@@ -12598,6 +12598,54 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn background_claim_fails_a_request_whose_template_is_gone(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(DaemonConfig {
+            background_concurrency_limit: 10,
+            ..Default::default()
+        });
+        let request =
+            create_background_request_for_test(&manager, "background-model", "owner").await;
+        manager
+            .append_model_filter_events(&[ModelFilter {
+                model: "background-model".to_string(),
+                state: ModelFilterState::Live,
+                expected_ready_at: None,
+            }])
+            .await
+            .unwrap();
+        sqlx::query(
+            "WITH removed AS (
+                DELETE FROM request_templates_g2 WHERE id = (SELECT template_id FROM requests WHERE id = $1)
+                RETURNING id
+             ) DELETE FROM request_template_routes route USING removed WHERE route.template_id = removed.id",
+        ).bind(*request as Uuid).execute(&pool).await.unwrap();
+        let claimed = manager
+            .claim_background_requests_by_kind(
+                BackgroundClaimKind::Batchless,
+                10,
+                5,
+                DaemonId::from(Uuid::new_v4()),
+                &HashMap::from([("background-model".to_string(), 10)]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert!(claimed.is_empty());
+        let (state, error): (String, Option<String>) =
+            sqlx::query_as("SELECT state, error FROM requests WHERE id = $1")
+                .bind(*request as Uuid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "failed");
+        assert_eq!(error.as_deref(), Some("request template no longer exists"));
+    }
+
+    #[sqlx::test]
     async fn test_claim_requests(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(

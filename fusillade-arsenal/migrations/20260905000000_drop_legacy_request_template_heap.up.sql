@@ -11,11 +11,13 @@
 -- content that a reader could still resolve. Nothing is deleted row by row;
 -- the heap goes as one relation.
 --
--- Block legacy writes throughout validation, while allowing readers to run.
--- Upgrade to the destructive lock only after the guard has passed. Both lock
--- acquisitions have bounded waits.
+-- Wait for legacy readers and writers before taking the validation snapshot:
+-- an existing reader may still create a request referencing a legacy template.
+-- Bound both lock acquisition and validation so a large archive fails closed
+-- instead of holding up legacy readers for an unbounded time.
 SET LOCAL lock_timeout = '5s';
-LOCK TABLE request_templates IN SHARE MODE;
+SET LOCAL statement_timeout = '5s';
+LOCK TABLE request_templates IN ACCESS EXCLUSIVE MODE;
 
 DO $$
 DECLARE
@@ -80,8 +82,6 @@ BEGIN
     END IF;
 END;
 $$;
-
-LOCK TABLE request_templates IN ACCESS EXCLUSIVE MODE;
 
 -- Generation-2 only. Dedicated batchless templates (file_id IS NULL) now live
 -- here too, so the file join is outer, exactly as the legacy arm's was: a

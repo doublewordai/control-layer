@@ -316,7 +316,7 @@ async fn the_down_migration_restores_an_empty_heap_and_the_two_arm_views(pool: P
 }
 
 #[sqlx::test(migrations = false)]
-async fn archive_guard_keeps_legacy_readers_available_and_refuses_referenced_rows(pool: PgPool) {
+async fn refuses_while_an_archived_request_references_a_legacy_template(pool: PgPool) {
     migrate_to_before_retirement(&pool).await;
     let week = current_week(&pool).await;
     insert_g2_template(&pool, week).await;
@@ -346,39 +346,61 @@ async fn archive_guard_keeps_legacy_readers_available_and_refuses_referenced_row
     .await
     .unwrap();
 
-    // Hold up the archive probe so we can check the lock held on the heap
-    // while validation is in progress, independently of archive size.
-    let mut blocker = pool.begin().await.unwrap();
-    sqlx::query("LOCK TABLE batch_requests_archive IN ACCESS EXCLUSIVE MODE")
-        .execute(&mut *blocker)
+    let error = apply_retirement(&pool)
+        .await
+        .expect_err("an archived reference must block retirement");
+    assert_eq!(sqlstate(&error).as_deref(), Some("55000"), "{error}");
+}
+
+#[sqlx::test(migrations = false)]
+async fn waits_for_a_legacy_reader_that_creates_a_request_before_validating(pool: PgPool) {
+    migrate_to_before_retirement(&pool).await;
+    let week = current_week(&pool).await;
+    insert_g2_template(&pool, week).await;
+    let legacy_id = insert_legacy_template(&pool, None).await;
+    sqlx::query(
+        "UPDATE request_templates SET created_at = NOW() - interval '30 days' WHERE id = $1",
+    )
+    .bind(legacy_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut reader = pool.begin().await.unwrap();
+    let read_id: Uuid = sqlx::query_scalar("SELECT id FROM request_templates WHERE id = $1")
+        .bind(legacy_id)
+        .fetch_one(&mut *reader)
         .await
         .unwrap();
     let migration_pool = pool.clone();
     let migration = tokio::spawn(async move { apply_retirement(&migration_pool).await });
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        let mut poll = tokio::time::interval(std::time::Duration::from_millis(10));
         loop {
-            let locked: bool = sqlx::query_scalar(
+            poll.tick().await;
+            let waiting: bool = sqlx::query_scalar(
                 "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE relation = 'request_templates'::regclass
-                 AND granted AND mode IN ('ShareLock', 'AccessExclusiveLock'))",
+                 AND NOT granted AND mode = 'AccessExclusiveLock')",
             ).fetch_one(&pool).await.unwrap();
-            if locked { break; }
-            tokio::task::yield_now().await;
+            if waiting { break; }
         }
-    }).await.expect("migration must lock legacy writes before probing the archive");
-    let read = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM request_templates").fetch_one(&pool),
-    )
-    .await;
-    blocker.rollback().await.unwrap();
+    }).await.expect("migration must wait for the existing reader");
+    sqlx::query("INSERT INTO requests (template_id, model, state, created_by) VALUES ($1, 'test-model', 'pending', 'tester')")
+        .bind(read_id).execute(&mut *reader).await.unwrap();
+    reader.commit().await.unwrap();
     let error = migration
         .await
         .unwrap()
-        .expect_err("an archived reference must block retirement");
+        .expect_err("the reader's committed request must block retirement");
     assert_eq!(sqlstate(&error).as_deref(), Some("55000"), "{error}");
-    assert_eq!(
-        read.expect("archive validation must not block legacy readers")
-            .unwrap(),
-        1
+    let visible: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM request_templates WHERE id = $1)")
+            .bind(read_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        visible,
+        "the newly referenced template must remain available"
     );
 }
