@@ -2061,7 +2061,7 @@ mod tests {
 
     /// An organization's low-balance alert reaches everyone who can add
     /// credits (its contact address, owners and admins) and no plain members.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_low_balance_notification_reaches_org_owners_and_admins(pool: sqlx::PgPool) {
         let scratch = std::env::temp_dir().join(format!("dwctl-test-emails-low-balance-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&scratch).unwrap();
