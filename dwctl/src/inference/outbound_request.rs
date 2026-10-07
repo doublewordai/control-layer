@@ -261,7 +261,7 @@ async fn reassemble_stream(response: Response, timeouts: StreamTimeouts) -> Resp
                 Err(_) => return Collected::Stalled(sink.seen),
             }
         }
-        Collected::Done(sink)
+        Collected::Done(Box::new(sink))
     })
     .await;
 
@@ -272,7 +272,7 @@ async fn reassemble_stream(response: Response, timeouts: StreamTimeouts) -> Resp
             return timeout_response("chunk");
         }
         Ok(Collected::ParseError(e)) => return sse_parse_error(&e),
-        Ok(Collected::Done(sink)) => sink,
+        Ok(Collected::Done(sink)) => *sink,
     };
 
     // Some providers answer 200 with an error envelope inside the stream. Surface
@@ -319,7 +319,7 @@ async fn reassemble_stream(response: Response, timeouts: StreamTimeouts) -> Resp
 
 /// How the collection phase ended.
 enum Collected {
-    Done(Sink),
+    Done(Box<Sink>),
     /// Idle for longer than the per-event budget, carrying the events seen so far
     /// for the diagnostic.
     Stalled(usize),

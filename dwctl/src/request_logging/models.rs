@@ -77,7 +77,7 @@ pub struct StreamErrorChunk {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ChatCompletionChunk {
-    Chunk(ChatChunk),
+    Chunk(Box<ChatChunk>),
     Error(StreamErrorChunk),
     #[serde(rename = "[DONE]")]
     Done,
