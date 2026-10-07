@@ -615,7 +615,7 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
                         } else {
                             // Strip `priority` from body if present and re-serialize
                             if let Ok(mut body_val) = serde_json::from_str::<serde_json::Value>(&body) {
-                                if body_val.as_object_mut().is_some_and(|o| o.remove("priority").is_some()) {
+                                if body_val.as_object_mut().is_some_and(|o| o.shift_remove("priority").is_some()) {
                                     serde_json::to_string(&body_val).unwrap_or(body)
                                 } else {
                                     body
@@ -719,7 +719,7 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
                     } else {
                         // Strip `priority` from body if present and re-serialize
                         if let Ok(mut body_val) = serde_json::from_str::<serde_json::Value>(&body) {
-                            if body_val.as_object_mut().is_some_and(|o| o.remove("priority").is_some()) {
+                            if body_val.as_object_mut().is_some_and(|o| o.shift_remove("priority").is_some()) {
                                 serde_json::to_string(&body_val).unwrap_or(body)
                             } else {
                                 body

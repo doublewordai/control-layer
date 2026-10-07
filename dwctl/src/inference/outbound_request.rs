@@ -450,6 +450,18 @@ mod tests {
     }
 
     #[test]
+    fn injecting_usage_keeps_key_order() {
+        let body = Bytes::from_static(
+            br#"{"model":"m","stream":true,"response_format":{"type":"json_schema","json_schema":{"name":"a","schema":{"type":"object","properties":{"z":{"type":"string"},"a":{"type":"string"}}}}},"messages":[]}"#,
+        );
+        let out = transform(&body, false, true).expect("should transform");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            r#"{"model":"m","stream":true,"response_format":{"type":"json_schema","json_schema":{"name":"a","schema":{"type":"object","properties":{"z":{"type":"string"},"a":{"type":"string"}}}}},"messages":[],"stream_options":{"include_usage":true}}"#
+        );
+    }
+
+    #[test]
     fn skips_non_streaming() {
         let body = serde_json::json!({"model": "gpt-4", "messages": [], "stream": false});
         assert!(run(&body, false).is_none());

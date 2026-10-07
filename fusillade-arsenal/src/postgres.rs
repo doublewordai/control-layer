@@ -100,7 +100,8 @@ fn sanitize_outbound_body(body: &str) -> std::borrow::Cow<'_, str> {
         return std::borrow::Cow::Borrowed(body);
     };
     // Bitwise OR so both removals run regardless of which is present.
-    let stripped = obj.remove("service_tier").is_some() | obj.remove("background").is_some();
+    let stripped =
+        obj.shift_remove("service_tier").is_some() | obj.shift_remove("background").is_some();
     if !stripped {
         return std::borrow::Cow::Borrowed(body);
     }

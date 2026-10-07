@@ -2704,6 +2704,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_rewritten_body_keeps_key_order() {
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "test-model".to_string(),
+            pool(
+                Target::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .onwards_model("upstream-model".to_string())
+                    .build(),
+            ),
+        );
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
+            strict_mode: false,
+            http_pool_config: None,
+        };
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"choices": []}"#);
+        let app_state = AppState::with_client(targets, mock_client.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let schema = r#"{"type":"object","properties":{"reasoning":{"type":"string"},"answer":{"type":"string"}},"required":["reasoning","answer"],"additionalProperties":false}"#;
+        let body = format!(
+            r#"{{"model":"test-model","messages":[{{"role":"user","content":"Hello!"}}],"response_format":{{"type":"json_schema","json_schema":{{"name":"answer","strict":true,"schema":{schema}}}}},"temperature":0.7}}"#
+        );
+        let response = server
+            .post("/v1/chat/completions")
+            .content_type("application/json")
+            .bytes(body.clone().into())
+            .await;
+        assert_eq!(response.status_code(), 200);
+
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1);
+        let forwarded = String::from_utf8(requests[0].body.clone()).unwrap();
+        assert_eq!(
+            forwarded,
+            body.replace(r#""model":"test-model""#, r#""model":"upstream-model""#)
+        );
+    }
+
+    #[tokio::test]
     async fn test_model_override_header_takes_precedence() {
         // Create two targets
         let targets_map = Arc::new(DashMap::new());

@@ -295,11 +295,11 @@ pub fn scrub_router_targets(nvext: &mut serde_json::Map<String, serde_json::Valu
         return false;
     };
     let removed = [
-        router.remove(TTFT_TARGET_FIELD),
-        router.remove(ITL_TARGET_FIELD),
+        router.shift_remove(TTFT_TARGET_FIELD),
+        router.shift_remove(ITL_TARGET_FIELD),
     ];
     if router.is_empty() {
-        nvext.remove(NVEXT_ROUTER_FIELD);
+        nvext.shift_remove(NVEXT_ROUTER_FIELD);
     }
     removed.iter().any(Option::is_some)
 }
