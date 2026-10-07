@@ -86,7 +86,15 @@ fn test_convert_to_config_file() {
     let target2 = create_test_target("claude-3", "claude-alias", "https://api.anthropic.com");
 
     let targets = vec![target1, target2];
-    let config = convert_to_config_file(targets, vec![], false, &Default::default(), &Default::default(), Default::default());
+    let config = convert_to_config_file(
+        targets,
+        vec![],
+        false,
+        &Default::default(),
+        &Default::default(),
+        Default::default(),
+        None,
+    );
 
     // Verify the config
     assert_eq!(config.targets.len(), 2);
@@ -121,7 +129,15 @@ fn test_convert_to_config_file_with_single_target() {
     let target = create_test_target("valid-model", "valid-alias", "https://api.valid.com");
 
     let targets = vec![target];
-    let config = convert_to_config_file(targets, vec![], false, &Default::default(), &Default::default(), Default::default());
+    let config = convert_to_config_file(
+        targets,
+        vec![],
+        false,
+        &Default::default(),
+        &Default::default(),
+        Default::default(),
+        None,
+    );
 
     // Should have exactly one target
     assert_eq!(config.targets.len(), 1);
@@ -2578,17 +2594,18 @@ async fn failed_reload_retries_without_another_notification_or_fallback(pool: sq
 }
 
 /// The per-model batch in-flight cap is the virtual (composite) model's
-/// `batch_capacity`, copied onto the composite's `default` pool. Regular
-/// deployments keep `batch_capacity` for the daemon's own concurrency but must
-/// not expose it to onwards as an in-flight cap.
+/// `batch_capacity`, copied onto the composite's `default` pool. A virtual
+/// model without its own positive value falls back to the configured default.
+/// Regular deployments keep `batch_capacity` for the daemon's own concurrency
+/// but must not expose it to onwards as an in-flight cap.
 #[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn batch_capacity_syncs_to_the_composite_default_pool(pool: sqlx::PgPool) {
     let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
     let composite = targets.targets.get("composite-priority").unwrap();
     assert_eq!(
         composite.value().default_pool().batch_inflight_limit(),
-        None,
-        "NULL batch_capacity means uncapped"
+        Some(200),
+        "NULL batch_capacity falls back to the 200 default"
     );
 
     sqlx::query("UPDATE deployed_models SET batch_capacity = 4 WHERE alias = 'composite-priority'")
@@ -2600,7 +2617,7 @@ async fn batch_capacity_syncs_to_the_composite_default_pool(pool: sqlx::PgPool) 
     assert_eq!(
         composite.value().default_pool().batch_inflight_limit(),
         Some(4),
-        "the composite's batch_capacity becomes the alias's batch in-flight cap"
+        "the composite's own positive batch_capacity wins over the default"
     );
 
     sqlx::query("UPDATE deployed_models SET batch_capacity = 4 WHERE alias = 'regular-public'")
@@ -2619,4 +2636,52 @@ async fn batch_capacity_syncs_to_the_composite_default_pool(pool: sqlx::PgPool) 
         None,
         "only virtual (composite) models carry a batch in-flight cap"
     );
+}
+
+/// A virtual model without its own `batch_capacity` is uncapped when the
+/// configurable default is turned off.
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn batch_capacity_default_can_be_turned_off(pool: sqlx::PgPool) {
+    let targets = super::load_targets_from_db_with_batch_default(&pool, &[], false, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        targets
+            .targets
+            .get("composite-priority")
+            .unwrap()
+            .value()
+            .default_pool()
+            .batch_inflight_limit(),
+        None,
+        "with the default off, a virtual model without batch_capacity is uncapped"
+    );
+}
+
+/// A stored non-positive `batch_capacity` is invalid: it must not become a cap
+/// of zero (refusing every request) nor silently read as uncapped. It falls
+/// back to the configured default.
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn batch_capacity_non_positive_falls_back_to_the_default(pool: sqlx::PgPool) {
+    for invalid in [0, -1] {
+        sqlx::query("UPDATE deployed_models SET batch_capacity = $1 WHERE alias = 'composite-priority'")
+            .bind(invalid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let targets = super::load_targets_from_db_with_batch_default(&pool, &[], false, Some(200))
+            .await
+            .unwrap();
+        assert_eq!(
+            targets
+                .targets
+                .get("composite-priority")
+                .unwrap()
+                .value()
+                .default_pool()
+                .batch_inflight_limit(),
+            Some(200),
+            "batch_capacity={invalid} must fall back to the default"
+        );
+    }
 }

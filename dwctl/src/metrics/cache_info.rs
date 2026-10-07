@@ -83,7 +83,7 @@ struct TariffInfo {
 pub fn describe_cache_info_metrics() {
     metrics::describe_gauge!(
         "dwctl_model_batch_inflight_limit",
-        "Global per-model batch in-flight cap for virtual models. Reported even when limits.batch_inflight.enforce is off; 0 means the model is uncapped, so a zero does not imply the cap is enforced."
+        "Effective global per-model batch in-flight cap for virtual models: the model's own positive batch_capacity, else limits.batch_inflight.default_capacity. Reported even when enforcement is off; 0 means the model is uncapped, so a zero does not imply the cap is enforced."
     );
     metrics::describe_gauge!(
         "dwctl_model_realtime_inflight_limit",
@@ -211,10 +211,17 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets, state: 
 
         if row.is_composite {
             gauge!("dwctl_model_realtime_inflight_limit", "model" => alias.clone()).set(row.realtime_inflight_limit as f64);
-            // The batch cap applies to virtual (composite) models. Reported even
+            // The batch cap applies to virtual (composite) models. Report the
+            // effective cap onwards actually enforces (the model's own value or
+            // the configured default), not the raw stored column. Reported even
             // when enforcement is off; 0 means uncapped, so a zero does not
             // imply the cap is enforced. Mirrors the realtime gauge above.
-            gauge!("dwctl_model_batch_inflight_limit", "model" => alias.clone()).set(row.batch_capacity.unwrap_or(0) as f64);
+            let batch_inflight_limit = targets
+                .targets
+                .get(alias)
+                .and_then(|spec| spec.value().default_pool().batch_inflight_limit())
+                .unwrap_or(0);
+            gauge!("dwctl_model_batch_inflight_limit", "model" => alias.clone()).set(batch_inflight_limit as f64);
         }
 
         // Batch capacity gauge
@@ -727,6 +734,91 @@ mod tests {
         assert!(
             output.contains(r#"component="cache-info-comp-child""#),
             "Should have component label"
+        );
+    }
+
+    /// The batch in-flight gauge must report the cap onwards actually enforces:
+    /// the composite's own positive `batch_capacity`, else the configured
+    /// default — not the raw stored column.
+    #[dwctl_test_macros::test]
+    async fn batch_inflight_limit_gauge_reports_the_effective_cap(pool: sqlx::PgPool) {
+        let handle = ensure_recorder();
+        let mut state = super::CacheInfoState::new();
+        let owner = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let alias = format!("batch-gauge-{}", uuid::Uuid::new_v4());
+        let child = format!("{alias}-child");
+
+        let endpoint_id: uuid::Uuid =
+            sqlx::query_scalar("INSERT INTO inference_endpoints (name,url,created_by) VALUES ($1,$2,$3) RETURNING id")
+                .bind(format!("{alias}-ep"))
+                .bind("https://api.example.com/v1")
+                .bind(owner.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let child_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO deployed_models (model_name,alias,is_composite,created_by,hosted_on) VALUES ($1,$1,false,$2,$3) RETURNING id",
+        )
+        .bind(&child)
+        .bind(owner.id)
+        .bind(endpoint_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let composite_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO deployed_models (model_name,alias,is_composite,created_by) VALUES ($1,$1,true,$2) RETURNING id",
+        )
+        .bind(&alias)
+        .bind(owner.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO deployed_model_components (composite_model_id,deployed_model_id,weight,sort_order,enabled) VALUES ($1,$2,1,0,TRUE)",
+        )
+        .bind(composite_id)
+        .bind(child_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // No own `batch_capacity`: the gauge reports the 200 default.
+        let targets = load_targets_from_db(&pool, &[], false).await.unwrap();
+        super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(&format!(r#"dwctl_model_batch_inflight_limit{{model="{alias}"}} 200"#)),
+            "a virtual model without its own capacity reports the default; got:\n{rendered}"
+        );
+
+        // An explicit positive value wins over the default.
+        sqlx::query("UPDATE deployed_models SET batch_capacity = 7 WHERE id = $1")
+            .bind(composite_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let targets = load_targets_from_db(&pool, &[], false).await.unwrap();
+        super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(&format!(r#"dwctl_model_batch_inflight_limit{{model="{alias}"}} 7"#)),
+            "an explicit positive capacity is reported; got:\n{rendered}"
+        );
+
+        // Turning the default off leaves the model uncapped, reported as 0.
+        sqlx::query("UPDATE deployed_models SET batch_capacity = NULL WHERE id = $1")
+            .bind(composite_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let targets = crate::sync::onwards_config::load_targets_from_db_with_batch_default(&pool, &[], false, None)
+            .await
+            .unwrap();
+        super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(&format!(r#"dwctl_model_batch_inflight_limit{{model="{alias}"}} 0"#)),
+            "with the default off an unset capacity reports 0; got:\n{rendered}"
         );
     }
 

@@ -607,11 +607,23 @@ limits:
     redis_url: rediss://:password@limits-redis.example:6379
   batch_inflight:
     enforce: true
+    default_capacity: 200
 ```
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `limits.batch_inflight.enforce` | `false` | Refuse batch requests that would exceed a virtual model's `batch_capacity`. Off, every batch request is admitted and no shared count is touched. |
+| `limits.batch_inflight.enforce` | `false` | Refuse batch requests that would exceed a virtual model's effective batch cap. Off, every batch request is admitted and no shared count is touched, so no cap applies however it was configured. |
+| `limits.batch_inflight.default_capacity` | `200` | Global batch cap for a virtual model that does not set its own positive `batch_capacity`. Set to `0` (or `null`) for no default. Must not be negative. |
+
+A virtual model's effective cap is its own `batch_capacity` when that is
+positive, otherwise `limits.batch_inflight.default_capacity`. This default only
+feeds the onwards cap: it does **not** change fusillade's per-daemon *starting*
+concurrency, which keeps using
+`background_services.batch_daemon.default_model_concurrency` for models without
+an explicit `batch_capacity`. Because an enforced default caps **every** virtual
+model that has not set its own value, raise `default_capacity` (or set it per
+model) wherever batch runs higher than 200, or the first requests past the
+default will be refused.
 
 ### Why realtime and batch differ
 
@@ -659,9 +671,11 @@ enable_metrics: true
 
 Exposes Prometheus metrics at `/internal/metrics`.
 
-`dwctl_model_batch_inflight_limit` reports each virtual model's global batch
-cap. It reports even when `limits.batch_inflight.enforce` is off, and an
-uncapped model (no `batch_capacity`) reports `0`, so a zero does not by itself
+`dwctl_model_batch_inflight_limit` reports each virtual model's **effective**
+global batch cap: its own positive `batch_capacity`, or the configured
+`limits.batch_inflight.default_capacity` when it has none. It reports even when
+`limits.batch_inflight.enforce` is off, and a model with no effective cap (the
+default turned off and no own value) reports `0`, so a zero does not by itself
 mean the cap is enforced — check the config switch.
 
 ### Request Logging

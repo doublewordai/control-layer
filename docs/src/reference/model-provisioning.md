@@ -258,13 +258,18 @@ models. Two values are exceptions:
 - `settings.batch_capacity` on the virtual model is the global cap on batch
   requests in flight on it, enforced by onwards when
   [`limits.batch_inflight.enforce`](./configuration.md#batch-in-flight-limits)
-  is on. It belongs to the virtual model, not its deployments; unset means
-  batch is uncapped. Over the cap, batch requests are refused with `529` and
+  is on. It belongs to the virtual model, not its deployments. A positive value
+  is used as the cap; when it is omitted (or non-positive, which is invalid),
+  the model falls back to
+  [`limits.batch_inflight.default_capacity`](./configuration.md#batch-in-flight-limits)
+  (default `200`). Over the cap, batch requests are refused with `529` and
   code `batch_capacity_exceeded`, never `429`. The value is dual-purpose: it
   also seeds fusillade's per-daemon *starting* concurrency, which adaptive
-  concurrency may grow past. Turning enforcement on turns that starting point
-  into a global ceiling, so raise it to the intended global cap first. File
-  batches, flex and background requests all share this one per-model ceiling.
+  concurrency may grow past (the configured default does **not** change that
+  starting concurrency). Turning enforcement on turns that starting point into
+  a global ceiling, so set the value — or raise `default_capacity` — to the
+  intended global cap first. File batches, flex and background requests all
+  share this one per-model ceiling.
 
 The retired settings `requests_per_second`, `burst_size` and `capacity` are
 still accepted so older catalogs load, but they are ignored.

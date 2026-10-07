@@ -129,7 +129,12 @@ set with `AppState::with_first_token_timeout_exempt_header`. Realtime requests
 are never counted against this cap, and batch requests are never counted
 against the per-account `inflight_limit`. The two counts are independent, so an
 alias can serve realtime traffic while its batch slots are full. `None` (or an
-absent field) means batch is uncapped.
+absent field) means batch is uncapped. The control layer resolves this field for
+each virtual model before writing the onwards config: a positive
+`batch_capacity` is used, otherwise it falls back to
+`limits.batch_inflight.default_capacity` (default `200`), so an enforced
+deployment caps virtual models that never set a value unless that default is
+turned off.
 
 The cap is read from the alias's default pool and counts against the alias the
 request named, even when a routing rule redirects it, so a redirected request

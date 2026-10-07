@@ -194,8 +194,12 @@ pub struct ModelSettings {
     /// Dual-purpose batch concurrency. It seeds fusillade's **starting**
     /// per-daemon concurrency for the model (adaptive concurrency may grow past
     /// it), and, once `limits.batch_inflight.enforce` is on, it is also the
-    /// **global** onwards cap on batch requests in flight on the alias. Raise it
-    /// to the intended global ceiling before enabling enforcement. The cap is
+    /// **global** onwards cap on batch requests in flight on the alias. A
+    /// positive value is used directly; when omitted, the onwards cap falls back
+    /// to `limits.batch_inflight.default_capacity` (default 200) while
+    /// fusillade's starting concurrency falls back to
+    /// `background_services.batch_daemon.default_model_concurrency`. Raise it to
+    /// the intended global ceiling before enabling enforcement. The cap is
     /// shared by file batches, flex and background requests.
     pub batch_capacity: Option<i32>,
     pub throughput: Option<f32>,

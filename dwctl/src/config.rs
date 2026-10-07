@@ -1180,10 +1180,62 @@ pub struct RealtimeInflightLimitsConfig {
 /// ceiling. Raise `batch_capacity` to the intended global cap before turning
 /// enforcement on. File batches, flex and background requests all share this
 /// single per-model ceiling.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BatchInflightLimitsConfig {
     pub enforce: bool,
+    /// Default global batch in-flight cap applied to virtual (composite) models
+    /// that do not set their own positive `batch_capacity`. Default: 200.
+    ///
+    /// This only affects the onwards cap; it does not change fusillade's
+    /// per-daemon starting concurrency, which keeps using
+    /// `background_services.batch_daemon.default_model_concurrency` for models
+    /// without an explicit `batch_capacity`. Set to `null` or `0` to leave
+    /// virtual models without their own value uncapped. Negative values are
+    /// rejected at config load.
+    #[serde(
+        default = "default_batch_inflight_capacity",
+        deserialize_with = "deserialize_batch_inflight_default_capacity"
+    )]
+    pub default_capacity: Option<u32>,
+}
+
+/// Default global batch in-flight cap for virtual models without a positive
+/// `batch_capacity` of their own.
+pub const DEFAULT_BATCH_INFLIGHT_CAPACITY: u32 = 200;
+
+fn default_batch_inflight_capacity() -> Option<u32> {
+    Some(DEFAULT_BATCH_INFLIGHT_CAPACITY)
+}
+
+/// Accepts a positive integer, or the "off" forms `null` and `0`; rejects
+/// negative values with a clear config-load error.
+fn deserialize_batch_inflight_default_capacity<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let value: Option<i64> = Option::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(value) if value < 0 => Err(D::Error::custom(format!(
+            "limits.batch_inflight.default_capacity must not be negative, got {value}"
+        ))),
+        Some(0) => Ok(None),
+        Some(value) => u32::try_from(value)
+            .map(Some)
+            .map_err(|_| D::Error::custom(format!("limits.batch_inflight.default_capacity is too large, got {value}"))),
+    }
+}
+
+impl Default for BatchInflightLimitsConfig {
+    fn default() -> Self {
+        Self {
+            enforce: false,
+            default_capacity: default_batch_inflight_capacity(),
+        }
+    }
 }
 
 /// Request limits configuration.
@@ -4054,6 +4106,49 @@ mod tests {
     }
 
     #[test]
+    fn batch_inflight_default_capacity_defaults_to_200() {
+        assert_eq!(LimitsConfig::default().batch_inflight.default_capacity, Some(200));
+    }
+
+    #[test]
+    fn batch_inflight_default_capacity_parses_an_explicit_positive_value() {
+        let parsed: LimitsConfig = serde_json::from_value(serde_json::json!({
+            "batch_inflight": { "default_capacity": 500 }
+        }))
+        .unwrap();
+        assert_eq!(parsed.batch_inflight.default_capacity, Some(500));
+    }
+
+    #[test]
+    fn batch_inflight_default_capacity_accepts_the_off_forms() {
+        for off in [serde_json::json!(null), serde_json::json!(0)] {
+            let parsed: LimitsConfig = serde_json::from_value(serde_json::json!({
+                "batch_inflight": { "default_capacity": off }
+            }))
+            .unwrap();
+            assert_eq!(parsed.batch_inflight.default_capacity, None, "{off} should mean no default");
+        }
+    }
+
+    #[test]
+    fn batch_inflight_default_capacity_rejects_negative_values() {
+        let error = serde_json::from_value::<LimitsConfig>(serde_json::json!({
+            "batch_inflight": { "default_capacity": -1 }
+        }))
+        .expect_err("a negative default capacity must be rejected");
+        assert!(error.to_string().contains("must not be negative"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn batch_inflight_default_capacity_rejects_out_of_range_values() {
+        let error = serde_json::from_value::<LimitsConfig>(serde_json::json!({
+            "batch_inflight": { "default_capacity": 5_000_000_000i64 }
+        }))
+        .expect_err("a default capacity beyond u32 must be rejected");
+        assert!(error.to_string().contains("too large"), "unexpected error: {error}");
+    }
+
+    #[test]
     fn obsolete_retention_sweep_interval_is_rejected_on_a_complete_config() {
         let mut serialized = serde_json::to_value(DaemonConfig::default()).unwrap();
         serialized["retention_sweep_interval_ms"] = serde_json::json!(1_000);
@@ -5098,6 +5193,41 @@ secret_key: "test-secret-key"
             jail.set_env("DWCTL_LIMITS__BATCH_INFLIGHT__ENFORCE", "true");
             let config = Config::load(&args)?;
             assert!(config.limits.batch_inflight.enforce);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_batch_inflight_default_capacity_env_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            assert_eq!(
+                Config::load(&args)?.limits.batch_inflight.default_capacity,
+                Some(200),
+                "default is 200"
+            );
+
+            jail.set_env("DWCTL_LIMITS__BATCH_INFLIGHT__DEFAULT_CAPACITY", "250");
+            assert_eq!(Config::load(&args)?.limits.batch_inflight.default_capacity, Some(250));
+
+            // 0 is the "off" form: no default cap.
+            jail.set_env("DWCTL_LIMITS__BATCH_INFLIGHT__DEFAULT_CAPACITY", "0");
+            assert_eq!(Config::load(&args)?.limits.batch_inflight.default_capacity, None);
+
+            // A negative override is rejected at load.
+            jail.set_env("DWCTL_LIMITS__BATCH_INFLIGHT__DEFAULT_CAPACITY", "-1");
+            assert!(Config::load(&args).is_err(), "a negative env override must be rejected");
 
             Ok(())
         });

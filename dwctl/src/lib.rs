@@ -3436,6 +3436,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
             direct_pools.clone(),
             Some(model_capacity_limits.clone()),
             config.background_services.batch_daemon.default_model_concurrency,
+            config.limits.batch_inflight.default_capacity,
             escalation_models,
             config.onwards.strict_mode,
         )
