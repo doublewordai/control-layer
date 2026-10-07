@@ -221,6 +221,25 @@ impl RequestState for Completed {}
 /// reschedules without spending a retry attempt.
 pub const BATCH_CAPACITY_EXCEEDED_CODE: &str = "batch_capacity_exceeded";
 
+/// True when an HTTP `status`/`body` is the gateway's per-model batch
+/// admission-control refusal: a 529 whose body carries
+/// [`BATCH_CAPACITY_EXCEEDED_CODE`].
+pub fn is_batch_capacity_exceeded_response(status: u16, body: &str) -> bool {
+    if status != 529 {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")?
+                .get("code")?
+                .as_str()
+                .map(|code| code == BATCH_CAPACITY_EXCEEDED_CODE)
+        })
+        .unwrap_or(false)
+}
+
 /// Reason why a request failed.
 ///
 /// This enum distinguishes between different types of failures to determine
@@ -278,21 +297,13 @@ impl FailureReason {
     /// the batch simply has to wait for a slot — so it reschedules without
     /// spending a retry attempt.
     pub fn is_batch_capacity_exceeded(&self) -> bool {
-        let body = match self {
-            FailureReason::RetriableHttpStatus { status: 529, body }
-            | FailureReason::NonRetriableHttpStatus { status: 529, body } => body,
-            _ => return false,
-        };
-        serde_json::from_str::<serde_json::Value>(body)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("error")?
-                    .get("code")?
-                    .as_str()
-                    .map(|code| code == BATCH_CAPACITY_EXCEEDED_CODE)
-            })
-            .unwrap_or(false)
+        match self {
+            FailureReason::RetriableHttpStatus { status, body }
+            | FailureReason::NonRetriableHttpStatus { status, body } => {
+                is_batch_capacity_exceeded_response(*status, body)
+            }
+            _ => false,
+        }
     }
 
     /// Returns a short, stable label for use in metrics.

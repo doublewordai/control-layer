@@ -320,6 +320,11 @@ impl<T: HttpClient> AppState<T> {
     }
 
     /// Plug in a shared counter for the per-model batch in-flight cap.
+    ///
+    /// Enforcement also requires [`AppState::with_batch_inflight_enforce`]. The
+    /// standalone `onwards` binary never calls either builder, so the cap is
+    /// inert there; only embedding processes (such as the control layer) enable
+    /// it.
     pub fn with_batch_inflight_limiter(
         mut self,
         limiter: Arc<dyn inflight::InflightLimiter>,
@@ -329,6 +334,9 @@ impl<T: HttpClient> AppState<T> {
     }
 
     /// Switch enforcement of the per-model batch in-flight cap on or off.
+    ///
+    /// The standalone `onwards` binary never enables this, so the cap is inert
+    /// there; see [`AppState::with_batch_inflight_limiter`].
     pub fn with_batch_inflight_enforce(mut self, enforce: bool) -> Self {
         self.batch_inflight_enforce = enforce;
         self

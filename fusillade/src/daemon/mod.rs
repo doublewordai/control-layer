@@ -2746,7 +2746,14 @@ where
                             let retry_attempt = failed.state.retry_attempt;
                             let reason_label = failed.state.reason.metric_label();
                             let status_code_label = failed.state.reason.status_code_label();
-                            if failed.state.reason.is_retriable() {
+                            // A batch-capacity refusal must always be rescheduled, even
+                            // when the configured `should_retry` predicate classifies
+                            // the 529 as non-retriable: it is admission control, not a
+                            // failed attempt, so rejecting it would persist the refusal as
+                            // a terminal failure.
+                            if failed.state.reason.is_retriable()
+                                || failed.state.reason.is_batch_capacity_exceeded()
+                            {
                                 // The gateway's per-model batch in-flight cap
                                 // refuses with a 529 carrying
                                 // `batch_capacity_exceeded`. That is admission

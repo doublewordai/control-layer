@@ -99,17 +99,20 @@ counter so several instances enforce one limit.
 
 ## Batch in-flight cap
 
-Realtime and batch are deliberately asymmetric. Realtime has only per-account
-limits and no per-model cap: a full downstream answers `529`, and realtime
+Realtime and batch are deliberately asymmetric. Realtime has no alias-wide total
+in-flight cap: only the per-account limits described above, which divide an
+alias's capacity between tenants rather than capping the alias as a whole. A
+full downstream answers `529`, and realtime
 traffic is allowed to grow into whatever capacity exists, with the per-account
 limit stopping one tenant from taking it all. Batch instead gets a per-model
 cap, because batch must never crowd realtime out of a model and can always be
 processed later — a refused batch request is rescheduled, not lost.
 
 A pool can also cap how many **batch** (dispatched) requests are in flight on
-its alias. Unlike the per-account limit above, this is one global count for the
-alias, shared across every dispatcher and proxy instance, so it is a ceiling on
-batch traffic rather than a per-tenant one. It is configured with
+its alias. Unlike the per-account limit above, this is a single count for the
+alias rather than a per-tenant one. It is shared across every dispatcher and
+proxy instance only when a shared limiter is plugged in; with the default local
+limiter the count is per process (see below). It is configured with
 `batch_inflight_limit`:
 
 ```json
@@ -158,6 +161,14 @@ limiter used for realtime `inflight_limit`, under a reserved `__batch__` scope
 so the two key spaces never collide). Enforcement is switched with
 `AppState::with_batch_inflight_enforce`; when it is off, batch requests are
 never refused and the limiter is not consulted at all.
+
+`batch_inflight_limit` is consumed only by an embedding process that both plugs
+in a limiter and turns enforcement on — the control layer does this when it
+resolves virtual models. The standalone `onwards` binary does not: it loads
+`batch_inflight_limit` from its config but never calls
+`AppState::with_batch_inflight_limiter` or `AppState::with_batch_inflight_enforce`,
+so enforcement stays off and the field has no effect there. To use the cap in a
+standalone process, call both builders on the constructed `AppState`.
 
 ## Combining rate limiting and concurrency limiting
 

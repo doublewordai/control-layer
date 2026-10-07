@@ -258,12 +258,15 @@ models. Two values are exceptions:
 - `settings.batch_capacity` on the virtual model is the global cap on batch
   requests in flight on it, enforced by onwards when
   [`limits.batch_inflight.enforce`](./configuration.md#batch-in-flight-limits)
-  is on. It belongs to the virtual model, not its deployments. A positive value
+  is on. A deployment's own `batch_capacity` remains valid and still sets that
+  deployment's fusillade starting concurrency; only the virtual model's value
+  becomes the onwards batch cap. A positive virtual-model value
   is used as the cap; when it is omitted (or non-positive, which is invalid),
   the model falls back to
   [`limits.batch_inflight.default_capacity`](./configuration.md#batch-in-flight-limits)
   (default `200`). Over the cap, batch requests are refused with `529` and
-  code `batch_capacity_exceeded`, never `429`. The value is dual-purpose: it
+  code `batch_capacity_exceeded`, never `429`. The virtual-model value is
+  dual-purpose: it
   also seeds fusillade's per-daemon *starting* concurrency, which adaptive
   concurrency may grow past (the configured default does **not** change that
   starting concurrency). Turning enforcement on turns that starting point into
