@@ -215,6 +215,7 @@ use axum::response::Response;
 use axum::{
     Router, ServiceExt, http, middleware,
     routing::{delete, get, patch, post, put},
+    serve::ListenerExt,
 };
 use axum_prometheus::PrometheusMetricLayerBuilder;
 use bon::Builder;
@@ -4480,6 +4481,14 @@ impl Application {
             shutdown.await;
             shutdown_token.cancel();
         };
+
+        // Streamed responses are many small writes; send each one immediately
+        // rather than waiting for the client to acknowledge the previous one.
+        let listener = listener.tap_io(|tcp| {
+            if let Err(err) = tcp.set_nodelay(true) {
+                warn!(%err, "failed to set TCP_NODELAY on an accepted connection");
+            }
+        });
 
         // Race the server against background task failures (fail-fast)
         let server_error: Option<anyhow::Error> = tokio::select! {
