@@ -5753,7 +5753,7 @@ async fn direct_realtime_retained_missing_or_invalid_partition_falls_back_to_liv
     let missing = late_realtime_record(Uuid::new_v4());
     let invalid = late_realtime_record(Uuid::new_v4());
     manager
-        .persist_completed_realtime_batch(&[missing.clone()])
+        .persist_completed_realtime_batch(std::slice::from_ref(&missing))
         .await
         .unwrap();
     let delete_on = invalid.completed_at.date_naive() + TimeDelta::days(2);
@@ -5764,7 +5764,7 @@ async fn direct_realtime_retained_missing_or_invalid_partition_falls_back_to_liv
         .await
         .unwrap();
     manager
-        .persist_completed_realtime_batch(&[invalid.clone()])
+        .persist_completed_realtime_batch(std::slice::from_ref(&invalid))
         .await
         .unwrap();
     for record in [missing, invalid] {

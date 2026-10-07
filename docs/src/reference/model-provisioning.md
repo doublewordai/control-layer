@@ -255,6 +255,24 @@ models. Two values are exceptions:
   are declared in [account limit files](#account-limits), not in the model
   catalog. A request that a traffic rule redirects to another model counts
   against the limit of the model it named.
+- `settings.batch_capacity` on the virtual model is the global cap on batch
+  requests in flight on it, enforced by onwards when
+  [`limits.batch_inflight.enforce`](./configuration.md#batch-in-flight-limits)
+  is on. A deployment's own `batch_capacity` remains valid and still sets that
+  deployment's fusillade starting concurrency; only the virtual model's value
+  becomes the onwards batch cap. A positive virtual-model value
+  is used as the cap; when it is omitted (or non-positive, which is invalid),
+  the model falls back to
+  [`limits.batch_inflight.default_capacity`](./configuration.md#batch-in-flight-limits)
+  (default `200`). Over the cap, batch requests are refused with `529` and
+  code `batch_capacity_exceeded`, never `429`. The virtual-model value is
+  dual-purpose: it
+  also seeds fusillade's per-daemon *starting* concurrency, which adaptive
+  concurrency may grow past (the configured default does **not** change that
+  starting concurrency). Turning enforcement on turns that starting point into
+  a global ceiling, so set the value — or raise `default_capacity` — to the
+  intended global cap first. File batches, flex and background requests all
+  share this one per-model ceiling.
 
 The retired settings `requests_per_second`, `burst_size` and `capacity` are
 still accepted so older catalogs load, but they are ignored.

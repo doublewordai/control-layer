@@ -103,6 +103,9 @@ pub struct ProviderPool {
     /// cheap however many organisations have overlays on the alias.
     serving: AliasServing,
     inflight: Option<Arc<InflightLimits>>,
+    /// The alias's global batch in-flight cap, shared across every daemon pod
+    /// and control-layer replica. `None` means batch is uncapped on this alias.
+    batch_inflight: Option<u32>,
 }
 
 /// The serving policy declared on an alias: the presets it offers and its
@@ -187,6 +190,7 @@ impl ProviderPool {
             routing_rules: Vec::new(),
             serving: AliasServing::default(),
             inflight: None,
+            batch_inflight: None,
         }
     }
 
@@ -222,6 +226,7 @@ impl ProviderPool {
             routing_rules,
             serving: AliasServing::default(),
             inflight: None,
+            batch_inflight: None,
         }
     }
 
@@ -243,6 +248,15 @@ impl ProviderPool {
 
     pub fn inflight_limits(&self) -> Option<&Arc<InflightLimits>> {
         self.inflight.as_ref()
+    }
+
+    pub fn with_batch_inflight_limit(mut self, limit: Option<u32>) -> Self {
+        self.batch_inflight = limit;
+        self
+    }
+
+    pub fn batch_inflight_limit(&self) -> Option<u32> {
+        self.batch_inflight
     }
 
     /// Elevated serving classes the alias offers.

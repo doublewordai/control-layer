@@ -237,6 +237,7 @@
           "default": null
         },
         "batch_capacity": {
+          "description": "Dual-purpose batch concurrency. It seeds fusillade's **starting**\nper-daemon concurrency for the model (adaptive concurrency may grow past\nit), and, once `limits.batch_inflight.enforce` is on, it is also the\n**global** onwards cap on batch requests in flight on the alias. A\npositive value is used directly; when omitted, the onwards cap falls back\nto `limits.batch_inflight.default_capacity` (default 200) while\nfusillade's starting concurrency falls back to\n`background_services.batch_daemon.default_model_concurrency`. Raise it to\nthe intended global ceiling before enabling enforcement. The cap is\nshared by file batches, flex and background requests.",
           "type": [
             "integer",
             "null"

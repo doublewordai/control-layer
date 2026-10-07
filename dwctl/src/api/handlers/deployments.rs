@@ -589,6 +589,18 @@ fn validate_realtime_inflight_limit(limit: Option<i32>) -> Result<()> {
     Ok(())
 }
 
+/// A non-positive `batch_capacity` is stored as either a cap of zero (which
+/// refuses every batch request) or a value onwards would read as uncapped, so
+/// reject it before it reaches the database.
+fn validate_batch_capacity(capacity: Option<i32>) -> Result<()> {
+    if capacity.is_some_and(|capacity| capacity < 1) {
+        return Err(Error::BadRequest {
+            message: "batch_capacity must be at least 1".to_string(),
+        });
+    }
+    Ok(())
+}
+
 #[utoipa::path(
     post,
     path = "/models",
@@ -641,6 +653,13 @@ pub async fn create_deployed_model<P: PoolProvider>(
     }
 
     validate_tariff_prices(tariffs.as_deref())?;
+
+    // Validate batch capacity if provided (both standard and composite models).
+    let batch_capacity = match &create {
+        DeployedModelCreate::Standard(s) => s.batch_capacity,
+        DeployedModelCreate::Composite(c) => c.batch_capacity,
+    };
+    validate_batch_capacity(batch_capacity)?;
 
     // Validate throughput is positive if provided
     if let Some(t) = throughput
@@ -846,6 +865,9 @@ pub async fn update_deployed_model<P: PoolProvider>(
     let has_system_access = has_permission(&current_user, resource::Models.into(), operation::SystemAccess.into());
 
     validate_tariff_prices(update.tariffs.as_deref())?;
+
+    // `Some(None)` clears the cap; only a concrete non-positive value is invalid.
+    validate_batch_capacity(update.batch_capacity.flatten())?;
 
     if let Some(Some(t)) = update.throughput
         && t <= 0.0
@@ -2206,6 +2228,48 @@ mod tests {
             .json(&json!({ "realtime_inflight_limit": 0 }))
             .await
             .assert_status_bad_request();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_non_positive_batch_capacity_is_rejected(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let auth = add_auth_headers(&user);
+
+        for invalid in [0, -1] {
+            app.post("/admin/api/v1/models")
+                .add_header(&auth[0].0, &auth[0].1)
+                .add_header(&auth[1].0, &auth[1].1)
+                .json(&json!({ "type": "composite", "model_name": format!("batch-{invalid}"), "alias": format!("batch-{invalid}"), "batch_capacity": invalid }))
+                .await
+                .assert_status_bad_request();
+        }
+
+        let response = app
+            .post("/admin/api/v1/models")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .json(&json!({ "type": "composite", "model_name": "batch-valid", "alias": "batch-valid", "batch_capacity": 5 }))
+            .await;
+        response.assert_status_ok();
+        let created: DeployedModelResponse = response.json();
+
+        for invalid in [0, -1] {
+            app.patch(&format!("/admin/api/v1/models/{}", created.id))
+                .add_header(&auth[0].0, &auth[0].1)
+                .add_header(&auth[1].0, &auth[1].1)
+                .json(&json!({ "batch_capacity": invalid }))
+                .await
+                .assert_status_bad_request();
+        }
+
+        let stored = sqlx::query_scalar::<_, i32>("SELECT batch_capacity FROM deployed_models WHERE id = $1")
+            .bind(created.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, 5, "a rejected update must leave the stored value untouched");
     }
 
     #[dwctl_test_macros::test]
