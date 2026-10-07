@@ -2167,7 +2167,7 @@ pub struct DaemonConfig {
     pub batch_archive_retirement_enabled: bool,
 
     /// Deprecated and ignored: the weekly generation-2 template store is the
-    /// only write path since the generation-1 heap was retired. The key is
+    /// only write path. Existing generation-1 rows remain readable. The key is
     /// still accepted so existing values files keep parsing; a warning is
     /// logged at startup when it is set. Remove it from your configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -57,7 +57,7 @@ async fn generation_two_parent_is_weekly_range_partitioned(pool: PgPool) {
     .unwrap();
     assert!(range_partitioned);
 
-    // The generation-1 heap is retired: nothing but the weekly store remains.
+    // Existing legacy templates remain available during the writer transition.
     let legacy_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'request_templates' \
                         AND relkind IN ('r', 'p'))",
@@ -65,7 +65,10 @@ async fn generation_two_parent_is_weekly_range_partitioned(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(!legacy_exists, "the legacy template heap must be gone");
+    assert!(
+        legacy_exists,
+        "the legacy template heap must remain available"
+    );
 }
 
 #[sqlx::test]
@@ -606,4 +609,58 @@ async fn batch_results_stream_finds_generation_two_templates(pool: PgPool) {
         .expect("stream item must not be an error");
     assert_eq!(item.custom_id.as_deref(), Some("line-0"));
     assert_eq!(item.input_body, serde_json::json!({"gen": 2}));
+}
+
+#[sqlx::test]
+async fn active_view_reads_both_generations_identically(pool: PgPool) {
+    let week = monday(&pool, 0).await;
+    sqlx::query("SELECT ensure_request_template_partition($1, NULL)")
+        .bind(week)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let legacy_file = create_file(&pool).await;
+    let legacy_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO request_templates (file_id, endpoint, method, path, body, model, api_key) \
+         VALUES ($1, 'https://example.invalid', 'POST', '/v1/x', '{\"gen\":1}', \
+                 'test-model', 'test-key') RETURNING id",
+    )
+    .bind(legacy_file)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let g2_file = create_file(&pool).await;
+    let g2_id = insert_g2_template(&pool, week, g2_file).await;
+
+    let bodies: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, body FROM active_request_templates WHERE id = ANY($1) ORDER BY body",
+    )
+    .bind(vec![legacy_id, g2_id])
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        bodies,
+        vec![
+            (legacy_id, "{\"gen\":1}".to_string()),
+            (g2_id, "{\"gen\":2}".to_string())
+        ],
+        "both generations must be visible through one identical view shape"
+    );
+
+    // A soft-deleted file hides its templates in either generation.
+    sqlx::query("UPDATE files SET deleted_at = NOW() WHERE id = ANY($1)")
+        .bind(vec![legacy_file, g2_file])
+        .execute(&pool)
+        .await
+        .unwrap();
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM active_request_templates WHERE id = ANY($1)")
+            .bind(vec![legacy_id, g2_id])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(remaining, 0);
 }

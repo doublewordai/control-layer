@@ -5945,3 +5945,83 @@ async fn direct_realtime_retained_conflicting_route_rolls_back_siblings(pool: Pg
         .fetch_one(&pool).await.unwrap();
     assert_eq!(payloads_and_groups, 0);
 }
+
+// Model requests created by the preceding writer version without changing
+// their identity or payload. Only the template storage generation changes.
+async fn move_fixture_template_to_legacy(pool: &PgPool, graph: &LiveGraph) {
+    sqlx::query(
+        "WITH moved AS (
+            DELETE FROM request_templates_g2 WHERE id = ANY($1) RETURNING *
+         ) INSERT INTO request_templates (
+            id, file_id, endpoint, method, path, body, model, api_key, created_at,
+            updated_at, custom_id, line_number, body_byte_size, metadata
+         ) SELECT id, file_id, endpoint, method, path, body, model, api_key, created_at,
+                  updated_at, custom_id, line_number, body_byte_size, metadata FROM moved",
+    )
+    .bind(&graph.template_ids)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM request_template_routes WHERE template_id = ANY($1)")
+        .bind(&graph.template_ids)
+        .execute(pool)
+        .await
+        .unwrap();
+    assert_wholly_live(pool, graph).await;
+}
+
+#[sqlx::test]
+async fn archives_existing_legacy_and_new_generation_two_requests(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
+    let manager = manager(&pool).await;
+    for legacy in [true, false] {
+        let graph = singleton(
+            &pool,
+            "flex",
+            TerminalState::Completed,
+            timestamp("2026-08-01T10:00:00Z"),
+            "generation-transition",
+        )
+        .await;
+        if legacy {
+            move_fixture_template_to_legacy(&pool, &graph).await;
+        }
+        let outcome = archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(outcome.groups_archived, 1);
+        assert_eq!(outcome.templates_archived, 1);
+        assert_wholly_retained(&pool, &graph).await;
+        assert_eq!(
+            count_ids(&pool, "request_templates", &graph.template_ids).await,
+            0
+        );
+    }
+}
+
+#[sqlx::test]
+async fn erases_existing_legacy_and_new_generation_two_requests(pool: PgPool) {
+    let manager = manager(&pool).await;
+    for legacy in [true, false] {
+        let graph = singleton(
+            &pool,
+            "flex",
+            TerminalState::Completed,
+            timestamp("2026-08-01T10:00:00Z"),
+            "generation-transition",
+        )
+        .await;
+        if legacy {
+            move_fixture_template_to_legacy(&pool, &graph).await;
+        }
+        assert_eq!(
+            manager
+                .delete_owned_response_group(graph.request_ids[0], OWNER)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_wholly_erased(&pool, &graph).await;
+    }
+}

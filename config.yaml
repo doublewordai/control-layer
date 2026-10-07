@@ -867,8 +867,8 @@ background_services:
     # batch_archive_retirement_enabled: false
     # batch_archive_retention_days: <positive days>
     # DEPRECATED and ignored: request templates are always written to the
-    # weekly generation-2 partitions now that the generation-1 heap has been
-    # retired. The key still parses so existing values files keep loading,
+    # weekly generation-2 partitions. Existing generation-1 rows remain
+    # readable. The key still parses so existing values files keep loading,
     # but it logs a warning at startup. Remove it.
     # template_generation_writes_enabled: false
     # File-content expiry + weekly template partition retirement. Tombstones

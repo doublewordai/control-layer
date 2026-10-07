@@ -1,6 +1,6 @@
 //! Row-level helpers for the generation-2 request template store.
 //!
-//! Every template lives in a weekly `request_templates_g2` partition and is
+//! Every new template lives in a weekly `request_templates_g2` partition and is
 //! located through its `request_template_routes` row, so any point write or
 //! delete has to touch both relations together: a template without a route is
 //! unreachable, and a route without a template is a dangling location oracle.
@@ -135,28 +135,38 @@ pub(crate) async fn delete_dedicated_templates(
         WHERE route.template_id = removed.id
         "#
     );
-    sqlx::query(&sql)
+    let removed_g2 = sqlx::query(&sql)
         .bind(template_ids)
         .execute(&mut *conn)
-        .await
-        .map(|result| result.rows_affected())
+        .await?
+        .rows_affected();
+    let legacy_sql = format!(
+        "DELETE FROM request_templates template WHERE template.id = ANY($1) \
+         AND template.file_id IS NULL {reference_guard}"
+    );
+    let removed_legacy = sqlx::query(&legacy_sql)
+        .bind(template_ids)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+    Ok(removed_g2 + removed_legacy)
 }
 
-/// Count how many of the ids still resolve to a template row through the
-/// route oracle.
+/// Count templates in either generation, resolving generation 2 through its route.
 pub(crate) async fn count_templates(
     conn: &mut PgConnection,
     template_ids: &[Uuid],
 ) -> std::result::Result<i64, sqlx::Error> {
     sqlx::query_scalar(
         r#"
+        SELECT (SELECT COUNT(*) FROM request_templates WHERE id = ANY($1)) + (
         SELECT COUNT(*)
         FROM request_template_routes route
         JOIN request_templates_g2 template
           ON template.created_on >= route.week_start
          AND template.created_on < route.week_start + 7
          AND template.id = route.template_id
-        WHERE route.template_id = ANY($1)
+        WHERE route.template_id = ANY($1))
         "#,
     )
     .bind(template_ids)

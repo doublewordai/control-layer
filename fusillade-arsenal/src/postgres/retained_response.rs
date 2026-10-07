@@ -2264,7 +2264,7 @@ async fn lock_live_graph_for_erasure(
     template_ids.sort_unstable();
     template_ids.dedup();
     if !template_ids.is_empty() {
-        let locked_templates: Vec<Uuid> = sqlx::query_scalar(
+        let mut locked_templates: Vec<Uuid> = sqlx::query_scalar(
             r#"
             SELECT template.id
             FROM request_template_routes route
@@ -2281,6 +2281,15 @@ async fn lock_live_graph_for_erasure(
         .fetch_all(&mut **tx)
         .await
         .map_err(database_failure)?;
+        let legacy_templates: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM request_templates WHERE id = ANY($1) ORDER BY id FOR UPDATE",
+        )
+        .bind(&template_ids)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(database_failure)?;
+        locked_templates.extend(legacy_templates);
+        locked_templates.sort_unstable();
         if locked_templates != template_ids {
             return Err(incomplete_graph());
         }
@@ -3600,7 +3609,7 @@ async fn move_graph<P: PoolProvider>(
     if template_ids.windows(2).any(|ids| ids[0] == ids[1]) {
         return Err(incomplete_graph());
     }
-    let template_rows = sqlx::query(
+    let mut template_rows = sqlx::query(
         r#"
         SELECT template.id, template.file_id, template.custom_id, template.endpoint,
                template.method, template.path, template.body, template.model,
@@ -3620,6 +3629,16 @@ async fn move_graph<P: PoolProvider>(
     .fetch_all(&mut *tx)
     .await
     .map_err(database_failure)?;
+    let legacy_rows = sqlx::query(
+        "SELECT id, file_id, custom_id, endpoint, method, path, body, model,
+                api_key, line_number, body_byte_size, metadata, created_at, updated_at
+         FROM request_templates WHERE id = ANY($1) ORDER BY id FOR UPDATE SKIP LOCKED",
+    )
+    .bind(&template_ids)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(database_failure)?;
+    template_rows.extend(legacy_rows);
     if template_rows.len() != template_ids.len() {
         let existing = template_store::count_templates(&mut tx, &template_ids)
             .await

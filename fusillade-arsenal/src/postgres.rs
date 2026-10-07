@@ -537,6 +537,17 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         self
     }
 
+    /// Compatibility builder. All new templates now use generation 2.
+    /// The argument is accepted so existing callers continue to compile.
+    pub fn with_template_generation_writes(self, _enabled: bool) -> Self {
+        self
+    }
+
+    /// New templates are always written to generation 2.
+    pub fn template_generation_writes_enabled(&self) -> bool {
+        true
+    }
+
     /// Install the single-session pool used only for partition-maintenance
     /// DDL. The pool shape is validated here so enabling retirement can be
     /// checked synchronously before a daemon acquires leadership.
@@ -8454,6 +8465,24 @@ const PURGE_DELETED_BATCH_ARCHIVED_REQUESTS: &str = r#"
             "#;
 
 const PURGE_DELETED_FILE_TEMPLATES: &str = r#"
+            DELETE FROM request_templates
+            WHERE id IN (
+                SELECT template.id
+                FROM (SELECT id FROM files
+                      WHERE deleted_at IS NOT NULL
+                        AND retention_expired_at IS NULL) file,
+                LATERAL (
+                    SELECT id
+                    FROM request_templates
+                    WHERE file_id = file.id
+                    LIMIT $1
+                    FOR UPDATE SKIP LOCKED
+                ) template
+                LIMIT $1
+            )
+            "#;
+
+const PURGE_DELETED_FILE_G2_TEMPLATES: &str = r#"
             WITH doomed AS (
                 SELECT template.created_on, template.id
                 FROM (SELECT id FROM files
@@ -9018,9 +9047,23 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
                 FusilladeError::Other(anyhow!("Failed to purge orphaned request templates: {e}"))
             })?
             .rows_affected() as i64;
-        // Missing templates are failed by the bounded claim paths. Do not
-        // scan the entire pending backlog on otherwise idle purge ticks.
-        let total = (requests_deleted + archived_deleted + templates_deleted) as u64;
+
+        // Step 2b: the generation-2 twin of step 2. Same explicit-deletion
+        // tombstone rule (`retention_expired_at IS NULL`); routes are removed
+        // atomically with their template rows so no dangling location oracle
+        // survives an erasure.
+        let g2_templates_deleted = sqlx::query(PURGE_DELETED_FILE_G2_TEMPLATES)
+            .bind(batch_size)
+            .execute(self.write_executor())
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!(
+                    "Failed to purge orphaned generation-2 templates: {e}"
+                ))
+            })?
+            .rows_affected() as i64;
+        let total =
+            (requests_deleted + archived_deleted + templates_deleted + g2_templates_deleted) as u64;
         if total > 0 {
             tracing::info!(
                 requests_deleted,
