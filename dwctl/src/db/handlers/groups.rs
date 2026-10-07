@@ -1157,8 +1157,6 @@ mod tests {
             name: "CASCADE Test Key".to_string(),
             description: Some("API key for CASCADE delete test".to_string()),
             purpose: ApiKeyPurpose::Realtime,
-            requests_per_second: None,
-            burst_size: None,
             created_by: test_user_id,
             spend_limit: None,
             spend_limit_interval: None,

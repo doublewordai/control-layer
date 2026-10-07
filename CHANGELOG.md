@@ -1,5 +1,60 @@
 # Changelog
 
+## [13.2.0](https://github.com/doublewordai/control-layer/compare/v13.1.2...v13.2.0) (2026-10-07)
+
+
+### Features
+
+* **limits:** cap batch requests in flight per model in onwards ([#1924](https://github.com/doublewordai/control-layer/issues/1924)) ([834827d](https://github.com/doublewordai/control-layer/commit/834827dbc2b09604e9759f8b715eb85b3e2c1e22))
+
+
+### Bug Fixes
+
+* **deps:** update undici to 7.29.1 ([#1933](https://github.com/doublewordai/control-layer/issues/1933)) ([c73c641](https://github.com/doublewordai/control-layer/commit/c73c64132731b91ae2aae466e8498736902da962))
+
+## [13.1.2](https://github.com/doublewordai/control-layer/compare/v13.1.1...v13.1.2) (2026-10-07)
+
+
+### Bug Fixes
+
+* preserve JSON key order in forwarded request bodies ([#1930](https://github.com/doublewordai/control-layer/issues/1930)) ([a8721a8](https://github.com/doublewordai/control-layer/commit/a8721a8ca8886b2437648131488a833e9461be0f))
+* set TCP_NODELAY on gateway sockets ([#1931](https://github.com/doublewordai/control-layer/issues/1931)) ([909a27e](https://github.com/doublewordai/control-layer/commit/909a27e95f7ace63385c8b8d3872b5a2290dd0d3))
+
+## [13.1.1](https://github.com/doublewordai/control-layer/compare/v13.1.0...v13.1.1) (2026-10-07)
+
+
+### Bug Fixes
+
+* **notifications:** send organization low-balance alerts to owners and admins ([#1863](https://github.com/doublewordai/control-layer/issues/1863)) ([c90dc91](https://github.com/doublewordai/control-layer/commit/c90dc913290fb0b57f0a6c0b449f9f3b6f545671))
+
+## [13.1.0](https://github.com/doublewordai/control-layer/compare/v13.0.0...v13.1.0) (2026-10-06)
+
+
+### Features
+
+* **onwards:** flag chat parameters not every backend supports ([#1925](https://github.com/doublewordai/control-layer/issues/1925)) ([b2271fb](https://github.com/doublewordai/control-layer/commit/b2271fb2b626d760937cfaf7ed77b0b0a6fe5ecb))
+
+
+### Bug Fixes
+
+* **security:** avoid raw HTML in chart styles (DW-927) ([#1926](https://github.com/doublewordai/control-layer/issues/1926)) ([312e7a3](https://github.com/doublewordai/control-layer/commit/312e7a3e991fe57629b92da4aaf10fd9619368ba))
+
+## [13.0.0](https://github.com/doublewordai/control-layer/compare/v12.11.3...v13.0.0) (2026-10-06)
+
+
+### ⚠ BREAKING CHANGES
+
+* **limits:** replace gateway rate limits with per-account realtime in-flight limits ([#1915](https://github.com/doublewordai/control-layer/issues/1915))
+
+### Features
+
+* **limits:** replace gateway rate limits with per-account realtime in-flight limits ([#1915](https://github.com/doublewordai/control-layer/issues/1915)) ([be53043](https://github.com/doublewordai/control-layer/commit/be530434b6d2fec1c5c2cfa0c366c9ced6954a5e))
+
+
+### Bug Fixes
+
+* **deps:** resolve patched js-yaml in dashboard lockfile ([#1918](https://github.com/doublewordai/control-layer/issues/1918)) ([5b53b45](https://github.com/doublewordai/control-layer/commit/5b53b45eb742367d27e2a3cb20615541aa274459))
+
 ## [12.11.3](https://github.com/doublewordai/control-layer/compare/v12.11.2...v12.11.3) (2026-10-03)
 
 

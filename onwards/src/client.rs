@@ -56,6 +56,10 @@ pub fn create_hyper_client(
     // zombies within ~105s.
     http_connector.set_keepalive(Some(Duration::from_secs(60)));
 
+    // Send each write immediately rather than holding small writes until the
+    // upstream acknowledges the previous segment (Nagle's algorithm).
+    http_connector.set_nodelay(true);
+
     let https = hyper_tls::HttpsConnector::new_with_connector(http_connector);
 
     tracing::info!(

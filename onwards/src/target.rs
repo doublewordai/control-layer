@@ -16,6 +16,7 @@
 use crate::affinity::AffinityConfig;
 use crate::aimd::AimdConfig;
 use crate::auth::KeySet;
+use crate::inflight::InflightLimits;
 use crate::load_balancer::{Provider, ProviderPool};
 use crate::reasoning::ReasoningTranslationConfig;
 use crate::serving::{AccountServing, ProviderKind, ServingOverlay, ServingPresets};
@@ -438,6 +439,20 @@ pub struct PoolSpec {
     #[serde(default)]
     pub overlays: HashMap<String, ServingOverlay>,
 
+    #[serde(default)]
+    pub inflight_limit: Option<u32>,
+
+    /// The alias's global batch in-flight cap. Distinct from `inflight_limit`,
+    /// which applies to realtime traffic only: batch requests are counted on
+    /// the named alias across every replica, and over the cap are refused with
+    /// 529 so the batch dispatcher backs off.
+    #[serde(default)]
+    pub batch_inflight_limit: Option<u32>,
+
+    #[serde(default)]
+    #[builder(default)]
+    pub account_inflight_limits: HashMap<String, u32>,
+
     /// The list of providers to load balance across
     pub providers: Vec<ProviderSpec>,
 }
@@ -560,6 +575,9 @@ pub struct PoolConfig {
     pub routing_rules: Vec<RoutingRule>,
     pub serving_classes: ServingPresets,
     pub overlays: HashMap<String, ServingOverlay>,
+    pub inflight_limit: Option<u32>,
+    pub batch_inflight_limit: Option<u32>,
+    pub account_inflight_limits: HashMap<String, u32>,
     pub providers: Vec<ProviderSpec>,
 }
 
@@ -577,6 +595,9 @@ impl From<PoolSpec> for PoolConfig {
             routing_rules: pool.routing_rules,
             serving_classes: pool.serving_classes,
             overlays: pool.overlays,
+            inflight_limit: pool.inflight_limit,
+            batch_inflight_limit: pool.batch_inflight_limit,
+            account_inflight_limits: pool.account_inflight_limits,
             providers: pool.providers,
         }
     }
@@ -723,6 +744,9 @@ impl TargetSpecOrList {
                     routing_rules: Vec::new(),
                     serving_classes: ServingPresets::new(),
                     overlays: HashMap::new(),
+                    inflight_limit: None,
+                    batch_inflight_limit: None,
+                    account_inflight_limits: HashMap::new(),
                     providers,
                 })
             }
@@ -764,6 +788,9 @@ impl TargetSpecOrList {
                     routing_rules: Vec::new(),
                     serving_classes: ServingPresets::new(),
                     overlays: HashMap::new(),
+                    inflight_limit: None,
+                    batch_inflight_limit: None,
+                    account_inflight_limits: HashMap::new(),
                     providers: vec![provider],
                 })
             }
@@ -1482,7 +1509,12 @@ fn build_pool(
         pool_config.trusted,
         pool_config.routing_rules,
     )
-    .with_serving(pool_config.serving_classes, pool_config.overlays))
+    .with_serving(pool_config.serving_classes, pool_config.overlays)
+    .with_inflight_limits(pool_config.inflight_limit.map(|default| InflightLimits {
+        default,
+        accounts: pool_config.account_inflight_limits,
+    }))
+    .with_batch_inflight_limit(pool_config.batch_inflight_limit))
 }
 
 impl Targets {
@@ -2787,6 +2819,66 @@ mod tests {
     }
 
     #[test]
+    fn inflight_limits_parse_onto_the_alias() {
+        let config: ConfigFile = serde_json::from_value(serde_json::json!({
+            "auth": {
+                "global_keys": [],
+                "key_definitions": {
+                    "acme_backend": { "key": "sk-acme-1", "labels": { "account": "acme" } }
+                }
+            },
+            "targets": {
+                "gpt-4": {
+                    "inflight_limit": 20,
+                    "batch_inflight_limit": 7,
+                    "account_inflight_limits": { "acme": 200 },
+                    "providers": [{ "url": "https://api.openai.com", "onwards_key": "sk-upstream" }]
+                },
+                "unlimited": {
+                    "providers": [{ "url": "https://api.openai.com" }]
+                }
+            }
+        }))
+        .unwrap();
+        let targets = Targets::from_config(config).unwrap();
+
+        let limits = targets
+            .targets
+            .get("gpt-4")
+            .and_then(|pools| pools.default_pool().inflight_limits().cloned())
+            .unwrap();
+        assert_eq!(limits.for_account("acme"), 200);
+        assert_eq!(limits.for_account("someone-else"), 20);
+        assert_eq!(
+            targets
+                .targets
+                .get("gpt-4")
+                .unwrap()
+                .default_pool()
+                .batch_inflight_limit(),
+            Some(7)
+        );
+        assert!(
+            targets
+                .targets
+                .get("unlimited")
+                .unwrap()
+                .default_pool()
+                .inflight_limits()
+                .is_none()
+        );
+        assert!(
+            targets
+                .targets
+                .get("unlimited")
+                .unwrap()
+                .default_pool()
+                .batch_inflight_limit()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn test_trusted_field_preserved_in_pool_conversion() {
         // Test PoolSpec -> PoolConfig conversion
         let pool_spec = PoolSpec {
@@ -2819,6 +2911,9 @@ mod tests {
             }],
             serving_classes: Default::default(),
             overlays: Default::default(),
+            inflight_limit: None,
+            batch_inflight_limit: None,
+            account_inflight_limits: Default::default(),
         };
 
         let pool_config = TargetSpecOrList::Pool(pool_spec)

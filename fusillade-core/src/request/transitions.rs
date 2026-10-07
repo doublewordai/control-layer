@@ -73,6 +73,7 @@
 //!     backoff_ms: 1000,         // Start with 1 second
 //!     backoff_factor: 2,        // Double each time (1s, 2s, 4s)
 //!     max_backoff_ms: 60000,    // Cap at 60 seconds
+//!     max_capacity_reschedule_age_ms: Some(3_600_000),
 //! };
 //! ```
 //!
@@ -111,7 +112,7 @@ use crate::{FusilladeError, error::Result, manager::Storage};
 
 use super::types::{
     Canceled, Claimed, Completed, DaemonId, Failed, FailureReason, HttpResponse, Pending,
-    Processing, Request, RequestCompletionResult,
+    Processing, Request, RequestCompletionResult, is_batch_capacity_exceeded_response,
 };
 
 /// Reason for cancelling a request.
@@ -250,6 +251,12 @@ impl Request<Claimed> {
     }
 }
 
+/// Default age bound, in milliseconds, for rescheduling a batch
+/// admission-control refusal (`batch_capacity_exceeded`) on a request that has
+/// no batch deadline. One hour is long enough to ride out transient capacity
+/// pressure while still guaranteeing the reschedule terminates.
+pub const DEFAULT_MAX_CAPACITY_RESCHEDULE_AGE_MS: i64 = 3_600_000;
+
 /// Configuration for retry behavior.
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
@@ -258,6 +265,18 @@ pub struct RetryConfig {
     pub backoff_ms: u64,
     pub backoff_factor: u64,
     pub max_backoff_ms: u64,
+    /// Maximum age, in milliseconds measured from the request's `created_at`
+    /// metadata, for which an admission-control refusal
+    /// (`batch_capacity_exceeded`, see [`FailureReason::is_batch_capacity_exceeded`])
+    /// may still be rescheduled.
+    ///
+    /// This is the only termination for such refusals on requests without a
+    /// batch deadline: they do not spend a retry attempt, so `max_retries`
+    /// never stops them. `None` disables the bound (reschedule indefinitely).
+    /// Requests with a batch deadline are bounded by the deadline cut-off
+    /// instead. The daemon starts from
+    /// [`DEFAULT_MAX_CAPACITY_RESCHEDULE_AGE_MS`].
+    pub max_capacity_reschedule_age_ms: Option<i64>,
 }
 
 impl Request<Failed> {
@@ -277,6 +296,31 @@ impl Request<Failed> {
         retry_attempt: u32,
         config: RetryConfig,
     ) -> std::result::Result<Request<Pending>, Box<Self>> {
+        self.reschedule_retry(retry_attempt, config, true)
+    }
+
+    /// Reschedule this failure without spending a retry attempt.
+    ///
+    /// Used for the gateway's batch admission-control refusal
+    /// ([`FailureReason::is_batch_capacity_exceeded`]): the request was not
+    /// attempted against a provider, it was only asked to wait for a slot, so
+    /// it must not be charged an attempt. Backoff and the deadline cut-off are
+    /// the same as [`Self::can_retry`], so a request that can no longer finish
+    /// in its window still fails here.
+    pub fn can_retry_without_spending_attempt(
+        self,
+        retry_attempt: u32,
+        config: RetryConfig,
+    ) -> std::result::Result<Request<Pending>, Box<Self>> {
+        self.reschedule_retry(retry_attempt, config, false)
+    }
+
+    fn reschedule_retry(
+        self,
+        retry_attempt: u32,
+        config: RetryConfig,
+        spend_attempt: bool,
+    ) -> std::result::Result<Request<Pending>, Box<Self>> {
         // Calculate exponential backoff: backoff_ms * (backoff_factor ^ retry_attempt)
         let backoff_duration = {
             let exponential = config
@@ -288,8 +332,26 @@ impl Request<Failed> {
         let now = chrono::Utc::now();
         let not_before = now + chrono::Duration::milliseconds(backoff_duration as i64);
 
-        if let Some(max_retries) = config.max_retries
+        // Admission-control reschedules do not spend attempts, so they are not
+        // bounded by `max_retries`. For requests with a batch deadline the
+        // deadline below still stops them; for requests without one, stop once
+        // the request is older than the configured bound instead.
+        if spend_attempt
+            && let Some(max_retries) = config.max_retries
             && retry_attempt >= max_retries
+        {
+            return Err(Box::new(self));
+        }
+
+        if !spend_attempt
+            && self.state.batch_expires_at.is_none()
+            && let Some(max_age_ms) = config.max_capacity_reschedule_age_ms
+            && let Some(created_at) = self
+                .data
+                .batch_metadata
+                .get("created_at")
+                .and_then(|value| value.parse::<chrono::DateTime<chrono::Utc>>().ok())
+            && now.signed_duration_since(created_at) >= chrono::Duration::milliseconds(max_age_ms)
         {
             return Err(Box::new(self));
         }
@@ -314,7 +376,11 @@ impl Request<Failed> {
         let request = Request {
             data: self.data,
             state: Pending {
-                retry_attempt: retry_attempt + 1,
+                retry_attempt: if spend_attempt {
+                    retry_attempt + 1
+                } else {
+                    retry_attempt
+                },
                 not_before: Some(not_before),
                 batch_expires_at: self.state.batch_expires_at,
             },
@@ -403,8 +469,16 @@ impl Request<Processing> {
                 // Check if this is an error response (4xx or 5xx)
                 let is_error = http_response.status >= 400;
 
+                // A batch admission-control refusal (a 529 carrying
+                // `batch_capacity_exceeded`) must reschedule even when the
+                // configured `should_retry` predicate rejects 529s. Take the
+                // retriable path so the refusal is not persisted as a terminal
+                // failure; the daemon still skips spending an attempt for it.
+                let batch_capacity_refusal =
+                    is_batch_capacity_exceeded_response(http_response.status, &http_response.body);
+
                 // Check if this response should be retried
-                if should_retry(&http_response) {
+                if should_retry(&http_response) || batch_capacity_refusal {
                     // Treat as failure for retry purposes
                     let failed_state = Failed {
                         reason: FailureReason::RetriableHttpStatus {
@@ -569,6 +643,7 @@ mod background_tests {
             backoff_ms: 1,
             backoff_factor: 2,
             max_backoff_ms: 10,
+            max_capacity_reschedule_age_ms: Some(3_600_000),
         }
     }
 
@@ -595,5 +670,190 @@ mod background_tests {
     #[test]
     fn background_retry_still_honors_retry_count() {
         assert!(failed_request(None).can_retry(2, retry_config()).is_err());
+    }
+
+    fn failed_request_with_reason(
+        reason: FailureReason,
+        retry_attempt: u32,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Request<Failed> {
+        let mut request = failed_request(deadline);
+        request.state.reason = reason;
+        request.state.retry_attempt = retry_attempt;
+        request
+    }
+
+    fn batch_capacity_body() -> String {
+        format!(
+            r#"{{"error":{{"type":"overloaded_error","code":"{}"}}}}"#,
+            crate::request::types::BATCH_CAPACITY_EXCEEDED_CODE
+        )
+    }
+
+    #[test]
+    fn batch_capacity_529_reschedules_without_spending_an_attempt() {
+        let request = failed_request_with_reason(
+            FailureReason::RetriableHttpStatus {
+                status: 529,
+                body: batch_capacity_body(),
+            },
+            2,
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        );
+        assert!(request.state.reason.is_batch_capacity_exceeded());
+
+        let pending = request
+            .can_retry_without_spending_attempt(2, retry_config())
+            .expect("admission control is rescheduled");
+        assert_eq!(
+            pending.state.retry_attempt, 2,
+            "the refusal must not consume a retry attempt"
+        );
+        assert!(pending.state.not_before.is_some(), "normal backoff applies");
+    }
+
+    #[test]
+    fn ordinary_529_still_spends_an_attempt() {
+        let request = failed_request_with_reason(
+            FailureReason::RetriableHttpStatus {
+                status: 529,
+                body: r#"{"error":{"type":"overloaded_error"}}"#.to_string(),
+            },
+            1,
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        );
+        assert!(!request.state.reason.is_batch_capacity_exceeded());
+
+        let pending = request.can_retry(1, retry_config()).expect("rescheduled");
+        assert_eq!(pending.state.retry_attempt, 2);
+    }
+
+    #[test]
+    fn batch_capacity_529_still_honours_the_deadline_cutoff() {
+        // The effective deadline is in the past, so even an admission-control
+        // reschedule must fail rather than keep waiting.
+        let expired = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let request = failed_request_with_reason(
+            FailureReason::RetriableHttpStatus {
+                status: 529,
+                body: batch_capacity_body(),
+            },
+            2,
+            Some(expired),
+        );
+        assert!(
+            request
+                .can_retry_without_spending_attempt(2, retry_config())
+                .is_err(),
+            "the request can no longer finish in its window"
+        );
+    }
+
+    fn with_created_at(
+        mut request: Request<Failed>,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Request<Failed> {
+        request
+            .data
+            .batch_metadata
+            .insert("created_at".to_string(), created_at.to_rfc3339());
+        request
+    }
+
+    #[test]
+    fn batch_capacity_529_without_deadline_stops_at_the_age_bound() {
+        // No batch deadline means the deadline cut-off never fires, so the age
+        // bound has to stop an otherwise endless stream of admission refusals.
+        let request = with_created_at(
+            failed_request_with_reason(
+                FailureReason::RetriableHttpStatus {
+                    status: 529,
+                    body: batch_capacity_body(),
+                },
+                0,
+                None,
+            ),
+            chrono::Utc::now() - chrono::Duration::milliseconds(3_600_001),
+        );
+
+        assert!(
+            request
+                .can_retry_without_spending_attempt(0, retry_config())
+                .is_err(),
+            "a deadline-less request must stop once it is older than the bound"
+        );
+    }
+
+    #[test]
+    fn batch_capacity_529_without_deadline_reschedules_within_the_age_bound() {
+        let request = with_created_at(
+            failed_request_with_reason(
+                FailureReason::RetriableHttpStatus {
+                    status: 529,
+                    body: batch_capacity_body(),
+                },
+                0,
+                None,
+            ),
+            chrono::Utc::now() - chrono::Duration::seconds(1),
+        );
+
+        assert!(
+            request
+                .can_retry_without_spending_attempt(0, retry_config())
+                .is_ok(),
+            "a young deadline-less request is still rescheduled"
+        );
+    }
+
+    #[test]
+    fn batch_capacity_529_with_deadline_ignores_the_age_bound() {
+        // A request with a deadline is bounded by that deadline, even when it
+        // is already older than the deadline-less age bound.
+        let request = with_created_at(
+            failed_request_with_reason(
+                FailureReason::RetriableHttpStatus {
+                    status: 529,
+                    body: batch_capacity_body(),
+                },
+                0,
+                Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            ),
+            chrono::Utc::now() - chrono::Duration::hours(2),
+        );
+
+        assert!(
+            request
+                .can_retry_without_spending_attempt(0, retry_config())
+                .is_ok(),
+            "the batch deadline, not the age bound, governs requests with one"
+        );
+    }
+
+    #[test]
+    fn batch_capacity_recognition_requires_a_529_with_the_code() {
+        for reason in [
+            FailureReason::RetriableHttpStatus {
+                status: 429,
+                body: batch_capacity_body(),
+            },
+            FailureReason::NonRetriableHttpStatus {
+                status: 529,
+                body: "not json".to_string(),
+            },
+            FailureReason::Timeout {
+                error: "timed out".to_string(),
+            },
+        ] {
+            assert!(!reason.is_batch_capacity_exceeded(), "{reason:?}");
+        }
+
+        assert!(
+            FailureReason::NonRetriableHttpStatus {
+                status: 529,
+                body: batch_capacity_body(),
+            }
+            .is_batch_capacity_exceeded()
+        );
     }
 }

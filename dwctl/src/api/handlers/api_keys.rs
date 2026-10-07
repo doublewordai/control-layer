@@ -491,13 +491,13 @@ pub async fn get_user_api_key<P: PoolProvider>(
     Ok(Json(ApiKeyInfoResponse::from(api_key).with_spend_state(spend_states.get(&key_id))))
 }
 
-/// Update a specific API key: metadata, rate limits, and the spending cap.
+/// Update a specific API key: metadata and the spending cap.
 #[utoipa::path(
     patch,
     path = "/users/{user_id}/api-keys/{id}",
     tag = "api_keys",
     summary = "Update API key",
-    description = "Update an API key's name, description, rate limits, or spending cap. \
+    description = "Update an API key's name, description, or spending cap. \
                    Setting a cap where none existed provisions cap-scope batch/flex execution and starts a fresh spend window; \
                    changing the cap interval or passing reset_window also restarts the window; \
                    passing spend_limit: null removes the cap.",
@@ -624,8 +624,8 @@ pub async fn update_user_api_key<P: PoolProvider>(
         });
     }
 
-    // Generic metadata/rate-limit fields via the existing repository update.
-    if data.name.is_some() || data.description.is_some() || data.requests_per_second.is_some() || data.burst_size.is_some() {
+    // Generic metadata fields via the existing repository update.
+    if data.name.is_some() || data.description.is_some() {
         if let Some(name) = &data.name
             && name.trim().is_empty()
         {
@@ -638,8 +638,6 @@ pub async fn update_user_api_key<P: PoolProvider>(
             &ApiKeyUpdateDBRequest {
                 name: data.name.clone(),
                 description: data.description.clone(),
-                requests_per_second: data.requests_per_second,
-                burst_size: data.burst_size,
             },
         )
         .await?;
@@ -1269,7 +1267,6 @@ mod tests {
     #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_capped_key_end_to_end_402(pool: PgPool) {
-        use crate::config::RateLimitTiersConfig;
         use crate::db::handlers::{Credits, Tariffs};
         use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
         use crate::db::models::tariffs::TariffCreateDBRequest;
@@ -1333,10 +1330,7 @@ mod tests {
             .unwrap();
 
         // Under the cap: both scope keys are in the paid pool.
-        let tiers = RateLimitTiersConfig::default();
-        let targets = crate::sync::onwards_config::load_targets_from_db(&pool, &[], false, &tiers)
-            .await
-            .unwrap();
+        let targets = crate::sync::onwards_config::load_targets_from_db(&pool, &[], false).await.unwrap();
         let has_key = |targets: &onwards::target::Targets, secret: &str| {
             let expected = ConstantTimeString::from(secret.to_string());
             targets.targets.get("cap-e2e-model").is_some_and(|p| {
@@ -1356,9 +1350,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let targets = crate::sync::onwards_config::load_targets_from_db(&pool, &[], false, &tiers)
-            .await
-            .unwrap();
+        let targets = crate::sync::onwards_config::load_targets_from_db(&pool, &[], false).await.unwrap();
         assert!(!has_key(&targets, &created.key), "exhausted root must leave the paid pool");
         assert!(!has_key(&targets, &child_secret), "the child is yanked with its root");
 

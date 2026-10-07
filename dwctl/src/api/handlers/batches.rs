@@ -4826,8 +4826,6 @@ mod tests {
                 name: "capped-batch-key".to_string(),
                 description: None,
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: Some(rust_decimal::Decimal::from(10)),
                 spend_limit_interval: None,

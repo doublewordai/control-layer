@@ -632,8 +632,8 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             let flex_stream_include_usage =
                 flex_stream && is_chat_completions_api && request_value["stream_options"]["include_usage"].as_bool().unwrap_or(false);
             if flex_stream && let Some(obj) = request_value.as_object_mut() {
-                obj.remove("stream");
-                obj.remove("stream_options");
+                obj.shift_remove("stream");
+                obj.shift_remove("stream_options");
             }
 
             // For ZDR, encrypt the body and store the per-request keys; any
@@ -1359,7 +1359,7 @@ fn scrub_request_id_fields(value: &mut serde_json::Value) -> bool {
     let mut scrubbed = false;
     if let Some(obj) = value.as_object_mut() {
         for key in SCRUB_ID_KEYS {
-            scrubbed |= obj.remove(key).is_some();
+            scrubbed |= obj.shift_remove(key).is_some();
         }
     }
     scrubbed
@@ -1391,7 +1391,7 @@ fn scrub_request_id_fields(value: &mut serde_json::Value) -> bool {
 pub(crate) fn strip_scheduling_priority(value: &mut serde_json::Value) -> bool {
     let mut scrubbed = false;
     if let Some(obj) = value.as_object_mut() {
-        scrubbed |= obj.remove("priority").is_some();
+        scrubbed |= obj.shift_remove("priority").is_some();
         // The carrier the dynamo frontend ACTUALLY honours is
         // `nvext.agent_hints.priority` (a top-level `priority` is rejected by
         // its validation) — remove exactly that key so an external caller
@@ -1400,7 +1400,7 @@ pub(crate) fn strip_scheduling_priority(value: &mut serde_json::Value) -> bool {
         if let Some(nvext) = obj.get_mut("nvext").and_then(|n| n.as_object_mut()) {
             scrubbed |= onwards::serving::scrub_router_targets(nvext);
             if let Some(hints) = nvext.get_mut("agent_hints").and_then(|h| h.as_object_mut()) {
-                scrubbed |= hints.remove("priority").is_some();
+                scrubbed |= hints.shift_remove("priority").is_some();
             }
         }
     }
@@ -1673,8 +1673,6 @@ mod tests {
                     name: "Org realtime key".to_string(),
                     description: None,
                     purpose: ApiKeyPurpose::Realtime,
-                    requests_per_second: None,
-                    burst_size: None,
                     member_id: None,
                     spend_limit: None,
                     spend_limit_interval: None,
@@ -1736,8 +1734,6 @@ mod tests {
                         name: "Org background key".to_string(),
                         description: None,
                         purpose: ApiKeyPurpose::Realtime,
-                        requests_per_second: None,
-                        burst_size: None,
                         member_id: None,
                         spend_limit: None,
                         spend_limit_interval: None,
@@ -1786,8 +1782,6 @@ mod tests {
                         name: "Foreground-only key".to_string(),
                         description: None,
                         purpose: ApiKeyPurpose::Realtime,
-                        requests_per_second: None,
-                        burst_size: None,
                         member_id: None,
                         spend_limit: None,
                         spend_limit_interval: None,

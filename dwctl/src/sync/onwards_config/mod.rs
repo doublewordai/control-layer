@@ -5,7 +5,6 @@ use crate::metrics::errors::component::ONWARDS_SYNC;
 use crate::types::UserId;
 use std::{
     collections::{BTreeMap, HashMap},
-    num::NonZeroU32,
     sync::Arc,
 };
 
@@ -13,10 +12,9 @@ use metrics::histogram;
 use onwards::affinity::AffinityConfig;
 use onwards::aimd::AimdConfig;
 use onwards::target::{
-    Auth, BackoffConfig as OnwardsBackoffConfig, ConcurrencyLimitParameters, ConfigFile, FallbackConfig as OnwardsFallbackConfig,
+    Auth, BackoffConfig as OnwardsBackoffConfig, ConfigFile, FallbackConfig as OnwardsFallbackConfig,
     JitterStrategy as OnwardsJitterStrategy, KeyDefinition, LoadBalanceStrategy as OnwardsLoadBalanceStrategy, PoolSpec, PoolsSpec,
-    ProviderSpec, RateLimitParameters, RoutingAction, RoutingRule, TargetSpecOrList, Targets, WatchTargetsStream,
-    inheritable_routing_rules,
+    ProviderSpec, RoutingAction, RoutingRule, TargetSpecOrList, Targets, WatchTargetsStream, inheritable_routing_rules,
 };
 use onwards::{AccountServing, ProviderKind, ServingClass, ServingOverlay, ServingPresets, ServingTargets};
 use sqlx::{PgPool, postgres::PgListener};
@@ -34,7 +32,7 @@ pub enum SyncStatus {
 }
 
 use crate::{
-    config::{ONWARDS_CONFIG_CHANGED_CHANNEL, RateLimitTiersConfig},
+    config::ONWARDS_CONFIG_CHANGED_CHANNEL,
     db::models::deployments::LoadBalancingStrategy,
     reasoning::{ReasoningTranslationConfig, resolve_reasoning_translation},
     types::{ApiKeyId, DeploymentId},
@@ -64,9 +62,6 @@ struct OnwardsTarget {
     // Deployment info
     model_name: String,
     alias: String,
-    requests_per_second: Option<f32>,
-    burst_size: Option<i32>,
-    capacity: Option<i32>,
     sanitize_responses: bool,
     trusted: bool,
     reasoning_translation: Option<ReasoningTranslationConfig>,
@@ -119,12 +114,6 @@ struct OnwardsApiKey {
     id: ApiKeyId,
     secret: String,
     purpose: String,
-    requests_per_second: Option<f32>,
-    burst_size: Option<i32>,
-    /// `verified` flag on the api_key's owning user (api_keys.user_id), used to
-    /// pick between the verified/unverified default rate-limit tiers when this
-    /// key has no per-key override.
-    user_verified: bool,
     /// Account-wide zero-data-retention flag on the api_key's owning user.
     /// Surfaced to onwards as a "zdr" key label; onwards does not act on it yet.
     zero_data_retention: bool,
@@ -140,6 +129,8 @@ type OverlaysByAlias = HashMap<String, HashMap<String, ServingOverlay>>;
 
 /// Serving account settings per account id, for accounts that have any.
 type AccountsById = HashMap<String, AccountServing>;
+
+type InflightOverridesByAlias = HashMap<String, HashMap<String, u32>>;
 
 /// Parse a stored class name; the CHECK constraints guarantee the set, so an
 /// unknown value is a schema drift worth a warning rather than a crash.
@@ -218,6 +209,28 @@ async fn load_overlays_from_db(db: &PgPool) -> Result<OverlaysByAlias, anyhow::E
         );
     }
     Ok(overlays)
+}
+
+async fn load_inflight_overrides_from_db(db: &PgPool) -> Result<InflightOverridesByAlias, anyhow::Error> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT dm.alias, o.user_id, o.inflight_limit
+        FROM realtime_inflight_limit_overrides o
+        INNER JOIN deployed_models dm ON dm.id = o.deployed_model_id
+        WHERE dm.deleted = FALSE
+        "#
+    )
+    .fetch_all(db)
+    .await?;
+
+    let mut overrides: InflightOverridesByAlias = HashMap::new();
+    for row in rows {
+        overrides
+            .entry(row.alias)
+            .or_default()
+            .insert(row.user_id.to_string(), row.inflight_limit as u32);
+    }
+    Ok(overrides)
 }
 
 /// Loads the serving account settings of every account that has any. An
@@ -346,15 +359,15 @@ pub struct OnwardsConfigSync {
     daemon_capacity_limits: Option<Arc<dashmap::DashMap<String, usize>>>,
     /// Default batch concurrency for models without explicit batch_capacity
     default_batch_capacity: usize,
+    /// Default global batch in-flight cap applied by onwards to virtual models
+    /// without their own positive `batch_capacity`. `None` means no default.
+    default_batch_inflight_capacity: Option<u32>,
     /// Model aliases that batch API keys should have automatic access to (escalation targets)
     escalation_models: Vec<String>,
     /// Tracks previous-cycle gauge label sets for zeroing stale metrics
     cache_info_state: crate::metrics::CacheInfoState,
     /// Enable strict mode with schema validation
     strict_mode: bool,
-    /// Default rate-limit tiers applied to API keys based on the owning user's
-    /// `verified` flag. Used when a key has no per-key override.
-    rate_limit_tiers: RateLimitTiersConfig,
 }
 
 pub struct SyncConfig {
@@ -380,31 +393,42 @@ impl OnwardsConfigSync {
     #[cfg(test)]
     #[instrument(skip(db))]
     pub async fn new(db: PgPool) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
-        Self::new_with_daemon_limits(db.clone(), db, None, 10, Vec::new(), false, RateLimitTiersConfig::default()).await
+        Self::new_with_daemon_limits(
+            db.clone(),
+            db,
+            None,
+            10,
+            Some(crate::config::DEFAULT_BATCH_INFLIGHT_CAPACITY),
+            Vec::new(),
+            false,
+        )
+        .await
     }
 
     /// Creates a new OnwardsConfigSync with optional daemon capacity limits map and escalation models
     ///
     /// `daemon_capacity_limits` - Shared map populated with per-model concurrency limits for the batch daemon.
     /// `default_batch_capacity` - Default concurrency limit for models without explicit `batch_capacity`.
+    /// `default_batch_inflight_capacity` - Default global batch in-flight cap for virtual models
+    ///   without their own positive `batch_capacity`; `None` means no default.
     /// `escalation_models` - Model aliases that batch API keys should have automatic access to.
     /// `strict_mode` - Enable strict mode with schema validation (only known OpenAI API paths accepted)
-    /// `rate_limit_tiers` - Default rate limits applied per-key based on the owning user's `verified` flag.
     /// `listener_db` - Direct (non-pooled) connections for the LISTEN session.
-    #[instrument(skip(db, listener_db, daemon_capacity_limits, escalation_models, rate_limit_tiers))]
+    #[instrument(skip(db, listener_db, daemon_capacity_limits, escalation_models))]
     pub async fn new_with_daemon_limits(
         db: impl sqlx_pool_router::PoolProvider,
         listener_db: impl sqlx_pool_router::PoolProvider,
         daemon_capacity_limits: Option<Arc<dashmap::DashMap<String, usize>>>,
         default_batch_capacity: usize,
+        default_batch_inflight_capacity: Option<u32>,
         escalation_models: Vec<String>,
         strict_mode: bool,
-        rate_limit_tiers: RateLimitTiersConfig,
     ) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
         // Live provider (not a pinned pool): survives runtime pool swaps.
         let db = sqlx_pool_router::DynPools::new(db);
         // Load initial configuration (including composite models)
-        let initial_targets = load_targets_from_db(&db.write(), &escalation_models, strict_mode, &rate_limit_tiers).await?;
+        let initial_targets =
+            load_targets_from_db_with_batch_default(&db.write(), &escalation_models, strict_mode, default_batch_inflight_capacity).await?;
 
         // If daemon limits are provided, populate them
         if let Some(ref limits) = daemon_capacity_limits {
@@ -434,10 +458,10 @@ impl OnwardsConfigSync {
             reload_checkpoint: None,
             daemon_capacity_limits,
             default_batch_capacity,
+            default_batch_inflight_capacity,
             escalation_models,
             cache_info_state,
             strict_mode,
-            rate_limit_tiers,
         };
         let stream = WatchTargetsStream::new(receiver);
 
@@ -585,20 +609,26 @@ impl OnwardsConfigSync {
     /// cache metrics, and sends the new Targets. Recoverable failures retain a
     /// pending retry; closed receivers stop the task, and fatal DB errors propagate.
     async fn full_reload(&mut self, source: &'static str) -> Result<ReloadOutcome, anyhow::Error> {
-        let new_targets =
-            match load_targets_from_db(&self.db.write(), &self.escalation_models, self.strict_mode, &self.rate_limit_tiers).await {
-                Ok(targets) => targets,
-                Err(e) => {
-                    crate::background_error!(ONWARDS_SYNC, "load_targets", Error, "Failed to load targets from database: {}", e);
-                    if e.to_string().contains("closed pool") || e.to_string().contains("connection closed") {
-                        error!("Database pool closed, exiting sync task");
-                        return Err(e);
-                    }
-                    #[cfg(test)]
-                    self.checkpoint(ReloadOutcome::Retry).await;
-                    return Ok(ReloadOutcome::Retry);
+        let new_targets = match load_targets_from_db_with_batch_default(
+            &self.db.write(),
+            &self.escalation_models,
+            self.strict_mode,
+            self.default_batch_inflight_capacity,
+        )
+        .await
+        {
+            Ok(targets) => targets,
+            Err(e) => {
+                crate::background_error!(ONWARDS_SYNC, "load_targets", Error, "Failed to load targets from database: {}", e);
+                if e.to_string().contains("closed pool") || e.to_string().contains("connection closed") {
+                    error!("Database pool closed, exiting sync task");
+                    return Err(e);
                 }
-            };
+                #[cfg(test)]
+                self.checkpoint(ReloadOutcome::Retry).await;
+                return Ok(ReloadOutcome::Retry);
+            }
+        };
         // Tests can commit a later change after this snapshot, before publication.
         #[cfg(test)]
         self.checkpoint(ReloadOutcome::Published).await;
@@ -675,9 +705,10 @@ struct OnwardsCompositeModel {
     #[allow(dead_code)] // Useful for debug logging
     id: DeploymentId,
     alias: String,
-    requests_per_second: Option<f32>,
-    burst_size: Option<i32>,
-    capacity: Option<i32>,
+    realtime_inflight_limit: i32,
+    /// Per-model batch in-flight cap. `None` means batch is uncapped on this
+    /// alias. See `deployed_models.batch_capacity`.
+    batch_capacity: Option<i32>,
     /// Load balancing strategy (weighted_random or priority)
     lb_strategy: LoadBalancingStrategy,
     /// Fallback enabled
@@ -735,9 +766,6 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
         SELECT
             cm.id as composite_model_id,
             cm.alias,
-            cm.requests_per_second,
-            cm.burst_size,
-            cm.capacity,
             cm.lb_strategy,
             cm.fallback_enabled,
             cm.fallback_on_rate_limit,
@@ -753,9 +781,6 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             -- Underlying deployment info
             dm.model_name,
             dm.alias as deployment_alias,
-            dm.requests_per_second as deployment_requests_per_second,
-            dm.burst_size as deployment_burst_size,
-            dm.capacity as deployment_capacity,
             dm.sanitize_responses as deployment_sanitize_responses,
             dm.trusted as deployment_trusted,
             ie.reasoning_translation as endpoint_reasoning_translation,
@@ -794,9 +819,6 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             ak.id as api_key_id,
             ak.secret as api_key_secret,
             ak.purpose as api_key_purpose,
-            ak.requests_per_second,
-            ak.burst_size,
-            ak.user_verified,
             ak.user_zero_data_retention,
             ak.user_id
         FROM deployed_models cm
@@ -805,10 +827,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 ak.id,
                 ak.secret,
                 ak.purpose,
-                ak.requests_per_second,
-                ak.burst_size,
                 ak.user_id,
-                u.verified as user_verified,
                 u.zero_data_retention as user_zero_data_retention
             FROM api_keys ak
             JOIN users u ON u.id = ak.user_id
@@ -934,9 +953,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
         SELECT
             id as composite_model_id,
             alias,
-            requests_per_second,
-            burst_size,
-            capacity,
+            realtime_inflight_limit,
+            batch_capacity,
             lb_strategy,
             fallback_enabled,
             fallback_on_rate_limit,
@@ -979,9 +997,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             OnwardsCompositeModel {
                 id: row.composite_model_id,
                 alias: row.alias,
-                requests_per_second: row.requests_per_second,
-                burst_size: row.burst_size,
-                capacity: row.capacity,
+                realtime_inflight_limit: row.realtime_inflight_limit,
+                batch_capacity: row.batch_capacity,
                 lb_strategy,
                 fallback_enabled: row.fallback_enabled.unwrap_or(true),
                 fallback_on_rate_limit: row.fallback_on_rate_limit.unwrap_or(true),
@@ -1029,9 +1046,6 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 target: OnwardsTarget {
                     model_name: row.model_name.clone(),
                     alias: row.deployment_alias.clone(),
-                    requests_per_second: row.deployment_requests_per_second,
-                    burst_size: row.deployment_burst_size,
-                    capacity: row.deployment_capacity,
                     sanitize_responses: row.deployment_sanitize_responses,
                     trusted: row.deployment_trusted,
                     reasoning_translation: resolve_reasoning_translation(
@@ -1079,9 +1093,6 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     id: row.api_key_id,
                     secret: row.api_key_secret,
                     purpose: row.api_key_purpose.clone(),
-                    requests_per_second: row.requests_per_second,
-                    burst_size: row.burst_size,
-                    user_verified: row.user_verified,
                     zero_data_retention: row.user_zero_data_retention,
                     user_id: row.user_id,
                 });
@@ -1099,6 +1110,36 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
     Ok(composites)
 }
 
+/// Resolves a virtual model's effective global batch in-flight cap.
+///
+/// A positive stored `batch_capacity` wins; a missing value falls back to the
+/// configured default. A non-positive stored value is invalid: interpreted as a
+/// cap it would either refuse every request (`0`) or silently read as uncapped,
+/// so it is ignored in favour of the default and warned about once per sync per
+/// model, matching [`update_daemon_capacity_limits`].
+fn effective_batch_inflight_limit(batch_capacity: Option<i32>, default_batch_inflight_capacity: Option<u32>, alias: &str) -> Option<u32> {
+    match batch_capacity {
+        Some(capacity) if capacity > 0 => Some(capacity as u32),
+        Some(capacity) => {
+            match default_batch_inflight_capacity {
+                Some(default) => warn!(
+                    alias = %alias,
+                    batch_capacity = capacity,
+                    default_capacity = default,
+                    "Invalid non-positive batch_capacity on a virtual model; capping batch at the default instead"
+                ),
+                None => warn!(
+                    alias = %alias,
+                    batch_capacity = capacity,
+                    "Invalid non-positive batch_capacity on a virtual model and no default cap is configured; batch is uncapped"
+                ),
+            }
+            default_batch_inflight_capacity
+        }
+        None => default_batch_inflight_capacity,
+    }
+}
+
 /// Converts a composite model to a TargetSpecOrList with weighted providers
 ///
 /// Uses onwards 0.10.0 weighted provider types for load balancing across
@@ -1106,28 +1147,17 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
 fn convert_composite_to_target_spec(
     composite: &OnwardsCompositeModel,
     key_definitions: &mut HashMap<String, KeyDefinition>,
-    rate_limit_tiers: &RateLimitTiersConfig,
     overlays: &OverlaysByAlias,
+    inflight_overrides: &InflightOverridesByAlias,
+    default_batch_inflight_capacity: Option<u32>,
 ) -> (String, TargetSpecOrList) {
     // Add this composite model's API keys to key_definitions
     for api_key in &composite.api_keys {
-        // The system key (nil UUID) carries internal traffic and is never tiered.
-        let rate_limit = if api_key.id.is_nil() {
-            None
-        } else {
-            resolve_key_rate_limit(
-                api_key.requests_per_second,
-                api_key.burst_size,
-                api_key.user_verified,
-                rate_limit_tiers,
-            )
-        };
-
         key_definitions.insert(
             api_key.id.to_string(),
             KeyDefinition {
                 key: api_key.secret.clone(),
-                rate_limit,
+                rate_limit: None,
                 concurrency_limit: None,
                 labels: key_labels(api_key),
             },
@@ -1140,34 +1170,6 @@ fn convert_composite_to_target_spec(
     } else {
         Some(composite.api_keys.iter().map(|k| k.secret.clone().into()).collect())
     };
-
-    // Build pool-level rate limiting
-    let rate_limit = match (composite.requests_per_second, composite.burst_size) {
-        (Some(rps), burst) if rps > 0.0 => {
-            let rps_u32 = NonZeroU32::new((rps.max(1.0) as u32).max(1)).unwrap();
-            let burst_u32 = burst.and_then(|b| NonZeroU32::new(b.max(1) as u32));
-            debug!(
-                "Composite model '{}' configured with {}req/s rate limit, burst: {:?}",
-                composite.alias, rps, burst_u32
-            );
-            Some(RateLimitParameters {
-                requests_per_second: rps_u32,
-                burst_size: burst_u32,
-            })
-        }
-        _ => None,
-    };
-
-    // Build pool-level concurrency limiting
-    let concurrency_limit = composite.capacity.map(|capacity| {
-        debug!(
-            "Composite model '{}' configured with {} max concurrent requests",
-            composite.alias, capacity
-        );
-        ConcurrencyLimitParameters {
-            max_concurrent_requests: capacity as usize,
-        }
-    });
 
     // Convert our LoadBalancingStrategy to onwards LoadBalanceStrategy
     let strategy = match composite.lb_strategy {
@@ -1218,24 +1220,6 @@ fn convert_composite_to_target_spec(
         let provider = {
             let target = &component.target;
 
-            // Build provider-level rate limiting (from underlying deployment)
-            let provider_rate_limit = match (target.requests_per_second, target.burst_size) {
-                (Some(rps), burst) if rps > 0.0 => {
-                    let rps_u32 = NonZeroU32::new((rps.max(1.0) as u32).max(1)).unwrap();
-                    let burst_u32 = burst.and_then(|b| NonZeroU32::new(b.max(1) as u32));
-                    Some(RateLimitParameters {
-                        requests_per_second: rps_u32,
-                        burst_size: burst_u32,
-                    })
-                }
-                _ => None,
-            };
-
-            // Build provider-level concurrency limiting
-            let provider_concurrency_limit = target.capacity.map(|capacity| ConcurrencyLimitParameters {
-                max_concurrent_requests: capacity as usize,
-            });
-
             {
                 debug!(
                     "  Provider '{}' ({}): weight={}, sanitize_response={}, trusted={}",
@@ -1246,8 +1230,8 @@ fn convert_composite_to_target_spec(
                     onwards_key: target.endpoint_api_key.clone(),
                     onwards_model: Some(target.model_name.clone()),
                     weight: component.weight.max(1) as u32,
-                    rate_limit: provider_rate_limit,
-                    concurrency_limit: provider_concurrency_limit,
+                    rate_limit: None,
+                    concurrency_limit: None,
                     upstream_auth_header_name: if target.auth_header_name != "Authorization" {
                         Some(target.auth_header_name.clone())
                     } else {
@@ -1308,8 +1292,8 @@ fn convert_composite_to_target_spec(
     // pool; there is no such thing yet as a pool with rules of its own.
     let make_pool = |pool_name: &str, providers: Vec<ProviderSpec>| PoolSpec {
         keys: keys.clone(),
-        rate_limit: rate_limit.clone(),
-        concurrency_limit: concurrency_limit.clone(),
+        rate_limit: None,
+        concurrency_limit: None,
         fallback: fallback.clone().map(|mut config| {
             if pool_name != DEFAULT_COMPONENT_POOL {
                 // Continuation pools must preserve their validated first hop.
@@ -1352,6 +1336,22 @@ fn convert_composite_to_target_spec(
         } else {
             HashMap::new()
         },
+        inflight_limit: (pool_name == DEFAULT_COMPONENT_POOL).then_some(composite.realtime_inflight_limit as u32),
+        // Batch requests are counted on the named alias globally; only the
+        // composite's default pool carries the cap. A positive `batch_capacity`
+        // wins; a NULL one falls back to the configured default. A non-positive
+        // stored value is invalid and also falls back (with a warning).
+        // Realtime traffic is unaffected.
+        batch_inflight_limit: if pool_name == DEFAULT_COMPONENT_POOL {
+            effective_batch_inflight_limit(composite.batch_capacity, default_batch_inflight_capacity, &composite.alias)
+        } else {
+            None
+        },
+        account_inflight_limits: if pool_name == DEFAULT_COMPONENT_POOL {
+            inflight_overrides.get(&composite.alias).cloned().unwrap_or_default()
+        } else {
+            HashMap::new()
+        },
     };
 
     let mut pools: HashMap<String, PoolSpec> = pool_providers
@@ -1373,46 +1373,16 @@ fn convert_composite_to_target_spec(
     (composite.alias.clone(), spec)
 }
 
-/// Resolves the rate limit for an API key. A non-NULL per-key
-/// `requests_per_second` always wins; otherwise we fall back to the
-/// verified/unverified tier defaults from config, which may themselves be unset
-/// (legacy "no limit unless overridden" behaviour).
-fn resolve_key_rate_limit(
-    per_key_rps: Option<f32>,
-    per_key_burst: Option<i32>,
-    user_verified: bool,
-    tiers: &RateLimitTiersConfig,
-) -> Option<RateLimitParameters> {
-    let (rps, burst) = match per_key_rps {
-        Some(rps) if rps > 0.0 => (rps, per_key_burst),
-        _ => {
-            let tier = if user_verified {
-                tiers.verified.as_ref()
-            } else {
-                tiers.unverified.as_ref()
-            };
-            let tier = tier?;
-            (tier.requests_per_second, tier.burst_size)
-        }
-    };
-
-    let rps_u32 = NonZeroU32::new((rps.max(1.0) as u32).max(1))?;
-    let burst_u32 = burst.and_then(|b| NonZeroU32::new(b.max(1) as u32));
-    Some(RateLimitParameters {
-        requests_per_second: rps_u32,
-        burst_size: burst_u32,
-    })
-}
-
 /// Converts both regular targets and composite models to ConfigFile format
-#[tracing::instrument(skip(targets, composites, rate_limit_tiers))]
+#[tracing::instrument(skip(targets, composites))]
 fn convert_to_config_file(
     targets: Vec<OnwardsTarget>,
     composites: Vec<OnwardsCompositeModel>,
     strict_mode: bool,
-    rate_limit_tiers: &RateLimitTiersConfig,
     overlays: &OverlaysByAlias,
+    inflight_overrides: &InflightOverridesByAlias,
     accounts: AccountsById,
+    default_batch_inflight_capacity: Option<u32>,
 ) -> ConfigFile {
     let mut key_definitions = HashMap::new();
 
@@ -1422,23 +1392,11 @@ fn convert_to_config_file(
         .map(|target| {
             // Add this target's API keys to key_definitions
             for api_key in &target.api_keys {
-                // The system key (nil UUID) carries internal traffic and is never tiered.
-                let rate_limit = if api_key.id.is_nil() {
-                    None
-                } else {
-                    resolve_key_rate_limit(
-                        api_key.requests_per_second,
-                        api_key.burst_size,
-                        api_key.user_verified,
-                        rate_limit_tiers,
-                    )
-                };
-
                 key_definitions.insert(
                     api_key.id.to_string(),
                     KeyDefinition {
                         key: api_key.secret.clone(),
-                        rate_limit,
+                        rate_limit: None,
                         concurrency_limit: None,
                         labels: key_labels(api_key),
                     },
@@ -1449,18 +1407,6 @@ fn convert_to_config_file(
                 None
             } else {
                 Some(target.api_keys.iter().map(|k| k.secret.clone().into()).collect())
-            };
-
-            let rate_limit = match (target.requests_per_second, target.burst_size) {
-                (Some(rps), burst) if rps > 0.0 => {
-                    let rps_u32 = NonZeroU32::new((rps.max(1.0) as u32).max(1)).unwrap();
-                    let burst_u32 = burst.and_then(|b| NonZeroU32::new(b.max(1) as u32));
-                    Some(RateLimitParameters {
-                        requests_per_second: rps_u32,
-                        burst_size: burst_u32,
-                    })
-                }
-                _ => None,
             };
 
             let upstream_auth_header_name = if target.auth_header_name != "Authorization" {
@@ -1474,17 +1420,13 @@ fn convert_to_config_file(
                 None
             };
 
-            let concurrency_limit = target.capacity.map(|capacity| ConcurrencyLimitParameters {
-                max_concurrent_requests: capacity as usize,
-            });
-
             // Build provider spec from target
             let provider = ProviderSpec {
                 url: target.endpoint_url.clone(),
                 onwards_key: target.endpoint_api_key.clone(),
                 onwards_model: Some(target.model_name.clone()),
-                rate_limit,
-                concurrency_limit,
+                rate_limit: None,
+                concurrency_limit: None,
                 upstream_auth_header_name,
                 upstream_auth_header_prefix,
                 response_headers: None,
@@ -1551,6 +1493,9 @@ fn convert_to_config_file(
                 routing_rules: target.routing_rules,
                 serving_classes: target.serving_classes,
                 overlays: overlays.get(&target.alias).cloned().unwrap_or_default(),
+                inflight_limit: None,
+                batch_inflight_limit: None,
+                account_inflight_limits: HashMap::new(),
             };
 
             (target.alias, TargetSpecOrList::Pool(pool_spec))
@@ -1569,7 +1514,13 @@ fn convert_to_config_file(
             );
         }
 
-        let (alias, spec) = convert_composite_to_target_spec(&composite, &mut key_definitions, rate_limit_tiers, overlays);
+        let (alias, spec) = convert_composite_to_target_spec(
+            &composite,
+            &mut key_definitions,
+            overlays,
+            inflight_overrides,
+            default_batch_inflight_capacity,
+        );
         target_specs.insert(alias, spec);
     }
 
@@ -1594,18 +1545,43 @@ fn convert_to_config_file(
 }
 
 /// Loads the current targets configuration from the database (including composite models)
+/// using the built-in default batch in-flight cap for virtual models without their own
+/// `batch_capacity`.
+///
+/// Test helper: production code goes through
+/// [`load_targets_from_db_with_batch_default`] so the configured default is honoured.
+///
+/// `escalation_models` - Model aliases that batch API keys should have automatic access to.
+/// This enables batch processing to route requests to escalation models without needing
+/// separate API key configuration.
+/// `strict_mode` - Enable strict mode with schema validation (only known OpenAI API paths accepted)
+#[cfg(test)]
+#[tracing::instrument(skip(db, escalation_models))]
+pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], strict_mode: bool) -> Result<Targets, anyhow::Error> {
+    load_targets_from_db_with_batch_default(
+        db,
+        escalation_models,
+        strict_mode,
+        Some(crate::config::DEFAULT_BATCH_INFLIGHT_CAPACITY),
+    )
+    .await
+}
+
+/// Loads the current targets configuration from the database (including composite models)
 /// General paid admission retains the same legacy tariff rule as composite loading.
 ///
 /// `escalation_models` - Model aliases that batch API keys should have automatic access to.
 /// This enables batch processing to route requests to escalation models without needing
 /// separate API key configuration.
 /// `strict_mode` - Enable strict mode with schema validation (only known OpenAI API paths accepted)
+/// `default_batch_inflight_capacity` - Global onboard cap applied to virtual models without a
+/// positive `batch_capacity` of their own; `None` leaves them uncapped.
 #[tracing::instrument(skip(db, escalation_models))]
-pub async fn load_targets_from_db(
+pub async fn load_targets_from_db_with_batch_default(
     db: &PgPool,
     escalation_models: &[String],
     strict_mode: bool,
-    rate_limit_tiers: &RateLimitTiersConfig,
+    default_batch_inflight_capacity: Option<u32>,
 ) -> Result<Targets, anyhow::Error> {
     let query_start = std::time::Instant::now();
     debug!("Loading onwards targets from database (with composite models)");
@@ -1619,9 +1595,6 @@ pub async fn load_targets_from_db(
             dm.model_name,
             dm.alias,
             dm.hosted_on,
-            dm.requests_per_second as deployment_requests_per_second,
-            dm.burst_size as deployment_burst_size,
-            dm.capacity,
             dm.sanitize_responses,
             dm.trusted,
             ie.reasoning_translation as endpoint_reasoning_translation,
@@ -1650,9 +1623,6 @@ pub async fn load_targets_from_db(
             ak.id as "api_key_id?",
             ak.secret as "api_key_secret?",
             ak.purpose as "api_key_purpose?",
-            ak.requests_per_second as api_key_requests_per_second,
-            ak.burst_size as api_key_burst_size,
-            ak.user_verified as "api_key_user_verified?",
             ak.user_zero_data_retention as "api_key_user_zero_data_retention?",
             ak.user_id as "api_key_user_id?",
             dm.serving_classes
@@ -1663,10 +1633,7 @@ pub async fn load_targets_from_db(
                 ak.id,
                 ak.secret,
                 ak.purpose,
-                ak.requests_per_second,
-                ak.burst_size,
                 ak.user_id,
-                u.verified as user_verified,
                 u.zero_data_retention as user_zero_data_retention
             FROM api_keys ak
             JOIN users u ON u.id = ak.user_id
@@ -1800,9 +1767,6 @@ pub async fn load_targets_from_db(
             OnwardsTarget {
                 model_name: row.model_name.clone(),
                 alias: row.alias.clone(),
-                requests_per_second: row.deployment_requests_per_second,
-                burst_size: row.deployment_burst_size,
-                capacity: row.capacity,
                 sanitize_responses: row.sanitize_responses,
                 trusted: row.trusted,
                 reasoning_translation: resolve_reasoning_translation(
@@ -1836,23 +1800,10 @@ pub async fn load_targets_from_db(
             }
         });
 
-        // user_verified is Option only because of the outer LEFT JOIN; whenever the
-        // lateral subquery emits a row, the inner JOIN to users guarantees it. We
-        // tie it to the same "row materialised" check as the other api_key columns
-        // so a future schema/SQL change can't silently demote keys to the
-        // unverified tier.
-        if let (
-            Some(api_key_id),
-            Some(api_key_secret),
-            Some(api_key_purpose),
-            Some(user_verified),
-            Some(zero_data_retention),
-            Some(user_id),
-        ) = (
+        if let (Some(api_key_id), Some(api_key_secret), Some(api_key_purpose), Some(zero_data_retention), Some(user_id)) = (
             row.api_key_id,
             row.api_key_secret,
             row.api_key_purpose,
-            row.api_key_user_verified,
             row.api_key_user_zero_data_retention,
             row.api_key_user_id,
         ) {
@@ -1860,9 +1811,6 @@ pub async fn load_targets_from_db(
                 id: api_key_id,
                 secret: api_key_secret,
                 purpose: api_key_purpose,
-                requests_per_second: row.api_key_requests_per_second,
-                burst_size: row.api_key_burst_size,
-                user_verified,
                 zero_data_retention,
                 user_id,
             });
@@ -1929,9 +1877,18 @@ pub async fn load_targets_from_db(
     // Convert to ConfigFile format
     // Per-alias overlays and per-account serving settings, each loaded once.
     let overlays = load_overlays_from_db(db).await?;
+    let inflight_overrides = load_inflight_overrides_from_db(db).await?;
     let accounts = load_accounts_from_db(db).await?;
 
-    let config = convert_to_config_file(targets, composites, strict_mode, rate_limit_tiers, &overlays, accounts);
+    let config = convert_to_config_file(
+        targets,
+        composites,
+        strict_mode,
+        &overlays,
+        &inflight_overrides,
+        accounts,
+        default_batch_inflight_capacity,
+    );
 
     // Convert ConfigFile to Targets
     Targets::from_config(config)

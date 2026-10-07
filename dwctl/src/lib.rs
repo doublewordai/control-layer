@@ -140,6 +140,7 @@ fn install_crypto_provider() {
     rustls::crypto::aws_lc_rs::default_provider().install_default().ok();
 }
 
+pub mod account_limits;
 pub mod api;
 pub mod auth;
 pub mod clickhouse;
@@ -173,6 +174,7 @@ pub mod pricing;
 mod probes;
 pub mod profiling;
 pub mod prompt_cache;
+pub mod realtime_inflight;
 pub mod reasoning;
 mod recompute;
 mod request_logging;
@@ -213,6 +215,7 @@ use axum::response::Response;
 use axum::{
     Router, ServiceExt, http, middleware,
     routing::{delete, get, patch, post, put},
+    serve::ListenerExt,
 };
 use axum_prometheus::PrometheusMetricLayerBuilder;
 use bon::Builder;
@@ -441,6 +444,7 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
                 .install_recorder()
                 .expect("Failed to install Prometheus recorder");
             initialize_database_error_metrics();
+            crate::metrics::describe_cache_info_metrics();
             handle
         })
         .clone()
@@ -612,9 +616,6 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
                             description: None,
                             model_type: None,
                             capabilities: None,
-                            requests_per_second: None,
-                            burst_size: None,
-                            capacity: None,
                             batch_capacity: None,
                             throughput: None,
                             tariffs: None,
@@ -1598,14 +1599,16 @@ async fn setup_database(
     seed_database(&config.model_sources, &main.pooled.write()).await?;
 
     if config.model_provisioning.enabled {
-        // Both catalogs are parsed and validated before either is applied, so
+        // Every catalog is parsed and validated before any is applied, so
         // a malformed overlay file fails startup without a half-applied model
-        // catalog. Overlays reference the model catalog's aliases, so they are
-        // applied after it.
+        // catalog. Overlays and account limits reference the model catalog's
+        // aliases, so they are applied after it.
         let catalog = model_provisioning::Catalog::load(&config.model_provisioning.directory)?;
         let overlays = org_overlays::OrgCatalog::load(&config.model_provisioning.org_overlays_directory)?;
+        let account_limits = account_limits::AccountLimitsCatalog::load(&config.model_provisioning.account_limits_directory)?;
         model_provisioning::apply(&main.pooled.write(), &catalog).await?;
         org_overlays::apply(&main.pooled.write(), &overlays).await?;
+        account_limits::apply(&main.pooled.write(), &account_limits).await?;
     }
 
     Ok((
@@ -2003,6 +2006,10 @@ pub async fn build_router(
         .route("/models/{id}", patch(api::handlers::deployments::update_deployed_model))
         .route("/models/{id}", delete(api::handlers::deployments::delete_deployed_model))
         .route("/models/{id}/overlays", get(api::handlers::serving::list_model_overlays))
+        .route(
+            "/models/{id}/realtime-inflight-limits",
+            get(api::handlers::realtime_inflight_limits::list_realtime_inflight_limits),
+        )
         .route("/models/{id}/cache-pricing", get(api::handlers::cache_pricing::get_cache_pricing))
         .route(
             "/models/{id}/cache-pricing",
@@ -3085,9 +3092,7 @@ impl BackgroundServices {
 
         // Use the same load function as the automatic sync
         // Note: escalation_models is empty for tests - individual tests can set up their own
-        let new_targets =
-            crate::sync::onwards_config::load_targets_from_db(pool, &[], self.strict_mode, &crate::config::RateLimitTiersConfig::default())
-                .await?;
+        let new_targets = crate::sync::onwards_config::load_targets_from_db(pool, &[], self.strict_mode).await?;
 
         // Snapshot the routing table this update should produce, before the
         // config is handed to the channel.
@@ -3431,9 +3436,9 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
             direct_pools.clone(),
             Some(model_capacity_limits.clone()),
             config.background_services.batch_daemon.default_model_concurrency,
+            config.limits.batch_inflight.default_capacity,
             escalation_models,
             config.onwards.strict_mode,
-            config.auth.rate_limits.clone(),
         )
         .await?;
 
@@ -4359,6 +4364,12 @@ impl Application {
         // No classifier is injected here.
         // Request-body edits (id-scrub, streaming usage flags) now live in dwctl's own
         // `outbound_request` middleware, so onwards needs no BodyTransformFn.
+        // One Redis pool for both in-flight limiters. The realtime per-account
+        // limit and the global batch cap share the configured connection; each
+        // has its own scope and switch. With no Redis URL the pool is `None`
+        // and both fall back to counting within this replica.
+        let limits_redis =
+            crate::realtime_inflight::RealtimeInflightLimiter::redis_pool(config.limits.realtime_inflight.redis_url.as_deref())?;
         let mut onwards_app_state = onwards::AppState::new(bg_services.onwards_targets.clone())
             .with_response_transform(onwards::create_openai_sanitizer())
             .with_upstream_rate_limit_message(config.onwards.upstream_rate_limit_message.clone())
@@ -4371,7 +4382,23 @@ impl Application {
             // Realtime traffic never carries it (the realtime path only adds
             // `x-fusillade-request-id`), so it exempts exactly the daemon
             // traffic, which tolerates latency and runs its own retries.
-            .with_first_token_timeout_exempt_header("x-fusillade-batch-created-at");
+            .with_first_token_timeout_exempt_header("x-fusillade-batch-created-at")
+            .with_inflight_limiter(Arc::new(crate::realtime_inflight::RealtimeInflightLimiter::from_parts(
+                "realtime",
+                config.limits.realtime_inflight.enforce,
+                limits_redis.clone(),
+            )))
+            // The batch cap shares the realtime Redis but has its own switch and
+            // reserved count scope. Off, the handler never consults this
+            // limiter, so no shared count is touched.
+            .with_batch_inflight_limiter(Arc::new(crate::realtime_inflight::RealtimeInflightLimiter::from_parts(
+                "batch",
+                true,
+                limits_redis,
+            )))
+            .with_batch_inflight_enforce(config.limits.batch_inflight.enforce)
+            .with_rejected_params(&config.onwards.rejected_params)
+            .map_err(|error| anyhow::anyhow!("onwards.rejected_params: {error}"))?;
         if config.onwards.first_token_timeout_ms > 0 {
             onwards_app_state =
                 onwards_app_state.with_first_token_timeout(std::time::Duration::from_millis(config.onwards.first_token_timeout_ms));
@@ -4479,6 +4506,14 @@ impl Application {
             shutdown.await;
             shutdown_token.cancel();
         };
+
+        // Streamed responses are many small writes; send each one immediately
+        // rather than waiting for the client to acknowledge the previous one.
+        let listener = listener.tap_io(|tcp| {
+            if let Err(err) = tcp.set_nodelay(true) {
+                warn!(%err, "failed to set TCP_NODELAY on an accepted connection");
+            }
+        });
 
         // Race the server against background task failures (fail-fast)
         let server_error: Option<anyhow::Error> = tokio::select! {

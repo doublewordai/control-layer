@@ -119,27 +119,19 @@ fn background_capacity(ordinary_limit: usize, background_limit: usize, in_flight
         .saturating_sub(in_flight)
 }
 
-/// The error code onwards returns, alongside a 429, when the caller's own
-/// concurrency limit is reached. Distinguishes "too many at once", which
-/// lowering concurrency fixes, from a provider's token-per-minute quota, which
-/// it does not.
-const ONWARDS_CONCURRENCY_LIMIT_CODE: &str = "concurrency_limit_exceeded";
-
 /// Whether a failure means "the model had nowhere to put this request".
 ///
-/// Two shapes count. A 529 is onwards refusing for capacity: the model's
-/// providers are full, at their caps, or not placed. A 429 carrying
-/// `concurrency_limit_exceeded` is the dispatching key's own concurrency limit
-/// in onwards, which lowering concurrency also relieves.
+/// A 529 is onwards refusing for capacity: the model's providers are full or
+/// not placed.
 ///
 /// That matters because the increase side grows on *demand* - a model that fills
 /// every slot it is offered is raised - so without a working decrease signal the
 /// limit only ever ratchets up.
 ///
-/// A bare 429 without that code is deliberately excluded. It is a provider rate
-/// limit, usually tokens per minute, and fewer concurrent requests does not
-/// necessarily mean fewer tokens per minute; cutting on it would shrink the
-/// limit for a wall that concurrency does not control.
+/// A 429 is deliberately excluded. It is a provider rate limit, usually tokens
+/// per minute, and fewer concurrent requests does not necessarily mean fewer
+/// tokens per minute; cutting on it would shrink the limit for a wall that
+/// concurrency does not control.
 ///
 /// Timeouts and connection resets are also excluded: they happened to a request
 /// the model had already accepted, so they say nothing about how many more it
@@ -160,10 +152,6 @@ fn is_downstream_overload(reason: &FailureReason) -> bool {
         // that, and the limit re-grows multiplicatively once capacity returns.
         FailureReason::RetriableHttpStatus { status: 503, .. }
         | FailureReason::NonRetriableHttpStatus { status: 503, .. } => true,
-        FailureReason::RetriableHttpStatus { status: 429, body }
-        | FailureReason::NonRetriableHttpStatus { status: 429, body } => {
-            body.contains(ONWARDS_CONCURRENCY_LIMIT_CODE)
-        }
         _ => false,
     }
 }
@@ -2758,9 +2746,32 @@ where
                             let retry_attempt = failed.state.retry_attempt;
                             let reason_label = failed.state.reason.metric_label();
                             let status_code_label = failed.state.reason.status_code_label();
-                            if failed.state.reason.is_retriable() {
-                                match failed.can_retry(retry_attempt, retry_config.clone()) {
+                            // A batch-capacity refusal must always be rescheduled, even
+                            // when the configured `should_retry` predicate classifies
+                            // the 529 as non-retriable: it is admission control, not a
+                            // failed attempt, so rejecting it would persist the refusal as
+                            // a terminal failure.
+                            if failed.state.reason.is_retriable()
+                                || failed.state.reason.is_batch_capacity_exceeded()
+                            {
+                                // The gateway's per-model batch in-flight cap
+                                // refuses with a 529 carrying
+                                // `batch_capacity_exceeded`. That is admission
+                                // control, not a failed attempt: it still backs
+                                // off (and still counts as downstream overload
+                                // above), but must not spend a retry attempt.
+                                let spends_attempt = !failed.state.reason.is_batch_capacity_exceeded();
+                                let retry_result = if spends_attempt {
+                                    failed.can_retry(retry_attempt, retry_config.clone())
+                                } else {
+                                    failed.can_retry_without_spending_attempt(
+                                        retry_attempt,
+                                        retry_config.clone(),
+                                    )
+                                };
+                                match retry_result {
                                     Ok(pending) => {
+                                        let new_attempt = pending.state.retry_attempt;
                                         let rescheduled = storage
                                             .reschedule_for_retry(
                                                 request_id,
@@ -2785,7 +2796,7 @@ where
                                             counter!(
                                                 "fusillade_requests_retried_total",
                                                 "model" => model_clone.clone(),
-                                                "attempt" => (retry_attempt + 1).to_string(),
+                                                "attempt" => new_attempt.to_string(),
                                                 "reason" => reason_label,
                                                 "status_code" => status_code_label.clone()
                                             )
@@ -2793,7 +2804,7 @@ where
                                             tracing::info!(
                                                 request_id = %request_id,
                                                 batch_id = ?batch_id,
-                                                retry_attempt = retry_attempt + 1,
+                                                retry_attempt = new_attempt,
                                                 "request.retry_persisted"
                                             );
                                         } else {
@@ -2805,7 +2816,7 @@ where
                                             tracing::warn!(
                                                 request_id = %request_id,
                                                 batch_id = ?batch_id,
-                                                retry_attempt = retry_attempt + 1,
+                                                retry_attempt = new_attempt,
                                                 "request.retry_skipped_lost_ownership"
                                             );
                                         }
@@ -3816,14 +3827,8 @@ mod tests {
     use super::*;
     use crate::request::FailureReason;
 
-    /// A 529 is a provider saying it is overloaded; a 429 carrying onwards'
-    /// concurrency code is onwards' own limiter, which is the wall this daemon
-    /// reaches first once the controller grows past a model's configured limit.
-    /// Matching 529 alone leaves the cut path unreachable in this deployment.
     #[test]
-    fn provider_529_and_onwards_concurrency_429_are_overload_signals() {
-        let onwards_429 =
-            r#"{"error":{"type":"rate_limit_error","code":"concurrency_limit_exceeded"}}"#;
+    fn provider_529_is_an_overload_signal() {
         for reason in [
             FailureReason::RetriableHttpStatus {
                 status: 529,
@@ -3832,14 +3837,6 @@ mod tests {
             FailureReason::NonRetriableHttpStatus {
                 status: 529,
                 body: String::new(),
-            },
-            FailureReason::RetriableHttpStatus {
-                status: 429,
-                body: onwards_429.to_string(),
-            },
-            FailureReason::NonRetriableHttpStatus {
-                status: 429,
-                body: onwards_429.to_string(),
             },
         ] {
             assert!(is_downstream_overload(&reason), "{reason:?}");
@@ -3866,6 +3863,38 @@ mod tests {
         }
     }
 
+    /// The gateway's per-model batch in-flight cap refuses with 529 and body
+    /// code `batch_capacity_exceeded`. That is a downstream overload signal, so
+    /// the dispatcher backs off rather than treating it as a per-key 429.
+    #[test]
+    fn batch_capacity_exceeded_529_is_an_overload_signal() {
+        for reason in [
+            FailureReason::RetriableHttpStatus {
+                status: 529,
+                body: r#"{"error":{"type":"overloaded_error","code":"batch_capacity_exceeded"}}"#
+                    .to_string(),
+            },
+            FailureReason::NonRetriableHttpStatus {
+                status: 529,
+                body: r#"{"error":{"type":"overloaded_error","code":"batch_capacity_exceeded"}}"#
+                    .to_string(),
+            },
+        ] {
+            assert!(is_downstream_overload(&reason), "{reason:?}");
+            assert!(
+                reason.is_batch_capacity_exceeded(),
+                "a batch_capacity_exceeded 529 must be recognised as admission control: {reason:?}"
+            );
+        }
+        // An ordinary 529 is overload but not admission control, so it still spends an attempt.
+        let plain = FailureReason::RetriableHttpStatus {
+            status: 529,
+            body: String::new(),
+        };
+        assert!(is_downstream_overload(&plain));
+        assert!(!plain.is_batch_capacity_exceeded());
+    }
+
     /// Everything else must leave the limit alone. A bare 429 is a provider rate
     /// limit, usually tokens per minute, which fewer concurrent requests does not
     /// necessarily reduce; timeouts and resets happened to a request the model had
@@ -3876,6 +3905,12 @@ mod tests {
             FailureReason::RetriableHttpStatus {
                 status: 429,
                 body: r#"{"error":{"code":"rate_limit_exceeded"}}"#.to_string(),
+            },
+            FailureReason::RetriableHttpStatus {
+                status: 429,
+                body:
+                    r#"{"error":{"type":"rate_limit_error","code":"concurrency_limit_exceeded"}}"#
+                        .to_string(),
             },
             FailureReason::RetriableHttpStatus {
                 status: 429,
@@ -5690,6 +5725,18 @@ mod tests {
         );
         assert!(claim_loop_kinds_for_mode(DaemonMode::Both, true, false, true, true).is_err());
         assert!(claim_loop_kinds_for_mode(DaemonMode::Both, true, true, true, false).is_err());
+    }
+
+    #[test]
+    fn priority_injection_keeps_key_order() {
+        let mut body = r#"{"model":"m","response_format":{"type":"json_schema","json_schema":{"name":"n","schema":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"string"}}}}},"messages":[]}"#.to_string();
+
+        inject_dynamo_priority(&mut body, 7);
+
+        assert_eq!(
+            body,
+            r#"{"model":"m","response_format":{"type":"json_schema","json_schema":{"name":"n","schema":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"string"}}}}},"messages":[],"nvext":{"agent_hints":{"priority":7}}}"#
+        );
     }
 
     #[test]

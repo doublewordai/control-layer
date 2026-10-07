@@ -333,3 +333,77 @@ async fn resolved_class_selects_the_billed_organisation_price(pool: PgPool) {
     );
     f.services.shutdown().await;
 }
+
+const ORDERED_SCHEMA: &str = r#"{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"string"}},"required":["zeta","alpha"],"additionalProperties":false}"#;
+const ORDERED_PARAMETERS: &str = r#"{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"],"additionalProperties":false}"#;
+
+#[dwctl_test_macros::test]
+async fn json_key_order_survives_ingress(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let (schema, parameters) = (ORDERED_SCHEMA, ORDERED_PARAMETERS);
+    let requests = [
+        (
+            "chat/completions",
+            format!(
+                r#"{{"model":"policy","messages":[{{"role":"user","content":"hi"}}],"stream":true,"response_format":{{"type":"json_schema","json_schema":{{"name":"n","strict":true,"schema":{schema}}}}},"tools":[{{"type":"function","function":{{"name":"lookup","parameters":{parameters}}}}}]}}"#
+            ),
+            vec![schema, parameters],
+        ),
+        (
+            "responses",
+            format!(
+                r#"{{"model":"policy","input":"hi","text":{{"format":{{"type":"json_schema","name":"n","strict":true,"schema":{schema}}}}},"tools":[{{"type":"function","name":"lookup","description":"d","parameters":{parameters}}}]}}"#
+            ),
+            vec![schema, parameters],
+        ),
+        (
+            "messages",
+            format!(
+                r#"{{"model":"policy","max_tokens":16,"messages":[{{"role":"user","content":"hi"}}],"tools":[{{"name":"lookup","description":"d","input_schema":{parameters}}}]}}"#
+            ),
+            vec![parameters],
+        ),
+    ];
+    for (path, body, expected) in requests {
+        f.server
+            .post(&format!("/ai/v1/{path}"))
+            .add_header("Authorization", format!("Bearer {}", f.key))
+            .content_type("application/json")
+            .bytes(body.into())
+            .await
+            .assert_status_ok();
+        let received = f.upstream.received_requests().await.unwrap();
+        let forwarded = String::from_utf8(received.last().unwrap().body.clone()).unwrap();
+        for fragment in expected {
+            assert!(forwarded.contains(fragment), "{path}: {forwarded}");
+        }
+    }
+}
+
+#[dwctl_test_macros::test]
+async fn json_key_order_survives_batch_upload(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let headers = format!("Bearer {}", f.key);
+    let line = format!(
+        r#"{{"custom_id":"r0","method":"POST","url":"/v1/chat/completions","body":{{"model":"policy","messages":[{{"role":"user","content":"hi"}}],"response_format":{{"type":"json_schema","json_schema":{{"name":"n","strict":true,"schema":{ORDERED_SCHEMA}}}}}}}}}"#
+    );
+    let response = f
+        .server
+        .post("/ai/v1/files")
+        .add_header("Authorization", &headers)
+        .multipart(
+            MultipartForm::new()
+                .add_text("purpose", "batch")
+                .add_part("file", Part::bytes(line.into_bytes()).file_name("ordered.jsonl")),
+        )
+        .await;
+    response.assert_status(StatusCode::CREATED);
+    let id = response.json::<Value>()["id"].as_str().unwrap().to_owned();
+    let content = f
+        .server
+        .get(&format!("/ai/v1/files/{id}/content"))
+        .add_header("Authorization", &headers)
+        .await;
+    content.assert_status_ok();
+    assert!(content.text().contains(ORDERED_SCHEMA), "{}", content.text());
+}

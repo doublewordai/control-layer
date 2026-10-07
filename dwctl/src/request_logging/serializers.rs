@@ -2129,8 +2129,9 @@ mod tests {
             service_tier: None,
         };
 
-        let parsed_response =
-            AiResponse::ChatCompletionsStream(vec![crate::request_logging::models::ChatCompletionChunk::Chunk(stream_chunk)]);
+        let parsed_response = AiResponse::ChatCompletionsStream(vec![crate::request_logging::models::ChatCompletionChunk::Chunk(
+            Box::new(stream_chunk),
+        )]);
 
         let metrics = UsageMetrics::extract(
             instance_id,

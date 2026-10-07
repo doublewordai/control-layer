@@ -8,6 +8,7 @@ use crate::affinity;
 use crate::auth;
 use crate::client::HttpClient;
 use crate::errors::{ErrorResponseBody, OnwardsErrorResponse};
+use crate::inflight::{BATCH_INFLIGHT_SCOPE, InflightSlot};
 use crate::models::ListModelResponse;
 use crate::serving::{
     self, ProviderKind, RequestedServingClass, ServingClassOutcome, ServingResolution,
@@ -26,7 +27,7 @@ use axum::{
 };
 use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
 use serde_json::map::Entry;
-use tracing::{Instrument, debug, error, instrument, trace, warn};
+use tracing::{Instrument, debug, error, info, instrument, trace, warn};
 use uuid::Uuid;
 
 /// Adapter to extract W3C trace context from an axum HeaderMap.
@@ -290,6 +291,8 @@ struct GuardedStream<S> {
     inner: S,
     _guard: ConcurrencyGuard,
     _inflight_guard: InflightGuard,
+    _inflight_slot: Option<InflightSlot>,
+    _batch_inflight_slot: Option<InflightSlot>,
 }
 
 impl<S, E> futures_util::Stream for GuardedStream<S>
@@ -602,7 +605,7 @@ pub async fn target_message_handler<T: HttpClient>(
     let request_class = RequestClass::from_path(&canonical_request_path);
     // The alias's serving policy (presets, overlays) is declared on its
     // default pool and applies whichever pool serves this request's class.
-    let (mut resolved_pool_name, mut pool, mut alias_serving) = match state.targets.targets.get(&model_name) {
+    let (mut resolved_pool_name, mut pool, mut alias_serving, alias_inflight, alias_batch_inflight) = match state.targets.targets.get(&model_name) {
         Some(pools) => {
             // Now that the model is known to be a configured target, tag the
             // in-flight guard so `onwards_model_inflight{model=…}` tracks this
@@ -617,6 +620,8 @@ pub async fn target_message_handler<T: HttpClient>(
                 pools.resolved_name(request_class),
                 pools.resolve(request_class).clone(),
                 pools.default_pool().alias_serving().clone(),
+                pools.default_pool().inflight_limits().cloned(),
+                pools.default_pool().batch_inflight_limit(),
             )
         }
         None => {
@@ -739,17 +744,17 @@ pub async fn target_message_handler<T: HttpClient>(
     // against the pool that will serve it. Strict: a class named on the
     // request that the account does not hold, or the alias does not offer,
     // is refused rather than quietly downgraded.
+    let (account_id, key_purpose) = bearer_token
+        .as_ref()
+        .and_then(|token| state.targets.key_labels.get(token))
+        .map(|labels| {
+            (
+                labels.get(serving::ACCOUNT_LABEL).cloned(),
+                labels.get("purpose").cloned(),
+            )
+        })
+        .unwrap_or((None, None));
     let serving_resolution: ServingResolution = {
-        let (account_id, key_purpose) = bearer_token
-            .as_ref()
-            .and_then(|token| state.targets.key_labels.get(token))
-            .map(|labels| {
-                (
-                    labels.get(serving::ACCOUNT_LABEL).cloned(),
-                    labels.get("purpose").cloned(),
-                )
-            })
-            .unwrap_or((None, None));
         let account = account_id
             .as_deref()
             .and_then(|id| state.targets.accounts.get(id).map(|r| r.value().clone()));
@@ -799,25 +804,91 @@ pub async fn target_message_handler<T: HttpClient>(
         resolution
     };
 
+    // Realtime traffic is everything the batch dispatcher did not stamp with
+    // the exempt header.
+    let is_realtime = !state
+        .first_token_timeout_exempt_header
+        .as_deref()
+        .is_some_and(|header| req.headers().contains_key(header));
+    // Labels failure outcomes, so a realtime outage can be told apart from a
+    // batch backlog retrying against the same model.
+    let traffic = if is_realtime { "realtime" } else { "dispatched" };
+
+    let body_json = if !body_bytes.is_empty()
+        && crate::reasoning::uses_reasoning_contract(&canonical_request_path)
+    {
+        Some(serde_json::from_slice::<serde_json::Value>(&body_bytes).map_err(|_| {
+            OnwardsErrorResponse::bad_request("Request body must be valid JSON.", None)
+        })?)
+    } else {
+        None
+    };
+
+    // Chat parameters not every worker can serve. Each is logged and counted;
+    // the configured ones are refused here.
+    let flagged_params = match body_json.as_ref() {
+        Some(body)
+            if state.targets.strict_mode
+                && canonical_request_path
+                    .trim_end_matches('/')
+                    .ends_with("/chat/completions") =>
+        {
+            crate::unsupported_params::chat_request_params(body)
+        }
+        _ => Vec::new(),
+    };
+    if !flagged_params.is_empty() {
+        let rejected: Vec<&'static str> = flagged_params
+            .iter()
+            .copied()
+            .filter(|param| state.rejected_params.contains(param))
+            .collect();
+        for param in &flagged_params {
+            let action = if rejected.contains(param) { "rejected" } else { "logged" };
+            metrics::counter!(
+                "onwards_unsupported_params_total",
+                "param" => *param,
+                "model" => model_name.to_string(),
+                "traffic" => traffic,
+                "action" => action,
+            )
+            .increment(1);
+        }
+        info!(
+            params = %flagged_params.join(","),
+            rejected = %rejected.join(","),
+            model = %model_name,
+            account = account_id.as_deref().unwrap_or(""),
+            api_key_id = ?authenticated_api_key_id,
+            traffic,
+            "Request uses parameters not every worker supports"
+        );
+        if let Some(first) = rejected.first() {
+            record_response_status(400);
+            return Err(OnwardsErrorResponse::invalid_request(
+                &crate::unsupported_params::rejection_message(&rejected),
+                Some(first),
+                "unsupported_parameter",
+            ));
+        }
+    }
+
     let canonical_reasoning = if let Some(reasoning) = req
         .extensions()
         .get::<crate::reasoning::CanonicalReasoningRequest>()
     {
         Some(reasoning.clone())
-    } else if !body_bytes.is_empty()
-        && crate::reasoning::uses_reasoning_contract(&canonical_request_path)
-    {
-        let body: serde_json::Value = serde_json::from_slice(&body_bytes).map_err(|_| {
-            OnwardsErrorResponse::bad_request("Request body must be valid JSON.", None)
-        })?;
+    } else if let Some(body) = body_json.as_ref() {
         crate::reasoning::parse_reasoning_request(
             &canonical_request_path,
-            &body,
+            body,
             state.targets.strict_mode,
         ).map_err(|error| OnwardsErrorResponse::reasoning(&error))?
     } else {
         None
     };
+    // Not needed past here; don't hold the parsed body while the upstream works.
+    drop(body_json);
 
     if let Some(reasoning) = canonical_reasoning.as_ref() {
         for provider in pool.providers() {
@@ -828,16 +899,6 @@ pub async fn target_message_handler<T: HttpClient>(
             }
         }
     }
-
-    // Realtime traffic is everything the batch dispatcher did not stamp with
-    // the exempt header.
-    let is_realtime = !state
-        .first_token_timeout_exempt_header
-        .as_deref()
-        .is_some_and(|header| req.headers().contains_key(header));
-    // Labels failure outcomes, so a realtime outage can be told apart from a
-    // batch backlog retrying against the same model.
-    let traffic = if is_realtime { "realtime" } else { "dispatched" };
 
     // Check if pool has no providers (e.g., composite model with no enabled components).
     // This runs after routing rules so that redirects get a chance to replace the pool.
@@ -857,6 +918,67 @@ pub async fn target_message_handler<T: HttpClient>(
         record_response_status(529);
         return Err(OnwardsErrorResponse::no_capacity());
     }
+
+    let mut inflight_slot = match (is_realtime, alias_inflight.as_deref(), account_id.as_deref()) {
+        (true, Some(limits), Some(account)) => {
+            let limit = limits.for_account(account);
+            match state
+                .inflight_limiter
+                .try_acquire(account, &model_name, limit)
+                .await
+            {
+                Some(slot) => Some(slot),
+                None => {
+                    debug!(
+                        "In-flight limit of {} reached for account {} on model {}",
+                        limit, account, model_name
+                    );
+                    metrics::counter!(
+                        "onwards_inflight_limit_refusals_total",
+                        "model" => model_name.clone(),
+                    )
+                    .increment(1);
+                    record_response_status(429);
+                    return Err(OnwardsErrorResponse::inflight_limited(&model_name, limit));
+                }
+            }
+        }
+        _ => None,
+    };
+
+    // Batch (dispatched) traffic gets its own per-model ceiling, held in the
+    // same shared limiter under a reserved scope so it is counted globally on
+    // the alias the request named. Realtime requests skip it; batch requests
+    // skip the per-account realtime limit above. A refusal is a 529, not a
+    // 429, so the batch dispatcher backs off instead of treating it as a
+    // per-key rate limit.
+    let mut batch_inflight_slot = if !is_realtime
+        && state.batch_inflight_enforce
+        && let Some(limit) = alias_batch_inflight
+    {
+        match state
+            .batch_inflight_limiter
+            .try_acquire(BATCH_INFLIGHT_SCOPE, &model_name, limit)
+            .await
+        {
+            Some(slot) => Some(slot),
+            None => {
+                debug!(
+                    "Batch in-flight cap of {} reached for model {}",
+                    limit, model_name
+                );
+                metrics::counter!(
+                    "onwards_batch_inflight_refusals_total",
+                    "model" => model_name.clone(),
+                )
+                .increment(1);
+                record_response_status(529);
+                return Err(OnwardsErrorResponse::batch_capacity_exceeded(&model_name, limit));
+            }
+        }
+    } else {
+        None
+    };
 
     // Check pool-level rate limit before selecting a provider
     {
@@ -1167,7 +1289,7 @@ pub async fn target_message_handler<T: HttpClient>(
             && let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&attempt_body)
             && let Some(obj) = parsed.as_object_mut()
         {
-            let removed = [obj.remove("priority"), obj.remove("nvext")];
+            let removed = [obj.shift_remove("priority"), obj.shift_remove("nvext")];
             if removed.iter().any(Option::is_some)
                 && let Ok(stripped) = serde_json::to_vec(&parsed)
             {
@@ -2083,6 +2205,8 @@ pub async fn target_message_handler<T: HttpClient>(
             inner: body.into_data_stream(),
             _guard: connection_guard,
             _inflight_guard: inflight_guard.take().expect("inflight_guard taken once on success path"),
+            _inflight_slot: inflight_slot.take(),
+            _batch_inflight_slot: batch_inflight_slot.take(),
         };
         let response = Response::from_parts(parts, axum::body::Body::from_stream(guarded));
 
@@ -3132,6 +3256,12 @@ mod tests {
             sse_buffer_limit: crate::sse::DEFAULT_SSE_BUFFER_LIMIT,
             first_token_timeout: None,
             first_token_timeout_exempt_header: None,
+            rejected_params: Vec::new(),
+            inflight_limiter: std::sync::Arc::new(crate::inflight::LocalInflightLimiter::default()),
+            batch_inflight_enforce: false,
+            batch_inflight_limiter: std::sync::Arc::new(
+                crate::inflight::LocalInflightLimiter::default(),
+            ),
         };
 
         // Create a simple POST request

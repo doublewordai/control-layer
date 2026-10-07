@@ -1,6 +1,6 @@
 [package]
 name = "dwctl"
-version = "12.11.3" # x-release-please-version
+version = "13.2.0" # x-release-please-version
 edition = "2024"
 publish = false
 description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
@@ -45,7 +45,7 @@ scopeguard = "1"
 # them; switch back to a crates.io release once one contains it.
 underway = { git = "https://github.com/doublewordai/underway", rev = "d4899d5f0e2bfb341ba7886958d09b6665a848ea" }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["preserve_order"] }
 serde_yaml = "0.9"
 schemars = "1.2"
 uuid = { version = "1.0", features = ["v4", "serde"] }

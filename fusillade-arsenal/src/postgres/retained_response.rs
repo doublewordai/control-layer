@@ -3051,7 +3051,10 @@ async fn lock_requests(
 fn canonical_payload_bytes(rows: &[RetainedResponseObjectRow]) -> MovementResult<Vec<u8>> {
     let mut bytes = Vec::new();
     for row in rows {
-        let payload = serde_json::to_vec(&row.payload)
+        // Sorted keys: a payload read back from `jsonb` comes back in jsonb's key order.
+        let mut payload = row.payload.clone();
+        payload.sort_all_objects();
+        let payload = serde_json::to_vec(&payload)
             .map_err(|_| RetainedResponseMovementError::IntegrityMismatch.into_fusillade_error())?;
         bytes.extend_from_slice(&(payload.len() as u64).to_be_bytes());
         bytes.extend_from_slice(&payload);

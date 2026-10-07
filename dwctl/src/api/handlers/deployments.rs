@@ -580,6 +580,27 @@ pub async fn list_deployed_models<P: PoolProvider>(
     }))
 }
 
+fn validate_realtime_inflight_limit(limit: Option<i32>) -> Result<()> {
+    if limit.is_some_and(|limit| limit < 1) {
+        return Err(Error::BadRequest {
+            message: "realtime_inflight_limit must be at least 1".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// A non-positive `batch_capacity` is stored as either a cap of zero (which
+/// refuses every batch request) or a value onwards would read as uncapped, so
+/// reject it before it reaches the database.
+fn validate_batch_capacity(capacity: Option<i32>) -> Result<()> {
+    if capacity.is_some_and(|capacity| capacity < 1) {
+        return Err(Error::BadRequest {
+            message: "batch_capacity must be at least 1".to_string(),
+        });
+    }
+    Ok(())
+}
+
 #[utoipa::path(
     post,
     path = "/models",
@@ -632,6 +653,13 @@ pub async fn create_deployed_model<P: PoolProvider>(
     }
 
     validate_tariff_prices(tariffs.as_deref())?;
+
+    // Validate batch capacity if provided (both standard and composite models).
+    let batch_capacity = match &create {
+        DeployedModelCreate::Standard(s) => s.batch_capacity,
+        DeployedModelCreate::Composite(c) => c.batch_capacity,
+    };
+    validate_batch_capacity(batch_capacity)?;
 
     // Validate throughput is positive if provided
     if let Some(t) = throughput
@@ -688,6 +716,7 @@ pub async fn create_deployed_model<P: PoolProvider>(
     validate_backoff(Some(b_initial), Some(b_max), Some(b_factor), b_total)?;
     if let DeployedModelCreate::Composite(c) = &create {
         validate_realtime_fallback_statuses(Some(&c.fallback_realtime_on_status))?;
+        validate_realtime_inflight_limit(c.realtime_inflight_limit)?;
     }
     match &create {
         DeployedModelCreate::Standard(s) => validate_aimd(s.first_token_timeout_ms, s.aimd.as_ref(), false, false, s.backoff_enabled)?,
@@ -837,6 +866,9 @@ pub async fn update_deployed_model<P: PoolProvider>(
 
     validate_tariff_prices(update.tariffs.as_deref())?;
 
+    // `Some(None)` clears the cap; only a concrete non-positive value is invalid.
+    validate_batch_capacity(update.batch_capacity.flatten())?;
+
     if let Some(Some(t)) = update.throughput
         && t <= 0.0
     {
@@ -940,6 +972,13 @@ pub async fn update_deployed_model<P: PoolProvider>(
             message: "reasoning_translation_overrides is only supported for standard models".to_string(),
         });
     }
+
+    if !is_composite && update.realtime_inflight_limit.is_some() {
+        return Err(Error::BadRequest {
+            message: "realtime_inflight_limit is only supported for composite models".to_string(),
+        });
+    }
+    validate_realtime_inflight_limit(update.realtime_inflight_limit)?;
 
     // Validate the backoff state the update would *result in*, merging
     // incoming fields over the stored values. Without merging, a one-sided
@@ -2159,6 +2198,102 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(stored, None);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_realtime_inflight_limit_below_one_is_rejected(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let auth = add_auth_headers(&user);
+
+        app.post("/admin/api/v1/models")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .json(&json!({ "type": "composite", "model_name": "inflight-zero", "alias": "inflight-zero", "realtime_inflight_limit": 0 }))
+            .await
+            .assert_status_bad_request();
+
+        let response = app
+            .post("/admin/api/v1/models")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .json(&json!({ "type": "composite", "model_name": "inflight-one", "alias": "inflight-one" }))
+            .await;
+        response.assert_status_ok();
+        let created: DeployedModelResponse = response.json();
+        app.patch(&format!("/admin/api/v1/models/{}", created.id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .json(&json!({ "realtime_inflight_limit": 0 }))
+            .await
+            .assert_status_bad_request();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_non_positive_batch_capacity_is_rejected(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let auth = add_auth_headers(&user);
+
+        for invalid in [0, -1] {
+            app.post("/admin/api/v1/models")
+                .add_header(&auth[0].0, &auth[0].1)
+                .add_header(&auth[1].0, &auth[1].1)
+                .json(&json!({ "type": "composite", "model_name": format!("batch-{invalid}"), "alias": format!("batch-{invalid}"), "batch_capacity": invalid }))
+                .await
+                .assert_status_bad_request();
+        }
+
+        let response = app
+            .post("/admin/api/v1/models")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .json(&json!({ "type": "composite", "model_name": "batch-valid", "alias": "batch-valid", "batch_capacity": 5 }))
+            .await;
+        response.assert_status_ok();
+        let created: DeployedModelResponse = response.json();
+
+        for invalid in [0, -1] {
+            app.patch(&format!("/admin/api/v1/models/{}", created.id))
+                .add_header(&auth[0].0, &auth[0].1)
+                .add_header(&auth[1].0, &auth[1].1)
+                .json(&json!({ "batch_capacity": invalid }))
+                .await
+                .assert_status_bad_request();
+        }
+
+        let stored = sqlx::query_scalar::<_, i32>("SELECT batch_capacity FROM deployed_models WHERE id = $1")
+            .bind(created.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, 5, "a rejected update must leave the stored value untouched");
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_standard_model_patch_rejects_realtime_inflight_limit(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let model = create_test_deployment(&pool, user.id, "inflight-standard", "inflight-standard").await;
+
+        let response = app
+            .patch(&format!("/admin/api/v1/models/{}", model.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .json(&json!({ "realtime_inflight_limit": 500 }))
+            .await;
+
+        response.assert_status_bad_request();
+
+        let stored = sqlx::query_scalar::<_, i32>("SELECT realtime_inflight_limit FROM deployed_models WHERE id = $1")
+            .bind(model.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, 14);
     }
 
     #[dwctl_test_macros::test]
@@ -3759,76 +3894,65 @@ mod tests {
 
     #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn test_rate_limits_permission_gating(pool: PgPool) {
+    async fn test_realtime_inflight_limit_permission_gating(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager = create_test_admin_user(&pool, Role::PlatformManager).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
+        let auth = |user| add_auth_headers(user);
 
-        // Create a deployment with rate limits
-        let deployment = create_test_deployment(&pool, platform_manager.id, "rate-limit-test", "rate-limit-alias").await;
-
-        // Set rate limits on the deployment
-        let update = json!({
-            "requests_per_second": 100.0,
-            "burst_size": 200
-        });
+        let manager_auth = auth(&platform_manager);
         let response = app
-            .patch(&format!("/admin/api/v1/models/{}", deployment.id))
-            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
-            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
-            .json(&update)
+            .post("/admin/api/v1/models")
+            .add_header(&manager_auth[0].0, &manager_auth[0].1)
+            .add_header(&manager_auth[1].0, &manager_auth[1].1)
+            .json(&json!({
+                "type": "composite",
+                "model_name": "inflight-composite",
+                "alias": "inflight-composite",
+                "realtime_inflight_limit": 40
+            }))
+            .await;
+        response.assert_status_ok();
+        let created: DeployedModelResponse = response.json();
+        assert_eq!(created.realtime_inflight_limit, Some(40));
+
+        let response = app
+            .patch(&format!("/admin/api/v1/models/{}", created.id))
+            .add_header(&manager_auth[0].0, &manager_auth[0].1)
+            .add_header(&manager_auth[1].0, &manager_auth[1].1)
+            .json(&json!({ "realtime_inflight_limit": 60 }))
             .await;
         response.assert_status_ok();
 
-        // Create a group and add users to it so they can see the deployment
         let mut pool_conn = pool.acquire().await.unwrap();
         let mut group_repo = Groups::new(&mut pool_conn);
-        let group_create = GroupCreateDBRequest {
-            name: "Rate Limit Test Group".to_string(),
-            description: Some("Test group for rate limit permissions".to_string()),
-            created_by: platform_manager.id,
-        };
-        let group = group_repo.create(&group_create).await.unwrap();
+        let group = group_repo
+            .create(&GroupCreateDBRequest {
+                name: "In-flight Limit Test Group".to_string(),
+                description: None,
+                created_by: platform_manager.id,
+            })
+            .await
+            .unwrap();
         group_repo.add_user_to_group(standard_user.id, group.id).await.unwrap();
         group_repo.add_user_to_group(request_viewer.id, group.id).await.unwrap();
         group_repo
-            .add_deployment_to_group(deployment.id, group.id, platform_manager.id)
+            .add_deployment_to_group(created.id, group.id, platform_manager.id)
             .await
             .unwrap();
 
-        // PlatformManager should see rate limits (has ModelRateLimits::ReadAll)
-        let response = app
-            .get(&format!("/admin/api/v1/models/{}", deployment.id))
-            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
-            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
-            .await;
-        response.assert_status_ok();
-        let pm_model: DeployedModelResponse = response.json();
-        assert_eq!(pm_model.requests_per_second, Some(100.0), "PlatformManager should see rate limits");
-        assert_eq!(pm_model.burst_size, Some(200), "PlatformManager should see burst size");
-
-        // StandardUser should NOT see rate limits (masked)
-        let response = app
-            .get(&format!("/admin/api/v1/models/{}", deployment.id))
-            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
-            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
-            .await;
-        response.assert_status_ok();
-        let user_model: DeployedModelResponse = response.json();
-        assert_eq!(user_model.requests_per_second, None, "StandardUser should NOT see rate limits");
-        assert_eq!(user_model.burst_size, None, "StandardUser should NOT see burst size");
-
-        // RequestViewer should NOT see rate limits (masked)
-        let response = app
-            .get(&format!("/admin/api/v1/models/{}", deployment.id))
-            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
-            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
-            .await;
-        response.assert_status_ok();
-        let rv_model: DeployedModelResponse = response.json();
-        assert_eq!(rv_model.requests_per_second, None, "RequestViewer should NOT see rate limits");
-        assert_eq!(rv_model.burst_size, None, "RequestViewer should NOT see burst size");
+        for (user, expected) in [(&platform_manager, Some(60)), (&standard_user, None), (&request_viewer, None)] {
+            let headers = auth(user);
+            let response = app
+                .get(&format!("/admin/api/v1/models/{}", created.id))
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .await;
+            response.assert_status_ok();
+            let model: DeployedModelResponse = response.json();
+            assert_eq!(model.realtime_inflight_limit, expected);
+        }
     }
 
     #[dwctl_test_macros::test]

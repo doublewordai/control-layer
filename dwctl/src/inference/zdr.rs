@@ -52,8 +52,8 @@ pub async fn prepare_flex_submit(
     request_value: &mut serde_json::Value,
 ) -> Result<String, KeystoreError> {
     if let Some(obj) = request_value.as_object_mut() {
-        obj.remove("service_tier");
-        obj.remove("background");
+        obj.shift_remove("service_tier");
+        obj.shift_remove("background");
     }
     let request_key = keystore::generate_key();
     let response_key = keystore::generate_key();

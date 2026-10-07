@@ -295,18 +295,6 @@ auth:
       # content_security_policy_report_only: ""        # roll a CSP out in report-only first
       # strict_transport_security: "max-age=31536000; includeSubDomains"  # usually set on whatever terminates TLS instead
 
-  # Default per-API-key rate limits, applied based on the owning user's
-  # `verified` flag (set true after a successful Stripe payment or auto-topup
-  # charge). Only used when the api_key has no explicit per-key override.
-  # Omit a tier (or the whole `rate_limits` block) to leave that tier
-  # unlimited.
-  #
-  # Both tiers are intentionally left unset: unverified users get full
-  # platform throughput — throttling it feels slow/unreliable — and are instead
-  # bounded by an upload-*volume* cap until they verify. See
-  # `batches.unverified_requests_per_completion_hour` below.
-  rate_limits: {}
-
 # Email configuration for password resets and notifications
 email:
   # Email transport - either 'file' (for development) or 'smtp' (for production)
@@ -494,6 +482,24 @@ batches:
 #     # Default: 10MB (10485760)
 #     # Changing this limit requires a restart to rebuild all routing layers.
 #     max_body_size: 10485760
+#   realtime_inflight:
+#     # Refuse realtime requests over each account's in-flight limit (default: false)
+#     enforce: true
+#     # Redis that holds the realtime in-flight counts every replica shares.
+#     # Unset or unreachable: each replica counts only its own requests.
+#     redis_url: rediss://:password@limits-redis.example:6379
+#   batch_inflight:
+#     # Refuse batch requests over each virtual model's batch_capacity
+#     # (default: false). Off: every batch request is admitted and no shared
+#     # count is touched. Reuses the realtime_inflight.redis_url above; batch
+#     # and realtime counts use separate key spaces.
+#     enforce: true
+#     # Global batch in-flight cap for virtual models that do not set their own
+#     # positive batch_capacity (default: 200). Does not change fusillade's
+#     # per-daemon starting concurrency, which keeps using
+#     # background_services.batch_daemon.default_model_concurrency. Set to 0 or
+#     # null for no default. Raise it per model where batch runs higher.
+#     default_capacity: 200
 
 # External data source connections (S3, etc.)
 # Allows users to connect external storage and sync files for batch processing.
@@ -554,6 +560,12 @@ onwards:
   # Priority composites with fallback enabled use AIMD by default in strict mode.
   # Override through the model API's aimd object, or set aimd.enabled=false to opt out.
   # See onwards/docs/src/load-aware-failover.md for coverage and tuning.
+  # Strict-mode chat parameters refused with a 400 instead of forwarded.
+  # Onwards logs and counts every parameter not every worker can serve
+  # (onwards_unsupported_params_total); only the ones listed here are refused.
+  # Names come from onwards::unsupported_params::params(), e.g. [n, logprobs].
+  # Set via environment: DWCTL_ONWARDS__REJECTED_PARAMS='[n,logprobs]'
+  rejected_params: []
 
 # Cached-input pricing (the dwctl-owned cache layer)
 cache:

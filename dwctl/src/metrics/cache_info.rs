@@ -78,6 +78,19 @@ struct TariffInfo {
     output_price: f64,
 }
 
+/// Register help text for the cache-info gauges. Must run after the Prometheus
+/// recorder is installed, alongside the other metric initialisers.
+pub fn describe_cache_info_metrics() {
+    metrics::describe_gauge!(
+        "dwctl_model_batch_inflight_limit",
+        "Effective global per-model batch in-flight cap for virtual models: the model's own positive batch_capacity, else limits.batch_inflight.default_capacity. Reported even when enforcement is off; 0 means the model is uncapped, so a zero does not imply the cap is enforced."
+    );
+    metrics::describe_gauge!(
+        "dwctl_model_realtime_inflight_limit",
+        "Default per-account realtime in-flight limit for virtual models; 0 means unlimited."
+    );
+}
+
 /// Update Prometheus gauges reflecting the current cache state.
 ///
 /// Queries PostgreSQL for model metadata (groups, components, tariffs) and
@@ -98,8 +111,7 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets, state: 
             dm.is_composite as "is_composite!",
             dm.lb_strategy,
             dm.sanitize_responses as "sanitize_responses!",
-            dm.requests_per_second,
-            dm.capacity,
+            dm.realtime_inflight_limit as "realtime_inflight_limit!",
             dm.batch_capacity,
             dm.throughput,
             EXISTS(
@@ -197,11 +209,20 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets, state: 
         )
         .set(1.0);
 
-        // Rate limit gauge — zero when unset so removal is reflected
-        gauge!("dwctl_model_rate_limit_rps", "model" => alias.clone()).set(row.requests_per_second.unwrap_or(0.0) as f64);
-
-        // Concurrency limit gauge
-        gauge!("dwctl_model_concurrency_limit", "model" => alias.clone()).set(row.capacity.unwrap_or(0) as f64);
+        if row.is_composite {
+            gauge!("dwctl_model_realtime_inflight_limit", "model" => alias.clone()).set(row.realtime_inflight_limit as f64);
+            // The batch cap applies to virtual (composite) models. Report the
+            // effective cap onwards actually enforces (the model's own value or
+            // the configured default), not the raw stored column. Reported even
+            // when enforcement is off; 0 means uncapped, so a zero does not
+            // imply the cap is enforced. Mirrors the realtime gauge above.
+            let batch_inflight_limit = targets
+                .targets
+                .get(alias)
+                .and_then(|spec| spec.value().default_pool().batch_inflight_limit())
+                .unwrap_or(0);
+            gauge!("dwctl_model_batch_inflight_limit", "model" => alias.clone()).set(batch_inflight_limit as f64);
+        }
 
         // Batch capacity gauge
         gauge!("dwctl_model_batch_capacity", "model" => alias.clone()).set(row.batch_capacity.unwrap_or(0) as f64);
@@ -314,8 +335,8 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets, state: 
             // Only zero single-label gauges if the alias is truly gone
             // (not just a metadata change like is_metered flipping)
             if !current_aliases.contains(m.alias.as_str()) {
-                gauge!("dwctl_model_rate_limit_rps", "model" => m.alias.clone()).set(0.0);
-                gauge!("dwctl_model_concurrency_limit", "model" => m.alias.clone()).set(0.0);
+                gauge!("dwctl_model_realtime_inflight_limit", "model" => m.alias.clone()).set(0.0);
+                gauge!("dwctl_model_batch_inflight_limit", "model" => m.alias.clone()).set(0.0);
                 gauge!("dwctl_model_batch_capacity", "model" => m.alias.clone()).set(0.0);
                 gauge!("dwctl_model_throughput_rps", "model" => m.alias.clone()).set(0.0);
                 gauge!("dwctl_model_api_key_count", "model" => m.alias.clone()).set(0.0);
@@ -368,7 +389,6 @@ mod tests {
     use std::str::FromStr;
 
     use crate::Role;
-    use crate::config::RateLimitTiersConfig;
     use crate::db::handlers::{Deployments, Groups, InferenceEndpoints, Repository, Tariffs};
     use crate::db::models::{
         deployments::{DeploymentCreateDBRequest, LoadBalancingStrategy},
@@ -399,9 +419,7 @@ mod tests {
         .await
         .unwrap();
         sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,name,input_price_per_token,output_price_per_token,api_key_purpose) VALUES ($1,$2,'private-price',7,7,'realtime')").bind(model).bind(org.id).execute(&pool).await.unwrap();
-        let targets = load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
-            .await
-            .unwrap();
+        let targets = load_targets_from_db(&pool, &[], false).await.unwrap();
         super::update_cache_info_metrics(&pool, &targets, &mut super::CacheInfoState::new())
             .await
             .unwrap();
@@ -454,9 +472,7 @@ mod tests {
                 model_type: None,
                 capabilities: None,
                 hosted_on: Some(endpoint.id),
-                requests_per_second: Some(100.0),
-                burst_size: None,
-                capacity: Some(50),
+                realtime_inflight_limit: None,
                 batch_capacity: Some(10),
                 throughput: Some(25.0),
                 provider_pricing: None,
@@ -528,9 +544,7 @@ mod tests {
         tx.commit().await.unwrap();
 
         // Load targets and update metrics
-        let targets = load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
-            .await
-            .unwrap();
+        let targets = load_targets_from_db(&pool, &[], false).await.unwrap();
         super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
@@ -541,12 +555,6 @@ mod tests {
         assert!(output.contains(r#"endpoint_host="api.openai.com""#), "Should extract endpoint host");
         assert!(output.contains(r#"is_metered="true""#), "Should be metered (tariff exists)");
 
-        // Verify limit gauges
-        assert!(output.contains("dwctl_model_rate_limit_rps{"), "Should emit rate limit gauge");
-        assert!(
-            output.contains("dwctl_model_concurrency_limit{"),
-            "Should emit concurrency limit gauge"
-        );
         assert!(output.contains("dwctl_model_batch_capacity{"), "Should emit batch capacity gauge");
         assert!(output.contains("dwctl_model_throughput_rps{"), "Should emit throughput gauge");
 
@@ -615,9 +623,7 @@ mod tests {
                 model_type: None,
                 capabilities: None,
                 hosted_on: Some(endpoint.id),
-                requests_per_second: None,
-                burst_size: None,
-                capacity: None,
+                realtime_inflight_limit: None,
                 batch_capacity: None,
                 throughput: None,
                 provider_pricing: None,
@@ -662,9 +668,7 @@ mod tests {
                 model_type: None,
                 capabilities: None,
                 hosted_on: None,
-                requests_per_second: None,
-                burst_size: None,
-                capacity: None,
+                realtime_inflight_limit: None,
                 batch_capacity: None,
                 throughput: None,
                 provider_pricing: None,
@@ -707,9 +711,7 @@ mod tests {
         .await
         .unwrap();
 
-        let targets = load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
-            .await
-            .unwrap();
+        let targets = load_targets_from_db(&pool, &[], false).await.unwrap();
         super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
@@ -732,6 +734,91 @@ mod tests {
         assert!(
             output.contains(r#"component="cache-info-comp-child""#),
             "Should have component label"
+        );
+    }
+
+    /// The batch in-flight gauge must report the cap onwards actually enforces:
+    /// the composite's own positive `batch_capacity`, else the configured
+    /// default — not the raw stored column.
+    #[dwctl_test_macros::test]
+    async fn batch_inflight_limit_gauge_reports_the_effective_cap(pool: sqlx::PgPool) {
+        let handle = ensure_recorder();
+        let mut state = super::CacheInfoState::new();
+        let owner = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let alias = format!("batch-gauge-{}", uuid::Uuid::new_v4());
+        let child = format!("{alias}-child");
+
+        let endpoint_id: uuid::Uuid =
+            sqlx::query_scalar("INSERT INTO inference_endpoints (name,url,created_by) VALUES ($1,$2,$3) RETURNING id")
+                .bind(format!("{alias}-ep"))
+                .bind("https://api.example.com/v1")
+                .bind(owner.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let child_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO deployed_models (model_name,alias,is_composite,created_by,hosted_on) VALUES ($1,$1,false,$2,$3) RETURNING id",
+        )
+        .bind(&child)
+        .bind(owner.id)
+        .bind(endpoint_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let composite_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO deployed_models (model_name,alias,is_composite,created_by) VALUES ($1,$1,true,$2) RETURNING id",
+        )
+        .bind(&alias)
+        .bind(owner.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO deployed_model_components (composite_model_id,deployed_model_id,weight,sort_order,enabled) VALUES ($1,$2,1,0,TRUE)",
+        )
+        .bind(composite_id)
+        .bind(child_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // No own `batch_capacity`: the gauge reports the 200 default.
+        let targets = load_targets_from_db(&pool, &[], false).await.unwrap();
+        super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(&format!(r#"dwctl_model_batch_inflight_limit{{model="{alias}"}} 200"#)),
+            "a virtual model without its own capacity reports the default; got:\n{rendered}"
+        );
+
+        // An explicit positive value wins over the default.
+        sqlx::query("UPDATE deployed_models SET batch_capacity = 7 WHERE id = $1")
+            .bind(composite_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let targets = load_targets_from_db(&pool, &[], false).await.unwrap();
+        super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(&format!(r#"dwctl_model_batch_inflight_limit{{model="{alias}"}} 7"#)),
+            "an explicit positive capacity is reported; got:\n{rendered}"
+        );
+
+        // Turning the default off leaves the model uncapped, reported as 0.
+        sqlx::query("UPDATE deployed_models SET batch_capacity = NULL WHERE id = $1")
+            .bind(composite_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let targets = crate::sync::onwards_config::load_targets_from_db_with_batch_default(&pool, &[], false, None)
+            .await
+            .unwrap();
+        super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(&format!(r#"dwctl_model_batch_inflight_limit{{model="{alias}"}} 0"#)),
+            "with the default off an unset capacity reports 0; got:\n{rendered}"
         );
     }
 
@@ -774,9 +861,7 @@ mod tests {
             model_type: None,
             capabilities: None,
             hosted_on: Some(endpoint.id),
-            requests_per_second: None,
-            burst_size: None,
-            capacity: None,
+            realtime_inflight_limit: None,
             batch_capacity: None,
             throughput: None,
             provider_pricing: None,
@@ -807,9 +892,7 @@ mod tests {
         .unwrap();
         tx.commit().await.unwrap();
 
-        let targets = load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
-            .await
-            .unwrap();
+        let targets = load_targets_from_db(&pool, &[], false).await.unwrap();
         super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
@@ -881,9 +964,7 @@ mod tests {
                 model_type: None,
                 capabilities: None,
                 hosted_on: Some(endpoint.id),
-                requests_per_second: None,
-                burst_size: None,
-                capacity: None,
+                realtime_inflight_limit: None,
                 batch_capacity: None,
                 throughput: None,
                 provider_pricing: None,
@@ -938,9 +1019,7 @@ mod tests {
         .unwrap();
 
         // Cycle 1: group is present — populates PREV_GROUPS
-        let targets = load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
-            .await
-            .unwrap();
+        let targets = load_targets_from_db(&pool, &[], false).await.unwrap();
         super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
@@ -967,9 +1046,7 @@ mod tests {
         .unwrap();
 
         // Cycle 2: group is gone — zeroing should zero the ORIGINAL series
-        let targets = load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
-            .await
-            .unwrap();
+        let targets = load_targets_from_db(&pool, &[], false).await.unwrap();
         super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
@@ -1037,9 +1114,7 @@ mod tests {
                 model_type: None,
                 capabilities: None,
                 hosted_on: Some(endpoint.id),
-                requests_per_second: None,
-                burst_size: None,
-                capacity: None,
+                realtime_inflight_limit: None,
                 batch_capacity: None,
                 throughput: None,
                 provider_pricing: None,
@@ -1084,9 +1159,7 @@ mod tests {
                 model_type: None,
                 capabilities: None,
                 hosted_on: None,
-                requests_per_second: None,
-                burst_size: None,
-                capacity: None,
+                realtime_inflight_limit: None,
                 batch_capacity: None,
                 throughput: None,
                 provider_pricing: None,
@@ -1130,9 +1203,7 @@ mod tests {
         .unwrap();
 
         // Cycle 1: component is present
-        let targets = load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
-            .await
-            .unwrap();
+        let targets = load_targets_from_db(&pool, &[], false).await.unwrap();
         super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
@@ -1157,9 +1228,7 @@ mod tests {
         .unwrap();
 
         // Cycle 2: component is gone — should zero the original series
-        let targets = load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
-            .await
-            .unwrap();
+        let targets = load_targets_from_db(&pool, &[], false).await.unwrap();
         super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
@@ -1229,11 +1298,9 @@ mod tests {
                 model_type: None,
                 capabilities: None,
                 hosted_on: Some(endpoint.id),
-                requests_per_second: Some(42.0),
-                burst_size: None,
-                capacity: Some(99),
+                realtime_inflight_limit: None,
                 batch_capacity: None,
-                throughput: None,
+                throughput: Some(42.0),
                 provider_pricing: None,
                 is_composite: false,
                 lb_strategy: None,
@@ -1264,9 +1331,7 @@ mod tests {
         tx.commit().await.unwrap();
 
         // Cycle 1: model is active
-        let targets = load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
-            .await
-            .unwrap();
+        let targets = load_targets_from_db(&pool, &[], false).await.unwrap();
         super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
@@ -1278,10 +1343,10 @@ mod tests {
             "dwctl_model_info should be 1.0 for active model"
         );
 
-        let rps_lines = find_metric_lines(&output, "dwctl_model_rate_limit_rps", r#"model="ghost-model""#);
+        let throughput_lines = find_metric_lines(&output, "dwctl_model_throughput_rps", r#"model="ghost-model""#);
         assert!(
-            rps_lines.iter().any(|l| l.ends_with(" 42")),
-            "Rate limit should be 42 for active model"
+            throughput_lines.iter().any(|l| l.ends_with(" 42")),
+            "Throughput should be 42 for active model"
         );
 
         // Soft-delete the model
@@ -1291,9 +1356,7 @@ mod tests {
             .unwrap();
 
         // Cycle 2: model is deleted — gauges should be zeroed
-        let targets = load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
-            .await
-            .unwrap();
+        let targets = load_targets_from_db(&pool, &[], false).await.unwrap();
         super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
@@ -1306,20 +1369,11 @@ mod tests {
             info_lines
         );
 
-        // Rate limit gauge should be zeroed
-        let rps_lines = find_metric_lines(&output, "dwctl_model_rate_limit_rps", r#"model="ghost-model""#);
+        let throughput_lines = find_metric_lines(&output, "dwctl_model_throughput_rps", r#"model="ghost-model""#);
         assert!(
-            rps_lines.iter().any(|l| l.ends_with(" 0")),
-            "Rate limit should be 0 after model deletion. Lines: {:?}",
-            rps_lines
-        );
-
-        // Concurrency limit gauge should be zeroed
-        let cap_lines = find_metric_lines(&output, "dwctl_model_concurrency_limit", r#"model="ghost-model""#);
-        assert!(
-            cap_lines.iter().any(|l| l.ends_with(" 0")),
-            "Concurrency limit should be 0 after model deletion. Lines: {:?}",
-            cap_lines
+            throughput_lines.iter().any(|l| l.ends_with(" 0")),
+            "Throughput should be 0 after model deletion. Lines: {:?}",
+            throughput_lines
         );
     }
 
@@ -1327,7 +1381,7 @@ mod tests {
     async fn test_metadata_change_preserves_single_label_gauges(pool: sqlx::PgPool) {
         // When a model's metadata changes (e.g., tariff added so is_metered
         // flips), the old info gauge series should be zeroed but single-label
-        // gauges (rate_limit, concurrency, etc.) must NOT be zeroed because
+        // gauges (throughput, batch capacity, etc.) must NOT be zeroed because
         // the model still exists.
         let handle = ensure_recorder();
         let mut state = super::CacheInfoState::new();
@@ -1367,11 +1421,9 @@ mod tests {
                 model_type: None,
                 capabilities: None,
                 hosted_on: Some(endpoint.id),
-                requests_per_second: Some(77.0),
-                burst_size: None,
-                capacity: None,
+                realtime_inflight_limit: None,
                 batch_capacity: None,
-                throughput: None,
+                throughput: Some(77.0),
                 provider_pricing: None,
                 is_composite: false,
                 lb_strategy: None,
@@ -1402,9 +1454,7 @@ mod tests {
         tx.commit().await.unwrap();
 
         // Cycle 1: model exists, is_metered=false (no tariff)
-        let targets = load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
-            .await
-            .unwrap();
+        let targets = load_targets_from_db(&pool, &[], false).await.unwrap();
         super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
@@ -1433,9 +1483,7 @@ mod tests {
         tx.commit().await.unwrap();
 
         // Cycle 2: same model, but is_metered changed
-        let targets = load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
-            .await
-            .unwrap();
+        let targets = load_targets_from_db(&pool, &[], false).await.unwrap();
         super::update_cache_info_metrics(&pool, &targets, &mut state).await.unwrap();
 
         let output = handle.render();
@@ -1456,11 +1504,11 @@ mod tests {
         );
 
         // Single-label gauges must NOT be zeroed — model still exists
-        let rps_lines = find_metric_lines(&output, "dwctl_model_rate_limit_rps", r#"model="meta-change-model""#);
+        let throughput_lines = find_metric_lines(&output, "dwctl_model_throughput_rps", r#"model="meta-change-model""#);
         assert!(
-            rps_lines.iter().any(|l| l.ends_with(" 77")),
-            "Rate limit should still be 77 after metadata change (not zeroed). Lines: {:?}",
-            rps_lines
+            throughput_lines.iter().any(|l| l.ends_with(" 77")),
+            "Throughput should still be 77 after metadata change (not zeroed). Lines: {:?}",
+            throughput_lines
         );
     }
 }

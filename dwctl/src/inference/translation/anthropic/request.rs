@@ -101,24 +101,24 @@ pub fn to_chat_completions(req: MessagesRequest, cache_enabled: bool) -> Result<
 /// caller data such as a tool call's `function.arguments`. Mirrors the sites in
 /// [`crate::prompt_cache::inject`]'s outbound sanitiser.
 fn strip_cache_control_markers(out: &mut serde_json::Map<String, Value>) {
-    out.remove("cache_control");
+    out.shift_remove("cache_control");
     if let Some(messages) = out.get_mut("messages").and_then(Value::as_array_mut) {
         for msg in messages.iter_mut() {
             if let Some(obj) = msg.as_object_mut() {
-                obj.remove("cache_control");
+                obj.shift_remove("cache_control");
             }
             // Array-form content only; string content carries no marker.
             if let Some(content) = msg.get_mut("content").and_then(Value::as_array_mut) {
                 for part in content.iter_mut() {
                     if let Some(part_obj) = part.as_object_mut() {
-                        part_obj.remove("cache_control");
+                        part_obj.shift_remove("cache_control");
                     }
                 }
             }
             if let Some(tool_calls) = msg.get_mut("tool_calls").and_then(Value::as_array_mut) {
                 for call in tool_calls.iter_mut() {
                     if let Some(call_obj) = call.as_object_mut() {
-                        call_obj.remove("cache_control");
+                        call_obj.shift_remove("cache_control");
                     }
                 }
             }
@@ -127,7 +127,7 @@ fn strip_cache_control_markers(out: &mut serde_json::Map<String, Value>) {
     if let Some(tools) = out.get_mut("tools").and_then(Value::as_array_mut) {
         for tool in tools.iter_mut() {
             if let Some(tool_obj) = tool.as_object_mut() {
-                tool_obj.remove("cache_control");
+                tool_obj.shift_remove("cache_control");
             }
         }
     }
@@ -396,6 +396,17 @@ mod tests {
     // cache-disabled behaviour is under test.
     fn translate(v: Value) -> Value {
         to_chat_completions(serde_json::from_value::<MessagesRequest>(v).unwrap(), true).unwrap()
+    }
+
+    #[test]
+    fn tool_input_schema_keeps_key_order() {
+        let schema = r#"{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"string"}},"required":["zeta","alpha"]}"#;
+        let req: MessagesRequest = serde_json::from_str(&format!(
+            r#"{{"model":"m","max_tokens":16,"messages":[{{"role":"user","content":"hi"}}],"tools":[{{"name":"lookup","input_schema":{schema}}}]}}"#
+        ))
+        .unwrap();
+        let out = serde_json::to_string(&to_chat_completions(req, true).unwrap()).unwrap();
+        assert!(out.contains(&format!(r#""parameters":{schema}"#)), "{out}");
     }
 
     #[test]

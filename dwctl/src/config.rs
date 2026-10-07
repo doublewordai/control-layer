@@ -846,10 +846,8 @@ pub struct AuthConfig {
     /// Applies to user registration and proxy header auth auto-creation
     /// StandardUser role is always guaranteed to be present even if not specified
     pub default_user_roles: Vec<Role>,
-    /// Default rate-limit tiers applied to API keys based on the owning user's
-    /// `verified` flag. Only used when the api_key has no explicit per-key
-    /// override. Leaving either tier as `None` means "no limit for that tier".
-    pub rate_limits: RateLimitTiersConfig,
+    #[serde(rename = "rate_limits", skip_serializing)]
+    pub ignored_rate_limits: serde::de::IgnoredAny,
     /// Extra email domains to treat as personal, on top of the built-in list
     /// in `auth::utils`.
     ///
@@ -889,27 +887,10 @@ impl Default for AuthConfig {
             proxy_header: ProxyHeaderAuthConfig::default(),
             security: SecurityConfig::default(),
             default_user_roles: vec![Role::StandardUser, Role::BackgroundInferenceUser],
-            rate_limits: RateLimitTiersConfig::default(),
+            ignored_rate_limits: serde::de::IgnoredAny,
             personal_email_domains: Vec::new(),
         }
     }
-}
-
-/// Per-tier defaults for API key rate limits. A `None` tier means no default
-/// limit is applied, preserving the legacy "unlimited unless overridden"
-/// behaviour for that tier.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct RateLimitTiersConfig {
-    pub verified: Option<RateLimitTierConfig>,
-    pub unverified: Option<RateLimitTierConfig>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RateLimitTierConfig {
-    pub requests_per_second: f32,
-    pub burst_size: Option<i32>,
 }
 
 /// Native username/password authentication configuration.
@@ -1166,6 +1147,95 @@ pub struct LimitsConfig {
     pub files: FileLimitsConfig,
     /// Request limits (per-request body size within batch files)
     pub requests: RequestLimitsConfig,
+    /// Realtime (interactive) per-account in-flight limits, counted per key
+    /// account.
+    pub realtime_inflight: RealtimeInflightLimitsConfig,
+    /// Global per-model batch in-flight cap. Reuses
+    /// [`RealtimeInflightLimitsConfig::redis_url`] for its shared counter, so
+    /// the cap holds across replicas; it is a separate switch because batch and
+    /// realtime limits can be rolled out independently.
+    pub batch_inflight: BatchInflightLimitsConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RealtimeInflightLimitsConfig {
+    pub enforce: bool,
+    pub redis_url: Option<String>,
+}
+
+/// Per-model batch in-flight cap.
+///
+/// When enforced, each virtual (composite) model's `batch_capacity` becomes a
+/// ceiling on how many batch (dispatched) requests may be in flight against
+/// that alias at once, counted globally across replicas in the same Redis used
+/// by [`RealtimeInflightLimitsConfig`]. `realtime_inflight` traffic is not
+/// affected. `redis_url` is intentionally not duplicated here: batch reuses
+/// `limits.realtime_inflight.redis_url`. With `enforce` false (the default)
+/// nothing is refused and no shared count is touched.
+///
+/// Enabling this changes the meaning of `batch_capacity`: without it the value
+/// is only fusillade's per-daemon *starting* concurrency (adaptive concurrency
+/// can grow past it), while with it the same value is also the *global*
+/// ceiling. Raise `batch_capacity` to the intended global cap before turning
+/// enforcement on. File batches, flex and background requests all share this
+/// single per-model ceiling.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BatchInflightLimitsConfig {
+    pub enforce: bool,
+    /// Default global batch in-flight cap applied to virtual (composite) models
+    /// that do not set their own positive `batch_capacity`. Default: 200.
+    ///
+    /// This only affects the onwards cap; it does not change fusillade's
+    /// per-daemon starting concurrency, which keeps using
+    /// `background_services.batch_daemon.default_model_concurrency` for models
+    /// without an explicit `batch_capacity`. Set to `null` or `0` to leave
+    /// virtual models without their own value uncapped. Negative values are
+    /// rejected at config load.
+    #[serde(
+        default = "default_batch_inflight_capacity",
+        deserialize_with = "deserialize_batch_inflight_default_capacity"
+    )]
+    pub default_capacity: Option<u32>,
+}
+
+/// Default global batch in-flight cap for virtual models without a positive
+/// `batch_capacity` of their own.
+pub const DEFAULT_BATCH_INFLIGHT_CAPACITY: u32 = 200;
+
+fn default_batch_inflight_capacity() -> Option<u32> {
+    Some(DEFAULT_BATCH_INFLIGHT_CAPACITY)
+}
+
+/// Accepts a positive integer, or the "off" forms `null` and `0`; rejects
+/// negative values with a clear config-load error.
+fn deserialize_batch_inflight_default_capacity<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let value: Option<i64> = Option::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(value) if value < 0 => Err(D::Error::custom(format!(
+            "limits.batch_inflight.default_capacity must not be negative, got {value}"
+        ))),
+        Some(0) => Ok(None),
+        Some(value) => u32::try_from(value)
+            .map(Some)
+            .map_err(|_| D::Error::custom(format!("limits.batch_inflight.default_capacity is too large, got {value}"))),
+    }
+}
+
+impl Default for BatchInflightLimitsConfig {
+    fn default() -> Self {
+        Self {
+            enforce: false,
+            default_capacity: default_batch_inflight_capacity(),
+        }
+    }
 }
 
 /// Request limits configuration.
@@ -1219,6 +1289,12 @@ pub struct OnwardsConfig {
     /// breach without cutting it off; once breaches exceed the controller's
     /// target rate, later requests shift to the alternates. Set to 0 to disable.
     pub first_token_timeout_ms: u64,
+    /// Strict-mode chat parameters that get a 400 instead of being forwarded.
+    /// Every parameter onwards flags as not servable by every worker is logged
+    /// and counted (`onwards_unsupported_params_total`); only the ones listed
+    /// here are refused. Names must come from `onwards::unsupported_params::params()`.
+    /// Default: empty (log only).
+    pub rejected_params: Vec<String>,
 }
 
 impl Default for OnwardsConfig {
@@ -1230,6 +1306,7 @@ impl Default for OnwardsConfig {
                 "This is a shared best-effort endpoint, rate limited under load – retry with backoff. For production workloads that aren't latency-sensitive, try our async or batch tiers (https://docs.doubleword.ai/inference-api/batch-inference); for a dedicated real-time endpoint with SLAs, higher rate limits, and volume pricing, contact support@doubleword.ai."
                     .to_string(),
             first_token_timeout_ms: 20_000,
+            rejected_params: Vec::new(),
         }
     }
 }
@@ -3294,6 +3371,7 @@ pub struct ModelProvisioningConfig {
     /// Directory containing per-organisation overlay YAML documents (see
     /// `org_overlays`). A missing directory is an empty catalog.
     pub org_overlays_directory: PathBuf,
+    pub account_limits_directory: PathBuf,
 }
 
 impl Default for ModelProvisioningConfig {
@@ -3302,6 +3380,7 @@ impl Default for ModelProvisioningConfig {
             enabled: false,
             directory: PathBuf::from("/app/model-provisioning.d"),
             org_overlays_directory: PathBuf::from("/app/org-overlays.d"),
+            account_limits_directory: PathBuf::from("/app/account-limits.d"),
         }
     }
 }
@@ -3529,6 +3608,16 @@ impl Config {
         if let Err(error) = self.background_services.prompt_cache_retention.validate() {
             return Err(Error::Internal {
                 operation: format!("Config validation: prompt-cache retention is invalid: {error}"),
+            });
+        }
+        if let Some(name) = self
+            .onwards
+            .rejected_params
+            .iter()
+            .find(|name| onwards::unsupported_params::known_param(name).is_none())
+        {
+            return Err(Error::Internal {
+                operation: format!("Config validation: onwards.rejected_params names an unknown parameter: {name}"),
             });
         }
         if self.background_services.batch_daemon.retention.expire_files
@@ -4008,6 +4097,60 @@ mod tests {
     }
 
     #[test]
+    fn batch_inflight_enforcement_defaults_off_and_parses_on() {
+        assert!(!LimitsConfig::default().batch_inflight.enforce);
+
+        let parsed: LimitsConfig = serde_json::from_value(serde_json::json!({
+            "batch_inflight": { "enforce": true }
+        }))
+        .unwrap();
+        assert!(parsed.batch_inflight.enforce);
+    }
+
+    #[test]
+    fn batch_inflight_default_capacity_defaults_to_200() {
+        assert_eq!(LimitsConfig::default().batch_inflight.default_capacity, Some(200));
+    }
+
+    #[test]
+    fn batch_inflight_default_capacity_parses_an_explicit_positive_value() {
+        let parsed: LimitsConfig = serde_json::from_value(serde_json::json!({
+            "batch_inflight": { "default_capacity": 500 }
+        }))
+        .unwrap();
+        assert_eq!(parsed.batch_inflight.default_capacity, Some(500));
+    }
+
+    #[test]
+    fn batch_inflight_default_capacity_accepts_the_off_forms() {
+        for off in [serde_json::json!(null), serde_json::json!(0)] {
+            let parsed: LimitsConfig = serde_json::from_value(serde_json::json!({
+                "batch_inflight": { "default_capacity": off }
+            }))
+            .unwrap();
+            assert_eq!(parsed.batch_inflight.default_capacity, None, "{off} should mean no default");
+        }
+    }
+
+    #[test]
+    fn batch_inflight_default_capacity_rejects_negative_values() {
+        let error = serde_json::from_value::<LimitsConfig>(serde_json::json!({
+            "batch_inflight": { "default_capacity": -1 }
+        }))
+        .expect_err("a negative default capacity must be rejected");
+        assert!(error.to_string().contains("must not be negative"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn batch_inflight_default_capacity_rejects_out_of_range_values() {
+        let error = serde_json::from_value::<LimitsConfig>(serde_json::json!({
+            "batch_inflight": { "default_capacity": 5_000_000_000i64 }
+        }))
+        .expect_err("a default capacity beyond u32 must be rejected");
+        assert!(error.to_string().contains("too large"), "unexpected error: {error}");
+    }
+
+    #[test]
     fn obsolete_retention_sweep_interval_is_rejected_on_a_complete_config() {
         let mut serialized = serde_json::to_value(DaemonConfig::default()).unwrap();
         serialized["retention_sweep_interval_ms"] = serde_json::json!(1_000);
@@ -4082,6 +4225,18 @@ mod tests {
             .insert("unknown".to_string(), 60);
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("unsupported service tier"));
+    }
+
+    #[test]
+    fn rejected_params_must_be_known() {
+        let mut config = Config::default();
+        config.secret_key = Some("test-secret-key".to_string());
+        config.onwards.rejected_params = vec!["logprobs".to_string()];
+        config.validate().unwrap();
+
+        config.onwards.rejected_params.push("top_k".to_string());
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("onwards.rejected_params names an unknown parameter: top_k"));
     }
 
     #[test]
@@ -5016,6 +5171,65 @@ secret_key: "test-secret-key"
 
             let config = Config::load(&args)?;
             assert_eq!(config.batches.default_throughput, 75.5);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_batch_inflight_enforce_env_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            assert!(!Config::load(&args)?.limits.batch_inflight.enforce, "default is off");
+
+            jail.set_env("DWCTL_LIMITS__BATCH_INFLIGHT__ENFORCE", "true");
+            let config = Config::load(&args)?;
+            assert!(config.limits.batch_inflight.enforce);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_batch_inflight_default_capacity_env_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            assert_eq!(
+                Config::load(&args)?.limits.batch_inflight.default_capacity,
+                Some(200),
+                "default is 200"
+            );
+
+            jail.set_env("DWCTL_LIMITS__BATCH_INFLIGHT__DEFAULT_CAPACITY", "250");
+            assert_eq!(Config::load(&args)?.limits.batch_inflight.default_capacity, Some(250));
+
+            // 0 is the "off" form: no default cap.
+            jail.set_env("DWCTL_LIMITS__BATCH_INFLIGHT__DEFAULT_CAPACITY", "0");
+            assert_eq!(Config::load(&args)?.limits.batch_inflight.default_capacity, None);
+
+            // A negative override is rejected at load.
+            jail.set_env("DWCTL_LIMITS__BATCH_INFLIGHT__DEFAULT_CAPACITY", "-1");
+            assert!(Config::load(&args).is_err(), "a negative env override must be rejected");
 
             Ok(())
         });
