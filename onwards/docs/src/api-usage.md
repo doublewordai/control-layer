@@ -58,8 +58,12 @@ See [Command Line Options](cli.md) for metrics configuration flags.
 
 Every client error that onwards decides on itself, such as an unknown model, a failed reasoning check, a strict-mode schema error or a rate limit, increments `onwards_rejections_total{model, status, code, traffic}`:
 
-- `code` is the error code returned to the client. Strict-mode body errors, which carry no code, are counted as `invalid_json` (malformed JSON) or `schema_mismatch` (valid JSON that doesn't match the schema).
-- `model` is set only when the request names a configured model, and is empty otherwise.
+- `code` is the error code returned to the client. Strict-mode body errors carry no code, so they are counted as:
+  - `invalid_json`: malformed JSON;
+  - `schema_mismatch`: valid JSON that doesn't match the schema;
+  - `invalid_content_type`: a `/v1/responses` body not sent as JSON;
+  - `invalid_body`: a `/v1/responses` body that couldn't be read.
+- `model` is the configured model the request names, without any serving-class suffix such as `:interactive`. It is empty when the request names no configured model.
 - `traffic` is `dispatched` for requests carrying the first-token-timeout exempt header and `realtime` otherwise.
 
 Each rejection is also logged at `info` with its status, code, parameter, model, account and API key ID. Values and request bodies are never logged. A client error that reports an upstream's response isn't counted.

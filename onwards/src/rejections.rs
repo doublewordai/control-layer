@@ -53,14 +53,17 @@ impl RejectionContext {
         self.model = Some(model.to_string());
     }
 
-    /// Records `model` if it names a configured alias.
+    /// Records the alias `model` selects, with any serving-class suffix
+    /// removed, if it is configured.
     pub(crate) fn set_model_if_configured<T: HttpClient>(
         &mut self,
         state: &AppState<T>,
         model: &str,
     ) {
-        if state.targets.targets.contains_key(model) {
-            self.set_model(model);
+        if let Ok((alias, _)) = serving::split_class_suffix(model)
+            && state.targets.targets.contains_key(alias)
+        {
+            self.set_model(alias);
         }
     }
 

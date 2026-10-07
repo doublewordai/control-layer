@@ -34,7 +34,8 @@ use crate::extract_model_from_request;
 use crate::handlers::{AuthenticatedApiKeyId, ResolvedTrust, target_message_handler};
 use crate::rejections::RejectionContext;
 use axum::Json;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{FromRequest, State};
 use axum::http::{Extensions, HeaderMap, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -253,16 +254,42 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     }
 
     let extensions = req.extensions().clone();
-    let request: ResponsesRequest = match axum::extract::Json::from_request(req, &state).await {
+    // Buffered before the `Json` extractor runs, so a refused request can still
+    // be attributed to its model.
+    let body_bytes = match Bytes::from_request(req, &state).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            error!(error = %e, "Failed to read responses request");
+            rejection_context(&state, &headers, None).record(
+                StatusCode::BAD_REQUEST,
+                "invalid_body",
+                None,
+            );
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("Invalid request: {}", e),
+            );
+        }
+    };
+    let mut json_request = Request::new(Body::from(body_bytes.clone()));
+    *json_request.headers_mut() = headers.clone();
+    *json_request.extensions_mut() = extensions.clone();
+    let request: ResponsesRequest = match Json::from_request(json_request, &state).await {
         Ok(Json(r)) => r,
         Err(e) => {
             error!(error = %e, "Failed to parse responses request");
-            let code = if e.status() == StatusCode::UNPROCESSABLE_ENTITY {
-                "schema_mismatch"
-            } else {
-                "invalid_json"
+            let code = match e {
+                JsonRejection::JsonDataError(_) => "schema_mismatch",
+                JsonRejection::MissingJsonContentType(_) => "invalid_content_type",
+                _ => "invalid_json",
             };
-            rejection_context(&state, &headers, None).record(StatusCode::BAD_REQUEST, code, None);
+            let model = extract_model_from_request(&headers, &body_bytes);
+            rejection_context(&state, &headers, model.as_deref()).record(
+                StatusCode::BAD_REQUEST,
+                code,
+                None,
+            );
             return error_response(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",

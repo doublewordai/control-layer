@@ -161,6 +161,66 @@ async fn completions_parameter_refusals_are_counted() {
 }
 
 #[tokio::test]
+async fn serving_class_suffixes_are_counted_under_the_alias() {
+    let alias = "suffixed-rejection-model";
+    let mock = MockHttpClient::new(StatusCode::OK, COMPLETION);
+    let server = strict_server(alias, mock.clone());
+
+    let response = server
+        .post("/completions")
+        .json(&json!({
+            "model": format!("{alias}:interactive"),
+            "prompt": "Hi",
+            "reasoning_effort": "low"
+        }))
+        .await;
+
+    response.assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(
+        count(&[("model", alias), ("code", "unsupported_parameter")]),
+        Some(1.0)
+    );
+}
+
+#[tokio::test]
+async fn responses_schema_errors_keep_the_model() {
+    let alias = "responses-schema-model";
+    let mock = MockHttpClient::new(StatusCode::OK, "{}");
+    let server = strict_server(alias, mock.clone());
+
+    let response = server
+        .post("/responses")
+        .json(&json!({"model": alias, "input": 42}))
+        .await;
+
+    response.assert_status(StatusCode::BAD_REQUEST);
+    assert!(mock.get_requests().is_empty());
+    assert_eq!(
+        count(&[("model", alias), ("code", "schema_mismatch")]),
+        Some(1.0)
+    );
+}
+
+#[tokio::test]
+async fn responses_bodies_not_sent_as_json_are_counted_as_such() {
+    let alias = "responses-content-type-model";
+    let mock = MockHttpClient::new(StatusCode::OK, "{}");
+    let server = strict_server(alias, mock.clone());
+
+    let response = server
+        .post("/responses")
+        .text(json!({"model": alias, "input": "Hello"}).to_string())
+        .await;
+
+    response.assert_status(StatusCode::BAD_REQUEST);
+    assert!(mock.get_requests().is_empty());
+    assert_eq!(
+        count(&[("model", alias), ("code", "invalid_content_type")]),
+        Some(1.0)
+    );
+}
+
+#[tokio::test]
 async fn upstream_client_errors_are_not_counted() {
     let alias = "upstream-error-model";
     let mock = MockHttpClient::new(StatusCode::BAD_REQUEST, UPSTREAM_ERROR);
