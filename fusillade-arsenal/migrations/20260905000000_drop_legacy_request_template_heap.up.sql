@@ -11,20 +11,20 @@
 -- content that a reader could still resolve. Nothing is deleted row by row;
 -- the heap goes as one relation.
 --
--- Hold the heap lock before checking the guard so a concurrent legacy writer
--- cannot insert between the check and the drop. Bound the wait so a busy
--- daemon is never queued behind this migration.
+-- Block legacy writes throughout validation, while allowing readers to run.
+-- Upgrade to the destructive lock only after the guard has passed. Both lock
+-- acquisitions have bounded waits.
 SET LOCAL lock_timeout = '5s';
-LOCK TABLE request_templates IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE request_templates IN SHARE MODE;
 
 DO $$
 DECLARE
     blocking_reason TEXT;
 BEGIN
-    -- Each probe is driven from the legacy heap, which is expected to be
-    -- small or empty by the time this runs; the per-row probes into
-    -- `requests` use its template_id index, the archive probe hashes the
-    -- heap against one archive pass.
+    -- Live-request probes use the template_id index. Archive validation below
+    -- visits one registered week at a time with an explicit pruning predicate.
+    -- Keep all probes in one statement so concurrent archive moves cannot hide
+    -- a reference between separate live and archive snapshots.
     SELECT reason INTO blocking_reason
     FROM (
         SELECT 'a legacy template is still referenced by a live request' AS reason
@@ -37,10 +37,17 @@ BEGIN
         )
         UNION ALL
         SELECT 'a legacy template is still referenced by an archived batch request'
-        WHERE EXISTS (
+        WHERE EXISTS (SELECT 1 FROM request_templates)
+          AND EXISTS (
             SELECT 1
-            FROM request_templates legacy
-            JOIN batch_requests_archive archived ON archived.template_id = legacy.id
+            FROM batch_archive_buckets bucket
+            CROSS JOIN LATERAL (
+                SELECT 1
+                FROM batch_requests_archive archived
+                JOIN request_templates legacy ON legacy.id = archived.template_id
+                WHERE archived.archive_bucket = bucket.week_start
+                LIMIT 1
+            ) referenced
         )
         UNION ALL
         SELECT 'a legacy template still belongs to a file that is not deleted'
@@ -73,6 +80,8 @@ BEGIN
     END IF;
 END;
 $$;
+
+LOCK TABLE request_templates IN ACCESS EXCLUSIVE MODE;
 
 -- Generation-2 only. Dedicated batchless templates (file_id IS NULL) now live
 -- here too, so the file join is outer, exactly as the legacy arm's was: a

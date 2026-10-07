@@ -6785,7 +6785,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         created_on, id, file_id, custom_id, endpoint, method,
                         path, body, model, api_key, body_byte_size
                     )
-                    SELECT (statement_timestamp() AT TIME ZONE 'UTC')::date,
+                    SELECT (transaction_timestamp() AT TIME ZONE 'UTC')::date,
                            id, NULL, NULL, endpoint, method, path, body, model,
                            api_key, body_byte_size
                     FROM UNNEST(
@@ -7635,7 +7635,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                     created_on, file_id, custom_id, endpoint, method, path,
                     body, model, api_key, line_number, body_byte_size
                 )
-                SELECT (statement_timestamp() AT TIME ZONE 'UTC')::date,
+                SELECT (transaction_timestamp() AT TIME ZONE 'UTC')::date,
                        $1, custom_id, endpoint, method, path, body, model,
                        api_key, line_number, body_byte_size
                 FROM UNNEST(
@@ -9018,40 +9018,14 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
                 FusilladeError::Other(anyhow!("Failed to purge orphaned request templates: {e}"))
             })?
             .rows_affected() as i64;
-        // Step 2b: a pending request whose template is gone (purged above, or
-        // its weekly partition retired and its route cleaned up) can never be
-        // claimed, and without a row-level FK it would otherwise occupy a
-        // claim slot on every tick. The route probe is a primary-key lookup.
-        let stranded_failed = sqlx::query(
-            r#"
-            UPDATE requests
-               SET state = 'failed',
-                   error = 'request template no longer exists',
-                   failed_at = NOW()
-             WHERE id IN (
-                   SELECT r.id
-                     FROM requests r
-                    WHERE r.state = 'pending'
-                      AND r.template_id IS NOT NULL
-                      AND NOT EXISTS (SELECT 1 FROM request_template_routes rt WHERE rt.template_id = r.template_id)
-                    LIMIT $1
-                    FOR UPDATE SKIP LOCKED
-             )
-            "#,
-        )
-        .bind(batch_size)
-        .execute(self.write_executor())
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fail stranded requests: {e}")))?
-        .rows_affected() as i64;
-        let total =
-            (requests_deleted + archived_deleted + templates_deleted + stranded_failed) as u64;
+        // Missing templates are failed by the bounded claim paths. Do not
+        // scan the entire pending backlog on otherwise idle purge ticks.
+        let total = (requests_deleted + archived_deleted + templates_deleted) as u64;
         if total > 0 {
             tracing::info!(
                 requests_deleted,
                 archived_deleted,
                 templates_deleted,
-                stranded_failed,
                 "Purged orphaned rows"
             );
         }
@@ -15416,11 +15390,10 @@ mod tests {
         );
     }
 
-    /// Without the old ON DELETE SET NULL, a pending request whose template
-    /// was purged would sit in the claim window forever. The orphan purge
-    /// fails it instead.
+    /// Orphan purges only follow deletion tombstones. Missing templates are
+    /// handled by the bounded claim paths, without sweeping the pending backlog.
     #[sqlx::test]
-    async fn test_purge_fails_pending_requests_whose_template_is_gone(pool: sqlx::PgPool) {
+    async fn test_purge_leaves_pending_requests_without_deletion_tombstones(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
@@ -15445,15 +15418,18 @@ mod tests {
         .unwrap();
 
         let purged = manager.purge_orphaned_rows(100).await.unwrap();
-        assert_eq!(purged, 2, "both stranded requests must be failed");
+        assert_eq!(purged, 0, "no deletion tombstones means no purge work");
         let states: Vec<(String, Option<String>)> =
             sqlx::query_as("SELECT state, error FROM requests WHERE batch_id = $1 ORDER BY id")
                 .bind(*stranded as Uuid)
                 .fetch_all(&pool)
                 .await
                 .unwrap();
-        assert!(states.iter().all(|(state, error)| state == "failed"
-            && error.as_deref() == Some("request template no longer exists")));
+        assert!(
+            states
+                .iter()
+                .all(|(state, error)| state == "pending" && error.is_none())
+        );
         let healthy_pending: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM requests WHERE batch_id = $1 AND state = 'pending'",
         )

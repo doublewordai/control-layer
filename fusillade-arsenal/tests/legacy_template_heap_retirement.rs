@@ -266,6 +266,9 @@ async fn drops_an_empty_heap_and_collapses_the_views_to_generation_two(pool: PgP
 #[sqlx::test(migrations = false)]
 async fn the_down_migration_restores_an_empty_heap_and_the_two_arm_views(pool: PgPool) {
     migrate_to_before_retirement(&pool).await;
+    let indexes_before: Vec<String> = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() AND tablename = 'request_templates' ORDER BY indexname",
+    ).fetch_all(&pool).await.unwrap();
     let week = current_week(&pool).await;
     let g2_id = insert_g2_template(&pool, week).await;
     apply_retirement(&pool).await.unwrap();
@@ -274,6 +277,14 @@ async fn the_down_migration_restores_an_empty_heap_and_the_two_arm_views(pool: P
         .undo(&pool, DROP_LEGACY_HEAP_MIGRATION - 1)
         .await
         .expect("the down migration must apply");
+
+    let indexes_after: Vec<String> = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() AND tablename = 'request_templates' ORDER BY indexname",
+    ).fetch_all(&pool).await.unwrap();
+    assert_eq!(
+        indexes_after, indexes_before,
+        "rollback must restore exactly the preceding index set"
+    );
 
     let legacy_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_templates")
         .fetch_one(&pool)
@@ -301,5 +312,73 @@ async fn the_down_migration_restores_an_empty_heap_and_the_two_arm_views(pool: P
         active,
         vec![legacy_id, g2_id],
         "dedicated templates written before rollback stay claimable"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn archive_guard_keeps_legacy_readers_available_and_refuses_referenced_rows(pool: PgPool) {
+    migrate_to_before_retirement(&pool).await;
+    let week = current_week(&pool).await;
+    insert_g2_template(&pool, week).await;
+    let legacy_id = insert_legacy_template(&pool, None).await;
+    sqlx::query(
+        "UPDATE request_templates SET created_at = NOW() - interval '30 days' WHERE id = $1",
+    )
+    .bind(legacy_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("SELECT ensure_archive_partitions(0)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let request_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO requests (template_id, model, state, created_by, completed_at, response_status, response_body)
+         VALUES ($1, 'test-model', 'completed', 'tester', NOW(), 200, '{}') RETURNING id",
+    ).bind(legacy_id).fetch_one(&pool).await.unwrap();
+    sqlx::query(
+        "WITH moved AS (DELETE FROM requests WHERE id = $1 RETURNING *)
+         INSERT INTO batch_requests_archive SELECT moved.*, $2::date FROM moved",
+    )
+    .bind(request_id)
+    .bind(week)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Hold up the archive probe so we can check the lock held on the heap
+    // while validation is in progress, independently of archive size.
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE batch_requests_archive IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let migration_pool = pool.clone();
+    let migration = tokio::spawn(async move { apply_retirement(&migration_pool).await });
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let locked: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE relation = 'request_templates'::regclass
+                 AND granted AND mode IN ('ShareLock', 'AccessExclusiveLock'))",
+            ).fetch_one(&pool).await.unwrap();
+            if locked { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("migration must lock legacy writes before probing the archive");
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM request_templates").fetch_one(&pool),
+    )
+    .await;
+    blocker.rollback().await.unwrap();
+    let error = migration
+        .await
+        .unwrap()
+        .expect_err("an archived reference must block retirement");
+    assert_eq!(sqlstate(&error).as_deref(), Some("55000"), "{error}");
+    assert_eq!(
+        read.expect("archive validation must not block legacy readers")
+            .unwrap(),
+        1
     );
 }

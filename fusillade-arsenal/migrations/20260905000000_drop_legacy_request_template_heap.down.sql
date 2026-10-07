@@ -27,10 +27,8 @@ CREATE TABLE request_templates (
 );
 
 CREATE INDEX idx_request_templates_file_id ON request_templates (file_id);
-CREATE INDEX idx_request_templates_custom_id ON request_templates (custom_id);
 CREATE INDEX idx_request_templates_file_line ON request_templates (file_id, line_number);
 CREATE INDEX idx_request_templates_file_model ON request_templates (file_id, model);
-CREATE INDEX idx_request_templates_model ON request_templates (model);
 
 CREATE TRIGGER update_request_templates_updated_at
     BEFORE UPDATE ON request_templates
