@@ -335,7 +335,7 @@ fn convert_text_format_to_response_format(text: Option<&TextConfig>) -> Option<R
             json_schema: None,
         }),
         "json_schema" => {
-            value.as_object_mut()?.remove("type");
+            value.as_object_mut()?.shift_remove("type");
             Some(ResponseFormat {
                 format_type,
                 json_schema: Some(value),
@@ -470,6 +470,17 @@ mod tests {
         assert_eq!(chat.messages[0].role, "assistant");
         assert_eq!(chat.messages[0].reasoning_content.as_deref(), Some("private chain"));
         assert_eq!(chat.messages[1].role, "user");
+    }
+
+    #[test]
+    fn json_schema_text_format_keeps_key_order() {
+        let schema = r#"{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"string"}},"required":["zeta","alpha"]}"#;
+        let request: ResponsesRequest = serde_json::from_str(&format!(
+            r#"{{"model":"m","input":"hi","text":{{"format":{{"type":"json_schema","name":"n","strict":true,"schema":{schema}}}}}}}"#
+        ))
+        .unwrap();
+        let chat = serde_json::to_string(&to_chat_request(&request)).unwrap();
+        assert!(chat.contains(&format!(r#""schema":{schema}"#)), "{chat}");
     }
 
     #[test]

@@ -1253,7 +1253,7 @@ pub async fn target_message_handler<T: HttpClient>(
             && let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&attempt_body)
             && let Some(obj) = parsed.as_object_mut()
         {
-            let removed = [obj.remove("priority"), obj.remove("nvext")];
+            let removed = [obj.shift_remove("priority"), obj.shift_remove("nvext")];
             if removed.iter().any(Option::is_some)
                 && let Ok(stripped) = serde_json::to_vec(&parsed)
             {
