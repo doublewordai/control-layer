@@ -1,5 +1,12 @@
 # Changelog
 
+## [13.1.1](https://github.com/doublewordai/control-layer/compare/v13.1.0...v13.1.1) (2026-10-07)
+
+
+### Bug Fixes
+
+* **notifications:** send organization low-balance alerts to owners and admins ([#1863](https://github.com/doublewordai/control-layer/issues/1863)) ([c90dc91](https://github.com/doublewordai/control-layer/commit/c90dc913290fb0b57f0a6c0b449f9f3b6f545671))
+
 ## [13.1.0](https://github.com/doublewordai/control-layer/compare/v13.0.0...v13.1.0) (2026-10-06)
 
 
