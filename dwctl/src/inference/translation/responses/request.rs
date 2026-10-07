@@ -8,7 +8,7 @@
 //! already carries any prior context and this is a plain, synchronous transform.
 
 use super::types::{
-    ContentPart, Include, Input, Item, MessageContent as ResponseMessageContent, ReasoningContent, ResponsesRequest,
+    ContentPart, Include, Input, Item, MessageContent as ResponseMessageContent, NamespaceTool, ReasoningContent, ResponsesRequest,
     StopSequence as ResponsesStopSequence, TextConfig, Tool as ResponseTool, ToolChoice as ResponseToolChoice,
 };
 use onwards::strict::schemas::chat_completions::{
@@ -263,8 +263,11 @@ fn convert_message_content(content: &ResponseMessageContent) -> MessageContent {
 }
 
 /// Convert Responses tools to Chat Completions tools.
+///
+/// Namespace groups are flattened first (see [`flatten_tool_namespaces`]), so
+/// this only ever sees top-level tools.
 fn convert_tools(tools: &[ResponseTool]) -> Vec<ChatTool> {
-    tools
+    flatten_tool_namespaces(tools)
         .iter()
         .filter_map(|tool| match tool {
             ResponseTool::Function {
@@ -304,6 +307,52 @@ fn convert_tools(tools: &[ResponseTool]) -> Vec<ChatTool> {
             }
         })
         .collect()
+}
+
+/// Flatten `namespace` tool groups into individual function tools.
+///
+/// Codex groups its function tools under a `namespace` wrapper
+/// (`{"type": "namespace", "name": "functions", "tools": [...]}`). Chat
+/// Completions has no namespaced-tool concept, so the group is flattened into
+/// the functions it contains. Names are left exactly as Codex declared them:
+/// the model sees the flat function name, calls it back flat, and Codex maps a
+/// missing namespace to its default `functions` namespace — so no name
+/// mangling or round-trip translation is needed.
+///
+/// `custom` members (freeform tools such as `apply_patch`, whose input is a
+/// grammar rather than a JSON Schema) are dropped: there is no Chat Completions
+/// equivalent, and silently rewriting them as functions would send the model a
+/// schema the tool does not accept.
+///
+/// Non-namespace tools pass through untouched.
+fn flatten_tool_namespaces(tools: &[ResponseTool]) -> Vec<ResponseTool> {
+    let mut flattened = Vec::with_capacity(tools.len());
+    for tool in tools {
+        match tool {
+            ResponseTool::Namespace { tools: members, .. } => {
+                for member in members {
+                    match member {
+                        NamespaceTool::Function {
+                            name,
+                            description,
+                            parameters,
+                            strict,
+                        } => flattened.push(ResponseTool::Function {
+                            name: name.clone(),
+                            description: description.clone(),
+                            parameters: parameters.clone(),
+                            strict: *strict,
+                        }),
+                        NamespaceTool::Custom { name, .. } => {
+                            debug!(tool = %name, "Skipping freeform tool in namespace group");
+                        }
+                    }
+                }
+            }
+            other => flattened.push(other.clone()),
+        }
+    }
+    flattened
 }
 
 /// Convert Responses tool choice to Chat Completions tool choice.
@@ -392,6 +441,116 @@ mod tests {
         assert!(messages[1].tool_calls.is_some());
         assert_eq!(messages[2].role, "tool");
         assert_eq!(messages[2].tool_call_id, Some("call_123".to_string()));
+    }
+
+    #[test]
+    fn namespace_tool_group_is_flattened_to_functions() {
+        // Codex sends its function tools wrapped in a `namespace` group; the
+        // edge translator must accept the wrapper and flatten it, or the
+        // request is rejected before any model sees it.
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "kimi-k2.5",
+            "input": "fix the build",
+            "tools": [{
+                "type": "namespace",
+                "name": "functions",
+                "description": "",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "exec_command",
+                        "description": "Runs a command.",
+                        "strict": false,
+                        "parameters": {"type": "object", "properties": {}}
+                    },
+                    {
+                        "type": "function",
+                        "name": "apply_patch",
+                        "description": "Edits files.",
+                        "strict": false,
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                ]
+            }]
+        }))
+        .unwrap();
+
+        let chat = to_chat_request(&request);
+        let tools = chat.tools.expect("tools should survive conversion");
+
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].function.name, "exec_command");
+        assert_eq!(tools[1].function.name, "apply_patch");
+    }
+
+    #[test]
+    fn freeform_tools_inside_a_namespace_are_dropped() {
+        // `custom` members carry a grammar, not a JSON Schema. There is no Chat
+        // Completions equivalent, so they are dropped rather than mistranslated.
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "kimi-k2.5",
+            "input": "fix the build",
+            "tools": [{
+                "type": "namespace",
+                "name": "functions",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "exec_command",
+                        "description": "Runs a command.",
+                        "parameters": {"type": "object", "properties": {}}
+                    },
+                    {
+                        "type": "custom",
+                        "name": "apply_patch",
+                        "description": "Edits files.",
+                        "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"}
+                    }
+                ]
+            }]
+        }))
+        .unwrap();
+
+        let chat = to_chat_request(&request);
+        let tools = chat.tools.expect("tools should survive conversion");
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "exec_command");
+    }
+
+    #[test]
+    fn namespace_group_and_plain_tools_coexist() {
+        // A request can mix grouped and top-level tools; order is preserved.
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "kimi-k2.5",
+            "input": "hi",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "functions",
+                    "tools": [{
+                        "type": "function",
+                        "name": "exec_command",
+                        "description": "Runs a command.",
+                        "parameters": {"type": "object", "properties": {}}
+                    }]
+                },
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "description": "Weather.",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            ]
+        }))
+        .unwrap();
+
+        let chat = to_chat_request(&request);
+        let tools = chat.tools.expect("tools should survive conversion");
+
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].function.name, "exec_command");
+        assert_eq!(tools[1].function.name, "get_weather");
     }
 
     #[test]

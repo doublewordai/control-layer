@@ -624,6 +624,50 @@ pub enum Tool {
         /// Name of the server-side tool to enable for this request.
         name: String,
     },
+
+    /// A named group of tools (`{"type": "namespace", ...}`).
+    ///
+    /// Codex wraps its function tools in a `namespace` group on the Responses
+    /// wire — usually `functions`, sometimes an MCP server namespace, and
+    /// potentially a namespace per group. The translation layer flattens the
+    /// group into ordinary function tools (see
+    /// `request::flatten_tool_namespaces`) because Chat Completions has no
+    /// namespaced-tool concept.
+    #[serde(rename = "namespace")]
+    Namespace {
+        /// Namespace name (e.g. `functions`).
+        name: String,
+        /// Namespace description; Codex sends an empty string for the default
+        /// `functions` namespace.
+        #[serde(default)]
+        description: Option<String>,
+        /// Grouped tools. `function` members are flattened; `custom` members
+        /// (freeform tools, e.g. `apply_patch`) are dropped, as they have no
+        /// Chat Completions equivalent.
+        tools: Vec<NamespaceTool>,
+    },
+}
+
+/// A tool nested inside a [`Tool::Namespace`] group.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum NamespaceTool {
+    #[serde(rename = "function")]
+    Function {
+        name: String,
+        description: String,
+        parameters: serde_json::Value,
+        #[serde(default = "default_strict")]
+        strict: bool,
+    },
+
+    /// Freeform tool (grammar-defined input rather than a JSON Schema).
+    #[serde(rename = "custom")]
+    Custom {
+        name: String,
+        #[serde(default)]
+        description: Option<String>,
+    },
 }
 
 /// Tool choice specification

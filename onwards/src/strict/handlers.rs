@@ -263,9 +263,16 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     let original_model = request.model.clone();
     let is_streaming = request.stream.unwrap_or(false);
 
+    // Codex groups its function tools under a `namespace` wrapper. Chat
+    // Completions (and the models behind it) have no namespaced-tool concept,
+    // so flatten the groups into their member functions before forwarding.
+    let mut request = request;
+    if let Some(ref mut tools) = request.tools {
+        *tools = flatten_tool_namespaces(std::mem::take(tools));
+    }
+
     // OpenAI requires additionalProperties: false in tool schemas even for /v1/responses
     // Add it if missing to ensure compatibility
-    let mut request = request;
     if let Some(ref mut tools) = request.tools {
         for tool in tools.iter_mut() {
             if let super::schemas::responses::Tool::Function { parameters, .. } = tool
@@ -1098,6 +1105,46 @@ async fn sanitize_embeddings_response(mut response: Response, original_model: St
 ///
 /// Deserializes the response through our strict schema (drops extra fields),
 /// rewrites the model field, and re-serializes.
+/// Flatten `namespace` tool groups into individual function tools.
+///
+/// Codex sends `{"type": "namespace", "name": "functions", "tools": [...]}`.
+/// Names are left as declared — Codex maps a missing namespace back to its
+/// default `functions` — and `custom` (freeform) members are dropped, as they
+/// have no Chat Completions equivalent.
+fn flatten_tool_namespaces(
+    tools: Vec<super::schemas::responses::Tool>,
+) -> Vec<super::schemas::responses::Tool> {
+    use super::schemas::responses::{NamespaceTool, Tool};
+
+    let mut flattened = Vec::with_capacity(tools.len());
+    for tool in tools {
+        match tool {
+            Tool::Namespace { tools: members, .. } => {
+                for member in members {
+                    match member {
+                        NamespaceTool::Function {
+                            name,
+                            description,
+                            parameters,
+                            strict,
+                        } => flattened.push(Tool::Function {
+                            name,
+                            description,
+                            parameters,
+                            strict,
+                        }),
+                        NamespaceTool::Custom { name, .. } => {
+                            debug!(tool = %name, "Skipping freeform tool in namespace group");
+                        }
+                    }
+                }
+            }
+            other => flattened.push(other),
+        }
+    }
+    flattened
+}
+
 async fn sanitize_responses_response(
     mut response: Response,
     original_model: String,
@@ -2953,6 +3000,81 @@ mod tests {
         assert!(!body_str.contains("provider"));
         assert!(!body_str.contains("cost"));
         assert!(!body_str.contains("internal_trace_id"));
+    }
+
+    #[tokio::test]
+    async fn test_responses_namespace_tools_are_flattened_before_forwarding() {
+        // Codex wraps its function tools in a `namespace` group. The strict
+        // Responses handler must accept the wrapper (it used to 400 on it) and
+        // forward the member functions as ordinary tools.
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "kimi-k2.5".to_string(),
+            Target::builder()
+                .url("https://dynamo.example.com/v1/".parse().unwrap())
+                .build()
+                .into_pool(),
+        );
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+        let mock_client = MockHttpClient::new(
+            StatusCode::OK,
+            r#"{"id":"resp_1","object":"response","created_at":1,"status":"completed","model":"kimi-k2.5","output":[],"tools":[],"tool_choice":"auto","truncation":"disabled","parallel_tool_calls":true,"text":{"format":{"type":"text"}},"top_p":1.0,"presence_penalty":0.0,"frequency_penalty":0.0,"top_logprobs":0,"temperature":1.0,"reasoning":null,"usage":null,"store":false,"background":false,"service_tier":"default"}"#,
+        );
+        let state = AppState::with_client(targets, mock_client.clone());
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body = serde_json::json!({
+            "model": "kimi-k2.5",
+            "input": "fix the build",
+            "tools": [{
+                "type": "namespace",
+                "name": "functions",
+                "description": "",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "exec_command",
+                        "description": "Runs a command.",
+                        "strict": false,
+                        "parameters": {"type": "object", "properties": {}}
+                    },
+                    {
+                        "type": "custom",
+                        "name": "apply_patch",
+                        "description": "Edits files.",
+                        "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"}
+                    }
+                ]
+            }]
+        });
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body.to_string()))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let forwarded = mock_client.requests.lock().unwrap();
+        assert_eq!(forwarded.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&forwarded[0].body).unwrap();
+        let tools = body["tools"]
+            .as_array()
+            .expect("tools should still be forwarded");
+        assert_eq!(tools.len(), 1, "only the function member survives");
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "exec_command");
     }
 
     #[tokio::test]

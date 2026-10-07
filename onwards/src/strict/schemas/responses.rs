@@ -631,6 +631,48 @@ pub enum Tool {
         /// Name of the server-side tool to enable for this request.
         name: String,
     },
+
+    /// A named group of tools (`{"type": "namespace", ...}`). Codex wraps its
+    /// function tools in one; the handler flattens the group into ordinary
+    /// function tools before forwarding (see `flatten_tool_namespaces`).
+    #[serde(rename = "namespace")]
+    Namespace {
+        /// Namespace name (e.g. `functions`).
+        #[allow(dead_code)]
+        name: String,
+        /// Namespace description; empty for the default `functions` namespace.
+        #[serde(default)]
+        #[allow(dead_code)]
+        description: Option<String>,
+        /// Grouped tools. `function` members are flattened; `custom` members
+        /// (freeform tools) are dropped.
+        #[allow(dead_code)]
+        tools: Vec<NamespaceTool>,
+    },
+}
+
+/// A tool nested inside a [`Tool::Namespace`] group.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum NamespaceTool {
+    #[serde(rename = "function")]
+    Function {
+        name: String,
+        description: String,
+        parameters: serde_json::Value,
+        #[serde(default = "default_strict")]
+        strict: bool,
+    },
+
+    /// Freeform tool (grammar-defined input rather than a JSON Schema).
+    #[serde(rename = "custom")]
+    Custom {
+        #[allow(dead_code)]
+        name: String,
+        #[serde(default)]
+        #[allow(dead_code)]
+        description: Option<String>,
+    },
 }
 
 /// Tool choice specification
