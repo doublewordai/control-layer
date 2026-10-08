@@ -27,6 +27,7 @@ where
     retention_maintenance: RetentionMaintenanceConfig,
     leak_config: Option<LeakConfig>,
     dispatch_tolerations: Option<Vec<crate::daemon::Toleration>>,
+    sla_release: Option<crate::daemon::SlaReleaseConfig>,
     processor: OnceLock<Arc<dyn RequestProcessor<PostgresStore<P>, H>>>,
 }
 
@@ -126,6 +127,7 @@ where
             retention_maintenance: RetentionMaintenanceConfig::default(),
             leak_config: None,
             dispatch_tolerations: None,
+            sla_release: None,
             processor: OnceLock::new(),
         }
     }
@@ -149,6 +151,13 @@ where
         tolerations: Vec<crate::daemon::Toleration>,
     ) -> Self {
         self.dispatch_tolerations = Some(tolerations);
+        self
+    }
+
+    /// Also release tolerations on a throughput projection; see
+    /// [`crate::Daemon::with_sla_release`].
+    pub fn with_sla_release(mut self, config: crate::daemon::SlaReleaseConfig) -> Self {
+        self.sla_release = Some(config);
         self
     }
 
@@ -217,6 +226,9 @@ where
         }
         if let Some(tolerations) = &self.dispatch_tolerations {
             daemon = daemon.with_dispatch_tolerations(tolerations.clone());
+        }
+        if let Some(config) = &self.sla_release {
+            daemon = daemon.with_sla_release(config.clone());
         }
         if let Some(processor) = self.processor.get().cloned() {
             daemon = daemon.with_processor(processor);

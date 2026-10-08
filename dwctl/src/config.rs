@@ -2246,6 +2246,12 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub dispatch_tolerations: Option<Vec<fusillade::daemon::Toleration>>,
 
+    /// Release a request's `dispatch_tolerations` early when our own workers
+    /// are projected to miss its SLA, not only inside the deadline ramp.
+    /// Off by default (ramp-only). See [`DispatchTolerationsSlaRelease`].
+    #[serde(default)]
+    pub dispatch_tolerations_sla_release: DispatchTolerationsSlaRelease,
+
     /// Database-wide per-model ceiling below which no-SLA background work may
     /// be claimed. Zero disables background processing while leaving
     /// submission and inspection available. Background processing also
@@ -2526,6 +2532,64 @@ fn default_batch_metadata_fields_dwctl() -> Vec<String> {
     ]
 }
 
+/// Throughput-projection release of `dispatch_tolerations`.
+///
+/// Per request, the daemon projects when the model's own workers would reach
+/// it: `work_ahead / throughput`. `work_ahead` is the model's outstanding
+/// (pending, claimed, processing) requests due no later than this one, read
+/// from the database every `refresh_interval_secs` for all models at once.
+/// `throughput` is measured only from requests dispatched WITH the
+/// tolerations (guaranteed to run on our workers; released ones may have
+/// spilled and would inflate it), as completions per in-flight-second scaled
+/// by the deployment-wide in-flight count. If the projected finish is later
+/// than `deadline - safety_margin * window`, the request is sent without
+/// tolerations and may spill: batch normally waits and retries rather than
+/// spill to the paid tier, but when it would miss its SLA, meeting the
+/// deadline matters more than the cost. The deadline ramp and past-deadline
+/// release always apply; until a model has `min_samples` tolerated
+/// completions only they do.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DispatchTolerationsSlaRelease {
+    /// Off by default: ramp-only release.
+    pub enabled: bool,
+    /// Half-life of the throughput estimate, in seconds. Default 600.
+    pub half_life_secs: f64,
+    /// Margin before the deadline, as a fraction of the completion window.
+    /// Default 0.1.
+    pub safety_margin: f64,
+    /// Successful tolerated completions per model before the projection is
+    /// trusted. Default 20.
+    pub min_samples: u64,
+    /// How often the outstanding-work snapshot is read, in seconds. Default 15.
+    pub refresh_interval_secs: u64,
+}
+
+impl Default for DispatchTolerationsSlaRelease {
+    fn default() -> Self {
+        let defaults = fusillade::daemon::SlaReleaseConfig::default();
+        Self {
+            enabled: false,
+            half_life_secs: defaults.half_life_secs,
+            safety_margin: defaults.safety_margin,
+            min_samples: defaults.min_samples,
+            refresh_interval_secs: defaults.refresh_interval_ms / 1000,
+        }
+    }
+}
+
+impl DispatchTolerationsSlaRelease {
+    /// The fusillade config, when enabled.
+    pub fn to_fusillade(&self) -> Option<fusillade::daemon::SlaReleaseConfig> {
+        self.enabled.then(|| fusillade::daemon::SlaReleaseConfig {
+            half_life_secs: self.half_life_secs,
+            safety_margin: self.safety_margin,
+            min_samples: self.min_samples,
+            refresh_interval_ms: self.refresh_interval_secs.saturating_mul(1000),
+        })
+    }
+}
+
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
@@ -2579,6 +2643,7 @@ impl Default for DaemonConfig {
             urgency_weight: default_urgency_weight(),
             inject_deadline_priority: false,
             dispatch_tolerations: None,
+            dispatch_tolerations_sla_release: DispatchTolerationsSlaRelease::default(),
             background_concurrency_limit: 0,
             batch_claim_size: 0,
             batch_claim_batch_size: default_batch_claim_batch_size(),
@@ -5608,6 +5673,35 @@ background_services:
                 "[] (tolerate nothing) is not the same as unset"
             );
             assert!(!daemon.inject_deadline_priority, "tolerations do not need deadline priority");
+            assert_eq!(
+                daemon.dispatch_tolerations_sla_release.to_fusillade(),
+                None,
+                "the projection is off by default"
+            );
+
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: test-secret-key
+background_services:
+  batch_daemon:
+    dispatch_tolerations: []
+    dispatch_tolerations_sla_release:
+      enabled: true
+      safety_margin: 0.2
+"#,
+            )?;
+            let config = Config::load(&args)?;
+            let sla_release = config
+                .background_services
+                .batch_daemon
+                .dispatch_tolerations_sla_release
+                .to_fusillade()
+                .unwrap();
+            assert_eq!(sla_release.safety_margin, 0.2);
+            assert_eq!(sla_release.half_life_secs, 600.0);
+            assert_eq!(sla_release.min_samples, 20);
+            assert_eq!(sla_release.refresh_interval_ms, 15_000);
 
             jail.create_file(
                 "test.yaml",

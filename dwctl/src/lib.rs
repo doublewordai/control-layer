@@ -4200,6 +4200,14 @@ impl Application {
         if let Some(tolerations) = &config.background_services.batch_daemon.dispatch_tolerations {
             postgres_daemon = postgres_daemon.with_dispatch_tolerations(tolerations.clone());
         }
+        if let Some(sla_release) = config
+            .background_services
+            .batch_daemon
+            .dispatch_tolerations_sla_release
+            .to_fusillade()
+        {
+            postgres_daemon = postgres_daemon.with_sla_release(sla_release);
+        }
         let postgres_daemon = Arc::new(postgres_daemon);
         // Build the ZDR keystore once and share it across the response store, the
         // daemon processor, and background services (which install the response
