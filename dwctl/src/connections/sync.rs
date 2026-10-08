@@ -986,7 +986,8 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
     //    On retries where a previous attempt already created AND populated a batch,
     //    skip reservation since those requests are already counted in pending.
     //    If the batch exists but isn't populated yet (failure between create and populate),
-    //    we still need to reserve capacity.
+    //    we still reserve capacity unless outstanding-work counting already covers it
+    //    (see `skip_reservation`).
     let batch_already_populated = if let Some(existing_batch_id) = sync_entry.batch_id {
         let batch = state.request_manager.get_batch(fusillade::BatchId(existing_batch_id)).await;
         match batch {
@@ -997,10 +998,18 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
         false
     };
 
+    // A retry that reuses an existing, not yet populated batch was admitted on
+    // its first activation. With outstanding-work counting on, admission
+    // already counts that batch through its file's templates, so reserving
+    // for it again would count it twice: a batch admitted at its model's
+    // capacity would then reject every retry and never be populated.
+    let skip_reservation =
+        batch_already_populated || (sync_entry.batch_id.is_some() && state.config.snapshot().batches.pending_capacity_counts_enabled);
+
     // Fetched once, for both capacity reservations and the cached model label
-    // below. A fresh create (no batch_id on the sync entry) always implies
-    // !batch_already_populated, so the label never needs stats this skips.
-    let file_stats = if batch_already_populated {
+    // below. A fresh create (no batch_id on the sync entry) never skips
+    // reservation, so the label never needs stats this skips.
+    let file_stats = if skip_reservation {
         Vec::new()
     } else {
         state
@@ -1010,7 +1019,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
             .map_err(|e| anyhow::anyhow!("get file template stats: {e}"))?
     };
 
-    let reservation_ids = if batch_already_populated {
+    let reservation_ids = if skip_reservation {
         Vec::new()
     } else {
         use crate::api::handlers::sla_capacity::{CapacityError, CapacityReservationInput, admission_windows, reserve_capacity};
@@ -1808,6 +1817,83 @@ mod tests {
             .await
             .expect("fetch batch_id");
         assert!(batch_id.is_none(), "no batch should be created when capacity is insufficient");
+    }
+
+    /// A retry after `create_batch_record` succeeded but population failed must
+    /// not count the existing batch twice: with outstanding-work counting on,
+    /// its templates are already counted, so a batch admitted at exactly its
+    /// model's capacity must still be populated on retry.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_activate_batch_retry_does_not_recount_unpopulated_batch(pool: PgPool) {
+        use crate::api::models::users::Role;
+        use crate::test::utils::{create_test_endpoint, create_test_model};
+
+        // 24h capacity = floor(2.5 / 86400 × 86400) = 2 requests.
+        let mut config = create_test_config();
+        config.batches.allowed_completion_windows = vec!["24h".to_string()];
+        config.batches.default_throughput = 2.5 / 86_400.0;
+        config.batches.pending_capacity_counts_enabled = true;
+
+        let state = setup_task_state_with_config(pool.clone(), config).await;
+
+        let user = create_test_user(&pool, Role::PlatformManager).await;
+        let user_id = user.id;
+        let endpoint_id = create_test_endpoint(&pool, "test-endpoint", user_id).await;
+        let model_alias = "test-model";
+        create_test_model(&pool, "test-model-internal", model_alias, endpoint_id, user_id).await;
+
+        let connection_id = insert_test_connection(&pool, user_id).await;
+        let sync_id = insert_test_sync_op(&pool, connection_id, user_id).await;
+        let entry_id = insert_test_sync_entry(&pool, sync_id, connection_id, "data/retry.jsonl").await;
+
+        let templates = vec![valid_template(model_alias), valid_template(model_alias)];
+        let file_id = create_test_file(&state, user_id, templates).await;
+
+        // A previous attempt created the batch (filling the model's capacity)
+        // and persisted its id, then failed before population.
+        let batch = state
+            .request_manager
+            .create_batch_record(fusillade::BatchInput {
+                file_id: fusillade::FileId(file_id),
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: Some(user_id.to_string()),
+                api_key_id: None,
+                api_key: None,
+                total_requests: Some(2),
+            })
+            .await
+            .expect("create_batch_record");
+        let batch_id = *batch.id;
+
+        sqlx::query("UPDATE sync_entries SET file_id = $2, template_count = 2, batch_id = $3 WHERE id = $1")
+            .bind(entry_id)
+            .bind(file_id)
+            .bind(batch_id)
+            .execute(&pool)
+            .await
+            .expect("update sync_entry");
+
+        let input = ActivateBatchInput {
+            sync_id,
+            sync_entry_id: entry_id,
+            connection_id,
+            file_id,
+            template_count: 2,
+        };
+
+        run_activate_batch(&state, &input)
+            .await
+            .expect("a retry of an admitted batch must not be rejected for its own capacity");
+
+        let batch = state
+            .request_manager
+            .get_batch(fusillade::BatchId(batch_id))
+            .await
+            .expect("get_batch");
+        assert_eq!(batch.pending_requests, 2, "the reused batch should be populated");
     }
 
     /// An unverified creditor's connection sync must honour the upload-volume
