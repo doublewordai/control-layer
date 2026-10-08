@@ -1013,7 +1013,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
     let reservation_ids = if batch_already_populated {
         Vec::new()
     } else {
-        use crate::api::handlers::sla_capacity::{CapacityError, CapacityReservationInput, reserve_capacity};
+        use crate::api::handlers::sla_capacity::{CapacityError, CapacityReservationInput, admission_windows, reserve_capacity};
         use crate::db::handlers::deployments::Deployments;
 
         // Filter out empty model aliases — those are tier-2 invalid lines that will
@@ -1050,18 +1050,23 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
             }
 
             let config = state.config.snapshot();
-            let cap_input = CapacityReservationInput {
-                completion_window: &completion_window,
-                file_model_counts: &file_model_counts,
-                model_throughputs: &batch_model_info.throughputs,
-                model_ids_by_alias: &model_ids_by_alias,
-                default_throughput: config.batches.default_throughput,
-                relaxation_factor: config.batches.relaxation_factor(&completion_window),
-                reservation_ttl_secs: config.batches.reservation_ttl_secs,
-                include_pending_counts: config.batches.pending_capacity_counts_enabled,
-            };
+            let windows = admission_windows(
+                &config.batches,
+                &completion_window,
+                config.batches.relaxation_factor(&completion_window),
+            );
+            let cap_input = CapacityReservationInput::from_config(
+                &config.batches,
+                &completion_window,
+                &windows,
+                &file_model_counts,
+                &batch_model_info.throughputs,
+                &model_ids_by_alias,
+            );
 
-            match reserve_capacity(&dwctl.write(), &*state.request_manager, &cap_input).await {
+            // Sync activations are rare and run in a background job; count
+            // fresh rather than sharing the API replicas' cache.
+            match reserve_capacity(&dwctl.write(), &*state.request_manager, None, &cap_input).await {
                 Ok(ids) => ids,
                 Err(CapacityError::InsufficientCapacity { completion_window, models }) => {
                     return Err(ActivateError::Retryable(format!(

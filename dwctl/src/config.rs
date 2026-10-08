@@ -1741,11 +1741,33 @@ pub struct BatchConfig {
     /// Default: 1000.
     pub unverified_requests_per_completion_hour: usize,
 
-    /// Include committed pending/claimed/processing requests in batch admission capacity checks.
-    /// When false, admission capacity checks only include active in-flight reservations.
+    /// Count work already admitted and not yet finished in batch admission capacity checks.
+    ///
+    /// When true, admitting a batch for window `W` checks, for `W` and every longer allowed
+    /// window, that the model's outstanding batch requests due within that window (pending,
+    /// claimed or processing rows of active batches, plus the template count of batches whose
+    /// rows have not been inserted yet), plus in-flight reservations, plus the new batch, fit in
+    /// `throughput × window × relaxation`. When false, admission only counts active in-flight
+    /// reservations, which makes the check effectively per batch.
     /// Default: false.
     #[serde(default)]
     pub pending_capacity_counts_enabled: bool,
+
+    /// Maximum age, in seconds, of a per-replica cached outstanding-work snapshot used by
+    /// batch admission when `pending_capacity_counts_enabled` is set.
+    ///
+    /// The count is proportional to a model's outstanding backlog, so it is refreshed at most
+    /// once per model per this interval per replica instead of on every submission. Using a
+    /// snapshot is safe at any age: reservations released after the snapshot was taken are
+    /// added back, so batches admitted since are still counted; a stale snapshot only
+    /// over-counts work that has completed since (under-acceptance). `0` disables the cache
+    /// and counts on every submission. Default: 10.
+    pub pending_capacity_counts_max_age_secs: u64,
+
+    /// Statement timeout, in milliseconds, for the admission outstanding-work count. On
+    /// timeout or error admission falls back to the last usable snapshot, or to reservations
+    /// only (fail open). Default: 10000.
+    pub pending_capacity_counts_timeout_ms: u64,
 }
 
 /// Configuration for the async requests feature.
@@ -1868,6 +1890,8 @@ impl Default for BatchConfig {
             reservation_ttl_secs: default_reservation_ttl_secs(),
             unverified_requests_per_completion_hour: 1000,
             pending_capacity_counts_enabled: false,
+            pending_capacity_counts_max_age_secs: 10,
+            pending_capacity_counts_timeout_ms: 10_000,
         }
     }
 }

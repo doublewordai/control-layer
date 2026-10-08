@@ -20,16 +20,10 @@ pub struct SlaCapacityCheckResult {
 
 /// Check if a batch can be accepted within the requested completion window.
 ///
-/// This is a simple check: for each model in the batch, verify that
-/// `(pending_requests + new_requests) <= throughput * window_seconds`
-///
-/// # Note on Concurrency for V1
-/// This capacity check does not use locking, so concurrent batch creations may
-/// both pass the check and then exceed the actual capacity. This is a known
-/// limitation that provides "best effort" protection - it will reject obvious
-/// overflows but may allow slight over-acceptance during concurrent bursts.
-/// This trade-off is intentional for Phase 1 to avoid complexity; proper
-/// concurrency control (e.g., advisory locks) will be added in future iterations.
+/// This is a pure check for one window: for each model in the batch, verify that
+/// `(pending_requests + new_requests) <= throughput * window_seconds * relaxation`.
+/// Concurrency control (advisory locks, reservations) and the choice of windows
+/// live in [`reserve_capacity`].
 ///
 /// # Arguments
 /// * `file_model_counts` - Map of model alias to request count in the new batch
@@ -157,18 +151,88 @@ pub(super) fn parse_window_to_seconds(window: &str) -> i64 {
 
 use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use uuid::Uuid;
+
+use crate::config::BatchConfig;
+
+/// One completion window a batch admission is checked against.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AdmissionWindow {
+    pub label: String,
+    pub seconds: i64,
+    pub relaxation_factor: f32,
+}
+
+/// The windows a batch submitted for `requested` must fit in: the requested
+/// window and every longer allowed window, shortest first.
+///
+/// Work due sooner also consumes the capacity of every longer window (the
+/// daemon serves earliest deadlines first, so a 1h batch delays 24h work that
+/// is already queued). A 1h batch is therefore checked against both the 1h and
+/// the 24h window; a 24h batch only against 24h, because it cannot delay work
+/// that is due sooner than itself.
+pub(crate) fn admission_windows(config: &BatchConfig, requested: &str, requested_relaxation: f32) -> Vec<AdmissionWindow> {
+    let requested_seconds = parse_window_to_seconds(requested);
+    let mut windows = vec![AdmissionWindow {
+        label: requested.to_string(),
+        seconds: requested_seconds,
+        relaxation_factor: requested_relaxation,
+    }];
+    for label in &config.allowed_completion_windows {
+        let seconds = parse_window_to_seconds(label);
+        if seconds > requested_seconds && !windows.iter().any(|w| w.label == *label) {
+            windows.push(AdmissionWindow {
+                label: label.clone(),
+                seconds,
+                relaxation_factor: config.relaxation_factor(label),
+            });
+        }
+    }
+    windows.sort_by_key(|w| w.seconds);
+    windows
+}
 
 /// Inputs for a capacity reservation check, independent of API/sync context.
 pub(crate) struct CapacityReservationInput<'a> {
+    /// The window the batch was submitted for; reservations are recorded under it.
     pub completion_window: &'a str,
+    /// Every window the batch must fit in (see [`admission_windows`]).
+    pub windows: &'a [AdmissionWindow],
     pub file_model_counts: &'a HashMap<String, i64>,
     pub model_throughputs: &'a HashMap<String, f32>,
     pub model_ids_by_alias: &'a HashMap<String, Uuid>,
     pub default_throughput: f32,
-    pub relaxation_factor: f32,
     pub reservation_ttl_secs: i64,
     pub include_pending_counts: bool,
+    pub pending_counts_max_age_secs: u64,
+    pub pending_counts_timeout_ms: u64,
+}
+
+impl<'a> CapacityReservationInput<'a> {
+    /// Build the input from the batch config, for a batch submitted for `completion_window`.
+    pub(crate) fn from_config(
+        config: &BatchConfig,
+        completion_window: &'a str,
+        windows: &'a [AdmissionWindow],
+        file_model_counts: &'a HashMap<String, i64>,
+        model_throughputs: &'a HashMap<String, f32>,
+        model_ids_by_alias: &'a HashMap<String, Uuid>,
+    ) -> Self {
+        Self {
+            completion_window,
+            windows,
+            file_model_counts,
+            model_throughputs,
+            model_ids_by_alias,
+            default_throughput: config.default_throughput,
+            reservation_ttl_secs: config.reservation_ttl_secs,
+            include_pending_counts: config.pending_capacity_counts_enabled,
+            pending_counts_max_age_secs: config.pending_capacity_counts_max_age_secs,
+            pending_counts_timeout_ms: config.pending_capacity_counts_timeout_ms,
+        }
+    }
 }
 
 /// Error type for capacity reservation operations.
@@ -180,146 +244,334 @@ pub(crate) enum CapacityError {
     Internal(String),
 }
 
+/// Outstanding admitted work per model alias and window label, plus the
+/// dwctl-clock instant read *before* the count: every batch committed before
+/// that instant is included in the counts.
+#[derive(Debug, Clone)]
+struct OutstandingDemand {
+    counts: HashMap<String, HashMap<String, i64>>,
+    since: DateTime<Utc>,
+}
+
+/// Per-replica cache of outstanding-work counts for batch admission.
+///
+/// Counting is proportional to a model's outstanding backlog, and batches are
+/// submitted far more often than that backlog changes meaningfully, so each
+/// replica refreshes a model's count at most once per
+/// `pending_capacity_counts_max_age_secs` instead of on every submission.
+///
+/// Reusing a snapshot is sound at any age because of how it is combined with
+/// reservations: a batch admitted after the snapshot was taken held a
+/// reservation until its batch row was committed, and `reserve_capacity`
+/// counts every reservation released at or after the snapshot's `since`
+/// instant. So a stale snapshot never misses admitted work; it only still
+/// counts work that has finished since, which errs towards rejecting. The
+/// one time-dependent part — work whose deadline moves *into* a window as time
+/// passes — is covered by counting each window over a horizon padded by the
+/// longest age a snapshot may be used at (see [`outstanding_demand`]).
+#[derive(Clone, Default)]
+pub struct AdmissionDemandCache {
+    inner: Arc<AdmissionDemandCacheInner>,
+}
+
+impl std::fmt::Debug for AdmissionDemandCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdmissionDemandCache").finish_non_exhaustive()
+    }
+}
+
+#[derive(Default)]
+struct AdmissionDemandCacheInner {
+    /// (model alias, window label) -> snapshot entry
+    entries: Mutex<HashMap<(String, String), DemandEntry>>,
+    /// Single-flight guard so concurrent submissions on one replica share one refresh.
+    refresh: tokio::sync::Mutex<()>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DemandEntry {
+    since: DateTime<Utc>,
+    taken: Instant,
+    horizon_pad_secs: i64,
+    count: i64,
+}
+
+impl AdmissionDemandCache {
+    fn lookup(
+        &self,
+        models: &[String],
+        windows: &[AdmissionWindow],
+        max_age: std::time::Duration,
+        horizon_pad_secs: i64,
+    ) -> Option<OutstandingDemand> {
+        let entries = self.inner.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let mut counts: HashMap<String, HashMap<String, i64>> = HashMap::new();
+        let mut since: Option<DateTime<Utc>> = None;
+        for model in models {
+            for window in windows {
+                let entry = entries.get(&(model.clone(), window.label.clone()))?;
+                if entry.taken.elapsed() > max_age || entry.horizon_pad_secs < horizon_pad_secs {
+                    return None;
+                }
+                counts.entry(model.clone()).or_default().insert(window.label.clone(), entry.count);
+                // Several entries combine under the oldest instant: counting
+                // reservations released since then covers all of them.
+                since = Some(since.map_or(entry.since, |s| s.min(entry.since)));
+            }
+        }
+        Some(OutstandingDemand { counts, since: since? })
+    }
+
+    fn store(&self, models: &[String], windows: &[AdmissionWindow], demand: &OutstandingDemand, taken: Instant, horizon_pad_secs: i64) {
+        let mut entries = self.inner.entries.lock().unwrap_or_else(|e| e.into_inner());
+        for model in models {
+            for window in windows {
+                let count = demand.counts.get(model).and_then(|w| w.get(&window.label)).copied().unwrap_or(0);
+                entries.insert(
+                    (model.clone(), window.label.clone()),
+                    DemandEntry {
+                        since: demand.since,
+                        taken,
+                        horizon_pad_secs,
+                        count,
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// Count outstanding admitted work for the batch's models, from the cache when
+/// a fresh enough snapshot exists. Returns `None` when no usable count could be
+/// obtained; admission then fails open to reservations only.
+async fn outstanding_demand<P: sqlx_pool_router::PoolProvider>(
+    dwctl_pool: &PgPool,
+    request_manager: &fusillade_arsenal::PostgresRequestManager<P>,
+    cache: Option<&AdmissionDemandCache>,
+    input: &CapacityReservationInput<'_>,
+) -> Option<OutstandingDemand> {
+    let mut models: Vec<String> = input.file_model_counts.keys().cloned().collect();
+    models.sort();
+    let max_age = std::time::Duration::from_secs(input.pending_counts_max_age_secs);
+    // A snapshot may be used up to 2 × max_age old (while another submission
+    // refreshes it, or after a failed refresh). Count each window over a
+    // horizon padded by that much, so work whose deadline enters the window
+    // while the snapshot ages is already included.
+    let pad_secs = i64::try_from(input.pending_counts_max_age_secs.saturating_mul(2)).unwrap_or(i64::MAX);
+
+    let Some(cache) = cache.filter(|_| input.pending_counts_max_age_secs > 0) else {
+        return fetch_outstanding_demand(
+            dwctl_pool,
+            request_manager,
+            &models,
+            input.windows,
+            0,
+            input.pending_counts_timeout_ms,
+        )
+        .await
+        .inspect_err(|e| log_count_failure(e))
+        .ok();
+    };
+
+    if let Some(hit) = cache.lookup(&models, input.windows, max_age, pad_secs) {
+        return Some(hit);
+    }
+
+    let _refresh = match cache.inner.refresh.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            // Another submission on this replica is refreshing. A snapshot
+            // within the padded horizon is still sound; otherwise wait for it.
+            if let Some(hit) = cache.lookup(&models, input.windows, max_age * 2, pad_secs) {
+                return Some(hit);
+            }
+            cache.inner.refresh.lock().await
+        }
+    };
+    if let Some(hit) = cache.lookup(&models, input.windows, max_age, pad_secs) {
+        return Some(hit);
+    }
+
+    let taken = Instant::now();
+    match fetch_outstanding_demand(
+        dwctl_pool,
+        request_manager,
+        &models,
+        input.windows,
+        pad_secs,
+        input.pending_counts_timeout_ms,
+    )
+    .await
+    {
+        Ok(demand) => {
+            cache.store(&models, input.windows, &demand, taken, pad_secs);
+            Some(demand)
+        }
+        Err(e) => {
+            log_count_failure(&e);
+            cache.lookup(&models, input.windows, max_age * 2, pad_secs)
+        }
+    }
+}
+
+fn log_count_failure(error: &str) {
+    tracing::error!(
+        error = %error,
+        "Outstanding-work count failed during batch admission; admitting on the last usable snapshot or active reservations only"
+    );
+}
+
+async fn fetch_outstanding_demand<P: sqlx_pool_router::PoolProvider>(
+    dwctl_pool: &PgPool,
+    request_manager: &fusillade_arsenal::PostgresRequestManager<P>,
+    models: &[String],
+    windows: &[AdmissionWindow],
+    horizon_pad_secs: i64,
+    timeout_ms: u64,
+) -> Result<OutstandingDemand, String> {
+    use crate::db::handlers::BatchAdmissionDemand;
+
+    // Read from the dwctl database (the clock `released_at` is stamped with),
+    // and before the count, so any reservation released earlier than this
+    // instant belongs to a batch whose row the count below already sees.
+    let since: DateTime<Utc> = sqlx::query_scalar!(r#"SELECT now() AS "now!""#)
+        .fetch_one(dwctl_pool)
+        .await
+        .map_err(|e| format!("read reservation clock: {e}"))?;
+
+    let horizons: Vec<(String, i64)> = windows
+        .iter()
+        .map(|w| (w.label.clone(), w.seconds.saturating_add(horizon_pad_secs)))
+        .collect();
+
+    // Primary, not a replica: the snapshot must include every batch committed
+    // before `since`.
+    let mut tx = request_manager
+        .begin_write()
+        .await
+        .map_err(|e| format!("begin outstanding-work count: {e}"))?;
+    let counts = BatchAdmissionDemand::new(&mut tx)
+        .outstanding_by_model_and_window(models, &horizons, timeout_ms)
+        .await
+        .map_err(|e| format!("count outstanding batch work: {e}"))?;
+    tx.rollback().await.ok();
+
+    Ok(OutstandingDemand { counts, since })
+}
+
 /// Reserve capacity for a batch. Returns reservation IDs on success,
-/// or `CapacityError::InsufficientCapacity` if the queue is full.
+/// or `CapacityError::InsufficientCapacity` if any checked window is full.
+///
+/// For each window in `input.windows` and each model in the batch:
+///
+/// ```text
+/// outstanding work due within the window      (pending_capacity_counts_enabled)
+///   + reservations for this or shorter windows (active, plus released since the count)
+///   + this batch
+///   <= floor(throughput × window × relaxation)
+/// ```
 ///
 /// Used by both `POST /batches` (API) and `run_activate_batch` (sync pipeline).
 pub(crate) async fn reserve_capacity<P: sqlx_pool_router::PoolProvider>(
     dwctl_pool: &PgPool,
     request_manager: &fusillade_arsenal::PostgresRequestManager<P>,
+    cache: Option<&AdmissionDemandCache>,
     input: &CapacityReservationInput<'_>,
 ) -> Result<Vec<Uuid>, CapacityError> {
     use crate::db::handlers::BatchCapacityReservations;
-    use fusillade::Storage;
-    use fusillade::request::ServiceTierFilter;
 
-    // Committed pending/claimed/processing rows are counted BEFORE the
-    // per-model advisory locks are taken. The count is the expensive part of
-    // admission — it scales with the active backlog of the requested models —
-    // and holding the locks across it head-of-line blocks every concurrent
-    // submission for the same model+window; a count that hit the statement
-    // timeout used to stall all of them for the full timeout.
+    // The outstanding-work count is taken BEFORE the per-model advisory locks.
+    // It is the expensive part of admission — it scales with the requested
+    // models' backlog — and holding the locks across it would head-of-line
+    // block every concurrent submission for the same model.
     //
-    // Reading pending rows before reservations reopens the swap-point race
-    // described on `reserve_capacity_for_batch`: a peer batch could commit its
-    // rows after this snapshot and release its reservation before the locked
-    // reservation read below, appearing in neither. `pending_counts_since`
-    // closes it: the reservation sum also includes reservations released at or
-    // after this instant, so a batch that swapped after the snapshot is still
-    // counted (at worst twice, which only errs towards under-acceptance). The
-    // instant is read from the dwctl database so it shares a clock with
-    // `released_at`, and it is read before the snapshot so that any release
-    // stamped earlier than it is guaranteed to have committed its rows before
-    // the snapshot was taken.
-    let mut pending_counts_since: Option<DateTime<Utc>> = None;
-    let pending_counts: HashMap<String, HashMap<String, i64>> = if input.include_pending_counts {
-        let since: DateTime<Utc> = sqlx::query_scalar!(r#"SELECT now() AS "now!""#)
-            .fetch_one(dwctl_pool)
-            .await
-            .map_err(|e| CapacityError::Internal(format!("read reservation clock: {e}")))?;
-        pending_counts_since = Some(since);
-
-        let windows = vec![(
-            input.completion_window.to_string(),
-            None,
-            parse_window_to_seconds(input.completion_window),
-        )];
-        let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
-        let model_filter: Vec<String> = input.file_model_counts.keys().cloned().collect();
-
-        // Only count normal batch rows when admitting new batches. Flex and
-        // realtime rows are batchless service tiers and should not consume
-        // batch capacity.
-        //
-        // Known scope limit: the tier doubles as a completion-window class —
-        // 1h-window batch rows are stored with service_tier = 'flex', and only
-        // 24h-window rows carry the NULL tier this filter selects. Admission
-        // for a 1h batch therefore counts reservations plus 24h-tier rows
-        // expiring inside the hour, but not the existing 1h/flex backlog.
-        // Widening the filter to include 'flex' would also count batchless
-        // flex (Responses API) rows against batch capacity, which this comment
-        // block deliberately excludes; revisit when admission moves to the
-        // counter-based estimator.
-        //
-        // Fail open: this count is an optional protection (it only runs when
-        // `pending_capacity_counts_enabled` is set), so a failed or timed-out
-        // count must not fail the submission — that would turn a database
-        // timeout into a customer-facing 500 for work the system could accept.
-        // Admission then degrades, for this one submission, to the same
-        // reservations-only check it performs with the flag off.
-        match request_manager
-            .get_pending_request_counts_by_model_and_window(&windows, &states, &model_filter, &ServiceTierFilter::Include(vec![None]), true)
-            .await
-        {
-            Ok(counts) => counts,
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    "Pending-count query failed during batch admission; admitting on active reservations only"
-                );
-                pending_counts_since = None;
-                HashMap::new()
-            }
-        }
+    // Reading outstanding work before reservations opens a gap: a peer batch
+    // could commit after the count and release its reservation before the
+    // locked reservation read below, appearing in neither. The reservation sum
+    // therefore also includes reservations released at or after the count's
+    // `since` instant, so such a batch is still counted (at worst twice, which
+    // only errs towards under-acceptance). The same argument makes a cached
+    // count of any age sound; see `AdmissionDemandCache`.
+    //
+    // Fail open: a failed count must not fail the submission — that would turn
+    // a database timeout into a customer-facing 500 for work the system could
+    // accept. Admission then degrades to the reservations-only check it
+    // performs with the flag off.
+    let demand = if input.include_pending_counts {
+        outstanding_demand(dwctl_pool, request_manager, cache, input).await
     } else {
-        HashMap::new()
+        None
     };
+    let released_since = demand.as_ref().map(|d| d.since);
+    let mut pending: HashMap<String, HashMap<String, i64>> = demand.map(|d| d.counts).unwrap_or_default();
 
     let mut tx = dwctl_pool
         .begin()
         .await
         .map_err(|e| CapacityError::Internal(format!("begin reservation transaction: {e}")))?;
 
-    // Lock per model+window in deterministic order to prevent concurrent races
+    // Lock every (model, window) pair this admission reads, in a global order
+    // (model id, then window length) so concurrent admissions spanning several
+    // models or windows cannot deadlock. A 1h and a 24h admission for the same
+    // model both take (model, 24h) and so serialise against each other.
     let mut model_pairs: Vec<(String, Uuid)> = input.model_ids_by_alias.iter().map(|(a, id)| (a.clone(), *id)).collect();
     model_pairs.sort_by_key(|(_, id)| *id);
 
     for (alias, model_id) in &model_pairs {
-        sqlx::query!(
-            "SELECT pg_advisory_xact_lock(hashtext($1::text), hashtext($2::text))",
-            model_id.to_string(),
-            input.completion_window
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| CapacityError::Internal(format!("lock reservation for {alias}: {e}")))?;
+        for window in input.windows {
+            sqlx::query!(
+                "SELECT pg_advisory_xact_lock(hashtext($1::text), hashtext($2::text))",
+                model_id.to_string(),
+                window.label
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| CapacityError::Internal(format!("lock reservation for {alias}: {e}")))?;
+        }
     }
 
-    // Sum reservations under the lock: active ones, plus — when pending rows
-    // were counted — any released since that snapshot (see above).
+    // Reservations under the lock. A reservation's deadline is its own
+    // window, so it counts towards every checked window at least that long.
     let model_ids: Vec<Uuid> = model_pairs.iter().map(|(_, id)| *id).collect();
     let id_to_alias: HashMap<Uuid, String> = model_pairs.iter().map(|(a, id)| (*id, a.clone())).collect();
     let mut reservations = BatchCapacityReservations::new(&mut tx);
 
     let reserved_rows = reservations
-        .sum_active_by_model_window(&model_ids, input.completion_window, pending_counts_since)
+        .sum_by_model_and_window(&model_ids, released_since)
         .await
-        .map_err(|e| CapacityError::Internal(format!("sum active reservations: {e}")))?;
+        .map_err(|e| CapacityError::Internal(format!("sum reservations: {e}")))?;
 
-    // Active reservations are always counted; the pending-count query above is optional.
-    let mut pending_with_reservations = pending_counts;
-    for (model_id, reserved) in reserved_rows {
-        if let Some(alias) = id_to_alias.get(&model_id) {
-            let windows = pending_with_reservations.entry(alias.clone()).or_default();
-            let entry = windows.entry(input.completion_window.to_string()).or_insert(0);
-            *entry += reserved;
+    for (model_id, reservation_window, reserved) in reserved_rows {
+        let Some(alias) = id_to_alias.get(&model_id) else { continue };
+        let reservation_seconds = parse_window_to_seconds(&reservation_window);
+        let per_window = pending.entry(alias.clone()).or_default();
+        for window in input.windows {
+            if reservation_seconds <= window.seconds {
+                *per_window.entry(window.label.clone()).or_insert(0) += reserved;
+            }
         }
     }
 
-    let capacity_result = check_sla_capacity(
-        input.file_model_counts,
-        &pending_with_reservations,
-        input.model_throughputs,
-        input.default_throughput,
-        input.completion_window,
-        input.relaxation_factor,
-    );
+    let mut overloaded_models: HashMap<String, i64> = HashMap::new();
+    for window in input.windows {
+        let result = check_sla_capacity(
+            input.file_model_counts,
+            &pending,
+            input.model_throughputs,
+            input.default_throughput,
+            &window.label,
+            window.relaxation_factor,
+        );
+        for (model, deficit) in result.overloaded_models {
+            let entry = overloaded_models.entry(model).or_insert(0);
+            *entry = (*entry).max(deficit);
+        }
+    }
 
-    if !capacity_result.has_capacity {
+    if !overloaded_models.is_empty() {
         tx.rollback().await.ok();
 
-        let overloaded_details: Vec<String> = capacity_result
-            .overloaded_models
+        let overloaded_details: Vec<String> = overloaded_models
             .iter()
             .map(|(model, deficit)| format!("{model} (needs {deficit} more capacity)"))
             .collect();
@@ -329,7 +581,8 @@ pub(crate) async fn reserve_capacity<P: sqlx_pool_router::PoolProvider>(
             "Batch rejected due to insufficient capacity"
         );
 
-        let model_names: Vec<&str> = capacity_result.overloaded_models.keys().map(|s| s.as_str()).collect();
+        let mut model_names: Vec<&str> = overloaded_models.keys().map(|s| s.as_str()).collect();
+        model_names.sort_unstable();
         return Err(CapacityError::InsufficientCapacity {
             completion_window: input.completion_window.to_string(),
             models: model_names.join(", "),
@@ -1176,5 +1429,52 @@ mod tests {
         // 1h relaxed (factor=2.0): effective=7200, 5000 < 7200, accepted
         let relaxed_1h = check_sla_capacity(&file_model_counts, &pending_counts, &model_throughputs, 1.0, "1h", 2.0);
         assert!(relaxed_1h.has_capacity);
+    }
+
+    // ==================== admission_windows tests ====================
+
+    fn batch_config(windows: &[&str], relaxation: &[(&str, f32)]) -> BatchConfig {
+        BatchConfig {
+            allowed_completion_windows: windows.iter().map(|w| w.to_string()).collect(),
+            window_relaxation_factors: relaxation.iter().map(|(w, f)| (w.to_string(), *f)).collect(),
+            ..BatchConfig::default()
+        }
+    }
+
+    #[test]
+    fn test_admission_windows_include_requested_and_longer_windows() {
+        let config = batch_config(&["24h", "1h"], &[("24h", 1.5)]);
+
+        let one_hour = admission_windows(&config, "1h", 2.0);
+        assert_eq!(
+            one_hour,
+            vec![
+                AdmissionWindow {
+                    label: "1h".to_string(),
+                    seconds: 3600,
+                    relaxation_factor: 2.0
+                },
+                AdmissionWindow {
+                    label: "24h".to_string(),
+                    seconds: 86400,
+                    relaxation_factor: 1.5
+                },
+            ]
+        );
+
+        // A 24h batch cannot delay work due sooner than itself.
+        let day = admission_windows(&config, "24h", 1.5);
+        assert_eq!(day.len(), 1);
+        assert_eq!(day[0].label, "24h");
+    }
+
+    #[test]
+    fn test_admission_windows_always_include_requested_window() {
+        // e.g. a sync connection whose default window is not in the API allow-list
+        let config = batch_config(&["24h"], &[]);
+        let windows = admission_windows(&config, "48h", 1.0);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].label, "48h");
+        assert_eq!(windows[0].seconds, 172800);
     }
 }
