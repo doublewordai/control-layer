@@ -292,35 +292,29 @@ pub async fn image_normalizer_middleware(
         }
     };
 
-    if substituted == 0 {
-        // No URLs touched — restore the original bytes verbatim to avoid
-        // any whitespace / key-order drift from a JSON round-trip.
-        *request.body_mut() = Body::from(body_bytes);
-    } else {
-        debug!(substituted, "image normaliser replaced URLs in request body");
-        let new_bytes = match serde_json::to_vec(&body_value) {
-            Ok(b) => b,
-            Err(e) => {
-                warn!(error = %e, "Failed to re-serialise body after image normalisation");
-                let body = serde_json::json!({
-                    "error": {
-                        "message": format!("failed to re-serialise request body: {e}"),
-                        "type": "internal_error",
-                        "code": "body_reserialize_failed",
-                    }
-                });
-                return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(body)).into_response();
-            }
-        };
-        // Keep Content-Length consistent with the new body so any
-        // downstream layer that reads it sees the post-substitution size.
-        let len = new_bytes.len();
-        request.headers_mut().insert(
-            axum::http::header::CONTENT_LENGTH,
-            len.to_string().parse().expect("digit string is a valid header value"),
-        );
-        *request.body_mut() = Body::from(new_bytes);
-    }
+    debug!(substituted, "image normaliser replaced URLs in request body");
+    let new_bytes = match serde_json::to_vec(&body_value) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(error = %e, "Failed to re-serialise body after image normalisation");
+            let body = serde_json::json!({
+                "error": {
+                    "message": format!("failed to re-serialise request body: {e}"),
+                    "type": "internal_error",
+                    "code": "body_reserialize_failed",
+                }
+            });
+            return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(body)).into_response();
+        }
+    };
+    // Keep Content-Length consistent with the new body so any
+    // downstream layer that reads it sees the post-substitution size.
+    let len = new_bytes.len();
+    request.headers_mut().insert(
+        axum::http::header::CONTENT_LENGTH,
+        len.to_string().parse().expect("digit string is a valid header value"),
+    );
+    *request.body_mut() = Body::from(new_bytes);
 
     next.run(request).await
 }
