@@ -4145,6 +4145,13 @@ impl Application {
             .to_fusillade_config_with_limits(Some(model_capacity_limits.clone()));
         let retention_maintenance_config = config.background_services.batch_daemon.to_fusillade_retention_maintenance_config();
 
+        if let Some(value) = config.background_services.batch_daemon.template_generation_writes_enabled {
+            tracing::warn!(
+                template_generation_writes_enabled = value,
+                "batch_daemon.template_generation_writes_enabled is deprecated and ignored: \
+                 the weekly generation-2 template store is the only write path. Remove the key."
+            );
+        }
         let mut request_manager = fusillade_arsenal::PostgresRequestManager::new(
             fusillade_pools.clone(),
             fusillade_arsenal::PostgresStorageConfig::from(&fusillade_daemon_config),
@@ -4167,7 +4174,6 @@ impl Application {
                 .retention
                 .batchless_retention_bounds_seconds(),
         )
-        .with_template_generation_writes(config.background_services.batch_daemon.template_generation_writes_enabled)
         .with_download_buffer_size(config.batches.files.download_buffer_size)
         .with_batch_insert_strategy(fusillade_arsenal::BatchInsertStrategy::Batched {
             batch_size: config.batches.files.batch_insert_size,

@@ -1,5 +1,19 @@
 # Changelog
 
+## [13.3.1](https://github.com/doublewordai/control-layer/compare/v13.3.0...v13.3.1) (2026-10-08)
+
+
+### Bug Fixes
+
+* write new request templates to generation two ([6c26427](https://github.com/doublewordai/control-layer/commit/6c264272d0f301f810e06af2a6a65531fc86880f))
+
+## [13.3.0](https://github.com/doublewordai/control-layer/compare/v13.2.0...v13.3.0) (2026-10-08)
+
+
+### Features
+
+* **onwards:** count and log the requests onwards rejects itself (DW-851) ([#1937](https://github.com/doublewordai/control-layer/issues/1937)) ([98c234e](https://github.com/doublewordai/control-layer/commit/98c234e6c97fd154496c6c2554683c124270b8bb))
+
 ## [13.2.0](https://github.com/doublewordai/control-layer/compare/v13.1.2...v13.2.0) (2026-10-07)
 
 

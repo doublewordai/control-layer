@@ -58,6 +58,7 @@ pub mod inflight;
 pub mod load_balancer;
 pub mod models;
 pub mod reasoning;
+mod rejections;
 pub mod response_id;
 pub mod response_sanitizer;
 pub mod serving;
