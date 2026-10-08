@@ -17,20 +17,42 @@ use crate::error::{FusilladeError, Result};
 /// Lazily guarantee the partition for the UTC week at transaction start.
 /// Inserts use the same transaction clock so crossing Monday is safe.
 ///
-/// The fast path is a catalog lookup; the advisory-locked helper runs only
-/// while the partition is genuinely missing (once per week per schema).
+/// Existing active partitions use a shared bucket-row lock, allowing concurrent
+/// writers while preventing retirement from fencing the bucket until commit.
+/// Missing or inconsistent partitions go through the validating creation helper.
 pub(crate) async fn ensure_current_week_partition(
     conn: &mut Transaction<'_, Postgres>,
 ) -> Result<()> {
+    let active: Option<bool> = sqlx::query_scalar(
+        r#"
+        SELECT true
+        FROM request_template_buckets bucket
+        JOIN pg_class child ON child.oid = bucket.partition_oid
+        JOIN pg_namespace namespace ON namespace.oid = child.relnamespace
+        JOIN pg_inherits inheritance ON inheritance.inhrelid = child.oid
+        WHERE bucket.week_start = date_trunc('week', transaction_timestamp() AT TIME ZONE 'UTC')::date
+          AND bucket.state = 'active'
+          AND bucket.partition_schema = current_schema()
+          AND namespace.nspname = bucket.partition_schema
+          AND child.relname = bucket.partition_table
+          AND bucket.partition_table = 'request_templates_g2_y'
+              || to_char(bucket.week_start, 'IYYY') || 'w' || to_char(bucket.week_start, 'IW')
+          AND inheritance.inhparent = 'request_templates_g2'::regclass
+          AND NOT inheritance.inhdetachpending
+          AND pg_get_expr(child.relpartbound, child.oid) = format(
+              'FOR VALUES FROM (%L) TO (%L)', bucket.week_start, bucket.week_start + 7)
+        FOR SHARE OF bucket
+        "#,
+    )
+    .fetch_optional(&mut **conn)
+    .await
+    .map_err(|e| FusilladeError::Other(anyhow!("Failed to lock template bucket: {}", e)))?;
+    if active == Some(true) {
+        return Ok(());
+    }
     sqlx::query(
         "SELECT ensure_request_template_partition( \
-             date_trunc('week', transaction_timestamp() AT TIME ZONE 'UTC')::date, NULL) \
-         WHERE to_regclass( \
-             'request_templates_g2_y' \
-                 || to_char(date_trunc('week', transaction_timestamp() AT TIME ZONE 'UTC')::date, 'IYYY') \
-                 || 'w' \
-                 || to_char(date_trunc('week', transaction_timestamp() AT TIME ZONE 'UTC')::date, 'IW') \
-         ) IS NULL",
+             date_trunc('week', transaction_timestamp() AT TIME ZONE 'UTC')::date, NULL)",
     )
     .execute(&mut **conn)
     .await
@@ -176,7 +198,56 @@ pub(crate) async fn count_templates(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use tokio::time::timeout;
+
     use super::*;
+
+    #[sqlx::test]
+    async fn existing_partition_rejects_a_retiring_bucket(pool: sqlx::PgPool) {
+        let mut setup = pool.begin().await.unwrap();
+        ensure_current_week_partition(&mut setup).await.unwrap();
+        setup.commit().await.unwrap();
+        sqlx::query("UPDATE request_template_buckets SET state = 'retiring'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        assert!(ensure_current_week_partition(&mut tx).await.is_err());
+    }
+
+    #[sqlx::test]
+    async fn existing_partition_shares_writer_locks_and_blocks_retirement(pool: sqlx::PgPool) {
+        let mut setup = pool.begin().await.unwrap();
+        ensure_current_week_partition(&mut setup).await.unwrap();
+        setup.commit().await.unwrap();
+        let mut first = pool.begin().await.unwrap();
+        ensure_current_week_partition(&mut first).await.unwrap();
+        let mut second = pool.begin().await.unwrap();
+        timeout(
+            Duration::from_secs(2),
+            ensure_current_week_partition(&mut second),
+        )
+        .await
+        .expect("existing-partition writers must not serialize")
+        .unwrap();
+        let blocked =
+            sqlx::query("SELECT week_start FROM request_template_buckets FOR UPDATE NOWAIT")
+                .fetch_all(&pool)
+                .await
+                .unwrap_err();
+        assert_eq!(
+            blocked.as_database_error().unwrap().code().as_deref(),
+            Some("55P03")
+        );
+        first.commit().await.unwrap();
+        second.commit().await.unwrap();
+        sqlx::query("UPDATE request_template_buckets SET state = 'retiring'")
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
 
     #[sqlx::test]
     async fn dedicated_insert_keeps_the_partition_ensured_before_a_week_boundary(
