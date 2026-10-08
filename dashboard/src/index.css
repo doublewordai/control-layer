@@ -449,10 +449,16 @@
 
 /* Not remapped via --color-white: that would also darken text-white on buttons. */
 .dark .bg-white,
-.dark .bg-white\/70,
-.dark .bg-white\/80,
+.dark .focus\:bg-white:focus,
 .dark .card {
   background-color: var(--color-doubleword-background-primary);
+}
+.dark .bg-white\/60 {
+  background-color: color-mix(
+    in srgb,
+    var(--color-doubleword-background-primary) 60%,
+    transparent
+  );
 }
 
 .dark input::placeholder,
