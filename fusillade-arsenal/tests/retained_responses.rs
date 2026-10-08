@@ -5945,3 +5945,53 @@ async fn direct_realtime_retained_conflicting_route_rolls_back_siblings(pool: Pg
         .fetch_one(&pool).await.unwrap();
     assert_eq!(payloads_and_groups, 0);
 }
+
+#[sqlx::test]
+async fn archives_generation_two_requests_after_heap_retirement(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
+    let manager = manager(&pool).await;
+    {
+        let graph = singleton(
+            &pool,
+            "flex",
+            TerminalState::Completed,
+            timestamp("2026-08-01T10:00:00Z"),
+            "generation-transition",
+        )
+        .await;
+        let outcome = archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(outcome.groups_archived, 1);
+        assert_eq!(outcome.templates_archived, 1);
+        assert_wholly_retained(&pool, &graph).await;
+        assert_eq!(
+            count_ids(&pool, "request_templates_all", &graph.template_ids).await,
+            0
+        );
+    }
+}
+
+#[sqlx::test]
+async fn erases_generation_two_requests_after_heap_retirement(pool: PgPool) {
+    let manager = manager(&pool).await;
+    {
+        let graph = singleton(
+            &pool,
+            "flex",
+            TerminalState::Completed,
+            timestamp("2026-08-01T10:00:00Z"),
+            "generation-transition",
+        )
+        .await;
+        assert_eq!(
+            manager
+                .delete_owned_response_group(graph.request_ids[0], OWNER)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_wholly_erased(&pool, &graph).await;
+    }
+}

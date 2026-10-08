@@ -9,6 +9,8 @@
 -- referenced them.
 SET LOCAL lock_timeout = '5s';
 
+DROP VIEW request_templates;
+
 CREATE TABLE request_templates (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     file_id UUID REFERENCES files(id) ON DELETE SET NULL,

@@ -425,7 +425,12 @@ observed healthy:
     still referenced by a live or archived request, still belongs to an
     undeleted file, or is at least as new as the newest generation-2 row;
     apply it only once every retention window that could hold generation-1
-    content has passed. Its down migration restores an empty generation-1
+    content has passed. Validation uses bounded reference-driven lookups and
+    fails closed on timeout; a quiet write counter alone is not a preflight.
+    An empty, storage-free `request_templates` compatibility view lets the
+    preceding generation-2 writer finish legacy cleanup during a rolling
+    update. It returns no rows, makes deletes no-ops, and rejects inserts.
+    Its down migration restores an empty generation-1
     heap and the two-arm views; rows are never restored.
 
 Rollback boundaries: before step 5 every change is reversible by disabling

@@ -1,3 +1,6 @@
+use std::borrow::Cow;
+
+use fusillade_arsenal::MIGRATOR;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -606,4 +609,74 @@ async fn batch_results_stream_finds_generation_two_templates(pool: PgPool) {
         .expect("stream item must not be an error");
     assert_eq!(item.custom_id.as_deref(), Some("line-0"));
     assert_eq!(item.input_body, serde_json::json!({"gen": 2}));
+}
+
+#[sqlx::test(migrations = false)]
+async fn expanded_active_view_reads_both_generations_before_retirement(pool: PgPool) {
+    // This contract belongs to the writer transition, before heap retirement.
+    sqlx::migrate::Migrator {
+        migrations: Cow::Owned(
+            MIGRATOR
+                .iter()
+                .filter(|migration| migration.version <= 20261007160000)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    }
+    .run(&pool)
+    .await
+    .unwrap();
+    let week = monday(&pool, 0).await;
+    sqlx::query("SELECT ensure_request_template_partition($1, NULL)")
+        .bind(week)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let legacy_file = create_file(&pool).await;
+    let legacy_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO request_templates (file_id, endpoint, method, path, body, model, api_key) \
+         VALUES ($1, 'https://example.invalid', 'POST', '/v1/x', '{\"gen\":1}', \
+                 'test-model', 'test-key') RETURNING id",
+    )
+    .bind(legacy_file)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let g2_file = create_file(&pool).await;
+    let g2_id = insert_g2_template(&pool, week, g2_file).await;
+
+    let bodies: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, body FROM active_request_templates WHERE id = ANY($1) ORDER BY body",
+    )
+    .bind(vec![legacy_id, g2_id])
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        bodies,
+        vec![
+            (legacy_id, "{\"gen\":1}".to_string()),
+            (g2_id, "{\"gen\":2}".to_string())
+        ],
+        "both generations must be visible through one identical view shape"
+    );
+
+    // A soft-deleted file hides its templates in either generation.
+    sqlx::query("UPDATE files SET deleted_at = NOW() WHERE id = ANY($1)")
+        .bind(vec![legacy_file, g2_file])
+        .execute(&pool)
+        .await
+        .unwrap();
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM active_request_templates WHERE id = ANY($1)")
+            .bind(vec![legacy_id, g2_id])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(remaining, 0);
 }

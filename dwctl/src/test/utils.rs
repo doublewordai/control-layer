@@ -109,18 +109,19 @@ pub async fn insert_fusillade_template(
     body: &str,
     custom_id: Option<&str>,
 ) {
+    let mut tx = pool.begin().await.expect("begin template insert transaction");
     sqlx::query(
         "SELECT fusillade.ensure_request_template_partition( \
-             date_trunc('week', statement_timestamp() AT TIME ZONE 'UTC')::date, NULL)",
+             date_trunc('week', transaction_timestamp() AT TIME ZONE 'UTC')::date, NULL)",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .expect("ensure current template partition");
     sqlx::query(
         "WITH inserted AS ( \
              INSERT INTO fusillade.request_templates_g2 \
                  (created_on, id, file_id, custom_id, endpoint, method, path, body, model, api_key, body_byte_size) \
-             VALUES ((statement_timestamp() AT TIME ZONE 'UTC')::date, $1, $2, $3, $4, 'POST', $5, $6, $7, $8, octet_length($6)) \
+             VALUES ((transaction_timestamp() AT TIME ZONE 'UTC')::date, $1, $2, $3, $4, 'POST', $5, $6, $7, $8, octet_length($6)) \
              RETURNING id, created_on \
          ) \
          INSERT INTO fusillade.request_template_routes (template_id, week_start) \
@@ -134,9 +135,10 @@ pub async fn insert_fusillade_template(
     .bind(body)
     .bind(model)
     .bind(api_key)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .expect("insert request template");
+    tx.commit().await.expect("commit template insert transaction");
 }
 
 pub async fn setup_fusillade_pool(pool: &PgPool) -> PgPool {

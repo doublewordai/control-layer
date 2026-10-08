@@ -9,7 +9,7 @@ use fusillade_arsenal::MIGRATOR;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-const DROP_LEGACY_HEAP_MIGRATION: i64 = 20260905000000;
+const DROP_LEGACY_HEAP_MIGRATION: i64 = 20261008130000;
 
 fn migrator_where(predicate: impl Fn(i64) -> bool) -> sqlx::migrate::Migrator {
     sqlx::migrate::Migrator {
@@ -264,6 +264,51 @@ async fn drops_an_empty_heap_and_collapses_the_views_to_generation_two(pool: PgP
 }
 
 #[sqlx::test(migrations = false)]
+async fn drops_old_unreferenced_templates_after_a_file_is_deleted(pool: PgPool) {
+    migrate_to_before_retirement(&pool).await;
+    let week = current_week(&pool).await;
+    let g2_id = insert_g2_template(&pool, week).await;
+    let file_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO files (name, size_bytes, size_finalized, status, purpose, deleted_at) \
+         VALUES ('deleted-legacy-file', 0, TRUE, 'processed', 'batch', NOW()) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    insert_legacy_template(&pool, Some(file_id)).await;
+    insert_legacy_template(&pool, None).await;
+    sqlx::query("UPDATE request_templates SET created_at = NOW() - INTERVAL '30 days'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    apply_retirement(&pool).await.unwrap();
+    let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM active_request_templates")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(ids, vec![g2_id]);
+    let legacy_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_class WHERE oid = to_regclass('request_templates') AND relkind IN ('r', 'p'))")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(!legacy_exists);
+}
+
+#[sqlx::test(migrations = false)]
+async fn refuses_nonempty_legacy_heap_without_generation_two_writes(pool: PgPool) {
+    migrate_to_before_retirement(&pool).await;
+    insert_legacy_template(&pool, None).await;
+    sqlx::query("UPDATE request_templates SET created_at = NOW() - INTERVAL '30 days'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let error = apply_retirement(&pool).await.unwrap_err();
+    assert_eq!(sqlstate(&error).as_deref(), Some("55000"), "{error}");
+}
+
+#[sqlx::test(migrations = false)]
 async fn the_down_migration_restores_an_empty_heap_and_the_two_arm_views(pool: PgPool) {
     migrate_to_before_retirement(&pool).await;
     let indexes_before: Vec<String> = sqlx::query_scalar(
@@ -403,4 +448,49 @@ async fn waits_for_a_legacy_reader_that_creates_a_request_before_validating(pool
         visible,
         "the newly referenced template must remain available"
     );
+}
+
+#[sqlx::test(migrations = false)]
+async fn preceding_writer_cleanup_remains_safe_after_heap_retirement(pool: PgPool) {
+    migrate_to_before_retirement(&pool).await;
+    let week = current_week(&pool).await;
+    let g2_id = insert_g2_template(&pool, week).await;
+    apply_retirement(&pool).await.unwrap();
+
+    // The preceding writer still probes and deletes legacy templates during
+    // archival and erasure. Its old query shape must work during a rolling update.
+    let ids: Vec<Uuid> =
+        sqlx::query_scalar("SELECT id FROM request_templates WHERE id = $1 FOR UPDATE SKIP LOCKED")
+            .bind(g2_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(ids.is_empty());
+    let deleted = sqlx::query("DELETE FROM request_templates WHERE id = $1 AND file_id IS NULL")
+        .bind(g2_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(deleted.rows_affected(), 0);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_templates")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+
+    // A still older writer must fail, rather than add hidden content.
+    assert!(
+        sqlx::query(
+            "INSERT INTO request_templates (endpoint, method, path, body, model, api_key)
+         VALUES ('https://example.invalid', 'POST', '/v1/x', '{}', 'test-model', 'test-key')",
+        )
+        .execute(&pool)
+        .await
+        .is_err()
+    );
+    let g2_ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM request_templates_all")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(g2_ids, vec![g2_id]);
 }

@@ -537,6 +537,17 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         self
     }
 
+    /// Compatibility builder. All new templates now use generation 2.
+    /// The argument is accepted so existing callers continue to compile.
+    pub fn with_template_generation_writes(self, _enabled: bool) -> Self {
+        self
+    }
+
+    /// New templates are always written to generation 2.
+    pub fn template_generation_writes_enabled(&self) -> bool {
+        true
+    }
+
     /// Install the single-session pool used only for partition-maintenance
     /// DDL. The pool shape is validated here so enabling retirement can be
     /// checked synchronously before a daemon acquires leadership.

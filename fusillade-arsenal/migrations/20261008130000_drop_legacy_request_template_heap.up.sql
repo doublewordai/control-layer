@@ -23,8 +23,9 @@ DO $$
 DECLARE
     blocking_reason TEXT;
 BEGIN
-    -- Live-request probes use the template_id index. Archive validation below
-    -- visits one registered week at a time with an explicit pruning predicate.
+    -- Drive probes from references, not from the potentially much larger legacy
+    -- heap. LIMIT prevents the planner from flattening the lateral index probes
+    -- into a legacy-first scan. Archives are pruned one registered week at a time.
     -- Keep all probes in one statement so concurrent archive moves cannot hide
     -- a reference between separate live and archive snapshots.
     SELECT reason INTO blocking_reason
@@ -32,10 +33,12 @@ BEGIN
         SELECT 'a legacy template is still referenced by a live request' AS reason
         WHERE EXISTS (
             SELECT 1
-            FROM request_templates legacy
-            WHERE EXISTS (
-                SELECT 1 FROM requests request WHERE request.template_id = legacy.id
-            )
+            FROM requests request
+            CROSS JOIN LATERAL (
+                SELECT 1 FROM request_templates legacy
+                WHERE legacy.id = request.template_id
+                LIMIT 1
+            ) referenced
         )
         UNION ALL
         SELECT 'a legacy template is still referenced by an archived batch request'
@@ -46,7 +49,11 @@ BEGIN
             CROSS JOIN LATERAL (
                 SELECT 1
                 FROM batch_requests_archive archived
-                JOIN request_templates legacy ON legacy.id = archived.template_id
+                CROSS JOIN LATERAL (
+                    SELECT 1 FROM request_templates legacy
+                    WHERE legacy.id = archived.template_id
+                    LIMIT 1
+                ) legacy
                 WHERE archived.archive_bucket = bucket.week_start
                 LIMIT 1
             ) referenced
@@ -55,8 +62,12 @@ BEGIN
         SELECT 'a legacy template still belongs to a file that is not deleted'
         WHERE EXISTS (
             SELECT 1
-            FROM request_templates legacy
-            JOIN files file ON file.id = legacy.file_id
+            FROM files file
+            CROSS JOIN LATERAL (
+                SELECT 1 FROM request_templates legacy
+                WHERE legacy.file_id = file.id
+                LIMIT 1
+            ) referenced
             WHERE file.deleted_at IS NULL
         )
         UNION ALL
@@ -114,3 +125,14 @@ SELECT g2.id, g2.file_id, g2.endpoint, g2.method, g2.path, g2.body, g2.model,
 FROM request_templates_g2 g2;
 
 DROP TABLE request_templates;
+
+-- The preceding generation-2 writer still reads/deletes legacy templates
+-- during cleanup. Keep those queries valid while its processes drain. This
+-- automatically updatable view owns no storage, exposes no rows, and cannot
+-- accept writes that could become invisible to the route oracle.
+CREATE VIEW request_templates AS
+SELECT id, file_id, endpoint, method, path, body, model, api_key, created_at,
+       updated_at, custom_id, line_number, body_byte_size, metadata
+FROM request_templates_g2
+WHERE false
+WITH CASCADED CHECK OPTION;
