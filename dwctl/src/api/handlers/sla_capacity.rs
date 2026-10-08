@@ -265,7 +265,10 @@ struct OutstandingDemand {
 /// reservation until its batch row was committed, and `reserve_capacity`
 /// counts every reservation released at or after the snapshot's `since`
 /// instant. So a stale snapshot never misses admitted work; it only still
-/// counts work that has finished since, which errs towards rejecting. The
+/// counts work that has finished since, which errs towards rejecting. A batch
+/// whose handler died before releasing is counted by its unreleased
+/// reservation only until the TTL lapses, so the reuse age is capped at half
+/// the TTL (see [`snapshot_max_age_secs`]). The
 /// one time-dependent part — work whose deadline moves *into* a window as time
 /// passes — is covered by counting each window over a horizon padded by the
 /// longest age a snapshot may be used at (see [`outstanding_demand`]).
@@ -352,14 +355,16 @@ async fn outstanding_demand<P: sqlx_pool_router::PoolProvider>(
 ) -> Option<OutstandingDemand> {
     let mut models: Vec<String> = input.file_model_counts.keys().cloned().collect();
     models.sort();
-    let max_age = std::time::Duration::from_secs(input.pending_counts_max_age_secs);
+    let max_age_secs = snapshot_max_age_secs(input.pending_counts_max_age_secs, input.reservation_ttl_secs);
+    let max_age = std::time::Duration::from_secs(max_age_secs);
     // A snapshot may be used up to 2 × max_age old (while another submission
     // refreshes it, or after a failed refresh). Count each window over a
     // horizon padded by that much, so work whose deadline enters the window
     // while the snapshot ages is already included.
-    let pad_secs = i64::try_from(input.pending_counts_max_age_secs.saturating_mul(2)).unwrap_or(i64::MAX);
+    let stale_max_age = max_age.saturating_mul(2);
+    let pad_secs = i64::try_from(max_age_secs.saturating_mul(2)).unwrap_or(i64::MAX);
 
-    let Some(cache) = cache.filter(|_| input.pending_counts_max_age_secs > 0) else {
+    let Some(cache) = cache.filter(|_| max_age_secs > 0) else {
         return fetch_outstanding_demand(
             dwctl_pool,
             request_manager,
@@ -382,7 +387,7 @@ async fn outstanding_demand<P: sqlx_pool_router::PoolProvider>(
         Err(_) => {
             // Another submission on this replica is refreshing. A snapshot
             // within the padded horizon is still sound; otherwise wait for it.
-            if let Some(hit) = cache.lookup(&models, input.windows, max_age * 2, pad_secs) {
+            if let Some(hit) = cache.lookup(&models, input.windows, stale_max_age, pad_secs) {
                 return Some(hit);
             }
             cache.inner.refresh.lock().await
@@ -409,9 +414,23 @@ async fn outstanding_demand<P: sqlx_pool_router::PoolProvider>(
         }
         Err(e) => {
             log_count_failure(&e);
-            cache.lookup(&models, input.windows, max_age * 2, pad_secs)
+            cache.lookup(&models, input.windows, stale_max_age, pad_secs)
         }
     }
+}
+
+/// The longest a cached outstanding-work snapshot may be reused without
+/// refresh, in seconds: the configured max age, capped at half the
+/// reservation TTL.
+///
+/// A batch admitted after a snapshot was taken is counted through its
+/// reservation. A released reservation is counted via `released_since` at any
+/// age, but an unreleased one (its handler died between creating the batch and
+/// releasing) only until its TTL lapses. A snapshot is used up to twice this
+/// age, so capping it at TTL / 2 keeps every reservation created after the
+/// snapshot active for as long as the snapshot is in use.
+fn snapshot_max_age_secs(configured_secs: u64, reservation_ttl_secs: i64) -> u64 {
+    configured_secs.min(u64::try_from(reservation_ttl_secs / 2).unwrap_or(0))
 }
 
 fn log_count_failure(error: &str) {
@@ -631,6 +650,19 @@ pub(crate) async fn release_reservations(dwctl_pool: &PgPool, reservation_ids: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_snapshot_max_age_capped_at_half_reservation_ttl() {
+        // Default config: 10s max age, 600s TTL.
+        assert_eq!(snapshot_max_age_secs(10, 600), 10);
+        // A snapshot reused at 2 × max age must not outlive an unreleased
+        // reservation created after it.
+        assert_eq!(snapshot_max_age_secs(900, 600), 300);
+        assert_eq!(snapshot_max_age_secs(u64::MAX, 600), 300);
+        // A TTL too short to cover any reuse disables the cache.
+        assert_eq!(snapshot_max_age_secs(10, 1), 0);
+        assert_eq!(snapshot_max_age_secs(10, -5), 0);
+    }
 
     // ==================== parse_window_to_seconds tests ====================
 

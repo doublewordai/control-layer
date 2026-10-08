@@ -1760,7 +1760,9 @@ pub struct BatchConfig {
     /// once per model per this interval per replica instead of on every submission. Using a
     /// snapshot is safe at any age: reservations released after the snapshot was taken are
     /// added back, so batches admitted since are still counted; a stale snapshot only
-    /// over-counts work that has completed since (under-acceptance). `0` disables the cache
+    /// over-counts work that has completed since (under-acceptance). The effective age is
+    /// capped at half of `reservation_ttl_secs`, so a reservation its handler never released
+    /// is still counted while any snapshot taken before it is in use. `0` disables the cache
     /// and counts on every submission. Default: 10.
     pub pending_capacity_counts_max_age_secs: u64,
 

@@ -414,7 +414,8 @@ batches:
   # When false only in-flight reservations are counted (a per-batch check).
   pending_capacity_counts_enabled: false
   # Per-replica cache age of the outstanding-work count (0 = count on every
-  # submission). Any age is safe; staleness only errs towards rejecting.
+  # submission). Staleness only errs towards rejecting; the age is capped at
+  # half of reservation_ttl_secs.
   pending_capacity_counts_max_age_secs: 10
   # Statement timeout for the count; on failure admission fails open.
   pending_capacity_counts_timeout_ms: 10000
