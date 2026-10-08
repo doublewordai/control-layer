@@ -488,6 +488,18 @@ batches:
 #     # Redis that holds the realtime in-flight counts every replica shares.
 #     # Unset or unreachable: each replica counts only its own requests.
 #     redis_url: rediss://:password@limits-redis.example:6379
+#   batch_inflight:
+#     # Refuse batch requests over each virtual model's batch_capacity
+#     # (default: false). Off: every batch request is admitted and no shared
+#     # count is touched. Reuses the realtime_inflight.redis_url above; batch
+#     # and realtime counts use separate key spaces.
+#     enforce: true
+#     # Global batch in-flight cap for virtual models that do not set their own
+#     # positive batch_capacity (default: 200). Does not change fusillade's
+#     # per-daemon starting concurrency, which keeps using
+#     # background_services.batch_daemon.default_model_concurrency. Set to 0 or
+#     # null for no default. Raise it per model where batch runs higher.
+#     default_capacity: 200
 
 # External data source connections (S3, etc.)
 # Allows users to connect external storage and sync files for batch processing.

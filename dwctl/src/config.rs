@@ -1147,7 +1147,14 @@ pub struct LimitsConfig {
     pub files: FileLimitsConfig,
     /// Request limits (per-request body size within batch files)
     pub requests: RequestLimitsConfig,
+    /// Realtime (interactive) per-account in-flight limits, counted per key
+    /// account.
     pub realtime_inflight: RealtimeInflightLimitsConfig,
+    /// Global per-model batch in-flight cap. Reuses
+    /// [`RealtimeInflightLimitsConfig::redis_url`] for its shared counter, so
+    /// the cap holds across replicas; it is a separate switch because batch and
+    /// realtime limits can be rolled out independently.
+    pub batch_inflight: BatchInflightLimitsConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -1155,6 +1162,80 @@ pub struct LimitsConfig {
 pub struct RealtimeInflightLimitsConfig {
     pub enforce: bool,
     pub redis_url: Option<String>,
+}
+
+/// Per-model batch in-flight cap.
+///
+/// When enforced, each virtual (composite) model's `batch_capacity` becomes a
+/// ceiling on how many batch (dispatched) requests may be in flight against
+/// that alias at once, counted globally across replicas in the same Redis used
+/// by [`RealtimeInflightLimitsConfig`]. `realtime_inflight` traffic is not
+/// affected. `redis_url` is intentionally not duplicated here: batch reuses
+/// `limits.realtime_inflight.redis_url`. With `enforce` false (the default)
+/// nothing is refused and no shared count is touched.
+///
+/// Enabling this changes the meaning of `batch_capacity`: without it the value
+/// is only fusillade's per-daemon *starting* concurrency (adaptive concurrency
+/// can grow past it), while with it the same value is also the *global*
+/// ceiling. Raise `batch_capacity` to the intended global cap before turning
+/// enforcement on. File batches, flex and background requests all share this
+/// single per-model ceiling.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BatchInflightLimitsConfig {
+    pub enforce: bool,
+    /// Default global batch in-flight cap applied to virtual (composite) models
+    /// that do not set their own positive `batch_capacity`. Default: 200.
+    ///
+    /// This only affects the onwards cap; it does not change fusillade's
+    /// per-daemon starting concurrency, which keeps using
+    /// `background_services.batch_daemon.default_model_concurrency` for models
+    /// without an explicit `batch_capacity`. Set to `null` or `0` to leave
+    /// virtual models without their own value uncapped. Negative values are
+    /// rejected at config load.
+    #[serde(
+        default = "default_batch_inflight_capacity",
+        deserialize_with = "deserialize_batch_inflight_default_capacity"
+    )]
+    pub default_capacity: Option<u32>,
+}
+
+/// Default global batch in-flight cap for virtual models without a positive
+/// `batch_capacity` of their own.
+pub const DEFAULT_BATCH_INFLIGHT_CAPACITY: u32 = 200;
+
+fn default_batch_inflight_capacity() -> Option<u32> {
+    Some(DEFAULT_BATCH_INFLIGHT_CAPACITY)
+}
+
+/// Accepts a positive integer, or the "off" forms `null` and `0`; rejects
+/// negative values with a clear config-load error.
+fn deserialize_batch_inflight_default_capacity<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let value: Option<i64> = Option::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(value) if value < 0 => Err(D::Error::custom(format!(
+            "limits.batch_inflight.default_capacity must not be negative, got {value}"
+        ))),
+        Some(0) => Ok(None),
+        Some(value) => u32::try_from(value)
+            .map(Some)
+            .map_err(|_| D::Error::custom(format!("limits.batch_inflight.default_capacity is too large, got {value}"))),
+    }
+}
+
+impl Default for BatchInflightLimitsConfig {
+    fn default() -> Self {
+        Self {
+            enforce: false,
+            default_capacity: default_batch_inflight_capacity(),
+        }
+    }
 }
 
 /// Request limits configuration.
@@ -4014,6 +4095,60 @@ mod tests {
     }
 
     #[test]
+    fn batch_inflight_enforcement_defaults_off_and_parses_on() {
+        assert!(!LimitsConfig::default().batch_inflight.enforce);
+
+        let parsed: LimitsConfig = serde_json::from_value(serde_json::json!({
+            "batch_inflight": { "enforce": true }
+        }))
+        .unwrap();
+        assert!(parsed.batch_inflight.enforce);
+    }
+
+    #[test]
+    fn batch_inflight_default_capacity_defaults_to_200() {
+        assert_eq!(LimitsConfig::default().batch_inflight.default_capacity, Some(200));
+    }
+
+    #[test]
+    fn batch_inflight_default_capacity_parses_an_explicit_positive_value() {
+        let parsed: LimitsConfig = serde_json::from_value(serde_json::json!({
+            "batch_inflight": { "default_capacity": 500 }
+        }))
+        .unwrap();
+        assert_eq!(parsed.batch_inflight.default_capacity, Some(500));
+    }
+
+    #[test]
+    fn batch_inflight_default_capacity_accepts_the_off_forms() {
+        for off in [serde_json::json!(null), serde_json::json!(0)] {
+            let parsed: LimitsConfig = serde_json::from_value(serde_json::json!({
+                "batch_inflight": { "default_capacity": off }
+            }))
+            .unwrap();
+            assert_eq!(parsed.batch_inflight.default_capacity, None, "{off} should mean no default");
+        }
+    }
+
+    #[test]
+    fn batch_inflight_default_capacity_rejects_negative_values() {
+        let error = serde_json::from_value::<LimitsConfig>(serde_json::json!({
+            "batch_inflight": { "default_capacity": -1 }
+        }))
+        .expect_err("a negative default capacity must be rejected");
+        assert!(error.to_string().contains("must not be negative"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn batch_inflight_default_capacity_rejects_out_of_range_values() {
+        let error = serde_json::from_value::<LimitsConfig>(serde_json::json!({
+            "batch_inflight": { "default_capacity": 5_000_000_000i64 }
+        }))
+        .expect_err("a default capacity beyond u32 must be rejected");
+        assert!(error.to_string().contains("too large"), "unexpected error: {error}");
+    }
+
+    #[test]
     fn obsolete_retention_sweep_interval_is_rejected_on_a_complete_config() {
         let mut serialized = serde_json::to_value(DaemonConfig::default()).unwrap();
         serialized["retention_sweep_interval_ms"] = serde_json::json!(1_000);
@@ -5034,6 +5169,65 @@ secret_key: "test-secret-key"
 
             let config = Config::load(&args)?;
             assert_eq!(config.batches.default_throughput, 75.5);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_batch_inflight_enforce_env_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            assert!(!Config::load(&args)?.limits.batch_inflight.enforce, "default is off");
+
+            jail.set_env("DWCTL_LIMITS__BATCH_INFLIGHT__ENFORCE", "true");
+            let config = Config::load(&args)?;
+            assert!(config.limits.batch_inflight.enforce);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_batch_inflight_default_capacity_env_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            assert_eq!(
+                Config::load(&args)?.limits.batch_inflight.default_capacity,
+                Some(200),
+                "default is 200"
+            );
+
+            jail.set_env("DWCTL_LIMITS__BATCH_INFLIGHT__DEFAULT_CAPACITY", "250");
+            assert_eq!(Config::load(&args)?.limits.batch_inflight.default_capacity, Some(250));
+
+            // 0 is the "off" form: no default cap.
+            jail.set_env("DWCTL_LIMITS__BATCH_INFLIGHT__DEFAULT_CAPACITY", "0");
+            assert_eq!(Config::load(&args)?.limits.batch_inflight.default_capacity, None);
+
+            // A negative override is rejected at load.
+            jail.set_env("DWCTL_LIMITS__BATCH_INFLIGHT__DEFAULT_CAPACITY", "-1");
+            assert!(Config::load(&args).is_err(), "a negative env override must be rejected");
 
             Ok(())
         });

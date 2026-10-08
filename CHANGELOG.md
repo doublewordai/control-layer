@@ -1,5 +1,17 @@
 # Changelog
 
+## [13.2.0](https://github.com/doublewordai/control-layer/compare/v13.1.2...v13.2.0) (2026-10-07)
+
+
+### Features
+
+* **limits:** cap batch requests in flight per model in onwards ([#1924](https://github.com/doublewordai/control-layer/issues/1924)) ([834827d](https://github.com/doublewordai/control-layer/commit/834827dbc2b09604e9759f8b715eb85b3e2c1e22))
+
+
+### Bug Fixes
+
+* **deps:** update undici to 7.29.1 ([#1933](https://github.com/doublewordai/control-layer/issues/1933)) ([c73c641](https://github.com/doublewordai/control-layer/commit/c73c64132731b91ae2aae466e8498736902da962))
+
 ## [13.1.2](https://github.com/doublewordai/control-layer/compare/v13.1.1...v13.1.2) (2026-10-07)
 
 

@@ -444,6 +444,7 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
                 .install_recorder()
                 .expect("Failed to install Prometheus recorder");
             initialize_database_error_metrics();
+            crate::metrics::describe_cache_info_metrics();
             handle
         })
         .clone()
@@ -3435,6 +3436,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
             direct_pools.clone(),
             Some(model_capacity_limits.clone()),
             config.background_services.batch_daemon.default_model_concurrency,
+            config.limits.batch_inflight.default_capacity,
             escalation_models,
             config.onwards.strict_mode,
         )
@@ -4356,6 +4358,12 @@ impl Application {
         // No classifier is injected here.
         // Request-body edits (id-scrub, streaming usage flags) now live in dwctl's own
         // `outbound_request` middleware, so onwards needs no BodyTransformFn.
+        // One Redis pool for both in-flight limiters. The realtime per-account
+        // limit and the global batch cap share the configured connection; each
+        // has its own scope and switch. With no Redis URL the pool is `None`
+        // and both fall back to counting within this replica.
+        let limits_redis =
+            crate::realtime_inflight::RealtimeInflightLimiter::redis_pool(config.limits.realtime_inflight.redis_url.as_deref())?;
         let mut onwards_app_state = onwards::AppState::new(bg_services.onwards_targets.clone())
             .with_response_transform(onwards::create_openai_sanitizer())
             .with_upstream_rate_limit_message(config.onwards.upstream_rate_limit_message.clone())
@@ -4369,9 +4377,20 @@ impl Application {
             // `x-fusillade-request-id`), so it exempts exactly the daemon
             // traffic, which tolerates latency and runs its own retries.
             .with_first_token_timeout_exempt_header("x-fusillade-batch-created-at")
-            .with_inflight_limiter(Arc::new(crate::realtime_inflight::RealtimeInflightLimiter::from_config(
-                &config.limits.realtime_inflight,
-            )?))
+            .with_inflight_limiter(Arc::new(crate::realtime_inflight::RealtimeInflightLimiter::from_parts(
+                "realtime",
+                config.limits.realtime_inflight.enforce,
+                limits_redis.clone(),
+            )))
+            // The batch cap shares the realtime Redis but has its own switch and
+            // reserved count scope. Off, the handler never consults this
+            // limiter, so no shared count is touched.
+            .with_batch_inflight_limiter(Arc::new(crate::realtime_inflight::RealtimeInflightLimiter::from_parts(
+                "batch",
+                true,
+                limits_redis,
+            )))
+            .with_batch_inflight_enforce(config.limits.batch_inflight.enforce)
             .with_rejected_params(&config.onwards.rejected_params)
             .map_err(|error| anyhow::anyhow!("onwards.rejected_params: {error}"))?;
         if config.onwards.first_token_timeout_ms > 0 {

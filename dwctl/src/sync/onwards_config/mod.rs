@@ -359,6 +359,9 @@ pub struct OnwardsConfigSync {
     daemon_capacity_limits: Option<Arc<dashmap::DashMap<String, usize>>>,
     /// Default batch concurrency for models without explicit batch_capacity
     default_batch_capacity: usize,
+    /// Default global batch in-flight cap applied by onwards to virtual models
+    /// without their own positive `batch_capacity`. `None` means no default.
+    default_batch_inflight_capacity: Option<u32>,
     /// Model aliases that batch API keys should have automatic access to (escalation targets)
     escalation_models: Vec<String>,
     /// Tracks previous-cycle gauge label sets for zeroing stale metrics
@@ -390,13 +393,24 @@ impl OnwardsConfigSync {
     #[cfg(test)]
     #[instrument(skip(db))]
     pub async fn new(db: PgPool) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
-        Self::new_with_daemon_limits(db.clone(), db, None, 10, Vec::new(), false).await
+        Self::new_with_daemon_limits(
+            db.clone(),
+            db,
+            None,
+            10,
+            Some(crate::config::DEFAULT_BATCH_INFLIGHT_CAPACITY),
+            Vec::new(),
+            false,
+        )
+        .await
     }
 
     /// Creates a new OnwardsConfigSync with optional daemon capacity limits map and escalation models
     ///
     /// `daemon_capacity_limits` - Shared map populated with per-model concurrency limits for the batch daemon.
     /// `default_batch_capacity` - Default concurrency limit for models without explicit `batch_capacity`.
+    /// `default_batch_inflight_capacity` - Default global batch in-flight cap for virtual models
+    ///   without their own positive `batch_capacity`; `None` means no default.
     /// `escalation_models` - Model aliases that batch API keys should have automatic access to.
     /// `strict_mode` - Enable strict mode with schema validation (only known OpenAI API paths accepted)
     /// `listener_db` - Direct (non-pooled) connections for the LISTEN session.
@@ -406,13 +420,15 @@ impl OnwardsConfigSync {
         listener_db: impl sqlx_pool_router::PoolProvider,
         daemon_capacity_limits: Option<Arc<dashmap::DashMap<String, usize>>>,
         default_batch_capacity: usize,
+        default_batch_inflight_capacity: Option<u32>,
         escalation_models: Vec<String>,
         strict_mode: bool,
     ) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
         // Live provider (not a pinned pool): survives runtime pool swaps.
         let db = sqlx_pool_router::DynPools::new(db);
         // Load initial configuration (including composite models)
-        let initial_targets = load_targets_from_db(&db.write(), &escalation_models, strict_mode).await?;
+        let initial_targets =
+            load_targets_from_db_with_batch_default(&db.write(), &escalation_models, strict_mode, default_batch_inflight_capacity).await?;
 
         // If daemon limits are provided, populate them
         if let Some(ref limits) = daemon_capacity_limits {
@@ -442,6 +458,7 @@ impl OnwardsConfigSync {
             reload_checkpoint: None,
             daemon_capacity_limits,
             default_batch_capacity,
+            default_batch_inflight_capacity,
             escalation_models,
             cache_info_state,
             strict_mode,
@@ -592,7 +609,14 @@ impl OnwardsConfigSync {
     /// cache metrics, and sends the new Targets. Recoverable failures retain a
     /// pending retry; closed receivers stop the task, and fatal DB errors propagate.
     async fn full_reload(&mut self, source: &'static str) -> Result<ReloadOutcome, anyhow::Error> {
-        let new_targets = match load_targets_from_db(&self.db.write(), &self.escalation_models, self.strict_mode).await {
+        let new_targets = match load_targets_from_db_with_batch_default(
+            &self.db.write(),
+            &self.escalation_models,
+            self.strict_mode,
+            self.default_batch_inflight_capacity,
+        )
+        .await
+        {
             Ok(targets) => targets,
             Err(e) => {
                 crate::background_error!(ONWARDS_SYNC, "load_targets", Error, "Failed to load targets from database: {}", e);
@@ -682,6 +706,9 @@ struct OnwardsCompositeModel {
     id: DeploymentId,
     alias: String,
     realtime_inflight_limit: i32,
+    /// Per-model batch in-flight cap. `None` means batch is uncapped on this
+    /// alias. See `deployed_models.batch_capacity`.
+    batch_capacity: Option<i32>,
     /// Load balancing strategy (weighted_random or priority)
     lb_strategy: LoadBalancingStrategy,
     /// Fallback enabled
@@ -927,6 +954,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             id as composite_model_id,
             alias,
             realtime_inflight_limit,
+            batch_capacity,
             lb_strategy,
             fallback_enabled,
             fallback_on_rate_limit,
@@ -970,6 +998,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 id: row.composite_model_id,
                 alias: row.alias,
                 realtime_inflight_limit: row.realtime_inflight_limit,
+                batch_capacity: row.batch_capacity,
                 lb_strategy,
                 fallback_enabled: row.fallback_enabled.unwrap_or(true),
                 fallback_on_rate_limit: row.fallback_on_rate_limit.unwrap_or(true),
@@ -1081,6 +1110,36 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
     Ok(composites)
 }
 
+/// Resolves a virtual model's effective global batch in-flight cap.
+///
+/// A positive stored `batch_capacity` wins; a missing value falls back to the
+/// configured default. A non-positive stored value is invalid: interpreted as a
+/// cap it would either refuse every request (`0`) or silently read as uncapped,
+/// so it is ignored in favour of the default and warned about once per sync per
+/// model, matching [`update_daemon_capacity_limits`].
+fn effective_batch_inflight_limit(batch_capacity: Option<i32>, default_batch_inflight_capacity: Option<u32>, alias: &str) -> Option<u32> {
+    match batch_capacity {
+        Some(capacity) if capacity > 0 => Some(capacity as u32),
+        Some(capacity) => {
+            match default_batch_inflight_capacity {
+                Some(default) => warn!(
+                    alias = %alias,
+                    batch_capacity = capacity,
+                    default_capacity = default,
+                    "Invalid non-positive batch_capacity on a virtual model; capping batch at the default instead"
+                ),
+                None => warn!(
+                    alias = %alias,
+                    batch_capacity = capacity,
+                    "Invalid non-positive batch_capacity on a virtual model and no default cap is configured; batch is uncapped"
+                ),
+            }
+            default_batch_inflight_capacity
+        }
+        None => default_batch_inflight_capacity,
+    }
+}
+
 /// Converts a composite model to a TargetSpecOrList with weighted providers
 ///
 /// Uses onwards 0.10.0 weighted provider types for load balancing across
@@ -1090,6 +1149,7 @@ fn convert_composite_to_target_spec(
     key_definitions: &mut HashMap<String, KeyDefinition>,
     overlays: &OverlaysByAlias,
     inflight_overrides: &InflightOverridesByAlias,
+    default_batch_inflight_capacity: Option<u32>,
 ) -> (String, TargetSpecOrList) {
     // Add this composite model's API keys to key_definitions
     for api_key in &composite.api_keys {
@@ -1277,6 +1337,16 @@ fn convert_composite_to_target_spec(
             HashMap::new()
         },
         inflight_limit: (pool_name == DEFAULT_COMPONENT_POOL).then_some(composite.realtime_inflight_limit as u32),
+        // Batch requests are counted on the named alias globally; only the
+        // composite's default pool carries the cap. A positive `batch_capacity`
+        // wins; a NULL one falls back to the configured default. A non-positive
+        // stored value is invalid and also falls back (with a warning).
+        // Realtime traffic is unaffected.
+        batch_inflight_limit: if pool_name == DEFAULT_COMPONENT_POOL {
+            effective_batch_inflight_limit(composite.batch_capacity, default_batch_inflight_capacity, &composite.alias)
+        } else {
+            None
+        },
         account_inflight_limits: if pool_name == DEFAULT_COMPONENT_POOL {
             inflight_overrides.get(&composite.alias).cloned().unwrap_or_default()
         } else {
@@ -1312,6 +1382,7 @@ fn convert_to_config_file(
     overlays: &OverlaysByAlias,
     inflight_overrides: &InflightOverridesByAlias,
     accounts: AccountsById,
+    default_batch_inflight_capacity: Option<u32>,
 ) -> ConfigFile {
     let mut key_definitions = HashMap::new();
 
@@ -1423,6 +1494,7 @@ fn convert_to_config_file(
                 serving_classes: target.serving_classes,
                 overlays: overlays.get(&target.alias).cloned().unwrap_or_default(),
                 inflight_limit: None,
+                batch_inflight_limit: None,
                 account_inflight_limits: HashMap::new(),
             };
 
@@ -1442,7 +1514,13 @@ fn convert_to_config_file(
             );
         }
 
-        let (alias, spec) = convert_composite_to_target_spec(&composite, &mut key_definitions, overlays, inflight_overrides);
+        let (alias, spec) = convert_composite_to_target_spec(
+            &composite,
+            &mut key_definitions,
+            overlays,
+            inflight_overrides,
+            default_batch_inflight_capacity,
+        );
         target_specs.insert(alias, spec);
     }
 
@@ -1467,14 +1545,44 @@ fn convert_to_config_file(
 }
 
 /// Loads the current targets configuration from the database (including composite models)
+/// using the built-in default batch in-flight cap for virtual models without their own
+/// `batch_capacity`.
+///
+/// Test helper: production code goes through
+/// [`load_targets_from_db_with_batch_default`] so the configured default is honoured.
+///
+/// `escalation_models` - Model aliases that batch API keys should have automatic access to.
+/// This enables batch processing to route requests to escalation models without needing
+/// separate API key configuration.
+/// `strict_mode` - Enable strict mode with schema validation (only known OpenAI API paths accepted)
+#[cfg(test)]
+#[tracing::instrument(skip(db, escalation_models))]
+pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], strict_mode: bool) -> Result<Targets, anyhow::Error> {
+    load_targets_from_db_with_batch_default(
+        db,
+        escalation_models,
+        strict_mode,
+        Some(crate::config::DEFAULT_BATCH_INFLIGHT_CAPACITY),
+    )
+    .await
+}
+
+/// Loads the current targets configuration from the database (including composite models)
 /// General paid admission retains the same legacy tariff rule as composite loading.
 ///
 /// `escalation_models` - Model aliases that batch API keys should have automatic access to.
 /// This enables batch processing to route requests to escalation models without needing
 /// separate API key configuration.
 /// `strict_mode` - Enable strict mode with schema validation (only known OpenAI API paths accepted)
+/// `default_batch_inflight_capacity` - Global onboard cap applied to virtual models without a
+/// positive `batch_capacity` of their own; `None` leaves them uncapped.
 #[tracing::instrument(skip(db, escalation_models))]
-pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], strict_mode: bool) -> Result<Targets, anyhow::Error> {
+pub async fn load_targets_from_db_with_batch_default(
+    db: &PgPool,
+    escalation_models: &[String],
+    strict_mode: bool,
+    default_batch_inflight_capacity: Option<u32>,
+) -> Result<Targets, anyhow::Error> {
     let query_start = std::time::Instant::now();
     debug!("Loading onwards targets from database (with composite models)");
 
@@ -1772,7 +1880,15 @@ pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], str
     let inflight_overrides = load_inflight_overrides_from_db(db).await?;
     let accounts = load_accounts_from_db(db).await?;
 
-    let config = convert_to_config_file(targets, composites, strict_mode, &overlays, &inflight_overrides, accounts);
+    let config = convert_to_config_file(
+        targets,
+        composites,
+        strict_mode,
+        &overlays,
+        &inflight_overrides,
+        accounts,
+        default_batch_inflight_capacity,
+    );
 
     // Convert ConfigFile to Targets
     Targets::from_config(config)

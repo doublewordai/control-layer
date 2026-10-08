@@ -172,6 +172,14 @@ pub struct AppState<T: HttpClient> {
     /// being forwarded. Every other flagged parameter is only logged and counted.
     pub rejected_params: Vec<&'static str>,
     pub inflight_limiter: Arc<dyn inflight::InflightLimiter>,
+    /// Enforces the per-model batch in-flight cap. Off, dispatched batch
+    /// requests are never refused and the batch limiter is never consulted, so
+    /// no shared count is touched.
+    pub batch_inflight_enforce: bool,
+    /// Counts batch in-flight requests. Kept separate from `inflight_limiter`
+    /// because the two have independent switches and count scopes: realtime
+    /// counts per account, batch counts one global scope per alias.
+    pub batch_inflight_limiter: Arc<dyn inflight::InflightLimiter>,
 }
 
 /// Default maximum request body size (32 MB).
@@ -204,6 +212,8 @@ impl<T: HttpClient> std::fmt::Debug for AppState<T> {
             )
             .field("rejected_params", &self.rejected_params)
             .field("inflight_limiter", &self.inflight_limiter)
+            .field("batch_inflight_enforce", &self.batch_inflight_enforce)
+            .field("batch_inflight_limiter", &self.batch_inflight_limiter)
             .finish()
     }
 }
@@ -230,6 +240,8 @@ impl AppState<HyperClient> {
             first_token_timeout_exempt_header: None,
             rejected_params: Vec::new(),
             inflight_limiter: Arc::new(inflight::LocalInflightLimiter::default()),
+            batch_inflight_enforce: false,
+            batch_inflight_limiter: Arc::new(inflight::LocalInflightLimiter::default()),
         }
     }
 }
@@ -249,6 +261,8 @@ impl<T: HttpClient> AppState<T> {
             first_token_timeout_exempt_header: None,
             rejected_params: Vec::new(),
             inflight_limiter: Arc::new(inflight::LocalInflightLimiter::default()),
+            batch_inflight_enforce: false,
+            batch_inflight_limiter: Arc::new(inflight::LocalInflightLimiter::default()),
         }
     }
 
@@ -302,6 +316,40 @@ impl<T: HttpClient> AppState<T> {
 
     pub fn with_inflight_limiter(mut self, limiter: Arc<dyn inflight::InflightLimiter>) -> Self {
         self.inflight_limiter = limiter;
+        self
+    }
+
+    /// Plug in a shared counter for the per-model batch in-flight cap.
+    ///
+    /// Enforcement also requires [`AppState::with_batch_inflight_enforce`]. The
+    /// standalone `onwards` binary never calls either builder, so the cap is
+    /// inert there; only embedding processes (such as the control layer) enable
+    /// it.
+    pub fn with_batch_inflight_limiter(
+        mut self,
+        limiter: Arc<dyn inflight::InflightLimiter>,
+    ) -> Self {
+        self.batch_inflight_limiter = limiter;
+        self
+    }
+
+    /// Switch enforcement of the per-model batch in-flight cap on or off.
+    ///
+    /// Batch requests are recognised by the header set with
+    /// [`AppState::with_first_token_timeout_exempt_header`], which the batch
+    /// dispatcher stamps on every request it sends. Without that header
+    /// configured no request counts as batch, so the cap never applies; enabling
+    /// enforcement without it logs a warning. The standalone `onwards` binary
+    /// never enables this, so the cap is inert there; see
+    /// [`AppState::with_batch_inflight_limiter`].
+    pub fn with_batch_inflight_enforce(mut self, enforce: bool) -> Self {
+        if enforce && self.first_token_timeout_exempt_header.is_none() {
+            tracing::warn!(
+                "batch in-flight cap enforcement is on, but no batch marker header is configured \
+                 (with_first_token_timeout_exempt_header); no request will be counted as batch"
+            );
+        }
+        self.batch_inflight_enforce = enforce;
         self
     }
 
@@ -3727,6 +3775,544 @@ mod tests {
             .unwrap();
         assert_eq!(direct.status(), StatusCode::OK);
         assert_eq!(mock_client.get_requests().len(), 2);
+    }
+
+    /// A pool with the batch cap under test and, optionally, a realtime limit.
+    fn batch_limited_targets(batch_limit: Option<u32>, realtime_limit: Option<u32>) -> Targets {
+        let targets_map = Arc::new(DashMap::new());
+        let mut pool = ProviderPool::new(vec![Provider::new(
+            Target::builder()
+                .url("https://api.example.com".parse().unwrap())
+                .build(),
+            1,
+        )])
+        .with_batch_inflight_limit(batch_limit);
+        if let Some(limit) = realtime_limit {
+            pool = pool.with_inflight_limits(Some(inflight::InflightLimits {
+                default: limit,
+                accounts: std::collections::HashMap::new(),
+            }));
+        }
+        targets_map.insert("batch-model".to_string(), pool.into());
+        let key_labels = Arc::new(DashMap::new());
+        key_labels.insert(
+            "sk-acct-a".to_string(),
+            std::collections::HashMap::from([(
+                serving::ACCOUNT_LABEL.to_string(),
+                "acct-a".to_string(),
+            )]),
+        );
+        Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels,
+            accounts: Arc::new(DashMap::new()),
+            strict_mode: false,
+            http_pool_config: None,
+        }
+    }
+
+    /// The dispatcher stamps every request it sends with the exempt header, so
+    /// this is what onwards classifies as batch traffic.
+    fn dispatched_chat_request(model: &str, key: &str) -> axum::extract::Request {
+        let mut request = inflight_chat_request(model, key);
+        request
+            .headers_mut()
+            .insert("x-dispatched", axum::http::HeaderValue::from_static("1"));
+        request
+    }
+
+    /// An unauthenticated dispatched request, for pools whose key labels are
+    /// empty (the fallback targets).
+    fn dispatched_request(model: &str) -> axum::extract::Request {
+        axum::extract::Request::builder()
+            .uri("/v1/chat/completions")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-dispatched", "1")
+            .body(axum::body::Body::from(
+                json!({"model": model, "messages": []}).to_string(),
+            ))
+            .unwrap()
+    }
+
+    /// Records every `try_acquire` so a test can assert the batch limiter was
+    /// (or was not) consulted and how many slots it was asked for.
+    #[derive(Debug, Default)]
+    struct CountingBatchLimiter {
+        calls: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl CountingBatchLimiter {
+        fn calls(&self) -> Vec<(String, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl inflight::InflightLimiter for CountingBatchLimiter {
+        fn try_acquire<'a>(
+            &'a self,
+            account: &'a str,
+            model: &'a str,
+            _limit: u32,
+        ) -> futures_util::future::BoxFuture<'a, Option<inflight::InflightSlot>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((account.to_owned(), model.to_owned()));
+            Box::pin(std::future::ready(Some(inflight::InflightSlot::new(()))))
+        }
+    }
+
+    fn batch_router_with_limiter(
+        targets: Targets,
+        mock_client: MockHttpClient,
+        enforce: bool,
+        limiter: Arc<dyn inflight::InflightLimiter>,
+    ) -> Router {
+        build_router(
+            AppState::with_client(targets, mock_client)
+                .with_first_token_timeout_exempt_header("x-dispatched")
+                .with_batch_inflight_enforce(enforce)
+                .with_batch_inflight_limiter(limiter),
+        )
+    }
+
+    /// Fallback targets carrying a global batch cap, for failover tests.
+    fn fallback_batch_targets(
+        alias: &str,
+        n: usize,
+        fallback: target::FallbackConfig,
+        batch_limit: Option<u32>,
+    ) -> target::Targets {
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::{LoadBalanceStrategy, Target};
+
+        let providers = (0..n)
+            .map(|i| {
+                let t = Target::builder()
+                    .url(format!("https://p{i}.example.com/").parse().unwrap())
+                    .request_timeout_secs(5)
+                    .build();
+                Provider::new(t, 1)
+            })
+            .collect();
+        let pool = ProviderPool::with_config(
+            providers,
+            None,
+            None,
+            None,
+            Some(fallback),
+            LoadBalanceStrategy::Priority,
+            false,
+            Vec::new(),
+        )
+        .with_batch_inflight_limit(batch_limit);
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(alias.to_string(), pool.into());
+        target::Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        }
+    }
+
+    fn batch_router(targets: Targets, mock_client: MockHttpClient, enforce: bool) -> Router {
+        build_router(
+            AppState::with_client(targets, mock_client)
+                .with_first_token_timeout_exempt_header("x-dispatched")
+                .with_batch_inflight_enforce(enforce),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_batch_inflight_cap_admits_up_to_the_limit() {
+        use tower::ServiceExt;
+
+        let targets = batch_limited_targets(Some(2), None);
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let router = batch_router(targets, mock_client.clone(), true);
+
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let response = router
+                .clone()
+                .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            held.push(response);
+        }
+        assert_eq!(mock_client.get_requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_batch_inflight_cap_refuses_at_the_cap_with_529() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let targets = batch_limited_targets(Some(1), None);
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let router = batch_router(targets, mock_client.clone(), true);
+
+        let admitted = router
+            .clone()
+            .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(admitted.status(), StatusCode::OK);
+
+        let refused = router
+            .clone()
+            .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::from_u16(529).unwrap());
+        assert_eq!(refused.headers()["retry-after"], "1");
+        let refused_body: serde_json::Value =
+            serde_json::from_slice(&refused.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(refused_body["error"]["type"], "overloaded_error");
+        assert_eq!(refused_body["error"]["code"], "batch_capacity_exceeded");
+        let message = refused_body["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("'batch-model'"),
+            "names the model: {message}"
+        );
+        assert!(message.contains('1'), "names the cap: {message}");
+        assert_eq!(mock_client.get_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_batch_inflight_slot_frees_when_body_finishes_or_drops() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let targets = batch_limited_targets(Some(1), None);
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let router = batch_router(targets, mock_client.clone(), true);
+
+        // Held until the body is fully consumed.
+        let first = router
+            .clone()
+            .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        let refused = router
+            .clone()
+            .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::from_u16(529).unwrap());
+        first.into_body().collect().await.unwrap();
+
+        let after = router
+            .clone()
+            .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(after.status(), StatusCode::OK);
+        drop(after);
+
+        // Dropping an unconsumed response frees the slot too (client
+        // disconnect).
+        let held = router
+            .clone()
+            .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(held.status(), StatusCode::OK);
+        drop(held);
+        let after_drop = router
+            .clone()
+            .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(after_drop.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_realtime_requests_never_touch_the_batch_cap() {
+        use tower::ServiceExt;
+
+        let targets = batch_limited_targets(Some(1), None);
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let router = batch_router(targets, mock_client.clone(), true);
+
+        let _batch = router
+            .clone()
+            .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+
+        // Realtime traffic is not counted against the batch cap.
+        let realtime = router
+            .clone()
+            .oneshot(inflight_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(realtime.status(), StatusCode::OK);
+
+        let refused = router
+            .clone()
+            .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::from_u16(529).unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_batch_inflight_null_cap_is_unlimited() {
+        use tower::ServiceExt;
+
+        let targets = batch_limited_targets(None, None);
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let router = batch_router(targets, mock_client.clone(), true);
+
+        let mut held = Vec::new();
+        for _ in 0..5 {
+            let response = router
+                .clone()
+                .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            held.push(response);
+        }
+        assert_eq!(mock_client.get_requests().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_batch_inflight_enforcement_off_never_refuses() {
+        use tower::ServiceExt;
+
+        let targets = batch_limited_targets(Some(1), None);
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let router = batch_router(targets, mock_client.clone(), false);
+
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            let response = router
+                .clone()
+                .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            held.push(response);
+        }
+        assert_eq!(mock_client.get_requests().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_batch_inflight_enforcement_off_does_not_consult_the_limiter() {
+        use tower::ServiceExt;
+
+        // Enforcement on proves the mock is wired in and counts.
+        let on_limiter = Arc::new(CountingBatchLimiter::default());
+        let on_router = batch_router_with_limiter(
+            batch_limited_targets(Some(1), None),
+            MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#),
+            true,
+            on_limiter.clone(),
+        );
+        let _held = on_router
+            .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(
+            on_limiter.calls().len(),
+            1,
+            "enforcement on consults the limiter"
+        );
+
+        // Off, the limiter must not be touched at all, so a request cannot be
+        // refused even when it is over the configured cap.
+        let off_limiter = Arc::new(CountingBatchLimiter::default());
+        let off_router = batch_router_with_limiter(
+            batch_limited_targets(Some(1), None),
+            MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#),
+            false,
+            off_limiter.clone(),
+        );
+        for _ in 0..3 {
+            let response = off_router
+                .clone()
+                .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert!(
+            off_limiter.calls().is_empty(),
+            "enforcement off must never call try_acquire: {:?}",
+            off_limiter.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_inflight_counts_a_redirected_request_against_the_model_it_named() {
+        use crate::target::{LoadBalanceStrategy, RoutingAction, RoutingRule};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let provider = || {
+            Provider::new(
+                Target::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .build(),
+                1,
+            )
+        };
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "named-model".to_string(),
+            ProviderPool::with_config(
+                vec![provider()],
+                None,
+                None,
+                None,
+                None,
+                LoadBalanceStrategy::default(),
+                false,
+                vec![RoutingRule {
+                    match_labels: std::collections::HashMap::from([(
+                        "purpose".to_string(),
+                        "batch".to_string(),
+                    )]),
+                    action: RoutingAction::Redirect {
+                        target: "served-model".to_string(),
+                    },
+                }],
+            )
+            .with_batch_inflight_limit(Some(1))
+            .into(),
+        );
+        targets_map.insert(
+            "served-model".to_string(),
+            ProviderPool::new(vec![provider()])
+                .with_batch_inflight_limit(Some(5))
+                .into(),
+        );
+        let key_labels = Arc::new(DashMap::new());
+        key_labels.insert(
+            "sk-acct-a".to_string(),
+            std::collections::HashMap::from([
+                (serving::ACCOUNT_LABEL.to_string(), "acct-a".to_string()),
+                ("purpose".to_string(), "batch".to_string()),
+            ]),
+        );
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels,
+            accounts: Arc::new(DashMap::new()),
+            strict_mode: false,
+            http_pool_config: None,
+        };
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let router = batch_router(targets, mock_client.clone(), true);
+
+        let redirected = router
+            .clone()
+            .oneshot(dispatched_chat_request("named-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(redirected.status(), StatusCode::OK);
+
+        // The named model's cap is 1, so the second request must be refused
+        // even though it is served by `served-model` (cap 5).
+        let refused = router
+            .clone()
+            .oneshot(dispatched_chat_request("named-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::from_u16(529).unwrap());
+        let refused_body: serde_json::Value =
+            serde_json::from_slice(&refused.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(refused_body["error"]["code"], "batch_capacity_exceeded");
+        assert!(
+            refused_body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("'named-model'")
+        );
+
+        // A request naming `served-model` uses that model's own cap and is
+        // admitted while the redirected one holds its slot on `named-model`.
+        let direct = router
+            .clone()
+            .oneshot(dispatched_chat_request("served-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(direct.status(), StatusCode::OK);
+        assert_eq!(mock_client.get_requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_batch_failover_acquires_only_one_slot() {
+        use tower::ServiceExt;
+
+        let targets = fallback_batch_targets("gpt-4", 2, retrying_fallback(vec![502], 2), Some(1));
+        let mock_client =
+            MockHttpClient::new(StatusCode::BAD_GATEWAY, r#"{"error":{"message":"bad"}}"#);
+        let limiter = Arc::new(CountingBatchLimiter::default());
+        let router = batch_router_with_limiter(targets, mock_client.clone(), true, limiter.clone());
+
+        let response = router.oneshot(dispatched_request("gpt-4")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            mock_client.get_requests().len(),
+            2,
+            "the request failed over to the second provider"
+        );
+        assert_eq!(
+            limiter.calls().len(),
+            1,
+            "one slot is held across failover, not one per attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_and_realtime_counts_are_independent() {
+        use tower::ServiceExt;
+
+        let targets = batch_limited_targets(Some(1), Some(1));
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let router = batch_router(targets, mock_client.clone(), true);
+
+        // One realtime request and one batch request can be in flight at once:
+        // they use different count scopes for the same alias.
+        let _realtime = router
+            .clone()
+            .oneshot(inflight_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        let _batch = router
+            .clone()
+            .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+
+        let refused_realtime = router
+            .clone()
+            .oneshot(inflight_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(refused_realtime.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let refused_batch = router
+            .clone()
+            .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(refused_batch.status(), StatusCode::from_u16(529).unwrap());
     }
 
     mod metrics {
