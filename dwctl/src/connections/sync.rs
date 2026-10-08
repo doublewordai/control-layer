@@ -1077,9 +1077,13 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
             // fresh rather than sharing the API replicas' cache.
             match reserve_capacity(&dwctl.write(), &*state.request_manager, None, &cap_input).await {
                 Ok(ids) => ids,
-                Err(CapacityError::InsufficientCapacity { completion_window, models }) => {
+                Err(CapacityError::InsufficientCapacity {
+                    completion_window,
+                    checked_window,
+                    models,
+                }) => {
                     return Err(ActivateError::Retryable(format!(
-                        "insufficient capacity for {completion_window} window (models: {models})"
+                        "insufficient capacity for {completion_window} window ({checked_window} window full; models: {models})"
                     ))
                     .into());
                 }

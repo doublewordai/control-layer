@@ -1182,11 +1182,20 @@ async fn reserve_capacity_for_batch<P: PoolProvider>(
     let pool = state.db.write();
     let reserved = reserve_capacity(&pool, &*state.request_manager, Some(&state.admission_demand_cache), &input).await;
     reserved.map_err(|e| match e {
-        CapacityError::InsufficientCapacity { completion_window, models } => Error::TooManyRequests {
-            message: format!(
-                "Insufficient capacity for {} completion window. The following models are currently at capacity: {}. Try again later or use a longer completion window.",
-                completion_window, models
-            ),
+        CapacityError::InsufficientCapacity {
+            completion_window,
+            checked_window,
+            models,
+        } => Error::TooManyRequests {
+            message: if checked_window == completion_window {
+                format!(
+                    "Insufficient capacity for {completion_window} completion window. The following models are currently at capacity: {models}. Try again later or use a longer completion window."
+                )
+            } else {
+                format!(
+                    "Insufficient capacity for {completion_window} completion window: the following models are at capacity for the {checked_window} completion window, which shorter-window batches also use: {models}. Try again later."
+                )
+            },
         },
         CapacityError::Internal(msg) => Error::Internal { operation: msg },
     })
@@ -4339,7 +4348,14 @@ mod tests {
         let err = super::reserve_capacity_for_batch(&state, "1h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 1.0)
             .await
             .expect_err("a 1h batch must also fit the 24h window");
-        assert!(matches!(err, Error::TooManyRequests { .. }));
+        // The response names the window that is actually full.
+        let Error::TooManyRequests { message } = err else {
+            panic!("expected TooManyRequests, got {err:?}");
+        };
+        assert!(
+            message.contains("at capacity for the 24h completion window"),
+            "message should name the full 24h window: {message}"
+        );
     }
 
     /// Active 1h reservations count against a 24h admission (and not vice versa).
