@@ -240,25 +240,26 @@
     box-sizing: border-box;
   }
   .dark {
-    --background: 20 14.3% 4.1%;
-    --foreground: 60 9.1% 97.8%;
-    --card: 20 14.3% 4.1%;
-    --card-foreground: 60 9.1% 97.8%;
-    --popover: 20 14.3% 4.1%;
-    --popover-foreground: 60 9.1% 97.8%;
-    --primary: 60 9.1% 97.8%;
-    --primary-foreground: 24 9.8% 10%;
-    --secondary: 12 6.5% 15.1%;
-    --secondary-foreground: 60 9.1% 97.8%;
-    --muted: 12 6.5% 15.1%;
-    --muted-foreground: 24 5.4% 63.9%;
-    --accent: 12 6.5% 15.1%;
-    --accent-foreground: 60 9.1% 97.8%;
-    --destructive: 0 62.8% 30.6%;
-    --destructive-foreground: 60 9.1% 97.8%;
-    --border: 12 6.5% 15.1%;
-    --input: 12 6.5% 15.1%;
-    --ring: 24 5.7% 82.9%;
+    color-scheme: dark;
+    --background: 0 0% 9%;
+    --foreground: 0 0% 93%;
+    --card: 0 0% 13%;
+    --card-foreground: 0 0% 93%;
+    --popover: 0 0% 13%;
+    --popover-foreground: 0 0% 93%;
+    --primary: 0 0% 93%;
+    --primary-foreground: 0 0% 10%;
+    --secondary: 0 0% 18%;
+    --secondary-foreground: 0 0% 93%;
+    --muted: 0 0% 18%;
+    --muted-foreground: 0 0% 67%;
+    --accent: 0 0% 21%;
+    --accent-foreground: 0 0% 96%;
+    --destructive: 0 65% 45%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 0 0% 24%;
+    --input: 0 0% 24%;
+    --ring: 0 0% 65%;
     --chart-1: oklch(0.65 0.18 260);
     --chart-2: oklch(0.488 0.243 264.376);
     --chart-3: oklch(0.769 0.188 70.08);
@@ -296,13 +297,13 @@
 */
 
 .dark {
-  --sidebar: #2e2c26;
-  --sidebar-foreground: #ccc5b4;
+  --sidebar: #202020;
+  --sidebar-foreground: #dddddd;
   --sidebar-primary: #fe6767;
   --sidebar-primary-foreground: #ffffff;
-  --sidebar-accent: #fe6767;
+  --sidebar-accent: #363636;
   --sidebar-accent-foreground: #ffffff;
-  --sidebar-border: #3a3831;
+  --sidebar-border: #383838;
   --sidebar-ring: hsl(217.2 91.2% 59.8%);
 }
 
@@ -373,4 +374,78 @@
 
 .modal-scrollbar::-webkit-scrollbar-thumb:hover {
   background: #6b7280;
+}
+
+/*
+  Dark palette. Tailwind compiles utilities to var(--color-*), so redefining the
+  variables here flips every doubleword-* and default-gray utility without
+  touching components. Unlayered so it wins over the theme layer.
+*/
+.dark {
+  --color-doubleword-background-primary: #222222;
+  --color-doubleword-background-secondary: #181818;
+  --color-doubleword-background-tertiary: #292929;
+  --color-doubleword-background-card: #222222;
+  --color-doubleword-background-dark: #1d1d1d;
+  --color-doubleword-text-primary: #eeeeee;
+  --color-doubleword-text-secondary: #d0d0d0;
+  --color-doubleword-text-tertiary: #aaaaaa;
+  --color-doubleword-text-muted: #999999;
+  --color-doubleword-border: #3a3a3a;
+  --color-doubleword-border-light: #303030;
+  --color-doubleword-border-dark: #4a4a4a;
+  --color-doubleword-neutral-50: #202020;
+  --color-doubleword-neutral-100: #303030;
+  --color-doubleword-neutral-200: #393939;
+  --color-doubleword-neutral-300: #454545;
+  --color-doubleword-neutral-400: #666666;
+  --color-doubleword-neutral-500: #888888;
+  --color-doubleword-neutral-600: #9c9c9c;
+  --color-doubleword-neutral-700: #b5b5b5;
+  --color-doubleword-neutral-800: #d0d0d0;
+  --color-doubleword-neutral-900: #eeeeee;
+  --color-doubleword-red-50: #382325;
+  --color-doubleword-red-100: #4a292b;
+  --color-doubleword-red-200: #5b3034;
+
+  --color-gray-50: #292929;
+  --color-gray-100: #303030;
+  --color-gray-200: #3a3a3a;
+  --color-gray-300: #454545;
+  --color-gray-400: #8a8a8a;
+  --color-gray-500: #9a9a9a;
+  --color-gray-600: #b0b0b0;
+  --color-gray-700: #c8c8c8;
+  --color-gray-800: #dcdcdc;
+  --color-gray-900: #eeeeee;
+  --color-gray-950: #f5f5f5;
+
+  --color-red-50: #382325;
+  --color-red-100: #4a292b;
+  --color-red-200: #5b3034;
+  --color-emerald-100: #153a2b;
+  --color-emerald-800: #8ce5b3;
+}
+
+/* Not remapped via --color-white: that would also darken text-white on buttons. */
+.dark .bg-white,
+.dark .bg-white\/70,
+.dark .bg-white\/80,
+.dark .card {
+  background-color: var(--color-doubleword-background-primary);
+}
+
+.dark input::placeholder,
+.dark textarea::placeholder {
+  color: #929292;
+}
+
+.dark .modal-scrollbar::-webkit-scrollbar-track {
+  background: #2a2a2a;
+}
+.dark .modal-scrollbar::-webkit-scrollbar-thumb {
+  background: #5a5a5a;
+}
+.dark .modal-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: #7a7a7a;
 }

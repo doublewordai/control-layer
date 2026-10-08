@@ -62,6 +62,7 @@ import {
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
 import { Button } from "@/components/ui/button";
+import { ThemeToggle } from "@/components/ui/theme-toggle";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -531,6 +532,7 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
                 </a>
                 </>
               )}
+              <ThemeToggle />
             </div>
           </header>
           <main className="flex-1">
