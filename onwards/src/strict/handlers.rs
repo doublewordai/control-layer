@@ -32,8 +32,10 @@ use crate::client::HttpClient;
 use crate::errors::OnwardsErrorResponse;
 use crate::extract_model_from_request;
 use crate::handlers::{AuthenticatedApiKeyId, ResolvedTrust, target_message_handler};
+use crate::rejections::RejectionContext;
 use axum::Json;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{FromRequest, State};
 use axum::http::{Extensions, HeaderMap, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -96,19 +98,49 @@ pub async fn models_handler<T: HttpClient + Clone + Send + Sync + 'static>(
 /// body that doesn't match the schema (missing/mistyped field), `400 Bad Request`
 /// for malformed JSON.
 #[allow(clippy::result_large_err)]
-fn parse_strict_request<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Response> {
+fn parse_strict_request<T: serde::de::DeserializeOwned, C: HttpClient>(
+    state: &AppState<C>,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<T, Response> {
     serde_json::from_slice::<T>(body).map_err(|e| {
-        let status = if e.is_data() {
-            StatusCode::UNPROCESSABLE_ENTITY
+        let (status, code) = if e.is_data() {
+            (StatusCode::UNPROCESSABLE_ENTITY, "schema_mismatch")
         } else {
-            StatusCode::BAD_REQUEST
+            (StatusCode::BAD_REQUEST, "invalid_json")
         };
+        let model = extract_model_from_request(headers, body);
+        rejection_context(state, headers, model.as_deref()).record(status, code, None);
         error_response(
             status,
             "invalid_request_error",
             &format!("Invalid request: {e}"),
         )
     })
+}
+
+/// The context for counting a request refused before it is forwarded.
+fn rejection_context<C: HttpClient>(
+    state: &AppState<C>,
+    headers: &HeaderMap,
+    model: Option<&str>,
+) -> RejectionContext {
+    let mut rejection = RejectionContext::from_request(state, headers);
+    if let Some(model) = model {
+        rejection.set_model_if_configured(state, model);
+    }
+    rejection
+}
+
+/// Counts and logs `error` for a request refused before it is forwarded.
+fn rejected<C: HttpClient>(
+    state: &AppState<C>,
+    headers: &HeaderMap,
+    model: Option<&str>,
+    error: OnwardsErrorResponse,
+) -> Response {
+    rejection_context(state, headers, model).record_error(&error);
+    error.into_response()
 }
 
 /// Handler for POST /v1/chat/completions
@@ -123,7 +155,14 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
     let extensions = req.extensions().clone();
     let body_bytes = match axum::body::to_bytes(req.into_body(), state.body_limit).await {
         Ok(bytes) => bytes,
-        Err(_) => return OnwardsErrorResponse::payload_too_large(state.body_limit).into_response(),
+        Err(_) => {
+            return rejected(
+                &state,
+                &headers,
+                None,
+                OnwardsErrorResponse::payload_too_large(state.body_limit),
+            );
+        }
     };
 
     // Validate the request against the strict schema, but forward the ORIGINAL bytes
@@ -131,7 +170,7 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
     // flags, image normalisation, tool injection); onwards only checks the shape and
     // passes the body through, so it never re-serialises (or silently drops unknown
     // nested fields) the customer's request.
-    let request: ChatCompletionRequest = match parse_strict_request(&body_bytes) {
+    let request: ChatCompletionRequest = match parse_strict_request(&state, &headers, &body_bytes) {
         Ok(request) => request,
         Err(response) => return response,
     };
@@ -215,10 +254,42 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     }
 
     let extensions = req.extensions().clone();
-    let request: ResponsesRequest = match axum::extract::Json::from_request(req, &state).await {
+    // Buffered before the `Json` extractor runs, so a refused request can still
+    // be attributed to its model.
+    let body_bytes = match Bytes::from_request(req, &state).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            error!(error = %e, "Failed to read responses request");
+            rejection_context(&state, &headers, None).record(
+                StatusCode::BAD_REQUEST,
+                "invalid_body",
+                None,
+            );
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("Invalid request: {}", e),
+            );
+        }
+    };
+    let mut json_request = Request::new(Body::from(body_bytes.clone()));
+    *json_request.headers_mut() = headers.clone();
+    *json_request.extensions_mut() = extensions.clone();
+    let request: ResponsesRequest = match Json::from_request(json_request, &state).await {
         Ok(Json(r)) => r,
         Err(e) => {
             error!(error = %e, "Failed to parse responses request");
+            let code = match e {
+                JsonRejection::JsonDataError(_) => "schema_mismatch",
+                JsonRejection::MissingJsonContentType(_) => "invalid_content_type",
+                _ => "invalid_json",
+            };
+            let model = extract_model_from_request(&headers, &body_bytes);
+            rejection_context(&state, &headers, model.as_deref()).record(
+                StatusCode::BAD_REQUEST,
+                code,
+                None,
+            );
             return error_response(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
@@ -257,7 +328,12 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     };
     if let Err(error) = crate::reasoning::validate_canonical_reasoning("/responses", &request_value)
     {
-        return OnwardsErrorResponse::reasoning(&error).into_response();
+        return rejected(
+            &state,
+            &headers,
+            Some(&request.model),
+            OnwardsErrorResponse::reasoning(&error),
+        );
     }
 
     let original_model = request.model.clone();
@@ -341,11 +417,18 @@ pub async fn embeddings_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     let extensions = req.extensions().clone();
     let body_bytes = match axum::body::to_bytes(req.into_body(), state.body_limit).await {
         Ok(bytes) => bytes,
-        Err(_) => return OnwardsErrorResponse::payload_too_large(state.body_limit).into_response(),
+        Err(_) => {
+            return rejected(
+                &state,
+                &headers,
+                None,
+                OnwardsErrorResponse::payload_too_large(state.body_limit),
+            );
+        }
     };
 
     // Validate the shape, forward the original bytes untouched (see chat handler).
-    let request: EmbeddingsRequest = match parse_strict_request(&body_bytes) {
+    let request: EmbeddingsRequest = match parse_strict_request(&state, &headers, &body_bytes) {
         Ok(request) => request,
         Err(response) => return response,
     };
@@ -399,11 +482,18 @@ pub async fn completions_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     let extensions = req.extensions().clone();
     let body_bytes = match axum::body::to_bytes(req.into_body(), state.body_limit).await {
         Ok(bytes) => bytes,
-        Err(_) => return OnwardsErrorResponse::payload_too_large(state.body_limit).into_response(),
+        Err(_) => {
+            return rejected(
+                &state,
+                &headers,
+                None,
+                OnwardsErrorResponse::payload_too_large(state.body_limit),
+            );
+        }
     };
 
     // Validate the shape, forward the original bytes untouched (see chat handler).
-    let request: CompletionRequest = match parse_strict_request(&body_bytes) {
+    let request: CompletionRequest = match parse_strict_request(&state, &headers, &body_bytes) {
         Ok(request) => request,
         Err(response) => return response,
     };
@@ -427,12 +517,12 @@ pub async fn completions_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         let message = format!(
             "Parameter '{param}' is not supported by /v1/completions. Use /v1/chat/completions or /v1/responses."
         );
-        return OnwardsErrorResponse::invalid_request(
-            &message,
-            Some(param),
-            "unsupported_parameter",
-        )
-        .into_response();
+        return rejected(
+            &state,
+            &headers,
+            Some(&request.model),
+            OnwardsErrorResponse::invalid_request(&message, Some(param), "unsupported_parameter"),
+        );
     }
 
     let original_model = request.model.clone();

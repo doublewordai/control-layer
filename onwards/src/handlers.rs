@@ -10,6 +10,7 @@ use crate::client::HttpClient;
 use crate::errors::{ErrorResponseBody, OnwardsErrorResponse};
 use crate::inflight::{BATCH_INFLIGHT_SCOPE, InflightSlot};
 use crate::models::ListModelResponse;
+use crate::rejections::RejectionContext;
 use crate::serving::{
     self, ProviderKind, RequestedServingClass, ServingClassOutcome, ServingResolution,
 };
@@ -508,6 +509,9 @@ pub async fn target_message_handler<T: HttpClient>(
 
     async move {
 
+    let mut rejection = RejectionContext::from_request(&state, req.headers());
+    let result = async {
+
     // Track inflight requests for observability. The guard is moved into GuardedStream
     // on the success path so the gauge stays incremented for the full lifetime of
     // streaming response bodies.
@@ -616,6 +620,7 @@ pub async fn target_message_handler<T: HttpClient>(
             if let Some(guard) = inflight_guard.as_mut() {
                 guard.set_model(&model_name);
             }
+            rejection.set_model(&model_name);
             (
                 pools.resolved_name(request_class),
                 pools.resolve(request_class).clone(),
@@ -1660,6 +1665,7 @@ pub async fn target_message_handler<T: HttpClient>(
                         code: "upstream_error".to_string(),
                     })
                     .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST))
+                    .from_upstream(true)
                     .build()
             } else {
                 OnwardsErrorResponse::builder()
@@ -1670,6 +1676,7 @@ pub async fn target_message_handler<T: HttpClient>(
                         code: "internal_error".to_string(),
                     })
                     .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY))
+                    .from_upstream(true)
                     .build()
             };
 
@@ -1978,6 +1985,7 @@ pub async fn target_message_handler<T: HttpClient>(
                             },
                         })
                         .status(StatusCode::from_u16(embedded).unwrap_or(StatusCode::BAD_REQUEST))
+                        .from_upstream(true)
                         .build()
                 };
                 return LoopAction::Done(Err(err));
@@ -2348,6 +2356,13 @@ pub async fn target_message_handler<T: HttpClient>(
     .await;
 
     result.map_err(|error| error.with_authenticated_api_key_id(authenticated_api_key_id))
+    }
+    .await;
+
+    if let Err(error) = &result {
+        rejection.record_error(error);
+    }
+    result
     }
     .instrument(span)
     .await
