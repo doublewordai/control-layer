@@ -1,5 +1,12 @@
 # Changelog
 
+## [13.4.0](https://github.com/doublewordai/control-layer/compare/v13.3.1...v13.4.0) (2026-10-08)
+
+
+### Features
+
+* **responses:** accept Codex tool namespace groups ([#1935](https://github.com/doublewordai/control-layer/issues/1935)) ([9d46bf7](https://github.com/doublewordai/control-layer/commit/9d46bf782d49dec56fa0c262c76e503c3d98e422))
+
 ## [13.3.1](https://github.com/doublewordai/control-layer/compare/v13.3.0...v13.3.1) (2026-10-08)
 
 
