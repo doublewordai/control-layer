@@ -1,11 +1,10 @@
 //! Schema-parity contract between `requests` and `batch_requests_archive`.
 //!
 //! The archive deliberately mirrors `requests` column-for-column, in the same
-//! order, with exactly one addition: `archive_bucket DATE NOT NULL`, appended
-//! LAST. That contract is what lets the per-batch move be
-//! `INSERT INTO batch_requests_archive SELECT r.*, $bucket FROM requests r`
-//! (positional alignment + appended partition key) and the retry move-back be
-//! the explicit `requests` column list — no per-column mapping code anywhere.
+//! order, with exactly one addition: `archive_bucket DATE NOT NULL`. It was
+//! appended last, and the per-batch move used `SELECT r.*, $bucket` alignment,
+//! until `dispatched_tolerated` was appended to both tables after it; the
+//! forward move and the retry move-back now both name their columns.
 //!
 //! If this test fails, the correct fix is ALWAYS to mirror the column change
 //! onto the twin table IN THE SAME MIGRATION (and update the move-back column
@@ -53,8 +52,23 @@ async fn archive_mirrors_requests_columns_plus_trailing_bucket(pool: PgPool) {
         "expected both tables to exist with columns"
     );
 
-    // Exactly one extra column, and it is archive_bucket, appended last.
-    let bucket = archive.pop().expect("archive has columns");
+    // Exactly one extra column: archive_bucket. It was last until
+    // dispatched_tolerated was appended to both tables after it; since then
+    // the forward move names its columns instead of relying on
+    // `SELECT r.*, $bucket` alignment (see forward_move_shape below), so its
+    // position no longer matters. Every other column must match in order.
+    let buckets: Vec<usize> = archive
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| column.name == "archive_bucket")
+        .map(|(position, _)| position)
+        .collect();
+    assert_eq!(
+        buckets.len(),
+        1,
+        "the archive has exactly one archive_bucket"
+    );
+    let bucket = archive.remove(buckets[0]);
     assert_eq!(
         (
             bucket.name.as_str(),
@@ -62,10 +76,7 @@ async fn archive_mirrors_requests_columns_plus_trailing_bucket(pool: PgPool) {
             bucket.is_nullable.as_str()
         ),
         ("archive_bucket", "date", "NO"),
-        "archive's final column must be archive_bucket DATE NOT NULL; \
-         found {bucket:?}. If a migration appended a new column to the archive \
-         after archive_bucket, move archive_bucket back to last or update the \
-         forward-move SQL that relies on `SELECT r.*, $bucket` alignment."
+        "archive_bucket must be DATE NOT NULL; found {bucket:?}"
     );
 
     // Remaining columns: identical names, order, types, and nullability.
@@ -138,14 +149,17 @@ async fn forward_move_shape_compiles_and_round_trips(pool: PgPool) {
     .await
     .unwrap();
 
+    // Forward shape: the same explicit column list as the move code; if this
+    // breaks, update BOTH.
     sqlx::query(
-        "INSERT INTO batch_requests_archive
-         SELECT r.*, date_trunc('week', now() AT TIME ZONE 'UTC')::date
+        "INSERT INTO batch_requests_archive (id, batch_id, template_id, state, retry_attempt, not_before, daemon_id, claimed_at, started_at, response_status, response_body, completed_at, error, failed_at, canceled_at, created_at, updated_at, custom_id, model, response_size, routed_model, service_tier, created_by, dispatched_tolerated, archive_bucket)
+         SELECT r.id, r.batch_id, r.template_id, r.state, r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at, r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at, r.created_at, r.updated_at, r.custom_id, r.model, r.response_size, r.routed_model, r.service_tier, r.created_by, r.dispatched_tolerated,
+                date_trunc('week', now() AT TIME ZONE 'UTC')::date
          FROM requests r WHERE r.batch_id = '11111111-1111-1111-1111-111111111111'",
     )
     .execute(&pool)
     .await
-    .expect("forward move shape must stay valid: SELECT r.*, $bucket");
+    .expect("forward move column list must stay valid");
 
     sqlx::query("DELETE FROM requests WHERE id = '22222222-2222-2222-2222-222222222222'")
         .execute(&pool)

@@ -156,18 +156,6 @@
     "reason": "Intermediate typed input, fixed count/ranking CTE, or template lookup; enclosing statement explicitly projects its final results."
   },
   {
-    "path": "fusillade-arsenal/src/postgres.rs",
-    "source": "SELECT r.*, $2::date",
-    "count": 1,
-    "reason": "Archive INSERT SELECT (or its test fixture) returns no row descriptor to the client. Archive/request column parity is covered by the archive schema tests; this is not a reader projection."
-  },
-  {
-    "path": "fusillade-arsenal/src/postgres.rs",
-    "source": "SELECT r.*, date_trunc('week', (SELECT created_at FROM batches WHERE id = $1) AT TIME ZONE 'UTC')::date",
-    "count": 1,
-    "reason": "Archive INSERT SELECT (or its test fixture) returns no row descriptor to the client. Archive/request column parity is covered by the archive schema tests; this is not a reader projection."
-  },
-  {
     "path": "dwctl/src/db/errors.rs",
     "source": "sqlx::query(\"SELECT * FROM cached_shape\").fetch_all(&mut *connection).await.unwrap();",
     "count": 1,

@@ -175,9 +175,57 @@ pub struct Claimed {
     /// daemon which `(user, window-class, model)` bucket to stamp (the model is
     /// read from the request's `data.model`). `None` for full-capacity claims.
     pub leak: Option<LeakStamp>,
+    /// Whether this dispatch keeps or releases the daemon's spillover
+    /// tolerations, as decided by the claim (and recorded on the row as
+    /// `dispatched_tolerated`). `None` when the claim path made no decision:
+    /// tolerations are not configured, or the path (single-row claims,
+    /// background) does not decide.
+    pub tolerations: Option<DispatchTolerations>,
 }
 
 impl RequestState for Claimed {}
+
+/// The claim's decision on a request's spillover tolerations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum DispatchTolerations {
+    /// Send the configured tolerations: our own workers only.
+    Keep,
+    /// Send none, so the request may spill.
+    Release(TolerationsRelease),
+}
+
+/// Why a request's spillover tolerations were released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum TolerationsRelease {
+    /// Inside the batch-claim deadline ramp.
+    Ramp,
+    /// Already past its deadline (retry grace).
+    PastDeadline,
+    /// Its deadline is before the model's release cutoff: projected to miss
+    /// the SLA waiting for our own workers.
+    SlaProjection,
+}
+
+impl TolerationsRelease {
+    /// Metric label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ramp => "ramp",
+            Self::PastDeadline => "past_deadline",
+            Self::SlaProjection => "sla_projection",
+        }
+    }
+
+    /// Parse the claim query's release reason.
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "ramp" => Some(Self::Ramp),
+            "past_deadline" => Some(Self::PastDeadline),
+            "sla_projection" => Some(Self::SlaProjection),
+            _ => None,
+        }
+    }
+}
 
 /// Request is currently being processed by a daemon (i.e., HTTP request in flight).
 #[derive(Debug, Clone, Serialize)]

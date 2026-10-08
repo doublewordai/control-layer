@@ -1692,21 +1692,6 @@ pub trait Storage: Send + Sync {
     ) -> Result<()>;
 }
 
-/// One model's dispatch-throughput sums: a single daemon's, or the sum over
-/// every live daemon. Only requests dispatched with spillover tolerations
-/// (so served by the deployment's own workers) are counted.
-#[derive(Debug, Clone, PartialEq)]
-pub struct DispatchThroughputSample {
-    pub model: String,
-    /// Exponentially decayed successful completions.
-    pub completions: f64,
-    /// Exponentially decayed in-flight-seconds (the integral of requests in
-    /// flight), with the same time constant.
-    pub slot_seconds: f64,
-    /// Successful completions counted since the daemon started (undecayed).
-    pub samples: i64,
-}
-
 /// Daemon lifecycle persistence.
 ///
 /// This trait provides storage operations for tracking daemon state,
@@ -1743,20 +1728,29 @@ pub trait DaemonStorage: Send + Sync {
     /// the daemon purge task for right-to-erasure compliance.
     async fn purge_orphaned_rows(&self, batch_size: i64) -> Result<u64>;
 
-    /// Publish this daemon's per-model dispatch-throughput sums and return
-    /// the sums over every daemon whose row was refreshed within
-    /// `stale_after_secs`, each decayed to now with time constant `tau_secs`.
-    ///
-    /// The default has no shared store: the daemon's own sums stand for the
-    /// whole deployment.
-    async fn exchange_dispatch_throughput(
+    /// Tell the storage how the claim decides spillover tolerations. Claims
+    /// that decide (the batch and batchless claim queries) then return a
+    /// [`crate::request::DispatchTolerations`] per row and record it as
+    /// `dispatched_tolerated`. The default storage makes no decision.
+    fn configure_tolerations_release(&self, _settings: crate::release::TolerationsReleaseSettings) {
+    }
+
+    /// Compute every model's release cutoff, if this daemon is the one to do
+    /// it: exactly one daemon computes per refresh interval (the first to
+    /// tick once the newest cutoff is older than the interval, serialised by
+    /// a lock). Returns `None` when another daemon holds the lock or the
+    /// cutoffs are fresh; otherwise the cutoffs written. The default storage
+    /// computes nothing.
+    async fn refresh_release_cutoffs(
         &self,
-        _daemon_id: DaemonId,
-        samples: &[DispatchThroughputSample],
-        _tau_secs: f64,
-        _stale_after_secs: f64,
-    ) -> Result<Vec<DispatchThroughputSample>> {
-        Ok(samples.to_vec())
+        _params: crate::release::ReleaseCutoffParams,
+    ) -> Result<Option<Vec<crate::release::ReleaseCutoff>>> {
+        Ok(None)
+    }
+
+    /// Age in seconds of every model's stored release cutoff.
+    async fn release_cutoff_ages(&self) -> Result<Vec<(String, f64)>> {
+        Ok(Vec::new())
     }
 
     /// Whether this backend explicitly implements the partitioned retained

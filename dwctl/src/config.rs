@@ -2532,40 +2532,40 @@ fn default_batch_metadata_fields_dwctl() -> Vec<String> {
     ]
 }
 
-/// Throughput-projection release of `dispatch_tolerations`.
+/// Release of `dispatch_tolerations` on an SLA projection.
 ///
-/// Per request, the daemon projects when the model's own workers would reach
-/// it: `work_ahead / throughput`. `work_ahead` is the model's outstanding
-/// (pending, claimed, processing) requests due no later than this one, read
-/// from the database every `refresh_interval_secs` for all models at once.
-/// `throughput` is measured only from requests dispatched WITH the
-/// tolerations (guaranteed to run on our workers; released ones may have
-/// spilled and would inflate it), as completions per in-flight-second scaled
-/// by the deployment-wide in-flight count. Every daemon publishes its decayed
-/// sums to the `dispatch_throughput_samples` table each refresh and reads
-/// back the sum over live daemons, so all replicas use the same estimate (and
-/// a restarted one is warm at once). If the projected finish is later
-/// than `deadline - safety_margin * window`, the request is sent without
-/// tolerations and may spill: batch normally waits and retries rather than
-/// spill to the paid tier, but when it would miss its SLA, meeting the
-/// deadline matters more than the cost. The deadline ramp and past-deadline
-/// release always apply; until a model has `min_samples` tolerated
-/// completions only they do.
+/// One daemon per `refresh_interval_secs` (whichever ticks first once the
+/// cutoffs are stale, serialised by a transaction-scoped advisory lock)
+/// computes, per model, the deadline before which requests are projected to
+/// miss their SLA on our own workers, and stores it in
+/// `model_release_cutoffs`. The claim query releases the tolerations of a
+/// request due before its model's cutoff, so every replica decides alike.
+///
+/// Throughput comes from the `requests` table: successful completions of
+/// requests dispatched WITH the tolerations (`dispatched_tolerated`; released
+/// ones may have spilled and would inflate it) in the last `window_secs`,
+/// `count / sum(completed_at - started_at)` times the deployment-wide
+/// in-flight count. The cutoff is the shortest deadline-ordered prefix whose
+/// release lets everything due later finish within `(1 - safety_margin)` of
+/// its remaining time. Batch normally waits and retries rather than spill to
+/// the paid tier, but when it would miss its SLA, meeting the deadline matters
+/// more than the cost. The deadline ramp and past-deadline release always
+/// apply; a model with fewer than `min_samples` tolerated completions in the
+/// window, or a cutoff older than three refresh intervals, gets only them.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DispatchTolerationsSlaRelease {
     /// Off by default: ramp-only release.
     pub enabled: bool,
-    /// Half-life of the throughput estimate, in seconds. Default 600.
-    pub half_life_secs: f64,
-    /// Margin before the deadline, as a fraction of the completion window.
-    /// Default 0.1.
-    pub safety_margin: f64,
-    /// Successful tolerated completions per model before the projection is
-    /// trusted. Default 20.
-    pub min_samples: u64,
-    /// How often the outstanding-work snapshot is read, in seconds. Default 15.
+    /// How often the cutoffs are recomputed, in seconds. Default 300.
     pub refresh_interval_secs: u64,
+    /// Trailing window of tolerated completions, in seconds. Default 900.
+    pub window_secs: u64,
+    /// Fraction of each deadline's remaining time kept as margin. Default 0.1.
+    pub safety_margin: f64,
+    /// Tolerated completions per model in the window before it gets a
+    /// cutoff. Default 20.
+    pub min_samples: u64,
 }
 
 impl Default for DispatchTolerationsSlaRelease {
@@ -2573,10 +2573,10 @@ impl Default for DispatchTolerationsSlaRelease {
         let defaults = fusillade::daemon::SlaReleaseConfig::default();
         Self {
             enabled: false,
-            half_life_secs: defaults.half_life_secs,
+            refresh_interval_secs: defaults.refresh_interval_secs,
+            window_secs: defaults.window_secs,
             safety_margin: defaults.safety_margin,
             min_samples: defaults.min_samples,
-            refresh_interval_secs: defaults.refresh_interval_ms / 1000,
         }
     }
 }
@@ -2584,11 +2584,11 @@ impl Default for DispatchTolerationsSlaRelease {
 impl DispatchTolerationsSlaRelease {
     /// The fusillade config, when enabled.
     pub fn to_fusillade(&self) -> Option<fusillade::daemon::SlaReleaseConfig> {
-        self.enabled.then(|| fusillade::daemon::SlaReleaseConfig {
-            half_life_secs: self.half_life_secs,
+        self.enabled.then_some(fusillade::daemon::SlaReleaseConfig {
+            refresh_interval_secs: self.refresh_interval_secs,
+            window_secs: self.window_secs,
             safety_margin: self.safety_margin,
             min_samples: self.min_samples,
-            refresh_interval_ms: self.refresh_interval_secs.saturating_mul(1000),
         })
     }
 }
@@ -5702,9 +5702,9 @@ background_services:
                 .to_fusillade()
                 .unwrap();
             assert_eq!(sla_release.safety_margin, 0.2);
-            assert_eq!(sla_release.half_life_secs, 600.0);
+            assert_eq!(sla_release.refresh_interval_secs, 300);
+            assert_eq!(sla_release.window_secs, 900);
             assert_eq!(sla_release.min_samples, 20);
-            assert_eq!(sla_release.refresh_interval_ms, 15_000);
 
             jail.create_file(
                 "test.yaml",

@@ -139,6 +139,7 @@ impl Request<Pending> {
                 batch_expires_at: self.state.batch_expires_at, // Carry over batch deadline
                 // This single-row claim path does not run the leaky-bucket gate.
                 leak: None,
+                tolerations: None,
             },
         };
         storage.persist(&request).await?;

@@ -46,6 +46,20 @@ const NOTIFICATION_DUE: IndexMigrations = IndexMigrations {
           AND cancelling_at IS NULL AND deleted_at IS NULL AND total_requests > 0",
 };
 
+const TOLERATED_COMPLETIONS: IndexMigrations = IndexMigrations {
+    name: "idx_requests_tolerated_completions",
+    build: 20261008120010,
+    validate: 20261008120030,
+    build_sql: include_str!(
+        "../migrations/20261008120010_add_requests_tolerated_completions_index.up.sql"
+    ),
+    // Right key and predicate, but started_at is not included: the
+    // throughput read would no longer be index-only.
+    wrong_definition:
+        "CREATE INDEX idx_requests_tolerated_completions ON requests (model, completed_at)
+        WHERE dispatched_tolerated AND state = 'completed'",
+};
+
 /// Apply every migration that precedes the index's build migration.
 async fn migrate_to_before(pool: &PgPool, index: &IndexMigrations) {
     let baseline = Migrator {
@@ -187,4 +201,24 @@ async fn notification_due_index_repairs_an_invalid_remnant(pool: PgPool) {
 #[sqlx::test(migrations = false)]
 async fn notification_due_index_rejects_a_same_name_wrong_definition(pool: PgPool) {
     wrong_definition(pool, &NOTIFICATION_DUE).await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn tolerated_completions_index_applies_fresh(pool: PgPool) {
+    fresh(pool, &TOLERATED_COMPLETIONS).await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn tolerated_completions_index_adopts_a_prebuilt_index(pool: PgPool) {
+    prebuilt(pool, &TOLERATED_COMPLETIONS).await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn tolerated_completions_index_repairs_an_invalid_remnant(pool: PgPool) {
+    invalid_remnant(pool, &TOLERATED_COMPLETIONS).await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn tolerated_completions_index_rejects_a_same_name_wrong_definition(pool: PgPool) {
+    wrong_definition(pool, &TOLERATED_COMPLETIONS).await;
 }

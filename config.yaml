@@ -951,18 +951,19 @@ background_services:
     # Dynamo frontends with doublewordai/dynamo#153; older ones reject the field.
     # dispatch_tolerations: []
 
-    # Also release the tolerations when our own workers are projected to miss
-    # a request's SLA: work_ahead / throughput > time left - safety_margin *
-    # window. work_ahead = the model's outstanding requests due no later than
-    # this one (DB snapshot every refresh_interval_secs); throughput = only
-    # completions of requests sent WITH tolerations (served by our workers).
-    # Below min_samples tolerated completions per model, ramp-only.
+    # Also release the tolerations of requests due before their model's
+    # release cutoff: the deadline before which our own workers are projected
+    # to miss. One daemon recomputes the cutoffs every refresh_interval_secs
+    # from requests dispatched WITH tolerations that completed in the last
+    # window_secs (count / busy seconds x in-flight) and the outstanding work
+    # by deadline; the claim applies them. Below min_samples, or with a
+    # cutoff older than 3 intervals, only the ramp/past-deadline floor applies.
     # dispatch_tolerations_sla_release:
     #   enabled: false
-    #   half_life_secs: 600
-    #   safety_margin: 0.1          # fraction of the completion window
+    #   refresh_interval_secs: 300
+    #   window_secs: 900
+    #   safety_margin: 0.1          # fraction of each deadline's remaining time
     #   min_samples: 20
-    #   refresh_interval_secs: 15
 
   # Batch completion notifications (emails + webhooks)
   # notifications:

@@ -202,6 +202,11 @@ pub struct PostgresRequestManager<P: PoolProvider> {
     /// reassembly moves into dwctl.
     response_transformer: std::sync::OnceLock<Arc<dyn crate::transform::ResponseTransformer>>,
     maintenance_budget: std::time::Duration,
+    /// How the batch and batchless claims decide spillover tolerations; set
+    /// by the daemon through `DaemonStorage::configure_tolerations_release`.
+    /// `None`: the claims make no decision.
+    tolerations_release:
+        std::sync::RwLock<Option<fusillade_core::release::TolerationsReleaseSettings>>,
 }
 
 struct StateWriteLimiter {
@@ -355,6 +360,8 @@ struct ClaimedRequestRow {
     leaked: bool,
     window_class: String,
     window_secs: f64,
+    /// `keep`, a release reason, or NULL when the claim made no decision.
+    tolerations_decision: Option<String>,
 }
 
 /// Macro for extracting a [`Batch`] from a dynamic query row (PgRow).
@@ -435,6 +442,24 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             batch_insert_strategy: BatchInsertStrategy::default(),
             response_transformer: std::sync::OnceLock::new(),
             maintenance_budget: maintenance_budget(DEFAULT_MAINTENANCE_QUERY_TIMEOUT),
+            tolerations_release: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// The claim's tolerations parameters: (decide, use cutoffs, max cutoff
+    /// age in seconds). Without settings the claim decides nothing.
+    fn tolerations_claim_params(&self) -> (bool, bool, f64) {
+        let settings = *self
+            .tolerations_release
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match settings {
+            Some(settings) if settings.tolerations_enabled => (
+                true,
+                settings.sla_release_enabled,
+                settings.cutoff_max_age_secs,
+            ),
+            _ => (false, false, 0.0),
         }
     }
 
@@ -1064,6 +1089,15 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                         } else {
                             None
                         },
+                        tolerations: row.tolerations_decision.as_deref().map(|decision| {
+                            match fusillade_core::request::TolerationsRelease::from_label(decision)
+                            {
+                                Some(reason) => {
+                                    fusillade_core::request::DispatchTolerations::Release(reason)
+                                }
+                                None => fusillade_core::request::DispatchTolerations::Keep,
+                            }
+                        }),
                     },
                     data: RequestData {
                         id: RequestId(row.id),
@@ -2485,6 +2519,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             .map(|t| self.config.service_tier_completion_windows_ms[t] as i64)
             .collect();
         let default_window_ms = self.config.default_completion_window_ms as i64;
+        let (decide_tolerations, use_release_cutoffs, cutoff_max_age_secs) =
+            self.tolerations_claim_params();
 
         let rows = sqlx::query_as!(
             ClaimedRequestRow,
@@ -2497,7 +2533,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             ),
             to_claim AS (
                 SELECT claimed.id, claimed.template_id, claimed.batch_id, claimed.effective_expires_at,
-                       claimed.leaked, claimed.window_class, claimed.window_secs
+                       claimed.leaked, claimed.window_class, claimed.window_secs, m.model
                 FROM all_models m
                 CROSS JOIN LATERAL (
                     SELECT c.id, c.template_id, c.batch_id, c.effective_expires_at,
@@ -2650,7 +2686,10 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             SET
                 state = 'claimed',
                 daemon_id = $1,
-                claimed_at = $3
+                claimed_at = $3,
+                -- TRUE: dispatched with spillover tolerations (on our own
+                -- workers); FALSE: released; NULL: the daemon sends none.
+                dispatched_tolerated = CASE WHEN $16::BOOLEAN THEN rel.reason IS NULL END
             FROM to_claim tc
             CROSS JOIN LATERAL (
                 -- Per-row lookup by primary key. A plain join on the
@@ -2659,6 +2698,26 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 -- LIMIT 1 keeps this subquery from being flattened into that join.
                 SELECT * FROM active_request_templates t WHERE t.id = tc.template_id LIMIT 1
             ) t
+            CROSS JOIN LATERAL (
+                -- Spillover-tolerations decision: released past the deadline,
+                -- inside the claim ramp (the same window_minutes ^ exponent
+                -- as the claim gate), or when due before the model's fresh
+                -- release cutoff (a primary-key lookup); otherwise kept.
+                SELECT CASE
+                    WHEN NOT $16::BOOLEAN OR tc.effective_expires_at IS NULL THEN NULL
+                    WHEN tc.effective_expires_at <= $3 THEN 'past_deadline'
+                    WHEN EXTRACT(EPOCH FROM (tc.effective_expires_at - $3))
+                         <= power(GREATEST(tc.window_secs, 0.0) / 60.0, $9::DOUBLE PRECISION) * 60.0
+                        THEN 'ramp'
+                    WHEN $17::BOOLEAN AND tc.effective_expires_at < (
+                        SELECT c.release_before_deadline FROM model_release_cutoffs c
+                        WHERE c.model = tc.model
+                          AND c.computed_at >= $3 - make_interval(secs => $18::DOUBLE PRECISION)
+                    ) THEN 'sla_projection'
+                END AS reason
+                -- Evaluate once per row (SET and RETURNING both read it).
+                OFFSET 0
+            ) rel
             WHERE r.id = tc.id
             RETURNING r.id,
                       r.batch_id,
@@ -2684,7 +2743,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                       '1'::TEXT as "batch_total_requests!",
                       tc.leaked as "leaked!",
                       tc.window_class as "window_class!",
-                      tc.window_secs as "window_secs!"
+                      tc.window_secs as "window_secs!",
+                      CASE WHEN $16::BOOLEAN THEN COALESCE(rel.reason, 'keep') END as "tolerations_decision?"
             "#,
             *daemon_id as Uuid,
             limit as i64,
@@ -2701,6 +2761,9 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             &cooldown_user_arr,
             &cooldown_window_arr,
             &cooldown_model_arr,
+            decide_tolerations,
+            use_release_cutoffs,
+            cutoff_max_age_secs,
         )
         .fetch_all(self.write_executor())
         .await
@@ -3021,7 +3084,9 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                       COALESCE(b.total_requests::TEXT, '1') as "batch_total_requests!",
                       FALSE as "leaked!",
                       'background'::TEXT as "window_class!",
-                      0::DOUBLE PRECISION as "window_secs!"
+                      0::DOUBLE PRECISION as "window_secs!",
+                      -- Background work makes no tolerations decision.
+                      NULL::TEXT as "tolerations_decision?"
             "#,
             *daemon_id as Uuid,
             limit as i64,
@@ -3781,6 +3846,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         // Leak state is claim-cycle-only and not persisted; a row
                         // rehydrated from storage is never re-stamped.
                         leak: None,
+                        // A rehydrated row is not being dispatched by this claim.
+                        tolerations: None,
                     },
                     data,
                 })),
@@ -6197,6 +6264,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         batch_expires_at: row.batch_expires_at,
                         // Leak state is claim-cycle-only and not persisted.
                         leak: None,
+                        tolerations: None,
                     },
                     data,
                 }),
@@ -6996,6 +7064,8 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             cooldown_windows.push(window.clone());
             cooldown_models.push(model.clone());
         }
+        let (decide_tolerations, use_release_cutoffs, cutoff_max_age_secs) =
+            self.tolerations_claim_params();
 
         let rows = sqlx::query_as!(
             ClaimedRequestRow,
@@ -7135,7 +7205,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             ),
             to_claim AS (
                 SELECT id, template_id, batch_id, expires_at AS effective_expires_at,
-                       leaked, window_class, window_secs
+                       leaked, window_class, window_secs, model
                 FROM (
                     SELECT c.*,
                            row_number() OVER (
@@ -7175,7 +7245,10 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             SET
                 state = 'claimed',
                 daemon_id = $1,
-                claimed_at = $3
+                claimed_at = $3,
+                -- TRUE: dispatched with spillover tolerations (on our own
+                -- workers); FALSE: released; NULL: the daemon sends none.
+                dispatched_tolerated = CASE WHEN $16::BOOLEAN THEN rel.reason IS NULL END
             FROM to_claim tc
             CROSS JOIN LATERAL (
                 -- Per-row lookup by primary key. A plain join on the
@@ -7185,6 +7258,26 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 SELECT * FROM active_request_templates t WHERE t.id = tc.template_id LIMIT 1
             ) t
             JOIN batches b ON tc.batch_id = b.id
+            CROSS JOIN LATERAL (
+                -- Spillover-tolerations decision: released past the deadline,
+                -- inside the claim ramp (the same window_minutes ^ exponent
+                -- as the claim gate), or when due before the model's fresh
+                -- release cutoff (a primary-key lookup); otherwise kept.
+                SELECT CASE
+                    WHEN NOT $16::BOOLEAN OR tc.effective_expires_at IS NULL THEN NULL
+                    WHEN tc.effective_expires_at <= $3 THEN 'past_deadline'
+                    WHEN EXTRACT(EPOCH FROM (tc.effective_expires_at - $3))
+                         <= power(GREATEST(tc.window_secs, 0.0) / 60.0, $11::DOUBLE PRECISION) * 60.0
+                        THEN 'ramp'
+                    WHEN $17::BOOLEAN AND tc.effective_expires_at < (
+                        SELECT c.release_before_deadline FROM model_release_cutoffs c
+                        WHERE c.model = tc.model
+                          AND c.computed_at >= $3 - make_interval(secs => $18::DOUBLE PRECISION)
+                    ) THEN 'sla_projection'
+                END AS reason
+                -- Evaluate once per row (SET and RETURNING both read it).
+                OFFSET 0
+            ) rel
             WHERE r.id = tc.id
             RETURNING r.id,
                       r.batch_id,
@@ -7207,7 +7300,8 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                       COALESCE(b.total_requests::TEXT, '1') as "batch_total_requests!",
                       tc.leaked as "leaked!",
                       tc.window_class as "window_class!",
-                      tc.window_secs as "window_secs!"
+                      tc.window_secs as "window_secs!",
+                      CASE WHEN $16::BOOLEAN THEN COALESCE(rel.reason, 'keep') END as "tolerations_decision?"
             "#,
             *daemon_id as Uuid,
             limit as i64,
@@ -7224,6 +7318,9 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             &cooldown_windows,
             &cooldown_models,
             leak_enabled,
+            decide_tolerations,
+            use_release_cutoffs,
+            cutoff_max_age_secs,
         )
         .fetch_all(self.write_executor())
         .await
@@ -8992,98 +9089,208 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         Ok(daemons)
     }
 
-    async fn exchange_dispatch_throughput(
+    fn configure_tolerations_release(
         &self,
-        daemon_id: DaemonId,
-        samples: &[crate::manager::DispatchThroughputSample],
-        tau_secs: f64,
-        stale_after_secs: f64,
-    ) -> Result<Vec<crate::manager::DispatchThroughputSample>> {
-        let tau_secs = tau_secs.max(1.0);
-        let models: Vec<&str> = samples.iter().map(|s| s.model.as_str()).collect();
-        let completions: Vec<f64> = samples.iter().map(|s| s.completions.max(0.0)).collect();
-        let slot_seconds: Vec<f64> = samples.iter().map(|s| s.slot_seconds.max(0.0)).collect();
-        let counts: Vec<i64> = samples.iter().map(|s| s.samples.max(0)).collect();
+        settings: fusillade_core::release::TolerationsReleaseSettings,
+    ) {
+        *self
+            .tolerations_release
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(settings);
+    }
 
-        // One upsert for every model this daemon has dispatched. The table is
-        // tiny (live daemons x models), so this and the aggregate below are
-        // cheap; neither runs on the request path.
-        if !models.is_empty() {
-            sqlx::query(
-                r#"
-                INSERT INTO dispatch_throughput_samples
-                    (daemon_id, model, completions_decayed, slot_seconds_decayed, samples, updated_at)
-                SELECT $1, s.model, s.completions, s.slot_seconds, s.samples, NOW()
-                FROM UNNEST($2::TEXT[], $3::FLOAT8[], $4::FLOAT8[], $5::BIGINT[])
-                    AS s(model, completions, slot_seconds, samples)
-                ON CONFLICT (daemon_id, model) DO UPDATE SET
-                    completions_decayed = EXCLUDED.completions_decayed,
-                    slot_seconds_decayed = EXCLUDED.slot_seconds_decayed,
-                    samples = EXCLUDED.samples,
-                    updated_at = EXCLUDED.updated_at
-                "#,
-            )
-            .bind(daemon_id.0)
-            .bind(&models)
-            .bind(&completions)
-            .bind(&slot_seconds)
-            .bind(&counts)
-            .execute(self.write_executor())
-            .await
-            .map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to publish dispatch throughput: {}", e))
-            })?;
+    async fn refresh_release_cutoffs(
+        &self,
+        params: fusillade_core::release::ReleaseCutoffParams,
+    ) -> Result<Option<Vec<fusillade_core::release::ReleaseCutoff>>> {
+        use fusillade_core::release::{
+            RELEASE_LADDER_SECS, ReleaseCutoff, release_cutoff_offset, tolerated_throughput,
+        };
+
+        // Leader election per refresh: a transaction-scoped advisory lock (this
+        // storage runs behind transaction poolers, where a session lock would
+        // stick to a pooled server connection), plus a freshness gate. The
+        // first daemon to tick once the cutoffs are older than the interval
+        // takes the lock, computes and commits; a daemon that finds the lock
+        // held, or fresh cutoffs, does nothing. A leader that dies mid-way
+        // rolls back and releases the lock, so the next tick of any daemon
+        // takes over.
+        let mut tx = self.begin_write().await.map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to begin release cutoff transaction: {}", e))
+        })?;
+        let locked: bool = sqlx::query_scalar(
+            "SELECT pg_try_advisory_xact_lock(hashtextextended('fusillade.release_cutoffs', 0))",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to take release cutoff lock: {}", e)))?;
+        if !locked {
+            return Ok(None);
+        }
+        let fresh: bool = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(computed_at) > NOW() - make_interval(secs => $1::FLOAT8), FALSE)
+             FROM model_release_cutoffs",
+        )
+        .bind(params.refresh_interval_secs)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to read release cutoff age: {}", e)))?;
+        if fresh {
+            return Ok(None);
         }
 
-        // Rows of daemons that died or restarted (a restart gets a new id)
-        // are excluded once stale below and deleted an hour after their last
-        // refresh, so the table never grows past live daemons x models.
-        sqlx::query(
-            "DELETE FROM dispatch_throughput_samples WHERE updated_at < NOW() - INTERVAL '1 hour'",
-        )
-        .execute(self.write_executor())
-        .await
-        .map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to delete stale dispatch throughput: {}", e))
-        })?;
+        // Outstanding work per model over the cumulative deadline ladder, and
+        // the deployment-wide in-flight count, from the indexed pending-counts
+        // query. Realtime (priority) and background rows are not daemon queue
+        // work.
+        let tiers = ServiceTierFilter::Exclude(vec![Some("priority".to_string())]);
+        let ladder: Vec<(String, Option<i64>, i64)> = RELEASE_LADDER_SECS
+            .iter()
+            .map(|secs| (secs.to_string(), None, *secs))
+            .collect();
+        let outstanding = self
+            .get_pending_request_counts_by_model_and_window(
+                &ladder,
+                &["pending".into(), "claimed".into(), "processing".into()],
+                &[],
+                &tiers,
+                false,
+            )
+            .await?;
+        let in_flight = self
+            .get_pending_request_counts_by_model_and_window(
+                &[("all".into(), None, 315_360_000)],
+                &["claimed".into(), "processing".into()],
+                &[],
+                &tiers,
+                false,
+            )
+            .await?;
+        let models: Vec<String> = outstanding.keys().cloned().collect();
 
-        // Sum the fresh rows, each decayed from its refresh to now so rows
-        // written at different moments are on the same footing.
+        // Our own workers' throughput: tolerated successful completions in the
+        // window, one index-only range scan of idx_requests_tolerated_completions
+        // per model. The sum of (completed_at - started_at) counts only time a
+        // request was in flight, so idle time is in neither sum.
         let rows = sqlx::query(
             r#"
-            SELECT
-                model,
-                SUM(completions_decayed
-                    * EXP(-EXTRACT(EPOCH FROM (NOW() - updated_at)) / $1::FLOAT8))::FLOAT8 AS completions,
-                SUM(slot_seconds_decayed
-                    * EXP(-EXTRACT(EPOCH FROM (NOW() - updated_at)) / $1::FLOAT8))::FLOAT8 AS slot_seconds,
-                SUM(samples)::BIGINT AS samples
-            FROM dispatch_throughput_samples
-            WHERE updated_at >= NOW() - make_interval(secs => $2::FLOAT8)
-            GROUP BY model
+            SELECT m.model, w.samples, w.busy_secs
+            FROM unnest($1::TEXT[]) AS m(model)
+            CROSS JOIN LATERAL (
+                SELECT COUNT(*)::BIGINT AS samples,
+                       COALESCE(SUM(EXTRACT(EPOCH FROM (r.completed_at - r.started_at))), 0)::FLOAT8 AS busy_secs
+                FROM requests r
+                WHERE r.dispatched_tolerated
+                  AND r.state = 'completed'
+                  AND r.model = m.model
+                  AND r.completed_at >= NOW() - make_interval(secs => $2::FLOAT8)
+                  AND r.started_at IS NOT NULL
+            ) w
             "#,
         )
-        .bind(tau_secs)
-        .bind(stale_after_secs)
-        .fetch_all(self.write_executor())
+        .bind(&models)
+        .bind(params.window_secs)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to read dispatch throughput: {}", e))
+            FusilladeError::Other(anyhow!("Failed to read tolerated completions: {}", e))
         })?;
+        let mut window: HashMap<String, (i64, f64)> = HashMap::new();
+        for row in rows {
+            let model: String = row.get("model");
+            window.insert(model, (row.get("samples"), row.get("busy_secs")));
+        }
 
-        rows.into_iter()
-            .map(|row| {
-                Ok(crate::manager::DispatchThroughputSample {
-                    model: row.try_get("model")?,
-                    completions: row.try_get("completions")?,
-                    slot_seconds: row.try_get("slot_seconds")?,
-                    samples: row.try_get("samples")?,
+        let computed_at: DateTime<Utc> = sqlx::query_scalar("SELECT NOW()")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to read the clock: {}", e)))?;
+        let mut cutoffs = Vec::with_capacity(models.len());
+        for (model, counts) in &outstanding {
+            let cumulative: Vec<f64> = RELEASE_LADDER_SECS
+                .iter()
+                .map(|secs| counts.get(&secs.to_string()).copied().unwrap_or(0) as f64)
+                .collect();
+            let (samples, busy_secs) = window.get(model).copied().unwrap_or((0, 0.0));
+            let model_in_flight = in_flight
+                .get(model)
+                .and_then(|counts| counts.get("all"))
+                .copied()
+                .unwrap_or(0);
+            let throughput =
+                tolerated_throughput(samples, busy_secs, model_in_flight, params.min_samples);
+            let release_before_deadline = throughput
+                .and_then(|throughput| {
+                    release_cutoff_offset(&cumulative, throughput, params.safety_margin)
                 })
-            })
-            .collect::<std::result::Result<Vec<_>, sqlx::Error>>()
+                .map(|offset| computed_at + chrono::Duration::seconds(offset));
+            cutoffs.push(ReleaseCutoff {
+                model: model.clone(),
+                release_before_deadline,
+                throughput: throughput.unwrap_or(0.0),
+                backlog_requests: cumulative.last().copied().unwrap_or(0.0) as i64,
+                samples,
+                computed_at,
+            });
+        }
+
+        // Every model with work gets a row (the newest computed_at is also
+        // the freshness gate); models with no work lose theirs.
+        let names: Vec<&str> = cutoffs.iter().map(|c| c.model.as_str()).collect();
+        let befores: Vec<Option<DateTime<Utc>>> =
+            cutoffs.iter().map(|c| c.release_before_deadline).collect();
+        let throughputs: Vec<f64> = cutoffs.iter().map(|c| c.throughput).collect();
+        let backlogs: Vec<i64> = cutoffs.iter().map(|c| c.backlog_requests).collect();
+        let samples: Vec<i64> = cutoffs.iter().map(|c| c.samples).collect();
+        sqlx::query(
+            r#"
+            INSERT INTO model_release_cutoffs
+                (model, release_before_deadline, throughput, backlog_requests, samples, computed_at)
+            SELECT c.model, c.release_before_deadline, c.throughput, c.backlog_requests, c.samples, $6
+            FROM UNNEST($1::TEXT[], $2::TIMESTAMPTZ[], $3::FLOAT8[], $4::BIGINT[], $5::BIGINT[])
+                AS c(model, release_before_deadline, throughput, backlog_requests, samples)
+            ON CONFLICT (model) DO UPDATE SET
+                release_before_deadline = EXCLUDED.release_before_deadline,
+                throughput = EXCLUDED.throughput,
+                backlog_requests = EXCLUDED.backlog_requests,
+                samples = EXCLUDED.samples,
+                computed_at = EXCLUDED.computed_at
+            "#,
+        )
+        .bind(&names)
+        .bind(&befores)
+        .bind(&throughputs)
+        .bind(&backlogs)
+        .bind(&samples)
+        .bind(computed_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to write release cutoffs: {}", e)))?;
+        sqlx::query("DELETE FROM model_release_cutoffs WHERE NOT (model = ANY($1::TEXT[]))")
+            .bind(&names)
+            .execute(&mut *tx)
+            .await
             .map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to decode dispatch throughput: {}", e))
-            })
+                FusilladeError::Other(anyhow!("Failed to delete idle release cutoffs: {}", e))
+            })?;
+        tx.commit().await.map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to commit release cutoffs: {}", e))
+        })?;
+        Ok(Some(cutoffs))
+    }
+
+    async fn release_cutoff_ages(&self) -> Result<Vec<(String, f64)>> {
+        let rows = sqlx::query(
+            "SELECT model, EXTRACT(EPOCH FROM (NOW() - computed_at))::FLOAT8 AS age
+             FROM model_release_cutoffs",
+        )
+        .fetch_all(self.read_executor())
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to read release cutoffs: {}", e)))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get("model"), row.get("age")))
+            .collect())
     }
 
     async fn purge_orphaned_rows(&self, batch_size: i64) -> Result<u64> {
@@ -9311,17 +9518,18 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             return Ok(ArchiveOutcome::SkippedNoPartition);
         }
 
-        // Forward move. Positional alignment (`r.*, $bucket`) is guaranteed
-        // by the schema-parity test suite (archive = requests' columns +
-        // archive_bucket appended last). ON CONFLICT makes crash-resume
-        // replay a no-op for rows already copied.
+        // Forward move. The column list is explicit because the archive's
+        // archive_bucket is no longer its last column (dispatched_tolerated
+        // was appended after it); the schema-parity test keeps the two tables'
+        // columns identical apart from archive_bucket. ON CONFLICT makes
+        // crash-resume replay a no-op for rows already copied.
         bound_to_deadline(&mut tx, deadline)
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to bound archive move: {}", e)))?;
         let inserted = sqlx::query(
             r#"
-            INSERT INTO batch_requests_archive
-            SELECT r.*, $2::date
+            INSERT INTO batch_requests_archive (id, batch_id, template_id, state, retry_attempt, not_before, daemon_id, claimed_at, started_at, response_status, response_body, completed_at, error, failed_at, canceled_at, created_at, updated_at, custom_id, model, response_size, routed_model, service_tier, created_by, dispatched_tolerated, archive_bucket)
+            SELECT r.id, r.batch_id, r.template_id, r.state, r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at, r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at, r.created_at, r.updated_at, r.custom_id, r.model, r.response_size, r.routed_model, r.service_tier, r.created_by, r.dispatched_tolerated, $2::date
             FROM requests r
             WHERE r.batch_id = $1
             ON CONFLICT (id, archive_bucket) DO NOTHING
@@ -15640,8 +15848,9 @@ mod tests {
         // DELETE/stamp committed: pre-copy a single row into the archive
         // exactly as the move would have.
         sqlx::query(
-            "INSERT INTO batch_requests_archive
-             SELECT r.*, date_trunc('week', (SELECT created_at FROM batches WHERE id = $1) AT TIME ZONE 'UTC')::date
+"INSERT INTO batch_requests_archive (id, batch_id, template_id, state, retry_attempt, not_before, daemon_id, claimed_at, started_at, response_status, response_body, completed_at, error, failed_at, canceled_at, created_at, updated_at, custom_id, model, response_size, routed_model, service_tier, created_by, dispatched_tolerated, archive_bucket)
+             SELECT r.id, r.batch_id, r.template_id, r.state, r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at, r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at, r.created_at, r.updated_at, r.custom_id, r.model, r.response_size, r.routed_model, r.service_tier, r.created_by, r.dispatched_tolerated,
+                    date_trunc('week', (SELECT created_at FROM batches WHERE id = $1) AT TIME ZONE 'UTC')::date
              FROM requests r WHERE r.batch_id = $1
              ORDER BY r.id LIMIT 1",
         )

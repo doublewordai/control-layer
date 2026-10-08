@@ -7,6 +7,7 @@ pub mod batch;
 pub mod daemon_record;
 pub mod error;
 pub mod manager;
+pub mod release;
 pub mod request;
 
 pub use batch::*;
@@ -16,9 +17,8 @@ pub use daemon_record::{
 };
 pub use error::{FusilladeError, Result};
 pub use manager::{
-    DaemonStorage, DispatchThroughputSample, ModelFilter, ModelFilterState,
-    RetainedResponseArchiveOutcome, RetainedResponseMaintenanceError,
-    RetainedResponsePartitionRunway, RetainedResponseRetirementOutcome, RetentionPolicy, Storage,
-    TrailingDemandCount,
+    DaemonStorage, ModelFilter, ModelFilterState, RetainedResponseArchiveOutcome,
+    RetainedResponseMaintenanceError, RetainedResponsePartitionRunway,
+    RetainedResponseRetirementOutcome, RetentionPolicy, Storage, TrailingDemandCount,
 };
 pub use request::*;
