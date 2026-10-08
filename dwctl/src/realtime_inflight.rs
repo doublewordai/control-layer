@@ -204,6 +204,19 @@ impl InflightLimiter for RealtimeInflightLimiter {
                 }
                 Err(_) => {
                     redis.timed_out();
+                    let scope = self.scope;
+                    tokio::spawn(async move {
+                        if let Err(error) = remove(&mut connection, &key, &member).await {
+                            crate::background_error!(
+                                crate::metrics::errors::component::REALTIME_INFLIGHT,
+                                "claim_withdraw",
+                                Warning,
+                                scope = scope,
+                                error = %error,
+                                "Failed to withdraw a timed-out in-flight claim; its lease will expire"
+                            );
+                        }
+                    });
                     tracing::warn!(scope = self.scope, "In-flight claim timed out; counting in this pod instead");
                     metrics::counter!("dwctl_realtime_inflight_redis_fallbacks_total", "scope" => self.scope).increment(1);
                     self.acquire_locally(account, model, limit)
@@ -241,7 +254,11 @@ async fn renew(redis: &SharedRedis, key: &str, member: &str) -> anyhow::Result<(
 
 async fn release(redis: &SharedRedis, key: &str, member: &str) -> anyhow::Result<()> {
     let mut connection = redis.connection().context("in-flight Redis is not connected")?;
-    redis::cmd("ZREM").arg(key).arg(member).query_async::<i64>(&mut connection).await?;
+    remove(&mut connection, key, member).await
+}
+
+async fn remove(connection: &mut ConnectionManager, key: &str, member: &str) -> anyhow::Result<()> {
+    redis::cmd("ZREM").arg(key).arg(member).query_async::<i64>(connection).await?;
     Ok(())
 }
 
@@ -310,6 +327,7 @@ impl Drop for RedisSlot {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -358,23 +376,88 @@ mod tests {
             .unwrap()
     }
 
-    async fn answer_setup_then_go_silent(mut socket: TcpStream) {
-        let mut received = Vec::new();
-        let mut answered = 0;
+    type Commands = Arc<Mutex<Vec<(String, String)>>>;
+
+    fn next_command(bytes: &[u8]) -> Option<(Vec<Vec<u8>>, usize)> {
+        let line_end = |from: usize| bytes[from..].windows(2).position(|pair| pair == b"\r\n").map(|at| from + at);
+        let header_end = line_end(0)?;
+        let count: usize = std::str::from_utf8(&bytes[1..header_end]).ok()?.parse().ok()?;
+        let mut position = header_end + 2;
+        let mut args = Vec::with_capacity(count);
+        for _ in 0..count {
+            let length_end = line_end(position)?;
+            let length: usize = std::str::from_utf8(&bytes[position + 1..length_end]).ok()?.parse().ok()?;
+            let start = length_end + 2;
+            if bytes.len() < start + length + 2 {
+                return None;
+            }
+            args.push(bytes[start..start + length].to_vec());
+            position = start + length + 2;
+        }
+        Some((args, position))
+    }
+
+    async fn serve(mut socket: TcpStream, claim_reply_after: Option<Duration>, commands: Commands) {
+        let mut pending = Vec::new();
         let mut buffer = [0u8; 4096];
+        let mut silent = false;
         while let Ok(read) = socket.read(&mut buffer).await {
             if read == 0 {
                 return;
             }
-            received.extend_from_slice(&buffer[..read]);
-            let setup_commands = received.windows(10).filter(|window| *window == b"\r\nCLIENT\r\n").count();
-            for _ in answered..setup_commands {
-                if socket.write_all(b"+OK\r\n").await.is_err() {
+            pending.extend_from_slice(&buffer[..read]);
+            while let Some((args, used)) = next_command(&pending) {
+                pending.drain(..used);
+                let name = String::from_utf8_lossy(&args[0]).to_ascii_uppercase();
+                let reply: &[u8] = match name.as_str() {
+                    "EVAL" => {
+                        commands
+                            .lock()
+                            .unwrap()
+                            .push((name, String::from_utf8_lossy(&args[5]).into_owned()));
+                        match claim_reply_after {
+                            Some(delay) => {
+                                tokio::time::sleep(delay).await;
+                                b":1\r\n"
+                            }
+                            None => {
+                                silent = true;
+                                b""
+                            }
+                        }
+                    }
+                    "ZREM" => {
+                        commands
+                            .lock()
+                            .unwrap()
+                            .push((name, String::from_utf8_lossy(&args[2]).into_owned()));
+                        b":1\r\n"
+                    }
+                    _ => b"+OK\r\n",
+                };
+                if !silent && socket.write_all(reply).await.is_err() {
                     return;
                 }
             }
-            answered = setup_commands;
         }
+    }
+
+    async fn fake_redis(claim_reply_after: Option<Duration>) -> (String, Arc<AtomicUsize>, Commands) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("redis://{}", listener.local_addr().unwrap());
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let commands = Commands::default();
+        tokio::spawn({
+            let accepted = Arc::clone(&accepted);
+            let commands = Arc::clone(&commands);
+            async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    accepted.fetch_add(1, Ordering::SeqCst);
+                    tokio::spawn(serve(socket, claim_reply_after, Arc::clone(&commands)));
+                }
+            }
+        });
+        (url, accepted, commands)
     }
 
     #[tokio::test]
@@ -416,19 +499,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_redis_that_stops_answering_is_replaced_with_a_new_connection() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("redis://{}", listener.local_addr().unwrap());
-        let accepted = Arc::new(AtomicUsize::new(0));
-        tokio::spawn({
-            let accepted = Arc::clone(&accepted);
-            async move {
-                while let Ok((socket, _)) = listener.accept().await {
-                    accepted.fetch_add(1, Ordering::SeqCst);
-                    tokio::spawn(answer_setup_then_go_silent(socket));
-                }
-            }
-        });
-
+        let (url, accepted, _) = fake_redis(None).await;
         let limiter = connected(limiter(Some(url))).await;
         assert_eq!(accepted.load(Ordering::SeqCst), 1);
 
@@ -443,6 +514,25 @@ mod tests {
         }
         assert_eq!(accepted.load(Ordering::SeqCst), 2);
         connected(limiter).await;
+    }
+
+    #[tokio::test]
+    async fn a_claim_that_answers_after_the_deadline_is_withdrawn() {
+        let (url, _, commands) = fake_redis(Some(REDIS_TIMEOUT * 2)).await;
+        let limiter = connected(limiter(Some(url))).await;
+
+        assert!(limiter.try_acquire("acct", "model", 10).await.is_some());
+        for _ in 0..500 {
+            if commands.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let commands = commands.lock().unwrap().clone();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].0, "EVAL");
+        assert_eq!(commands[1].0, "ZREM");
+        assert_eq!(commands[0].1, commands[1].1, "the withdrawal removes the member the claim added");
     }
 
     #[tokio::test]
