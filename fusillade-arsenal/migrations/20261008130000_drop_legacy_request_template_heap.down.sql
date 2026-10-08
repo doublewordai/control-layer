@@ -28,6 +28,8 @@ CREATE TABLE request_templates (
     metadata JSONB
 );
 
+CREATE INDEX idx_request_templates_retirement_created_at ON request_templates (created_at);
+
 CREATE INDEX idx_request_templates_file_id ON request_templates (file_id);
 CREATE INDEX idx_request_templates_file_line ON request_templates (file_id, line_number);
 CREATE INDEX idx_request_templates_file_model ON request_templates (file_id, model);

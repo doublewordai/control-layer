@@ -494,3 +494,50 @@ async fn preceding_writer_cleanup_remains_safe_after_heap_retirement(pool: PgPoo
         .unwrap();
     assert_eq!(g2_ids, vec![g2_id]);
 }
+
+#[sqlx::test(migrations = false)]
+async fn recency_preparation_indexes_a_populated_heap_before_retirement(pool: PgPool) {
+    migrator_where(|version| version < 20261008125910)
+        .run(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO request_templates (endpoint, method, path, body, model, api_key, created_at)
+         SELECT 'https://example.invalid', 'POST', '/v1/x', '{}', 'm', 'k', NOW() - INTERVAL '30 days'
+         FROM generate_series(1, 10000)",
+    ).execute(&pool).await.unwrap();
+    migrate_to_before_retirement(&pool).await;
+    sqlx::query("ANALYZE request_templates")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let plan: serde_json::Value =
+        sqlx::query_scalar("EXPLAIN (FORMAT JSON) SELECT MAX(created_at) FROM request_templates")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        plan.to_string()
+            .contains("idx_request_templates_retirement_created_at"),
+        "{plan}"
+    );
+    let week = current_week(&pool).await;
+    insert_g2_template(&pool, week).await;
+    apply_retirement(&pool).await.unwrap();
+}
+
+#[sqlx::test(migrations = false)]
+async fn recency_preparation_rejects_a_same_named_index_with_the_wrong_definition(pool: PgPool) {
+    migrator_where(|version| version < 20261008125910)
+        .run(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE INDEX idx_request_templates_retirement_created_at ON request_templates (updated_at)")
+        .execute(&pool).await.unwrap();
+    let error = apply_retirement(&pool).await.unwrap_err();
+    assert_eq!(sqlstate(&error).as_deref(), Some("55000"), "{error}");
+    let heap_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_class WHERE oid = to_regclass('request_templates') AND relkind = 'r')",
+    ).fetch_one(&pool).await.unwrap();
+    assert!(heap_exists);
+}

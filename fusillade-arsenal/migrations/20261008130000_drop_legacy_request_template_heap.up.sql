@@ -72,15 +72,13 @@ BEGIN
         )
         UNION ALL
         SELECT 'the legacy heap holds a template at least as new as the newest generation-2 template'
-        WHERE EXISTS (
-            SELECT 1
-            FROM request_templates legacy
-            WHERE (legacy.created_at AT TIME ZONE 'UTC')
-                >= COALESCE(
-                    (SELECT MAX(created_on) FROM request_templates_g2),
-                    DATE '-infinity'
-                )
-        )
+        -- MAX uses the prepared btree's endpoint instead of scanning for an
+        -- absent recent row. Convert the date cutoff, not the indexed column.
+        WHERE (SELECT MAX(created_at) FROM request_templates)
+            >= COALESCE(
+                (SELECT MAX(created_on)::timestamp AT TIME ZONE 'UTC' FROM request_templates_g2),
+                TIMESTAMPTZ '-infinity'
+            )
     ) blockers
     LIMIT 1;
 

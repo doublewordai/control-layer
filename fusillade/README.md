@@ -425,7 +425,15 @@ observed healthy:
     still referenced by a live or archived request, still belongs to an
     undeleted file, or is at least as new as the newest generation-2 row;
     apply it only once every retention window that could hold generation-1
-    content has passed. Validation uses bounded reference-driven lookups and
+    content has passed. A nonempty legacy heap also requires at least one
+    generation-2 row whose UTC creation date is later than every remaining
+    legacy timestamp; retention expiry alone is insufficient. An empty heap
+    does not require a generation-2 baseline. Do not insert synthetic content
+    to bypass this guard.
+    Preparatory migrations build and repair a concurrent `created_at` index
+    before the retirement lock, then validate its definition and readiness.
+    They require temporary index space and two concurrent build passes; the
+    index is removed with the heap. Validation uses bounded reference-driven lookups and
     fails closed on timeout; a quiet write counter alone is not a preflight.
     An empty, storage-free `request_templates` compatibility view lets the
     preceding generation-2 writer finish legacy cleanup during a rolling
