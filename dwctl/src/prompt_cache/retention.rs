@@ -318,7 +318,17 @@ mod tests {
         assert_eq!(sweep(&pool, &config, &CancellationToken::new()).await.unwrap(), None);
         assert_eq!(remaining(&pool).await.len(), 1);
         holder.close().await.unwrap();
-        assert_eq!(sweep(&pool, &config, &CancellationToken::new()).await.unwrap(), Some(1));
-        assert_eq!(sweep(&pool, &config, &CancellationToken::new()).await.unwrap(), Some(0));
+        assert_eq!(sweep_once_the_lock_is_free(&pool, &config).await, Some(1));
+        assert_eq!(sweep_once_the_lock_is_free(&pool, &config).await, Some(0));
+    }
+
+    async fn sweep_once_the_lock_is_free(pool: &PgPool, config: &PromptCacheRetentionConfig) -> Option<u64> {
+        for _ in 0..200 {
+            if let Some(deleted) = sweep(pool, config, &CancellationToken::new()).await.unwrap() {
+                return Some(deleted);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        None
     }
 }
