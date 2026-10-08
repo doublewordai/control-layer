@@ -5017,7 +5017,24 @@ mod tests {
                 .await
                 .assert_status(StatusCode::CREATED);
         }
+        // The handler releases its reservation in a spawned task after it
+        // returns; wait for both, so the third submission sees only the batches.
+        wait_for_reservations_released(pool).await;
         submit_one_request_batch(&app, &user, "24h").await
+    }
+
+    async fn wait_for_reservations_released(pool: &PgPool) {
+        for _ in 0..200 {
+            let unreleased: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM batch_capacity_reservations WHERE released_at IS NULL")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            if unreleased == 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("capacity reservations were not released within 5s");
     }
 
     #[dwctl_test_macros::test]
