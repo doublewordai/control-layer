@@ -266,6 +266,13 @@ fn call_priority(call: &fusillade::http::MockCall) -> i64 {
         .expect("daemon must inject an integer priority")
 }
 
+/// The spillover tolerations the daemon wrote into a dispatched body.
+fn call_tolerations(call: &fusillade::http::MockCall) -> serde_json::Value {
+    serde_json::from_str::<serde_json::Value>(&call.body).unwrap()["nvext"]["routing_constraints"]
+        ["tolerations"]
+        .clone()
+}
+
 #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
 async fn postgres_convenience_builder_installs_retained_response_fence(pool: sqlx::PgPool) {
     let retention = RetentionMaintenanceConfig::new(fusillade::RetentionPolicy {
@@ -487,9 +494,12 @@ async fn background_tier_end_to_end(pool: sqlx::PgPool) {
     mark_models_live_for_test(manager.as_ref(), &["spare-model"]).await;
 
     let shutdown = CancellationToken::new();
-    let daemon_handle = postgres_daemon(manager.clone(), http_client.clone(), config)
-        .run(shutdown.clone())
-        .unwrap();
+    let daemon_handle = Arc::new(
+        PostgresDaemon::new(manager.clone(), http_client.clone(), config)
+            .with_dispatch_tolerations(vec![]),
+    )
+    .run(shutdown.clone())
+    .unwrap();
 
     wait_for_mock_calls(&http_client, 2).await;
     let stability_deadline = tokio::time::Instant::now() + Duration::from_millis(150);
@@ -504,6 +514,7 @@ async fn background_tier_end_to_end(pool: sqlx::PgPool) {
     for call in http_client.get_calls() {
         assert!(call.body.contains(r#""kind":"sla""#));
         assert!(call_priority(&call) > i32::MIN as i64);
+        assert_eq!(call_tolerations(&call), serde_json::json!([]));
     }
 
     triggers.next().unwrap().send(()).unwrap();
@@ -513,6 +524,8 @@ async fn background_tier_end_to_end(pool: sqlx::PgPool) {
     assert!(calls[3].body.contains("background"));
     assert_eq!(call_priority(&calls[2]), i32::MIN as i64);
     assert_eq!(call_priority(&calls[3]), i32::MIN as i64);
+    assert_eq!(call_tolerations(&calls[2]), serde_json::json!([]));
+    assert_eq!(call_tolerations(&calls[3]), serde_json::json!([]));
     assert!(
         calls[2].body.contains(r#""kind":"background-batch""#)
             || calls[3].body.contains(r#""kind":"background-batch""#)

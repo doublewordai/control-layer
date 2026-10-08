@@ -322,6 +322,38 @@ impl RetentionMaintenanceConfig {
     }
 }
 
+/// A Kubernetes-style toleration, as Dynamo reads it from
+/// `nvext.routing_constraints.tolerations`: `key`, `operator` (`Equal`, the
+/// default, or `Exists`), `value` and `effect` (`NoSchedule` or
+/// `PreferNoSchedule`; absent matches both). `{operator: Exists}` with no key
+/// tolerates every taint.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Toleration {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator: Option<TolerationOperator>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<TaintEffect>,
+}
+
+/// How a [`Toleration`] matches a taint's value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TolerationOperator {
+    Equal,
+    Exists,
+}
+
+/// The taint effect a [`Toleration`] tolerates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TaintEffect {
+    NoSchedule,
+    PreferNoSchedule,
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct DaemonConfig {
     /// Claim-loop mode for this daemon process.

@@ -32,7 +32,7 @@ use crate::request::{Claimed, DaemonId, FailureReason, Request, RequestCompletio
 
 pub use config::{
     DaemonConfig, DaemonMode, LeakConfig, ModelEscalationConfig, RetentionMaintenanceConfig,
-    ShouldRetryFn, default_should_retry,
+    ShouldRetryFn, TaintEffect, Toleration, TolerationOperator, default_should_retry,
 };
 pub use fusillade_core::daemon_record::{
     AnyDaemonRecord, DaemonData, DaemonRecord, DaemonState, DaemonStats, DaemonStatus, Dead,
@@ -192,7 +192,36 @@ fn sla_dynamo_priority(deadline: chrono::DateTime<chrono::Utc>) -> i32 {
         .clamp(MIN_SLA_DYNAMO_PRIORITY as i64, i32::MAX as i64) as i32
 }
 
-fn inject_dynamo_priority(body: &mut String, priority: i32) {
+/// Return `parent[key]` as a mutable object, replacing a missing or non-object
+/// value with `{}`.
+fn object_entry<'a>(
+    parent: &'a mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> &'a mut serde_json::Map<String, serde_json::Value> {
+    let entry = parent
+        .entry(key)
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !entry.is_object() {
+        *entry = serde_json::Value::Object(serde_json::Map::new());
+    }
+    entry
+        .as_object_mut()
+        .expect("entry was just made an object")
+}
+
+/// Write the daemon's Dynamo extensions into an outbound body in one parse and
+/// one serialise: the scheduling priority at `nvext.agent_hints.priority` and
+/// the spillover tolerations at `nvext.routing_constraints.tolerations`. Each
+/// overwrites a value already in the body; every other key is preserved. With
+/// neither set, or a body that is not a JSON object, the body is untouched.
+fn inject_dynamo_extensions(
+    body: &mut String,
+    priority: Option<i32>,
+    tolerations: Option<&serde_json::Value>,
+) {
+    if priority.is_none() && tolerations.is_none() {
+        return;
+    }
     let Ok(mut json) = serde_json::from_str::<serde_json::Value>(body) else {
         return;
     };
@@ -200,33 +229,58 @@ fn inject_dynamo_priority(body: &mut String, priority: i32) {
         return;
     };
 
-    let nvext = object
-        .entry("nvext")
-        .or_insert_with(|| serde_json::json!({}));
-    if !nvext.is_object() {
-        *nvext = serde_json::json!({});
+    let nvext = object_entry(object, "nvext");
+    if let Some(priority) = priority {
+        object_entry(nvext, "agent_hints").insert(
+            "priority".to_string(),
+            serde_json::Value::Number(priority.into()),
+        );
     }
-    let Some(nvext_object) = nvext.as_object_mut() else {
-        return;
-    };
-
-    let agent_hints = nvext_object
-        .entry("agent_hints")
-        .or_insert_with(|| serde_json::json!({}));
-    if !agent_hints.is_object() {
-        *agent_hints = serde_json::json!({});
+    if let Some(tolerations) = tolerations {
+        object_entry(nvext, "routing_constraints")
+            .insert("tolerations".to_string(), tolerations.clone());
     }
-    let Some(hints_object) = agent_hints.as_object_mut() else {
-        return;
-    };
-    hints_object.insert(
-        "priority".to_string(),
-        serde_json::Value::Number(priority.into()),
-    );
 
     if let Ok(new_body) = serde_json::to_string(&json) {
         *body = new_body;
     }
+}
+
+/// Whether a request is close enough to its SLA deadline that the daemon
+/// stops sending its spillover tolerations, letting Dynamo spill it to a paid
+/// tier like realtime traffic. Batch normally waits and retries rather than
+/// spilling to the paid tier, but near SLA failure, meeting the deadline
+/// matters more than the cost.
+///
+/// The release window is the batch-claim deadline ramp (`claim_ramp_exponent`):
+/// a request is released once its remaining time is within
+/// `window_minutes ^ exponent` minutes of the deadline, where the window runs
+/// from `created_at` to the deadline (about 59 minutes for 24h and 10 for 1h at
+/// 0.56). The batches the claim gate releases near their deadline are the ones
+/// allowed to spill. A request past its deadline (retry grace) is always
+/// released; one with no deadline (background) never is. An unreadable
+/// `created_at` keeps the tolerations until the deadline passes.
+fn tolerations_released(
+    deadline: Option<chrono::DateTime<chrono::Utc>>,
+    created_at: Option<&str>,
+    ramp_exponent: f64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let Some(deadline) = deadline else {
+        return false;
+    };
+    let remaining_secs = (deadline - now).num_milliseconds() as f64 / 1000.0;
+    if remaining_secs <= 0.0 {
+        return true;
+    }
+    let Some(created_at) = created_at
+        .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+        .map(|created_at| created_at.with_timezone(&chrono::Utc))
+    else {
+        return false;
+    };
+    let window_secs = ((deadline - created_at).num_milliseconds() as f64 / 1000.0).max(0.0);
+    remaining_secs <= (window_secs / 60.0).powf(ramp_exponent) * 60.0
 }
 
 /// Backoff before retrying a failed claim cycle: exponential in the number of
@@ -1676,6 +1730,9 @@ where
     config: DaemonConfig,
     retention_maintenance: RetentionMaintenanceConfig,
     leak_config: Option<LeakConfig>,
+    /// Pre-serialised [`Daemon::with_dispatch_tolerations`] value, written into
+    /// every dispatched body. `None` injects nothing.
+    dispatch_tolerations: Option<serde_json::Value>,
     /// Per-claim processing hook. Defaults to [`DefaultRequestProcessor`],
     /// which preserves the existing fire-and-store pipeline byte-for-byte.
     /// Override via [`Daemon::with_processor`] to inject custom orchestration
@@ -1779,6 +1836,7 @@ where
             config,
             retention_maintenance: RetentionMaintenanceConfig::default(),
             leak_config: None,
+            dispatch_tolerations: None,
             processor: Arc::new(DefaultRequestProcessor),
             requests_in_flight: Arc::new(dashmap::DashMap::new()),
             adaptive_concurrency,
@@ -1823,6 +1881,28 @@ where
     /// Async/flex claims always retain `DaemonConfig::leaks_per_window`.
     pub fn with_leak_config(mut self, config: LeakConfig) -> Self {
         self.leak_config = Some(config);
+        self
+    }
+
+    /// Write these tolerations to `nvext.routing_constraints.tolerations` on
+    /// every request the daemon dispatches (batch, flex and background),
+    /// overwriting any value already in the body and leaving the rest of
+    /// `nvext` untouched. Dynamo's spillover router keeps a request off every
+    /// tier whose taints it does not tolerate, so an empty list (tolerate
+    /// nothing) keeps daemon traffic on the model's own workers: when they are
+    /// full the request is refused with a 529 and retried rather than sent to
+    /// a paid external tier. Without this, bodies are left byte-identical.
+    /// Independent of [`DaemonConfig::inject_deadline_priority`].
+    ///
+    /// Near its SLA deadline a request is sent without the field instead (see
+    /// `tolerations_released`): batch normally waits rather than spill to
+    /// the paid tier, but near SLA failure meeting the deadline matters more
+    /// than the cost. Counted by `fusillade_tolerations_released_total{model}`.
+    pub fn with_dispatch_tolerations(mut self, tolerations: Vec<Toleration>) -> Self {
+        // Serialised once here, not per request: the same value goes on every
+        // dispatched body.
+        self.dispatch_tolerations =
+            Some(serde_json::to_value(tolerations).expect("tolerations serialise to JSON"));
         self
     }
 
@@ -2479,19 +2559,35 @@ where
             }
         }
 
+        let now = chrono::Utc::now();
         for prepared_request in &mut prepared {
             let request = &mut prepared_request.request;
             let priority = if kind.is_background() {
-                BACKGROUND_DYNAMO_PRIORITY
+                Some(BACKGROUND_DYNAMO_PRIORITY)
             } else if self.config.inject_deadline_priority {
-                let Some(deadline) = request.state.batch_expires_at else {
-                    continue;
-                };
-                sla_dynamo_priority(deadline)
+                request.state.batch_expires_at.map(sla_dynamo_priority)
             } else {
-                continue;
+                None
             };
-            inject_dynamo_priority(&mut request.data.body, priority);
+            let mut tolerations = self.dispatch_tolerations.as_ref();
+            if tolerations.is_some()
+                && !kind.is_background()
+                && tolerations_released(
+                    request.state.batch_expires_at,
+                    request
+                        .data
+                        .batch_metadata
+                        .get("created_at")
+                        .map(String::as_str),
+                    self.config.claim_ramp_exponent,
+                    now,
+                )
+            {
+                tolerations = None;
+                counter!("fusillade_tolerations_released_total", "model" => request.data.model.clone())
+                    .increment(1);
+            }
+            inject_dynamo_extensions(&mut request.data.body, priority, tolerations);
         }
 
         prepared
@@ -5731,7 +5827,7 @@ mod tests {
     fn priority_injection_keeps_key_order() {
         let mut body = r#"{"model":"m","response_format":{"type":"json_schema","json_schema":{"name":"n","schema":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"string"}}}}},"messages":[]}"#.to_string();
 
-        inject_dynamo_priority(&mut body, 7);
+        inject_dynamo_extensions(&mut body, Some(7), None);
 
         assert_eq!(
             body,
@@ -5750,7 +5846,7 @@ mod tests {
         })
         .to_string();
 
-        inject_dynamo_priority(&mut body, BACKGROUND_DYNAMO_PRIORITY);
+        inject_dynamo_extensions(&mut body, Some(BACKGROUND_DYNAMO_PRIORITY), None);
 
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
@@ -5767,6 +5863,268 @@ mod tests {
         assert!(
             sla_dynamo_priority(chrono::DateTime::<chrono::Utc>::MAX_UTC)
                 > BACKGROUND_DYNAMO_PRIORITY
+        );
+    }
+
+    #[test]
+    fn no_extensions_leave_the_body_byte_identical() {
+        // Odd spacing and key order a re-serialise would normalise.
+        let original = r#"{ "model":"m",  "nvext":{"routing_constraints":{"tolerations":[{"operator":"Exists"}]}}, "a":1 }"#;
+        let mut body = original.to_string();
+        inject_dynamo_extensions(&mut body, None, None);
+        assert_eq!(body, original);
+
+        // A non-object body is left alone even when something is configured.
+        let mut body = "[1,2]".to_string();
+        inject_dynamo_extensions(&mut body, Some(1), Some(&serde_json::json!([])));
+        assert_eq!(body, "[1,2]");
+    }
+
+    #[test]
+    fn tolerations_overwrite_the_body_value_and_keep_siblings() {
+        let mut body = serde_json::json!({
+            "model": "m",
+            "nvext": {
+                "cache_control": {"enabled": true},
+                "agent_hints": {"max_batch_size": 8},
+                "routing_constraints": {
+                    "tolerations": [{"operator": "Exists"}],
+                    "required_taints": ["gpu.h200"],
+                    "preferred_taints": {"zone.a": 1.0}
+                }
+            }
+        })
+        .to_string();
+
+        inject_dynamo_extensions(&mut body, None, Some(&serde_json::json!([])));
+
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let constraints = &json["nvext"]["routing_constraints"];
+        assert_eq!(constraints["tolerations"], serde_json::json!([]));
+        assert_eq!(
+            constraints["required_taints"],
+            serde_json::json!(["gpu.h200"])
+        );
+        assert_eq!(constraints["preferred_taints"]["zone.a"], 1.0);
+        assert_eq!(json["nvext"]["cache_control"]["enabled"], true);
+        assert!(
+            json["nvext"]["agent_hints"].get("priority").is_none(),
+            "tolerations alone do not inject a priority"
+        );
+        assert_eq!(json["nvext"]["agent_hints"]["max_batch_size"], 8);
+    }
+
+    #[test]
+    fn tolerations_and_priority_are_injected_together() {
+        let tolerations = serde_json::to_value(vec![Toleration {
+            key: Some("dynamo.spillover/external".to_string()),
+            operator: Some(TolerationOperator::Exists),
+            value: None,
+            effect: Some(TaintEffect::PreferNoSchedule),
+        }])
+        .unwrap();
+        let mut body = r#"{"model":"m","messages":[],"nvext":"not-an-object"}"#.to_string();
+
+        inject_dynamo_extensions(&mut body, Some(-42), Some(&tolerations));
+
+        assert_eq!(
+            body,
+            r#"{"model":"m","messages":[],"nvext":{"agent_hints":{"priority":-42},"routing_constraints":{"tolerations":[{"key":"dynamo.spillover/external","operator":"Exists","effect":"PreferNoSchedule"}]}}}"#
+        );
+    }
+
+    #[test]
+    fn tolerations_are_released_near_and_past_the_deadline() {
+        let created_str = "2026-10-08T00:00:00.000000Z";
+        let created = chrono::DateTime::parse_from_rfc3339(created_str)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let day = created + chrono::Duration::hours(24);
+        let hour = created + chrono::Duration::hours(1);
+        let at = |deadline: chrono::DateTime<chrono::Utc>, minutes_left: i64| {
+            deadline - chrono::Duration::minutes(minutes_left)
+        };
+
+        // 24h window at 0.56: 1440 ^ 0.56 ~= 58.7 minutes.
+        assert!(!tolerations_released(
+            Some(day),
+            Some(created_str),
+            0.56,
+            at(day, 600)
+        ));
+        assert!(!tolerations_released(
+            Some(day),
+            Some(created_str),
+            0.56,
+            at(day, 60)
+        ));
+        assert!(tolerations_released(
+            Some(day),
+            Some(created_str),
+            0.56,
+            at(day, 58)
+        ));
+        // 1h window at 0.56: 60 ^ 0.56 ~= 9.9 minutes.
+        assert!(!tolerations_released(
+            Some(hour),
+            Some(created_str),
+            0.56,
+            at(hour, 11)
+        ));
+        assert!(tolerations_released(
+            Some(hour),
+            Some(created_str),
+            0.56,
+            at(hour, 9)
+        ));
+        // Past the deadline (retry grace): released whatever the window.
+        assert!(tolerations_released(
+            Some(day),
+            Some(created_str),
+            0.56,
+            at(day, -1)
+        ));
+        assert!(tolerations_released(Some(day), None, 0.56, at(day, -1)));
+        // No deadline (background): never released.
+        assert!(!tolerations_released(
+            None,
+            Some(created_str),
+            0.56,
+            at(day, -1)
+        ));
+        // Unreadable created_at: kept until the deadline passes.
+        assert!(!tolerations_released(
+            Some(day),
+            Some("yesterday"),
+            0.56,
+            at(day, 1)
+        ));
+    }
+
+    #[sqlx::test]
+    async fn dispatch_tolerations_follow_the_deadline(pool: sqlx::PgPool) {
+        use crate::request::{Claimed, Request, RequestData};
+
+        let storage = Arc::new(fusillade_arsenal::PostgresRequestManager::new(
+            fusillade_arsenal::TestDbPools::new(pool).await.unwrap(),
+            fusillade_arsenal::PostgresStorageConfig::default(),
+        ));
+        let daemon = Daemon::new(
+            storage,
+            Arc::new(crate::MockHttpClient::new()),
+            DaemonConfig {
+                inject_deadline_priority: true,
+                ..Default::default()
+            },
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .with_dispatch_tolerations(vec![]);
+
+        let now = chrono::Utc::now();
+        let created_at = (now - chrono::Duration::hours(12)).to_rfc3339();
+        const BODY: &str = r#"{"model":"m","messages":[]}"#;
+        let claimed = |deadline: Option<chrono::DateTime<chrono::Utc>>| Request {
+            state: Claimed {
+                daemon_id: DaemonId(uuid::Uuid::new_v4()),
+                claimed_at: now,
+                retry_attempt: 0,
+                batch_expires_at: deadline,
+                leak: None,
+            },
+            data: RequestData {
+                id: crate::request::RequestId::from(uuid::Uuid::new_v4()),
+                batch_id: None,
+                template_id: crate::batch::TemplateId(uuid::Uuid::new_v4()),
+                custom_id: None,
+                endpoint: "http://localhost".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/chat/completions".to_string(),
+                body: BODY.to_string(),
+                model: "m".to_string(),
+                api_key: "k".to_string(),
+                created_by: "u".to_string(),
+                batch_metadata: HashMap::from([("created_at".to_string(), created_at.clone())]),
+            },
+        };
+        let far = now + chrono::Duration::hours(12);
+        let near = now + chrono::Duration::minutes(5);
+        let past = now - chrono::Duration::minutes(5);
+        let prepared = daemon.prepare_claimed_requests(
+            vec![claimed(Some(far)), claimed(Some(near)), claimed(Some(past))],
+            ClaimLoopKind::Request,
+        );
+        let bodies: Vec<serde_json::Value> = prepared
+            .iter()
+            .map(|p| serde_json::from_str(&p.request.data.body).unwrap())
+            .collect();
+
+        assert_eq!(
+            bodies[0]["nvext"]["routing_constraints"]["tolerations"],
+            serde_json::json!([]),
+            "far from its deadline, batch must not spill to the paid tier"
+        );
+        for (body, deadline) in [(&bodies[1], near), (&bodies[2], past)] {
+            assert!(
+                body["nvext"].get("routing_constraints").is_none(),
+                "near or past its deadline the request may spill"
+            );
+            let mut expected = BODY.to_string();
+            inject_dynamo_extensions(&mut expected, Some(sla_dynamo_priority(deadline)), None);
+            assert_eq!(
+                prepared_body(&prepared, deadline),
+                expected,
+                "identical to injection-off apart from the priority"
+            );
+        }
+
+        // Background work has no deadline and keeps the tolerations.
+        let prepared =
+            daemon.prepare_claimed_requests(vec![claimed(None)], ClaimLoopKind::BackgroundRequest);
+        let body: serde_json::Value = serde_json::from_str(&prepared[0].request.data.body).unwrap();
+        assert_eq!(
+            body["nvext"]["routing_constraints"]["tolerations"],
+            serde_json::json!([])
+        );
+    }
+
+    fn prepared_body(
+        prepared: &[PreparedRequest],
+        deadline: chrono::DateTime<chrono::Utc>,
+    ) -> String {
+        prepared
+            .iter()
+            .find(|p| p.request.state.batch_expires_at == Some(deadline))
+            .unwrap()
+            .request
+            .data
+            .body
+            .clone()
+    }
+
+    #[test]
+    fn dispatch_tolerations_deserialize() {
+        let tolerations: Vec<Toleration> = serde_json::from_value(serde_json::json!([])).unwrap();
+        assert!(
+            tolerations.is_empty(),
+            "an empty list (tolerate nothing) is expressible"
+        );
+
+        let tolerations: Vec<Toleration> = serde_json::from_value(serde_json::json!([
+            {"key": "dynamo.spillover/external", "effect": "NoSchedule"},
+            {"operator": "Exists"}
+        ]))
+        .unwrap();
+        assert_eq!(tolerations[0].effect, Some(TaintEffect::NoSchedule));
+        assert_eq!(tolerations[0].operator, None);
+        assert_eq!(tolerations[1].operator, Some(TolerationOperator::Exists));
+
+        assert!(
+            serde_json::from_value::<Vec<Toleration>>(serde_json::json!([{"effect": "NoExecute"}]))
+                .is_err(),
+            "an effect Dynamo does not know is a config error, not a silent no-op"
+        );
+        assert!(
+            serde_json::from_value::<Vec<Toleration>>(serde_json::json!([{"keys": "x"}])).is_err()
         );
     }
 

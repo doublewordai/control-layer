@@ -3102,7 +3102,7 @@ mod tests {
         add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
 
         // Upload file with priority field that user is trying to manipulate
-        let jsonl_content = r#"{"custom_id": "priority-hijack", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8", "messages": [{"role": "user", "content": "urgent"}], "priority": -999999, "nvext": {"router": {"ttft_target": 1, "itl_target": 2, "keep": true}, "agent_hints": {"priority": 999, "keep": true}, "keep": true}}}"#;
+        let jsonl_content = r#"{"custom_id": "priority-hijack", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8", "messages": [{"role": "user", "content": "urgent"}], "priority": -999999, "nvext": {"router": {"ttft_target": 1, "itl_target": 2, "keep": true}, "agent_hints": {"priority": 999, "keep": true}, "routing_constraints": {"tolerations": [{"operator": "Exists"}], "required_taints": ["keep"]}, "keep": true}}}"#;
 
         let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-priority.jsonl");
 
@@ -3146,6 +3146,10 @@ mod tests {
         assert_eq!(body["nvext"]["router"]["keep"], true);
         assert_eq!(body["nvext"]["agent_hints"]["keep"], true);
         assert_eq!(body["nvext"]["keep"], true);
+        // Spillover tolerations are the daemon's to set, never the uploader's;
+        // the narrowing taint selectors pass through.
+        assert!(body["nvext"]["routing_constraints"].get("tolerations").is_none());
+        assert_eq!(body["nvext"]["routing_constraints"]["required_taints"], serde_json::json!(["keep"]));
 
         // Verify other fields are preserved
         assert_eq!(

@@ -2222,6 +2222,30 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub inject_deadline_priority: bool,
 
+    /// Tolerations the daemon writes to `nvext.routing_constraints.tolerations`
+    /// on every request it dispatches (batch, flex and background), replacing
+    /// any value in the body. Dynamo's spillover router keeps a request off
+    /// every tier whose taints it does not tolerate, so `[]` (tolerate
+    /// nothing) keeps daemon traffic off the paid external tier: when the
+    /// model's own workers are full the request gets a 529 and is retried.
+    /// Unset (the default) injects nothing and leaves bodies byte-identical.
+    /// Independent of `inject_deadline_priority`.
+    ///
+    /// Near SLA failure the daemon stops sending them: batch normally waits and
+    /// retries rather than spilling to the paid tier, but close to its deadline
+    /// meeting the SLA matters more than the cost. A request within the
+    /// batch-claim deadline ramp (`claim_ramp_exponent`: `window_minutes ^
+    /// exponent` minutes before its deadline, about 59 min for 24h and 10 min
+    /// for 1h at 0.56), or already past its deadline, is sent without the field
+    /// and so falls back to the policy default, which may spill. Work without a
+    /// deadline (background) always carries them. Counted by
+    /// `fusillade_tolerations_released_total{model}`.
+    ///
+    /// Requires Dynamo frontends that understand `routing_constraints.tolerations`
+    /// (doublewordai/dynamo#153): older frontends reject the field.
+    #[serde(default)]
+    pub dispatch_tolerations: Option<Vec<fusillade::daemon::Toleration>>,
+
     /// Database-wide per-model ceiling below which no-SLA background work may
     /// be claimed. Zero disables background processing while leaving
     /// submission and inspection available. Background processing also
@@ -2554,6 +2578,7 @@ impl Default for DaemonConfig {
             streamable_endpoints: Vec::new(),
             urgency_weight: default_urgency_weight(),
             inject_deadline_priority: false,
+            dispatch_tolerations: None,
             background_concurrency_limit: 0,
             batch_claim_size: 0,
             batch_claim_batch_size: default_batch_claim_batch_size(),
@@ -5554,6 +5579,56 @@ background_services:
             assert_eq!(fusillade_config.adaptive_growth_factor, 2.0);
             assert_eq!(fusillade_config.adaptive_cut_factor, 0.5);
             assert_eq!(fusillade_config.memory_gate_high_fraction, 0.75);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_dispatch_tolerations_yaml() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: test-secret-key
+background_services:
+  batch_daemon:
+    dispatch_tolerations: []
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+            let daemon = &config.background_services.batch_daemon;
+            assert_eq!(
+                daemon.dispatch_tolerations,
+                Some(vec![]),
+                "[] (tolerate nothing) is not the same as unset"
+            );
+            assert!(!daemon.inject_deadline_priority, "tolerations do not need deadline priority");
+
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: test-secret-key
+background_services:
+  batch_daemon:
+    dispatch_tolerations:
+      - key: dynamo.spillover/external
+        effect: PreferNoSchedule
+"#,
+            )?;
+            let config = Config::load(&args)?;
+            let tolerations = config.background_services.batch_daemon.dispatch_tolerations.unwrap();
+            assert_eq!(tolerations.len(), 1);
+            assert_eq!(tolerations[0].key.as_deref(), Some("dynamo.spillover/external"));
+            assert_eq!(tolerations[0].effect, Some(fusillade::daemon::TaintEffect::PreferNoSchedule));
+
+            jail.create_file("test.yaml", "secret_key: test-secret-key\n")?;
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.dispatch_tolerations, None);
 
             Ok(())
         });

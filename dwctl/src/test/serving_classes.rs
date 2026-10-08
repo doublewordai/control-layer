@@ -407,3 +407,45 @@ async fn json_key_order_survives_batch_upload(pool: PgPool) {
     content.assert_status_ok();
     assert!(content.text().contains(ORDERED_SCHEMA), "{}", content.text());
 }
+
+/// Spillover tolerations decide whether Dynamo may send a request to the paid
+/// external tier, so only the fusillade daemon may set them. A realtime caller's
+/// value is stripped and the body re-serialised (onwards forwards the bytes it
+/// receives, COR-522); the daemon loopback keeps its injected value.
+#[dwctl_test_macros::test]
+async fn spillover_tolerations_are_stripped_from_clients_and_kept_from_the_daemon(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let response = f
+        .server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {}", f.key))
+        .json(&json!({"model":"policy","messages":[{"role":"user","content":"hi"}],
+            "nvext":{"routing_constraints":{"tolerations":[{"operator":"Exists"}],"required_taints":["keep"]},
+                "cache_control":{"enabled":true}}}))
+        .await;
+    response.assert_status_ok();
+    let forwarded = f.last_body().await;
+    assert!(
+        forwarded["nvext"]["routing_constraints"].get("tolerations").is_none(),
+        "a realtime caller must not choose the tiers it may spill to"
+    );
+    assert_eq!(forwarded["nvext"]["routing_constraints"]["required_taints"], json!(["keep"]));
+    assert_eq!(forwarded["nvext"]["cache_control"]["enabled"], true);
+
+    let response = f
+        .server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {}", f.key))
+        .add_header("x-fusillade-request-id", Uuid::new_v4().to_string())
+        .json(&json!({"model":"policy","messages":[{"role":"user","content":"hi"}],
+            "nvext":{"routing_constraints":{"tolerations":[]},"agent_hints":{"priority":-1700000000}}}))
+        .await;
+    response.assert_status_ok();
+    let forwarded = f.last_body().await;
+    assert_eq!(
+        forwarded["nvext"]["routing_constraints"]["tolerations"],
+        json!([]),
+        "the daemon's tolerations reach the frontend"
+    );
+    assert_eq!(forwarded["nvext"]["agent_hints"]["priority"], -1700000000);
+}

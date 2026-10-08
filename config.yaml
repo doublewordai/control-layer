@@ -935,6 +935,22 @@ background_services:
     # deadlines produce larger numbers.
     # inject_deadline_priority: false
 
+    # Spillover tolerations written to `nvext.routing_constraints.tolerations`
+    # on every request the daemon dispatches (batch, flex, background),
+    # replacing any value in the body. Dynamo's spillover router keeps a
+    # request off every tier whose taints it does not tolerate, so `[]`
+    # (tolerate nothing) keeps daemon traffic off the paid external tier: when
+    # the model's own workers are full the request gets a 529 and is retried.
+    # Near SLA failure the tolerations are dropped: batch normally waits and
+    # retries rather than spill to the paid tier, but close to its deadline
+    # meeting the SLA matters more than the cost. Inside the claim ramp window
+    # (claim_ramp_exponent: window_minutes ^ exponent minutes before the
+    # deadline, ~59 min for 24h, ~10 min for 1h) or past the deadline, the
+    # field is omitted and the request may spill. Background work keeps them.
+    # Unset injects nothing. Independent of inject_deadline_priority. Needs
+    # Dynamo frontends with doublewordai/dynamo#153; older ones reject the field.
+    # dispatch_tolerations: []
+
   # Batch completion notifications (emails + webhooks)
   # notifications:
   #   poll_interval: 30s                # How often to poll for completed batches
