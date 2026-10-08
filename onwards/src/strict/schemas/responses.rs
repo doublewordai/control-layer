@@ -641,7 +641,9 @@ pub enum Tool {
         #[allow(dead_code)]
         name: String,
         /// Namespace description; empty for the default `functions` namespace.
-        #[serde(default)]
+        /// Only serialized when present, so a group that omitted it does not
+        /// come back with an invented `"description": null`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         #[allow(dead_code)]
         description: Option<String>,
         /// Grouped tools. `function` members are flattened; `custom` members
@@ -943,6 +945,34 @@ pub struct OutputTokensDetails {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_namespace_group_round_trips_without_inventing_fields() {
+        // A namespace group that omitted `description`/`strict` must come back
+        // exactly as sent: re-serialization is what feeds any request echo.
+        let sent = serde_json::json!([{
+            "type": "namespace",
+            "name": "functions",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "description": "Runs a command.",
+                    "parameters": {"type": "object", "properties": {}}
+                },
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"}
+                }
+            ]
+        }]);
+
+        let tools: Vec<Tool> = serde_json::from_value(sent.clone()).unwrap();
+        let echoed = serde_json::to_value(&tools).unwrap();
+
+        assert_eq!(echoed, sent);
+    }
 
     #[test]
     fn test_deserialize_simple_request() {
