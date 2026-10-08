@@ -8992,6 +8992,100 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         Ok(daemons)
     }
 
+    async fn exchange_dispatch_throughput(
+        &self,
+        daemon_id: DaemonId,
+        samples: &[crate::manager::DispatchThroughputSample],
+        tau_secs: f64,
+        stale_after_secs: f64,
+    ) -> Result<Vec<crate::manager::DispatchThroughputSample>> {
+        let tau_secs = tau_secs.max(1.0);
+        let models: Vec<&str> = samples.iter().map(|s| s.model.as_str()).collect();
+        let completions: Vec<f64> = samples.iter().map(|s| s.completions.max(0.0)).collect();
+        let slot_seconds: Vec<f64> = samples.iter().map(|s| s.slot_seconds.max(0.0)).collect();
+        let counts: Vec<i64> = samples.iter().map(|s| s.samples.max(0)).collect();
+
+        // One upsert for every model this daemon has dispatched. The table is
+        // tiny (live daemons x models), so this and the aggregate below are
+        // cheap; neither runs on the request path.
+        if !models.is_empty() {
+            sqlx::query(
+                r#"
+                INSERT INTO dispatch_throughput_samples
+                    (daemon_id, model, completions_decayed, slot_seconds_decayed, samples, updated_at)
+                SELECT $1, s.model, s.completions, s.slot_seconds, s.samples, NOW()
+                FROM UNNEST($2::TEXT[], $3::FLOAT8[], $4::FLOAT8[], $5::BIGINT[])
+                    AS s(model, completions, slot_seconds, samples)
+                ON CONFLICT (daemon_id, model) DO UPDATE SET
+                    completions_decayed = EXCLUDED.completions_decayed,
+                    slot_seconds_decayed = EXCLUDED.slot_seconds_decayed,
+                    samples = EXCLUDED.samples,
+                    updated_at = EXCLUDED.updated_at
+                "#,
+            )
+            .bind(daemon_id.0)
+            .bind(&models)
+            .bind(&completions)
+            .bind(&slot_seconds)
+            .bind(&counts)
+            .execute(self.write_executor())
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to publish dispatch throughput: {}", e))
+            })?;
+        }
+
+        // Rows of daemons that died or restarted (a restart gets a new id)
+        // are excluded once stale below and deleted an hour after their last
+        // refresh, so the table never grows past live daemons x models.
+        sqlx::query(
+            "DELETE FROM dispatch_throughput_samples WHERE updated_at < NOW() - INTERVAL '1 hour'",
+        )
+        .execute(self.write_executor())
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to delete stale dispatch throughput: {}", e))
+        })?;
+
+        // Sum the fresh rows, each decayed from its refresh to now so rows
+        // written at different moments are on the same footing.
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                model,
+                SUM(completions_decayed
+                    * EXP(-EXTRACT(EPOCH FROM (NOW() - updated_at)) / $1::FLOAT8))::FLOAT8 AS completions,
+                SUM(slot_seconds_decayed
+                    * EXP(-EXTRACT(EPOCH FROM (NOW() - updated_at)) / $1::FLOAT8))::FLOAT8 AS slot_seconds,
+                SUM(samples)::BIGINT AS samples
+            FROM dispatch_throughput_samples
+            WHERE updated_at >= NOW() - make_interval(secs => $2::FLOAT8)
+            GROUP BY model
+            "#,
+        )
+        .bind(tau_secs)
+        .bind(stale_after_secs)
+        .fetch_all(self.write_executor())
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to read dispatch throughput: {}", e))
+        })?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(crate::manager::DispatchThroughputSample {
+                    model: row.try_get("model")?,
+                    completions: row.try_get("completions")?,
+                    slot_seconds: row.try_get("slot_seconds")?,
+                    samples: row.try_get("samples")?,
+                })
+            })
+            .collect::<std::result::Result<Vec<_>, sqlx::Error>>()
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to decode dispatch throughput: {}", e))
+            })
+    }
+
     async fn purge_orphaned_rows(&self, batch_size: i64) -> Result<u64> {
         // Step 1: Delete requests whose parent batch has been soft-deleted.
         // Must run before template deletion to prevent ON DELETE SET NULL on

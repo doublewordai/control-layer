@@ -2544,7 +2544,6 @@ where
         }
 
         let now = chrono::Utc::now();
-        let now_instant = std::time::Instant::now();
         for prepared_request in &mut prepared {
             let capacity_model = &prepared_request.capacity_model;
             let request = &mut prepared_request.request;
@@ -2563,7 +2562,7 @@ where
                         .as_ref()
                         .zip(deadline)
                         .and_then(|(sla_release, deadline)| {
-                            sla_release.projection(capacity_model, deadline, now_instant)
+                            sla_release.projection(capacity_model, deadline)
                         });
                 let reason = release_reason(
                     deadline,
@@ -3287,28 +3286,27 @@ where
         });
         daemon_handles.push(("heartbeat", heartbeat_handle));
 
-        // Refresh the outstanding-work snapshot the SLA projection reads, off
-        // the claim path: two indexed count queries per interval for every
-        // model, never one per request.
+        // Refresh the shared snapshot the SLA projection reads, off the claim
+        // path: publish this daemon's throughput sums and read the
+        // deployment-wide ones (one upsert, one aggregate over a table of
+        // live daemons x models), then two indexed count queries for the
+        // outstanding work of every model. Never one query per request.
         if let Some(sla_release) = self.sla_release.clone()
             && self.dispatch_tolerations.is_some()
             && claim_loop_kinds.iter().any(|kind| !kind.is_background())
         {
             let storage = self.storage.clone();
             let shutdown_token = self.shutdown_token.clone();
+            let daemon_id = self.daemon_id;
             let handle = tokio::spawn(async move {
                 let mut interval = tokio::time::interval(sla_release.refresh_interval());
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     tokio::select! {
                         _ = interval.tick() => {
-                            let refreshed_at = chrono::Utc::now();
-                            match sla_release::read_backlog(storage.as_ref()).await {
-                                Ok(models) => sla_release.install(refreshed_at, models),
-                                Err(error) => {
-                                    counter!("fusillade_sla_release_refresh_errors_total").increment(1);
-                                    tracing::warn!(%error, "Failed to refresh the SLA release backlog snapshot; keeping the previous one");
-                                }
+                            if let Err(error) = sla_release.refresh(storage.as_ref(), daemon_id).await {
+                                counter!("fusillade_sla_release_refresh_errors_total").increment(1);
+                                tracing::warn!(%error, "Failed to refresh the SLA release snapshot; keeping the previous one");
                             }
                         }
                         _ = shutdown_token.cancelled() => break,
@@ -5991,16 +5989,25 @@ mod tests {
         );
     }
 
-    /// Two models, the same queue ahead and the same deadline: the one whose
-    /// own workers deliver slowly is projected to miss the SLA and released
-    /// early (well outside the ramp); the fast one keeps `[]`.
+    /// Two replicas with different local histories publish their throughput
+    /// sums, read back the same deployment-wide sums and make the same
+    /// decisions: with the same queue ahead and deadline, the model our workers
+    /// serve slowly is released early (well outside the ramp) and the fast one
+    /// keeps `[]`. A replica that just started (no local history) uses the
+    /// shared estimate at once; a dead replica's stale row is left out.
     #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
-    async fn sla_release_frees_a_slow_models_batch_early(pool: sqlx::PgPool) {
+    async fn sla_release_is_shared_across_replicas(pool: sqlx::PgPool) {
         use crate::request::{Claimed, Request, RequestData};
         use fusillade_core::manager::Storage;
+        type ReplicaDaemon = Daemon<
+            fusillade_arsenal::PostgresRequestManager<fusillade_arsenal::TestDbPools>,
+            crate::MockHttpClient,
+        >;
 
         let storage = Arc::new(fusillade_arsenal::PostgresRequestManager::new(
-            fusillade_arsenal::TestDbPools::new(pool).await.unwrap(),
+            fusillade_arsenal::TestDbPools::new(pool.clone())
+                .await
+                .unwrap(),
             fusillade_arsenal::PostgresStorageConfig::default(),
         ));
         // 30 outstanding flex requests per model, due in about an hour.
@@ -6027,29 +6034,77 @@ mod tests {
         assert_eq!(backlog["fast"].total(), 30.0);
         assert_eq!(backlog["slow"].global_in_flight, 0.0);
 
-        let daemon = Daemon::new(
-            storage,
-            Arc::new(crate::MockHttpClient::new()),
-            DaemonConfig::default(),
-            tokio_util::sync::CancellationToken::new(),
-        )
-        .with_dispatch_tolerations(vec![])
-        .with_sla_release(SlaReleaseConfig {
-            min_samples: 1,
-            ..Default::default()
-        });
-        let sla_release = daemon.sla_release.clone().unwrap();
-        sla_release.install(chrono::Utc::now(), backlog);
-        // Our workers: a "slow" request takes 1000s per slot, a "fast" one 0.1s.
-        let t0 = std::time::Instant::now();
-        sla_release.estimator.started("slow", t0);
-        sla_release
-            .estimator
-            .finished("slow", true, t0 + Duration::from_secs(1_000));
-        sla_release.estimator.started("fast", t0);
-        sla_release
-            .estimator
-            .finished("fast", true, t0 + Duration::from_millis(100));
+        // Each replica alone has one sample; min_samples applies to the sum.
+        let replica = || {
+            Daemon::new(
+                storage.clone(),
+                Arc::new(crate::MockHttpClient::new()),
+                DaemonConfig::default(),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .with_dispatch_tolerations(vec![])
+            .with_sla_release(SlaReleaseConfig {
+                min_samples: 2,
+                ..Default::default()
+            })
+        };
+        let (a, b) = (replica(), replica());
+        let seed = |daemon: &ReplicaDaemon, model: &str, secs: f64| {
+            let estimator = &daemon.sla_release.as_ref().unwrap().estimator;
+            let t0 = std::time::Instant::now();
+            estimator.started(model, t0);
+            estimator.finished(model, true, t0 + Duration::from_secs_f64(secs));
+        };
+        // Different local rates: per in-flight-second, A sees fast 10 and
+        // slow 1/500; B sees fast 5 and slow 1/2000.
+        seed(&a, "fast", 0.1);
+        seed(&a, "slow", 500.0);
+        seed(&b, "fast", 0.2);
+        seed(&b, "slow", 2_000.0);
+
+        let refresh = |daemon: &ReplicaDaemon| {
+            let release = daemon.sla_release.clone().unwrap();
+            let storage = daemon.storage.clone();
+            let daemon_id = daemon.daemon_id;
+            async move { release.refresh(storage.as_ref(), daemon_id).await.unwrap() }
+        };
+        // A publishes first and only sees itself: one sample, still cold.
+        refresh(&a).await;
+        let shared_throughput = |daemon: &ReplicaDaemon, model: &str| {
+            let release = daemon.sla_release.as_ref().unwrap();
+            let snapshot = release.backlog.read().unwrap();
+            release.throughput(snapshot.throughput.get(model), 0.0)
+        };
+        assert_eq!(
+            shared_throughput(&a, "fast"),
+            None,
+            "one replica's sample is below min_samples"
+        );
+        refresh(&b).await;
+        refresh(&a).await;
+        let (a_fast, b_fast) = (shared_throughput(&a, "fast"), shared_throughput(&b, "fast"));
+        let (a_slow, b_slow) = (shared_throughput(&a, "slow"), shared_throughput(&b, "slow"));
+        // Summed: fast 2 / 0.3s; slow 2 over the decayed in-flight-seconds of
+        // 500s and 2000s (tau = 600 / ln 2), times one in flight.
+        let tau = 600.0 / std::f64::consts::LN_2;
+        let decayed = |secs: f64| tau * (1.0 - (-secs / tau).exp());
+        assert!((a_fast.unwrap() - 2.0 / 0.3).abs() < 0.01, "{a_fast:?}");
+        let slow_expected = 2.0 / (decayed(500.0) + decayed(2_000.0));
+        assert!((a_slow.unwrap() - slow_expected).abs() < 1e-5, "{a_slow:?}");
+        // The replicas read at slightly different moments, so the rows are
+        // decayed by slightly different amounts: equal to well under 0.1%.
+        let agree = |x: Option<f64>, y: Option<f64>| {
+            let (x, y) = (x.unwrap(), y.unwrap());
+            (x - y).abs() <= 1e-3 * x.abs().max(y.abs())
+        };
+        assert!(
+            agree(a_fast, b_fast),
+            "replicas agree: {a_fast:?} {b_fast:?}"
+        );
+        assert!(
+            agree(a_slow, b_slow),
+            "replicas agree: {a_slow:?} {b_slow:?}"
+        );
 
         // Both due in 70 minutes on a 2h window: outside the ~15 minute ramp,
         // with all 30 outstanding requests ahead. Budget: 70 - 12 = 58 minutes.
@@ -6079,47 +6134,85 @@ mod tests {
                 batch_metadata: HashMap::from([("created_at".to_string(), created_at.clone())]),
             },
         };
-        let prepared = daemon
-            .prepare_claimed_requests(vec![claimed("slow"), claimed("fast")], ClaimLoopKind::Batch);
-        let body = |model: &str| -> serde_json::Value {
-            let p = prepared.iter().find(|p| p.capacity_model == model).unwrap();
-            serde_json::from_str(&p.request.data.body).unwrap()
+        let decisions = |daemon: &ReplicaDaemon| -> Vec<(String, bool)> {
+            let mut decisions: Vec<(String, bool)> = daemon
+                .prepare_claimed_requests(
+                    vec![claimed("slow"), claimed("fast")],
+                    ClaimLoopKind::Batch,
+                )
+                .into_iter()
+                .map(|p| {
+                    let body: serde_json::Value =
+                        serde_json::from_str(&p.request.data.body).unwrap();
+                    let tolerated = body["nvext"]["routing_constraints"]["tolerations"]
+                        == serde_json::json!([]);
+                    assert_eq!(tolerated, p.tolerated);
+                    (p.capacity_model, tolerated)
+                })
+                .collect();
+            decisions.sort();
+            decisions
         };
-
-        // slow: 30 requests at 0.001/s is 30000s, far past the budget.
-        assert!(
-            body("slow")["nvext"].get("routing_constraints").is_none(),
-            "a batch our workers will not finish in time may spill"
-        );
-        // fast: 30 requests at 10/s is 3s.
+        // slow: 30 requests at 0.0008/s is ~37500s, far past the budget;
+        // fast: 30 requests at 6.7/s is 4.5s.
+        let expected = vec![("fast".to_string(), true), ("slow".to_string(), false)];
+        assert_eq!(decisions(&a), expected);
         assert_eq!(
-            body("fast")["nvext"]["routing_constraints"]["tolerations"],
-            serde_json::json!([])
-        );
-        assert!(
-            prepared
-                .iter()
-                .any(|p| p.capacity_model == "fast" && p.tolerated)
-        );
-        assert!(
-            prepared
-                .iter()
-                .any(|p| p.capacity_model == "slow" && !p.tolerated)
+            decisions(&b),
+            expected,
+            "the same decision on every replica"
         );
 
-        // Without the projection both stay on our workers (ramp-only).
-        let daemon = Daemon::new(
-            daemon.storage.clone(),
+        // A replica that just started has no local history but projects from
+        // the shared sums straight away.
+        let c = replica();
+        refresh(&c).await;
+        assert_eq!(decisions(&c), expected);
+
+        // A dead replica's row stops being refreshed: once stale it is left
+        // out of the sums. Age B's rows past the staleness bound (4 x 15s).
+        sqlx::query(
+            "UPDATE dispatch_throughput_samples SET updated_at = NOW() - INTERVAL '5 minutes' WHERE daemon_id = $1",
+        )
+        .bind(b.daemon_id.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+        refresh(&c).await;
+        assert_eq!(
+            shared_throughput(&c, "fast"),
+            None,
+            "without B only A's single sample is fresh: below min_samples"
+        );
+        // Rows an hour old are deleted on the next refresh.
+        sqlx::query(
+            "UPDATE dispatch_throughput_samples SET updated_at = NOW() - INTERVAL '2 hours' WHERE daemon_id = $1",
+        )
+        .bind(b.daemon_id.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+        refresh(&a).await;
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM dispatch_throughput_samples WHERE daemon_id = $1",
+        )
+        .bind(b.daemon_id.0)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0);
+
+        // Without the projection both models stay on our workers (ramp-only).
+        let ramp_only = Daemon::new(
+            storage.clone(),
             Arc::new(crate::MockHttpClient::new()),
             DaemonConfig::default(),
             tokio_util::sync::CancellationToken::new(),
         )
         .with_dispatch_tolerations(vec![]);
-        let prepared = daemon.prepare_claimed_requests(vec![claimed("slow")], ClaimLoopKind::Batch);
-        let body: serde_json::Value = serde_json::from_str(&prepared[0].request.data.body).unwrap();
         assert_eq!(
-            body["nvext"]["routing_constraints"]["tolerations"],
-            serde_json::json!([])
+            decisions(&ramp_only),
+            vec![("fast".to_string(), true), ("slow".to_string(), true)]
         );
     }
 

@@ -2541,7 +2541,10 @@ fn default_batch_metadata_fields_dwctl() -> Vec<String> {
 /// `throughput` is measured only from requests dispatched WITH the
 /// tolerations (guaranteed to run on our workers; released ones may have
 /// spilled and would inflate it), as completions per in-flight-second scaled
-/// by the deployment-wide in-flight count. If the projected finish is later
+/// by the deployment-wide in-flight count. Every daemon publishes its decayed
+/// sums to the `dispatch_throughput_samples` table each refresh and reads
+/// back the sum over live daemons, so all replicas use the same estimate (and
+/// a restarted one is warm at once). If the projected finish is later
 /// than `deadline - safety_margin * window`, the request is sent without
 /// tolerations and may spill: batch normally waits and retries rather than
 /// spill to the paid tier, but when it would miss its SLA, meeting the

@@ -15,12 +15,18 @@
 //! `work_ahead` comes from the database (outstanding requests whose deadline
 //! is no later than this one, refreshed every few seconds for all models in
 //! one query) and `throughput` from [`ThroughputEstimator`], which only counts
-//! requests dispatched with tolerations, i.e. served by our own workers.
+//! requests dispatched with tolerations, i.e. served by our own workers. Each
+//! daemon publishes its estimator sums to `dispatch_throughput_samples` on
+//! every refresh and reads back the sum over the live daemons, so every
+//! replica decides from the same deployment-wide numbers.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+use fusillade_core::manager::{DaemonStorage, DispatchThroughputSample};
+use fusillade_core::request::DaemonId;
 
 /// Configuration for releasing tolerations on a throughput projection.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -122,20 +128,20 @@ pub(crate) fn release_reason(
         .then_some(ReleaseReason::SlaProjection)
 }
 
-/// Per-model throughput of our own workers, from requests dispatched with
-/// tolerations (which Dynamo never sends to a spillover tier).
+/// This daemon's share of the per-model throughput of our own workers, from
+/// requests dispatched with tolerations (which Dynamo never sends to a
+/// spillover tier).
 ///
-/// Measured as successful completions per in-flight-second: exponentially
-/// decayed completions divided by the exponentially decayed integral of
-/// tolerated requests in flight. By Little's law that is `1 / latency`, so
-/// multiplying it by the model's concurrency gives its throughput; the
-/// daemon uses the database-wide in-flight count, which turns a per-pod
-/// measurement into a whole-deployment estimate. Idle time decays both sums
-/// equally, so an idle model keeps its last rate instead of drifting to zero.
+/// Two exponentially decayed sums per model: successful completions, and
+/// in-flight-seconds (the integral of tolerated requests in flight). Every
+/// refresh each daemon publishes its sums to the database and reads back the
+/// sum over every live daemon, and the projection uses only those
+/// deployment-wide sums, so every replica sees the same estimate. The ratio
+/// of the summed sums is completions per in-flight-second (`1 / latency`, by
+/// Little's law), weighted across daemons by how much each one ran.
 #[derive(Debug)]
 pub(crate) struct ThroughputEstimator {
     tau_secs: f64,
-    min_samples: u64,
     models: dashmap::DashMap<String, Mutex<ModelRate>>,
 }
 
@@ -163,12 +169,16 @@ impl ModelRate {
 }
 
 impl ThroughputEstimator {
-    pub(crate) fn new(half_life_secs: f64, min_samples: u64) -> Self {
+    pub(crate) fn new(half_life_secs: f64) -> Self {
         Self {
             tau_secs: half_life_secs.max(1.0) / std::f64::consts::LN_2,
-            min_samples,
             models: dashmap::DashMap::new(),
         }
+    }
+
+    /// The decay time constant: `half_life / ln 2`.
+    pub(crate) fn tau_secs(&self) -> f64 {
+        self.tau_secs
     }
 
     fn with_model<T>(&self, model: &str, now: Instant, f: impl FnOnce(&mut ModelRate) -> T) -> T {
@@ -204,22 +214,23 @@ impl ThroughputEstimator {
         });
     }
 
-    /// Tolerated requests of this model in flight on this daemon.
-    pub(crate) fn local_in_flight(&self, model: &str) -> u64 {
-        self.models
-            .get(model)
-            .map(|rate| rate.lock().unwrap_or_else(|p| p.into_inner()).in_flight)
-            .unwrap_or(0)
-    }
-
-    /// Successful completions per in-flight-second, or `None` until the model
-    /// has `min_samples` successful tolerated completions.
-    pub(crate) fn per_slot_rate(&self, model: &str, now: Instant) -> Option<f64> {
-        self.models.get(model)?;
-        self.with_model(model, now, |rate| {
-            (rate.total_completions >= self.min_samples && rate.slot_secs > 0.0)
-                .then(|| rate.completions / rate.slot_secs)
-        })
+    /// This daemon's sums for every model it has dispatched, decayed to `now`.
+    pub(crate) fn export(&self, now: Instant) -> Vec<DispatchThroughputSample> {
+        let models: Vec<String> = self.models.iter().map(|e| e.key().clone()).collect();
+        models
+            .into_iter()
+            .map(|model| {
+                let (completions, slot_seconds, samples) = self.with_model(&model, now, |rate| {
+                    (rate.completions, rate.slot_secs, rate.total_completions)
+                });
+                DispatchThroughputSample {
+                    model,
+                    completions,
+                    slot_seconds,
+                    samples: i64::try_from(samples).unwrap_or(i64::MAX),
+                }
+            })
+            .collect()
     }
 
     /// Track one tolerated dispatch; dropping the guard records the finish.
@@ -292,11 +303,13 @@ impl ModelBacklog {
     }
 }
 
-/// The last outstanding-work snapshot for every model.
+/// The last shared snapshot: outstanding work and deployment-wide throughput
+/// sums for every model, read in one refresh.
 #[derive(Debug, Default)]
 pub(crate) struct BacklogSnapshot {
     pub refreshed_at: Option<DateTime<Utc>>,
-    pub models: std::collections::HashMap<String, ModelBacklog>,
+    pub models: HashMap<String, ModelBacklog>,
+    pub throughput: HashMap<String, DispatchThroughputSample>,
 }
 
 /// Shared state for the projection: the estimator, the snapshot and config.
@@ -310,38 +323,33 @@ pub(crate) struct SlaRelease {
 impl SlaRelease {
     pub(crate) fn new(config: SlaReleaseConfig) -> Self {
         Self {
-            estimator: Arc::new(ThroughputEstimator::new(
-                config.half_life_secs,
-                config.min_samples,
-            )),
+            estimator: Arc::new(ThroughputEstimator::new(config.half_life_secs)),
             backlog: RwLock::new(BacklogSnapshot::default()),
             config,
         }
     }
 
-    /// Our workers' throughput for `model`: per-slot rate times the
-    /// database-wide in-flight count (at least this daemon's own, and one).
+    /// Our workers' deployment-wide throughput for a model, from the shared
+    /// sums: `sum(completions) / sum(in-flight-seconds)` times the
+    /// deployment-wide in-flight count (at least one). `None` until the live
+    /// daemons together have `min_samples` successful tolerated completions.
     pub(crate) fn throughput(
         &self,
-        model: &str,
+        shared: Option<&DispatchThroughputSample>,
         global_in_flight: f64,
-        now: Instant,
     ) -> Option<f64> {
-        let per_slot = self.estimator.per_slot_rate(model, now)?;
-        let concurrency = global_in_flight
-            .max(self.estimator.local_in_flight(model) as f64)
-            .max(1.0);
-        Some(per_slot * concurrency)
+        let shared = shared?;
+        if shared.samples < i64::try_from(self.config.min_samples).unwrap_or(i64::MAX)
+            || shared.slot_seconds <= 0.0
+        {
+            return None;
+        }
+        Some(shared.completions / shared.slot_seconds * global_in_flight.max(1.0))
     }
 
     /// Projection inputs for a request of `model` due at `deadline`, or
-    /// `None` without a snapshot or a trusted estimate (ramp-only then).
-    pub(crate) fn projection(
-        &self,
-        model: &str,
-        deadline: DateTime<Utc>,
-        now: Instant,
-    ) -> Option<Projection> {
+    /// `None` without a fresh snapshot or a trusted estimate (ramp-only then).
+    pub(crate) fn projection(&self, model: &str, deadline: DateTime<Utc>) -> Option<Projection> {
         let snapshot = self.backlog.read().unwrap_or_else(|p| p.into_inner());
         let refreshed_at = snapshot.refreshed_at?;
         // A snapshot the refresher has not replaced for ten intervals (the
@@ -351,7 +359,8 @@ impl SlaRelease {
             return None;
         }
         let backlog = snapshot.models.get(model)?;
-        let throughput = self.throughput(model, backlog.global_in_flight, now)?;
+        let throughput =
+            self.throughput(snapshot.throughput.get(model), backlog.global_in_flight)?;
         let offset = (deadline - refreshed_at).num_milliseconds() as f64 / 1000.0;
         Some(Projection {
             work_ahead: backlog.work_ahead(offset),
@@ -364,26 +373,58 @@ impl SlaRelease {
     pub(crate) fn install(
         &self,
         refreshed_at: DateTime<Utc>,
-        models: std::collections::HashMap<String, ModelBacklog>,
+        models: HashMap<String, ModelBacklog>,
+        throughput: Vec<DispatchThroughputSample>,
     ) {
-        let now = Instant::now();
+        let throughput: HashMap<String, DispatchThroughputSample> = throughput
+            .into_iter()
+            .map(|sample| (sample.model.clone(), sample))
+            .collect();
         for (model, backlog) in &models {
-            if let Some(throughput) = self.throughput(model, backlog.global_in_flight, now) {
+            if let Some(rate) = self.throughput(throughput.get(model), backlog.global_in_flight) {
                 metrics::gauge!("fusillade_perceived_throughput", "model" => model.clone())
-                    .set(throughput);
-                if throughput > 0.0 {
+                    .set(rate);
+                if rate > 0.0 {
                     metrics::gauge!("fusillade_projected_backlog_seconds", "model" => model.clone())
-                        .set(backlog.total() / throughput);
+                        .set(backlog.total() / rate);
                 }
             }
         }
         let mut snapshot = self.backlog.write().unwrap_or_else(|p| p.into_inner());
         snapshot.refreshed_at = Some(refreshed_at);
         snapshot.models = models;
+        snapshot.throughput = throughput;
     }
 
     pub(crate) fn refresh_interval(&self) -> Duration {
         Duration::from_millis(self.config.refresh_interval_ms.max(1_000))
+    }
+
+    /// A row not refreshed for four intervals belongs to a daemon that died
+    /// or stopped, and is left out of the sums.
+    pub(crate) fn stale_after(&self) -> Duration {
+        self.refresh_interval() * 4
+    }
+
+    /// One refresh: publish this daemon's throughput sums and read back the
+    /// deployment-wide ones, then read the outstanding work, and install both.
+    pub(crate) async fn refresh<S>(&self, storage: &S, daemon_id: DaemonId) -> crate::Result<()>
+    where
+        S: fusillade_core::manager::Storage + DaemonStorage + ?Sized,
+    {
+        let refreshed_at = Utc::now();
+        let local = self.estimator.export(Instant::now());
+        let throughput = storage
+            .exchange_dispatch_throughput(
+                daemon_id,
+                &local,
+                self.estimator.tau_secs(),
+                self.stale_after().as_secs_f64(),
+            )
+            .await?;
+        let models = read_backlog(storage).await?;
+        self.install(refreshed_at, models, throughput);
+        Ok(())
     }
 }
 
@@ -393,7 +434,7 @@ impl SlaRelease {
 /// Background and realtime rows are excluded.
 pub(crate) async fn read_backlog<S: fusillade_core::manager::Storage + ?Sized>(
     storage: &S,
-) -> crate::Result<std::collections::HashMap<String, ModelBacklog>> {
+) -> crate::Result<HashMap<String, ModelBacklog>> {
     use fusillade_core::request::ServiceTierFilter;
 
     // Daemon work only: realtime rows (`priority` tier, processed by the
@@ -423,7 +464,7 @@ pub(crate) async fn read_backlog<S: fusillade_core::manager::Storage + ?Sized>(
         )
         .await?;
 
-    let mut models = std::collections::HashMap::new();
+    let mut models = HashMap::new();
     for (model, counts) in outstanding {
         let cumulative = LADDER_SECS
             .iter()
@@ -558,40 +599,61 @@ mod tests {
         );
     }
 
+    /// One model's exported sums, as the daemon would publish them.
+    fn exported(
+        estimator: &ThroughputEstimator,
+        model: &str,
+        now: Instant,
+    ) -> DispatchThroughputSample {
+        estimator
+            .export(now)
+            .into_iter()
+            .find(|sample| sample.model == model)
+            .unwrap()
+    }
+
+    fn per_slot(sample: &DispatchThroughputSample) -> f64 {
+        sample.completions / sample.slot_seconds
+    }
+
+    /// Element-wise sum, as the database aggregate computes it.
+    fn summed(samples: &[DispatchThroughputSample]) -> DispatchThroughputSample {
+        DispatchThroughputSample {
+            model: samples[0].model.clone(),
+            completions: samples.iter().map(|s| s.completions).sum(),
+            slot_seconds: samples.iter().map(|s| s.slot_seconds).sum(),
+            samples: samples.iter().map(|s| s.samples).sum(),
+        }
+    }
+
     #[test]
-    fn estimator_is_cold_until_min_samples_then_measures_per_slot_rate() {
-        let estimator = ThroughputEstimator::new(600.0, 3);
+    fn estimator_measures_completions_per_in_flight_second() {
+        let estimator = ThroughputEstimator::new(600.0);
         let t0 = Instant::now();
-        assert_eq!(estimator.per_slot_rate("m", t0), None, "never seen");
+        assert!(estimator.export(t0).is_empty(), "never seen");
 
         // Two slots busy, each finishing a request every 2s: 1 completion/s
         // overall, 0.5 per in-flight-second.
         estimator.started("m", t0);
         estimator.started("m", t0);
         let mut t = t0;
-        for _ in 0..2 {
-            t += Duration::from_secs(1);
-            estimator.finished("m", true, t);
-            estimator.started("m", t);
-        }
-        assert_eq!(
-            estimator.per_slot_rate("m", t),
-            None,
-            "two samples, three required"
-        );
         for _ in 0..200 {
             t += Duration::from_secs(1);
             estimator.finished("m", true, t);
             estimator.started("m", t);
         }
-        let rate = estimator.per_slot_rate("m", t).unwrap();
-        assert!((rate - 0.5).abs() < 0.01, "{rate}");
-        assert_eq!(estimator.local_in_flight("m"), 2);
+        let sample = exported(&estimator, "m", t);
+        assert_eq!(sample.samples, 200);
+        assert!(
+            (per_slot(&sample) - 0.5).abs() < 0.01,
+            "{}",
+            per_slot(&sample)
+        );
     }
 
     #[test]
     fn estimator_counts_only_successes_and_decays_toward_the_new_rate() {
-        let estimator = ThroughputEstimator::new(60.0, 1);
+        let estimator = ThroughputEstimator::new(60.0);
         let t0 = Instant::now();
         let mut t = t0;
         // One slot, a success every second: rate 1 per slot-second.
@@ -601,7 +663,7 @@ mod tests {
             estimator.finished("m", true, t);
             estimator.started("m", t);
         }
-        assert!((estimator.per_slot_rate("m", t).unwrap() - 1.0).abs() < 0.01);
+        assert!((per_slot(&exported(&estimator, "m", t)) - 1.0).abs() < 0.01);
 
         // The model slows: one success every 4s, failures in between.
         for i in 0..600 {
@@ -609,29 +671,92 @@ mod tests {
             estimator.finished("m", i % 4 == 3, t);
             estimator.started("m", t);
         }
-        let rate = estimator.per_slot_rate("m", t).unwrap();
+        let sample = exported(&estimator, "m", t);
+        assert_eq!(sample.samples, 600 + 150, "failures are not samples");
+        let rate = per_slot(&sample);
         assert!((rate - 0.25).abs() < 0.03, "ten half-lives later: {rate}");
 
         // Idle time decays both sums alike: the rate holds.
         estimator.finished("m", false, t);
-        let later = t + Duration::from_secs(3_600);
-        let idle_rate = estimator.per_slot_rate("m", later).unwrap();
+        let idle_rate = per_slot(&exported(&estimator, "m", t + Duration::from_secs(3_600)));
         assert!((idle_rate - rate).abs() < 0.03, "{idle_rate} vs {rate}");
+    }
+
+    /// Summing the published sums gives the deployment's rate, weighted by
+    /// how much each replica ran: two replicas with different local rates
+    /// agree on one number, and min_samples applies to the sum.
+    #[test]
+    fn summed_estimates_combine_replicas() {
+        let t0 = Instant::now();
+        let (a, b) = (
+            ThroughputEstimator::new(600.0),
+            ThroughputEstimator::new(600.0),
+        );
+        // A: one slot, a success every second. B: three slots, each taking 6s.
+        a.started("m", t0);
+        for _ in 0..3 {
+            b.started("m", t0);
+        }
+        let mut t = t0;
+        for second in 1..=60 {
+            t += Duration::from_secs(1);
+            a.finished("m", true, t);
+            a.started("m", t);
+            if second % 2 == 0 {
+                b.finished("m", true, t);
+                b.started("m", t);
+            }
+        }
+        let (sa, sb) = (exported(&a, "m", t), exported(&b, "m", t));
+        assert!((per_slot(&sa) - 1.0).abs() < 0.02);
+        assert!((per_slot(&sb) - 1.0 / 6.0).abs() < 0.02);
+        let total = summed(&[sa, sb]);
+        // 90 completions over 240 in-flight-seconds.
+        assert!(
+            (per_slot(&total) - 90.0 / 240.0).abs() < 0.01,
+            "{}",
+            per_slot(&total)
+        );
+        assert_eq!(total.samples, 90);
+
+        let release = SlaRelease::new(SlaReleaseConfig {
+            min_samples: 90,
+            ..Default::default()
+        });
+        // Four in flight across the deployment: about 1.5 completions/s.
+        let throughput = release.throughput(Some(&total), 4.0).unwrap();
+        assert!((throughput - 1.5).abs() < 0.05, "{throughput}");
+        let release = SlaRelease::new(SlaReleaseConfig {
+            min_samples: 91,
+            ..Default::default()
+        });
+        assert_eq!(
+            release.throughput(Some(&total), 4.0),
+            None,
+            "cold below min_samples"
+        );
+        assert_eq!(release.throughput(None, 4.0), None, "no shared row");
     }
 
     #[test]
     fn tracked_dispatch_records_the_outcome_on_drop() {
-        let estimator = Arc::new(ThroughputEstimator::new(600.0, 1));
+        let estimator = Arc::new(ThroughputEstimator::new(600.0));
+        let in_flight = |estimator: &ThroughputEstimator| {
+            estimator
+                .models
+                .get("m")
+                .map(|rate| rate.lock().unwrap().in_flight)
+                .unwrap_or(0)
+        };
         {
             let mut tracked = estimator.track("m");
-            assert_eq!(estimator.local_in_flight("m"), 1);
+            assert_eq!(in_flight(&estimator), 1);
             tracked.succeeded = true;
         }
-        assert_eq!(estimator.local_in_flight("m"), 0);
+        assert_eq!(in_flight(&estimator), 0);
         drop(estimator.track("m"));
-        let rate = estimator.models.get("m").unwrap();
         assert_eq!(
-            rate.lock().unwrap().total_completions,
+            exported(&estimator, "m", Instant::now()).samples,
             1,
             "the failure did not count"
         );
@@ -659,46 +784,62 @@ mod tests {
     }
 
     #[test]
-    fn projection_needs_a_snapshot_and_a_warm_estimate() {
+    fn projection_needs_a_fresh_snapshot_and_a_warm_shared_estimate() {
         let release = SlaRelease::new(SlaReleaseConfig {
             min_samples: 1,
             ..Default::default()
         });
         let deadline = Utc::now() + chrono::Duration::hours(1);
-        let now = Instant::now();
-        assert!(
-            release.projection("m", deadline, now).is_none(),
-            "no snapshot"
-        );
+        assert!(release.projection("m", deadline).is_none(), "no snapshot");
 
-        release.install(
-            Utc::now(),
-            std::collections::HashMap::from([(
+        let backlog = || {
+            HashMap::from([(
                 "m".to_string(),
                 ModelBacklog {
                     cumulative: vec![50.0; LADDER_SECS.len()],
                     global_in_flight: 10.0,
                 },
-            )]),
-        );
+            )])
+        };
+        release.install(Utc::now(), backlog(), vec![]);
         assert!(
-            release.projection("m", deadline, now).is_none(),
-            "cold estimator"
+            release.projection("m", deadline).is_none(),
+            "no shared estimate"
         );
 
+        // The local estimator alone does not count: only the shared sums do.
+        let now = Instant::now();
         release.estimator.started("m", now);
         release
             .estimator
             .finished("m", true, now + Duration::from_secs(2));
-        let projection = release
-            .projection("m", deadline, now + Duration::from_secs(2))
-            .unwrap();
+        assert!(release.projection("m", deadline).is_none());
+
+        let shared = vec![DispatchThroughputSample {
+            model: "m".to_string(),
+            completions: 1.0,
+            slot_seconds: 2.0,
+            samples: 1,
+        }];
+        release.install(Utc::now(), backlog(), shared.clone());
+        let projection = release.projection("m", deadline).unwrap();
         assert_eq!(projection.work_ahead, 50.0);
-        // 1 completion over 2 slot-seconds, times 10 in flight across daemons.
+        // 1 completion over 2 in-flight-seconds, times 10 in flight.
         assert!(
-            (projection.throughput - 5.0).abs() < 0.01,
+            (projection.throughput - 5.0).abs() < 1e-9,
             "{}",
             projection.throughput
+        );
+
+        // A snapshot the refresher has not replaced for ten intervals is stale.
+        release.install(
+            Utc::now() - chrono::Duration::minutes(10),
+            backlog(),
+            shared,
+        );
+        assert!(
+            release.projection("m", deadline).is_none(),
+            "stale snapshot"
         );
     }
 }
