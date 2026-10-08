@@ -107,7 +107,8 @@ impl SharedRedis {
         tokio::spawn(async move {
             let config = ConnectionManagerConfig::new()
                 .set_connection_timeout(CONNECT_TIMEOUT)
-                .set_response_timeout(RESPONSE_TIMEOUT);
+                .set_response_timeout(RESPONSE_TIMEOUT)
+                .set_number_of_retries(0);
             loop {
                 match ConnectionManager::new_with_config(redis.client.clone(), config.clone()).await {
                     Ok(connection) => {
@@ -456,7 +457,7 @@ mod tests {
         }
     }
 
-    async fn fake_redis(claim_reply_after: Option<Duration>) -> (String, Arc<AtomicUsize>, Commands) {
+    async fn fake_redis(claim_reply_after: Option<Duration>, refuse_first: usize) -> (String, Arc<AtomicUsize>, Commands) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("redis://{}", listener.local_addr().unwrap());
         let accepted = Arc::new(AtomicUsize::new(0));
@@ -466,8 +467,9 @@ mod tests {
             let commands = Arc::clone(&commands);
             async move {
                 while let Ok((socket, _)) = listener.accept().await {
-                    accepted.fetch_add(1, Ordering::SeqCst);
-                    tokio::spawn(serve(socket, claim_reply_after, Arc::clone(&commands)));
+                    if accepted.fetch_add(1, Ordering::SeqCst) >= refuse_first {
+                        tokio::spawn(serve(socket, claim_reply_after, Arc::clone(&commands)));
+                    }
                 }
             }
         });
@@ -512,8 +514,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_connection_attempts_are_retried_every_second() {
+        let (url, accepted, _) = fake_redis(Some(Duration::ZERO), 2).await;
+        let limiter = limiter(Some(url));
+        assert!(limiter.redis.as_ref().unwrap().connection().is_none());
+        connected(limiter).await;
+        assert_eq!(accepted.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
     async fn a_redis_that_stops_answering_is_replaced_with_a_new_connection() {
-        let (url, accepted, commands) = fake_redis(None).await;
+        let (url, accepted, commands) = fake_redis(None, 0).await;
         let limiter = connected(limiter(Some(url))).await;
         assert_eq!(accepted.load(Ordering::SeqCst), 1);
 
@@ -543,7 +554,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_claim_that_answers_after_the_deadline_is_withdrawn() {
-        let (url, _, commands) = fake_redis(Some(REDIS_TIMEOUT * 2)).await;
+        let (url, _, commands) = fake_redis(Some(REDIS_TIMEOUT * 2), 0).await;
         let limiter = connected(limiter(Some(url))).await;
 
         assert!(limiter.try_acquire("acct", "model", 10).await.is_some());
