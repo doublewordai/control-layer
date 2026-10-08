@@ -72,8 +72,19 @@ impl SharedRedis {
         Ok(redis)
     }
 
+    fn current(&self) -> Option<Arc<ConnectionManager>> {
+        self.connection.load_full()
+    }
+
     fn connection(&self) -> Option<ConnectionManager> {
-        self.connection.load_full().map(|connection| ConnectionManager::clone(&connection))
+        self.current().map(|connection| ConnectionManager::clone(&connection))
+    }
+
+    fn is_current(&self, connection: &Arc<ConnectionManager>) -> bool {
+        self.connection
+            .load()
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, connection))
     }
 
     fn answered(&self) {
@@ -181,11 +192,12 @@ impl InflightLimiter for RealtimeInflightLimiter {
             let Some(redis) = &self.redis else {
                 return self.acquire_locally(account, model, limit);
             };
-            let Some(mut connection) = redis.connection() else {
+            let Some(current) = redis.current() else {
                 tracing::warn!(scope = self.scope, "In-flight Redis is not connected; counting in this pod instead");
                 metrics::counter!("dwctl_realtime_inflight_redis_fallbacks_total", "scope" => self.scope).increment(1);
                 return self.acquire_locally(account, model, limit);
             };
+            let mut connection = ConnectionManager::clone(&current);
             let key = inflight_key(model, account);
             let member = Uuid::new_v4().to_string();
             match tokio::time::timeout(REDIS_TIMEOUT, claim(&mut connection, &key, &member, limit)).await {
@@ -204,19 +216,21 @@ impl InflightLimiter for RealtimeInflightLimiter {
                 }
                 Err(_) => {
                     redis.timed_out();
-                    let scope = self.scope;
-                    tokio::spawn(async move {
-                        if let Err(error) = remove(&mut connection, &key, &member).await {
-                            crate::background_error!(
-                                crate::metrics::errors::component::REALTIME_INFLIGHT,
-                                "claim_withdraw",
-                                Warning,
-                                scope = scope,
-                                error = %error,
-                                "Failed to withdraw a timed-out in-flight claim; its lease will expire"
-                            );
-                        }
-                    });
+                    if redis.is_current(&current) {
+                        let scope = self.scope;
+                        tokio::spawn(async move {
+                            if let Err(error) = remove(&mut connection, &key, &member).await {
+                                crate::background_error!(
+                                    crate::metrics::errors::component::REALTIME_INFLIGHT,
+                                    "claim_withdraw",
+                                    Warning,
+                                    scope = scope,
+                                    error = %error,
+                                    "Failed to withdraw a timed-out in-flight claim; its lease will expire"
+                                );
+                            }
+                        });
+                    }
                     tracing::warn!(scope = self.scope, "In-flight claim timed out; counting in this pod instead");
                     metrics::counter!("dwctl_realtime_inflight_redis_fallbacks_total", "scope" => self.scope).increment(1);
                     self.acquire_locally(account, model, limit)
@@ -499,13 +513,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_redis_that_stops_answering_is_replaced_with_a_new_connection() {
-        let (url, accepted, _) = fake_redis(None).await;
+        let (url, accepted, commands) = fake_redis(None).await;
         let limiter = connected(limiter(Some(url))).await;
         assert_eq!(accepted.load(Ordering::SeqCst), 1);
 
-        for _ in 0..RECONNECT_AFTER_TIMEOUTS {
-            assert!(limiter.try_acquire("acct", "model", 10).await.is_some());
-        }
+        let claims = (0..20).map(|_| limiter.try_acquire("acct", "model", 100));
+        assert!(futures::future::join_all(claims).await.iter().all(Option::is_some));
         for _ in 0..500 {
             if accepted.load(Ordering::SeqCst) == 2 {
                 break;
@@ -514,6 +527,18 @@ mod tests {
         }
         assert_eq!(accepted.load(Ordering::SeqCst), 2);
         connected(limiter).await;
+        let withdrawals = || commands.lock().unwrap().iter().filter(|(name, _)| name == "ZREM").count() as u32;
+        for _ in 0..500 {
+            if withdrawals() >= RECONNECT_AFTER_TIMEOUTS - 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            withdrawals(),
+            RECONNECT_AFTER_TIMEOUTS - 1,
+            "claims on a replaced connection are not withdrawn"
+        );
     }
 
     #[tokio::test]
