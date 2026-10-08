@@ -59,6 +59,7 @@
 
 pub mod analytics;
 pub mod api_keys;
+pub mod batch_admission_demand;
 pub mod batch_templates;
 pub mod cache_tariffs;
 pub mod capacity_reservations;
@@ -78,6 +79,7 @@ pub mod tariffs;
 pub mod users;
 pub mod webhooks;
 
+pub use batch_admission_demand::BatchAdmissionDemand;
 pub use batch_templates::BatchTemplates;
 pub use cache_tariffs::{ActiveTariff, CacheTariffOverrides, CacheTariffs};
 pub use capacity_reservations::BatchCapacityReservations;

@@ -14,47 +14,62 @@ impl<'c> BatchCapacityReservations<'c> {
         Self { db }
     }
 
-    /// Sum unexpired reservations per model for one completion window.
+    /// Sum reservations per model and completion window.
     ///
-    /// Active (unreleased) reservations are always counted. When
-    /// `released_since` is set, reservations released at or after that instant
-    /// are counted too: `reserve_capacity` snapshots committed pending rows
-    /// *before* taking the admission lock, so a peer batch that committed its
-    /// rows after the snapshot and released its reservation before this read
-    /// would otherwise be counted by neither. Including recently released
-    /// reservations closes that gap; the worst case is a batch counted twice,
-    /// which only errs towards under-acceptance. `released_since` must come
-    /// from the same clock as `released_at` (this database's `now()`).
+    /// Unreleased reservations count until they expire (the TTL is the safety
+    /// net for a handler that died before releasing). When `released_since` is
+    /// set, reservations released at or after that instant are counted too,
+    /// whatever their expiry: `reserve_capacity` takes its outstanding-work
+    /// snapshot (possibly a cached one) *before* reading reservations, so a
+    /// peer batch that committed after the snapshot and released its
+    /// reservation since would otherwise be counted by neither. A released
+    /// reservation stands for a batch that is already committed, so its TTL is
+    /// irrelevant here. The worst case is a batch counted twice, which only
+    /// errs towards under-acceptance. `released_since` must come from the same
+    /// clock as `released_at` (this database's `now()`).
+    ///
+    /// The two branches are served by `idx_batch_capacity_reservations_active`
+    /// (unreleased rows) and `idx_batch_capacity_reservations_released`
+    /// (recently released rows), so the cost does not grow with the number of
+    /// reservations the ledger has accumulated.
     #[instrument(skip(self, model_ids), fields(count = model_ids.len()), err)]
-    pub async fn sum_active_by_model_window(
+    pub async fn sum_by_model_and_window(
         &mut self,
         model_ids: &[Uuid],
-        completion_window: &str,
         released_since: Option<DateTime<Utc>>,
-    ) -> Result<Vec<(Uuid, i64)>> {
+    ) -> Result<Vec<(Uuid, String, i64)>> {
         if model_ids.is_empty() {
             return Ok(Vec::new());
         }
 
         let rows = sqlx::query!(
             r#"
-            SELECT model_id,
-                   COALESCE(SUM(reserved_requests), 0)::BIGINT AS reserved
-            FROM batch_capacity_reservations
-            WHERE model_id = ANY($1)
-              AND completion_window = $2
-              AND (released_at IS NULL OR released_at >= $3)
-              AND expires_at > now()
-            GROUP BY model_id
+            SELECT model_id AS "model_id!",
+                   completion_window AS "completion_window!",
+                   COALESCE(SUM(reserved_requests), 0)::BIGINT AS "reserved!"
+            FROM (
+                SELECT model_id, completion_window, reserved_requests
+                FROM batch_capacity_reservations
+                WHERE model_id = ANY($1)
+                  AND released_at IS NULL
+                  AND expires_at > now()
+                UNION ALL
+                SELECT model_id, completion_window, reserved_requests
+                FROM batch_capacity_reservations
+                WHERE $2::timestamptz IS NOT NULL
+                  AND model_id = ANY($1)
+                  AND released_at IS NOT NULL
+                  AND released_at >= $2::timestamptz
+            ) r
+            GROUP BY model_id, completion_window
             "#,
             model_ids,
-            completion_window,
             released_since
         )
         .fetch_all(&mut *self.db)
         .await?;
 
-        Ok(rows.into_iter().map(|r| (r.model_id, r.reserved.unwrap_or(0))).collect())
+        Ok(rows.into_iter().map(|r| (r.model_id, r.completion_window, r.reserved)).collect())
     }
 
     #[instrument(skip(self, rows), fields(count = rows.len()), err)]
@@ -144,10 +159,11 @@ mod tests {
 
         assert_eq!(ids.len(), 2);
 
-        let rows = repo.sum_active_by_model_window(&[model_a, model_b], "24h", None).await.unwrap();
+        let rows = repo.sum_by_model_and_window(&[model_a, model_b], None).await.unwrap();
 
         let mut map = HashMap::new();
-        for (id, sum) in rows {
+        for (id, window, sum) in rows {
+            assert_eq!(window, "24h");
             map.insert(id, sum);
         }
 
@@ -169,9 +185,9 @@ mod tests {
 
         repo.release_reservations(&ids).await.unwrap();
 
-        let rows = repo.sum_active_by_model_window(&[model_a], "24h", None).await.unwrap();
+        let rows = repo.sum_by_model_and_window(&[model_a], None).await.unwrap();
 
-        let sum = rows.into_iter().find(|(id, _)| *id == model_a).map(|(_, v)| v).unwrap_or(0);
+        let sum = sum_for(rows, model_a, "24h");
 
         assert_eq!(sum, 0);
     }
@@ -188,9 +204,9 @@ mod tests {
 
         repo.insert_reservations(&[(model_a, "24h", 25, expires_at)]).await.unwrap();
 
-        let rows = repo.sum_active_by_model_window(&[model_a], "24h", None).await.unwrap();
+        let rows = repo.sum_by_model_and_window(&[model_a], None).await.unwrap();
 
-        let sum = rows.into_iter().find(|(id, _)| *id == model_a).map(|(_, v)| v).unwrap_or(0);
+        let sum = sum_for(rows, model_a, "24h");
 
         assert_eq!(sum, 0);
     }
@@ -232,18 +248,69 @@ mod tests {
             .await
             .unwrap();
 
-        let sum_for = |rows: Vec<(Uuid, i64)>| rows.into_iter().find(|(id, _)| *id == model_a).map(|(_, v)| v).unwrap_or(0);
-
         let with_since = BatchCapacityReservations::new(&mut conn)
-            .sum_active_by_model_window(&[model_a], "24h", Some(since))
+            .sum_by_model_and_window(&[model_a], Some(since))
             .await
             .unwrap();
-        assert_eq!(sum_for(with_since), 27);
+        assert_eq!(sum_for(with_since, model_a, "24h"), 27);
 
         let active_only = BatchCapacityReservations::new(&mut conn)
-            .sum_active_by_model_window(&[model_a], "24h", None)
+            .sum_by_model_and_window(&[model_a], None)
             .await
             .unwrap();
-        assert_eq!(sum_for(active_only), 7);
+        assert_eq!(sum_for(active_only, model_a, "24h"), 7);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_released_since_ignores_ttl_and_sums_per_window(pool: PgPool) {
+        let (model_a, _) = setup_models(&pool).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let since: chrono::DateTime<Utc> = sqlx::query_scalar!(r#"SELECT now() AS "now!""#)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+
+        // A reservation whose TTL lapsed before it was released still stands
+        // for a batch that committed after `since`, so it must be counted.
+        let lapsed = BatchCapacityReservations::new(&mut conn)
+            .insert_reservations(&[(model_a, "24h", 11, Utc::now() - Duration::minutes(1))])
+            .await
+            .unwrap();
+        BatchCapacityReservations::new(&mut conn)
+            .release_reservations(&lapsed)
+            .await
+            .unwrap();
+
+        // Active reservations in two windows are reported separately.
+        BatchCapacityReservations::new(&mut conn)
+            .insert_reservations(&[
+                (model_a, "1h", 3, Utc::now() + Duration::minutes(10)),
+                (model_a, "24h", 5, Utc::now() + Duration::minutes(10)),
+            ])
+            .await
+            .unwrap();
+
+        let rows = BatchCapacityReservations::new(&mut conn)
+            .sum_by_model_and_window(&[model_a], Some(since))
+            .await
+            .unwrap();
+        assert_eq!(sum_for(rows.clone(), model_a, "24h"), 16);
+        assert_eq!(sum_for(rows, model_a, "1h"), 3);
+
+        // Without `since`, the lapsed-then-released reservation is not counted.
+        let rows = BatchCapacityReservations::new(&mut conn)
+            .sum_by_model_and_window(&[model_a], None)
+            .await
+            .unwrap();
+        assert_eq!(sum_for(rows, model_a, "24h"), 5);
+    }
+
+    fn sum_for(rows: Vec<(Uuid, String, i64)>, model: Uuid, window: &str) -> i64 {
+        rows.into_iter()
+            .filter(|(id, w, _)| *id == model && w == window)
+            .map(|(_, _, v)| v)
+            .sum()
     }
 }

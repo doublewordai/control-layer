@@ -406,7 +406,18 @@ batches:
   # method / make a payment). Set to 0 to disable. Default: 1000.
   unverified_requests_per_completion_hour: 1000
 
-  pending_capacity_counts_enabled: false # Include committed pending requests in batch submission capacity checks (default: false)
+  # Count work already admitted and not yet finished (pending/claimed/processing
+  # rows of active batches, and batches whose rows are not inserted yet) in
+  # batch admission. Admitting a batch for window W then checks W and every
+  # longer allowed window: outstanding work due within the window + in-flight
+  # reservations + the new batch <= throughput * window * relaxation.
+  # When false only in-flight reservations are counted (a per-batch check).
+  pending_capacity_counts_enabled: false
+  # Per-replica cache age of the outstanding-work count (0 = count on every
+  # submission). Any age is safe; staleness only errs towards rejecting.
+  pending_capacity_counts_max_age_secs: 10
+  # Statement timeout for the count; on failure admission fails open.
+  pending_capacity_counts_timeout_ms: 10000
 
   # Allowed completion windows for batch processing
   # These define the maximum time from batch creation to completion
