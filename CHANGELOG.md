@@ -1,5 +1,12 @@
 # Changelog
 
+## [13.4.2](https://github.com/doublewordai/control-layer/compare/v13.4.1...v13.4.2) (2026-10-08)
+
+
+### Bug Fixes
+
+* **limits:** retry in-flight Redis reconnects every second ([#1946](https://github.com/doublewordai/control-layer/issues/1946)) ([39af83c](https://github.com/doublewordai/control-layer/commit/39af83ccdfccc1677749dc3eacfa214d6a3a2beb))
+
 ## [13.4.1](https://github.com/doublewordai/control-layer/compare/v13.4.0...v13.4.1) (2026-10-08)
 
 
