@@ -124,6 +124,7 @@ aes-gcm = "0.10.3"
 deadpool-redis = "0.18"
 redis = { version = "0.27", default-features = false, features = [
   "tokio-rustls-comp",
+  "connection-manager",
 ] }
 paste = "1.0"
 serde_with = "3.14.1"
