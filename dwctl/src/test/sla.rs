@@ -203,26 +203,21 @@ async fn test_route_at_claim_time_escalation(pool: PgPool) {
     // Create request templates
     for i in 1..=3 {
         let template_id = Uuid::new_v4();
-        sqlx::query(
-            r#"
-            INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method)
-            VALUES ($1, $2, 'test-model', $3, $4, '/v1/chat/completions', $5, $6, 'POST')
-            "#,
-        )
-        .bind(template_id)
-        .bind(file_id)
-        .bind(&user_batch_api_key)
-        .bind(mock_server.uri())
-        .bind(
-            serde_json::to_string(
+        crate::test::utils::insert_fusillade_template(
+            &pool,
+            template_id,
+            Some(file_id),
+            "test-model",
+            &user_batch_api_key,
+            &mock_server.uri(),
+            "/v1/chat/completions",
+            &serde_json::to_string(
                 &serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": format!("Test {}", i)}]}),
             )
             .unwrap(),
+            Some(&format!("req-{}", i)),
         )
-        .bind(format!("req-{}", i))
-        .execute(&pool)
-        .await
-        .expect("Failed to create request template");
+        .await;
     }
 
     tracing::info!("📄 File and request templates created: {}", file_id);
@@ -252,7 +247,7 @@ async fn test_route_at_claim_time_escalation(pool: PgPool) {
         let request_id = Uuid::new_v4();
         let template_id = sqlx::query_scalar::<_, Uuid>(
             r#"
-            SELECT id FROM fusillade.request_templates
+            SELECT id FROM fusillade.request_templates_all
             WHERE file_id = $1 AND custom_id = $2
             "#,
         )
@@ -467,18 +462,21 @@ async fn test_no_escalation_when_not_near_expiry(pool: PgPool) {
 
     for i in 1..=3 {
         let template_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'test-model', $3, $4, '/v1/chat/completions', $5, $6, 'POST')",
+        crate::test::utils::insert_fusillade_template(
+            &pool,
+            template_id,
+            Some(file_id),
+            "test-model",
+            &user_batch_api_key,
+            &mock_server.uri(),
+            "/v1/chat/completions",
+            &serde_json::to_string(
+                &serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": format!("Test {}", i)}]}),
+            )
+            .unwrap(),
+            Some(&format!("req-{}", i)),
         )
-        .bind(template_id)
-        .bind(file_id)
-        .bind(&user_batch_api_key)
-        .bind(mock_server.uri())
-        .bind(serde_json::to_string(&serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": format!("Test {}", i)}]})).unwrap())
-        .bind(format!("req-{}", i))
-        .execute(&pool)
-        .await
-        .expect("Failed to create template");
+        .await;
     }
 
     // Create batch that expires in 24 HOURS (well outside 60s threshold)
@@ -501,7 +499,7 @@ async fn test_no_escalation_when_not_near_expiry(pool: PgPool) {
     // Create request records
     for i in 1..=3 {
         let request_id = Uuid::new_v4();
-        let template_id: Uuid = sqlx::query_scalar("SELECT id FROM fusillade.request_templates WHERE file_id = $1 AND custom_id = $2")
+        let template_id: Uuid = sqlx::query_scalar("SELECT id FROM fusillade.request_templates_all WHERE file_id = $1 AND custom_id = $2")
             .bind(file_id)
             .bind(format!("req-{}", i))
             .fetch_one(&pool)

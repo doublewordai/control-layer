@@ -411,12 +411,16 @@ observed healthy:
    finalization-anchored retention period. Every batch in a week must be
    fully archived, frozen, and individually past its period before the week
    drops; completion stamps batch metadata rows (which are never deleted).
-10. Enable the generation-2 template write cutover, then file-content expiry
-    and weekly template retirement with an explicit creation-anchored period.
-    A template week drops only when no live file still owns rows in it; file
-    rows are tombstoned, never deleted. The frozen legacy template heap is
-    dropped later as one relation, in a separately approved forward
-    migration, once its whole horizon has passed.
+10. Enable file-content expiry and weekly template retirement with an
+    explicit creation-anchored period. A template week drops only when no
+    live file still owns rows in it and no dedicated batchless template
+    remains in it; file rows are tombstoned, never deleted.
+11. Write all new templates to generation 2, including flex, background, and
+    realtime templates. Existing generation-1 templates remain readable and
+    can still be archived or erased. The generation-write configuration and
+    builder argument are accepted as compatibility no-ops. Keep the legacy
+    table until existing requests and retained file references have drained;
+    table removal is a separate migration.
 
 Rollback boundaries: before step 5 every change is reversible by disabling
 flags and (only on an empty lifecycle) reverting the expand migration — the
@@ -426,6 +430,10 @@ reader versions; content already in retained partitions is served through
 routes and must not be abandoned by downgrading readers below step 3. After
 the first partition drop, retirement is irreversible by design; an unfinished
 retirement journal must keep an enabled maintenance owner until it completes.
+Once dedicated generation-2 templates have been written, use versions that
+can archive and erase both generations. Older versions can still read them
+through the expanded view, but their legacy-only archival and erasure paths
+cannot manage the new templates.
 
 Abort and hold conditions: stop the ramp if the preflight fails, the runway
 gauge falls behind the horizon, retirement retries persist, mover integrity
