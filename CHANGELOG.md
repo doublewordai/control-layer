@@ -1,5 +1,12 @@
 # Changelog
 
+## [13.3.1](https://github.com/doublewordai/control-layer/compare/v13.3.0...v13.3.1) (2026-10-08)
+
+
+### Bug Fixes
+
+* write new request templates to generation two ([6c26427](https://github.com/doublewordai/control-layer/commit/6c264272d0f301f810e06af2a6a65531fc86880f))
+
 ## [13.3.0](https://github.com/doublewordai/control-layer/compare/v13.2.0...v13.3.0) (2026-10-08)
 
 
