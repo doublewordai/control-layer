@@ -69,6 +69,10 @@ pub struct OnwardsErrorResponse {
     /// class for failed requests too.
     pub serving_outcome: Option<crate::serving::ServingClassOutcome>,
     pub(crate) authenticated_api_key_id: Option<Uuid>,
+    /// Reports an upstream's error rather than a refusal by onwards itself,
+    /// so it isn't counted as a gateway rejection.
+    #[builder(default)]
+    pub(crate) from_upstream: bool,
 }
 
 impl OnwardsErrorResponse {
@@ -84,6 +88,7 @@ impl OnwardsErrorResponse {
                 .expect("reasoning errors use valid HTTP status codes"),
             serving_outcome: None,
             authenticated_api_key_id: None,
+            from_upstream: false,
         }
     }
 
@@ -100,6 +105,7 @@ impl OnwardsErrorResponse {
             status: StatusCode::NOT_FOUND,
             serving_outcome: None,
             authenticated_api_key_id: None,
+            from_upstream: false,
         }
     }
 
@@ -114,6 +120,7 @@ impl OnwardsErrorResponse {
             status: StatusCode::TOO_MANY_REQUESTS,
             serving_outcome: None,
             authenticated_api_key_id: None,
+            from_upstream: false,
         }
     }
 
@@ -131,6 +138,7 @@ impl OnwardsErrorResponse {
             status: StatusCode::TOO_MANY_REQUESTS,
             serving_outcome: None,
             authenticated_api_key_id: None,
+            from_upstream: true,
         }
     }
 
@@ -145,6 +153,7 @@ impl OnwardsErrorResponse {
             status: StatusCode::TOO_MANY_REQUESTS,
             serving_outcome: None,
             authenticated_api_key_id: None,
+            from_upstream: false,
         }
     }
 
@@ -161,6 +170,7 @@ impl OnwardsErrorResponse {
             status: StatusCode::TOO_MANY_REQUESTS,
             serving_outcome: None,
             authenticated_api_key_id: None,
+            from_upstream: false,
         }
     }
 
@@ -181,6 +191,7 @@ impl OnwardsErrorResponse {
             status: overload_status(),
             serving_outcome: None,
             authenticated_api_key_id: None,
+            from_upstream: false,
         }
     }
 
@@ -196,6 +207,7 @@ impl OnwardsErrorResponse {
             status: overload_status(),
             serving_outcome: None,
             authenticated_api_key_id: None,
+            from_upstream: false,
         }
     }
 
@@ -212,6 +224,7 @@ impl OnwardsErrorResponse {
             status: overload_status(),
             serving_outcome: None,
             authenticated_api_key_id: None,
+            from_upstream: false,
         }
     }
 
@@ -226,6 +239,7 @@ impl OnwardsErrorResponse {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             serving_outcome: None,
             authenticated_api_key_id: None,
+            from_upstream: false,
         }
     }
 
@@ -240,6 +254,7 @@ impl OnwardsErrorResponse {
             status: StatusCode::BAD_GATEWAY,
             serving_outcome: None,
             authenticated_api_key_id: None,
+            from_upstream: false,
         }
     }
 
@@ -254,6 +269,7 @@ impl OnwardsErrorResponse {
             status: StatusCode::SERVICE_UNAVAILABLE,
             serving_outcome: None,
             authenticated_api_key_id: None,
+            from_upstream: false,
         }
     }
 
@@ -269,6 +285,7 @@ impl OnwardsErrorResponse {
             status: StatusCode::GATEWAY_TIMEOUT,
             serving_outcome: None,
             authenticated_api_key_id: None,
+            from_upstream: false,
         }
     }
 
@@ -285,6 +302,7 @@ impl OnwardsErrorResponse {
             status: StatusCode::PAYLOAD_TOO_LARGE,
             serving_outcome: None,
             authenticated_api_key_id: None,
+            from_upstream: false,
         }
     }
 
@@ -299,6 +317,7 @@ impl OnwardsErrorResponse {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             serving_outcome: None,
             authenticated_api_key_id: None,
+            from_upstream: false,
         }
     }
 
@@ -317,6 +336,7 @@ impl OnwardsErrorResponse {
             status: StatusCode::BAD_REQUEST,
             serving_outcome: None,
             authenticated_api_key_id: None,
+            from_upstream: false,
         }
     }
 
@@ -331,6 +351,7 @@ impl OnwardsErrorResponse {
             status: StatusCode::FORBIDDEN,
             serving_outcome: None,
             authenticated_api_key_id: None,
+            from_upstream: false,
         }
     }
 
@@ -346,12 +367,19 @@ impl OnwardsErrorResponse {
             status: StatusCode::UNAUTHORIZED,
             serving_outcome: None,
             authenticated_api_key_id: None,
+            from_upstream: false,
         }
     }
 
     pub(crate) fn with_authenticated_api_key_id(mut self, api_key_id: Option<Uuid>) -> Self {
         self.authenticated_api_key_id = api_key_id;
         self
+    }
+
+    /// A client error onwards decided on itself, rather than one reporting an
+    /// upstream's response.
+    pub(crate) fn is_gateway_rejection(&self) -> bool {
+        self.status.is_client_error() && !self.from_upstream
     }
 }
 
