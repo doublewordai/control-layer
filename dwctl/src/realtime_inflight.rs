@@ -344,6 +344,7 @@ impl Drop for RedisSlot {
 mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
+    use std::time::Instant;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -516,10 +517,16 @@ mod tests {
     #[tokio::test]
     async fn failed_connection_attempts_are_retried_every_second() {
         let (url, accepted, _) = fake_redis(Some(Duration::ZERO), 2).await;
+        let started = Instant::now();
         let limiter = limiter(Some(url));
         assert!(limiter.redis.as_ref().unwrap().connection().is_none());
         connected(limiter).await;
+        let elapsed = started.elapsed();
         assert_eq!(accepted.load(Ordering::SeqCst), 3);
+        assert!(
+            elapsed >= RECONNECT_BACKOFF * 2 && elapsed < RECONNECT_BACKOFF * 4,
+            "connected after {elapsed:?}"
+        );
     }
 
     #[tokio::test]
