@@ -238,8 +238,16 @@ impl<'a> CapacityReservationInput<'a> {
 /// Error type for capacity reservation operations.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CapacityError {
-    #[error("insufficient capacity for {completion_window} window: {models}")]
-    InsufficientCapacity { completion_window: String, models: String },
+    /// `completion_window` is the window the batch was submitted for;
+    /// `checked_window` is the longest checked window that was full, which is
+    /// longer than `completion_window` when shorter-deadline work is rejected
+    /// because a longer window it also consumes is full.
+    #[error("insufficient capacity for {completion_window} window (full: {checked_window}): {models}")]
+    InsufficientCapacity {
+        completion_window: String,
+        checked_window: String,
+        models: String,
+    },
     #[error("{0}")]
     Internal(String),
 }
@@ -572,6 +580,8 @@ pub(crate) async fn reserve_capacity<P: sqlx_pool_router::PoolProvider>(
     }
 
     let mut overloaded_models: HashMap<String, i64> = HashMap::new();
+    // Windows are shortest first, so this ends as the longest full window.
+    let mut full_window: Option<&str> = None;
     for window in input.windows {
         let result = check_sla_capacity(
             input.file_model_counts,
@@ -581,6 +591,9 @@ pub(crate) async fn reserve_capacity<P: sqlx_pool_router::PoolProvider>(
             &window.label,
             window.relaxation_factor,
         );
+        if !result.has_capacity {
+            full_window = Some(&window.label);
+        }
         for (model, deficit) in result.overloaded_models {
             let entry = overloaded_models.entry(model).or_insert(0);
             *entry = (*entry).max(deficit);
@@ -594,8 +607,10 @@ pub(crate) async fn reserve_capacity<P: sqlx_pool_router::PoolProvider>(
             .iter()
             .map(|(model, deficit)| format!("{model} (needs {deficit} more capacity)"))
             .collect();
+        let checked_window = full_window.unwrap_or(input.completion_window);
         tracing::warn!(
             completion_window = %input.completion_window,
+            checked_window = %checked_window,
             overloaded_models = %overloaded_details.join(", "),
             "Batch rejected due to insufficient capacity"
         );
@@ -604,6 +619,7 @@ pub(crate) async fn reserve_capacity<P: sqlx_pool_router::PoolProvider>(
         model_names.sort_unstable();
         return Err(CapacityError::InsufficientCapacity {
             completion_window: input.completion_window.to_string(),
+            checked_window: checked_window.to_string(),
             models: model_names.join(", "),
         });
     }
