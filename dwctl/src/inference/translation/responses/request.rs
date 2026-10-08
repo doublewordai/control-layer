@@ -42,8 +42,17 @@ pub fn to_chat_request(request: &ResponsesRequest) -> ChatCompletionRequest {
 
     messages.extend(input_to_messages(&request.input));
 
-    let tools = request.tools.as_ref().map(|t| convert_tools(t));
-    let tool_choice = request.tool_choice.as_ref().map(convert_tool_choice);
+    let (tools, dropped_tools) = match request.tools.as_ref() {
+        Some(tools) => {
+            let (flattened, dropped) = flatten_tool_namespaces(tools);
+            (Some(convert_tools(&flattened)), dropped)
+        }
+        None => (None, std::collections::BTreeSet::new()),
+    };
+    let tool_choice = request
+        .tool_choice
+        .as_ref()
+        .map(|choice| reconcile_tool_choice(choice, &dropped_tools));
 
     let include_logprobs = request.includes(Include::MessageOutputTextLogprobs);
 
@@ -267,7 +276,7 @@ fn convert_message_content(content: &ResponseMessageContent) -> MessageContent {
 /// Namespace groups are flattened first (see [`flatten_tool_namespaces`]), so
 /// this only ever sees top-level tools.
 fn convert_tools(tools: &[ResponseTool]) -> Vec<ChatTool> {
-    flatten_tool_namespaces(tools)
+    tools
         .iter()
         .filter_map(|tool| match tool {
             ResponseTool::Function {
@@ -325,8 +334,9 @@ fn convert_tools(tools: &[ResponseTool]) -> Vec<ChatTool> {
 /// schema the tool does not accept.
 ///
 /// Non-namespace tools pass through untouched.
-fn flatten_tool_namespaces(tools: &[ResponseTool]) -> Vec<ResponseTool> {
+fn flatten_tool_namespaces(tools: &[ResponseTool]) -> (Vec<ResponseTool>, std::collections::BTreeSet<String>) {
     let mut flattened = Vec::with_capacity(tools.len());
+    let mut dropped = std::collections::BTreeSet::new();
     for tool in tools {
         match tool {
             ResponseTool::Namespace { tools: members, .. } => {
@@ -337,14 +347,16 @@ fn flatten_tool_namespaces(tools: &[ResponseTool]) -> Vec<ResponseTool> {
                             description,
                             parameters,
                             strict,
+                            ..
                         } => flattened.push(ResponseTool::Function {
                             name: name.clone(),
                             description: description.clone(),
                             parameters: parameters.clone(),
-                            strict: *strict,
+                            strict: strict.unwrap_or(true),
                         }),
                         NamespaceTool::Custom { name, .. } => {
                             debug!(tool = %name, "Skipping freeform tool in namespace group");
+                            dropped.insert(name.clone());
                         }
                     }
                 }
@@ -352,7 +364,20 @@ fn flatten_tool_namespaces(tools: &[ResponseTool]) -> Vec<ResponseTool> {
             other => flattened.push(other.clone()),
         }
     }
-    flattened
+    (flattened, dropped)
+}
+
+/// Translate a tool choice, downgrading one that pinned a tool we could not
+/// forward. A choice naming a tool the request no longer offers is rejected by
+/// providers, so it falls back to `auto` and the rest of the request still runs.
+fn reconcile_tool_choice(choice: &ResponseToolChoice, dropped: &std::collections::BTreeSet<String>) -> ChatToolChoice {
+    match choice {
+        ResponseToolChoice::Specific { name: Some(target), .. } if dropped.contains(target) => {
+            warn!(tool = %target, "tool_choice named a dropped freeform tool; falling back to auto");
+            ChatToolChoice::Mode("auto".to_string())
+        }
+        other => convert_tool_choice(other),
+    }
 }
 
 /// Convert Responses tool choice to Chat Completions tool choice.
@@ -551,6 +576,100 @@ mod tests {
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0].function.name, "exec_command");
         assert_eq!(tools[1].function.name, "get_weather");
+    }
+
+    #[test]
+    fn dropped_freeform_tool_downgrades_a_pinned_tool_choice() {
+        // `tool_choice` naming a tool that was dropped would name a tool the
+        // request no longer offers; it falls back to `auto` instead.
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "kimi-k2.5",
+            "input": "fix the build",
+            "tools": [{
+                "type": "namespace",
+                "name": "functions",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "exec_command",
+                        "description": "Runs a command.",
+                        "parameters": {"type": "object", "properties": {}}
+                    },
+                    {
+                        "type": "custom",
+                        "name": "apply_patch",
+                        "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"}
+                    }
+                ]
+            }],
+            "tool_choice": {"type": "function", "name": "apply_patch"}
+        }))
+        .unwrap();
+
+        let chat = to_chat_request(&request);
+        let choice = chat.tool_choice.expect("tool_choice should survive");
+
+        assert!(matches!(choice, ChatToolChoice::Mode(ref mode) if mode == "auto"));
+    }
+
+    #[test]
+    fn a_tool_choice_naming_a_surviving_tool_is_preserved() {
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "kimi-k2.5",
+            "input": "fix the build",
+            "tools": [{
+                "type": "namespace",
+                "name": "functions",
+                "tools": [{
+                    "type": "function",
+                    "name": "exec_command",
+                    "description": "Runs a command.",
+                    "parameters": {"type": "object", "properties": {}}
+                }]
+            }],
+            "tool_choice": {"type": "function", "name": "exec_command"}
+        }))
+        .unwrap();
+
+        let chat = to_chat_request(&request);
+        let choice = chat.tool_choice.expect("tool_choice should survive");
+
+        match choice {
+            ChatToolChoice::Specific { function, .. } => assert_eq!(function.name, "exec_command"),
+            other => panic!("expected a specific tool choice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_namespace_echoes_back_exactly_as_sent() {
+        // The Responses object echoes the request's tools, so parsing and
+        // re-serializing must not invent fields the caller never sent.
+        let sent = serde_json::json!({
+            "model": "kimi-k2.5",
+            "input": "fix the build",
+            "tools": [{
+                "type": "namespace",
+                "name": "functions",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "exec_command",
+                        "description": "Runs a command.",
+                        "parameters": {"type": "object", "properties": {}}
+                    },
+                    {
+                        "type": "custom",
+                        "name": "apply_patch",
+                        "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"}
+                    }
+                ]
+            }]
+        });
+
+        let request: ResponsesRequest = serde_json::from_value(sent.clone()).unwrap();
+        let echoed = serde_json::to_value(request.tools.unwrap()).unwrap();
+
+        assert_eq!(echoed, sent["tools"]);
     }
 
     #[test]

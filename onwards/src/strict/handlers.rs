@@ -268,7 +268,24 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     // so flatten the groups into their member functions before forwarding.
     let mut request = request;
     if let Some(ref mut tools) = request.tools {
-        *tools = flatten_tool_namespaces(std::mem::take(tools));
+        let (flattened, dropped) = flatten_tool_namespaces(std::mem::take(tools));
+        *tools = flattened;
+        // A choice pinned to a tool we could not forward would name a tool the
+        // request no longer offers, which providers reject outright. Fall back
+        // to `auto` so the rest of the request still runs.
+        if let Some(super::schemas::responses::ToolChoice::Specific {
+            name: Some(target), ..
+        }) = &request.tool_choice
+            && dropped.contains(target)
+        {
+            warn!(
+                tool = %target,
+                "tool_choice named a freeform tool that was dropped; falling back to auto"
+            );
+            request.tool_choice = Some(super::schemas::responses::ToolChoice::Mode(
+                "auto".to_string(),
+            ));
+        }
     }
 
     // OpenAI requires additionalProperties: false in tool schemas even for /v1/responses
@@ -1101,22 +1118,24 @@ async fn sanitize_embeddings_response(mut response: Response, original_model: St
     }
 }
 
-/// Sanitize responses API response
-///
-/// Deserializes the response through our strict schema (drops extra fields),
-/// rewrites the model field, and re-serializes.
 /// Flatten `namespace` tool groups into individual function tools.
 ///
 /// Codex sends `{"type": "namespace", "name": "functions", "tools": [...]}`.
 /// Names are left as declared — Codex maps a missing namespace back to its
 /// default `functions` — and `custom` (freeform) members are dropped, as they
-/// have no Chat Completions equivalent.
+/// have no Chat Completions equivalent. The dropped definitions stay on the
+/// parsed request, so anything that echoes the request back (the response's
+/// `tools` field) still sees the caller's own payload.
 fn flatten_tool_namespaces(
     tools: Vec<super::schemas::responses::Tool>,
-) -> Vec<super::schemas::responses::Tool> {
+) -> (
+    Vec<super::schemas::responses::Tool>,
+    std::collections::BTreeSet<String>,
+) {
     use super::schemas::responses::{NamespaceTool, Tool};
 
     let mut flattened = Vec::with_capacity(tools.len());
+    let mut dropped = std::collections::BTreeSet::new();
     for tool in tools {
         match tool {
             Tool::Namespace { tools: members, .. } => {
@@ -1127,14 +1146,16 @@ fn flatten_tool_namespaces(
                             description,
                             parameters,
                             strict,
+                            ..
                         } => flattened.push(Tool::Function {
                             name,
                             description,
                             parameters,
-                            strict,
+                            strict: strict.unwrap_or(true),
                         }),
                         NamespaceTool::Custom { name, .. } => {
                             debug!(tool = %name, "Skipping freeform tool in namespace group");
+                            dropped.insert(name);
                         }
                     }
                 }
@@ -1142,9 +1163,13 @@ fn flatten_tool_namespaces(
             other => flattened.push(other),
         }
     }
-    flattened
+    (flattened, dropped)
 }
 
+/// Sanitize responses API response
+///
+/// Deserializes the response through our strict schema (drops extra fields),
+/// rewrites the model field, and re-serializes.
 async fn sanitize_responses_response(
     mut response: Response,
     original_model: String,
@@ -3075,6 +3100,72 @@ mod tests {
         assert_eq!(tools.len(), 1, "only the function member survives");
         assert_eq!(tools[0]["type"], "function");
         assert_eq!(tools[0]["name"], "exec_command");
+    }
+
+    #[tokio::test]
+    async fn test_responses_dropped_freeform_tool_downgrades_pinned_tool_choice() {
+        // A `tool_choice` pinned to a freeform tool that could not be forwarded
+        // would name a tool the request no longer offers; it falls back to
+        // `auto` so the rest of the request still runs.
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "kimi-k2.5".to_string(),
+            Target::builder()
+                .url("https://dynamo.example.com/v1/".parse().unwrap())
+                .build()
+                .into_pool(),
+        );
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+        let mock_client = MockHttpClient::new(
+            StatusCode::OK,
+            r#"{"id":"resp_1","object":"response","created_at":1,"status":"completed","model":"kimi-k2.5","output":[],"tools":[],"tool_choice":"auto","truncation":"disabled","parallel_tool_calls":true,"text":{"format":{"type":"text"}},"top_p":1.0,"presence_penalty":0.0,"frequency_penalty":0.0,"top_logprobs":0,"temperature":1.0,"reasoning":null,"usage":null,"store":false,"background":false,"service_tier":"default"}"#,
+        );
+        let state = AppState::with_client(targets, mock_client.clone());
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body = serde_json::json!({
+            "model": "kimi-k2.5",
+            "input": "fix the build",
+            "tools": [{
+                "type": "namespace",
+                "name": "functions",
+                "tools": [{
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"}
+                }]
+            }],
+            "tool_choice": {"type": "function", "name": "apply_patch"}
+        });
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body.to_string()))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let forwarded = mock_client.requests.lock().unwrap();
+        assert_eq!(forwarded.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&forwarded[0].body).unwrap();
+        assert!(
+            body["tools"]
+                .as_array()
+                .is_none_or(|tools| tools.is_empty()),
+            "the freeform tool is not forwarded"
+        );
+        assert_eq!(body["tool_choice"], "auto");
     }
 
     #[tokio::test]

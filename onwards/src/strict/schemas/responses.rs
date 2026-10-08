@@ -657,21 +657,36 @@ pub enum Tool {
 pub enum NamespaceTool {
     #[serde(rename = "function")]
     Function {
+        #[allow(dead_code)]
         name: String,
         description: String,
         parameters: serde_json::Value,
-        #[serde(default = "default_strict")]
-        strict: bool,
+        /// Optional rather than defaulted to `true`: the request echo must not
+        /// invent a value the caller omitted. Treated as strict when flattening.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[allow(dead_code)]
+        strict: Option<bool>,
+        /// Deferred-loading hint; not forwarded, but kept for a faithful echo.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[allow(dead_code)]
+        defer_loading: Option<bool>,
     },
 
-    /// Freeform tool (grammar-defined input rather than a JSON Schema).
+    /// Freeform tool (grammar-defined input rather than a JSON Schema). Not
+    /// forwarded, but its definition is kept intact for a faithful echo.
     #[serde(rename = "custom")]
     Custom {
         #[allow(dead_code)]
         name: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         #[allow(dead_code)]
         description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[allow(dead_code)]
+        format: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[allow(dead_code)]
+        defer_loading: Option<bool>,
     },
 }
 
