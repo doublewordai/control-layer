@@ -20,6 +20,7 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const RECONNECT_AFTER_TIMEOUTS: u32 = 3;
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
+const RELEASE_RETRY_EVERY: Duration = Duration::from_secs(1);
 
 const CLAIM_SCRIPT: &str = r"
 local now = redis.call('TIME')
@@ -326,15 +327,23 @@ impl Drop for RedisSlot {
         let key = std::mem::take(&mut self.key);
         let member = std::mem::take(&mut self.member);
         tokio::spawn(async move {
-            if let Err(error) = release(&redis, &key, &member).await {
-                crate::background_error!(
-                    crate::metrics::errors::component::REALTIME_INFLIGHT,
-                    "lease_release",
-                    Warning,
-                    scope = scope,
-                    error = %error,
-                    "Failed to release an in-flight slot; its lease will expire"
-                );
+            let give_up_at = tokio::time::Instant::now() + LEASE;
+            loop {
+                match release(&redis, &key, &member).await {
+                    Ok(()) => return,
+                    Err(error) if tokio::time::Instant::now() + RELEASE_RETRY_EVERY >= give_up_at => {
+                        crate::background_error!(
+                            crate::metrics::errors::component::REALTIME_INFLIGHT,
+                            "lease_release",
+                            Warning,
+                            scope = scope,
+                            error = %error,
+                            "Could not release an in-flight slot before its lease expired"
+                        );
+                        return;
+                    }
+                    Err(_) => tokio::time::sleep(RELEASE_RETRY_EVERY).await,
+                }
             }
         });
     }
@@ -527,6 +536,41 @@ mod tests {
             elapsed >= RECONNECT_BACKOFF * 2 && elapsed < RECONNECT_BACKOFF * 4,
             "connected after {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_release_is_retried_once_redis_is_back() {
+        let (url, _, commands) = fake_redis(Some(Duration::ZERO), 0).await;
+        let limiter = connected(limiter(Some(url))).await;
+        let redis = limiter.redis.clone().unwrap();
+        let removed = || {
+            commands
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(name, _)| name == "ZREM")
+                .map(|(_, member)| member.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let slot = limiter.try_acquire("acct", "model", 10).await.expect("slot");
+        let member = commands.lock().unwrap()[0].1.clone();
+        let connection = redis.connection.load_full();
+        redis.connection.store(None);
+        drop(slot);
+        for _ in 0..30 {
+            assert!(removed().is_empty());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        redis.connection.store(connection);
+        for _ in 0..500 {
+            if !removed().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(removed(), vec![member]);
     }
 
     #[tokio::test]
