@@ -122,50 +122,103 @@ fn leader_tick(config: &SlaReleaseConfig) -> Duration {
     (config.refresh_interval() / 10).clamp(Duration::from_secs(1), Duration::from_secs(30))
 }
 
+/// Projected seconds to clear a model's backlog at its throughput; NaN (no
+/// projection) without throughput.
+fn projected_backlog_secs(backlog_requests: i64, throughput: f64) -> f64 {
+    if throughput > 0.0 {
+        backlog_requests as f64 / throughput
+    } else {
+        f64::NAN
+    }
+}
+
 /// Recompute the release cutoffs when this daemon is the one to do it, and
-/// publish the leader and cutoff-age metrics. Every daemon runs this; the
-/// storage lets exactly one compute per refresh interval.
+/// publish the cutoff metrics. Every daemon runs this; the storage lets
+/// exactly one compute per refresh interval.
+///
+/// Each storage call is bounded by `query_timeout` and abandoned on shutdown,
+/// so a stalled database can neither hang this task nor the daemon's drain.
+///
+/// `fusillade_release_leader` is 1 on the daemon whose computation is the
+/// current one (it computed within the last refresh interval, so no other
+/// daemon can have computed since), and every computation counts in
+/// `fusillade_release_cutoff_computations_total`. The per-model gauges come
+/// from the stored cutoffs, read by every daemon, so all replicas report the
+/// same current values; a model whose cutoff row is gone is reset.
 pub(crate) async fn run_release_leader<S>(
     storage: std::sync::Arc<S>,
     config: SlaReleaseConfig,
+    query_timeout: Duration,
     shutdown: CancellationToken,
 ) where
     S: DaemonStorage + ?Sized,
 {
     let mut interval = tokio::time::interval(leader_tick(&config));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_computed: Option<tokio::time::Instant> = None;
+    let mut reported: std::collections::HashSet<String> = std::collections::HashSet::new();
     loop {
         tokio::select! {
             _ = interval.tick() => {}
             _ = shutdown.cancelled() => break,
         }
-        match storage.refresh_release_cutoffs(config.params()).await {
-            Ok(Some(cutoffs)) => {
-                gauge!("fusillade_release_leader").set(1.0);
-                for cutoff in &cutoffs {
-                    gauge!("fusillade_perceived_throughput", "model" => cutoff.model.clone())
-                        .set(cutoff.throughput);
-                    if cutoff.throughput > 0.0 {
-                        gauge!("fusillade_projected_backlog_seconds", "model" => cutoff.model.clone())
-                            .set(cutoff.backlog_requests as f64 / cutoff.throughput);
-                    }
-                }
+        match super::maintenance_query(
+            &shutdown,
+            "release cutoff refresh",
+            query_timeout,
+            storage.refresh_release_cutoffs(config.params()),
+        )
+        .await
+        {
+            Ok(Some(Some(cutoffs))) => {
+                last_computed = Some(tokio::time::Instant::now());
+                metrics::counter!("fusillade_release_cutoff_computations_total").increment(1);
                 tracing::debug!(models = cutoffs.len(), "Computed release cutoffs");
             }
-            Ok(None) => gauge!("fusillade_release_leader").set(0.0),
+            Ok(Some(None)) => {}
+            Ok(None) => break,
             Err(error) => {
-                gauge!("fusillade_release_leader").set(0.0);
                 metrics::counter!("fusillade_sla_release_refresh_errors_total").increment(1);
                 tracing::warn!(%error, "Failed to refresh release cutoffs");
             }
         }
-        match storage.release_cutoff_ages().await {
-            Ok(ages) => {
-                for (model, age) in ages {
-                    gauge!("fusillade_release_cutoff_age_seconds", "model" => model).set(age);
+        let leading = last_computed.is_some_and(|at| at.elapsed() < config.refresh_interval());
+        gauge!("fusillade_release_leader").set(if leading { 1.0 } else { 0.0 });
+
+        match super::maintenance_query(
+            &shutdown,
+            "release cutoff status",
+            query_timeout,
+            storage.release_cutoff_status(),
+        )
+        .await
+        {
+            Ok(Some(status)) => {
+                let mut current = std::collections::HashSet::with_capacity(status.len());
+                for cutoff in status {
+                    let model = cutoff.model;
+                    gauge!("fusillade_release_cutoff_age_seconds", "model" => model.clone())
+                        .set(cutoff.age_secs);
+                    gauge!("fusillade_perceived_throughput", "model" => model.clone())
+                        .set(cutoff.throughput);
+                    gauge!("fusillade_projected_backlog_seconds", "model" => model.clone()).set(
+                        projected_backlog_secs(cutoff.backlog_requests, cutoff.throughput),
+                    );
+                    current.insert(model);
                 }
+                // A model with no outstanding work loses its row: no backlog,
+                // no throughput, no cutoff to age.
+                for model in reported.difference(&current) {
+                    gauge!("fusillade_release_cutoff_age_seconds", "model" => model.clone())
+                        .set(f64::NAN);
+                    gauge!("fusillade_perceived_throughput", "model" => model.clone()).set(0.0);
+                    gauge!("fusillade_projected_backlog_seconds", "model" => model.clone())
+                        .set(0.0);
+                }
+                reported = current;
             }
-            Err(error) => tracing::debug!(%error, "Failed to read release cutoff ages"),
+            Ok(None) => break,
+            Err(error) => tracing::debug!(%error, "Failed to read release cutoffs"),
         }
     }
 }

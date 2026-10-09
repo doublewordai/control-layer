@@ -9162,10 +9162,19 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         // takes the lock, computes and commits; a daemon that finds the lock
         // held, or fresh cutoffs, does nothing. A leader that dies mid-way
         // rolls back and releases the lock, so the next tick of any daemon
-        // takes over.
-        let mut tx = self.begin_write().await.map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to begin release cutoff transaction: {}", e))
-        })?;
+        // takes over. Every statement is bounded to end within the
+        // maintenance budget, so a stalled database cannot hold the
+        // transaction (and its lock) past the daemon's own timeout.
+        let deadline = self.maintenance_deadline();
+        let bound = |e: sqlx::Error| {
+            FusilladeError::Other(anyhow!("Failed to bound release cutoff refresh: {}", e))
+        };
+        let mut tx = self
+            .begin_maintenance_write_until(deadline)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to begin release cutoff transaction: {}", e))
+            })?;
         let locked: bool = sqlx::query_scalar(
             "SELECT pg_try_advisory_xact_lock(hashtextextended('fusillade.release_cutoffs', 0))",
         )
@@ -9190,7 +9199,8 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         // Outstanding work per model over the cumulative deadline ladder, and
         // the deployment-wide in-flight count, from the indexed pending-counts
         // query. Realtime (priority) and background rows are not daemon queue
-        // work.
+        // work. Both read the primary (`strict`): replica lag would drop new
+        // backlog or keep finished work, and this runs once per interval.
         let tiers = ServiceTierFilter::Exclude(vec![Some("priority".to_string())]);
         let ladder: Vec<(String, Option<i64>, i64)> = RELEASE_LADDER_SECS
             .iter()
@@ -9202,7 +9212,7 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
                 &["pending".into(), "claimed".into(), "processing".into()],
                 &[],
                 &tiers,
-                false,
+                true,
             )
             .await?;
         let in_flight = self
@@ -9211,10 +9221,11 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
                 &["claimed".into(), "processing".into()],
                 &[],
                 &tiers,
-                false,
+                true,
             )
             .await?;
         let models: Vec<String> = outstanding.keys().cloned().collect();
+        bound_to_deadline(&mut tx, deadline).await.map_err(bound)?;
 
         // Our own workers' throughput: tolerated successful completions in the
         // window, one index-only range scan of idx_requests_tolerated_completions
@@ -9249,7 +9260,10 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             window.insert(model, (row.get("samples"), row.get("busy_secs")));
         }
 
-        let computed_at: DateTime<Utc> = sqlx::query_scalar("SELECT NOW()")
+        // The wall clock after the reads, not the transaction start: the
+        // cutoff is an offset from the moment the backlog was counted.
+        bound_to_deadline(&mut tx, deadline).await.map_err(bound)?;
+        let computed_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to read the clock: {}", e)))?;
@@ -9290,6 +9304,7 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         let throughputs: Vec<f64> = cutoffs.iter().map(|c| c.throughput).collect();
         let backlogs: Vec<i64> = cutoffs.iter().map(|c| c.backlog_requests).collect();
         let samples: Vec<i64> = cutoffs.iter().map(|c| c.samples).collect();
+        bound_to_deadline(&mut tx, deadline).await.map_err(bound)?;
         sqlx::query(
             r#"
             INSERT INTO model_release_cutoffs
@@ -9314,6 +9329,7 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         .execute(&mut *tx)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to write release cutoffs: {}", e)))?;
+        bound_to_deadline(&mut tx, deadline).await.map_err(bound)?;
         sqlx::query("DELETE FROM model_release_cutoffs WHERE NOT (model = ANY($1::TEXT[]))")
             .bind(&names)
             .execute(&mut *tx)
@@ -9327,9 +9343,12 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         Ok(Some(cutoffs))
     }
 
-    async fn release_cutoff_ages(&self) -> Result<Vec<(String, f64)>> {
+    async fn release_cutoff_status(
+        &self,
+    ) -> Result<Vec<fusillade_core::release::ReleaseCutoffStatus>> {
         let rows = sqlx::query(
-            "SELECT model, EXTRACT(EPOCH FROM (NOW() - computed_at))::FLOAT8 AS age
+            "SELECT model, EXTRACT(EPOCH FROM (NOW() - computed_at))::FLOAT8 AS age,
+                    throughput, backlog_requests
              FROM model_release_cutoffs",
         )
         .fetch_all(self.read_executor())
@@ -9337,7 +9356,12 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to read release cutoffs: {}", e)))?;
         Ok(rows
             .into_iter()
-            .map(|row| (row.get("model"), row.get("age")))
+            .map(|row| fusillade_core::release::ReleaseCutoffStatus {
+                model: row.get("model"),
+                age_secs: row.get("age"),
+                throughput: row.get("throughput"),
+                backlog_requests: row.get("backlog_requests"),
+            })
             .collect())
     }
 

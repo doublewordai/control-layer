@@ -61,6 +61,18 @@ pub struct ReleaseCutoff {
     pub computed_at: DateTime<Utc>,
 }
 
+/// A stored cutoff as every daemon reads it back, for metrics: each replica
+/// publishes the same values, so no pod reports figures from a computation it
+/// no longer leads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReleaseCutoffStatus {
+    pub model: String,
+    /// Seconds since the cutoff was computed.
+    pub age_secs: f64,
+    pub throughput: f64,
+    pub backlog_requests: i64,
+}
+
 /// Throughput of our own workers from tolerated completions in the window:
 /// `count / sum(completed_at - started_at)` is completions per in-flight
 /// second (`1 / latency`, by Little's law; idle time is in neither sum), and

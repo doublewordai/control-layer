@@ -168,6 +168,20 @@ async fn a_slow_model_gets_a_cutoff_and_a_cold_one_does_not(pool: PgPool) {
         .release_before_deadline
         .expect("the slow model is behind");
     assert_eq!(cutoff, computed_at + chrono::Duration::seconds(3_600));
+    // The claim reads the stored cutoff, not the returned one.
+    let stored: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+        "SELECT release_before_deadline FROM model_release_cutoffs WHERE model = 'slow'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, Some(computed_at + chrono::Duration::seconds(3_600)));
+    // Every daemon publishes the metrics from the stored rows.
+    let status = storage.release_cutoff_status().await.unwrap();
+    let slow_status = status.iter().find(|s| s.model == "slow").unwrap();
+    assert_eq!(slow_status.backlog_requests, slow.backlog_requests);
+    assert!((slow_status.throughput - slow.throughput).abs() < 1e-9);
+    assert!(slow_status.age_secs >= 0.0);
     let cold = cutoffs.iter().find(|c| c.model == "cold").unwrap();
     assert_eq!(cold.release_before_deadline, None);
     assert_eq!(cold.throughput, 0.0);

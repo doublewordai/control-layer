@@ -3307,6 +3307,7 @@ where
             let handle = tokio::spawn(sla_release::run_release_leader(
                 self.storage.clone(),
                 config,
+                Duration::from_millis(self.config.claim_query_timeout_ms),
                 self.shutdown_token.clone(),
             ));
             daemon_handles.push(("release_cutoffs", handle));

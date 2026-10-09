@@ -1748,8 +1748,8 @@ pub trait DaemonStorage: Send + Sync {
         Ok(None)
     }
 
-    /// Age in seconds of every model's stored release cutoff.
-    async fn release_cutoff_ages(&self) -> Result<Vec<(String, f64)>> {
+    /// Every model's stored release cutoff: its age, throughput and backlog.
+    async fn release_cutoff_status(&self) -> Result<Vec<crate::release::ReleaseCutoffStatus>> {
         Ok(Vec::new())
     }
 
