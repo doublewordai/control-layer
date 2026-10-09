@@ -165,6 +165,11 @@ pub async fn image_normalizer_middleware(
     // signed.
     let mode = Mode::AllAndTokens;
 
+    if !walker::has_inputs(&body_value, mode) {
+        *request.body_mut() = Body::from(body_bytes);
+        return next.run(request).await;
+    }
+
     // Who is calling, from the bearer key. Two things come out of one lookup:
     // the attribution (the PRINCIPAL: the key's `user_id` — a person, or the
     // organization for an org key — used for `image_access` bookkeeping of
@@ -287,35 +292,29 @@ pub async fn image_normalizer_middleware(
         }
     };
 
-    if substituted == 0 {
-        // No URLs touched — restore the original bytes verbatim to avoid
-        // any whitespace / key-order drift from a JSON round-trip.
-        *request.body_mut() = Body::from(body_bytes);
-    } else {
-        debug!(substituted, "image normaliser replaced URLs in request body");
-        let new_bytes = match serde_json::to_vec(&body_value) {
-            Ok(b) => b,
-            Err(e) => {
-                warn!(error = %e, "Failed to re-serialise body after image normalisation");
-                let body = serde_json::json!({
-                    "error": {
-                        "message": format!("failed to re-serialise request body: {e}"),
-                        "type": "internal_error",
-                        "code": "body_reserialize_failed",
-                    }
-                });
-                return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(body)).into_response();
-            }
-        };
-        // Keep Content-Length consistent with the new body so any
-        // downstream layer that reads it sees the post-substitution size.
-        let len = new_bytes.len();
-        request.headers_mut().insert(
-            axum::http::header::CONTENT_LENGTH,
-            len.to_string().parse().expect("digit string is a valid header value"),
-        );
-        *request.body_mut() = Body::from(new_bytes);
-    }
+    debug!(substituted, "image normaliser replaced URLs in request body");
+    let new_bytes = match serde_json::to_vec(&body_value) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(error = %e, "Failed to re-serialise body after image normalisation");
+            let body = serde_json::json!({
+                "error": {
+                    "message": format!("failed to re-serialise request body: {e}"),
+                    "type": "internal_error",
+                    "code": "body_reserialize_failed",
+                }
+            });
+            return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(body)).into_response();
+        }
+    };
+    // Keep Content-Length consistent with the new body so any
+    // downstream layer that reads it sees the post-substitution size.
+    let len = new_bytes.len();
+    request.headers_mut().insert(
+        axum::http::header::CONTENT_LENGTH,
+        len.to_string().parse().expect("digit string is a valid header value"),
+    );
+    *request.body_mut() = Body::from(new_bytes);
 
     next.run(request).await
 }
@@ -420,7 +419,10 @@ mod tests {
     use crate::image_normalizer::{DefaultImageNormalizer, DisabledNormalizer, ImageNormalizer, MemoryStore, config::FetcherConfig};
     use axum::{Router, body::to_bytes, http::Method, middleware, routing::post};
     use serde_json::json;
+    use sqlx::postgres::PgPoolOptions;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::TcpListener;
     use tower::ServiceExt;
 
     /// 1×1 transparent PNG, base64-encoded as a data URI; used as the
@@ -484,6 +486,44 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(echoed["messages"][0]["content"], "hi");
+    }
+
+    #[tokio::test]
+    async fn only_a_request_with_images_looks_up_its_caller() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        tokio::spawn({
+            let connections = Arc::clone(&connections);
+            async move {
+                while listener.accept().await.is_ok() {
+                    connections.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        let pool = PgPoolOptions::new()
+            .acquire_timeout(Duration::from_secs(1))
+            .connect_lazy(&format!("postgres://caller:lookup@{address}/dwctl"))
+            .unwrap();
+        let mut state = state_for_tests();
+        state.pool = Some(sqlx_pool_router::DynPools::new(pool));
+        let router = build_router(state);
+
+        let text_only = json!({ "model": "vision", "messages": [ { "role": "user", "content": "hi" } ] });
+        let (status, echoed) = post_json_as(router.clone(), Some("sk-test"), text_only.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(echoed, text_only);
+        assert_eq!(connections.load(Ordering::SeqCst), 0);
+
+        let with_image = json!({
+            "model": "vision",
+            "messages": [{ "role": "user", "content": [
+                { "type": "image_url", "image_url": { "url": TINY_PNG_DATA_URI } }
+            ]}]
+        });
+        let (status, _) = post_json_as(router, Some("sk-test"), with_image).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(connections.load(Ordering::SeqCst) > 0);
     }
 
     #[tokio::test]
