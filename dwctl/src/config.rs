@@ -2582,6 +2582,19 @@ impl Default for DispatchTolerationsSlaRelease {
 }
 
 impl DispatchTolerationsSlaRelease {
+    /// `safety_margin` is a fraction of the remaining time: outside `[0, 1)`
+    /// it would silently release nearly every deadline (above 1) or drop the
+    /// margin (below 0), so it is rejected rather than clamped.
+    pub fn validate(&self) -> Result<(), String> {
+        if !(self.safety_margin.is_finite() && (0.0..1.0).contains(&self.safety_margin)) {
+            return Err(format!(
+                "safety_margin must be a finite fraction in [0, 1), got {}",
+                self.safety_margin
+            ));
+        }
+        Ok(())
+    }
+
     /// The fusillade config, when enabled.
     pub fn to_fusillade(&self) -> Option<fusillade::daemon::SlaReleaseConfig> {
         self.enabled.then_some(fusillade::daemon::SlaReleaseConfig {
@@ -3691,6 +3704,11 @@ impl Config {
         if let Err(error) = self.background_services.batch_daemon.retention.validate() {
             return Err(Error::Internal {
                 operation: format!("Config validation: batch retention is invalid: {error}"),
+            });
+        }
+        if let Err(error) = self.background_services.batch_daemon.dispatch_tolerations_sla_release.validate() {
+            return Err(Error::Internal {
+                operation: format!("Config validation: dispatch_tolerations_sla_release is invalid: {error}"),
             });
         }
         if let Err(error) = self.background_services.task_retention.validate() {
@@ -5705,6 +5723,17 @@ background_services:
             assert_eq!(sla_release.refresh_interval_secs, 300);
             assert_eq!(sla_release.window_secs, 900);
             assert_eq!(sla_release.min_samples, 20);
+
+            for bad in ["1.5", "-0.1", "1.0", ".nan"] {
+                jail.create_file(
+                    "test.yaml",
+                    &format!(
+                        "secret_key: test-secret-key\nbackground_services:\n  batch_daemon:\n    dispatch_tolerations: []\n    dispatch_tolerations_sla_release:\n      enabled: true\n      safety_margin: {bad}\n"
+                    ),
+                )?;
+                let error = Config::load(&args).expect_err("an out-of-range safety_margin is rejected");
+                assert!(error.to_string().contains("safety_margin"), "{bad}: {error}");
+            }
 
             jail.create_file(
                 "test.yaml",
