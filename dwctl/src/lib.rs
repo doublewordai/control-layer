@@ -4377,12 +4377,12 @@ impl Application {
         // No classifier is injected here.
         // Request-body edits (id-scrub, streaming usage flags) now live in dwctl's own
         // `outbound_request` middleware, so onwards needs no BodyTransformFn.
-        // One Redis pool for both in-flight limiters. The realtime per-account
-        // limit and the global batch cap share the configured connection; each
-        // has its own scope and switch. With no Redis URL the pool is `None`
-        // and both fall back to counting within this replica.
+        // One Redis connection for both in-flight limiters. The realtime
+        // per-account limit and the global batch cap share it; each has its own
+        // scope and switch. With no Redis URL it is `None` and both fall back to
+        // counting within this replica.
         let limits_redis =
-            crate::realtime_inflight::RealtimeInflightLimiter::redis_pool(config.limits.realtime_inflight.redis_url.as_deref())?;
+            crate::realtime_inflight::RealtimeInflightLimiter::shared_redis(config.limits.realtime_inflight.redis_url.as_deref())?;
         let mut onwards_app_state = onwards::AppState::new(bg_services.onwards_targets.clone())
             .with_response_transform(onwards::create_openai_sanitizer())
             .with_upstream_rate_limit_message(config.onwards.upstream_rate_limit_message.clone())

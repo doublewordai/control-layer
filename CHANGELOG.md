@@ -1,5 +1,28 @@
 # Changelog
 
+## [13.4.3](https://github.com/doublewordai/control-layer/compare/v13.4.2...v13.4.3) (2026-10-09)
+
+
+### Bug Fixes
+
+* **db:** connect to Postgres with rustls ([#1948](https://github.com/doublewordai/control-layer/issues/1948)) ([baafb4b](https://github.com/doublewordai/control-layer/commit/baafb4b1acf066272b28aa2837eab2b219662823))
+* **images:** look up the caller only for requests with image inputs ([#1949](https://github.com/doublewordai/control-layer/issues/1949)) ([6d71346](https://github.com/doublewordai/control-layer/commit/6d7134641fc5a948bfe317ac28196d0de9303fbd))
+* **limits:** retry failed in-flight slot releases until Redis is back ([#1950](https://github.com/doublewordai/control-layer/issues/1950)) ([26d88b4](https://github.com/doublewordai/control-layer/commit/26d88b4869f2e2c886272d1a7ab2d1baa7893236))
+
+## [13.4.2](https://github.com/doublewordai/control-layer/compare/v13.4.1...v13.4.2) (2026-10-08)
+
+
+### Bug Fixes
+
+* **limits:** retry in-flight Redis reconnects every second ([#1946](https://github.com/doublewordai/control-layer/issues/1946)) ([39af83c](https://github.com/doublewordai/control-layer/commit/39af83ccdfccc1677749dc3eacfa214d6a3a2beb))
+
+## [13.4.1](https://github.com/doublewordai/control-layer/compare/v13.4.0...v13.4.1) (2026-10-08)
+
+
+### Bug Fixes
+
+* **limits:** share one Redis connection for in-flight checks ([#1940](https://github.com/doublewordai/control-layer/issues/1940)) ([1177b69](https://github.com/doublewordai/control-layer/commit/1177b69660044dd09c33bfdf153ecb23b60f2417))
+
 ## [13.4.0](https://github.com/doublewordai/control-layer/compare/v13.3.1...v13.4.0) (2026-10-08)
 
 
