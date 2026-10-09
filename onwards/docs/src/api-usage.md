@@ -70,9 +70,13 @@ Each rejection also sets these attributes on the current trace span: onwards' `o
 
 - `error.type`: the same code as the metric;
 - `onwards.rejection.param`: the parameter the error names, if any;
-- `onwards.account` and `onwards.api_key_id`: from the labels of the key the request presented;
+- `onwards.account` and `onwards.api_key_id`: from the labels of the key the request presented, when it has them;
 - `http.response.status_code`: on `onwards.request`.
 
-Each rejection is also logged at `info` with its status, code, parameter, model, account and API key ID. The exceptions are refusals by the caller's own limits (`rate_limit`, `concurrency_limit_exceeded`, `inflight_limit_exceeded`): a client retrying in a tight loop would log every attempt, so those are only counted and traced.
+Each rejection is also logged at `info` with its status, code, parameter, model, account and API key ID, except refusals by a request limit, which are only counted and traced: a client retrying in a tight loop would otherwise log every attempt. These are:
+
+- `rate_limit`: the key's, the model's or a provider's rate limit;
+- `concurrency_limit_exceeded`: the key's concurrency limit;
+- `inflight_limit_exceeded`: the account's in-flight limit on the model.
 
 Request parameter values and request bodies are never recorded. A client error that reports an upstream's response isn't counted.

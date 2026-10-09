@@ -7,12 +7,11 @@
 //!   `model` is set only for configured aliases, so the label stays bounded
 //!   whatever a client sends;
 //! - sets `error.type` (the error code), `onwards.rejection.param`,
-//!   `onwards.account` and `onwards.api_key_id` on the current span, and the
-//!   response status on onwards' request span;
-//! - is logged once at `info` with the same fields, except refusals by the
-//!   caller's own rate, concurrency or in-flight limits. A client retrying in a
-//!   tight loop would otherwise log every attempt; those are counted and traced
-//!   only.
+//!   `onwards.account` and `onwards.api_key_id` (when the key has them) on the
+//!   current span, and the response status on onwards' request span;
+//! - is logged once at `info` with the same fields, except refusals by a rate,
+//!   concurrency or in-flight limit. A client retrying in a tight loop would
+//!   otherwise log every attempt; those are counted and traced only.
 //!
 //! Request values and bodies are never recorded.
 
@@ -28,8 +27,9 @@ use crate::{
     serving,
 };
 
-/// Codes of the refusals by a caller's own limits, which are not logged.
-const CALLER_LIMIT_CODES: &[&str] = &[RATE_LIMIT_CODE, CONCURRENCY_LIMIT_CODE, INFLIGHT_LIMIT_CODE];
+/// Codes of the refusals by a request limit, which are not logged. `rate_limit`
+/// covers the key's, the model's and a provider's rate limit.
+const LIMIT_CODES: &[&str] = &[RATE_LIMIT_CODE, CONCURRENCY_LIMIT_CODE, INFLIGHT_LIMIT_CODE];
 
 /// What is known about a request when onwards refuses it.
 #[derive(Debug, Clone)]
@@ -144,7 +144,7 @@ impl RejectionContext {
 /// Whether a rejection with `code` gets a log line as well as its count and
 /// span attributes.
 fn logs_rejection(code: &str) -> bool {
-    !CALLER_LIMIT_CODES.contains(&code)
+    !LIMIT_CODES.contains(&code)
 }
 
 #[cfg(test)]
@@ -152,7 +152,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn caller_limits_are_not_logged() {
+    fn limit_refusals_are_not_logged() {
         assert!(!logs_rejection("rate_limit"));
         assert!(!logs_rejection("concurrency_limit_exceeded"));
         assert!(!logs_rejection("inflight_limit_exceeded"));
