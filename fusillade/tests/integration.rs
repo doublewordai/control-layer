@@ -266,7 +266,7 @@ fn call_priority(call: &fusillade::http::MockCall) -> i64 {
         .expect("daemon must inject an integer priority")
 }
 
-/// The spillover tolerations the daemon wrote into a dispatched body.
+/// The scheduling tolerations the daemon wrote into a dispatched body.
 fn call_tolerations(call: &fusillade::http::MockCall) -> serde_json::Value {
     serde_json::from_str::<serde_json::Value>(&call.body).unwrap()["nvext"]["routing_constraints"]
         ["tolerations"]

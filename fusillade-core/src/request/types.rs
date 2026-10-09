@@ -175,7 +175,7 @@ pub struct Claimed {
     /// daemon which `(user, window-class, model)` bucket to stamp (the model is
     /// read from the request's `data.model`). `None` for full-capacity claims.
     pub leak: Option<LeakStamp>,
-    /// Whether this dispatch keeps or releases the daemon's spillover
+    /// Whether this dispatch keeps or releases the daemon's scheduling
     /// tolerations, as decided by the claim (and recorded on the row as
     /// `dispatched_tolerated`). `None` when the claim path made no decision:
     /// tolerations are not configured, or the path (single-row claims,
@@ -185,16 +185,16 @@ pub struct Claimed {
 
 impl RequestState for Claimed {}
 
-/// The claim's decision on a request's spillover tolerations.
+/// The claim's decision on a request's scheduling tolerations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum DispatchTolerations {
-    /// Send the configured tolerations: our own workers only.
+    /// Send the configured tolerations.
     Keep,
-    /// Send none, so the request may spill.
+    /// Send none, so the backend may schedule the request anywhere.
     Release(TolerationsRelease),
 }
 
-/// Why a request's spillover tolerations were released.
+/// Why a request's scheduling tolerations were released.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum TolerationsRelease {
     /// Inside the batch-claim deadline ramp.
@@ -202,7 +202,7 @@ pub enum TolerationsRelease {
     /// Already past its deadline (retry grace).
     PastDeadline,
     /// Its deadline is before the model's release cutoff: projected to miss
-    /// the SLA waiting for our own workers.
+    /// the SLA while keeping its tolerations.
     SlaProjection,
 }
 

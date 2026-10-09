@@ -1,12 +1,14 @@
-//! Release cutoffs for the daemon's spillover tolerations.
+//! Release cutoffs for the daemon's scheduling tolerations.
 //!
-//! The daemon sends batch requests with spillover tolerations so Dynamo keeps
-//! them on our own workers. Batch normally waits and retries rather than
-//! spilling to the paid tier, but when our workers will not reach a request
-//! before its deadline, meeting the SLA matters more than the cost. A leader
-//! computes, per model, the deadline before which requests are projected to
-//! miss on our own workers (`release_before_deadline`); the claim releases
-//! the tolerations of requests due before it.
+//! The daemon sends batch requests with scheduling tolerations that the
+//! upstream inference backend understands; a backend may, for example, use
+//! them to keep batch work off capacity reserved for other traffic. When the
+//! capacity a tolerated request may use will not reach it before its
+//! deadline, meeting the SLA matters more than where it runs. A leader
+//! computes, per model, the deadline before which tolerated requests are
+//! projected to miss (`release_before_deadline`); the claim releases the
+//! tolerations of requests due before it, so the backend may schedule them
+//! anywhere.
 
 use chrono::{DateTime, Utc};
 
@@ -21,7 +23,7 @@ pub const RELEASE_LADDER_SECS: [i64; 20] = [
 /// Settings the daemon hands its storage for the claim-time decision.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TolerationsReleaseSettings {
-    /// The daemon sends spillover tolerations; without them the claim makes
+    /// The daemon sends scheduling tolerations; without them the claim makes
     /// no decision and leaves `dispatched_tolerated` unset.
     pub tolerations_enabled: bool,
     /// Release on the leader's cutoffs, not only on the deadline floor.
@@ -52,7 +54,7 @@ pub struct ReleaseCutoff {
     /// Requests due before this are released. `None`: nothing beyond the
     /// deadline floor (on track, or too few samples to project).
     pub release_before_deadline: Option<DateTime<Utc>>,
-    /// Our workers' completions per second (0 when below `min_samples`).
+    /// Tolerated completions per second (0 when below `min_samples`).
     pub throughput: f64,
     /// Outstanding requests (pending, claimed, processing) of the model.
     pub backlog_requests: i64,
@@ -73,7 +75,8 @@ pub struct ReleaseCutoffStatus {
     pub backlog_requests: i64,
 }
 
-/// Throughput of our own workers from tolerated completions in the window:
+/// Throughput available to tolerated requests, from tolerated completions in
+/// the window:
 /// `count / sum(completed_at - started_at)` is completions per in-flight
 /// second (`1 / latency`, by Little's law; idle time is in neither sum), and
 /// times the deployment-wide in-flight count (at least one) it is
@@ -88,11 +91,11 @@ pub fn tolerated_throughput(
         .then(|| samples as f64 / busy_secs * in_flight.max(1) as f64)
 }
 
-/// The shortest prefix of the deadline-ordered queue to release so that our
-/// workers finish everything after it in time.
+/// The shortest prefix of the deadline-ordered queue to release so that the
+/// tolerated capacity finishes everything after it in time.
 ///
 /// Requests are served roughly in deadline order. If the requests due before
-/// `now + L[i]` are released (they may spill and stop occupying our workers),
+/// `now + L[i]` are released (they may run anywhere and stop occupying the tolerated capacity),
 /// the one due at `now + L[j]` waits for `W[j] - W[i]` requests ahead of it,
 /// which takes `(W[j] - W[i]) / throughput`. The cutoff is the smallest ladder
 /// point `L[i]` such that every later point finishes within

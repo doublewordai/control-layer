@@ -33,7 +33,7 @@ use crate::request::{Claimed, DaemonId, FailureReason, Request, RequestCompletio
 
 pub use config::{
     DaemonConfig, DaemonMode, LeakConfig, ModelEscalationConfig, RetentionMaintenanceConfig,
-    ShouldRetryFn, TaintEffect, Toleration, TolerationOperator, default_should_retry,
+    ShouldRetryFn, Toleration, TolerationEffect, TolerationOperator, default_should_retry,
 };
 pub use fusillade_core::daemon_record::{
     AnyDaemonRecord, DaemonData, DaemonRecord, DaemonState, DaemonStats, DaemonStatus, Dead,
@@ -226,13 +226,13 @@ enum TolerationsWrite<'a> {
     Remove,
 }
 
-/// Write the daemon's Dynamo extensions into an outbound body in one parse and
-/// one serialise: the scheduling priority at `nvext.agent_hints.priority` and
-/// the spillover tolerations at `nvext.routing_constraints.tolerations`. Each
+/// Write the daemon's request extensions (`nvext`) into an outbound body in one
+/// parse and one serialise: the scheduling priority at
+/// `nvext.agent_hints.priority` and the scheduling tolerations at `nvext.routing_constraints.tolerations`. Each
 /// overwrites a value already in the body (or, for released tolerations,
 /// removes it); every other key is preserved. With nothing to write or remove,
 /// or a body that is not a JSON object, the body is untouched.
-fn inject_dynamo_extensions(
+fn inject_nvext_extensions(
     body: &mut String,
     priority: Option<i32>,
     tolerations: TolerationsWrite<'_>,
@@ -1880,17 +1880,17 @@ where
     /// Write these tolerations to `nvext.routing_constraints.tolerations` on
     /// every request the daemon dispatches (batch, flex and background),
     /// overwriting any value already in the body and leaving the rest of
-    /// `nvext` untouched. Dynamo's spillover router keeps a request off every
-    /// tier whose taints it does not tolerate, so an empty list (tolerate
-    /// nothing) keeps daemon traffic on the model's own workers: when they are
-    /// full the request is refused with a 529 and retried rather than sent to
-    /// a paid external tier. Without this, bodies are left byte-identical.
+    /// `nvext` untouched. They are scheduling/routing tolerations understood
+    /// by the upstream inference backend; a backend may, for example, use
+    /// them to keep batch work off capacity reserved for other traffic, so
+    /// the request waits and is retried instead. Without this, bodies are
+    /// left byte-identical.
     /// Independent of [`DaemonConfig::inject_deadline_priority`].
     ///
     /// Near its SLA deadline a request is sent without the field instead (see
-    /// `tolerations_released`): batch normally waits rather than spill to
-    /// the paid tier, but near SLA failure meeting the deadline matters more
-    /// than the cost. Counted by `fusillade_tolerations_released_total{model}`.
+    /// `tolerations_released`), so the backend may schedule it anywhere: near
+    /// SLA failure, meeting the deadline matters more than where it runs.
+    /// Counted by `fusillade_tolerations_released_total{model}`.
     pub fn with_dispatch_tolerations(mut self, tolerations: Vec<Toleration>) -> Self {
         // Serialised once here, not per request: the same value goes on every
         // dispatched body.
@@ -1900,8 +1900,8 @@ where
     }
 
     /// Also release a request's tolerations when its deadline is before its
-    /// model's release cutoff: the deadline before which our own workers are
-    /// projected to miss, computed by one daemon per refresh interval from
+    /// model's release cutoff: the deadline before which tolerated requests
+    /// are projected to miss, computed by one daemon per refresh interval from
     /// tolerated completions in the requests table and the outstanding work.
     /// The claim query applies it. Without this only the deadline floor (ramp
     /// and past-deadline) releases. Has no effect without
@@ -2614,7 +2614,7 @@ where
                     }
                 }
             }
-            inject_dynamo_extensions(
+            inject_nvext_extensions(
                 &mut prepared_request.request.data.body,
                 priority,
                 tolerations,
@@ -3291,7 +3291,7 @@ where
         });
         daemon_handles.push(("heartbeat", heartbeat_handle));
 
-        // The claim queries decide spillover tolerations from these settings.
+        // The claim queries decide scheduling tolerations from these settings.
         self.storage
             .configure_tolerations_release(sla_release::claim_settings(
                 self.dispatch_tolerations.is_some(),
@@ -5881,7 +5881,7 @@ mod tests {
     fn priority_injection_keeps_key_order() {
         let mut body = r#"{"model":"m","response_format":{"type":"json_schema","json_schema":{"name":"n","schema":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"string"}}}}},"messages":[]}"#.to_string();
 
-        inject_dynamo_extensions(&mut body, Some(7), TolerationsWrite::Leave);
+        inject_nvext_extensions(&mut body, Some(7), TolerationsWrite::Leave);
 
         assert_eq!(
             body,
@@ -5900,7 +5900,7 @@ mod tests {
         })
         .to_string();
 
-        inject_dynamo_extensions(
+        inject_nvext_extensions(
             &mut body,
             Some(BACKGROUND_DYNAMO_PRIORITY),
             TolerationsWrite::Leave,
@@ -5929,12 +5929,12 @@ mod tests {
         // Odd spacing and key order a re-serialise would normalise.
         let original = r#"{ "model":"m",  "nvext":{"routing_constraints":{"tolerations":[{"operator":"Exists"}]}}, "a":1 }"#;
         let mut body = original.to_string();
-        inject_dynamo_extensions(&mut body, None, TolerationsWrite::Leave);
+        inject_nvext_extensions(&mut body, None, TolerationsWrite::Leave);
         assert_eq!(body, original);
 
         // A non-object body is left alone even when something is configured.
         let mut body = "[1,2]".to_string();
-        inject_dynamo_extensions(
+        inject_nvext_extensions(
             &mut body,
             Some(1),
             TolerationsWrite::Set(&serde_json::json!([])),
@@ -5951,14 +5951,14 @@ mod tests {
                 "agent_hints": {"max_batch_size": 8},
                 "routing_constraints": {
                     "tolerations": [{"operator": "Exists"}],
-                    "required_taints": ["gpu.h200"],
-                    "preferred_taints": {"zone.a": 1.0}
+                    "required": ["a"],
+                    "preferred": {"b": 1.0}
                 }
             }
         })
         .to_string();
 
-        inject_dynamo_extensions(
+        inject_nvext_extensions(
             &mut body,
             None,
             TolerationsWrite::Set(&serde_json::json!([])),
@@ -5967,11 +5967,8 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         let constraints = &json["nvext"]["routing_constraints"];
         assert_eq!(constraints["tolerations"], serde_json::json!([]));
-        assert_eq!(
-            constraints["required_taints"],
-            serde_json::json!(["gpu.h200"])
-        );
-        assert_eq!(constraints["preferred_taints"]["zone.a"], 1.0);
+        assert_eq!(constraints["required"], serde_json::json!(["a"]));
+        assert_eq!(constraints["preferred"]["b"], 1.0);
         assert_eq!(json["nvext"]["cache_control"]["enabled"], true);
         assert!(
             json["nvext"]["agent_hints"].get("priority").is_none(),
@@ -5987,13 +5984,13 @@ mod tests {
             "nvext": {
                 "routing_constraints": {
                     "tolerations": [{"operator": "Exists"}],
-                    "required_taints": ["gpu.h200"]
+                    "required": ["a"]
                 }
             }
         })
         .to_string();
 
-        inject_dynamo_extensions(&mut body, Some(5), TolerationsWrite::Remove);
+        inject_nvext_extensions(&mut body, Some(5), TolerationsWrite::Remove);
 
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         let constraints = &json["nvext"]["routing_constraints"];
@@ -6001,35 +5998,32 @@ mod tests {
             constraints.get("tolerations").is_none(),
             "a released request is sent without the field"
         );
-        assert_eq!(
-            constraints["required_taints"],
-            serde_json::json!(["gpu.h200"])
-        );
+        assert_eq!(constraints["required"], serde_json::json!(["a"]));
         assert_eq!(json["nvext"]["agent_hints"]["priority"], 5);
 
         // Nothing to remove and nothing else to write: byte-identical.
         let original = r#"{ "model":"m",  "a":1 }"#;
         let mut body = original.to_string();
-        inject_dynamo_extensions(&mut body, None, TolerationsWrite::Remove);
+        inject_nvext_extensions(&mut body, None, TolerationsWrite::Remove);
         assert_eq!(body, original);
     }
 
     #[test]
     fn tolerations_and_priority_are_injected_together() {
         let tolerations = serde_json::to_value(vec![Toleration {
-            key: Some("dynamo.spillover/external".to_string()),
+            key: Some("example.com/reserved".to_string()),
             operator: Some(TolerationOperator::Exists),
             value: None,
-            effect: Some(TaintEffect::PreferNoSchedule),
+            effect: Some(TolerationEffect::PreferNoSchedule),
         }])
         .unwrap();
         let mut body = r#"{"model":"m","messages":[],"nvext":"not-an-object"}"#.to_string();
 
-        inject_dynamo_extensions(&mut body, Some(-42), TolerationsWrite::Set(&tolerations));
+        inject_nvext_extensions(&mut body, Some(-42), TolerationsWrite::Set(&tolerations));
 
         assert_eq!(
             body,
-            r#"{"model":"m","messages":[],"nvext":{"agent_hints":{"priority":-42},"routing_constraints":{"tolerations":[{"key":"dynamo.spillover/external","operator":"Exists","effect":"PreferNoSchedule"}]}}}"#
+            r#"{"model":"m","messages":[],"nvext":{"agent_hints":{"priority":-42},"routing_constraints":{"tolerations":[{"key":"example.com/reserved","operator":"Exists","effect":"PreferNoSchedule"}]}}}"#
         );
     }
 
@@ -6094,15 +6088,15 @@ mod tests {
         assert_eq!(
             bodies[0]["nvext"]["routing_constraints"]["tolerations"],
             serde_json::json!([]),
-            "far from its deadline, batch must not spill to the paid tier"
+            "far from its deadline, batch keeps its tolerations"
         );
         for (body, deadline) in [(&bodies[1], near), (&bodies[2], past)] {
             assert!(
                 body["nvext"].get("routing_constraints").is_none(),
-                "near or past its deadline the request may spill"
+                "near or past its deadline the tolerations are released"
             );
             let mut expected = BODY.to_string();
-            inject_dynamo_extensions(
+            inject_nvext_extensions(
                 &mut expected,
                 Some(sla_dynamo_priority(deadline)),
                 TolerationsWrite::Leave,
@@ -6177,18 +6171,18 @@ mod tests {
         );
 
         let tolerations: Vec<Toleration> = serde_json::from_value(serde_json::json!([
-            {"key": "dynamo.spillover/external", "effect": "NoSchedule"},
+            {"key": "example.com/reserved", "effect": "NoSchedule"},
             {"operator": "Exists"}
         ]))
         .unwrap();
-        assert_eq!(tolerations[0].effect, Some(TaintEffect::NoSchedule));
+        assert_eq!(tolerations[0].effect, Some(TolerationEffect::NoSchedule));
         assert_eq!(tolerations[0].operator, None);
         assert_eq!(tolerations[1].operator, Some(TolerationOperator::Exists));
 
         assert!(
             serde_json::from_value::<Vec<Toleration>>(serde_json::json!([{"effect": "NoExecute"}]))
                 .is_err(),
-            "an effect Dynamo does not know is a config error, not a silent no-op"
+            "an unknown effect is a config error, not a silent no-op"
         );
         assert!(
             serde_json::from_value::<Vec<Toleration>>(serde_json::json!([{"keys": "x"}])).is_err()

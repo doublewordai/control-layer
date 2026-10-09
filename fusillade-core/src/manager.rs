@@ -1728,7 +1728,7 @@ pub trait DaemonStorage: Send + Sync {
     /// the daemon purge task for right-to-erasure compliance.
     async fn purge_orphaned_rows(&self, batch_size: i64) -> Result<u64>;
 
-    /// Tell the storage how the claim decides spillover tolerations. Claims
+    /// Tell the storage how the claim decides scheduling tolerations. Claims
     /// that decide (the batch and batchless claim queries) then return a
     /// [`crate::request::DispatchTolerations`] per row and record it as
     /// `dispatched_tolerated`. The default storage makes no decision.

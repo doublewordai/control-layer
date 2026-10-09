@@ -1,16 +1,17 @@
-//! When to stop sending a request's spillover tolerations.
+//! When to stop sending a request's scheduling tolerations.
 //!
-//! The daemon marks dispatched requests with tolerations (`[]` keeps them off
-//! a paid spillover tier). Batch normally waits and retries rather than
-//! spilling to the paid tier, but near SLA failure, meeting the deadline
-//! matters more than the cost, so a request is sent without tolerations (it
-//! then falls back to the policy default and may spill) when:
+//! The daemon marks dispatched requests with scheduling tolerations that the
+//! upstream inference backend understands; a backend may, for example, use
+//! them to keep batch work off capacity reserved for other traffic. Near SLA
+//! failure, meeting the deadline matters more than where the request runs, so
+//! it is sent without tolerations (the backend may then schedule it anywhere)
+//! when:
 //!
 //! - it is past its deadline, or inside the batch-claim deadline ramp (the
 //!   floor, always), or
 //! - with [`SlaReleaseConfig`] enabled, its deadline is before its model's
-//!   release cutoff: the deadline before which our own workers are projected
-//!   to miss.
+//!   release cutoff: the deadline before which tolerated requests are
+//!   projected to miss.
 //!
 //! The claim query decides (and records the decision as
 //! `requests.dispatched_tolerated`), so every replica decides from the same

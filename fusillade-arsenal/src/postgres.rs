@@ -250,7 +250,7 @@ pub struct PostgresRequestManager<P: PoolProvider> {
     /// reassembly moves into dwctl.
     response_transformer: std::sync::OnceLock<Arc<dyn crate::transform::ResponseTransformer>>,
     maintenance_budget: std::time::Duration,
-    /// How the batch and batchless claims decide spillover tolerations; set
+    /// How the batch and batchless claims decide scheduling tolerations; set
     /// by the daemon through `DaemonStorage::configure_tolerations_release`.
     /// `None`: the claims make no decision.
     tolerations_release:
@@ -2735,8 +2735,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 state = 'claimed',
                 daemon_id = $1,
                 claimed_at = $3,
-                -- TRUE: dispatched with spillover tolerations (on our own
-                -- workers); FALSE: released; NULL: the daemon sends none.
+                -- TRUE: dispatched with the scheduling tolerations; FALSE:
+                -- released; NULL: the daemon sends none.
                 dispatched_tolerated = CASE WHEN $16::BOOLEAN THEN rel.reason IS NULL END
             FROM to_claim tc
             CROSS JOIN LATERAL (
@@ -2747,7 +2747,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 SELECT * FROM active_request_templates t WHERE t.id = tc.template_id LIMIT 1
             ) t
             CROSS JOIN LATERAL (
-                -- Spillover-tolerations decision: released past the deadline,
+                -- Scheduling-tolerations decision: released past the deadline,
                 -- inside the claim ramp (the same window_minutes ^ exponent
                 -- as the claim gate), or when due before the model's fresh
                 -- release cutoff (a primary-key lookup); otherwise kept.
@@ -7294,8 +7294,8 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 state = 'claimed',
                 daemon_id = $1,
                 claimed_at = $3,
-                -- TRUE: dispatched with spillover tolerations (on our own
-                -- workers); FALSE: released; NULL: the daemon sends none.
+                -- TRUE: dispatched with the scheduling tolerations; FALSE:
+                -- released; NULL: the daemon sends none.
                 dispatched_tolerated = CASE WHEN $16::BOOLEAN THEN rel.reason IS NULL END
             FROM to_claim tc
             CROSS JOIN LATERAL (
@@ -7307,7 +7307,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             ) t
             JOIN batches b ON tc.batch_id = b.id
             CROSS JOIN LATERAL (
-                -- Spillover-tolerations decision: released past the deadline,
+                -- Scheduling-tolerations decision: released past the deadline,
                 -- inside the claim ramp (the same window_minutes ^ exponent
                 -- as the claim gate), or when due before the model's fresh
                 -- release cutoff (a primary-key lookup); otherwise kept.
@@ -9227,7 +9227,7 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         let models: Vec<String> = outstanding.keys().cloned().collect();
         bound_to_deadline(&mut tx, deadline).await.map_err(bound)?;
 
-        // Our own workers' throughput: tolerated successful completions in the
+        // Tolerated throughput: tolerated successful completions in the
         // window, one index-only range scan of idx_requests_tolerated_completions
         // per model. The sum of (completed_at - started_at) counts only time a
         // request was in flight, so idle time is in neither sum.

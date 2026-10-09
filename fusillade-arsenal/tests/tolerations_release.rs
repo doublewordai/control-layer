@@ -1,4 +1,4 @@
-//! Spillover-tolerations release: the cutoff computation (leader election,
+//! Scheduling-tolerations release: the cutoff computation (leader election,
 //! throughput from tolerated completions, the cutoff itself) and the claim's
 //! decision, against a real database.
 
@@ -148,7 +148,7 @@ async fn a_slow_model_gets_a_cutoff_and_a_cold_one_does_not(pool: PgPool) {
     // 600 flex requests due in about an hour, 1 in flight.
     let slow = flex(&storage, "slow", 600).await;
     in_flight(&pool, &slow[..1]).await;
-    // Each takes 30s on our workers: 1 in flight -> 1/30 per second, so the
+    // Each takes 30s while tolerated: 1 in flight -> 1/30 per second, so the
     // hour's work takes about 5 hours. Release everything due within the hour.
     for i in 0..20 {
         completed(&pool, "slow", Some(true), 30.0, 30.0 * i as f64).await;
@@ -326,7 +326,7 @@ async fn the_claim_applies_the_cutoff_and_falls_back_to_the_floor(pool: PgPool) 
         );
     }
 
-    // Due after the cutoff: kept on our workers.
+    // Due after the cutoff: tolerations kept.
     set_cutoff(&pool, "m", 1_800, 0).await;
     let later = flex(&a, "m", 2).await;
     let decisions = claim(&b, "m", 2).await;

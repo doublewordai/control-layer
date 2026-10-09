@@ -1,11 +1,12 @@
--- Release of spillover tolerations on an SLA projection.
+-- Release of scheduling tolerations on an SLA projection.
 --
 -- requests.dispatched_tolerated records, at claim, whether the daemon sends
--- the request with its spillover tolerations (TRUE: kept on our own workers)
--- or releases them (FALSE: may spill to a paid tier). NULL: no decision
+-- the request with its scheduling tolerations (TRUE) or releases them
+-- (FALSE: the backend may schedule it anywhere). NULL: no decision
 -- (tolerations not configured, background, realtime, or claimed before this
--- migration). Only rows dispatched with tolerations measure our own workers'
--- throughput: a released one may have been served elsewhere.
+-- migration). Only rows dispatched with tolerations measure the throughput
+-- available to tolerated requests: a released one may have been served
+-- elsewhere.
 --
 -- model_release_cutoffs holds one row per model with outstanding work,
 -- written by whichever daemon computes the cutoffs (one per refresh

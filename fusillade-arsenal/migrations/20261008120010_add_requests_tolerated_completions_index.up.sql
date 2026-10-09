@@ -1,6 +1,6 @@
 -- no-transaction
 --
--- Throughput of our own workers for the spillover-tolerations release.
+-- Throughput of tolerated requests for the scheduling-tolerations release.
 --
 -- Once per refresh interval one daemon reads, for each model with
 -- outstanding work,

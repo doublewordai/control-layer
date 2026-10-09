@@ -91,10 +91,11 @@ pub fn to_chat_request(request: &ResponsesRequest) -> ChatCompletionRequest {
     }
 }
 
-/// Dynamo's request extensions (`nvext`) carried onto the Chat Completions
-/// body. They hold the fusillade daemon's scheduling priority and spillover
+/// The request extensions (`nvext`) carried onto the Chat Completions body.
+/// They hold the fusillade daemon's scheduling priority and scheduling
 /// tolerations for a batch-dispatched `/v1/responses` request; dropping them
-/// here would send a batch request onto the paid spillover tier. A realtime
+/// here would let the backend schedule a batch request as if it carried
+/// neither. A realtime
 /// client's own priority and tolerations are stripped by the inference
 /// middleware, which runs before translation, so whatever survives to here is
 /// either trusted or harmless.

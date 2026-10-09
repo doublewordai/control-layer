@@ -144,7 +144,7 @@ where
         self
     }
 
-    /// Mark every dispatched request with these spillover tolerations; see
+    /// Mark every dispatched request with these scheduling tolerations; see
     /// [`crate::Daemon::with_dispatch_tolerations`].
     pub fn with_dispatch_tolerations(
         mut self,

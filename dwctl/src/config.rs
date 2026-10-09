@@ -2265,30 +2265,29 @@ pub struct DaemonConfig {
 
     /// Tolerations the daemon writes to `nvext.routing_constraints.tolerations`
     /// on every request it dispatches (batch, flex and background), replacing
-    /// any value in the body. Dynamo's spillover router keeps a request off
-    /// every tier whose taints it does not tolerate, so `[]` (tolerate
-    /// nothing) keeps daemon traffic off the paid external tier: when the
-    /// model's own workers are full the request gets a 529 and is retried.
+    /// any value in the body. They are Kubernetes-style scheduling/routing
+    /// tolerations understood by the upstream inference backend; a backend
+    /// may, for example, use them to keep batch work off capacity reserved for
+    /// other traffic, so the request waits and is retried instead.
     /// Unset (the default) injects nothing and leaves bodies byte-identical.
     /// Independent of `inject_deadline_priority`.
     ///
-    /// Near SLA failure the daemon stops sending them: batch normally waits and
-    /// retries rather than spilling to the paid tier, but close to its deadline
-    /// meeting the SLA matters more than the cost. A request within the
+    /// Near SLA failure the daemon stops sending them: close to its deadline,
+    /// meeting the SLA matters more than where the request runs. A request within the
     /// batch-claim deadline ramp (`claim_ramp_exponent`: `window_minutes ^
     /// exponent` minutes before its deadline, about 59 min for 24h and 10 min
     /// for 1h at 0.56), or already past its deadline, is sent without the field
-    /// and so falls back to the policy default, which may spill. Work without a
+    /// and the backend may schedule it anywhere. Work without a
     /// deadline (background) always carries them. Counted by
     /// `fusillade_tolerations_released_total{model}`.
     ///
-    /// Requires Dynamo frontends that understand `routing_constraints.tolerations`
-    /// (doublewordai/dynamo#153): older frontends reject the field.
+    /// The backend must accept `routing_constraints.tolerations`; one that
+    /// does not may reject the request.
     #[serde(default)]
     pub dispatch_tolerations: Option<Vec<fusillade::daemon::Toleration>>,
 
-    /// Release a request's `dispatch_tolerations` early when our own workers
-    /// are projected to miss its SLA, not only inside the deadline ramp.
+    /// Release a request's `dispatch_tolerations` early when it is projected
+    /// to miss its SLA with them, not only inside the deadline ramp.
     /// Off by default (ramp-only). See [`DispatchTolerationsSlaRelease`].
     #[serde(default)]
     pub dispatch_tolerations_sla_release: DispatchTolerationsSlaRelease,
@@ -2578,19 +2577,18 @@ fn default_batch_metadata_fields_dwctl() -> Vec<String> {
 /// One daemon per `refresh_interval_secs` (whichever ticks first once the
 /// cutoffs are stale, serialised by a transaction-scoped advisory lock)
 /// computes, per model, the deadline before which requests are projected to
-/// miss their SLA on our own workers, and stores it in
+/// miss their SLA while keeping their tolerations, and stores it in
 /// `model_release_cutoffs`. The claim query releases the tolerations of a
 /// request due before its model's cutoff, so every replica decides alike.
 ///
 /// Throughput comes from the `requests` table: successful completions of
 /// requests dispatched WITH the tolerations (`dispatched_tolerated`; released
-/// ones may have spilled and would inflate it) in the last `window_secs`,
+/// ones may have run on other capacity and would inflate it) in the last `window_secs`,
 /// `count / sum(completed_at - started_at)` times the deployment-wide
 /// in-flight count. The cutoff is the shortest deadline-ordered prefix whose
 /// release lets everything due later finish within `(1 - safety_margin)` of
-/// its remaining time. Batch normally waits and retries rather than spill to
-/// the paid tier, but when it would miss its SLA, meeting the deadline matters
-/// more than the cost. The deadline ramp and past-deadline release always
+/// its remaining time. When a request would miss its SLA, meeting the deadline
+/// matters more than where it runs. The deadline ramp and past-deadline release always
 /// apply; a model with fewer than `min_samples` tolerated completions in the
 /// window, or a cutoff older than three refresh intervals, gets only them.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -5835,15 +5833,15 @@ secret_key: test-secret-key
 background_services:
   batch_daemon:
     dispatch_tolerations:
-      - key: dynamo.spillover/external
+      - key: example.com/reserved
         effect: PreferNoSchedule
 "#,
             )?;
             let config = Config::load(&args)?;
             let tolerations = config.background_services.batch_daemon.dispatch_tolerations.unwrap();
             assert_eq!(tolerations.len(), 1);
-            assert_eq!(tolerations[0].key.as_deref(), Some("dynamo.spillover/external"));
-            assert_eq!(tolerations[0].effect, Some(fusillade::daemon::TaintEffect::PreferNoSchedule));
+            assert_eq!(tolerations[0].key.as_deref(), Some("example.com/reserved"));
+            assert_eq!(tolerations[0].effect, Some(fusillade::daemon::TolerationEffect::PreferNoSchedule));
 
             jail.create_file("test.yaml", "secret_key: test-secret-key\n")?;
             let config = Config::load(&args)?;

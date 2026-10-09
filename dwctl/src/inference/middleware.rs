@@ -1385,13 +1385,12 @@ fn scrub_request_id_fields(value: &mut serde_json::Value) -> bool {
 /// itl_target}`): those are the resolver's to set (onwards writes them after
 /// resolution), never the caller's.
 ///
-/// Also removes the spillover tolerations (`nvext.routing_constraints.
-/// tolerations`): Dynamo's spillover router reads them to decide which tiers
-/// (including the paid external one) a request may use, so they are trusted
-/// routing input set only by the fusillade daemon (`dispatch_tolerations`),
-/// which, like the deadline priority, re-enters through the
-/// `x-fusillade-request-id` early return and is never stripped here. The
-/// sibling `required_taints`/`preferred_taints` only narrow routing and pass
+/// Also removes the scheduling tolerations (`nvext.routing_constraints.
+/// tolerations`): the upstream inference backend may read them to decide
+/// which capacity a request may be scheduled on, so they are trusted routing
+/// input set only by the fusillade daemon (`dispatch_tolerations`), which,
+/// like the deadline priority, re-enters through the `x-fusillade-request-id`
+/// early return and is never stripped here. Other routing constraints pass
 /// through.
 ///
 /// Returns whether anything was removed. Onwards validates and then forwards
@@ -1535,8 +1534,8 @@ mod tests {
                 "cache_control": {"enabled": true},
                 "routing_constraints": {
                     "tolerations": [{"operator": "Exists"}],
-                    "required_taints": ["gpu.h200"],
-                    "preferred_taints": {"zone.a": 1.0}
+                    "required": ["a"],
+                    "preferred": {"b": 1.0}
                 }
             }
         });
@@ -1544,10 +1543,10 @@ mod tests {
         let constraints = &body["nvext"]["routing_constraints"];
         assert!(
             constraints.get("tolerations").is_none(),
-            "a client must not tolerate its way onto the paid tier"
+            "a client must not set its own scheduling tolerations"
         );
-        assert_eq!(constraints["required_taints"], serde_json::json!(["gpu.h200"]));
-        assert_eq!(constraints["preferred_taints"]["zone.a"], 1.0);
+        assert_eq!(constraints["required"], serde_json::json!(["a"]));
+        assert_eq!(constraints["preferred"]["b"], 1.0);
         assert_eq!(body["nvext"]["cache_control"]["enabled"], true);
 
         // An empty list is still a client-supplied value.
@@ -1555,8 +1554,8 @@ mod tests {
         assert!(strip_scheduling_priority(&mut body));
         assert_eq!(body["nvext"]["routing_constraints"], serde_json::json!({}));
 
-        // Narrowing constraints alone: nothing to remove, nothing to rebuild.
-        let mut body = serde_json::json!({"model": "m", "nvext": {"routing_constraints": {"required_taints": ["x"]}}});
+        // Other constraints alone: nothing to remove, nothing to rebuild.
+        let mut body = serde_json::json!({"model": "m", "nvext": {"routing_constraints": {"required": ["x"]}}});
         assert!(!strip_scheduling_priority(&mut body));
     }
 

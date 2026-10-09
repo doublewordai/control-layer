@@ -23,4 +23,4 @@ END
 $$;
 
 COMMENT ON INDEX idx_requests_tolerated_completions IS
-'Tolerated successful completions per model for the spillover-tolerations release throughput read. Predicate must stay identical to that query''s static WHERE; started_at is included so the read is index-only.';
+'Tolerated successful completions per model for the scheduling-tolerations release throughput read. Predicate must stay identical to that query''s static WHERE; started_at is included so the read is index-only.';
