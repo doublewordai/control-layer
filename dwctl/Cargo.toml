@@ -1,6 +1,6 @@
 [package]
 name = "dwctl"
-version = "13.3.1" # x-release-please-version
+version = "13.4.2" # x-release-please-version
 edition = "2024"
 publish = false
 description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
@@ -124,6 +124,7 @@ aes-gcm = "0.10.3"
 deadpool-redis = "0.18"
 redis = { version = "0.27", default-features = false, features = [
   "tokio-rustls-comp",
+  "connection-manager",
 ] }
 paste = "1.0"
 serde_with = "3.14.1"
