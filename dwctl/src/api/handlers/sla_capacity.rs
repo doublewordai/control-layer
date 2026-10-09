@@ -235,18 +235,37 @@ impl<'a> CapacityReservationInput<'a> {
     }
 }
 
+/// A checked window that was full, with the models at capacity in it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FullWindow {
+    pub window: String,
+    /// Sorted model aliases. Each model is listed under the longest window it
+    /// failed, and only there.
+    pub models: Vec<String>,
+}
+
+/// `"model-a, model-b (24h); model-c (1h)"`, longest window first.
+pub(crate) fn describe_full_windows(full_windows: &[FullWindow]) -> String {
+    full_windows
+        .iter()
+        .rev()
+        .map(|fw| format!("{} ({})", fw.models.join(", "), fw.window))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// Error type for capacity reservation operations.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CapacityError {
     /// `completion_window` is the window the batch was submitted for;
-    /// `checked_window` is the longest checked window that was full, which is
-    /// longer than `completion_window` when shorter-deadline work is rejected
+    /// `full_windows` (shortest first) are the checked windows that were full,
+    /// each with the models that are at capacity there. A window longer than
+    /// `completion_window` appears when shorter-deadline work is rejected
     /// because a longer window it also consumes is full.
-    #[error("insufficient capacity for {completion_window} window (full: {checked_window}): {models}")]
+    #[error("insufficient capacity for {completion_window} window: {}", describe_full_windows(full_windows))]
     InsufficientCapacity {
         completion_window: String,
-        checked_window: String,
-        models: String,
+        full_windows: Vec<FullWindow>,
     },
     #[error("{0}")]
     Internal(String),
@@ -579,9 +598,10 @@ pub(crate) async fn reserve_capacity<P: sqlx_pool_router::PoolProvider>(
         }
     }
 
-    let mut overloaded_models: HashMap<String, i64> = HashMap::new();
-    // Windows are shortest first, so this ends as the longest full window.
-    let mut full_window: Option<&str> = None;
+    // Per model: the longest checked window it does not fit in, with the
+    // deficit there. Windows are shortest first, so a later failure replaces
+    // an earlier one and each model is reported against one window only.
+    let mut overloaded_models: HashMap<String, (&str, i64)> = HashMap::new();
     for window in input.windows {
         let result = check_sla_capacity(
             input.file_model_counts,
@@ -591,36 +611,48 @@ pub(crate) async fn reserve_capacity<P: sqlx_pool_router::PoolProvider>(
             &window.label,
             window.relaxation_factor,
         );
-        if !result.has_capacity {
-            full_window = Some(&window.label);
-        }
         for (model, deficit) in result.overloaded_models {
-            let entry = overloaded_models.entry(model).or_insert(0);
-            *entry = (*entry).max(deficit);
+            overloaded_models.insert(model, (window.label.as_str(), deficit));
         }
     }
 
     if !overloaded_models.is_empty() {
         tx.rollback().await.ok();
 
-        let overloaded_details: Vec<String> = overloaded_models
+        let full_windows: Vec<FullWindow> = input
+            .windows
             .iter()
-            .map(|(model, deficit)| format!("{model} (needs {deficit} more capacity)"))
+            .filter_map(|window| {
+                let mut models: Vec<String> = overloaded_models
+                    .iter()
+                    .filter(|(_, (label, _))| *label == window.label)
+                    .map(|(model, _)| model.clone())
+                    .collect();
+                if models.is_empty() {
+                    return None;
+                }
+                models.sort_unstable();
+                Some(FullWindow {
+                    window: window.label.clone(),
+                    models,
+                })
+            })
             .collect();
-        let checked_window = full_window.unwrap_or(input.completion_window);
+        let mut overloaded_details: Vec<String> = overloaded_models
+            .iter()
+            .map(|(model, (label, deficit))| format!("{model} (needs {deficit} more capacity in {label})"))
+            .collect();
+        overloaded_details.sort_unstable();
         tracing::warn!(
             completion_window = %input.completion_window,
-            checked_window = %checked_window,
+            full_windows = %describe_full_windows(&full_windows),
             overloaded_models = %overloaded_details.join(", "),
             "Batch rejected due to insufficient capacity"
         );
 
-        let mut model_names: Vec<&str> = overloaded_models.keys().map(|s| s.as_str()).collect();
-        model_names.sort_unstable();
         return Err(CapacityError::InsufficientCapacity {
             completion_window: input.completion_window.to_string(),
-            checked_window: checked_window.to_string(),
-            models: model_names.join(", "),
+            full_windows,
         });
     }
 

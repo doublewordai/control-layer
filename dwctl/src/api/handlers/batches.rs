@@ -1184,21 +1184,45 @@ async fn reserve_capacity_for_batch<P: PoolProvider>(
     reserved.map_err(|e| match e {
         CapacityError::InsufficientCapacity {
             completion_window,
-            checked_window,
-            models,
+            full_windows,
         } => Error::TooManyRequests {
-            message: if checked_window == completion_window {
-                format!(
-                    "Insufficient capacity for {completion_window} completion window. The following models are currently at capacity: {models}. Try again later or use a longer completion window."
-                )
-            } else {
-                format!(
-                    "Insufficient capacity for {completion_window} completion window: the following models are at capacity for the {checked_window} completion window, which shorter-window batches also use: {models}. Try again later."
-                )
-            },
+            message: capacity_rejection_message(&completion_window, &full_windows),
         },
         CapacityError::Internal(msg) => Error::Internal { operation: msg },
     })
+}
+
+/// The 429 message for a capacity rejection. Each model is named under the
+/// window it is at capacity for, so a model that only fails the requested
+/// window is not reported against a longer one (or vice versa).
+fn capacity_rejection_message(completion_window: &str, full_windows: &[super::sla_capacity::FullWindow]) -> String {
+    if let [only] = full_windows
+        && only.window == completion_window
+    {
+        return format!(
+            "Insufficient capacity for {completion_window} completion window. The following models are currently at capacity: {}. Try again later or use a longer completion window.",
+            only.models.join(", ")
+        );
+    }
+    let parts: Vec<String> = full_windows
+        .iter()
+        .rev()
+        .map(|fw| {
+            let models = fw.models.join(", ");
+            if fw.window == completion_window {
+                format!("at capacity for the {} completion window: {models}", fw.window)
+            } else {
+                format!(
+                    "at capacity for the {} completion window, which shorter-window batches also use: {models}",
+                    fw.window
+                )
+            }
+        })
+        .collect();
+    format!(
+        "Insufficient capacity for {completion_window} completion window: the following models are {}. Try again later.",
+        parts.join("; and ")
+    )
 }
 
 async fn release_capacity_reservations<P: PoolProvider>(state: &AppState<P>, reservation_ids: &[Uuid]) -> Result<()> {
@@ -4431,6 +4455,82 @@ mod tests {
         assert!(
             message.contains("at capacity for the 24h completion window"),
             "message should name the full 24h window: {message}"
+        );
+    }
+
+    /// Models that fail different windows are each reported against their own
+    /// window: a model that only overflows the requested 1h window must not be
+    /// reported as at capacity for 24h, and vice versa.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_reserve_capacity_reports_each_model_against_its_full_window(pool: PgPool) {
+        let mut config = create_test_config();
+        config.batches.allowed_completion_windows = vec!["1h".to_string(), "24h".to_string()];
+        let state = create_test_app_state_with_fusillade(pool.clone(), config).await;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let endpoint_id = create_test_endpoint(&pool, &format!("test-{}", Uuid::new_v4()), user.id).await;
+        let alias_a = format!("alias-a-{}", Uuid::new_v4());
+        let alias_b = format!("alias-b-{}", Uuid::new_v4());
+        let model_a = create_test_model(&pool, "model-a", &alias_a, endpoint_id, user.id).await;
+        let model_b = create_test_model(&pool, "model-b", &alias_b, endpoint_id, user.id).await;
+
+        // A: 1h capacity 3, 24h capacity 86. B: 1h capacity 3600, 24h capacity 86400.
+        let model_throughputs = HashMap::from([(alias_a.clone(), 0.001_f32), (alias_b.clone(), 1.0_f32)]);
+        let model_ids_by_alias = HashMap::from([(alias_a.clone(), model_a), (alias_b.clone(), model_b)]);
+
+        // Fill B's 24h window to within 5 requests.
+        super::reserve_capacity_for_batch(
+            &state,
+            "24h",
+            &HashMap::from([(alias_b.clone(), 86_395_i64)]),
+            &model_throughputs,
+            &model_ids_by_alias,
+            1.0,
+        )
+        .await
+        .expect("24h reservation for B fits");
+
+        // 10 each in 1h: A overflows only 1h, B overflows only 24h.
+        let err = super::reserve_capacity_for_batch(
+            &state,
+            "1h",
+            &HashMap::from([(alias_a.clone(), 10_i64), (alias_b.clone(), 10_i64)]),
+            &model_throughputs,
+            &model_ids_by_alias,
+            1.0,
+        )
+        .await
+        .expect_err("both models are over capacity in some window");
+        let Error::TooManyRequests { message } = err else {
+            panic!("expected TooManyRequests, got {err:?}");
+        };
+        assert!(
+            message.contains(&format!("at capacity for the 1h completion window: {alias_a}")),
+            "A is reported against 1h: {message}"
+        );
+        assert!(
+            message.contains(&format!("which shorter-window batches also use: {alias_b}")),
+            "B is reported against 24h: {message}"
+        );
+        assert!(
+            !message.contains(&format!("{alias_a}, {alias_b}")) && !message.contains(&format!("{alias_b}, {alias_a}")),
+            "the models are not merged under one window: {message}"
+        );
+    }
+
+    #[test]
+    fn test_capacity_rejection_message_single_requested_window() {
+        let message = super::capacity_rejection_message(
+            "24h",
+            &[crate::api::handlers::sla_capacity::FullWindow {
+                window: "24h".to_string(),
+                models: vec!["a".to_string(), "b".to_string()],
+            }],
+        );
+        assert_eq!(
+            message,
+            "Insufficient capacity for 24h completion window. The following models are currently at capacity: a, b. Try again later or use a longer completion window."
         );
     }
 
