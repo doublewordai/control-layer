@@ -189,7 +189,7 @@ fn emit_concurrency_increase(model: &str, adjustment: ConcurrencyAdjustment) {
     );
 }
 
-fn sla_dynamo_priority(deadline: chrono::DateTime<chrono::Utc>) -> i32 {
+fn sla_priority(deadline: chrono::DateTime<chrono::Utc>) -> i32 {
     deadline
         .timestamp()
         .saturating_neg()
@@ -2571,7 +2571,7 @@ where
             let priority = if kind.is_background() {
                 Some(BACKGROUND_DYNAMO_PRIORITY)
             } else if self.config.inject_deadline_priority {
-                request.state.batch_expires_at.map(sla_dynamo_priority)
+                request.state.batch_expires_at.map(sla_priority)
             } else {
                 None
             };
@@ -5915,12 +5915,11 @@ mod tests {
         assert_eq!(json["nvext"]["cache_control"]["enabled"], true);
 
         assert_eq!(
-            sla_dynamo_priority(chrono::DateTime::<chrono::Utc>::MAX_UTC),
+            sla_priority(chrono::DateTime::<chrono::Utc>::MAX_UTC),
             MIN_SLA_DYNAMO_PRIORITY
         );
         assert!(
-            sla_dynamo_priority(chrono::DateTime::<chrono::Utc>::MAX_UTC)
-                > BACKGROUND_DYNAMO_PRIORITY
+            sla_priority(chrono::DateTime::<chrono::Utc>::MAX_UTC) > BACKGROUND_DYNAMO_PRIORITY
         );
     }
 
@@ -6098,7 +6097,7 @@ mod tests {
             let mut expected = BODY.to_string();
             inject_nvext_extensions(
                 &mut expected,
-                Some(sla_dynamo_priority(deadline)),
+                Some(sla_priority(deadline)),
                 TolerationsWrite::Leave,
             );
             assert_eq!(
