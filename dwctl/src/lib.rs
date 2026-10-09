@@ -327,6 +327,11 @@ where
     /// Encrypted key custody, built from `config.keystore`. `None` means it is
     /// not configured (ZDR flex disabled).
     pub keystore: Option<crate::keystore::Keystore>,
+    /// Per-key account policy map (ZDR, disabled modalities, pinned
+    /// tolerations), kept fresh by [`crate::sync::key_policy`]. The batch
+    /// ingest path reads an account's pinned tolerations from here (its hidden
+    /// batch key belongs to that account) so batch matches realtime.
+    pub key_policy_cache: crate::sync::key_policy::KeyPolicyCache,
 }
 
 impl<P> AppState<P>
@@ -4423,6 +4428,7 @@ impl Application {
             .task_runner(bg_services.task_runner.clone())
             .maybe_outlet_db(outlet_pools.clone())
             .limiters(limiters)
+            .key_policy_cache(bg_services.key_policy_cache.clone())
             .maybe_connections_encryption_key(bg_services.connections_encryption_key.clone())
             .maybe_keystore(bg_services.keystore.clone())
             .response_store(response_store)

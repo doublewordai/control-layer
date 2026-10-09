@@ -14,6 +14,18 @@ fn offline_account_limits_validator_checks_limits_accounts_and_model_references(
         (vec![base.replace("70", "0")], false, "must be positive"),
         (vec![base.replace("realtime_inflight", "realtime")], false, "unknown field"),
         (vec![base.to_owned(), base.to_owned()], false, "also declared"),
+        // A pinned toleration that is valid on its own is accepted.
+        (
+            vec![format!("{base}pinned_tolerations:\n  - {{key: dedicated, value: only, effect: NoSchedule}}\n")],
+            true,
+            "",
+        ),
+        // An `Exists` toleration must not carry a value.
+        (
+            vec![format!("{base}pinned_tolerations:\n  - {{key: dedicated, operator: Exists, value: nope}}\n")],
+            false,
+            "must not carry a value",
+        ),
     ] {
         let accounts = tempdir().unwrap();
         for (index, contents) in files.iter().enumerate() {

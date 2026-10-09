@@ -151,6 +151,29 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
 
     let scrubbed_scheduling = strip_scheduling_priority(&mut request_value);
 
+    // The bearer token is needed below for ZDR, modality and pin decisions.
+    // Read it now (it was earlier only parsed after the body was re-serialised)
+    // so the pin can be applied to `request_value` before the bytes are rebuilt.
+    let api_key = parts
+        .headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|s| s.to_string());
+
+    // An operator can pin an account's scheduling tolerations: every request
+    // from the account then carries exactly the pinned list at
+    // `nvext.routing_constraints.tolerations`, replacing anything the client
+    // sent (stripped by `strip_scheduling_priority` above). Answered from the
+    // per-key policy map, so this covers realtime, flex and background alike;
+    // batch JSONL files are scrubbed and pinned at ingest. An unpinned account
+    // is unchanged.
+    let pinned = pinned_tolerations(&state.key_policy_cache, api_key.as_deref());
+    let scrubbed_pinned = match pinned.as_deref() {
+        Some(tolerations) => set_pinned_tolerations(&mut request_value, tolerations),
+        None => false,
+    };
+
     // A serving-class suffix (`alias:interactive`) is a request for a class,
     // not part of the model's identity: strip it here, at the outermost layer,
     // so analytics, the prompt cache and billing all key on the bare alias,
@@ -174,8 +197,8 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // bytes it receives (COR-522), so anything a scrubber removed from
     // `request_value` only stays removed if the bytes are rebuilt from it.
     // Every scrubber reports whether it changed something; the common case
-    // (nothing to scrub, no suffix) keeps the caller's bytes untouched.
-    let body_bytes = if scrubbed_class || scrubbed_ids || scrubbed_scheduling {
+    // (nothing to scrub, no suffix, no pin) keeps the caller's bytes untouched.
+    let body_bytes = if scrubbed_class || scrubbed_ids || scrubbed_scheduling || scrubbed_pinned {
         bytes::Bytes::from(request_value.to_string())
     } else {
         body_bytes
@@ -186,14 +209,6 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // The router is nested at /ai/v1, so the path here is e.g. "/responses".
     // Prepend /v1 for the full API path used by the loopback and fusillade templates.
     let endpoint = format!("/v1{nested_path}");
-
-    // Extract bearer token for auth check and batch attribution
-    let api_key = parts
-        .headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .map(|s| s.to_string());
 
     // Stateful continuation requires the prior response body. Realtime ZDR
     // deliberately never retains that body, while queued ZDR crypto-shreds it,
@@ -1402,14 +1417,58 @@ pub(crate) fn strip_scheduling_priority(value: &mut serde_json::Value) -> bool {
             if let Some(hints) = nvext.get_mut("agent_hints").and_then(|h| h.as_object_mut()) {
                 scrubbed |= hints.shift_remove("priority").is_some();
             }
+            // Scheduling tolerations are the operator's to pin, never the
+            // caller's: strip any client-supplied list the same way priority
+            // is stripped. A pinned account's list is written back afterwards
+            // by `set_pinned_tolerations`, so the only surviving value is the
+            // operator's (possibly empty) pin.
+            if let Some(routing) = nvext.get_mut("routing_constraints").and_then(|r| r.as_object_mut()) {
+                scrubbed |= routing.shift_remove("tolerations").is_some();
+            }
         }
     }
     scrubbed
 }
 
-/// Strip a serving-class suffix (`alias:class`) from the request's `model`,
-/// in place, returning the requested class. A model without a suffix is left
-/// untouched; an unknown class is an error listing the valid set.
+/// The tolerations pinned to the account owning the api key `secret`, or `None`
+/// when the account is not pinned. Answered from the per-key policy map.
+pub(crate) fn pinned_tolerations(
+    cache: &crate::sync::key_policy::KeyPolicyCache,
+    api_key: Option<&str>,
+) -> Option<std::sync::Arc<serde_json::Value>> {
+    api_key.and_then(|secret| cache.pinned_tolerations(secret))
+}
+
+/// Write `tolerations` to `nvext.routing_constraints.tolerations`, in place,
+/// returning whether the body changed. Creates `nvext` and
+/// `routing_constraints` when absent, and leaves any other key (including
+/// other `routing_constraints` siblings) untouched. An existing identical
+/// value is a no-op so the common path keeps the caller's bytes.
+pub(crate) fn set_pinned_tolerations(value: &mut serde_json::Value, tolerations: &serde_json::Value) -> bool {
+    let Some(obj) = value.as_object_mut() else {
+        return false;
+    };
+    let nvext = obj.entry("nvext").or_insert_with(|| serde_json::json!({}));
+    if !nvext.is_object() {
+        *nvext = serde_json::json!({});
+    }
+    let Some(nvext) = nvext.as_object_mut() else {
+        return false;
+    };
+    let routing = nvext.entry("routing_constraints").or_insert_with(|| serde_json::json!({}));
+    if !routing.is_object() {
+        *routing = serde_json::json!({});
+    }
+    let Some(routing) = routing.as_object_mut() else {
+        return false;
+    };
+    if routing.get("tolerations") == Some(tolerations) {
+        return false;
+    }
+    routing.insert("tolerations".to_string(), tolerations.clone());
+    true
+}
+
 fn strip_serving_class_suffix(
     value: &mut serde_json::Value,
     asynchronous: bool,
@@ -1434,6 +1493,54 @@ fn strip_serving_class_suffix(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_pinned_tolerations_writes_the_pinned_list_and_preserves_the_rest() {
+        // The pin replaces a client's nvext wholesale-safely: it is written
+        // verbatim into routing_constraints.tolerations, and every sibling
+        // (other nvext keys, other routing_constraints keys) survives.
+        let mut body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "nvext": {
+                "agent_hints": {"max_batch_size": 8},
+                "routing_constraints": {"region": "eu", "tolerations": [{"operator": "Exists"}]}
+            }
+        });
+        let pinned = serde_json::json!([{"key": "dedicated", "value": "only"}]);
+        assert!(set_pinned_tolerations(&mut body, &pinned), "a changed value rebuilds the body");
+        assert_eq!(body["nvext"]["routing_constraints"]["tolerations"], pinned);
+        assert_eq!(body["nvext"]["routing_constraints"]["region"], "eu");
+        assert_eq!(body["nvext"]["agent_hints"]["max_batch_size"], 8);
+
+        // Writing the same value again is a no-op, so the common path keeps the
+        // caller's bytes.
+        assert!(!set_pinned_tolerations(&mut body, &pinned));
+
+        // An empty pin is a real value, distinct from absent.
+        let mut empty = serde_json::json!({"model": "m"});
+        assert!(set_pinned_tolerations(&mut empty, &serde_json::json!([])));
+        assert_eq!(empty["nvext"]["routing_constraints"]["tolerations"], serde_json::json!([]));
+
+        // A non-object nvext is replaced rather than panicking.
+        let mut broken = serde_json::json!({"model": "m", "nvext": "not-an-object"});
+        assert!(set_pinned_tolerations(&mut broken, &serde_json::json!([])));
+        assert_eq!(broken["nvext"]["routing_constraints"]["tolerations"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn pinned_tolerations_reads_the_key_policy_cache() {
+        let cache = crate::sync::key_policy::KeyPolicyCache::from_policies([(
+            "sk-pinned".to_string(),
+            crate::sync::key_policy::KeyPolicy {
+                pinned_tolerations: Some(std::sync::Arc::new(serde_json::json!([]))),
+                ..Default::default()
+            },
+        )]);
+        assert!(pinned_tolerations(&cache, Some("sk-pinned")).is_some());
+        assert!(pinned_tolerations(&cache, Some("sk-other")).is_none());
+        assert!(pinned_tolerations(&cache, None).is_none());
+    }
 
     #[test]
     fn strip_scheduling_priority_removes_only_the_top_level_field() {
@@ -1513,6 +1620,26 @@ mod tests {
 
         let mut body = serde_json::json!({"model": "m", "nvext": {"cache_control": {"enabled": true}}});
         assert!(!strip_scheduling_priority(&mut body), "nothing to re-serialise for");
+    }
+
+    #[test]
+    fn strip_scheduling_priority_also_scrubs_client_tolerations() {
+        // A caller's toleration list is the operator's to pin, never theirs:
+        // it is removed like priority, and other nvext keys survive.
+        let mut body = serde_json::json!({
+            "model": "m",
+            "nvext": {
+                "routing_constraints": {"tolerations": [{"operator": "Exists"}], "region": "eu"},
+                "cache_control": {"enabled": true}
+            }
+        });
+        assert!(strip_scheduling_priority(&mut body), "the tolerations were present and removed");
+        assert!(body["nvext"]["routing_constraints"].get("tolerations").is_none());
+        assert_eq!(body["nvext"]["routing_constraints"]["region"], "eu", "siblings survive");
+        assert_eq!(body["nvext"]["cache_control"]["enabled"], true);
+
+        let mut clean = serde_json::json!({"model": "m", "nvext": {"routing_constraints": {"region": "eu"}}});
+        assert!(!strip_scheduling_priority(&mut clean), "nothing removed, nothing to rebuild");
     }
 
     #[test]
