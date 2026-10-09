@@ -66,4 +66,13 @@ Every client error that onwards decides on itself, such as an unknown model, a f
 - `model` is the configured model the request names, without any serving-class suffix such as `:interactive`. It is empty when the request names no configured model.
 - `traffic` is `dispatched` for requests carrying the first-token-timeout exempt header and `realtime` otherwise.
 
-Each rejection is also logged at `info` with its status, code, parameter, model, account and API key ID. Values and request bodies are never logged. A client error that reports an upstream's response isn't counted.
+Each rejection also sets these attributes on the current trace span: onwards' `onwards.request` span, or the enclosing span for a strict-mode refusal made before forwarding:
+
+- `error.type`: the same code as the metric;
+- `onwards.rejection.param`: the parameter the error names, if any;
+- `onwards.account` and `onwards.api_key_id`: from the labels of the key the request presented;
+- `http.response.status_code`: on `onwards.request`.
+
+Each rejection is also logged at `info` with its status, code, parameter, model, account and API key ID. The exceptions are refusals by the caller's own limits (`rate_limit`, `concurrency_limit_exceeded`, `inflight_limit_exceeded`): a client retrying in a tight loop would log every attempt, so those are only counted and traced.
+
+Request parameter values and request bodies are never recorded. A client error that reports an upstream's response isn't counted.
