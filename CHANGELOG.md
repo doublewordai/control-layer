@@ -1,5 +1,14 @@
 # Changelog
 
+## [13.4.3](https://github.com/doublewordai/control-layer/compare/v13.4.2...v13.4.3) (2026-10-09)
+
+
+### Bug Fixes
+
+* **db:** connect to Postgres with rustls ([#1948](https://github.com/doublewordai/control-layer/issues/1948)) ([baafb4b](https://github.com/doublewordai/control-layer/commit/baafb4b1acf066272b28aa2837eab2b219662823))
+* **images:** look up the caller only for requests with image inputs ([#1949](https://github.com/doublewordai/control-layer/issues/1949)) ([6d71346](https://github.com/doublewordai/control-layer/commit/6d7134641fc5a948bfe317ac28196d0de9303fbd))
+* **limits:** retry failed in-flight slot releases until Redis is back ([#1950](https://github.com/doublewordai/control-layer/issues/1950)) ([26d88b4](https://github.com/doublewordai/control-layer/commit/26d88b4869f2e2c886272d1a7ab2d1baa7893236))
+
 ## [13.4.2](https://github.com/doublewordai/control-layer/compare/v13.4.1...v13.4.2) (2026-10-08)
 
 
