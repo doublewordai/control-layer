@@ -9351,7 +9351,11 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
                     throughput, backlog_requests
              FROM model_release_cutoffs",
         )
-        .fetch_all(self.read_executor())
+        // Primary: the gauges must match the cutoffs the claim path (a
+        // primary write) applies, and a lagging replica would report a just
+        // refreshed or deleted cutoff late. The table holds one row per model
+        // with outstanding work, so this is cheap.
+        .fetch_all(self.write_executor())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to read release cutoffs: {}", e)))?;
         Ok(rows
