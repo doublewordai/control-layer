@@ -179,6 +179,7 @@ pub mod reasoning;
 mod recompute;
 mod request_logging;
 pub mod sample_files;
+pub mod scheduling;
 mod static_assets;
 mod sync;
 pub mod task_retention;

@@ -1,6 +1,11 @@
 import { useState, useEffect } from "react";
 import { useUpdateOrganization } from "@/api/control-layer/hooks";
-import type { Organization, ServingClassName } from "@/api/control-layer/types";
+import type {
+  Organization,
+  PinnedTolerations,
+  ServingClassName,
+} from "@/api/control-layer/types";
+import { SchedulingRestrictions } from "@/components/features/scheduling/SchedulingRestrictions";
 import {
   Dialog,
   DialogContent,
@@ -41,6 +46,8 @@ export function EditOrganizationModal({
   const [grantedClasses, setGrantedClasses] = useState<ServingClassName[]>([]);
   const [defaultClass, setDefaultClass] = useState<ServingClassName | "standard">("standard");
   const [selfHostedOnly, setSelfHostedOnly] = useState(false);
+  const [pinnedTolerations, setPinnedTolerations] =
+    useState<PinnedTolerations | null>(null);
   const updateOrg = useUpdateOrganization();
 
   useEffect(() => {
@@ -51,6 +58,7 @@ export function EditOrganizationModal({
       setGrantedClasses(organization.granted_serving_classes ?? []);
       setDefaultClass(organization.default_serving_class ?? "standard");
       setSelfHostedOnly(organization.self_hosted_only ?? false);
+      setPinnedTolerations(organization.pinned_tolerations ?? null);
     }
   }, [organization, isOpen]);
 
@@ -81,6 +89,7 @@ export function EditOrganizationModal({
                 default_serving_class:
                   defaultClass === "standard" ? null : defaultClass,
                 self_hosted_only: selfHostedOnly,
+                pinned_tolerations: pinnedTolerations,
               }
             : {}),
         },
@@ -234,6 +243,11 @@ export function EditOrganizationModal({
                     aria-label="Toggle self-hosted only"
                   />
                 </div>
+                <SchedulingRestrictions
+                  pinned={pinnedTolerations}
+                  canEdit={canEditServing}
+                  onChange={setPinnedTolerations}
+                />
               </div>
             )}
           </div>

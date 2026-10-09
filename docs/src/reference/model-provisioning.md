@@ -374,20 +374,16 @@ leaves partial model edits. Metadata-only edits are still permitted.
 
 An account limit file gives one account its own realtime in-flight limit on
 some virtual models, in place of each model's
-`settings.realtime_inflight_limit`, and can pin its scheduling tolerations.
-The account is a user or an organisation, named by its username, and an
-organisation's limit covers every key the organisation owns. One file per
-account, mounted at `model_provisioning.account_limits_directory`:
+`settings.realtime_inflight_limit`. The account is a user or an organisation,
+named by its username, and an organisation's limit covers every key the
+organisation owns. One file per account, mounted at
+`model_provisioning.account_limits_directory`:
 
 ```yaml
 account: acme
 realtime_inflight:
   example/chat-model: 200
   example/fast-model: 40
-pinned_tolerations:
-  - key: dedicated
-    value: chat
-    effect: NoSchedule
 ```
 
 Startup applies the files after the model catalog, in one transaction, and
@@ -398,32 +394,15 @@ changes nothing. An unknown account, or a model that is not a live virtual
 model, fails startup before any per-account limit is written; the model catalog
 and organisation overlays have already been applied by then.
 
-`pinned_tolerations`, when present, is a fixed Kubernetes-style toleration
-list (each entry a `key`, an optional `operator` of `Equal` or `Exists`, an
-optional `value`, and an optional `effect` of `NoSchedule` or
-`PreferNoSchedule`) that dwctl writes to
-`nvext.routing_constraints.tolerations` on **every** inference request from the
-account — realtime, flex and batch alike — so the account always schedules onto
-capacity carrying a matching taint. The list is the operator's: a client's own
-tolerations are stripped exactly as its scheduling priority is, so a pin
-replaces rather than extends them. `pinned_tolerations: []` is meaningful and
-distinct from the key being absent: an empty list pins nothing onto an account
-whose every request would otherwise be free to land on tainted capacity.
-Removing the key (or the file) clears the pin on the next start; changes reach
-a running server through the same configuration-notify path as the rest of the
-catalog.
-
 Run the same offline validation used by deployment CI:
 
 ```sh
 dwctl-model-provisioning validate-account-limits ./account-limits.d --models ./model-provisioning.d
 ```
 
-It rejects unknown fields, limits below 1, an account declared in two files,
-models absent from the model catalog, and a malformed toleration (`Equal`
-without a value, `Exists` carrying one, an unknown `effect` or `operator`).
-Whether each account exists can only be checked against the database, at
-startup.
+It rejects unknown fields, limits below 1, an account declared in two files and
+models absent from the model catalog. Whether each account exists can only be
+checked against the database, at startup.
 
 `GET /admin/api/v1/models/{id}/realtime-inflight-limits` returns a virtual
 model's default and its per-account limits, for platform managers.

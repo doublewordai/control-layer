@@ -31,41 +31,6 @@ struct AccountLimitsDocument {
     account: String,
     #[serde(default)]
     realtime_inflight: BTreeMap<String, i32>,
-    /// Scheduling tolerations pinned to every request from this account.
-    /// `None` (the key absent) means not pinned; `Some(vec![])` is a real pin
-    /// (forbid tainted capacity). Same object shape as a daemon toleration.
-    #[serde(default)]
-    pinned_tolerations: Option<Vec<Toleration>>,
-}
-
-/// One Kubernetes-style scheduling toleration, the shape written to
-/// `nvext.routing_constraints.tolerations`. Validated at load so a malformed
-/// entry fails startup (and the validate-account-limits CLI) rather than
-/// producing an invalid request body later.
-#[derive(Debug, Clone, Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-struct Toleration {
-    key: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    operator: Option<TolerationOperator>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    value: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    effect: Option<TolerationEffect>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, serde::Serialize)]
-enum TolerationOperator {
-    Equal,
-    Exists,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, serde::Serialize)]
-enum TolerationEffect {
-    #[serde(rename = "NoSchedule")]
-    NoSchedule,
-    #[serde(rename = "PreferNoSchedule")]
-    PreferNoSchedule,
 }
 
 impl AccountLimitsCatalog {
@@ -123,42 +88,9 @@ impl AccountLimitsCatalog {
             for (alias, limit) in &file.document.realtime_inflight {
                 ensure!(*limit > 0, "{}: realtime_inflight limit on {alias:?} must be positive", file.source);
             }
-            for toleration in file.document.pinned_tolerations.iter().flatten() {
-                validate_toleration(toleration).with_context(|| format!("{}: pinned_tolerations", file.source))?;
-            }
         }
         Ok(())
     }
-
-    /// The pinned tolerations declared across the catalog, keyed by account
-    /// username. Only accounts that declare `pinned_tolerations` appear;
-    /// accounts without the key are unpinned and left out. The value is the
-    /// list serialised exactly as it will be written to the request body.
-    pub fn pinned_tolerations(&self) -> Result<BTreeMap<String, serde_json::Value>> {
-        self.files
-            .iter()
-            .filter_map(|file| {
-                file.document
-                    .pinned_tolerations
-                    .as_ref()
-                    .map(|tolerations| (file.document.account.clone(), tolerations))
-            })
-            .map(|(account, tolerations)| {
-                let value = serde_json::to_value(tolerations).with_context(|| format!("serialise pinned tolerations for {account:?}"))?;
-                Ok((account, value))
-            })
-            .collect::<Result<_>>()
-    }
-}
-
-/// Reject a toleration the request path could not send: `Equal` must carry a
-/// value, `Exists` must not.
-fn validate_toleration(toleration: &Toleration) -> Result<()> {
-    match toleration.operator.unwrap_or(TolerationOperator::Equal) {
-        TolerationOperator::Equal => ensure!(toleration.value.is_some(), "operator Equal needs a value (or set operator: Exists)"),
-        TolerationOperator::Exists => ensure!(toleration.value.is_none(), "operator Exists must not carry a value"),
-    }
-    Ok(())
 }
 
 pub async fn apply(pool: &PgPool, catalog: &AccountLimitsCatalog) -> Result<()> {
@@ -210,35 +142,6 @@ pub async fn apply(pool: &PgPool, catalog: &AccountLimitsCatalog) -> Result<()> 
     .execute(&mut *transaction)
     .await
     .context("write account limits")?;
-
-    // Pinned tolerations replace what the files declare, like the limits above:
-    // one array per pinned account, and every other stored pin cleared. The
-    // account is matched by username (already resolved as existing above).
-    let pinned = catalog.pinned_tolerations()?;
-    let pinned_accounts: Vec<String> = pinned.keys().cloned().collect();
-    let pinned_values: Vec<serde_json::Value> = pinned.into_values().collect();
-    sqlx::query(
-        "UPDATE users u
-         SET pinned_tolerations = d.pinned
-         FROM UNNEST($1::text[], $2::jsonb[]) AS d(account, pinned)
-         WHERE u.username = d.account
-           AND u.pinned_tolerations IS DISTINCT FROM d.pinned",
-    )
-    .bind(&pinned_accounts)
-    .bind(&pinned_values)
-    .execute(&mut *transaction)
-    .await
-    .context("write pinned tolerations")?;
-    sqlx::query(
-        "UPDATE users
-         SET pinned_tolerations = NULL
-         WHERE pinned_tolerations IS NOT NULL
-           AND username <> ALL($1::text[])",
-    )
-    .bind(&pinned_accounts)
-    .execute(&mut *transaction)
-    .await
-    .context("clear undeclared pinned tolerations")?;
 
     transaction.commit().await.context("commit account limits")?;
     Ok(())
@@ -385,41 +288,6 @@ mod tests {
                 ],
                 "also declared",
             ),
-            // An `Equal` (the default operator) toleration needs a value.
-            (
-                vec![("a.yaml", "account: acme\npinned_tolerations:\n  - key: dedicated\n")],
-                "Equal needs a value",
-            ),
-            // `Exists` must not carry a value.
-            (
-                vec![(
-                    "a.yaml",
-                    "account: acme\npinned_tolerations:\n  - {key: k, operator: Exists, value: nope}\n",
-                )],
-                "must not carry a value",
-            ),
-            // Unknown enum spellings and fields are refused.
-            (
-                vec![(
-                    "a.yaml",
-                    "account: acme\npinned_tolerations:\n  - {key: k, value: v, effect: Bogus}\n",
-                )],
-                "unknown variant",
-            ),
-            (
-                vec![(
-                    "a.yaml",
-                    "account: acme\npinned_tolerations:\n  - {key: k, value: v, operator: Sometimes}\n",
-                )],
-                "unknown variant",
-            ),
-            (
-                vec![(
-                    "a.yaml",
-                    "account: acme\npinned_tolerations:\n  - {key: k, value: v, priority: 1}\n",
-                )],
-                "unknown field",
-            ),
         ] {
             let directory = tempdir().unwrap();
             for (name, contents) in files {
@@ -468,78 +336,6 @@ mod tests {
         fs::remove_file(directory.path().join("acme.yaml")).unwrap();
         apply(&pool, &AccountLimitsCatalog::load(directory.path()).unwrap()).await.unwrap();
         assert!(stored(&pool).await.is_empty());
-    }
-
-    /// The stored pins: only accounts that are pinned, username to the JSON
-    /// list, in a stable order.
-    async fn stored_pins(pool: &PgPool) -> Vec<(String, serde_json::Value)> {
-        sqlx::query_as("SELECT username, pinned_tolerations FROM users WHERE pinned_tolerations IS NOT NULL ORDER BY username")
-            .fetch_all(pool)
-            .await
-            .unwrap()
-    }
-
-    #[dwctl_test_macros::test]
-    async fn pinned_tolerations_are_applied_and_cleared_like_the_other_keys(pool: PgPool) {
-        insert_account(&pool, "acme", "organization").await;
-        insert_account(&pool, "bob", "individual").await;
-
-        // An account may be pinned with no realtime_inflight entry at all.
-        let directory = tempdir().unwrap();
-        write(directory.path(), "acme.yaml", "account: acme\npinned_tolerations: []\n");
-        write(
-            directory.path(),
-            "bob.yaml",
-            "account: bob\npinned_tolerations:\n  - key: dedicated\n    value: only\n    effect: NoSchedule\n",
-        );
-        apply(&pool, &AccountLimitsCatalog::load(directory.path()).unwrap()).await.unwrap();
-        assert_eq!(
-            stored_pins(&pool).await,
-            vec![
-                ("acme".to_string(), serde_json::json!([])),
-                (
-                    "bob".to_string(),
-                    serde_json::json!([{"key": "dedicated", "value": "only", "effect": "NoSchedule"}])
-                ),
-            ]
-        );
-
-        // Editing one file and removing another: the edit lands, the removal
-        // clears that account's pin.
-        write(
-            directory.path(),
-            "bob.yaml",
-            "account: bob\npinned_tolerations:\n  - {key: dedicated, value: churned}\n",
-        );
-        fs::remove_file(directory.path().join("acme.yaml")).unwrap();
-        apply(&pool, &AccountLimitsCatalog::load(directory.path()).unwrap()).await.unwrap();
-        assert_eq!(
-            stored_pins(&pool).await,
-            vec![("bob".to_string(), serde_json::json!([{"key": "dedicated", "value": "churned"}]))]
-        );
-
-        // An unmanaged (missing) directory changes nothing.
-        apply(&pool, &AccountLimitsCatalog::load(directory.path().join("absent")).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(stored_pins(&pool).await.len(), 1);
-
-        // An empty directory clears every pin.
-        fs::remove_file(directory.path().join("bob.yaml")).unwrap();
-        apply(&pool, &AccountLimitsCatalog::load(directory.path()).unwrap()).await.unwrap();
-        assert!(stored_pins(&pool).await.is_empty());
-    }
-
-    #[test]
-    fn pinned_tolerations_accessor_returns_only_declared_accounts() {
-        let directory = tempdir().unwrap();
-        write(directory.path(), "a.yaml", "account: acme\nrealtime_inflight:\n  org/model: 10\n");
-        write(directory.path(), "b.yaml", "account: bob\npinned_tolerations: []\n");
-        let declared = AccountLimitsCatalog::load(directory.path()).unwrap().pinned_tolerations().unwrap();
-        assert_eq!(
-            declared.into_iter().collect::<Vec<_>>(),
-            vec![("bob".to_string(), serde_json::json!([]))]
-        );
     }
 
     #[dwctl_test_macros::test]

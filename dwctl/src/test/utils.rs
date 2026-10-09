@@ -606,6 +606,7 @@ pub async fn get_system_user(pool: &mut PgConnection) -> UserResponse {
         default_serving_class: None,
         self_hosted_only: false,
         granted_serving_classes: Default::default(),
+        pinned_tolerations: Default::default(),
     }
 }
 
@@ -799,6 +800,7 @@ pub async fn create_test_org(pool: &PgPool, created_by: UserId) -> UserResponse 
         default_serving_class: None,
         self_hosted_only: false,
         granted_serving_classes: Default::default(),
+        pinned_tolerations: Default::default(),
     }
 }
 

@@ -261,3 +261,87 @@ async fn a_pinned_account_stamps_its_tolerations_on_uploaded_batch_requests(pool
     // Other nvext the client sent still passes through.
     assert_eq!(body["model"], "plain");
 }
+
+/// A platform manager sets the pin through the admin API; a non-manager
+/// cannot, and the pin is only visible back to a platform manager.
+#[dwctl_test_macros::test]
+async fn a_platform_manager_sets_and_clears_the_pin_through_the_admin_api(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let headers = add_auth_headers(&create_test_admin_user(&pool, Role::PlatformManager).await);
+    let member = create_test_user_with_roles(&pool, vec![Role::StandardUser]).await;
+    let member_headers = add_auth_headers(&member);
+
+    // Setting the "dedicated capacity" toggle is the empty list; the GET must
+    // show it back to the manager.
+    let response = f
+        .server
+        .patch(&format!("/admin/api/v1/users/{}", f.user))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&json!({"pinned_tolerations": []}))
+        .await;
+    response.assert_status_ok();
+    let updated = response.json::<Value>();
+    assert_eq!(updated["pinned_tolerations"], json!([]), "{updated}");
+
+    // The pin reaches the request path on the next sync (the API write fires
+    // the notify trigger; refresh the cache the way the LISTEN/NOTIFY loop
+    // would, as `set_pin` does).
+    f.services.sync_key_policy(&pool).await.unwrap();
+    let body = f.post_realtime().await;
+    assert_eq!(body["nvext"]["routing_constraints"]["tolerations"], json!([]), "{body}");
+
+    // A plain member's GET omits the operator's routing decision entirely.
+    let as_member_response = f
+        .server
+        .get(&format!("/admin/api/v1/users/{}", member.id))
+        .add_header(&member_headers[0].0, &member_headers[0].1)
+        .add_header(&member_headers[1].0, &member_headers[1].1)
+        .await;
+    as_member_response.assert_status_ok();
+    let as_member = as_member_response.json::<Value>();
+    assert!(as_member.get("pinned_tolerations").is_none(), "{as_member}");
+
+    // Clearing the pin: `null` maps to no pinned tolerations.
+    let cleared_response = f
+        .server
+        .patch(&format!("/admin/api/v1/users/{}", f.user))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&json!({"pinned_tolerations": null}))
+        .await;
+    cleared_response.assert_status_ok();
+    let cleared = cleared_response.json::<Value>();
+    assert!(cleared["pinned_tolerations"].is_null(), "{cleared}");
+    f.services.sync_key_policy(&pool).await.unwrap();
+    let body = f.post_realtime().await;
+    assert!(body["nvext"]["routing_constraints"]["tolerations"].is_null(), "{body}");
+}
+
+/// A malformed toleration is refused server-side before it reaches the column,
+/// and a plain member cannot set a pin on their own account at all.
+#[dwctl_test_macros::test]
+async fn a_malformed_pin_is_refused_and_a_member_cannot_set_one(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let headers = add_auth_headers(&create_test_admin_user(&pool, Role::PlatformManager).await);
+    let member = create_test_user_with_roles(&pool, vec![Role::StandardUser]).await;
+    let member_headers = add_auth_headers(&member);
+
+    // `Equal` (the default operator) needs a value.
+    f.server
+        .patch(&format!("/admin/api/v1/users/{}", f.user))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&json!({"pinned_tolerations": [{"key": "dedicated"}]}))
+        .await
+        .assert_status(StatusCode::BAD_REQUEST);
+
+    // A plain member may not set the pin on their own account.
+    f.server
+        .patch(&format!("/admin/api/v1/users/{}", member.id))
+        .add_header(&member_headers[0].0, &member_headers[0].1)
+        .add_header(&member_headers[1].0, &member_headers[1].1)
+        .json(&json!({"pinned_tolerations": []}))
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+}

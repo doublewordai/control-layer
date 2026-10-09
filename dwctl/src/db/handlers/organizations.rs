@@ -144,7 +144,7 @@ impl<'c> Organizations<'c> {
                    is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,
                    low_balance_notification_sent, low_balance_threshold,
                    auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, invoicing_enabled, zero_data_retention,
-                   granted_serving_classes, default_serving_class, self_hosted_only
+                   granted_serving_classes, default_serving_class, self_hosted_only, pinned_tolerations
             FROM users
             WHERE (username = $1 OR username LIKE $1 || '~%')
               AND user_type = 'organization'
@@ -217,6 +217,7 @@ impl<'c> Organizations<'c> {
                     granted_serving_classes: r.granted_serving_classes,
                     default_serving_class: r.default_serving_class,
                     self_hosted_only: r.self_hosted_only,
+                    pinned_tolerations: r.pinned_tolerations,
                 }))
             }
             None => Ok(None),
@@ -331,7 +332,7 @@ impl<'c> Organizations<'c> {
                       is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,
                       low_balance_notification_sent, low_balance_threshold,
                       auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, invoicing_enabled, zero_data_retention,
-                   granted_serving_classes, default_serving_class, self_hosted_only
+                   granted_serving_classes, default_serving_class, self_hosted_only, pinned_tolerations
             "#,
             org_id,
             request.name,
@@ -395,6 +396,7 @@ impl<'c> Organizations<'c> {
             granted_serving_classes: row.granted_serving_classes,
             default_serving_class: row.default_serving_class,
             self_hosted_only: row.self_hosted_only,
+            pinned_tolerations: row.pinned_tolerations,
         })
     }
 
@@ -438,6 +440,10 @@ impl<'c> Organizations<'c> {
                 END,
                 self_hosted_only = COALESCE($11, self_hosted_only),
                 granted_serving_classes = COALESCE($12, granted_serving_classes),
+                pinned_tolerations = CASE
+                    WHEN $13::boolean THEN $14
+                    ELSE pinned_tolerations
+                END,
                 updated_at = NOW()
             WHERE id = $1 AND user_type = 'organization' AND is_deleted = false
             RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,
@@ -445,7 +451,7 @@ impl<'c> Organizations<'c> {
                       batch_notifications_enabled, first_batch_email_sent,
                       low_balance_notification_sent, low_balance_threshold,
                       auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, invoicing_enabled, zero_data_retention,
-                   granted_serving_classes, default_serving_class, self_hosted_only
+                   granted_serving_classes, default_serving_class, self_hosted_only, pinned_tolerations
             "#,
             id,
             request.display_name,
@@ -459,6 +465,8 @@ impl<'c> Organizations<'c> {
             request.default_serving_class.clone().flatten(),
             request.self_hosted_only,
             request.granted_serving_classes.as_deref(),
+            request.pinned_tolerations.is_some() as bool,
+            request.pinned_tolerations.clone().flatten(),
         )
         .fetch_optional(&mut *self.db)
         .await?
@@ -497,6 +505,7 @@ impl<'c> Organizations<'c> {
             granted_serving_classes: row.granted_serving_classes,
             default_serving_class: row.default_serving_class,
             self_hosted_only: row.self_hosted_only,
+            pinned_tolerations: row.pinned_tolerations,
         })
     }
 
@@ -1586,6 +1595,7 @@ mod tests {
                     default_serving_class: None,
                     self_hosted_only: None,
                     granted_serving_classes: Default::default(),
+                    pinned_tolerations: Default::default(),
                 },
             )
             .await
@@ -1632,6 +1642,7 @@ mod tests {
                     default_serving_class: None,
                     self_hosted_only: None,
                     granted_serving_classes: Default::default(),
+                    pinned_tolerations: Default::default(),
                 },
             )
             .await
@@ -1681,6 +1692,7 @@ mod tests {
                     default_serving_class: None,
                     self_hosted_only: None,
                     granted_serving_classes: Default::default(),
+                    pinned_tolerations: Default::default(),
                 },
             )
             .await
@@ -1704,6 +1716,7 @@ mod tests {
                     default_serving_class: None,
                     self_hosted_only: None,
                     granted_serving_classes: Default::default(),
+                    pinned_tolerations: Default::default(),
                 },
             )
             .await
@@ -1728,6 +1741,7 @@ mod tests {
                     default_serving_class: None,
                     self_hosted_only: None,
                     granted_serving_classes: Default::default(),
+                    pinned_tolerations: Default::default(),
                 },
             )
             .await
@@ -1750,6 +1764,7 @@ mod tests {
                     default_serving_class: None,
                     self_hosted_only: None,
                     granted_serving_classes: Default::default(),
+                    pinned_tolerations: Default::default(),
                 },
             )
             .await
