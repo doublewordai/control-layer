@@ -144,6 +144,54 @@ impl Default for BatchInsertStrategy {
     }
 }
 
+/// Every `requests` column, in table order: the columns the forward archive
+/// move copies into `batch_requests_archive` (plus `archive_bucket`). The
+/// archive's `archive_bucket` is no longer its last column, so the move names
+/// its columns rather than relying on `SELECT r.*` alignment. The
+/// `archive_schema_parity` test checks this list against the catalog, so a
+/// column added to both tables cannot be silently left out of the move.
+pub const ARCHIVE_FORWARD_COLUMNS: &[&str] = &[
+    "id",
+    "batch_id",
+    "template_id",
+    "state",
+    "retry_attempt",
+    "not_before",
+    "daemon_id",
+    "claimed_at",
+    "started_at",
+    "response_status",
+    "response_body",
+    "completed_at",
+    "error",
+    "failed_at",
+    "canceled_at",
+    "created_at",
+    "updated_at",
+    "custom_id",
+    "model",
+    "response_size",
+    "routed_model",
+    "service_tier",
+    "created_by",
+    "dispatched_tolerated",
+];
+
+/// The forward archive move: copy the rows of batch `$1` into the archive
+/// with `bucket` (an SQL expression) as their `archive_bucket`.
+pub fn archive_forward_insert_sql(bucket: &str) -> String {
+    let columns = ARCHIVE_FORWARD_COLUMNS.join(", ");
+    let selected = ARCHIVE_FORWARD_COLUMNS
+        .iter()
+        .map(|column| format!("r.{column}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "INSERT INTO batch_requests_archive ({columns}, archive_bucket) \
+         SELECT {selected}, {bucket} FROM requests r WHERE r.batch_id = $1"
+    )
+}
+
 /// Server-side budget for one daemon maintenance call, derived from the
 /// daemon's client-side query timeout.
 ///
@@ -9526,15 +9574,10 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         bound_to_deadline(&mut tx, deadline)
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to bound archive move: {}", e)))?;
-        let inserted = sqlx::query(
-            r#"
-            INSERT INTO batch_requests_archive (id, batch_id, template_id, state, retry_attempt, not_before, daemon_id, claimed_at, started_at, response_status, response_body, completed_at, error, failed_at, canceled_at, created_at, updated_at, custom_id, model, response_size, routed_model, service_tier, created_by, dispatched_tolerated, archive_bucket)
-            SELECT r.id, r.batch_id, r.template_id, r.state, r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at, r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at, r.created_at, r.updated_at, r.custom_id, r.model, r.response_size, r.routed_model, r.service_tier, r.created_by, r.dispatched_tolerated, $2::date
-            FROM requests r
-            WHERE r.batch_id = $1
-            ON CONFLICT (id, archive_bucket) DO NOTHING
-            "#,
-        )
+        let inserted = sqlx::query(&format!(
+            "{} ON CONFLICT (id, archive_bucket) DO NOTHING",
+            archive_forward_insert_sql("$2::date")
+        ))
         .bind(*batch_id as Uuid)
         .bind(batch.bucket)
         .execute(&mut *tx)
@@ -15847,13 +15890,12 @@ mod tests {
         // Simulate a crash after the INSERT copied one row but before the
         // DELETE/stamp committed: pre-copy a single row into the archive
         // exactly as the move would have.
-        sqlx::query(
-"INSERT INTO batch_requests_archive (id, batch_id, template_id, state, retry_attempt, not_before, daemon_id, claimed_at, started_at, response_status, response_body, completed_at, error, failed_at, canceled_at, created_at, updated_at, custom_id, model, response_size, routed_model, service_tier, created_by, dispatched_tolerated, archive_bucket)
-             SELECT r.id, r.batch_id, r.template_id, r.state, r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at, r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at, r.created_at, r.updated_at, r.custom_id, r.model, r.response_size, r.routed_model, r.service_tier, r.created_by, r.dispatched_tolerated,
-                    date_trunc('week', (SELECT created_at FROM batches WHERE id = $1) AT TIME ZONE 'UTC')::date
-             FROM requests r WHERE r.batch_id = $1
-             ORDER BY r.id LIMIT 1",
-        )
+        sqlx::query(&format!(
+            "{} ORDER BY r.id LIMIT 1",
+            archive_forward_insert_sql(
+                "date_trunc('week', (SELECT created_at FROM batches WHERE id = $1) AT TIME ZONE 'UTC')::date"
+            )
+        ))
         .bind(*batch_id as Uuid)
         .execute(&pool)
         .await

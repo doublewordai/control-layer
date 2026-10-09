@@ -107,6 +107,24 @@ async fn archive_mirrors_requests_columns_plus_trailing_bucket(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn forward_move_names_every_requests_column(pool: PgPool) {
+    // The forward move lists its columns (archive_bucket is no longer the
+    // archive's last column), so a new column needs adding to that list too:
+    // without this check a column mirrored onto the archive would be archived
+    // as NULL.
+    let requests: Vec<String> = column_shapes(&pool, "requests")
+        .await
+        .into_iter()
+        .map(|column| column.name)
+        .collect();
+    assert_eq!(
+        fusillade_arsenal::postgres::ARCHIVE_FORWARD_COLUMNS,
+        requests.as_slice(),
+        "ARCHIVE_FORWARD_COLUMNS must name every requests column in table order"
+    );
+}
+
+#[sqlx::test]
 async fn archive_has_no_foreign_keys(pool: PgPool) {
     // Deliberate design (see table COMMENT + phase 3 plan): FK enforcement
     // would take KEY SHARE locks on referenced rows during every bulk move,
@@ -149,14 +167,13 @@ async fn forward_move_shape_compiles_and_round_trips(pool: PgPool) {
     .await
     .unwrap();
 
-    // Forward shape: the same explicit column list as the move code; if this
-    // breaks, update BOTH.
-    sqlx::query(
-        "INSERT INTO batch_requests_archive (id, batch_id, template_id, state, retry_attempt, not_before, daemon_id, claimed_at, started_at, response_status, response_body, completed_at, error, failed_at, canceled_at, created_at, updated_at, custom_id, model, response_size, routed_model, service_tier, created_by, dispatched_tolerated, archive_bucket)
-         SELECT r.id, r.batch_id, r.template_id, r.state, r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at, r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at, r.created_at, r.updated_at, r.custom_id, r.model, r.response_size, r.routed_model, r.service_tier, r.created_by, r.dispatched_tolerated,
-                date_trunc('week', now() AT TIME ZONE 'UTC')::date
-         FROM requests r WHERE r.batch_id = '11111111-1111-1111-1111-111111111111'",
-    )
+    // Forward shape: the move code's own statement. It names every requests
+    // column (forward_move_names_every_requests_column), so a column mirrored
+    // onto both tables but missing from the move fails there, not silently.
+    sqlx::query(&fusillade_arsenal::postgres::archive_forward_insert_sql(
+        "date_trunc('week', now() AT TIME ZONE 'UTC')::date",
+    ))
+    .bind(uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap())
     .execute(&pool)
     .await
     .expect("forward move column list must stay valid");
