@@ -8,7 +8,9 @@
 //!   whatever a client sends;
 //! - sets `error.type` (the error code), `onwards.rejection.param`,
 //!   `onwards.account` and `onwards.api_key_id` (when the key has them) on the
-//!   current span, and the response status on onwards' request span;
+//!   current span, and the response status on onwards' request span. A
+//!   strict-mode refusal made before that span exists needs an embedding
+//!   gateway's request span; the standalone server has none;
 //! - is logged once at `info` with the same fields, except refusals by a rate,
 //!   concurrency or in-flight limit. A client retrying in a tight loop would
 //!   otherwise log every attempt; those are counted and traced only.
