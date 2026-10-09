@@ -301,7 +301,7 @@
   --sidebar-foreground: #dddddd;
   --sidebar-primary: #fe6767;
   --sidebar-primary-foreground: #ffffff;
-  --sidebar-accent: #363636;
+  --sidebar-accent: #fe6767;
   --sidebar-accent-foreground: #ffffff;
   --sidebar-border: #383838;
   --sidebar-ring: hsl(217.2 91.2% 59.8%);
@@ -420,6 +420,38 @@
   --color-red-200: #5b3034;
   --color-emerald-100: #153a2b;
   --color-emerald-800: #8ce5b3;
+
+  /* Pastel panels: darkened tints of each hue (text shades are lightened below). */
+  --color-blue-50: color-mix(in oklab, #3b82f6 9%, #222222);
+  --color-blue-100: color-mix(in oklab, #3b82f6 14%, #222222);
+  --color-blue-200: color-mix(in oklab, #3b82f6 20%, #222222);
+  --color-green-50: color-mix(in oklab, #22c55e 9%, #222222);
+  --color-green-100: color-mix(in oklab, #22c55e 14%, #222222);
+  --color-green-200: color-mix(in oklab, #22c55e 20%, #222222);
+  --color-yellow-50: color-mix(in oklab, #eab308 9%, #222222);
+  --color-yellow-100: color-mix(in oklab, #eab308 14%, #222222);
+  --color-yellow-200: color-mix(in oklab, #eab308 20%, #222222);
+  --color-amber-50: color-mix(in oklab, #f59e0b 9%, #222222);
+  --color-amber-100: color-mix(in oklab, #f59e0b 14%, #222222);
+  --color-amber-200: color-mix(in oklab, #f59e0b 20%, #222222);
+  --color-orange-50: color-mix(in oklab, #f97316 9%, #222222);
+  --color-orange-100: color-mix(in oklab, #f97316 14%, #222222);
+  --color-orange-200: color-mix(in oklab, #f97316 20%, #222222);
+  --color-purple-50: color-mix(in oklab, #a855f7 9%, #222222);
+  --color-purple-100: color-mix(in oklab, #a855f7 14%, #222222);
+  --color-purple-200: color-mix(in oklab, #a855f7 20%, #222222);
+  --color-cyan-50: color-mix(in oklab, #06b6d4 9%, #222222);
+  --color-cyan-100: color-mix(in oklab, #06b6d4 14%, #222222);
+  --color-cyan-200: color-mix(in oklab, #06b6d4 20%, #222222);
+  --color-violet-50: color-mix(in oklab, #8b5cf6 9%, #222222);
+  --color-violet-100: color-mix(in oklab, #8b5cf6 14%, #222222);
+  --color-violet-200: color-mix(in oklab, #8b5cf6 20%, #222222);
+  --color-slate-50: #292929;
+  --color-slate-100: #303030;
+  --color-slate-200: #3a3a3a;
+  --color-slate-300: #454545;
+  --color-slate-400: #8a8a8a;
+  --color-slate-500: #9a9a9a;
 }
 
 /*
@@ -442,6 +474,75 @@
 .dark .hover\:text-red-600:hover { color: #fca5a5; }
 .dark .hover\:text-red-700:hover { color: #fecaca; }
 .dark .hover\:text-red-800:hover { color: #fecaca; }
+
+/* Same treatment for the other hues' text and borders, and for slate. */
+.dark .border-blue-300 { border-color: color-mix(in oklab, #3b82f6 32%, #222222); }
+.dark .text-blue-600 { color: #60a5fa; }
+.dark .text-blue-700 { color: #93c5fd; }
+.dark .text-blue-800,
+.dark .text-blue-900 { color: #bfdbfe; }
+.dark .hover\:text-blue-700:hover { color: #bfdbfe; }
+.dark .border-green-300 { border-color: color-mix(in oklab, #22c55e 32%, #222222); }
+.dark .text-green-600 { color: #4ade80; }
+.dark .text-green-700 { color: #86efac; }
+.dark .text-green-800,
+.dark .text-green-900 { color: #bbf7d0; }
+.dark .hover\:text-green-700:hover { color: #bbf7d0; }
+.dark .border-yellow-300 { border-color: color-mix(in oklab, #eab308 32%, #222222); }
+.dark .text-yellow-600 { color: #facc15; }
+.dark .text-yellow-700 { color: #fde047; }
+.dark .text-yellow-800,
+.dark .text-yellow-900 { color: #fef08a; }
+.dark .hover\:text-yellow-700:hover { color: #fef08a; }
+.dark .border-amber-300 { border-color: color-mix(in oklab, #f59e0b 32%, #222222); }
+.dark .text-amber-600 { color: #fbbf24; }
+.dark .text-amber-700 { color: #fcd34d; }
+.dark .text-amber-800,
+.dark .text-amber-900 { color: #fde68a; }
+.dark .hover\:text-amber-700:hover { color: #fde68a; }
+.dark .border-orange-300 { border-color: color-mix(in oklab, #f97316 32%, #222222); }
+.dark .text-orange-600 { color: #fb923c; }
+.dark .text-orange-700 { color: #fdba74; }
+.dark .text-orange-800,
+.dark .text-orange-900 { color: #fed7aa; }
+.dark .hover\:text-orange-700:hover { color: #fed7aa; }
+.dark .border-purple-300 { border-color: color-mix(in oklab, #a855f7 32%, #222222); }
+.dark .text-purple-600 { color: #c084fc; }
+.dark .text-purple-700 { color: #d8b4fe; }
+.dark .text-purple-800,
+.dark .text-purple-900 { color: #e9d5ff; }
+.dark .hover\:text-purple-700:hover { color: #e9d5ff; }
+.dark .border-emerald-300 { border-color: color-mix(in oklab, #10b981 32%, #222222); }
+.dark .text-emerald-600 { color: #34d399; }
+.dark .text-emerald-700 { color: #6ee7b7; }
+.dark .text-emerald-800,
+.dark .text-emerald-900 { color: #a7f3d0; }
+.dark .hover\:text-emerald-700:hover { color: #a7f3d0; }
+.dark .border-cyan-300 { border-color: color-mix(in oklab, #06b6d4 32%, #222222); }
+.dark .text-cyan-600 { color: #22d3ee; }
+.dark .text-cyan-700 { color: #67e8f9; }
+.dark .text-cyan-800,
+.dark .text-cyan-900 { color: #a5f3fc; }
+.dark .hover\:text-cyan-700:hover { color: #a5f3fc; }
+.dark .border-violet-300 { border-color: color-mix(in oklab, #8b5cf6 32%, #222222); }
+.dark .text-violet-600 { color: #a78bfa; }
+.dark .text-violet-700 { color: #c4b5fd; }
+.dark .text-violet-800,
+.dark .text-violet-900 { color: #ddd6fe; }
+.dark .hover\:text-violet-700:hover { color: #ddd6fe; }
+.dark .hover\:text-blue-600:hover { color: #60a5fa; }
+.dark .hover\:text-green-600:hover { color: #4ade80; }
+.dark .hover\:text-yellow-600:hover { color: #facc15; }
+.dark .hover\:text-amber-600:hover { color: #fbbf24; }
+.dark .hover\:text-orange-600:hover { color: #fb923c; }
+.dark .hover\:text-purple-600:hover { color: #c084fc; }
+.dark .hover\:text-emerald-600:hover { color: #34d399; }
+.dark .hover\:text-cyan-600:hover { color: #22d3ee; }
+.dark .hover\:text-violet-600:hover { color: #a78bfa; }
+.dark .text-slate-600 { color: #b0b0b0; }
+.dark .text-slate-700 { color: #c8c8c8; }
+.dark .text-slate-800 { color: #dcdcdc; }
+.dark .text-slate-900 { color: #eeeeee; }
 
 /* neutral-900 is light text in dark mode but a button fill (under white text) in a few places. */
 .dark .bg-doubleword-neutral-900 { background-color: #2f2f2f; }
@@ -474,4 +575,42 @@
 }
 .dark .modal-scrollbar::-webkit-scrollbar-thumb:hover {
   background: #7a7a7a;
+}
+
+/* Usage page colours (inline-styled, so they cannot use Tailwind classes). */
+:root {
+  --usage-page: #f8fafc;
+  --usage-surface: #ffffff;
+  --usage-pill-active: #ffffff;
+  --usage-row-hover: #fafbfd;
+  --usage-track: #f1f5f9;
+  --usage-border: #e2e8f0;
+  --usage-strong: #0f172a;
+  --usage-text: #1e293b;
+  --usage-text-2: #334155;
+  --usage-mid: #475569;
+  --usage-muted: #64748b;
+  --usage-faint: #94a3b8;
+  --usage-faint-2: #b0b8c4;
+  --usage-sep: #cbd5e1;
+  --usage-success: #059669;
+  --usage-success-bg: #ecfdf5;
+}
+.dark {
+  --usage-page: #181818;
+  --usage-surface: #222222;
+  --usage-pill-active: #3a3a3a;
+  --usage-row-hover: #2a2a2a;
+  --usage-track: #2e2e2e;
+  --usage-border: #3a3a3a;
+  --usage-strong: #f2f2f2;
+  --usage-text: #e6e6e6;
+  --usage-text-2: #d4d4d4;
+  --usage-mid: #bdbdbd;
+  --usage-muted: #a3a3a3;
+  --usage-faint: #8a8a8a;
+  --usage-faint-2: #6f6f6f;
+  --usage-sep: #555555;
+  --usage-success: #34d399;
+  --usage-success-bg: #12332a;
 }

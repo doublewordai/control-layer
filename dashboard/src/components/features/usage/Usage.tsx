@@ -66,7 +66,7 @@ function MiniBar({ value, max, color, delay = 0 }: { value: number; max: number;
     return () => clearTimeout(t);
   }, [value, max, delay]);
   return (
-      <div style={{ height: 5, borderRadius: 3, background: "#f1f5f9", overflow: "hidden", flex: 1 }}>
+      <div style={{ height: 5, borderRadius: 3, background: "var(--usage-track)", overflow: "hidden", flex: 1 }}>
         <div style={{
           height: "100%", borderRadius: 3, background: color,
           width: `${w}%`, transition: "width 0.9s cubic-bezier(0.16,1,0.3,1)",
@@ -151,23 +151,23 @@ function DonutChart({ data, size = 190, thickness = 24, centerLabel }: { data: D
           {hovered !== null && (
               <div style={{
                 position: "absolute", top: -8, left: "50%", transform: "translateX(-50%)",
-                background: "white", borderRadius: 8, padding: "6px 12px",
-                boxShadow: "0 2px 8px rgba(0,0,0,0.12)", border: "1px solid #e2e8f0",
+                background: "var(--usage-surface)", borderRadius: 8, padding: "6px 12px",
+                boxShadow: "0 2px 8px rgba(0,0,0,0.12)", border: "1px solid var(--usage-border)",
                 display: "flex", flexDirection: "column", alignItems: "center", gap: 2,
                 whiteSpace: "nowrap", pointerEvents: "none",
               }}>
-                <span style={{ fontSize: 11, color: "#475569", fontWeight: 600 }}>
+                <span style={{ fontSize: 11, color: "var(--usage-mid)", fontWeight: 600 }}>
                   {arcs[hovered].label}
                 </span>
-                <span style={{ fontSize: 16, fontWeight: 700, color: "#1e293b", fontVariantNumeric: "tabular-nums" }}>
+                <span style={{ fontSize: 16, fontWeight: 700, color: "var(--usage-text)", fontVariantNumeric: "tabular-nums" }}>
                   {arcs[hovered].format(arcs[hovered].value)}
                 </span>
               </div>
           )}
-          <span style={{ fontSize: 10, color: "#94a3b8", textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>
+          <span style={{ fontSize: 10, color: "var(--usage-faint)", textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>
             {centerLabel}
           </span>
-          <span style={{ fontSize: 18, fontWeight: 700, color: "#1e293b", fontVariantNumeric: "tabular-nums" }}>
+          <span style={{ fontSize: 18, fontWeight: 700, color: "var(--usage-text)", fontVariantNumeric: "tabular-nums" }}>
             {data[0]?.totalFormat(total)}
           </span>
         </div>
@@ -209,9 +209,9 @@ export function Usage() {
   }, [usage]);
 
   const card = {
-    background: "#fff",
+    background: "var(--usage-surface)",
     borderRadius: 12,
-    border: "1px solid #e2e8f0",
+    border: "1px solid var(--usage-border)",
     boxShadow: "0 1px 3px rgba(0,0,0,0.04), 0 1px 2px rgba(0,0,0,0.02)",
   };
 
@@ -224,7 +224,7 @@ export function Usage() {
           }}>
             <div>
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <h1 style={{ fontSize: 22, fontWeight: 700, color: "#0f172a", margin: 0 }}>Usage</h1>
+                <h1 style={{ fontSize: 22, fontWeight: 700, color: "var(--usage-strong)", margin: 0 }}>Usage</h1>
                 <Button
                   variant="ghost"
                   size="sm"
@@ -238,14 +238,14 @@ export function Usage() {
                   />
                 </Button>
               </div>
-              <p style={{ fontSize: 13, color: "#94a3b8", margin: "2px 0 0" }}>
+              <p style={{ fontSize: 13, color: "var(--usage-faint)", margin: "2px 0 0" }}>
                 API consumption &amp; cost breakdown
               </p>
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
               <div style={{
                 display: "flex", gap: 1, padding: 3, borderRadius: 10,
-                background: "#f1f5f9", border: "1px solid #e2e8f0",
+                background: "var(--usage-track)", border: "1px solid var(--usage-border)",
               }}>
                 {["1d","7d","30d","90d","all"].map((v) => {
                   const o = RANGE_OPTIONS.find(r => r.value === v);
@@ -253,8 +253,8 @@ export function Usage() {
                       <button key={v} onClick={() => setRange(v)} style={{
                         padding: "5px 12px", fontSize: 12, fontWeight: 500, borderRadius: 7,
                         border: "none", cursor: "pointer", transition: "all 0.15s",
-                        background: range === v ? "#fff" : "transparent",
-                        color: range === v ? "#0f172a" : "#64748b",
+                        background: range === v ? "var(--usage-pill-active)" : "transparent",
+                        color: range === v ? "var(--usage-strong)" : "var(--usage-muted)",
                         boxShadow: range === v ? "0 1px 3px rgba(0,0,0,0.08)" : "none",
                       }}>
                         {o?.label}
@@ -273,9 +273,9 @@ export function Usage() {
                           style={{
                             appearance: "none", WebkitAppearance: "none",
                             padding: "5px 28px 5px 10px", fontSize: 12, fontWeight: 500,
-                            borderRadius: 8, border: "1px solid #e2e8f0",
-                            background: isMoreSelected ? "#fff" : "#f1f5f9",
-                            color: isMoreSelected ? "#0f172a" : "#64748b",
+                            borderRadius: 8, border: "1px solid var(--usage-border)",
+                            background: isMoreSelected ? "var(--usage-pill-active)" : "var(--usage-track)",
+                            color: isMoreSelected ? "var(--usage-strong)" : "var(--usage-muted)",
                             cursor: "pointer", outline: "none",
                             boxShadow: isMoreSelected ? "0 1px 3px rgba(0,0,0,0.08)" : "none",
                           }}
@@ -288,7 +288,7 @@ export function Usage() {
                       </select>
                       <svg width="10" height="10" viewBox="0 0 10 10" fill="none"
                            style={{ position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)", pointerEvents: "none" }}>
-                        <path d="M2.5 4L5 6.5L7.5 4" stroke="#64748b" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                        <path d="M2.5 4L5 6.5L7.5 4" style={{ stroke: "var(--usage-muted)" }} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
                       </svg>
                     </div>
                 );
@@ -300,13 +300,13 @@ export function Usage() {
 
   if (isLoading) {
     return (
-      <div style={{ minHeight: "100vh", background: "#f8fafc" }}>
+      <div style={{ minHeight: "100vh", background: "var(--usage-page)" }}>
         <div style={{ maxWidth: 1140, margin: "0 auto", padding: "32px 24px 64px" }}>
           {header}
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: "80px 0", color: "#94a3b8", fontSize: 14 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: "80px 0", color: "var(--usage-faint)", fontSize: 14 }}>
             <svg width="16" height="16" viewBox="0 0 16 16" style={{ animation: "spin 1s linear infinite" }}>
-              <circle cx="8" cy="8" r="6" fill="none" stroke="#e2e8f0" strokeWidth="2.5" />
-              <path d="M8 2A6 6 0 0 1 14 8" fill="none" stroke="#94a3b8" strokeWidth="2.5" strokeLinecap="round" />
+              <circle cx="8" cy="8" r="6" fill="none" style={{ stroke: "var(--usage-border)" }} strokeWidth="2.5" />
+              <path d="M8 2A6 6 0 0 1 14 8" fill="none" style={{ stroke: "var(--usage-faint)" }} strokeWidth="2.5" strokeLinecap="round" />
             </svg>
             Collecting usage data — this can take up to 30 seconds for larger date ranges
           </div>
@@ -317,10 +317,10 @@ export function Usage() {
 
   if (!usage) {
     return (
-      <div style={{ minHeight: "100vh", background: "#f8fafc" }}>
+      <div style={{ minHeight: "100vh", background: "var(--usage-page)" }}>
         <div style={{ maxWidth: 1140, margin: "0 auto", padding: "32px 24px 64px" }}>
           {header}
-          <p style={{ color: "#94a3b8", fontSize: 14, textAlign: "center", padding: "80px 0" }}>
+          <p style={{ color: "var(--usage-faint)", fontSize: 14, textAlign: "center", padding: "80px 0" }}>
             No usage data available.
           </p>
         </div>
@@ -356,22 +356,22 @@ export function Usage() {
 
             {/* Tokens */}
             <div style={{ ...card, padding: "20px 24px" }}>
-              <div style={{ fontSize: 12, fontWeight: 600, color: "#94a3b8", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 8 }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: "var(--usage-faint)", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 8 }}>
                 Tokens
               </div>
-              <div style={{ fontSize: 30, fontWeight: 700, color: "#0f172a", fontVariantNumeric: "tabular-nums", lineHeight: 1 }}>
+              <div style={{ fontSize: 30, fontWeight: 700, color: "var(--usage-strong)", fontVariantNumeric: "tabular-nums", lineHeight: 1 }}>
                 <AnimatedNumber value={usage.total_input_tokens + usage.total_output_tokens} format={(v) => formatCompact(Math.round(v))} />
               </div>
               <div style={{ display: "flex", gap: 20, marginTop: 12 }}>
                 <div>
-                  <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 2 }}>Input</div>
+                  <div style={{ fontSize: 11, color: "var(--usage-faint)", marginBottom: 2 }}>Input</div>
                   <div style={{ fontSize: 15, fontWeight: 600, color: "#0ea5e9", fontVariantNumeric: "tabular-nums" }}>
                     {formatCompact(usage.total_input_tokens)}
                   </div>
                 </div>
-                <div style={{ width: 1, background: "#e2e8f0" }} />
+                <div style={{ width: 1, background: "var(--usage-border)" }} />
                 <div>
-                  <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 2 }}>Output</div>
+                  <div style={{ fontSize: 11, color: "var(--usage-faint)", marginBottom: 2 }}>Output</div>
                   <div style={{ fontSize: 15, fontWeight: 600, color: "#10b981", fontVariantNumeric: "tabular-nums" }}>
                     {formatCompact(usage.total_output_tokens)}
                   </div>
@@ -381,14 +381,14 @@ export function Usage() {
 
             {/* Batches */}
             <div style={{ ...card, padding: "20px 24px" }}>
-              <div style={{ fontSize: 12, fontWeight: 600, color: "#94a3b8", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 8 }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: "var(--usage-faint)", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 8 }}>
                 Batches
               </div>
-              <div style={{ fontSize: 30, fontWeight: 700, color: "#0f172a", fontVariantNumeric: "tabular-nums", lineHeight: 1 }}>
+              <div style={{ fontSize: 30, fontWeight: 700, color: "var(--usage-strong)", fontVariantNumeric: "tabular-nums", lineHeight: 1 }}>
                 <AnimatedNumber value={usage.total_batch_count} format={(v) => formatNumber(Math.round(v))} />
               </div>
               <div style={{ marginTop: 12 }}>
-                <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 2 }}>Avg batch size</div>
+                <div style={{ fontSize: 11, color: "var(--usage-faint)", marginBottom: 2 }}>Avg batch size</div>
                 <div style={{ fontSize: 15, fontWeight: 600, color: "#f59e0b", fontVariantNumeric: "tabular-nums" }}>
                   {usage.avg_requests_per_batch.toFixed(1)} reqs
                 </div>
@@ -397,27 +397,27 @@ export function Usage() {
 
             {/* Cost */}
             <div style={{ ...card, padding: "20px 24px" }}>
-              <div style={{ fontSize: 12, fontWeight: 600, color: "#94a3b8", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 8 }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: "var(--usage-faint)", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 8 }}>
                 Cost
               </div>
-              <div style={{ fontSize: 30, fontWeight: 700, color: "#0f172a", fontVariantNumeric: "tabular-nums", lineHeight: 1 }}>
+              <div style={{ fontSize: 30, fontWeight: 700, color: "var(--usage-strong)", fontVariantNumeric: "tabular-nums", lineHeight: 1 }}>
                 <AnimatedNumber value={totalCost} format={(v) => formatDollars(v)} />
               </div>
               {realtimeCost > 0 && (
                   <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 14 }}>
                     <div style={{
                       display: "inline-flex", alignItems: "center", gap: 5,
-                      background: "#ecfdf5", borderRadius: 8, padding: "5px 10px",
+                      background: "var(--usage-success-bg)", borderRadius: 8, padding: "5px 10px",
                     }}>
                       <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-                        <path d="M12 9L7.5 4.5L5.5 6.5L2 3" stroke="#059669" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-                        <path d="M8.5 9H12V5.5" stroke="#059669" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                        <path d="M12 9L7.5 4.5L5.5 6.5L2 3" style={{ stroke: "var(--usage-success)" }} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                        <path d="M8.5 9H12V5.5" style={{ stroke: "var(--usage-success)" }} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
                       </svg>
-                      <span style={{ fontSize: 13, fontWeight: 600, color: "#059669" }}>
+                      <span style={{ fontSize: 13, fontWeight: 600, color: "var(--usage-success)" }}>
                     Saved {savings.toFixed(0)}% ({formatDollars(realtimeCost - totalCost)})
                   </span>
                     </div>
-                    <span style={{ fontSize: 12, color: "#64748b", fontWeight: 500 }}>
+                    <span style={{ fontSize: 12, color: "var(--usage-muted)", fontWeight: 500 }}>
                   vs sync
                 </span>
                   </div>
@@ -431,13 +431,13 @@ export function Usage() {
             {/* Left: donuts stacked */}
             <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
               <div style={{ ...card, padding: "20px 24px", display: "flex", flexDirection: "column", alignItems: "center", flex: 1, justifyContent: "center" }}>
-                <div style={{ fontSize: 13, fontWeight: 600, color: "#475569", marginBottom: 12, alignSelf: "flex-start" }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: "var(--usage-mid)", marginBottom: 12, alignSelf: "flex-start" }}>
                   Cost by Model
                 </div>
                 <DonutChart data={costPieData} size={180} thickness={22} centerLabel="Total" />
               </div>
               <div style={{ ...card, padding: "20px 24px", display: "flex", flexDirection: "column", alignItems: "center", flex: 1, justifyContent: "center" }}>
-                <div style={{ fontSize: 13, fontWeight: 600, color: "#475569", marginBottom: 12, alignSelf: "flex-start" }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: "var(--usage-mid)", marginBottom: 12, alignSelf: "flex-start" }}>
                   Requests by Model
                 </div>
                 <DonutChart data={requestPieData} size={180} thickness={22} centerLabel="Total" />
@@ -447,15 +447,15 @@ export function Usage() {
             {/* Right: model table */}
             <div style={{ ...card, overflow: "hidden" }}>
               <div style={{ padding: "18px 24px 12px" }}>
-                <div style={{ fontSize: 13, fontWeight: 600, color: "#475569" }}>Model Breakdown</div>
+                <div style={{ fontSize: 13, fontWeight: 600, color: "var(--usage-mid)" }}>Model Breakdown</div>
               </div>
 
               {/* Header */}
               <div style={{
                 display: "grid", gridTemplateColumns: "2fr 1.1fr 1.6fr 0.7fr",
                 padding: "0 24px 10px", gap: 12,
-                fontSize: 11, color: "#94a3b8", textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600,
-                borderBottom: "1px solid #f1f5f9",
+                fontSize: 11, color: "var(--usage-faint)", textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600,
+                borderBottom: "1px solid var(--usage-track)",
               }}>
                 <span>Model</span>
                 <span style={{ textAlign: "right" }}>Requests</span>
@@ -469,7 +469,7 @@ export function Usage() {
                       style={{
                         display: "grid", gridTemplateColumns: "2fr 1.1fr 1.6fr 0.7fr",
                         padding: "14px 24px", gap: 12, alignItems: "center",
-                        borderBottom: i < chartData.length - 1 ? "1px solid #f8fafc" : "none",
+                        borderBottom: i < chartData.length - 1 ? "1px solid var(--usage-page)" : "none",
                         transition: "background 0.12s",
                         opacity: mounted ? 1 : 0,
                         transform: mounted ? "none" : "translateY(6px)",
@@ -477,22 +477,22 @@ export function Usage() {
                         transitionDuration: "0.12s, 0.5s, 0.5s",
                         transitionDelay: `0s, ${i * 50}ms, ${i * 50}ms`,
                       }}
-                      onMouseEnter={(e) => (e.currentTarget.style.background = "#fafbfd")}
+                      onMouseEnter={(e) => (e.currentTarget.style.background = "var(--usage-row-hover)")}
                       onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
                   >
                     {/* Model */}
                     <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                       <div style={{ width: 8, height: 8, borderRadius: 2, background: PALETTE[i % PALETTE.length], flexShrink: 0 }} />
                       <div>
-                        <div style={{ fontSize: 13, fontWeight: 600, color: "#1e293b" }}>{d.model}</div>
-                        <div style={{ fontSize: 11, color: "#94a3b8" }}>{d.provider}</div>
+                        <div style={{ fontSize: 13, fontWeight: 600, color: "var(--usage-text)" }}>{d.model}</div>
+                        <div style={{ fontSize: 11, color: "var(--usage-faint)" }}>{d.provider}</div>
                       </div>
                     </div>
 
                     {/* Requests */}
                     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                       <MiniBar value={d.requests} max={maxRequests} color={PALETTE[i % PALETTE.length]} delay={i * 60} />
-                      <span style={{ fontSize: 13, fontWeight: 600, color: "#334155", fontVariantNumeric: "tabular-nums", minWidth: 42, textAlign: "right" }}>
+                      <span style={{ fontSize: 13, fontWeight: 600, color: "var(--usage-text-2)", fontVariantNumeric: "tabular-nums", minWidth: 42, textAlign: "right" }}>
                     {formatCompact(d.requests)}
                   </span>
                     </div>
@@ -501,9 +501,9 @@ export function Usage() {
                     <div>
                       <div style={{ display: "flex", gap: 8, fontSize: 12, fontVariantNumeric: "tabular-nums", alignItems: "baseline" }}>
                         <span style={{ color: "#0ea5e9", fontWeight: 500 }}>{formatCompact(d.input_tokens)}</span>
-                        <span style={{ color: "#cbd5e1" }}>/</span>
+                        <span style={{ color: "var(--usage-sep)" }}>/</span>
                         <span style={{ color: "#10b981", fontWeight: 500 }}>{formatCompact(d.output_tokens)}</span>
-                        <span style={{ color: "#b0b8c4", fontSize: 11 }}>{formatCompact(d.input_tokens + d.output_tokens)}</span>
+                        <span style={{ color: "var(--usage-faint-2)", fontSize: 11 }}>{formatCompact(d.input_tokens + d.output_tokens)}</span>
                       </div>
                       <div style={{ display: "flex", gap: 2, marginTop: 5, maxWidth: 160 }}>
                         <div style={{
@@ -524,7 +524,7 @@ export function Usage() {
                     </div>
 
                     {/* Cost */}
-                    <div style={{ textAlign: "right", fontSize: 13, fontWeight: 600, color: "#1e293b", fontVariantNumeric: "tabular-nums" }}>
+                    <div style={{ textAlign: "right", fontSize: 13, fontWeight: 600, color: "var(--usage-text)", fontVariantNumeric: "tabular-nums" }}>
                       {formatDollars(d.cost)}
                     </div>
                   </div>
