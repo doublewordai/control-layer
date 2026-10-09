@@ -268,7 +268,7 @@ batches:
   # When disabled, these endpoints will not be available (default: true).
   enabled: true
   pending_capacity_counts_enabled: false # Count admitted, unfinished batch work per model and window in batch admission (default: false)
-  pending_capacity_counts_max_age_secs: 10 # Per-replica cache age of that count; 0 counts on every submission (default: 10)
+  pending_capacity_counts_max_age_secs: 10 # Per-replica cache age of that count, capped at half of reservation_ttl_secs; 0 counts on every submission (default: 10)
   pending_capacity_counts_timeout_ms: 10000 # Statement timeout for the count; admission fails open on error (default: 10000)
 
   # Files configuration for batch file uploads/downloads
