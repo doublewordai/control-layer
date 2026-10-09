@@ -213,17 +213,31 @@ fn object_entry<'a>(
         .expect("entry was just made an object")
 }
 
+/// What dispatch does with a body's `nvext.routing_constraints.tolerations`.
+#[derive(Debug, Clone, Copy)]
+enum TolerationsWrite<'a> {
+    /// Tolerations are not configured: the body is not touched.
+    Leave,
+    /// Overwrite with the daemon's tolerations.
+    Set(&'a serde_json::Value),
+    /// Released: send the request without the field, whatever the stored
+    /// body holds (a body stored before uploads stripped it, or written by
+    /// another client of this library, could otherwise keep a toleration).
+    Remove,
+}
+
 /// Write the daemon's Dynamo extensions into an outbound body in one parse and
 /// one serialise: the scheduling priority at `nvext.agent_hints.priority` and
 /// the spillover tolerations at `nvext.routing_constraints.tolerations`. Each
-/// overwrites a value already in the body; every other key is preserved. With
-/// neither set, or a body that is not a JSON object, the body is untouched.
+/// overwrites a value already in the body (or, for released tolerations,
+/// removes it); every other key is preserved. With nothing to write or remove,
+/// or a body that is not a JSON object, the body is untouched.
 fn inject_dynamo_extensions(
     body: &mut String,
     priority: Option<i32>,
-    tolerations: Option<&serde_json::Value>,
+    tolerations: TolerationsWrite<'_>,
 ) {
-    if priority.is_none() && tolerations.is_none() {
+    if priority.is_none() && matches!(tolerations, TolerationsWrite::Leave) {
         return;
     }
     let Ok(mut json) = serde_json::from_str::<serde_json::Value>(body) else {
@@ -233,19 +247,28 @@ fn inject_dynamo_extensions(
         return;
     };
 
-    let nvext = object_entry(object, "nvext");
+    let mut changed = false;
+    if let TolerationsWrite::Remove = tolerations {
+        changed |= object
+            .get_mut("nvext")
+            .and_then(|nvext| nvext.get_mut("routing_constraints"))
+            .and_then(serde_json::Value::as_object_mut)
+            .is_some_and(|constraints| constraints.remove("tolerations").is_some());
+    }
     if let Some(priority) = priority {
-        object_entry(nvext, "agent_hints").insert(
+        object_entry(object_entry(object, "nvext"), "agent_hints").insert(
             "priority".to_string(),
             serde_json::Value::Number(priority.into()),
         );
+        changed = true;
     }
-    if let Some(tolerations) = tolerations {
-        object_entry(nvext, "routing_constraints")
+    if let TolerationsWrite::Set(tolerations) = tolerations {
+        object_entry(object_entry(object, "nvext"), "routing_constraints")
             .insert("tolerations".to_string(), tolerations.clone());
+        changed = true;
     }
 
-    if let Ok(new_body) = serde_json::to_string(&json) {
+    if changed && let Ok(new_body) = serde_json::to_string(&json) {
         *body = new_body;
     }
 }
@@ -2552,8 +2575,11 @@ where
             } else {
                 None
             };
-            let mut tolerations = self.dispatch_tolerations.as_ref();
-            if tolerations.is_some() && !kind.is_background() {
+            let mut tolerations = self
+                .dispatch_tolerations
+                .as_ref()
+                .map_or(TolerationsWrite::Leave, TolerationsWrite::Set);
+            if self.dispatch_tolerations.is_some() && !kind.is_background() {
                 // The claim query decides (and records the decision on the
                 // row) whenever the storage supports it; otherwise apply the
                 // deadline floor here.
@@ -2572,7 +2598,7 @@ where
                     ),
                 };
                 if let Some(reason) = reason {
-                    tolerations = None;
+                    tolerations = TolerationsWrite::Remove;
                     counter!(
                         "fusillade_tolerations_released_total",
                         "model" => capacity_model.clone(),
@@ -5854,7 +5880,7 @@ mod tests {
     fn priority_injection_keeps_key_order() {
         let mut body = r#"{"model":"m","response_format":{"type":"json_schema","json_schema":{"name":"n","schema":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"string"}}}}},"messages":[]}"#.to_string();
 
-        inject_dynamo_extensions(&mut body, Some(7), None);
+        inject_dynamo_extensions(&mut body, Some(7), TolerationsWrite::Leave);
 
         assert_eq!(
             body,
@@ -5873,7 +5899,11 @@ mod tests {
         })
         .to_string();
 
-        inject_dynamo_extensions(&mut body, Some(BACKGROUND_DYNAMO_PRIORITY), None);
+        inject_dynamo_extensions(
+            &mut body,
+            Some(BACKGROUND_DYNAMO_PRIORITY),
+            TolerationsWrite::Leave,
+        );
 
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
@@ -5898,12 +5928,16 @@ mod tests {
         // Odd spacing and key order a re-serialise would normalise.
         let original = r#"{ "model":"m",  "nvext":{"routing_constraints":{"tolerations":[{"operator":"Exists"}]}}, "a":1 }"#;
         let mut body = original.to_string();
-        inject_dynamo_extensions(&mut body, None, None);
+        inject_dynamo_extensions(&mut body, None, TolerationsWrite::Leave);
         assert_eq!(body, original);
 
         // A non-object body is left alone even when something is configured.
         let mut body = "[1,2]".to_string();
-        inject_dynamo_extensions(&mut body, Some(1), Some(&serde_json::json!([])));
+        inject_dynamo_extensions(
+            &mut body,
+            Some(1),
+            TolerationsWrite::Set(&serde_json::json!([])),
+        );
         assert_eq!(body, "[1,2]");
     }
 
@@ -5923,7 +5957,11 @@ mod tests {
         })
         .to_string();
 
-        inject_dynamo_extensions(&mut body, None, Some(&serde_json::json!([])));
+        inject_dynamo_extensions(
+            &mut body,
+            None,
+            TolerationsWrite::Set(&serde_json::json!([])),
+        );
 
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         let constraints = &json["nvext"]["routing_constraints"];
@@ -5942,6 +5980,40 @@ mod tests {
     }
 
     #[test]
+    fn released_tolerations_remove_a_stored_value() {
+        let mut body = serde_json::json!({
+            "model": "m",
+            "nvext": {
+                "routing_constraints": {
+                    "tolerations": [{"operator": "Exists"}],
+                    "required_taints": ["gpu.h200"]
+                }
+            }
+        })
+        .to_string();
+
+        inject_dynamo_extensions(&mut body, Some(5), TolerationsWrite::Remove);
+
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let constraints = &json["nvext"]["routing_constraints"];
+        assert!(
+            constraints.get("tolerations").is_none(),
+            "a released request is sent without the field"
+        );
+        assert_eq!(
+            constraints["required_taints"],
+            serde_json::json!(["gpu.h200"])
+        );
+        assert_eq!(json["nvext"]["agent_hints"]["priority"], 5);
+
+        // Nothing to remove and nothing else to write: byte-identical.
+        let original = r#"{ "model":"m",  "a":1 }"#;
+        let mut body = original.to_string();
+        inject_dynamo_extensions(&mut body, None, TolerationsWrite::Remove);
+        assert_eq!(body, original);
+    }
+
+    #[test]
     fn tolerations_and_priority_are_injected_together() {
         let tolerations = serde_json::to_value(vec![Toleration {
             key: Some("dynamo.spillover/external".to_string()),
@@ -5952,7 +6024,7 @@ mod tests {
         .unwrap();
         let mut body = r#"{"model":"m","messages":[],"nvext":"not-an-object"}"#.to_string();
 
-        inject_dynamo_extensions(&mut body, Some(-42), Some(&tolerations));
+        inject_dynamo_extensions(&mut body, Some(-42), TolerationsWrite::Set(&tolerations));
 
         assert_eq!(
             body,
@@ -6029,7 +6101,11 @@ mod tests {
                 "near or past its deadline the request may spill"
             );
             let mut expected = BODY.to_string();
-            inject_dynamo_extensions(&mut expected, Some(sla_dynamo_priority(deadline)), None);
+            inject_dynamo_extensions(
+                &mut expected,
+                Some(sla_dynamo_priority(deadline)),
+                TolerationsWrite::Leave,
+            );
             assert_eq!(
                 prepared_body(&prepared, deadline),
                 expected,
