@@ -2390,6 +2390,13 @@ pub async fn build_router(
             realtime_ttl,
             token_ttl,
             pool: Some(sqlx_pool_router::DynPools::new(state.db.clone())),
+            keystore: state.keystore.clone(),
+            // Same policy map the inference middleware decides ZDR from, so a
+            // realtime ZDR caller's images are inlined rather than stored.
+            key_policy_cache: inference_middleware_state
+                .as_ref()
+                .map(|s| s.key_policy_cache.clone())
+                .unwrap_or_else(crate::sync::key_policy::KeyPolicyCache::empty),
         };
         onwards_router.layer(middleware::from_fn_with_state(
             image_normalizer_state,

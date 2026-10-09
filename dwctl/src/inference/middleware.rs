@@ -564,6 +564,11 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                     ))
                     .unwrap();
             }
+            // ZDR keys exist before anything is stored: the request key seals
+            // the request's images on their way into the object store below, as
+            // well as the body further down, so no ZDR image is ever written in
+            // plaintext and shredding the key shreds the images with the body.
+            let zdr_keys = zdr.then(crate::inference::zdr::FlexKeys::generate);
             // Flex is persisted now and dispatched later by the daemon, so —
             // unlike realtime — this leg does NOT pass through the
             // image-normaliser layer. Normalise image inputs to `dw-img://`
@@ -596,7 +601,8 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                     None => None,
                 };
                 let access_pool = Some(state.dwctl_pool.write().into_inner());
-                match normalize_value_to_tokens(&mut request_value, &state.image_normalizer, access_pool, attribution).await {
+                let seal_key = zdr_keys.as_ref().map(|keys| &keys.request[..]);
+                match normalize_value_to_tokens(&mut request_value, &state.image_normalizer, access_pool, attribution, seal_key).await {
                     Ok(n) => {
                         if n > 0 {
                             tracing::debug!(substituted = n, service_tier = %service_tier, "Queued image normalisation replaced image inputs with tokens");
@@ -638,7 +644,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
 
             // For ZDR, encrypt the body and store the per-request keys; any
             // failure fails the request rather than falling back to plaintext.
-            let flex_body = if zdr {
+            let flex_body = if let Some(keys) = zdr_keys.as_ref() {
                 let zdr_store_error = || {
                     Response::builder()
                         .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -652,7 +658,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                     tracing::error!("ZDR enabled but keystore missing; refusing to store plaintext");
                     return zdr_store_error();
                 };
-                match crate::inference::zdr::prepare_flex_submit(keystore, &request_id, &mut request_value).await {
+                match crate::inference::zdr::prepare_flex_submit(keystore, &request_id, keys, &mut request_value).await {
                     Ok(body) => body,
                     Err(e) => {
                         tracing::error!(error = %e, "ZDR submit failed; refusing to store plaintext");
