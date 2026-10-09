@@ -37,7 +37,8 @@ impl<'c> BatchAdmissionDemand<'c> {
     ///   (24h rows carry a NULL tier, 1h rows `flex`);
     /// * unpopulated batches (`requests_started_at` NULL — created, but the
     ///   background population job has not inserted their rows yet): their
-    ///   template count from the input file. `requests_started_at` is stamped
+    ///   template count from the input file, overdue ones included until they
+    ///   are a whole longest window past their deadline. `requests_started_at` is stamped
     ///   in the same transaction as the row INSERT, so within this single
     ///   statement snapshot a batch is counted exactly one way.
     ///
@@ -112,9 +113,14 @@ impl<'c> BatchAdmissionDemand<'c> {
                 FROM active_batches ab
                 JOIN request_templates_all t ON t.file_id = ab.file_id
                 WHERE NOT ab.populated
-                  -- An unpopulated batch past its deadline is stuck, not work
-                  -- the daemon will run; don't let it hold capacity forever.
-                  AND ab.expires_at > NOW()
+                  -- Population ignores the deadline and the claim path serves
+                  -- overdue rows first, so an overdue unpopulated batch is
+                  -- still work that will consume capacity: count it, like
+                  -- overdue populated rows. Only a batch still unpopulated a
+                  -- whole longest window past its deadline is treated as
+                  -- stuck (its population job has given up), so it cannot
+                  -- hold capacity forever.
+                  AND ab.expires_at > NOW() - make_interval(secs => (SELECT MAX(horizon_seconds) FROM windows))
                   AND t.model = ANY($1)
                 GROUP BY t.model, ab.expires_at
             )

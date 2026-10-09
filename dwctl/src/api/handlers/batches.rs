@@ -4325,6 +4325,82 @@ mod tests {
         assert_eq!(counts[&alias]["24h"], 3);
     }
 
+    /// An unpopulated batch past its deadline is still populated and served
+    /// (overdue rows are claimed first), so its templates keep counting against
+    /// every window. Only one stuck a whole longest window past its deadline
+    /// stops counting.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_outstanding_counts_overdue_unpopulated_batches(pool: PgPool) {
+        let mut config = create_test_config();
+        config.batches.pending_capacity_counts_enabled = true;
+        let state = create_test_app_state_with_fusillade(pool.clone(), config).await;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let endpoint_id = create_test_endpoint(&pool, &format!("test-{}", Uuid::new_v4()), user.id).await;
+        let alias = format!("alias-{}", Uuid::new_v4());
+        create_test_model(&pool, "model-a", &alias, endpoint_id, user.id).await;
+
+        let file_id = state
+            .request_manager
+            .create_file("overdue-unpopulated-test".to_string(), None, capacity_templates(&alias, 3))
+            .await
+            .expect("create file");
+        let batch = state
+            .request_manager
+            .create_batch_record(fusillade::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: Some(3),
+            })
+            .await
+            .expect("create batch record without populating it");
+
+        let windows = [("1h".to_string(), 3_600_i64), ("24h".to_string(), 86_400_i64)];
+        let count = |state: &crate::AppState<TestDbPools>| {
+            let alias = alias.clone();
+            let windows = windows.clone();
+            let request_manager = state.request_manager.clone();
+            async move {
+                let mut tx = request_manager.begin_write().await.unwrap();
+                crate::db::handlers::BatchAdmissionDemand::new(&mut tx)
+                    .outstanding_by_model_and_window(std::slice::from_ref(&alias), &windows, 10_000)
+                    .await
+                    .unwrap()
+                    .remove(&alias)
+                    .unwrap_or_default()
+            }
+        };
+
+        // Overdue by a minute: counted in every window.
+        let mut tx = state.request_manager.begin_write().await.unwrap();
+        sqlx::query("UPDATE batches SET expires_at = NOW() - INTERVAL '1 minute' WHERE id = $1")
+            .bind(*batch.id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let counts = count(&state).await;
+        assert_eq!(counts.get("1h"), Some(&3), "overdue unpopulated work counts: {counts:?}");
+        assert_eq!(counts.get("24h"), Some(&3), "overdue unpopulated work counts: {counts:?}");
+
+        // Stuck for longer than the longest window past its deadline: dropped.
+        let mut tx = state.request_manager.begin_write().await.unwrap();
+        sqlx::query("UPDATE batches SET expires_at = NOW() - INTERVAL '25 hours' WHERE id = $1")
+            .bind(*batch.id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let counts = count(&state).await;
+        assert!(counts.is_empty(), "a long-stuck unpopulated batch stops counting: {counts:?}");
+    }
+
     /// A 1h submission also has to fit in every longer window: with the 24h
     /// window closed (relaxation 0), a 1h batch is rejected even though the 1h
     /// window itself has room.
