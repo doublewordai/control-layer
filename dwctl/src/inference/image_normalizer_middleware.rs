@@ -296,7 +296,10 @@ pub async fn image_normalizer_middleware(
             // store (a client echoing back a URL we signed). Re-ingesting
             // and re-signing would waste a round-trip re-fetching an image we
             // already host and clobber the original TTL with the realtime one.
-            if !is_data_uri && normalizer.owns_url(&url) {
+            //
+            // Not for ZDR: a ZDR request never hands the provider a URL into
+            // our store, so an echoed one is fetched and inlined below.
+            if !is_data_uri && !zdr && normalizer.owns_url(&url) {
                 return Ok::<String, NormalizeError>(url);
             }
             let input = if is_data_uri {
@@ -823,6 +826,34 @@ mod tests {
         let url = echoed["messages"][0]["content"][1]["image_url"]["url"].as_str().unwrap();
         assert_eq!(url, TINY_PNG_DATA_URI, "validated and inlined, not swapped for a signed URL");
         assert!(store.objects().is_empty(), "a ZDR image must never reach the store");
+    }
+
+    #[tokio::test]
+    async fn a_zdr_caller_echoing_one_of_our_urls_does_not_get_it_forwarded() {
+        // A non-ZDR caller's echoed store URL passes through untouched; a ZDR
+        // caller's is fetched and inlined instead, so the provider never gets a
+        // URL into the store. MemoryStore URLs are not fetchable, so for ZDR
+        // the fetch fails rather than the URL being forwarded.
+        let store = Arc::new(MemoryStore::new().with_base_url("http://test.local/dw-img"));
+        let mut state = state_over(store);
+        state.key_policy_cache =
+            crate::sync::key_policy::KeyPolicyCache::from_pairs([("sk-zdr".to_string(), true), ("sk-plain".to_string(), false)]);
+        let ours = "http://test.local/dw-img/abcd?expires=1";
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "image_url", "image_url": {"url": ours}}
+            ]}]
+        });
+
+        let (status, echoed) = post_json_as(build_router(state.clone()), Some("sk-plain"), body.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(echoed["messages"][0]["content"][1]["image_url"]["url"], ours);
+
+        let (status, echoed) = post_json_as(build_router(state), Some("sk-zdr"), body).await;
+        assert_ne!(status, StatusCode::OK, "{echoed}");
+        assert!(!echoed.to_string().contains(ours), "ZDR must not forward a store URL: {echoed}");
     }
 
     #[tokio::test]

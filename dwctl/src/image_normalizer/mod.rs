@@ -285,12 +285,24 @@ impl<S: ImageStore + 'static> ImageNormalizer for DefaultImageNormalizer<S> {
     }
 
     async fn load(&self, input: ImageInput) -> Result<(String, Bytes), NormalizeError> {
-        match input {
+        let (mime, bytes) = match input {
             ImageInput::HttpUrl(url) => {
                 let fetched = self.fetcher.fetch(&url).await?;
-                Ok((fetched.mime, fetched.bytes))
+                (fetched.mime, fetched.bytes)
             }
             ImageInput::DataUri(uri) => {
+                // Bound the encoded payload before decoding it, so an oversized
+                // `data:` URI is refused without allocating its decoded size.
+                let max_encoded_len = self.fetcher.max_bytes().div_ceil(3).saturating_mul(4);
+                if uri
+                    .split_once(',')
+                    .is_some_and(|(_, payload)| payload.len() as u64 > max_encoded_len)
+                {
+                    return Err(NormalizeError::BadInput(format!(
+                        "data: URI payload exceeds cap {}",
+                        self.fetcher.max_bytes()
+                    )));
+                }
                 let decoded = data_uri::parse(&uri)?;
                 // Enforce the same size and MIME policy as the HTTP fetch
                 // path — a `data:` URI must not bypass the normaliser's
@@ -307,9 +319,16 @@ impl<S: ImageStore + 'static> ImageNormalizer for DefaultImageNormalizer<S> {
                 if !self.fetcher.mime_allowed(&decoded.mime) {
                     return Err(NormalizeError::BadInput(format!("mime not allowed: {}", decoded.mime)));
                 }
-                Ok((decoded.mime, Bytes::from(decoded.bytes)))
+                (decoded.mime, Bytes::from(decoded.bytes))
             }
+        };
+        // No image format starts with the sealed-object prefix. Refusing it here
+        // keeps that prefix an unambiguous marker: a stored plaintext image can
+        // never be mistaken for a sealed one.
+        if sealed::is_sealed(&bytes) {
+            return Err(NormalizeError::BadInput("payload is not a supported image".into()));
         }
+        Ok((mime, bytes))
     }
 
     async fn ingest_sealed(&self, input: ImageInput, key: &[u8]) -> Result<IngestResult, NormalizeError> {
@@ -529,6 +548,40 @@ mod tests {
         assert_eq!(mime, "image/png");
         assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
         assert!(sealed::open(&crate::keystore::generate_key(), &blob).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_payload_that_looks_sealed_is_refused() {
+        // An "image" carrying the sealed prefix must never be stored as
+        // plaintext, or a ZDR dispatch would try to open it as sealed.
+        use base64::Engine as _;
+        let mut spoof = sealed::SEALED_MAGIC.to_vec();
+        spoof.extend_from_slice(b"not really sealed");
+        let uri = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(&spoof));
+        let store = Arc::new(MemoryStore::new());
+        let n = DefaultImageNormalizer::new(FetcherConfig::default(), store.clone());
+        let err = n.ingest(ImageInput::DataUri(uri)).await.unwrap_err();
+        assert!(matches!(err, NormalizeError::BadInput(_)), "got {err:?}");
+        assert!(store.objects().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_oversized_data_uri_is_refused_before_decoding() {
+        let cfg = FetcherConfig {
+            max_bytes: 8,
+            ..FetcherConfig::default()
+        };
+        let n = DefaultImageNormalizer::new(cfg, Arc::new(MemoryStore::new()));
+        // Not even valid base64: proves the length check runs before the decode.
+        let uri = format!("data:image/png;base64,{}", "!".repeat(64));
+        let err = n.load(ImageInput::DataUri(uri)).await.unwrap_err();
+        match err {
+            NormalizeError::BadInput(m) => assert!(m.contains("exceeds cap"), "{m}"),
+            other => panic!("got {other:?}"),
+        }
+        // A payload at the cap still decodes.
+        let ok = format!("data:image/png;base64,{}", "AAAAAAAAAAA=");
+        assert!(n.load(ImageInput::DataUri(ok)).await.is_ok());
     }
 
     #[tokio::test]
