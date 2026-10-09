@@ -123,6 +123,13 @@ impl MemoryStore {
         self.base_url = base_url.into();
         self
     }
+
+    /// Every stored object's raw bytes, for tests asserting what reached the store.
+    #[cfg(test)]
+    pub fn objects(&self) -> Vec<Bytes> {
+        let map = self.inner.lock().expect("MemoryStore mutex poisoned");
+        map.values().map(|(_, bytes)| bytes.clone()).collect()
+    }
 }
 
 #[async_trait]
