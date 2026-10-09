@@ -65,7 +65,8 @@ impl<'c> BatchAdmissionDemand<'c> {
 
         // Bound the statement: admission fails open on error, so a slow count
         // must not hold a pooled connection (or a request) for longer than this.
-        // The value is an integer from config, not user input.
+        // The value is an integer from config, not user input. Config rejects
+        // 0; the floor of 1 keeps a programmatic 0 from meaning "no timeout".
         sqlx::query(&format!("SET LOCAL statement_timeout = {}", statement_timeout_ms.max(1)))
             .execute(&mut *self.db)
             .await?;

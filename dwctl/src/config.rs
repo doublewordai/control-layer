@@ -1768,7 +1768,9 @@ pub struct BatchConfig {
 
     /// Statement timeout, in milliseconds, for the admission outstanding-work count. On
     /// timeout or error admission falls back to the last usable snapshot, or to reservations
-    /// only (fail open). Default: 10000.
+    /// only (fail open). Must be positive (> 0): a zero timeout would fail every count and
+    /// silently turn the check off. Default: 10000.
+    #[serde(deserialize_with = "deserialize_positive_timeout_ms")]
     pub pending_capacity_counts_timeout_ms: u64,
 }
 
@@ -1851,6 +1853,19 @@ where
         ))),
         Some(value) => Ok(value),
     }
+}
+
+fn deserialize_positive_timeout_ms<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let value = u64::deserialize(deserializer)?;
+    if value == 0 {
+        return Err(D::Error::custom("pending_capacity_counts_timeout_ms must be positive (> 0), got 0"));
+    }
+    Ok(value)
 }
 
 /// Custom deserializer that validates throughput is positive, with null/missing defaulting to 100.0
@@ -5447,6 +5462,58 @@ batches:
     fn test_reservation_ttl_default() {
         let config = Config::default();
         assert_eq!(config.batches.reservation_ttl_secs, 600);
+    }
+
+    #[test]
+    fn test_pending_capacity_counts_timeout_zero_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  pending_capacity_counts_timeout_ms: 0
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("pending_capacity_counts_timeout_ms must be positive")
+            );
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_pending_capacity_counts_timeout_explicit_value() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  pending_capacity_counts_timeout_ms: 2500
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+            assert_eq!(config.batches.pending_capacity_counts_timeout_ms, 2500);
+
+            Ok(())
+        });
     }
 
     #[test]
