@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0](https://github.com/doublewordai/control-layer/compare/onwards-v1.2.0...onwards-v2.0.0) (2026-10-10)
+
+
+### ⚠ BREAKING CHANGES
+
+* **limits:** replace gateway rate limits with per-account realtime in-flight limits ([#1915](https://github.com/doublewordai/control-layer/issues/1915))
+* **onwards:** frame SSE before applying buffer limit
+
+### Features
+
+* **dwctl:** let slow first tokens stream until a 20-second failover deadline ([#1808](https://github.com/doublewordai/control-layer/issues/1808)) ([444ad7c](https://github.com/doublewordai/control-layer/commit/444ad7cfd5d04d5077ef62b61a2fb9cd72b5f03e))
+* **limits:** cap batch requests in flight per model in onwards ([#1924](https://github.com/doublewordai/control-layer/issues/1924)) ([834827d](https://github.com/doublewordai/control-layer/commit/834827dbc2b09604e9759f8b715eb85b3e2c1e22))
+* **limits:** count in-flight limit checks and refusals per account ([#1957](https://github.com/doublewordai/control-layer/issues/1957)) ([f6a7486](https://github.com/doublewordai/control-layer/commit/f6a74865a43a71bb9c3d9228958dfde66c364477))
+* **limits:** name the account and report its limit on in-flight metrics ([#1958](https://github.com/doublewordai/control-layer/issues/1958)) ([72c6e97](https://github.com/doublewordai/control-layer/commit/72c6e974d435a20ed5cd36f977016434b3b7be4b))
+* **limits:** replace gateway rate limits with per-account realtime in-flight limits ([#1915](https://github.com/doublewordai/control-layer/issues/1915)) ([be53043](https://github.com/doublewordai/control-layer/commit/be530434b6d2fec1c5c2cfa0c366c9ced6954a5e))
+* **onwards:** conversation affinity for priority pools ([#1892](https://github.com/doublewordai/control-layer/issues/1892)) ([b2ff624](https://github.com/doublewordai/control-layer/commit/b2ff624480cade3f985b1a02045304add2339705))
+* **onwards:** count and log the requests onwards rejects itself (DW-851) ([#1937](https://github.com/doublewordai/control-layer/issues/1937)) ([98c234e](https://github.com/doublewordai/control-layer/commit/98c234e6c97fd154496c6c2554683c124270b8bb))
+* **onwards:** flag chat parameters not every backend supports ([#1925](https://github.com/doublewordai/control-layer/issues/1925)) ([b2271fb](https://github.com/doublewordai/control-layer/commit/b2271fb2b626d760937cfaf7ed77b0b0a6fe5ecb))
+* **onwards:** make AIMD share control decide under overload and recover ([#1803](https://github.com/doublewordai/control-layer/issues/1803)) ([8bb4a6f](https://github.com/doublewordai/control-layer/commit/8bb4a6fc3a865993d810bcd671165e13fe7c7ce7))
+* **onwards:** send a scheduling priority on every dynamo request ([#1848](https://github.com/doublewordai/control-layer/issues/1848)) ([094fe22](https://github.com/doublewordai/control-layer/commit/094fe227e2bcd3c86f2b090a6b7a4fa44eb2d17d))
+* **onwards:** trace rejections and stop logging caller-limit refusals ([#1952](https://github.com/doublewordai/control-layer/issues/1952)) ([f051e4c](https://github.com/doublewordai/control-layer/commit/f051e4c8324f413422fc237abcf3ddac504b9650))
+* **responses:** accept Codex tool namespace groups ([#1935](https://github.com/doublewordai/control-layer/issues/1935)) ([9d46bf7](https://github.com/doublewordai/control-layer/commit/9d46bf782d49dec56fa0c262c76e503c3d98e422))
+* serving classes v1 ([#1774](https://github.com/doublewordai/control-layer/issues/1774)) ([e1c9275](https://github.com/doublewordai/control-layer/commit/e1c92756cbe16953360aa4055cf1011992c55767))
+
+
+### Bug Fixes
+
+* **analytics:** checkpoint records before enrichment ([#1789](https://github.com/doublewordai/control-layer/issues/1789)) ([7ed4000](https://github.com/doublewordai/control-layer/commit/7ed4000159b0ea8ef496e84437517c7511a0bce6))
+* Correctly handle otel tracing through onwards ([#1827](https://github.com/doublewordai/control-layer/issues/1827)) ([107d619](https://github.com/doublewordai/control-layer/commit/107d619195a55c5b0cac65801aaffad06256668a))
+* **onwards:** answer every capacity refusal with 529 and Retry-After ([#1913](https://github.com/doublewordai/control-layer/issues/1913)) ([8ca5e6d](https://github.com/doublewordai/control-layer/commit/8ca5e6d4802ebc0e3fe85802d35c7dffd06680d4))
+* **onwards:** frame SSE before applying buffer limit ([5ebb4f1](https://github.com/doublewordai/control-layer/commit/5ebb4f122e5cba74fc971afd0e94b4d050ae96a4))
+* **onwards:** return realtime-only failover statuses as sent when no provider is left ([#1811](https://github.com/doublewordai/control-layer/issues/1811)) ([2b954b9](https://github.com/doublewordai/control-layer/commit/2b954b9b22620e4764fffc5793c9e65303170e37))
+* **onwards:** stop re-asking overloaded providers and answer 429 when every provider is full ([#1911](https://github.com/doublewordai/control-layer/issues/1911)) ([ad19d05](https://github.com/doublewordai/control-layer/commit/ad19d05bcda37f50cbf258a79882b75df3efed39))
+* preserve JSON key order in forwarded request bodies ([#1930](https://github.com/doublewordai/control-layer/issues/1930)) ([a8721a8](https://github.com/doublewordai/control-layer/commit/a8721a8ca8886b2437648131488a833e9461be0f))
+* **proxy:** preserve upstream rate-limit responses ([#1800](https://github.com/doublewordai/control-layer/issues/1800)) ([8a2052b](https://github.com/doublewordai/control-layer/commit/8a2052b3627d7c120b42bf436891529ba3de3f89))
+* set TCP_NODELAY on gateway sockets ([#1931](https://github.com/doublewordai/control-layer/issues/1931)) ([909a27e](https://github.com/doublewordai/control-layer/commit/909a27e95f7ace63385c8b8d3872b5a2290dd0d3))
+
+
+### Performance Improvements
+
+* **onwards:** share a pool's key set between requests ([#1901](https://github.com/doublewordai/control-layer/issues/1901)) ([18cd38c](https://github.com/doublewordai/control-layer/commit/18cd38c64a5f6af25a85d29120a3ca186e382226))
+
 ## [1.2.0](https://github.com/doublewordai/control-layer/compare/onwards-v1.1.0...onwards-v1.2.0) (2026-09-16)
 
 
