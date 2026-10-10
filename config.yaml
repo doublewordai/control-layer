@@ -607,6 +607,22 @@ cache:
   # bursty batch pod (e.g. 3); default 1.
   # Set via environment: DWCTL_CACHE__INDEX_CONN_RETRIES=3
   # index_conn_retries: 1
+  # Serving-path retry of tokenizer-svc HTTP 503 overloads for cache classification
+  # (tokenize/render//v1/models). Non-serving callers (recompute/replay/prefix-chain/continuation)
+  # stay single-attempt. Retries continue until the owning request's classify task ends:
+  # upstream inference time plus the classify_deadline_secs JOIN grace (which is not an overall
+  # retry deadline and is unchanged). First attempts never spend budget; each retry opens a
+  # fresh connection and Retry-After is not honored. Budgets are PER PROCESS — multiply by the
+  # replica count when sizing against a shared tokenizer-svc. Defaults are conservative
+  # starting points, not measured optima. See docs/src/reference/configuration.md for metrics.
+  # Set via environment: DWCTL_CACHE__TOKENIZER_RETRY__ENABLED=true
+  # tokenizer_retry:
+  #   enabled: true              # DWCTL_CACHE__TOKENIZER_RETRY__ENABLED
+  #   initial_backoff_ms: 100    # DWCTL_CACHE__TOKENIZER_RETRY__INITIAL_BACKOFF_MS
+  #   max_backoff_ms: 2000       # DWCTL_CACHE__TOKENIZER_RETRY__MAX_BACKOFF_MS
+  #   retries_per_second: 10     # DWCTL_CACHE__TOKENIZER_RETRY__RETRIES_PER_SECOND
+  #   retry_burst: 10            # DWCTL_CACHE__TOKENIZER_RETRY__RETRY_BURST
+  #   max_concurrent_retries: 8  # DWCTL_CACHE__TOKENIZER_RETRY__MAX_CONCURRENT_RETRIES
   # Default pricing multipliers — pre-fill values when enabling caching on a model without
   # explicit per-tier rates. The model_cache_tariffs row is the source of truth, so these
   # only matter at enable-time. Defaults shown; uncomment to override.

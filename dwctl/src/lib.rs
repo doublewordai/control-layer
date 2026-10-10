@@ -405,6 +405,11 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
                 )
                 .expect("Failed to set custom buckets for dwctl_cache_tokenizer_duration_seconds")
                 .set_buckets_for_metric(
+                    Matcher::Full("dwctl_cache_tokenizer_retry_budget_wait_seconds".to_string()),
+                    CACHE_LATENCY_BUCKETS,
+                )
+                .expect("Failed to set custom buckets for dwctl_cache_tokenizer_retry_budget_wait_seconds")
+                .set_buckets_for_metric(
                     Matcher::Full("dwctl_cache_commit_duration_seconds".to_string()),
                     CACHE_LATENCY_BUCKETS,
                 )
@@ -2480,10 +2485,27 @@ pub async fn build_router(
         let cfg = state.current_config();
         if cfg.cache.enabled {
             let pool = sqlx_pool_router::DynPools::new(state.db.clone());
+            // One shared retry budget for this process's serving classifier. Attaching it does
+            // not make the client retry: only the cache layer's per-request
+            // `Classifier::serving_scoped()` clone retries tokenizer-svc 503s, for as long as
+            // that request's classify task lives.
+            let mut tokenizer = crate::prompt_cache::TokenizerClient::new(cfg.cache.tokenizer_url.clone());
+            let retry = &cfg.cache.tokenizer_retry;
+            if retry.enabled {
+                tokenizer = tokenizer.with_retry_budget(crate::prompt_cache::TokenizerRetryBudget::new(
+                    crate::prompt_cache::TokenizerRetryPolicy {
+                        initial_backoff: std::time::Duration::from_millis(retry.initial_backoff_ms),
+                        max_backoff: std::time::Duration::from_millis(retry.max_backoff_ms),
+                        retries_per_second: retry.retries_per_second,
+                        retry_burst: retry.retry_burst,
+                        max_concurrent_retries: retry.max_concurrent_retries,
+                    },
+                ));
+            }
             let classifier = crate::prompt_cache::Classifier::new(
                 crate::prompt_cache::PrincipalResolver::new(pool.clone()),
                 crate::prompt_cache::ModelConfigResolver::new(pool.clone()),
-                crate::prompt_cache::TokenizerClient::new(cfg.cache.tokenizer_url.clone()),
+                tokenizer,
                 Arc::new(crate::prompt_cache::PostgresIndex::new(pool, cfg.cache.index_conn_retries)),
                 crate::prompt_cache::TierPolicy::from_config(&cfg.cache.enabled_ttls, &cfg.cache.default_ttl),
                 crate::prompt_cache::TelemetryPolicy::from_config(
