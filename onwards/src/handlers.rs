@@ -927,6 +927,12 @@ pub async fn target_message_handler<T: HttpClient>(
     let mut inflight_slot = match (is_realtime, alias_inflight.as_deref(), account_id.as_deref()) {
         (true, Some(limits), Some(account)) => {
             let limit = limits.for_account(account);
+            metrics::counter!(
+                "onwards_inflight_limit_checks_total",
+                "model" => model_name.clone(),
+                "account" => account.to_string(),
+            )
+            .increment(1);
             match state
                 .inflight_limiter
                 .try_acquire(account, &model_name, limit)
@@ -941,6 +947,7 @@ pub async fn target_message_handler<T: HttpClient>(
                     metrics::counter!(
                         "onwards_inflight_limit_refusals_total",
                         "model" => model_name.clone(),
+                        "account" => account.to_string(),
                     )
                     .increment(1);
                     record_response_status(429);

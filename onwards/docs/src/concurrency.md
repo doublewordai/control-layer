@@ -97,6 +97,16 @@ plugged-in limiter can admit others without counting them. Counts are per
 process by default; `AppState::with_inflight_limiter` plugs in a shared
 counter so several instances enforce one limit.
 
+Every request checked against the limit is counted in
+`onwards_inflight_limit_checks_total{model, account}` and every refusal in
+`onwards_inflight_limit_refusals_total{model, account}`, so the share of an
+account's realtime requests refused on an alias is the ratio of the two. A
+series appears with its first increment, in each process: the checks counter
+has one for each account and alias with realtime traffic on a limited alias,
+and the refusals counter one only for the accounts that have been refused. An
+account that was never refused has no refusal series, so the ratio is missing
+for it rather than zero.
+
 ## Batch in-flight cap
 
 Realtime and batch are deliberately asymmetric. Realtime has no alias-wide total
