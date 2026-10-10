@@ -304,6 +304,14 @@ async fn reassemble_stream(response: Response, timeouts: StreamTimeouts) -> Resp
     let status = if status.is_success() && sink.is_reasoning_without_answer() {
         warn!("upstream completed reasoning without an answer, reclassifying");
         StatusCode::BAD_GATEWAY
+    } else if status.is_success() && sink.is_unterminated() {
+        // The stream closed cleanly but a choice never received its
+        // finish_reason, so generation was cut short (a cancelled or timed-out
+        // upstream can end the body without an error frame). Stored as a
+        // success, the row would keep a truncated completion; as a 502 it is
+        // retried.
+        warn!("upstream stream ended before a finish_reason, reclassifying");
+        StatusCode::BAD_GATEWAY
     } else {
         status
     };
@@ -380,6 +388,10 @@ impl Sink {
 
     fn is_reasoning_without_answer(&self) -> bool {
         self.reassemble && self.reassembler.is_reasoning_without_answer()
+    }
+
+    fn is_unterminated(&self) -> bool {
+        self.reassemble && self.reassembler.is_unterminated()
     }
 }
 
@@ -523,10 +535,14 @@ mod tests {
         )
     }
 
+    fn stop() -> String {
+        r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#.to_string()
+    }
+
     /// The core of the move: SSE frames in, one completion object out.
     #[tokio::test]
     async fn reassembles_sse_into_a_single_json_body() {
-        let frames = [chunk("Hello"), chunk(" world"), "[DONE]".to_string()];
+        let frames = [chunk("Hello"), chunk(" world"), stop(), "[DONE]".to_string()];
         let refs: Vec<&str> = frames.iter().map(String::as_str).collect();
 
         let out = reassemble_stream(sse_response(StatusCode::OK, &refs), timeouts(1000, 1000, 5000)).await;
@@ -558,6 +574,23 @@ mod tests {
         }
     }
 
+    /// A stream that closes cleanly before its finish_reason was cut short
+    /// upstream. Stored as a success it would keep a truncated completion, so it
+    /// comes back as a retryable failure, with or without the closing [DONE].
+    #[tokio::test]
+    async fn a_stream_that_ends_without_a_finish_reason_is_reclassified() {
+        let reasoning = r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"reasoning_content":"thinking"},"finish_reason":null}]}"#;
+
+        for frames in [vec![reasoning, "[DONE]"], vec![reasoning]] {
+            let out = reassemble_stream(sse_response(StatusCode::OK, &frames), timeouts(1000, 1000, 5000)).await;
+
+            assert_eq!(out.status(), StatusCode::BAD_GATEWAY);
+            let body: serde_json::Value = serde_json::from_str(&body_string(out).await).unwrap();
+            assert_eq!(body["choices"][0]["message"]["reasoning_content"], "thinking");
+            assert!(body["choices"][0]["finish_reason"].is_null());
+        }
+    }
+
     /// Content-free keepalive frames are what make a stream's wire size unrelated
     /// to the body it assembles to. They must not reach the assembled body.
     #[tokio::test]
@@ -567,8 +600,9 @@ mod tests {
         let mut noisy = vec![chunk("Hello")];
         noisy.extend(std::iter::repeat_n(keepalive.to_string(), 500));
         noisy.push(chunk(" world"));
+        noisy.push(stop());
         let noisy_refs: Vec<&str> = noisy.iter().map(String::as_str).collect();
-        let clean = [chunk("Hello"), chunk(" world")];
+        let clean = [chunk("Hello"), chunk(" world"), stop()];
         let clean_refs: Vec<&str> = clean.iter().map(String::as_str).collect();
 
         let a = reassemble_stream(sse_response(StatusCode::OK, &noisy_refs), timeouts(1000, 1000, 5000)).await;

@@ -270,6 +270,19 @@ impl Reassembler {
             })
     }
 
+    /// Whether any reassembled completions choice never received a
+    /// `finish_reason`, meaning the stream ended before generation did. Every
+    /// OpenAI-compatible stream closes each choice with one, so a choice without
+    /// it is a truncated response, not a finished one. Always false on the
+    /// Responses API path, which signals completion with `response.completed`.
+    pub fn is_unterminated(&self) -> bool {
+        !self.is_responses_api
+            && self
+                .choices
+                .values()
+                .any(|choice| !choice.contains_key("finish_reason"))
+    }
+
     /// Assemble the accumulated state into a non-streaming response body.
     pub fn finish(self) -> anyhow::Result<String> {
         // The Responses API emits typed events (`response.created`,
@@ -757,6 +770,17 @@ mod tests {
             })
             .collect();
 
+        // Recorded streams from real providers are complete, so each must close
+        // every choice with a finish_reason.
+        let mut acc = Reassembler::new();
+        for event in &events {
+            acc.push(event);
+        }
+        assert!(
+            !acc.is_unterminated(),
+            "fixture {provider}/{name}: a complete stream left a choice without a finish_reason"
+        );
+
         let actual: Value = serde_json::from_str(&reassemble(&events).unwrap()).unwrap();
 
         let mut errors = vec![];
@@ -914,6 +938,42 @@ mod tests {
         }
 
         assert!(reassembler.is_reasoning_without_answer());
+    }
+
+    #[test]
+    fn a_choice_without_a_finish_reason_is_unterminated() {
+        let reasoning = ev(
+            "",
+            r#"{"id":"1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":"thinking"},"finish_reason":null}]}"#,
+        );
+        let answer = ev(
+            "",
+            r#"{"id":"1","object":"chat.completion.chunk","choices":[{"index":1,"delta":{"content":"done"},"finish_reason":"stop"}]}"#,
+        );
+        let finish_first = ev(
+            "",
+            r#"{"id":"1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}"#,
+        );
+
+        let mut cut = Reassembler::new();
+        cut.push(&reasoning);
+        cut.push(&ev("", "[DONE]"));
+        assert!(cut.is_unterminated(), "the stream ended mid-generation");
+
+        let mut one_of_two = Reassembler::new();
+        one_of_two.push(&reasoning);
+        one_of_two.push(&answer);
+        assert!(one_of_two.is_unterminated(), "choice 0 never finished");
+
+        let mut finished = Reassembler::new();
+        finished.push(&reasoning);
+        finished.push(&answer);
+        finished.push(&finish_first);
+        assert!(!finished.is_unterminated());
+
+        let mut responses = Reassembler::new();
+        responses.push(&ev("response.completed", r#"{"response":{"id":"r"}}"#));
+        assert!(!responses.is_unterminated());
     }
 
     /// Build an event with the given type and data.
