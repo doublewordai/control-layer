@@ -749,16 +749,17 @@ pub async fn target_message_handler<T: HttpClient>(
     // against the pool that will serve it. Strict: a class named on the
     // request that the account does not hold, or the alias does not offer,
     // is refused rather than quietly downgraded.
-    let (account_id, key_purpose) = bearer_token
+    let (account_id, account_name, key_purpose) = bearer_token
         .as_ref()
         .and_then(|token| state.targets.key_labels.get(token))
         .map(|labels| {
             (
                 labels.get(serving::ACCOUNT_LABEL).cloned(),
+                labels.get(serving::ACCOUNT_NAME_LABEL).cloned(),
                 labels.get("purpose").cloned(),
             )
         })
-        .unwrap_or((None, None));
+        .unwrap_or((None, None, None));
     let serving_resolution: ServingResolution = {
         let account = account_id
             .as_deref()
@@ -927,10 +928,19 @@ pub async fn target_message_handler<T: HttpClient>(
     let mut inflight_slot = match (is_realtime, alias_inflight.as_deref(), account_id.as_deref()) {
         (true, Some(limits), Some(account)) => {
             let limit = limits.for_account(account);
+            let account_name = account_name.unwrap_or_default();
+            metrics::gauge!(
+                "onwards_inflight_account_limit",
+                "model" => model_name.clone(),
+                "account" => account.to_string(),
+                "account_name" => account_name.clone(),
+            )
+            .set(f64::from(limit));
             metrics::counter!(
                 "onwards_inflight_limit_checks_total",
                 "model" => model_name.clone(),
                 "account" => account.to_string(),
+                "account_name" => account_name.clone(),
             )
             .increment(1);
             match state
@@ -948,6 +958,7 @@ pub async fn target_message_handler<T: HttpClient>(
                         "onwards_inflight_limit_refusals_total",
                         "model" => model_name.clone(),
                         "account" => account.to_string(),
+                        "account_name" => account_name,
                     )
                     .increment(1);
                     record_response_status(429);
