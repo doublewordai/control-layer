@@ -1,5 +1,13 @@
 # Changelog
 
+## [13.6.0](https://github.com/doublewordai/control-layer/compare/v13.5.0...v13.6.0) (2026-10-10)
+
+
+### Features
+
+* **limits:** count in-flight limit checks and refusals per account ([#1957](https://github.com/doublewordai/control-layer/issues/1957)) ([f6a7486](https://github.com/doublewordai/control-layer/commit/f6a74865a43a71bb9c3d9228958dfde66c364477))
+* **onwards:** trace rejections and stop logging caller-limit refusals ([#1952](https://github.com/doublewordai/control-layer/issues/1952)) ([f051e4c](https://github.com/doublewordai/control-layer/commit/f051e4c8324f413422fc237abcf3ddac504b9650))
+
 ## [13.5.0](https://github.com/doublewordai/control-layer/compare/v13.4.3...v13.5.0) (2026-10-09)
 
 
