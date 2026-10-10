@@ -139,7 +139,7 @@ async fn translate_response_back(
                 // Deliberately NOT a 5xx: the upstream succeeded, and the same
                 // body will fail translation identically on every attempt, so
                 // this must map to a status fusillade classifies as
-                // non-retriable (it retries >=500, 429, 408 and 404) or a
+                // non-retriable (it retries >=500, 429 and 408) or a
                 // daemon-dispatched request retry-loops on it forever
                 // (COR-630).
                 error_response(translator, StatusCode::UNPROCESSABLE_ENTITY, "response translation failed")
