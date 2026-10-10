@@ -48,6 +48,12 @@
     "reason": "Intermediate materialized/ordered batch rows only; push_query ends in an explicit final SELECT, so added batch columns do not change its client result."
   },
   {
+    "path": "fusillade-arsenal/src/postgres/batch_list.rs",
+    "source": "query_builder.push(\"(SELECT b.*, 0 AS priority FROM batches b WHERE FALSE)\");",
+    "count": 1,
+    "reason": "Empty arm for an active-only status after a terminal cursor; intermediate materialized rows only, and push_query ends in an explicit final SELECT, so added batch columns do not change its client result."
+  },
+  {
     "path": "fusillade-arsenal/src/postgres/retained_response.rs",
     "source": "SELECT * FROM requests WHERE id = $1",
     "count": 1,
