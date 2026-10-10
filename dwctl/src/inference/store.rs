@@ -514,6 +514,15 @@ pub fn detail_to_response_object(detail: &fusillade::RequestDetail) -> serde_jso
             if let Some(usage) = parsed.get("usage") {
                 resp["usage"] = usage.clone();
             }
+            // The request row completed, but the stored Responses object may
+            // have been cut short (max_output_tokens, content filter). Keep the
+            // label so callers can tell a truncated turn from a finished one.
+            if parsed.get("status").and_then(|s| s.as_str()) == Some("incomplete") {
+                resp["status"] = serde_json::json!("incomplete");
+                if let Some(details) = parsed.get("incomplete_details") {
+                    resp["incomplete_details"] = details.clone();
+                }
+            }
             // ChatCompletion format (batch results)
             if parsed.get("choices").is_some() {
                 resp["output"] = serde_json::json!([{
@@ -785,8 +794,9 @@ pub fn chat_completion_to_stream_chunks(completion: &serde_json::Value, include_
 /// flex surface is text-first; extend this if tool streaming over flex is
 /// needed). Each tuple is `(event_name, data)`; the event name is fed to the
 /// SSE `event:` field *and* stamped into `data["type"]` (clients read the
-/// latter). The Responses surface has no `[DONE]` sentinel —
-/// `response.completed` is the terminator.
+/// latter). The Responses surface has no `[DONE]` sentinel — the terminal
+/// `response.completed` / `response.incomplete` / `response.failed` event is
+/// the terminator.
 pub fn response_object_to_stream_events(response: &serde_json::Value) -> Vec<(&'static str, serde_json::Value)> {
     let id = response.get("id").cloned().unwrap_or(serde_json::Value::Null);
     let created_at = response.get("created_at").cloned().unwrap_or(serde_json::Value::Null);
@@ -854,8 +864,15 @@ pub fn response_object_to_stream_events(response: &serde_json::Value) -> Vec<(&'
         }
     }
 
-    // Terminator: carries the full assembled object (usage, status, etc.).
-    events.push(mk("response.completed", serde_json::json!({ "response": response.clone() })));
+    // Terminator: carries the full assembled object (usage, status, etc.). The
+    // event name follows the stored status so a cut-short or failed response
+    // is not replayed to the client as completed.
+    let terminal = match response.get("status").and_then(|s| s.as_str()) {
+        Some("incomplete") => "response.incomplete",
+        Some("failed") => "response.failed",
+        _ => "response.completed",
+    };
+    events.push(mk(terminal, serde_json::json!({ "response": response.clone() })));
     events
 }
 
@@ -1264,6 +1281,41 @@ mod tests {
         assert_eq!(status_to_error_type(429), "rate_limit_error");
         assert_eq!(status_to_error_type(500), "server_error");
         assert_eq!(status_to_error_type(503), "server_error");
+    }
+
+    #[test]
+    fn incomplete_stored_response_keeps_incomplete_status() {
+        let body = r#"{"id":"resp_x","object":"response","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"message","role":"assistant","status":"incomplete","content":[{"type":"output_text","text":"partial"}]}]}"#;
+        let detail = make_detail("completed", Some(200), Some(body), None);
+        let value = detail_to_response_object(&detail);
+        assert_eq!(value["status"], "incomplete");
+        assert_eq!(value["incomplete_details"]["reason"], "max_output_tokens");
+        assert_eq!(value["output"][0]["content"][0]["text"], "partial");
+    }
+
+    #[test]
+    fn completed_stored_response_stays_completed() {
+        let body = r#"{"id":"resp_x","object":"response","status":"completed","output":[]}"#;
+        let detail = make_detail("completed", Some(200), Some(body), None);
+        let value = detail_to_response_object(&detail);
+        assert_eq!(value["status"], "completed");
+        assert!(value.get("incomplete_details").is_none());
+    }
+
+    #[test]
+    fn stored_response_replay_terminates_with_stored_status() {
+        let incomplete = serde_json::json!({
+            "id": "resp_x", "object": "response", "status": "incomplete", "created_at": 1, "model": "m", "output": []
+        });
+        let last = response_object_to_stream_events(&incomplete).pop().unwrap();
+        assert_eq!(last.0, "response.incomplete");
+        assert_eq!(last.1["type"], "response.incomplete");
+
+        let failed = serde_json::json!({ "id": "resp_y", "object": "response", "status": "failed", "output": [] });
+        assert_eq!(response_object_to_stream_events(&failed).pop().unwrap().0, "response.failed");
+
+        let completed = serde_json::json!({ "id": "resp_z", "object": "response", "status": "completed", "output": [] });
+        assert_eq!(response_object_to_stream_events(&completed).pop().unwrap().0, "response.completed");
     }
 
     fn make_detail(

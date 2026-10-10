@@ -14,8 +14,9 @@ use onwards::strict::schemas::chat_completions::{
 };
 
 use super::types::{
-    ContentPart, FunctionCallItem, Include, Item, ItemStatus, MessageContent as ResponseMessageContent, MessageItem, ReasoningContent,
-    ReasoningItem, ResponseStatus, ResponsesRequest, ResponsesResponse, SummaryContent, TextConfig, TextFormat, TruncationStrategy,
+    ContentPart, FunctionCallItem, Include, IncompleteDetails, Item, ItemStatus, MessageContent as ResponseMessageContent, MessageItem,
+    ReasoningContent, ReasoningItem, ResponseStatus, ResponsesRequest, ResponsesResponse, SummaryContent, TextConfig, TextFormat,
+    TruncationStrategy,
 };
 use super::util::{chat_usage_to_response_usage, merge_reasoning_text};
 
@@ -42,6 +43,7 @@ pub fn to_responses_response(
         .collect();
 
     let status = determine_response_status(&chat_response.choices);
+    let incomplete_details = incomplete_details_for(&chat_response.choices);
 
     let completed_at = if status == ResponseStatus::Completed {
         Some(chat_response.created)
@@ -63,7 +65,7 @@ pub fn to_responses_response(
         created_at: chat_response.created,
         completed_at,
         status,
-        incomplete_details: None,
+        incomplete_details,
         model: request.model.clone(),
         previous_response_id: request.previous_response_id.clone(),
         instructions: request.instructions.clone(),
@@ -193,9 +195,22 @@ fn determine_response_status(choices: &[Choice]) -> ResponseStatus {
         Some("stop") => ResponseStatus::Completed,
         Some("length") => ResponseStatus::Incomplete,
         Some("tool_calls") => ResponseStatus::RequiresAction,
-        Some("content_filter") => ResponseStatus::Failed,
+        Some("content_filter") => ResponseStatus::Incomplete,
         _ => ResponseStatus::Completed,
     }
+}
+
+/// Why an incomplete response stopped, as OpenAI reports it in
+/// `incomplete_details.reason`. `None` for a response that is not incomplete.
+fn incomplete_details_for(choices: &[Choice]) -> Option<IncompleteDetails> {
+    let reason = match choices.first()?.finish_reason.as_deref()? {
+        "length" => "max_output_tokens",
+        "content_filter" => "content_filter",
+        _ => return None,
+    };
+    Some(IncompleteDetails {
+        reason: reason.to_string(),
+    })
 }
 
 static ITEM_COUNTER: AtomicU64 = AtomicU64::new(0);
