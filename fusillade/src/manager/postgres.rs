@@ -26,6 +26,8 @@ where
     config: DaemonConfig,
     retention_maintenance: RetentionMaintenanceConfig,
     leak_config: Option<LeakConfig>,
+    dispatch_tolerations: Option<Vec<crate::daemon::Toleration>>,
+    sla_release: Option<crate::daemon::SlaReleaseConfig>,
     processor: OnceLock<Arc<dyn RequestProcessor<PostgresStore<P>, H>>>,
 }
 
@@ -124,6 +126,8 @@ where
             config,
             retention_maintenance: RetentionMaintenanceConfig::default(),
             leak_config: None,
+            dispatch_tolerations: None,
+            sla_release: None,
             processor: OnceLock::new(),
         }
     }
@@ -137,6 +141,23 @@ where
     /// Opt into configurable batch leaking; async/flex rates are unchanged.
     pub fn with_leak_config(mut self, config: LeakConfig) -> Self {
         self.leak_config = Some(config);
+        self
+    }
+
+    /// Mark every dispatched request with these scheduling tolerations; see
+    /// [`crate::Daemon::with_dispatch_tolerations`].
+    pub fn with_dispatch_tolerations(
+        mut self,
+        tolerations: Vec<crate::daemon::Toleration>,
+    ) -> Self {
+        self.dispatch_tolerations = Some(tolerations);
+        self
+    }
+
+    /// Also release tolerations on a throughput projection; see
+    /// [`crate::Daemon::with_sla_release`].
+    pub fn with_sla_release(mut self, config: crate::daemon::SlaReleaseConfig) -> Self {
+        self.sla_release = Some(config);
         self
     }
 
@@ -202,6 +223,12 @@ where
         .with_retention_maintenance(self.retention_maintenance.clone());
         if let Some(config) = &self.leak_config {
             daemon = daemon.with_leak_config(config.clone());
+        }
+        if let Some(tolerations) = &self.dispatch_tolerations {
+            daemon = daemon.with_dispatch_tolerations(tolerations.clone());
+        }
+        if let Some(config) = &self.sla_release {
+            daemon = daemon.with_sla_release(config.clone());
         }
         if let Some(processor) = self.processor.get().cloned() {
             daemon = daemon.with_processor(processor);

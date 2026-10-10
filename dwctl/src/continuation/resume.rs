@@ -116,6 +116,15 @@ pub fn build_leg_body(ctx: &RequestContext, token_ids: &[u32], max_tokens: Optio
     if let Some(max_tokens) = max_tokens {
         body["max_tokens"] = json!(max_tokens);
     }
+    // Scheduling tolerations: the leg must carry the original's tolerations,
+    // or a batch stream (which the fusillade daemon marks with
+    // `dispatch_tolerations`) could finish on capacity the backend reserves
+    // for other traffic. This
+    // layer sits inside the inference middleware, so on a realtime body any
+    // client-supplied value is already stripped and only the daemon's survives.
+    if let Some(tolerations) = ctx.body.pointer("/nvext/routing_constraints/tolerations").filter(|v| !v.is_null()) {
+        body["nvext"]["routing_constraints"] = json!({"tolerations": tolerations});
+    }
     // Sampling passthrough: the continuation must be drawn from the same
     // distribution the client asked for. The repetition penalties belong here
     // as much as temperature does — they are what stops a long generation
@@ -289,6 +298,31 @@ mod tests {
         assert!(body.get("max_tokens").is_none(), "an unbounded request stays unbounded");
         // The chat-shaped fields must never appear on a completions leg.
         assert!(body.get("messages").is_none());
+    }
+
+    #[test]
+    fn leg_body_keeps_the_original_scheduling_tolerations() {
+        let original = json!({
+            "model": "test-model", "stream": true,
+            "nvext": {
+                "agent_hints": {"priority": -1_700_000_000},
+                "routing_constraints": {"tolerations": [], "other": ["x"]},
+                "cache_control": {"enabled": true}
+            }
+        });
+        let body = build_leg_body(&ctx(original), &[9], None, 100);
+        assert_eq!(
+            body["nvext"]["routing_constraints"],
+            json!({"tolerations": []}),
+            "a batch leg keeps the tolerations the original was dispatched with"
+        );
+        assert_eq!(body["nvext"]["agent_hints"]["priority"], 100, "the leg keeps its own priority");
+
+        let body = build_leg_body(&ctx(json!({"model": "test-model"})), &[9], None, 100);
+        assert!(
+            body["nvext"].get("routing_constraints").is_none(),
+            "nothing to carry, nothing added"
+        );
     }
 
     /// A field the client sent as `null` means "unset"; forwarding it as an

@@ -406,7 +406,19 @@ batches:
   # method / make a payment). Set to 0 to disable. Default: 1000.
   unverified_requests_per_completion_hour: 1000
 
-  pending_capacity_counts_enabled: false # Include committed pending requests in batch submission capacity checks (default: false)
+  # Count work already admitted and not yet finished (pending/claimed/processing
+  # rows of active batches, and batches whose rows are not inserted yet) in
+  # batch admission. Admitting a batch for window W then checks W and every
+  # longer allowed window: outstanding work due within the window + in-flight
+  # reservations + the new batch <= throughput * window * relaxation.
+  # When false only in-flight reservations are counted (a per-batch check).
+  pending_capacity_counts_enabled: false
+  # Per-replica cache age of the outstanding-work count (0 = count on every
+  # submission). Staleness only errs towards rejecting; the age is capped at
+  # half of reservation_ttl_secs.
+  pending_capacity_counts_max_age_secs: 10
+  # Statement timeout for the count; on failure admission fails open.
+  pending_capacity_counts_timeout_ms: 10000
 
   # Allowed completion windows for batch processing
   # These define the maximum time from batch creation to completion
@@ -934,6 +946,36 @@ background_services:
     # is the negated Unix timestamp of the batch SLA deadline so earlier
     # deadlines produce larger numbers.
     # inject_deadline_priority: false
+
+    # Scheduling tolerations written to `nvext.routing_constraints.tolerations`
+    # on every request the daemon dispatches (batch, flex, background),
+    # replacing any value in the body. They are Kubernetes-style
+    # scheduling/routing tolerations understood by the upstream inference
+    # backend; a backend may, for example, use them to keep batch work off
+    # capacity reserved for other traffic, so the request waits and is
+    # retried instead. Near SLA failure the tolerations are dropped: meeting
+    # the deadline matters more than where the request runs. Inside the claim
+    # ramp window (claim_ramp_exponent: window_minutes ^ exponent minutes
+    # before the deadline, ~59 min for 24h, ~10 min for 1h) or past the
+    # deadline, the field is omitted and the backend may schedule the request
+    # anywhere. Background work keeps them. Unset injects nothing. Independent
+    # of inject_deadline_priority. The backend must accept the field; one that
+    # does not may reject the request.
+    # dispatch_tolerations: []
+
+    # Also release the tolerations of requests due before their model's
+    # release cutoff: the deadline before which requests that keep their
+    # tolerations are projected to miss. One daemon recomputes the cutoffs
+    # every refresh_interval_secs from requests dispatched WITH tolerations
+    # that completed in the last window_secs (count / busy seconds x in-flight) and the outstanding work
+    # by deadline; the claim applies them. Below min_samples, or with a
+    # cutoff older than 3 intervals, only the ramp/past-deadline floor applies.
+    # dispatch_tolerations_sla_release:
+    #   enabled: false
+    #   refresh_interval_secs: 300
+    #   window_secs: 900
+    #   safety_margin: 0.1          # fraction of each deadline's remaining time
+    #   min_samples: 20
 
   # Batch completion notifications (emails + webhooks)
   # notifications:

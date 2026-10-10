@@ -1102,66 +1102,59 @@ async fn get_model_ids_by_aliases<P: PoolProvider>(state: &AppState<P>, model_al
 }
 
 /// Reserve capacity for a batch before it is created, then release it once fusillade
-/// has committed the batch to its own database.
+/// has committed the batch record.
 ///
-/// ## Three-phase pipeline
+/// ## Pipeline
 ///
 /// ```text
-/// Phase 1 — Reserve   (this fn)
-///   ├─ read pending request counts      (fusillade write pool, OUTSIDE the lock;
-///   │                                     the expensive read — scales with backlog)
+/// Phase 1 — Reserve   (this fn → sla_capacity::reserve_capacity)
+///   ├─ outstanding work per model and window   (fusillade primary, OUTSIDE the lock,
+///   │                                            cached per replica for up to
+///   │                                            pending_capacity_counts_max_age_secs)
 ///   ├─ BEGIN tx on dwctl write pool
-///   ├─ pg_advisory_xact_lock per (model_id, window)  ← serialises concurrent reservations
-///   ├─ read reservations                (dwctl write pool, inside tx: active ones plus
-///   │                                     any released since the pending snapshot)
-///   ├─ check combined capacity
+///   ├─ pg_advisory_xact_lock per (model_id, checked window)  ← serialises admissions
+///   ├─ read reservations          (inside tx: active ones plus any released since
+///   │                              the outstanding-work snapshot)
+///   ├─ check every checked window (the requested one and each longer allowed one)
 ///   ├─ INSERT reservation rows
 ///   └─ COMMIT  ← lock released, reservation visible to peers
 ///
-/// Phase 2 — create_batch   (fusillade, ms – seconds depending on batch size)
-///   └─ single atomic tx: INSERT batches → INSERT requests → UPDATE totals → COMMIT
+/// Phase 2 — create_batch_record   (fusillade, one row)
+///   └─ the batch is active with requests_started_at NULL; the outstanding-work
+///      count covers it through its file's templates
 ///
-///   └─ UPDATE reservations SET released_at = now()
+///   └─ UPDATE reservations SET released_at = now()   (handler returns)
+///
+/// Phase 3 — populate (background job, later)
+///   └─ one tx: INSERT requests + SET requests_started_at; from then on the
+///      count covers the batch through its pending/claimed/processing rows
+/// ```
+///
+/// Because an unpopulated batch is counted by its templates, releasing the reservation
+/// when the handler returns (before population) leaves no gap; the switch from templates
+/// to rows happens inside one fusillade transaction, so a single count sees exactly one.
 ///
 /// ## Advisory lock scope
 ///
-/// `pg_advisory_xact_lock` is transaction-scoped and per `(model_id, window)` pair.
-/// All concurrent callers for the same model+window queue behind this lock — only one
-/// can read-check-then-insert at a time. Locks are acquired in deterministic UUID order
-/// to prevent deadlocks when a batch spans multiple models.
+/// `pg_advisory_xact_lock` is transaction-scoped and per `(model_id, window)` pair, and an
+/// admission locks every window it checks. Locks are acquired in a global order (model id,
+/// then window length) so admissions spanning several models or windows cannot deadlock.
 ///
-/// The pending-count read is deliberately kept *outside* the lock. It is the only
-/// expensive step (it reads every active request of the requested models), so holding
-/// the lock across it would head-of-line block every concurrent submission for the same
-/// model+window behind the slowest count — and a count that hit its statement timeout
-/// stalled all of them for the full timeout. Outside the lock, a slow count degrades one
-/// submission instead of blocking all of them.
+/// The outstanding-work count is deliberately kept *outside* the lock. It is the only
+/// expensive step (it reads the requested models' active request rows), so holding the
+/// lock across it would head-of-line block every concurrent submission for the same model.
 ///
 /// ## Read ordering and the fail-safe race window
 ///
-/// The two capacity reads come from **different connection pools** (dwctl vs. fusillade),
-/// so they hold independent PostgreSQL snapshots under `READ COMMITTED`. There is an
-/// unavoidable, tiny race window at the exact moment a concurrent batch finishes
-/// `create_batch` and its reservation is released — the "swap point" where requests
-/// transition from a reservation into committed pending rows.
+/// The count and the reservation read hold independent snapshots on different databases.
+/// A batch whose record commits after the count and whose reservation is released before
+/// the reservation read would naively appear in **neither**. The reservation read
+/// therefore also counts reservations *released at or after* the instant the count was
+/// taken (`since`, read from the dwctl clock before the count). A batch released earlier
+/// than `since` was committed before the count and is in it; one released later is
+/// counted via its reservation — possibly by both reads, which only errs towards
+/// **under-acceptance**. The same rule makes a cached count of any age sound.
 ///
-/// Because pending rows are read **first** (outside the lock) and reservations
-/// **second** (inside it), a batch swapping between the two reads would naively appear
-/// in **neither** — it wasn't committed when the rows were counted, and it was already
-/// released when the reservations were summed. To make the race fail-safe, the
-/// reservation read also counts reservations *released at or after* the instant the
-/// pending snapshot was taken (`released_since`). That instant is read from the dwctl
-/// database, so it shares a clock with `released_at`, and it is read before the pending
-/// snapshot, so any reservation released earlier than it belongs to a batch whose rows
-/// were already committed and therefore counted by the snapshot.
-///
-/// A batch that swaps during the window is then counted via its recently released
-/// reservation — and, if it committed just before the snapshot, possibly by both reads.
-/// That double count is a conservative over-estimate of load that leads to
-/// **under-acceptance** rather than over-acceptance.
-///
-/// In short: the race is an inherent consequence of reading across two independent
-/// connections, but the released-since rule ensures it always errs on the side of caution.
 /// Thin wrapper around the shared `reserve_capacity` for the API handler context.
 /// Converts `CapacityError` to the API's `Error` type.
 async fn reserve_capacity_for_batch<P: PoolProvider>(
@@ -1172,31 +1165,64 @@ async fn reserve_capacity_for_batch<P: PoolProvider>(
     model_ids_by_alias: &HashMap<String, Uuid>,
     relaxation_factor: f32,
 ) -> Result<Vec<Uuid>> {
-    use super::sla_capacity::{CapacityError, CapacityReservationInput, reserve_capacity};
+    use super::sla_capacity::{CapacityError, CapacityReservationInput, admission_windows, reserve_capacity};
 
     let config = state.current_config();
-    let input = CapacityReservationInput {
+    let windows = admission_windows(&config.batches, completion_window, relaxation_factor);
+    let input = CapacityReservationInput::from_config(
+        &config.batches,
         completion_window,
+        &windows,
         file_model_counts,
         model_throughputs,
         model_ids_by_alias,
-        default_throughput: config.batches.default_throughput,
-        relaxation_factor,
-        reservation_ttl_secs: config.batches.reservation_ttl_secs,
-        include_pending_counts: config.batches.pending_capacity_counts_enabled,
-    };
+    );
 
     // Use the write pool for the reservation transaction
     let pool = state.db.write();
-    reserve_capacity(&pool, &*state.request_manager, &input).await.map_err(|e| match e {
-        CapacityError::InsufficientCapacity { completion_window, models } => Error::TooManyRequests {
-            message: format!(
-                "Insufficient capacity for {} completion window. The following models are currently at capacity: {}. Try again later or use a longer completion window.",
-                completion_window, models
-            ),
+    let reserved = reserve_capacity(&pool, &*state.request_manager, Some(&state.admission_demand_cache), &input).await;
+    reserved.map_err(|e| match e {
+        CapacityError::InsufficientCapacity {
+            completion_window,
+            full_windows,
+        } => Error::TooManyRequests {
+            message: capacity_rejection_message(&completion_window, &full_windows),
         },
         CapacityError::Internal(msg) => Error::Internal { operation: msg },
     })
+}
+
+/// The 429 message for a capacity rejection. Each model is named under the
+/// window it is at capacity for, so a model that only fails the requested
+/// window is not reported against a longer one (or vice versa).
+fn capacity_rejection_message(completion_window: &str, full_windows: &[super::sla_capacity::FullWindow]) -> String {
+    if let [only] = full_windows
+        && only.window == completion_window
+    {
+        return format!(
+            "Insufficient capacity for {completion_window} completion window. The following models are currently at capacity: {}. Try again later or use a longer completion window.",
+            only.models.join(", ")
+        );
+    }
+    let parts: Vec<String> = full_windows
+        .iter()
+        .rev()
+        .map(|fw| {
+            let models = fw.models.join(", ");
+            if fw.window == completion_window {
+                format!("at capacity for the {} completion window: {models}", fw.window)
+            } else {
+                format!(
+                    "at capacity for the {} completion window, which shorter-window batches also use: {models}",
+                    fw.window
+                )
+            }
+        })
+        .collect();
+    format!(
+        "Insufficient capacity for {completion_window} completion window: the following models are {}. Try again later.",
+        parts.join("; and ")
+    )
 }
 
 async fn release_capacity_reservations<P: PoolProvider>(state: &AppState<P>, reservation_ids: &[Uuid]) -> Result<()> {
@@ -4205,9 +4231,10 @@ mod tests {
 
     #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn test_reserve_capacity_for_batch_ignores_flex_pending_counts_when_enabled(pool: PgPool) {
+    async fn test_reserve_capacity_for_batch_counts_one_hour_batch_rows_when_enabled(pool: PgPool) {
         let mut config = create_test_config();
         config.batches.pending_capacity_counts_enabled = true;
+        config.batches.allowed_completion_windows = vec!["1h".to_string(), "24h".to_string()];
         let state = create_test_app_state_with_fusillade(pool.clone(), config).await;
 
         let user = create_test_user(&pool, Role::StandardUser).await;
@@ -4216,19 +4243,428 @@ mod tests {
         let alias = format!("alias-{}", Uuid::new_v4());
         let model_id = create_test_model(&pool, "model-a", &alias, endpoint_id, user.id).await;
 
-        // Fusillade maps a 1h completion window to service_tier = 'flex'.
+        // Fusillade stores a 1h batch's rows with service_tier = 'flex'. They are
+        // admitted batch work and must count against the 1h window.
         seed_pending_capacity_batch(&state, &alias, "1h").await;
 
         let file_model_counts = HashMap::from([(alias.clone(), 1_i64)]);
+        // 1h capacity = floor(0.001 × 3600) = 3, already used by the 3 pending rows.
         let model_throughputs = HashMap::from([(alias.clone(), 0.001_f32)]);
         let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
 
-        let reservation_ids =
-            super::reserve_capacity_for_batch(&state, "1h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 1.0)
-                .await
-                .expect("flex pending counts should be ignored for batch capacity");
+        let err = super::reserve_capacity_for_batch(&state, "1h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 1.0)
+            .await
+            .expect_err("1h batch rows must count against the 1h window");
+        assert!(matches!(err, Error::TooManyRequests { .. }));
 
+        // 24h capacity = floor(0.001 × 86400) = 86: room for one more.
+        let reservation_ids =
+            super::reserve_capacity_for_batch(&state, "24h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 1.0)
+                .await
+                .expect("24h window has room");
         assert_eq!(reservation_ids.len(), 1);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_reserve_capacity_for_batch_counts_one_hour_rows_against_24h_window(pool: PgPool) {
+        let mut config = create_test_config();
+        config.batches.pending_capacity_counts_enabled = true;
+        config.batches.allowed_completion_windows = vec!["1h".to_string(), "24h".to_string()];
+        let state = create_test_app_state_with_fusillade(pool.clone(), config).await;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let endpoint_id = create_test_endpoint(&pool, &format!("test-{}", Uuid::new_v4()), user.id).await;
+        let alias = format!("alias-{}", Uuid::new_v4());
+        let model_id = create_test_model(&pool, "model-a", &alias, endpoint_id, user.id).await;
+
+        // 3 rows due within the hour also consume 24h capacity.
+        seed_pending_capacity_batch(&state, &alias, "1h").await;
+
+        // 24h capacity = floor(3.5 / 86400 × 86400) = 3.
+        let file_model_counts = HashMap::from([(alias.clone(), 1_i64)]);
+        let model_throughputs = HashMap::from([(alias.clone(), 3.5_f32 / 86_400.0)]);
+        let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
+
+        let err = super::reserve_capacity_for_batch(&state, "24h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 1.0)
+            .await
+            .expect_err("work due within 1h consumes 24h capacity");
+        assert!(matches!(err, Error::TooManyRequests { .. }));
+    }
+
+    /// A batch whose record exists but whose rows the background population job
+    /// has not inserted yet is still admitted work: it counts by its templates.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_reserve_capacity_for_batch_counts_unpopulated_batches_when_enabled(pool: PgPool) {
+        let mut config = create_test_config();
+        config.batches.pending_capacity_counts_enabled = true;
+        let state = create_test_app_state_with_fusillade(pool.clone(), config).await;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let endpoint_id = create_test_endpoint(&pool, &format!("test-{}", Uuid::new_v4()), user.id).await;
+        let alias = format!("alias-{}", Uuid::new_v4());
+        let model_id = create_test_model(&pool, "model-a", &alias, endpoint_id, user.id).await;
+
+        let file_id = state
+            .request_manager
+            .create_file("unpopulated-capacity-test".to_string(), None, capacity_templates(&alias, 3))
+            .await
+            .expect("create file");
+        let batch = state
+            .request_manager
+            .create_batch_record(fusillade::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: Some(3),
+            })
+            .await
+            .expect("create batch record without populating it");
+
+        let file_model_counts = HashMap::from([(alias.clone(), 1_i64)]);
+        let model_throughputs = HashMap::from([(alias.clone(), 3.5_f32 / 86_400.0)]); // 24h capacity 3
+        let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
+
+        let err = super::reserve_capacity_for_batch(&state, "24h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 1.0)
+            .await
+            .expect_err("an unpopulated batch's templates must count");
+        assert!(matches!(err, Error::TooManyRequests { .. }));
+
+        // Populating swaps templates for rows without changing the count.
+        state
+            .request_manager
+            .populate_batch(batch.id, file_id)
+            .await
+            .expect("populate batch");
+        let mut tx = state.request_manager.begin_write().await.unwrap();
+        let counts = crate::db::handlers::BatchAdmissionDemand::new(&mut tx)
+            .outstanding_by_model_and_window(std::slice::from_ref(&alias), &[("24h".to_string(), 86_400)], 10_000)
+            .await
+            .unwrap();
+        assert_eq!(counts[&alias]["24h"], 3);
+    }
+
+    /// An unpopulated batch past its deadline is still populated and served
+    /// (overdue rows are claimed first), so its templates keep counting against
+    /// every window. Only one stuck a whole longest window past its deadline
+    /// stops counting.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_outstanding_counts_overdue_unpopulated_batches(pool: PgPool) {
+        let mut config = create_test_config();
+        config.batches.pending_capacity_counts_enabled = true;
+        let state = create_test_app_state_with_fusillade(pool.clone(), config).await;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let endpoint_id = create_test_endpoint(&pool, &format!("test-{}", Uuid::new_v4()), user.id).await;
+        let alias = format!("alias-{}", Uuid::new_v4());
+        create_test_model(&pool, "model-a", &alias, endpoint_id, user.id).await;
+
+        let file_id = state
+            .request_manager
+            .create_file("overdue-unpopulated-test".to_string(), None, capacity_templates(&alias, 3))
+            .await
+            .expect("create file");
+        let batch = state
+            .request_manager
+            .create_batch_record(fusillade::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: Some(3),
+            })
+            .await
+            .expect("create batch record without populating it");
+
+        let windows = [("1h".to_string(), 3_600_i64), ("24h".to_string(), 86_400_i64)];
+        let count = |state: &crate::AppState<TestDbPools>| {
+            let alias = alias.clone();
+            let windows = windows.clone();
+            let request_manager = state.request_manager.clone();
+            async move {
+                let mut tx = request_manager.begin_write().await.unwrap();
+                crate::db::handlers::BatchAdmissionDemand::new(&mut tx)
+                    .outstanding_by_model_and_window(std::slice::from_ref(&alias), &windows, 10_000)
+                    .await
+                    .unwrap()
+                    .remove(&alias)
+                    .unwrap_or_default()
+            }
+        };
+
+        // Overdue by a minute: counted in every window.
+        let mut tx = state.request_manager.begin_write().await.unwrap();
+        sqlx::query("UPDATE batches SET expires_at = NOW() - INTERVAL '1 minute' WHERE id = $1")
+            .bind(*batch.id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let counts = count(&state).await;
+        assert_eq!(counts.get("1h"), Some(&3), "overdue unpopulated work counts: {counts:?}");
+        assert_eq!(counts.get("24h"), Some(&3), "overdue unpopulated work counts: {counts:?}");
+
+        // Stuck for longer than the longest window past its deadline: dropped.
+        let mut tx = state.request_manager.begin_write().await.unwrap();
+        sqlx::query("UPDATE batches SET expires_at = NOW() - INTERVAL '25 hours' WHERE id = $1")
+            .bind(*batch.id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let counts = count(&state).await;
+        assert!(counts.is_empty(), "a long-stuck unpopulated batch stops counting: {counts:?}");
+    }
+
+    /// A 1h submission also has to fit in every longer window: with the 24h
+    /// window closed (relaxation 0), a 1h batch is rejected even though the 1h
+    /// window itself has room.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_reserve_capacity_checks_longer_windows(pool: PgPool) {
+        let mut config = create_test_config();
+        config.batches.allowed_completion_windows = vec!["1h".to_string(), "24h".to_string()];
+        config.batches.window_relaxation_factors = HashMap::from([("24h".to_string(), 0.0)]);
+        let state = create_test_app_state_with_fusillade(pool.clone(), config).await;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let endpoint_id = create_test_endpoint(&pool, &format!("test-{}", Uuid::new_v4()), user.id).await;
+        let alias = format!("alias-{}", Uuid::new_v4());
+        let model_id = create_test_model(&pool, "model-a", &alias, endpoint_id, user.id).await;
+
+        let file_model_counts = HashMap::from([(alias.clone(), 1_i64)]);
+        let model_throughputs = HashMap::from([(alias.clone(), 1000.0_f32)]);
+        let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
+
+        let err = super::reserve_capacity_for_batch(&state, "1h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 1.0)
+            .await
+            .expect_err("a 1h batch must also fit the 24h window");
+        // The response names the window that is actually full.
+        let Error::TooManyRequests { message } = err else {
+            panic!("expected TooManyRequests, got {err:?}");
+        };
+        assert!(
+            message.contains("at capacity for the 24h completion window"),
+            "message should name the full 24h window: {message}"
+        );
+    }
+
+    /// Models that fail different windows are each reported against their own
+    /// window: a model that only overflows the requested 1h window must not be
+    /// reported as at capacity for 24h, and vice versa.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_reserve_capacity_reports_each_model_against_its_full_window(pool: PgPool) {
+        let mut config = create_test_config();
+        config.batches.allowed_completion_windows = vec!["1h".to_string(), "24h".to_string()];
+        let state = create_test_app_state_with_fusillade(pool.clone(), config).await;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let endpoint_id = create_test_endpoint(&pool, &format!("test-{}", Uuid::new_v4()), user.id).await;
+        let alias_a = format!("alias-a-{}", Uuid::new_v4());
+        let alias_b = format!("alias-b-{}", Uuid::new_v4());
+        let model_a = create_test_model(&pool, "model-a", &alias_a, endpoint_id, user.id).await;
+        let model_b = create_test_model(&pool, "model-b", &alias_b, endpoint_id, user.id).await;
+
+        // A: 1h capacity 3, 24h capacity 86. B: 1h capacity 3600, 24h capacity 86400.
+        let model_throughputs = HashMap::from([(alias_a.clone(), 0.001_f32), (alias_b.clone(), 1.0_f32)]);
+        let model_ids_by_alias = HashMap::from([(alias_a.clone(), model_a), (alias_b.clone(), model_b)]);
+
+        // Fill B's 24h window to within 5 requests.
+        super::reserve_capacity_for_batch(
+            &state,
+            "24h",
+            &HashMap::from([(alias_b.clone(), 86_395_i64)]),
+            &model_throughputs,
+            &model_ids_by_alias,
+            1.0,
+        )
+        .await
+        .expect("24h reservation for B fits");
+
+        // 10 each in 1h: A overflows only 1h, B overflows only 24h.
+        let err = super::reserve_capacity_for_batch(
+            &state,
+            "1h",
+            &HashMap::from([(alias_a.clone(), 10_i64), (alias_b.clone(), 10_i64)]),
+            &model_throughputs,
+            &model_ids_by_alias,
+            1.0,
+        )
+        .await
+        .expect_err("both models are over capacity in some window");
+        let Error::TooManyRequests { message } = err else {
+            panic!("expected TooManyRequests, got {err:?}");
+        };
+        assert!(
+            message.contains(&format!("at capacity for the 1h completion window: {alias_a}")),
+            "A is reported against 1h: {message}"
+        );
+        assert!(
+            message.contains(&format!("which shorter-window batches also use: {alias_b}")),
+            "B is reported against 24h: {message}"
+        );
+        assert!(
+            !message.contains(&format!("{alias_a}, {alias_b}")) && !message.contains(&format!("{alias_b}, {alias_a}")),
+            "the models are not merged under one window: {message}"
+        );
+    }
+
+    #[test]
+    fn test_capacity_rejection_message_single_requested_window() {
+        let message = super::capacity_rejection_message(
+            "24h",
+            &[crate::api::handlers::sla_capacity::FullWindow {
+                window: "24h".to_string(),
+                models: vec!["a".to_string(), "b".to_string()],
+            }],
+        );
+        assert_eq!(
+            message,
+            "Insufficient capacity for 24h completion window. The following models are currently at capacity: a, b. Try again later or use a longer completion window."
+        );
+    }
+
+    /// Active 1h reservations count against a 24h admission (and not vice versa).
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_reserve_capacity_counts_shorter_window_reservations(pool: PgPool) {
+        let mut config = create_test_config();
+        config.batches.allowed_completion_windows = vec!["1h".to_string(), "24h".to_string()];
+        let state = create_test_app_state_with_fusillade(pool.clone(), config).await;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let endpoint_id = create_test_endpoint(&pool, &format!("test-{}", Uuid::new_v4()), user.id).await;
+        let alias = format!("alias-{}", Uuid::new_v4());
+        let model_id = create_test_model(&pool, "model-a", &alias, endpoint_id, user.id).await;
+
+        // 1h capacity = floor(0.001 × 3600) = 3; 24h capacity = 86.
+        let model_throughputs = HashMap::from([(alias.clone(), 0.001_f32)]);
+        let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
+
+        let one_hour = super::reserve_capacity_for_batch(
+            &state,
+            "1h",
+            &HashMap::from([(alias.clone(), 3_i64)]),
+            &model_throughputs,
+            &model_ids_by_alias,
+            1.0,
+        )
+        .await
+        .expect("1h batch fits");
+        assert_eq!(one_hour.len(), 1);
+
+        // 3 reserved (1h) + 84 > 86.
+        let err = super::reserve_capacity_for_batch(
+            &state,
+            "24h",
+            &HashMap::from([(alias.clone(), 84_i64)]),
+            &model_throughputs,
+            &model_ids_by_alias,
+            1.0,
+        )
+        .await
+        .expect_err("1h reservation consumes 24h capacity");
+        assert!(matches!(err, Error::TooManyRequests { .. }));
+
+        // 3 reserved (1h) + 83 = 86 fits.
+        super::reserve_capacity_for_batch(
+            &state,
+            "24h",
+            &HashMap::from([(alias.clone(), 83_i64)]),
+            &model_throughputs,
+            &model_ids_by_alias,
+            1.0,
+        )
+        .await
+        .expect("fits exactly");
+    }
+
+    /// The per-replica outstanding-work cache stays sound: a batch admitted
+    /// after the snapshot was taken is counted through its released reservation.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_reserve_capacity_cached_snapshot_counts_batches_admitted_since(pool: PgPool) {
+        let mut config = create_test_config();
+        config.batches.pending_capacity_counts_enabled = true;
+        config.batches.pending_capacity_counts_max_age_secs = 3600;
+        let state = create_test_app_state_with_fusillade(pool.clone(), config).await;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let endpoint_id = create_test_endpoint(&pool, &format!("test-{}", Uuid::new_v4()), user.id).await;
+        let alias = format!("alias-{}", Uuid::new_v4());
+        let model_id = create_test_model(&pool, "model-a", &alias, endpoint_id, user.id).await;
+
+        let file_model_counts = HashMap::from([(alias.clone(), 2_i64)]);
+        let model_throughputs = HashMap::from([(alias.clone(), 3.5_f32 / 86_400.0)]); // 24h capacity 3
+        let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
+
+        // First admission takes (and caches) a snapshot with nothing outstanding.
+        let first = super::reserve_capacity_for_batch(&state, "24h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 1.0)
+            .await
+            .expect("first batch fits");
+        // Its handler returns: the reservation is released. (The batch record is
+        // deliberately not created, so only the released reservation can carry it.)
+        super::release_capacity_reservations(&state, &first).await.unwrap();
+
+        // The cached snapshot predates the release, so the released reservation
+        // is still counted: 2 + 2 > 3.
+        let err = super::reserve_capacity_for_batch(&state, "24h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 1.0)
+            .await
+            .expect_err("work admitted after the cached snapshot must still count");
+        assert!(matches!(err, Error::TooManyRequests { .. }));
+    }
+
+    /// With caching disabled each admission counts afresh, and a reservation
+    /// released before that count is no longer included.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_reserve_capacity_uncached_count_drops_reservations_released_before_it(pool: PgPool) {
+        let mut config = create_test_config();
+        config.batches.pending_capacity_counts_enabled = true;
+        config.batches.pending_capacity_counts_max_age_secs = 0;
+        let state = create_test_app_state_with_fusillade(pool.clone(), config).await;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let endpoint_id = create_test_endpoint(&pool, &format!("test-{}", Uuid::new_v4()), user.id).await;
+        let alias = format!("alias-{}", Uuid::new_v4());
+        let model_id = create_test_model(&pool, "model-a", &alias, endpoint_id, user.id).await;
+
+        let file_model_counts = HashMap::from([(alias.clone(), 2_i64)]);
+        let model_throughputs = HashMap::from([(alias.clone(), 3.5_f32 / 86_400.0)]); // 24h capacity 3
+        let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
+
+        let first = super::reserve_capacity_for_batch(&state, "24h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 1.0)
+            .await
+            .expect("first batch fits");
+        super::release_capacity_reservations(&state, &first).await.unwrap();
+
+        super::reserve_capacity_for_batch(&state, "24h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 1.0)
+            .await
+            .expect("a fresh count supersedes reservations released before it");
+    }
+
+    fn capacity_templates(alias: &str, n: usize) -> Vec<fusillade::RequestTemplateInput> {
+        (0..n)
+            .map(|idx| fusillade::RequestTemplateInput {
+                custom_id: Some(format!("capacity-{idx}")),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/chat/completions".to_string(),
+                body: format!(r#"{{"model":"{alias}","messages":[{{"role":"user","content":"hello"}}]}}"#),
+                model: alias.to_string(),
+                api_key: "key".to_string(),
+            })
+            .collect()
     }
 
     /// Test that create_batch API accepts "high" priority name
@@ -4720,6 +5156,61 @@ mod tests {
             .add_header(&auth[0].0, &auth[0].1)
             .add_header(&auth[1].0, &auth[1].1)
             .await
+    }
+
+    /// Back-to-back submissions through the API must add up: once a batch's
+    /// handler has returned (releasing its reservation) the batch itself still
+    /// holds the model's window capacity, whether or not its rows have been
+    /// inserted yet. With outstanding-work counting off, admission is per batch.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_create_batch_window_capacity_accumulates_across_batches(pool: PgPool) {
+        let third = submit_three_one_request_batches(&pool, true).await;
+        third.assert_status(StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_create_batch_window_capacity_is_per_batch_without_counts(pool: PgPool) {
+        let third = submit_three_one_request_batches(&pool, false).await;
+        third.assert_status(StatusCode::CREATED);
+    }
+
+    /// Submit two one-request 24h batches into a 24h capacity of 2 (both must be
+    /// accepted) and return the response to a third.
+    async fn submit_three_one_request_batches(pool: &PgPool, counts_enabled: bool) -> axum_test::TestResponse {
+        let mut config = create_test_config();
+        config.batches.allowed_completion_windows = vec!["24h".to_string()];
+        // 24h capacity = floor(2.5 / 86400 × 86400) = 2 requests.
+        config.batches.default_throughput = 2.5 / 86_400.0;
+        config.batches.pending_capacity_counts_enabled = counts_enabled;
+
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let user = setup_batch_user(pool).await;
+
+        for _ in 0..2 {
+            submit_one_request_batch(&app, &user, "24h")
+                .await
+                .assert_status(StatusCode::CREATED);
+        }
+        // The handler releases its reservation in a spawned task after it
+        // returns; wait for both, so the third submission sees only the batches.
+        wait_for_reservations_released(pool).await;
+        submit_one_request_batch(&app, &user, "24h").await
+    }
+
+    async fn wait_for_reservations_released(pool: &PgPool) {
+        for _ in 0..200 {
+            let unreleased: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM batch_capacity_reservations WHERE released_at IS NULL")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            if unreleased == 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("capacity reservations were not released within 5s");
     }
 
     #[dwctl_test_macros::test]

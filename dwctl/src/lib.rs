@@ -327,6 +327,9 @@ where
     /// Encrypted key custody, built from `config.keystore`. `None` means it is
     /// not configured (ZDR flex disabled).
     pub keystore: Option<crate::keystore::Keystore>,
+    /// Per-replica cache of outstanding batch work used by batch admission.
+    #[builder(default)]
+    pub admission_demand_cache: crate::api::handlers::sla_capacity::AdmissionDemandCache,
 }
 
 impl<P> AppState<P>
@@ -4201,11 +4204,21 @@ impl Application {
                 .await?;
         }
         let request_manager = Arc::new(request_manager);
-        let postgres_daemon = Arc::new(
-            fusillade::PostgresDaemon::from_store(request_manager.clone(), fusillade_daemon_config.clone())
-                .with_retention_maintenance(retention_maintenance_config)
-                .with_leak_config(config.background_services.batch_daemon.leak.clone()),
-        );
+        let mut postgres_daemon = fusillade::PostgresDaemon::from_store(request_manager.clone(), fusillade_daemon_config.clone())
+            .with_retention_maintenance(retention_maintenance_config)
+            .with_leak_config(config.background_services.batch_daemon.leak.clone());
+        if let Some(tolerations) = &config.background_services.batch_daemon.dispatch_tolerations {
+            postgres_daemon = postgres_daemon.with_dispatch_tolerations(tolerations.clone());
+        }
+        if let Some(sla_release) = config
+            .background_services
+            .batch_daemon
+            .dispatch_tolerations_sla_release
+            .to_fusillade()
+        {
+            postgres_daemon = postgres_daemon.with_sla_release(sla_release);
+        }
+        let postgres_daemon = Arc::new(postgres_daemon);
         // Build the ZDR keystore once and share it across the response store, the
         // daemon processor, and background services (which install the response
         // transformer). A misconfiguration is fatal.

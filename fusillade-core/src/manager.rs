@@ -1728,6 +1728,31 @@ pub trait DaemonStorage: Send + Sync {
     /// the daemon purge task for right-to-erasure compliance.
     async fn purge_orphaned_rows(&self, batch_size: i64) -> Result<u64>;
 
+    /// Tell the storage how the claim decides scheduling tolerations. Claims
+    /// that decide (the batch and batchless claim queries) then return a
+    /// [`crate::request::DispatchTolerations`] per row and record it as
+    /// `dispatched_tolerated`. The default storage makes no decision.
+    fn configure_tolerations_release(&self, _settings: crate::release::TolerationsReleaseSettings) {
+    }
+
+    /// Compute every model's release cutoff, if this daemon is the one to do
+    /// it: exactly one daemon computes per refresh interval (the first to
+    /// tick once the newest cutoff is older than the interval, serialised by
+    /// a lock). Returns `None` when another daemon holds the lock or the
+    /// cutoffs are fresh; otherwise the cutoffs written. The default storage
+    /// computes nothing.
+    async fn refresh_release_cutoffs(
+        &self,
+        _params: crate::release::ReleaseCutoffParams,
+    ) -> Result<Option<Vec<crate::release::ReleaseCutoff>>> {
+        Ok(None)
+    }
+
+    /// Every model's stored release cutoff: its age, throughput and backlog.
+    async fn release_cutoff_status(&self) -> Result<Vec<crate::release::ReleaseCutoffStatus>> {
+        Ok(Vec::new())
+    }
+
     /// Whether this backend explicitly implements the partitioned retained
     /// response lifecycle. Backends must opt in; the default keeps movement
     /// and retirement unavailable.

@@ -7,6 +7,7 @@ pub mod batch;
 pub mod daemon_record;
 pub mod error;
 pub mod manager;
+pub mod release;
 pub mod request;
 
 pub use batch::*;

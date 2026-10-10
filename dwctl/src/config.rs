@@ -1741,11 +1741,37 @@ pub struct BatchConfig {
     /// Default: 1000.
     pub unverified_requests_per_completion_hour: usize,
 
-    /// Include committed pending/claimed/processing requests in batch admission capacity checks.
-    /// When false, admission capacity checks only include active in-flight reservations.
+    /// Count work already admitted and not yet finished in batch admission capacity checks.
+    ///
+    /// When true, admitting a batch for window `W` checks, for `W` and every longer allowed
+    /// window, that the model's outstanding batch requests due within that window (pending,
+    /// claimed or processing rows of active batches, plus the template count of batches whose
+    /// rows have not been inserted yet), plus in-flight reservations, plus the new batch, fit in
+    /// `throughput × window × relaxation`. When false, admission only counts active in-flight
+    /// reservations, which makes the check effectively per batch.
     /// Default: false.
     #[serde(default)]
     pub pending_capacity_counts_enabled: bool,
+
+    /// Maximum age, in seconds, of a per-replica cached outstanding-work snapshot used by
+    /// batch admission when `pending_capacity_counts_enabled` is set.
+    ///
+    /// The count is proportional to a model's outstanding backlog, so it is refreshed at most
+    /// once per model per this interval per replica instead of on every submission. Using a
+    /// snapshot is safe at any age: reservations released after the snapshot was taken are
+    /// added back, so batches admitted since are still counted; a stale snapshot only
+    /// over-counts work that has completed since (under-acceptance). The effective age is
+    /// capped at half of `reservation_ttl_secs`, so a reservation its handler never released
+    /// is still counted while any snapshot taken before it is in use. `0` disables the cache
+    /// and counts on every submission. Default: 10.
+    pub pending_capacity_counts_max_age_secs: u64,
+
+    /// Statement timeout, in milliseconds, for the admission outstanding-work count. On
+    /// timeout or error admission falls back to the last usable snapshot, or to reservations
+    /// only (fail open). Must be positive (> 0): a zero timeout would fail every count and
+    /// silently turn the check off. Default: 10000.
+    #[serde(deserialize_with = "deserialize_positive_timeout_ms")]
+    pub pending_capacity_counts_timeout_ms: u64,
 }
 
 /// Configuration for the async requests feature.
@@ -1829,6 +1855,19 @@ where
     }
 }
 
+fn deserialize_positive_timeout_ms<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let value = u64::deserialize(deserializer)?;
+    if value == 0 {
+        return Err(D::Error::custom("pending_capacity_counts_timeout_ms must be positive (> 0), got 0"));
+    }
+    Ok(value)
+}
+
 /// Custom deserializer that validates throughput is positive, with null/missing defaulting to 100.0
 fn deserialize_positive_throughput<'de, D>(deserializer: D) -> Result<f32, D::Error>
 where
@@ -1868,6 +1907,8 @@ impl Default for BatchConfig {
             reservation_ttl_secs: default_reservation_ttl_secs(),
             unverified_requests_per_completion_hour: 1000,
             pending_capacity_counts_enabled: false,
+            pending_capacity_counts_max_age_secs: 10,
+            pending_capacity_counts_timeout_ms: 10_000,
         }
     }
 }
@@ -2222,6 +2263,35 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub inject_deadline_priority: bool,
 
+    /// Tolerations the daemon writes to `nvext.routing_constraints.tolerations`
+    /// on every request it dispatches (batch, flex and background), replacing
+    /// any value in the body. They are Kubernetes-style scheduling/routing
+    /// tolerations understood by the upstream inference backend; a backend
+    /// may, for example, use them to keep batch work off capacity reserved for
+    /// other traffic, so the request waits and is retried instead.
+    /// Unset (the default) injects nothing and leaves bodies byte-identical.
+    /// Independent of `inject_deadline_priority`.
+    ///
+    /// Near SLA failure the daemon stops sending them: close to its deadline,
+    /// meeting the SLA matters more than where the request runs. A request within the
+    /// batch-claim deadline ramp (`claim_ramp_exponent`: `window_minutes ^
+    /// exponent` minutes before its deadline, about 59 min for 24h and 10 min
+    /// for 1h at 0.56), or already past its deadline, is sent without the field
+    /// and the backend may schedule it anywhere. Work without a
+    /// deadline (background) always carries them. Counted by
+    /// `fusillade_tolerations_released_total{model}`.
+    ///
+    /// The backend must accept `routing_constraints.tolerations`; one that
+    /// does not may reject the request.
+    #[serde(default)]
+    pub dispatch_tolerations: Option<Vec<fusillade::daemon::Toleration>>,
+
+    /// Release a request's `dispatch_tolerations` early when it is projected
+    /// to miss its SLA with them, not only inside the deadline ramp.
+    /// Off by default (ramp-only). See [`DispatchTolerationsSlaRelease`].
+    #[serde(default)]
+    pub dispatch_tolerations_sla_release: DispatchTolerationsSlaRelease,
+
     /// Database-wide per-model ceiling below which no-SLA background work may
     /// be claimed. Zero disables background processing while leaving
     /// submission and inspection available. Background processing also
@@ -2502,6 +2572,79 @@ fn default_batch_metadata_fields_dwctl() -> Vec<String> {
     ]
 }
 
+/// Release of `dispatch_tolerations` on an SLA projection.
+///
+/// One daemon per `refresh_interval_secs` (whichever ticks first once the
+/// cutoffs are stale, serialised by a transaction-scoped advisory lock)
+/// computes, per model, the deadline before which requests are projected to
+/// miss their SLA while keeping their tolerations, and stores it in
+/// `model_release_cutoffs`. The claim query releases the tolerations of a
+/// request due before its model's cutoff, so every replica decides alike.
+///
+/// Throughput comes from the `requests` table: successful completions of
+/// requests dispatched WITH the tolerations (`dispatched_tolerated`; released
+/// ones may have run on other capacity and would inflate it) in the last `window_secs`,
+/// `count / sum(completed_at - started_at)` times the deployment-wide
+/// in-flight count. The cutoff is the shortest deadline-ordered prefix whose
+/// release lets everything due later finish within `(1 - safety_margin)` of
+/// its remaining time. When a request would miss its SLA, meeting the deadline
+/// matters more than where it runs. The deadline ramp and past-deadline release always
+/// apply; a model with fewer than `min_samples` tolerated completions in the
+/// window, or a cutoff older than three refresh intervals, gets only them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DispatchTolerationsSlaRelease {
+    /// Off by default: ramp-only release.
+    pub enabled: bool,
+    /// How often the cutoffs are recomputed, in seconds. Default 300.
+    pub refresh_interval_secs: u64,
+    /// Trailing window of tolerated completions, in seconds. Default 900.
+    pub window_secs: u64,
+    /// Fraction of each deadline's remaining time kept as margin. Default 0.1.
+    pub safety_margin: f64,
+    /// Tolerated completions per model in the window before it gets a
+    /// cutoff. Default 20.
+    pub min_samples: u64,
+}
+
+impl Default for DispatchTolerationsSlaRelease {
+    fn default() -> Self {
+        let defaults = fusillade::daemon::SlaReleaseConfig::default();
+        Self {
+            enabled: false,
+            refresh_interval_secs: defaults.refresh_interval_secs,
+            window_secs: defaults.window_secs,
+            safety_margin: defaults.safety_margin,
+            min_samples: defaults.min_samples,
+        }
+    }
+}
+
+impl DispatchTolerationsSlaRelease {
+    /// `safety_margin` is a fraction of the remaining time: outside `[0, 1)`
+    /// it would silently release nearly every deadline (above 1) or drop the
+    /// margin (below 0), so it is rejected rather than clamped.
+    pub fn validate(&self) -> Result<(), String> {
+        if !(self.safety_margin.is_finite() && (0.0..1.0).contains(&self.safety_margin)) {
+            return Err(format!(
+                "safety_margin must be a finite fraction in [0, 1), got {}",
+                self.safety_margin
+            ));
+        }
+        Ok(())
+    }
+
+    /// The fusillade config, when enabled.
+    pub fn to_fusillade(&self) -> Option<fusillade::daemon::SlaReleaseConfig> {
+        self.enabled.then_some(fusillade::daemon::SlaReleaseConfig {
+            refresh_interval_secs: self.refresh_interval_secs,
+            window_secs: self.window_secs,
+            safety_margin: self.safety_margin,
+            min_samples: self.min_samples,
+        })
+    }
+}
+
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
@@ -2554,6 +2697,8 @@ impl Default for DaemonConfig {
             streamable_endpoints: Vec::new(),
             urgency_weight: default_urgency_weight(),
             inject_deadline_priority: false,
+            dispatch_tolerations: None,
+            dispatch_tolerations_sla_release: DispatchTolerationsSlaRelease::default(),
             background_concurrency_limit: 0,
             batch_claim_size: 0,
             batch_claim_batch_size: default_batch_claim_batch_size(),
@@ -3598,6 +3743,11 @@ impl Config {
         if let Err(error) = self.background_services.batch_daemon.retention.validate() {
             return Err(Error::Internal {
                 operation: format!("Config validation: batch retention is invalid: {error}"),
+            });
+        }
+        if let Err(error) = self.background_services.batch_daemon.dispatch_tolerations_sla_release.validate() {
+            return Err(Error::Internal {
+                operation: format!("Config validation: dispatch_tolerations_sla_release is invalid: {error}"),
             });
         }
         if let Err(error) = self.background_services.task_retention.validate() {
@@ -5313,6 +5463,58 @@ batches:
     }
 
     #[test]
+    fn test_pending_capacity_counts_timeout_zero_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  pending_capacity_counts_timeout_ms: 0
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("pending_capacity_counts_timeout_ms must be positive")
+            );
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_pending_capacity_counts_timeout_explicit_value() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  pending_capacity_counts_timeout_ms: 2500
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+            assert_eq!(config.batches.pending_capacity_counts_timeout_ms, 2500);
+
+            Ok(())
+        });
+    }
+
+    #[test]
     fn test_pending_capacity_counts_default_disabled() {
         let config = Config::default();
         assert!(!config.batches.pending_capacity_counts_enabled);
@@ -5554,6 +5756,96 @@ background_services:
             assert_eq!(fusillade_config.adaptive_growth_factor, 2.0);
             assert_eq!(fusillade_config.adaptive_cut_factor, 0.5);
             assert_eq!(fusillade_config.memory_gate_high_fraction, 0.75);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_dispatch_tolerations_yaml() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: test-secret-key
+background_services:
+  batch_daemon:
+    dispatch_tolerations: []
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+            let daemon = &config.background_services.batch_daemon;
+            assert_eq!(
+                daemon.dispatch_tolerations,
+                Some(vec![]),
+                "[] (tolerate nothing) is not the same as unset"
+            );
+            assert!(!daemon.inject_deadline_priority, "tolerations do not need deadline priority");
+            assert_eq!(
+                daemon.dispatch_tolerations_sla_release.to_fusillade(),
+                None,
+                "the projection is off by default"
+            );
+
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: test-secret-key
+background_services:
+  batch_daemon:
+    dispatch_tolerations: []
+    dispatch_tolerations_sla_release:
+      enabled: true
+      safety_margin: 0.2
+"#,
+            )?;
+            let config = Config::load(&args)?;
+            let sla_release = config
+                .background_services
+                .batch_daemon
+                .dispatch_tolerations_sla_release
+                .to_fusillade()
+                .unwrap();
+            assert_eq!(sla_release.safety_margin, 0.2);
+            assert_eq!(sla_release.refresh_interval_secs, 300);
+            assert_eq!(sla_release.window_secs, 900);
+            assert_eq!(sla_release.min_samples, 20);
+
+            for bad in ["1.5", "-0.1", "1.0", ".nan"] {
+                jail.create_file(
+                    "test.yaml",
+                    &format!(
+                        "secret_key: test-secret-key\nbackground_services:\n  batch_daemon:\n    dispatch_tolerations: []\n    dispatch_tolerations_sla_release:\n      enabled: true\n      safety_margin: {bad}\n"
+                    ),
+                )?;
+                let error = Config::load(&args).expect_err("an out-of-range safety_margin is rejected");
+                assert!(error.to_string().contains("safety_margin"), "{bad}: {error}");
+            }
+
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: test-secret-key
+background_services:
+  batch_daemon:
+    dispatch_tolerations:
+      - key: example.com/reserved
+        effect: PreferNoSchedule
+"#,
+            )?;
+            let config = Config::load(&args)?;
+            let tolerations = config.background_services.batch_daemon.dispatch_tolerations.unwrap();
+            assert_eq!(tolerations.len(), 1);
+            assert_eq!(tolerations[0].key.as_deref(), Some("example.com/reserved"));
+            assert_eq!(tolerations[0].effect, Some(fusillade::daemon::TolerationEffect::PreferNoSchedule));
+
+            jail.create_file("test.yaml", "secret_key: test-secret-key\n")?;
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.dispatch_tolerations, None);
 
             Ok(())
         });

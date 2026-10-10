@@ -1391,6 +1391,14 @@ fn scrub_request_id_fields(value: &mut serde_json::Value) -> bool {
 /// itl_target}`): those are the resolver's to set (onwards writes them after
 /// resolution), never the caller's.
 ///
+/// Also removes the scheduling tolerations (`nvext.routing_constraints.
+/// tolerations`): the upstream inference backend may read them to decide
+/// which capacity a request may be scheduled on, so they are trusted routing
+/// input set only by the fusillade daemon (`dispatch_tolerations`), which,
+/// like the deadline priority, re-enters through the `x-fusillade-request-id`
+/// early return and is never stripped here. Other routing constraints pass
+/// through.
+///
 /// Returns whether anything was removed. Onwards validates and then forwards
 /// the ORIGINAL bytes (COR-522), so a removal only takes effect if the caller
 /// re-serialises the body from the scrubbed value.
@@ -1407,6 +1415,9 @@ pub(crate) fn strip_scheduling_priority(value: &mut serde_json::Value) -> bool {
             scrubbed |= onwards::serving::scrub_router_targets(nvext);
             if let Some(hints) = nvext.get_mut("agent_hints").and_then(|h| h.as_object_mut()) {
                 scrubbed |= hints.shift_remove("priority").is_some();
+            }
+            if let Some(constraints) = nvext.get_mut("routing_constraints").and_then(|c| c.as_object_mut()) {
+                scrubbed |= constraints.shift_remove("tolerations").is_some();
             }
         }
     }
@@ -1519,6 +1530,39 @@ mod tests {
 
         let mut body = serde_json::json!({"model": "m", "nvext": {"cache_control": {"enabled": true}}});
         assert!(!strip_scheduling_priority(&mut body), "nothing to re-serialise for");
+    }
+
+    #[test]
+    fn strip_scheduling_priority_removes_client_tolerations_only() {
+        let mut body = serde_json::json!({
+            "model": "m",
+            "nvext": {
+                "cache_control": {"enabled": true},
+                "routing_constraints": {
+                    "tolerations": [{"operator": "Exists"}],
+                    "required": ["a"],
+                    "preferred": {"b": 1.0}
+                }
+            }
+        });
+        assert!(strip_scheduling_priority(&mut body), "a removal is reported so the body is rebuilt");
+        let constraints = &body["nvext"]["routing_constraints"];
+        assert!(
+            constraints.get("tolerations").is_none(),
+            "a client must not set its own scheduling tolerations"
+        );
+        assert_eq!(constraints["required"], serde_json::json!(["a"]));
+        assert_eq!(constraints["preferred"]["b"], 1.0);
+        assert_eq!(body["nvext"]["cache_control"]["enabled"], true);
+
+        // An empty list is still a client-supplied value.
+        let mut body = serde_json::json!({"model": "m", "nvext": {"routing_constraints": {"tolerations": []}}});
+        assert!(strip_scheduling_priority(&mut body));
+        assert_eq!(body["nvext"]["routing_constraints"], serde_json::json!({}));
+
+        // Other constraints alone: nothing to remove, nothing to rebuild.
+        let mut body = serde_json::json!({"model": "m", "nvext": {"routing_constraints": {"required": ["x"]}}});
+        assert!(!strip_scheduling_priority(&mut body));
     }
 
     #[test]
