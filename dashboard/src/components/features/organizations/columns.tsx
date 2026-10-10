@@ -3,6 +3,7 @@
 import { type ColumnDef } from "@tanstack/react-table";
 import { ArrowUpDown, Edit2, Trash2, Eye, Receipt } from "lucide-react";
 import type { Organization } from "@/api/control-layer/types";
+import { pinBadgeLabel } from "@/utils/schedulingTolerations";
 
 interface OrganizationColumnActions {
   onView: (org: Organization) => void;
@@ -30,9 +31,19 @@ export const createOrganizationColumns = (
       const org = row.original;
       return (
         <div>
-          <p className="font-medium text-doubleword-neutral-900">
-            {org.display_name || org.username}
-          </p>
+          <div className="flex items-center gap-2">
+            <p className="font-medium text-doubleword-neutral-900">
+              {org.display_name || org.username}
+            </p>
+            {pinBadgeLabel(org.pinned_tolerations) && (
+              <span
+                className="text-xs px-2 py-0.5 bg-gray-100 text-gray-700 rounded-full"
+                title="Scheduling restrictions are pinned for this organization"
+              >
+                {pinBadgeLabel(org.pinned_tolerations)}
+              </span>
+            )}
+          </div>
           <p className="text-sm text-doubleword-neutral-500">{org.username}</p>
         </div>
       );

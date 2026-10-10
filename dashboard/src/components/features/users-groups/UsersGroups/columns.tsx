@@ -4,6 +4,7 @@ import { type ColumnDef } from "@tanstack/react-table";
 import { ArrowUpDown, Edit2, Users, Trash2, Receipt } from "lucide-react";
 import { Checkbox, UserAvatar } from "@/components";
 import type { DisplayUser, DisplayGroup } from "@/types/display.ts";
+import { pinBadgeLabel } from "@/utils/schedulingTolerations";
 
 interface UserColumnActions {
   onEdit: (user: DisplayUser) => void;
@@ -87,6 +88,14 @@ export const createUserColumns = (
               {user.isAdmin && (
                 <span className="text-xs px-2 py-0.5 bg-doubleword-primary text-white rounded-full">
                   Admin
+                </span>
+              )}
+              {pinBadgeLabel(user.pinned_tolerations) && (
+                <span
+                  className="text-xs px-2 py-0.5 bg-gray-100 text-gray-700 rounded-full"
+                  title="Scheduling restrictions are pinned for this account"
+                >
+                  {pinBadgeLabel(user.pinned_tolerations)}
                 </span>
               )}
             </div>

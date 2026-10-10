@@ -96,6 +96,10 @@ pub async fn list_users<P: PoolProvider>(
     // Check if user has permission to view billing data (Credits ReadAll)
     let can_view_billing = permissions::has_permission(&current_user, Resource::Credits, Operation::ReadAll);
 
+    // Platform managers see each account's pinned scheduling tolerations in the
+    // list (drives the "dedicated capacity" badge); nobody else does.
+    let can_update_all_users = permissions::can_update_all_resources(&current_user, Resource::Users);
+
     // If includes billing AND user has permission, create balances_map.
     //
     // Both billing facts are fetched together so `include=billing` means the
@@ -133,7 +137,14 @@ pub async fn list_users<P: PoolProvider>(
 
     // Iterate through and enrich users
     for user in users {
-        let mut response_user = UserResponse::from(user);
+        let pinned_tolerations = if can_update_all_users {
+            user.pinned_tolerations
+                .clone()
+                .and_then(|value| serde_json::from_value::<crate::scheduling::PinnedTolerations>(value).ok())
+        } else {
+            None
+        };
+        let mut response_user = UserResponse::from(user).with_pinned_tolerations(pinned_tolerations);
         // If includes groups
         if let Some(groups_map) = &groups_map
             && let Some(user_groups_map) = &user_groups_map
@@ -256,7 +267,19 @@ pub async fn get_user<P: PoolProvider>(
         id: target_user_id.to_string(),
     })?;
 
-    let mut response = UserResponse::from(user);
+    // Pinned scheduling tolerations are an operator's routing decision, so
+    // only platform managers (UpdateAll on users) see them, here as well as on
+    // the PATCH. `UserResponse::from` deliberately drops the field.
+    let can_update_all_users = permissions::can_update_all_resources(&current_user, Resource::Users);
+    let pinned_tolerations = if can_update_all_users {
+        user.pinned_tolerations
+            .clone()
+            .and_then(|value| serde_json::from_value::<crate::scheduling::PinnedTolerations>(value).ok())
+    } else {
+        None
+    };
+
+    let mut response = UserResponse::from(user).with_pinned_tolerations(pinned_tolerations);
 
     // Include billing if requested and permitted
     // Permitted if:
@@ -442,7 +465,8 @@ pub async fn update_user<P: PoolProvider>(
     if !can_update_all_users
         && (user_data.granted_serving_classes.is_some()
             || user_data.default_serving_class.is_some()
-            || user_data.self_hosted_only.is_some())
+            || user_data.self_hosted_only.is_some()
+            || user_data.pinned_tolerations.is_some())
     {
         return Err(Error::InsufficientPermissions {
             required: Permission::Allow(Resource::Users, Operation::UpdateAll),
@@ -457,6 +481,13 @@ pub async fn update_user<P: PoolProvider>(
         for class in classes {
             super::validate_elevated_serving_class(class)?;
         }
+    }
+    // Reject a toleration the request path could not serialise into a valid
+    // body, so a malformed pin fails here rather than on every request later.
+    if let Some(Some(pinned)) = &user_data.pinned_tolerations {
+        pinned.validate().map_err(|error| Error::BadRequest {
+            message: error.to_string(),
+        })?;
     }
 
     // Validate auto-topup fields if provided
@@ -488,7 +519,16 @@ pub async fn update_user<P: PoolProvider>(
     let db_request = UserUpdateDBRequest::new(user_data);
 
     let user = repo.update(user_id, &db_request).await?;
-    Ok(Json(UserResponse::from(user)))
+    // Only a platform manager could have set a pin (the UpdateAll gate above
+    // rejects anyone else), so they are the only caller who sees it back.
+    let pinned_tolerations = if can_update_all_users {
+        user.pinned_tolerations
+            .clone()
+            .and_then(|value| serde_json::from_value::<crate::scheduling::PinnedTolerations>(value).ok())
+    } else {
+        None
+    };
+    Ok(Json(UserResponse::from(user).with_pinned_tolerations(pinned_tolerations)))
 }
 
 // DELETE /user/{user_id} - Delete user (admin only)

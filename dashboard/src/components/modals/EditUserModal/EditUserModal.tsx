@@ -1,7 +1,12 @@
 import React, { useState } from "react";
 import { User, Info } from "lucide-react";
 import { useUpdateUser } from "../../../api/control-layer";
-import type { Role, ServingClassName } from "../../../api/control-layer/types";
+import type {
+  PinnedTolerations,
+  Role,
+  ServingClassName,
+} from "../../../api/control-layer/types";
+import { SchedulingRestrictions } from "../../features/scheduling/SchedulingRestrictions";
 import { AVAILABLE_ROLES, SUBSET_ROLES, getRoleDisplayName } from "../../../utils/roles";
 import {
   Dialog,
@@ -31,6 +36,7 @@ interface EditUserModalProps {
     granted_serving_classes?: ServingClassName[];
     default_serving_class?: ServingClassName | null;
     self_hosted_only?: boolean;
+    pinned_tolerations?: PinnedTolerations | null;
   };
   /** Whether the current user may toggle zero data retention (admins only). */
   canEditZdr?: boolean;
@@ -55,6 +61,8 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
     granted_serving_classes: currentUser.granted_serving_classes ?? [],
     default_serving_class: (currentUser.default_serving_class ?? "standard") as ServingClassName | "standard",
     self_hosted_only: currentUser.self_hosted_only ?? false,
+    // null/absent both mean "not pinned"; the controls model that as null.
+    pinned_tolerations: (currentUser.pinned_tolerations ?? null) as PinnedTolerations | null,
   });
   const [error, setError] = useState<string | null>(null);
 
@@ -85,6 +93,9 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
                     ? null
                     : formData.default_serving_class,
                 self_hosted_only: formData.self_hosted_only,
+                // Scheduling restrictions are platform-manager only too, and
+                // share the serving-settings gate server-side.
+                pinned_tolerations: formData.pinned_tolerations,
               }
             : {}),
         },
@@ -357,6 +368,16 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
                     aria-label="Toggle self-hosted only"
                   />
                 </div>
+                <SchedulingRestrictions
+                  pinned={formData.pinned_tolerations}
+                  canEdit={canEditServing}
+                  onChange={(next) =>
+                    setFormData((prev) => ({
+                      ...prev,
+                      pinned_tolerations: next,
+                    }))
+                  }
+                />
               </div>
             )}
 

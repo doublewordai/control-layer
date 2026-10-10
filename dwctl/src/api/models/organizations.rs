@@ -73,6 +73,14 @@ pub struct OrganizationUpdate {
     /// Omit to leave unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled_modalities: Option<Vec<crate::modalities::Modality>>,
+    /// Account setting: a fixed scheduling toleration list pinned to every
+    /// request from this organization, written to
+    /// `nvext.routing_constraints.tolerations`. `[]` keeps the workspace's
+    /// work off any tainted capacity. Platform managers only (UpdateAll on
+    /// organizations): never the organization itself, whatever its role.
+    /// Omit to leave unchanged; `null` clears the pin.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub pinned_tolerations: Option<Option<crate::scheduling::PinnedTolerations>>,
 }
 
 /// Full organization details returned by the API.
@@ -102,6 +110,13 @@ pub struct OrganizationResponse {
     /// any member with access to the organization; only owners change it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_modalities: Option<Vec<crate::modalities::Modality>>,
+    /// Account setting: scheduling tolerations pinned to every request from
+    /// this organization. `null` when not pinned; `[]` when its work is kept
+    /// on dedicated capacity. Present only for platform managers (callers with
+    /// UpdateAll on organizations): an operator's routing decision, not
+    /// workspace data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pinned_tolerations: Option<crate::scheduling::PinnedTolerations>,
 }
 
 impl OrganizationResponse {
@@ -112,6 +127,7 @@ impl OrganizationResponse {
             pending_email_change: None,
             auto_join_enabled: None,
             disabled_modalities: None,
+            pinned_tolerations: None,
         }
     }
 
@@ -132,6 +148,13 @@ impl OrganizationResponse {
 
     pub fn with_disabled_modalities(mut self, disabled: crate::modalities::ModalitySet) -> Self {
         self.disabled_modalities = Some(disabled.to_vec());
+        self
+    }
+
+    /// Include the pinned scheduling tolerations. Only the handlers that have
+    /// already checked the caller may see them (platform managers only).
+    pub fn with_pinned_tolerations(mut self, pinned: Option<crate::scheduling::PinnedTolerations>) -> Self {
+        self.pinned_tolerations = pinned;
         self
     }
 }

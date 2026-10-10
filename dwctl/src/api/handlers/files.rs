@@ -177,6 +177,7 @@ impl OpenAIBatchRequest {
         api_key: String,
         accessible_models: &HashMap<String, AccessibleBatchModel>,
         allowed_url_paths: &[String],
+        pinned_tolerations: Option<&serde_json::Value>,
     ) -> Result<fusillade::RequestTemplateInput> {
         // Validate custom_id is safe for HTTP headers
         validate_custom_id(&self.custom_id)?;
@@ -233,6 +234,13 @@ impl OpenAIBatchRequest {
         let mut sanitized_body = self.body.clone();
         sanitized_body["model"] = model.clone().into();
         crate::inference::middleware::strip_scheduling_priority(&mut sanitized_body);
+
+        // A pinned account's batch requests carry its fixed toleration list,
+        // exactly as its realtime and flex requests do. Applied after the strip
+        // above so the client can never override it.
+        if let Some(tolerations) = pinned_tolerations {
+            crate::inference::middleware::set_pinned_tolerations(&mut sanitized_body, tolerations);
+        }
 
         // Serialize sanitized body back to string
         let body = serde_json::to_string(&sanitized_body).map_err(|e| Error::BadRequest {
@@ -689,6 +697,10 @@ struct FileRequestContext {
     api_key: String,
     accessible_models: HashMap<String, AccessibleBatchModel>,
     allowed_url_paths: Vec<String>,
+    /// Scheduling tolerations pinned to the account that owns this upload, or
+    /// `None` when the account is not pinned. Written verbatim to
+    /// `nvext.routing_constraints.tolerations` on every template body.
+    pinned_tolerations: Option<serde_json::Value>,
 }
 
 struct AccessibleBatchModel {
@@ -728,6 +740,7 @@ fn create_file_stream(
         api_key,
         accessible_models,
         allowed_url_paths,
+        pinned_tolerations,
     } = req_ctx;
     let normalizer = config.normalizer.clone();
     let normalizer_mode = config.normalizer_mode;
@@ -927,8 +940,13 @@ fn create_file_stream(
                                     match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
                                         Ok(openai_req) => {
                                             // Transform to internal format (includes model access validation)
-                                            match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models, &allowed_url_paths)
-                                            {
+                                            match openai_req.to_internal(
+                                                &endpoint,
+                                                api_key.clone(),
+                                                &accessible_models,
+                                                &allowed_url_paths,
+                                                pinned_tolerations.as_ref(),
+                                            ) {
                                                 Ok(mut template) => {
                                                     // Normalise image URLs in the per-template body
                                                     // before the size cap check, since substitution
@@ -1019,7 +1037,13 @@ fn create_file_stream(
 
                             match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
                                 Ok(openai_req) => {
-                                    match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models, &allowed_url_paths) {
+                                    match openai_req.to_internal(
+                                        &endpoint,
+                                        api_key.clone(),
+                                        &accessible_models,
+                                        &allowed_url_paths,
+                                        pinned_tolerations.as_ref(),
+                                    ) {
                                         Ok(mut template) => {
                                             // Normalise image URLs in the trailing line as well.
                                             if let Err(e) = normalize_template_body_in_place(
@@ -1229,6 +1253,13 @@ pub async fn upload_file<P: PoolProvider>(
         .await
         .map_err(Error::Database)?;
 
+    // The account's pinned scheduling tolerations, if the operator pinned one.
+    // The hidden batch key belongs to the account that owns the batch
+    // (`target_user_id` is the org in org context, else the person), so its
+    // per-key policy carries the account's pin. Read it from the same policy
+    // map realtime uses, so batch and realtime agree on the pinned list.
+    let pinned_tolerations = state.key_policy_cache.pinned_tolerations(&user_api_key);
+
     // Construct batch execution endpoint (where fusillade will send requests)
     let endpoint = format!("http://{}:{}/ai", config.host, config.port);
 
@@ -1271,6 +1302,7 @@ pub async fn upload_file<P: PoolProvider>(
             api_key: user_api_key,
             accessible_models,
             allowed_url_paths: config.batches.allowed_url_paths.clone(),
+            pinned_tolerations: pinned_tolerations.map(|t| (*t).clone()),
         },
         Some(api_key_id),
     );

@@ -84,6 +84,7 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
         .limiters(limiters)
         .response_store(response_store)
         .image_normalizer(image_normalizer)
+        .key_policy_cache(crate::sync::key_policy::KeyPolicyCache::empty())
         .build()
 }
 
@@ -228,6 +229,7 @@ pub async fn create_test_app_state_with_database_pools(
         .limiters(limiters)
         .response_store(response_store)
         .image_normalizer(image_normalizer)
+        .key_policy_cache(crate::sync::key_policy::KeyPolicyCache::empty())
         .build()
 }
 
@@ -604,6 +606,7 @@ pub async fn get_system_user(pool: &mut PgConnection) -> UserResponse {
         default_serving_class: None,
         self_hosted_only: false,
         granted_serving_classes: Default::default(),
+        pinned_tolerations: Default::default(),
     }
 }
 
@@ -797,6 +800,7 @@ pub async fn create_test_org(pool: &PgPool, created_by: UserId) -> UserResponse 
         default_serving_class: None,
         self_hosted_only: false,
         granted_serving_classes: Default::default(),
+        pinned_tolerations: Default::default(),
     }
 }
 

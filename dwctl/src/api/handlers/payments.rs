@@ -828,6 +828,7 @@ pub async fn process_auto_topup<P: PoolProvider>(
         default_serving_class: None,
         self_hosted_only: None,
         granted_serving_classes: Default::default(),
+        pinned_tolerations: Default::default(),
     };
 
     let mut conn = state.db.write().acquire().await.map_err(|e| {
@@ -1003,6 +1004,7 @@ pub async fn enable_auto_topup<P: PoolProvider>(
                 default_serving_class: None,
                 self_hosted_only: None,
                 granted_serving_classes: Default::default(),
+                pinned_tolerations: Default::default(),
             };
 
             Users::new(&mut conn).update(target.id, &update).await.map_err(|e| {
@@ -1081,6 +1083,7 @@ pub async fn disable_auto_topup<P: PoolProvider>(State(state): State<AppState<P>
         default_serving_class: None,
         self_hosted_only: None,
         granted_serving_classes: Default::default(),
+        pinned_tolerations: Default::default(),
     };
 
     Users::new(&mut conn).update(target.id, &update).await.map_err(|e| match e {

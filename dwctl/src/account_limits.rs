@@ -29,6 +29,7 @@ struct AccountLimitsFile {
 #[serde(deny_unknown_fields)]
 struct AccountLimitsDocument {
     account: String,
+    #[serde(default)]
     realtime_inflight: BTreeMap<String, i32>,
 }
 
@@ -141,6 +142,7 @@ pub async fn apply(pool: &PgPool, catalog: &AccountLimitsCatalog) -> Result<()> 
     .execute(&mut *transaction)
     .await
     .context("write account limits")?;
+
     transaction.commit().await.context("commit account limits")?;
     Ok(())
 }

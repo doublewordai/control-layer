@@ -515,6 +515,9 @@ export interface User {
   granted_serving_classes?: ServingClassName[];
   default_serving_class?: ServingClassName | null;
   self_hosted_only?: boolean;
+  // Scheduling tolerations pinned to the account's requests (platform managers
+  // only). null/absent = not pinned; [] = kept on dedicated capacity.
+  pinned_tolerations?: PinnedTolerations | null;
   user_type?: "individual" | "organization"; // User type
   organizations?: OrganizationSummary[]; // only present when include=organizations or for current user
   active_organization_id?: string; // only present for /users/current
@@ -690,6 +693,9 @@ export interface UserUpdateRequest {
   granted_serving_classes?: ServingClassName[];
   default_serving_class?: ServingClassName | null;
   self_hosted_only?: boolean;
+  // Scheduling tolerations pinned to the account: platform managers only.
+  // [] keeps the account on dedicated capacity; null clears the pin.
+  pinned_tolerations?: PinnedTolerations | null;
 }
 
 export interface GroupUpdateRequest {
@@ -1781,6 +1787,33 @@ export type OrgMemberRole = "owner" | "admin" | "member";
  */
 export type Modality = "realtime" | "batch";
 
+/** How a tolration's key is matched. */
+export type SchedulingTolerationOperator = "Equal" | "Exists";
+
+/** How strictly a matching taint must be tolerated. */
+export type SchedulingTolerationEffect = "NoSchedule" | "PreferNoSchedule";
+
+/**
+ * One Kubernetes-style scheduling toleration, the shape dwctl writes to
+ * `nvext.routing_constraints.tolerations`. `operator` defaults to `Equal`
+ * (which needs a `value`); `effect` defaults to `NoSchedule`.
+ */
+export interface SchedulingToleration {
+  key: string;
+  operator?: SchedulingTolerationOperator;
+  value?: string;
+  effect?: SchedulingTolerationEffect;
+}
+
+/**
+ * A fixed list of scheduling tolerations pinned to every request from an
+ * account. `null` (the field absent) means the account is not pinned; an
+ * empty list (`[]`) is a real pin that keeps the account's work off any
+ * tainted capacity. Platform managers set and read it; ordinary account
+ * members never see it.
+ */
+export type PinnedTolerations = SchedulingToleration[];
+
 export interface OrganizationSummary {
   id: string;
   name: string;
@@ -1818,6 +1851,12 @@ export interface Organization extends User {
    * organization owns. Empty (or absent) means everything is allowed.
    */
   disabled_modalities?: Modality[];
+  /**
+   * Scheduling tolerations pinned to every request from this organization
+   * (platform managers only). null/absent = not pinned; [] = kept on
+   * dedicated capacity.
+   */
+  pinned_tolerations?: PinnedTolerations | null;
 }
 
 export interface OrganizationMember {
@@ -1850,6 +1889,9 @@ export interface OrganizationUpdateRequest {
   self_hosted_only?: boolean;
   /** Replaces the whole set; owner-only. An empty list re-enables everything. */
   disabled_modalities?: Modality[];
+  // Scheduling tolerations pinned to the organization: platform managers only.
+  // [] keeps the workspace on dedicated capacity; null clears the pin.
+  pinned_tolerations?: PinnedTolerations | null;
 }
 
 export interface InviteMemberRequest {

@@ -2,6 +2,7 @@ pub mod anthropic;
 pub mod cache_classifier;
 pub mod databases;
 pub mod modalities;
+pub mod pinned_tolerations;
 pub mod responses;
 pub mod serving_classes;
 pub mod sigterm_drain;
@@ -1416,6 +1417,7 @@ async fn test_request_logging_disabled(pool: PgPool) {
         .response_store(response_store)
         .image_normalizer(std::sync::Arc::new(crate::image_normalizer::DisabledNormalizer)
             as std::sync::Arc<dyn crate::image_normalizer::ImageNormalizer>)
+        .key_policy_cache(crate::sync::key_policy::KeyPolicyCache::empty())
         .build();
     let onwards_router = axum::Router::new(); // Empty onwards router for testing
     let router = super::build_router(&mut app_state, onwards_router, None, None, None, false, None, None)
@@ -2083,6 +2085,7 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
         .response_store(response_store)
         .image_normalizer(std::sync::Arc::new(crate::image_normalizer::DisabledNormalizer)
             as std::sync::Arc<dyn crate::image_normalizer::ImageNormalizer>)
+        .key_policy_cache(crate::sync::key_policy::KeyPolicyCache::empty())
         .build();
 
     let onwards_router = axum::Router::new();
@@ -2145,6 +2148,7 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
         .response_store(response_store)
         .image_normalizer(std::sync::Arc::new(crate::image_normalizer::DisabledNormalizer)
             as std::sync::Arc<dyn crate::image_normalizer::ImageNormalizer>)
+        .key_policy_cache(crate::sync::key_policy::KeyPolicyCache::empty())
         .build();
 
     let onwards_router = axum::Router::new();

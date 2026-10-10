@@ -2,17 +2,19 @@
 //!
 //! Maintains a memory-local map from api key secret to the owning account's
 //! request policy: the `users.zero_data_retention` flag (read by
-//! [`crate::inference::zdr::is_zdr_request`]) and the account's
+//! [`crate::inference::zdr::is_zdr_request`]), the account's
 //! `users.disabled_modalities` (read by the inference middleware's modality
-//! gate). Both answer on the request hot path with a lock-free map read and no
-//! DB round-trip.
+//! gate), and any `users.pinned_tolerations` (read by the inference middleware
+//! and the batch ingest path to affix a fixed toleration list to every request
+//! from the account). All answer on the request hot path with a lock-free map
+//! read and no DB round-trip.
 //!
 //! Unlike [`crate::sync::onwards_config`], which rebuilds the whole routing
 //! table on every change, this runs one small two-table join and swaps a flat
 //! map, so refreshing it on every `auth_config_changed` notification is cheap.
 //! It reuses that channel (fired by the `api_keys` trigger and the `users`
-//! ZDR and disabled-modalities triggers), a 100ms debounce, and a periodic
-//! fallback reload.
+//! ZDR, disabled-modalities and pinned-tolerations triggers), a 100ms debounce,
+//! and a periodic fallback reload.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,14 +29,20 @@ use crate::metrics::errors::component;
 use crate::modalities::ModalitySet;
 
 /// The account-level policy a key inherits from its owner (`api_keys.user_id`,
-/// the organization for an org key). `Copy` so a map read hands back a value
-/// and the caller never holds the `ArcSwap` guard across an await.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// the organization for an org key). `Clone` (not `Copy`) because a pinned
+/// toleration list is shared behind an `Arc`, so a map read hands back a cheap
+/// clone and the caller never holds the `ArcSwap` guard across an await.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct KeyPolicy {
     /// `users.zero_data_retention` of the owning account.
     pub zdr: bool,
     /// `users.disabled_modalities` of the owning account.
     pub disabled_modalities: ModalitySet,
+    /// `users.pinned_tolerations` of the owning account: the scheduling
+    /// toleration list written verbatim to `nvext.routing_constraints
+    /// .tolerations` on every request from this account. `None` means the
+    /// account is not pinned.
+    pub pinned_tolerations: Option<Arc<serde_json::Value>>,
 }
 
 /// Lock-free, cheap-to-clone handle to the shared secret-to-policy map.
@@ -59,7 +67,7 @@ impl KeyPolicyCache {
     /// The policy for the api key `secret`, or the default for an unknown key.
     /// Hot-path safe.
     pub fn policy(&self, secret: &str) -> KeyPolicy {
-        self.inner.load().get(secret).copied().unwrap_or_default()
+        self.inner.load().get(secret).cloned().unwrap_or_default()
     }
 
     /// Whether the api key `secret` belongs to a ZDR account. Hot-path safe.
@@ -70,6 +78,12 @@ impl KeyPolicyCache {
     /// The modalities the owning account has disabled for `secret`.
     pub fn disabled_modalities(&self, secret: &str) -> ModalitySet {
         self.policy(secret).disabled_modalities
+    }
+
+    /// The tolerations pinned to the account owning `secret`, or `None` when
+    /// the account is not pinned. Hot-path safe.
+    pub fn pinned_tolerations(&self, secret: &str) -> Option<Arc<serde_json::Value>> {
+        self.policy(secret).pinned_tolerations
     }
 
     fn replace(&self, map: HashMap<String, KeyPolicy>) {
@@ -103,7 +117,7 @@ impl KeyPolicyCache {
 async fn load(pool: &PgPool) -> Result<HashMap<String, KeyPolicy>, sqlx::Error> {
     let rows = sqlx::query!(
         r#"
-        SELECT ak.secret, u.zero_data_retention, u.disabled_modalities
+        SELECT ak.secret, u.zero_data_retention, u.disabled_modalities, u.pinned_tolerations
         FROM api_keys ak
         JOIN users u ON u.id = ak.user_id
         WHERE NOT ak.is_deleted
@@ -120,6 +134,7 @@ async fn load(pool: &PgPool) -> Result<HashMap<String, KeyPolicy>, sqlx::Error> 
                 KeyPolicy {
                     zdr: r.zero_data_retention,
                     disabled_modalities: ModalitySet::from_db(&r.disabled_modalities),
+                    pinned_tolerations: r.pinned_tolerations.map(Arc::new),
                 },
             )
         })
@@ -267,10 +282,28 @@ mod tests {
             KeyPolicy {
                 zdr: false,
                 disabled_modalities: [Modality::Batch].into_iter().collect(),
+                ..Default::default()
             },
         )]);
         assert!(cache.disabled_modalities("sk-no-batch").contains(Modality::Batch));
         assert!(!cache.disabled_modalities("sk-no-batch").contains(Modality::Realtime));
         assert!(cache.disabled_modalities("sk-missing").is_empty());
+    }
+
+    #[test]
+    fn pinned_tolerations_follow_the_policy_and_default_to_none() {
+        let cache = KeyPolicyCache::from_policies([(
+            "sk-pinned".to_string(),
+            KeyPolicy {
+                pinned_tolerations: Some(Arc::new(serde_json::json!([{"key": "pool", "value": "dedicated"}]))),
+                ..Default::default()
+            },
+        )]);
+        assert_eq!(
+            cache.pinned_tolerations("sk-pinned").as_deref(),
+            Some(&serde_json::json!([{"key": "pool", "value": "dedicated"}]))
+        );
+        // An unpinned account and an unknown key both read as not pinned.
+        assert!(cache.pinned_tolerations("sk-missing").is_none());
     }
 }
