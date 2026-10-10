@@ -1,5 +1,12 @@
 # Changelog
 
+## [13.7.0](https://github.com/doublewordai/control-layer/compare/v13.6.0...v13.7.0) (2026-10-10)
+
+
+### Features
+
+* **limits:** name the account and report its limit on in-flight metrics ([#1958](https://github.com/doublewordai/control-layer/issues/1958)) ([72c6e97](https://github.com/doublewordai/control-layer/commit/72c6e974d435a20ed5cd36f977016434b3b7be4b))
+
 ## [13.6.0](https://github.com/doublewordai/control-layer/compare/v13.5.0...v13.6.0) (2026-10-10)
 
 
