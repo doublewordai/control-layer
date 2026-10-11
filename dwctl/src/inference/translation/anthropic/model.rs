@@ -218,13 +218,15 @@ pub enum StopReason {
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_read_input_tokens: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_creation_input_tokens: Option<u64>,
-    /// Per-TTL creation breakdown (Anthropic's `cache_creation` object; the 24h
-    /// field is a dwctl extension). Billing prices each tier at its own write
-    /// premium, so dropping this on translation billed creations at list.
+    /// Always serialized (0 when caching is unused), matching the live
+    /// Anthropic API rather than the SDKs' looser Optional typing.
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    /// Per-TTL creation breakdown (Anthropic's `cache_creation` object).
+    /// Billing prices each tier at its own write premium, so dropping this on
+    /// translation billed creations at list.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_creation: Option<CacheCreation>,
 }
@@ -232,14 +234,17 @@ pub struct Usage {
 /// The `cache_creation` per-TTL breakdown. Field names match what the cache
 /// layer splices into the OpenAI frame, so the analytics extractor reads either
 /// shape with one code path.
+///
+/// Deliberately NO 24h field: it exists internally, but 24h writes are
+/// disabled at the server config level, so emitting an always-zero
+/// `ephemeral_24h_input_tokens` on the customer frame would only mislead
+/// (Anthropic's spec has exactly the two fields below).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheCreation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ephemeral_5m_input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ephemeral_1h_input_tokens: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ephemeral_24h_input_tokens: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
