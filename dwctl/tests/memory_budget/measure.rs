@@ -17,6 +17,9 @@ use crate::upstream::Reply;
 /// Requests in flight in every round.
 pub const CONCURRENCY: usize = 32;
 
+/// Measured rounds per data point; the quietest is kept (see [`quietest`]).
+const ATTEMPTS: usize = 3;
+
 /// Where the load generator sends requests.
 #[derive(Clone, Copy)]
 pub enum Target {
@@ -90,9 +93,9 @@ impl std::fmt::Display for Scaling {
 /// size lets pools, caches and buffers grow to it; the second is the one measured.
 pub fn scaling(harness: &Harness, load: impl Fn(usize) -> Load, [small, large]: [usize; 2]) -> Scaling {
     round(harness, load(small));
-    let small = round(harness, load(small));
+    let small = quietest(harness, || load(small));
     let first_large = round(harness, load(large));
-    let large = round(harness, load(large));
+    let large = quietest(harness, || load(large));
     let size_delta = (large.size - small.size) as f64;
     let copies = (large.held - small.held) / size_delta;
     Scaling {
@@ -103,6 +106,24 @@ pub fn scaling(harness: &Harness, load: impl Fn(usize) -> Load, [small, large]: 
         small,
         large,
     }
+}
+
+/// Runs [`ATTEMPTS`] rounds of the same load and keeps the one holding least.
+///
+/// Background work (routing sync, log flushing, pool upkeep) occasionally
+/// allocates a burst between the baseline and the held snapshot, and that burst
+/// is divided across the round's requests as if they held it. Memory the
+/// requests really hold appears in every round; a burst does not, and it only
+/// ever adds. So the minimum filters the noise without loosening any budget.
+pub fn quietest(harness: &Harness, load: impl Fn() -> Load) -> Round {
+    rounds(harness, load)
+        .min_by(|a, b| a.held.total_cmp(&b.held))
+        .expect("at least one attempt")
+}
+
+/// [`ATTEMPTS`] rounds of the same load, for callers that pick their own quietest.
+pub fn rounds<'a>(harness: &'a Harness, load: impl Fn() -> Load + 'a) -> impl Iterator<Item = Round> + 'a {
+    (0..ATTEMPTS).map(move |_| round(harness, load()))
 }
 
 pub fn round(harness: &Harness, load: Load) -> Round {

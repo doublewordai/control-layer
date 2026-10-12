@@ -1,5 +1,27 @@
 # Changelog
 
+## [13.7.0](https://github.com/doublewordai/control-layer/compare/v13.6.0...v13.7.0) (2026-10-10)
+
+
+### Features
+
+* **limits:** name the account and report its limit on in-flight metrics ([#1958](https://github.com/doublewordai/control-layer/issues/1958)) ([72c6e97](https://github.com/doublewordai/control-layer/commit/72c6e974d435a20ed5cd36f977016434b3b7be4b))
+
+## [13.6.0](https://github.com/doublewordai/control-layer/compare/v13.5.0...v13.6.0) (2026-10-10)
+
+
+### Features
+
+* **limits:** count in-flight limit checks and refusals per account ([#1957](https://github.com/doublewordai/control-layer/issues/1957)) ([f6a7486](https://github.com/doublewordai/control-layer/commit/f6a74865a43a71bb9c3d9228958dfde66c364477))
+* **onwards:** trace rejections and stop logging caller-limit refusals ([#1952](https://github.com/doublewordai/control-layer/issues/1952)) ([f051e4c](https://github.com/doublewordai/control-layer/commit/f051e4c8324f413422fc237abcf3ddac504b9650))
+
+## [13.5.0](https://github.com/doublewordai/control-layer/compare/v13.4.3...v13.5.0) (2026-10-09)
+
+
+### Features
+
+* **zdr:** encrypt images at rest for zero-data-retention requests ([#1953](https://github.com/doublewordai/control-layer/issues/1953)) ([f63e795](https://github.com/doublewordai/control-layer/commit/f63e795fc79f4871b4b85f6fc7d9cc57c0752e4b))
+
 ## [13.4.3](https://github.com/doublewordai/control-layer/compare/v13.4.2...v13.4.3) (2026-10-09)
 
 

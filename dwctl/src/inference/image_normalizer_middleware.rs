@@ -21,6 +21,15 @@
 //! unauthorised token gets a 403 and a lookup failure a 503 (which the
 //! daemon retries).
 //!
+//! Zero-data-retention: no ZDR image is ever stored in plaintext, and a
+//! provider is never handed a URL to one. For a ZDR caller (per-key policy) or
+//! a ZDR dispatch (the `x-fusillade-batch-zdr` marker the dispatch processor
+//! stamps), raw image inputs are fetched and validated but NOT stored — they
+//! are inlined as `data:` URIs. Tokens on a ZDR dispatch that name sealed
+//! objects (encrypted at flex enqueue with the request's ZDR key) are
+//! decrypted with that key and inlined the same way; a sealed object is never
+//! signed, since the provider would only fetch ciphertext.
+//!
 //! Pattern: read the body once via `axum::body::to_bytes`, mutate the JSON
 //! in place, restore the body via `Body::from(...)`.
 //!
@@ -71,7 +80,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
 
-use crate::image_normalizer::{ImageInput, ImageNormalizer, ImageToken, Mode, NormalizeError, TokenParseError, walker};
+use crate::image_normalizer::{ImageInput, ImageNormalizer, ImageToken, Mode, NormalizeError, TokenParseError, sealed, walker};
 use sqlx::PgPool;
 
 /// Shared state threaded through the middleware.
@@ -97,6 +106,12 @@ pub struct ImageNormalizerMiddlewareState {
     /// per-user-mode lookup once the opt-in flag is wired through.
     /// `None` disables both (useful in tests).
     pub pool: Option<sqlx_pool_router::DynPools>,
+    /// ZDR keystore: holds the per-request key that opens a ZDR dispatch's
+    /// sealed images. `None` when ZDR is not configured.
+    pub keystore: Option<crate::keystore::Keystore>,
+    /// Per-key ZDR policy, so a realtime ZDR caller's images are inlined
+    /// rather than stored.
+    pub key_policy_cache: crate::sync::key_policy::KeyPolicyCache,
 }
 
 /// Extract the Bearer token from `Authorization`, case-insensitive.
@@ -187,6 +202,13 @@ pub async fn image_normalizer_middleware(
         };
     let attribution_for_access = caller_lookup.as_ref().ok().copied().flatten().map(|c| c.attribution);
 
+    // ZDR is decided from the per-key policy and the dispatch marker alone, NOT
+    // from the caller lookup, so a lookup failure can never downgrade a ZDR
+    // request into storing its images in plaintext.
+    let zdr_dispatch_id = zdr_dispatch_request_id(&request);
+    let zdr = zdr_dispatch_id.is_some()
+        || crate::inference::zdr::is_zdr_request(&state.key_policy_cache, extract_bearer_token(&request).as_deref());
+
     let normalizer = state.normalizer.clone();
     // Every signed URL this request produces — a signed token, or a freshly
     // ingested image — gets the same TTL: a daemon loopback must outlive one
@@ -227,11 +249,24 @@ pub async fn image_normalizer_middleware(
         }
     };
 
+    // The request key that opens this dispatch's sealed images. Fetched once,
+    // only when there are tokens to open. `Err` is kept so a keystore blip is a
+    // retryable failure rather than a missing key.
+    let zdr_request_key: Result<Option<Arc<Vec<u8>>>, String> = match (zdr_dispatch_id, state.keystore.as_ref()) {
+        (Some(request_id), Some(keystore)) if !walker::tokens(&body_value).is_empty() => keystore
+            .get(&crate::inference::zdr::key_id(&request_id, crate::inference::zdr::KeyKind::Request))
+            .await
+            .map(|key| key.map(Arc::new))
+            .map_err(|e| e.to_string()),
+        _ => Ok(None),
+    };
+
     let pool_for_access = state.pool.clone();
     let substitute = move |url: String| {
         let normalizer = normalizer.clone();
         let pool_for_access = pool_for_access.clone();
         let grants = grants.clone();
+        let zdr_request_key = zdr_request_key.clone();
         let is_data_uri = url.starts_with("data:");
         async move {
             // `dw-img://` token: sign it, no ingest — the bytes are already in
@@ -245,6 +280,13 @@ pub async fn image_normalizer_middleware(
                     Ok(set) if !set.contains(&token) => return Err(NormalizeError::Forbidden),
                     Ok(_) => {}
                 }
+                // A ZDR dispatch's sealed image: decrypt with the request key
+                // and inline it. Signing it would hand the provider ciphertext.
+                if zdr_dispatch_id.is_some()
+                    && let Some(blob) = normalizer.read_sealed(token).await?
+                {
+                    return open_sealed_as_data_uri(&zdr_request_key, &blob);
+                }
                 // The bearer only decides the TTL: a dispatch must outlive one
                 // full processing attempt; a client request is realtime.
                 let signed = normalizer.sign(token, sign_ttl).await?;
@@ -254,7 +296,10 @@ pub async fn image_normalizer_middleware(
             // store (a client echoing back a URL we signed). Re-ingesting
             // and re-signing would waste a round-trip re-fetching an image we
             // already host and clobber the original TTL with the realtime one.
-            if !is_data_uri && normalizer.owns_url(&url) {
+            //
+            // Not for ZDR: a ZDR request never hands the provider a URL into
+            // our store, so an echoed one is fetched and inlined below.
+            if !is_data_uri && !zdr && normalizer.owns_url(&url) {
                 return Ok::<String, NormalizeError>(url);
             }
             let input = if is_data_uri {
@@ -262,6 +307,11 @@ pub async fn image_normalizer_middleware(
             } else {
                 ImageInput::HttpUrl(url)
             };
+            // ZDR: fetch and validate, but never store — inline the bytes.
+            if zdr {
+                let (mime, bytes) = normalizer.load(input).await?;
+                return Ok(sealed::to_data_uri(&mime, &bytes));
+            }
             let ingested = normalizer.ingest(input).await?;
             // Same TTL rule as for tokens: a daemon loopback (a synced record
             // keeps its raw image URLs until dispatch) must outlive one full
@@ -319,6 +369,36 @@ pub async fn image_normalizer_middleware(
     next.run(request).await
 }
 
+/// The fusillade request id of a ZDR daemon dispatch: the loopback carries the
+/// `x-fusillade-batch-zdr: 1` marker (stamped by the dispatch processor after it
+/// decrypted the body) and `x-fusillade-request-id`. `None` for anything else.
+fn zdr_dispatch_request_id(request: &Request<Body>) -> Option<uuid::Uuid> {
+    let headers = request.headers();
+    let marked = headers.get(crate::inference::zdr::ZDR_MARKER_HEADER).and_then(|v| v.to_str().ok()) == Some("1");
+    if !marked {
+        return None;
+    }
+    headers
+        .get("x-fusillade-request-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+}
+
+/// Decrypt a sealed image with the dispatch's request key and render it as a
+/// `data:` URI. A missing key or an unreachable keystore is a retryable store
+/// failure: the daemon retries, and if the key really is gone the dispatch
+/// processor fails the request terminally on the next attempt.
+fn open_sealed_as_data_uri(key: &Result<Option<Arc<Vec<u8>>>, String>, blob: &[u8]) -> Result<String, NormalizeError> {
+    let key = match key {
+        Ok(Some(key)) => key,
+        Ok(None) => return Err(NormalizeError::StoreFailed("ZDR request key unavailable for sealed image".into())),
+        Err(e) => return Err(NormalizeError::StoreFailed(format!("ZDR keystore unavailable: {e}"))),
+    };
+    let (mime, bytes) =
+        sealed::open(key, blob).map_err(|e| NormalizeError::StoreFailed(format!("sealed image could not be opened: {e}")))?;
+    Ok(sealed::to_data_uri(&mime, &bytes))
+}
+
 /// Normalise every image input in `body` to a `dw-img://` token (the
 /// content-addressed reference), ingesting the bytes into the store. Used by
 /// the **Flex** enqueue path: the request is persisted with tokens, and when
@@ -332,6 +412,10 @@ pub async fn image_normalizer_middleware(
 /// supplied (then `attribution` is required). Returns the number of
 /// substitutions made.
 ///
+/// With `seal_key` (a ZDR request's request key) every image is encrypted
+/// before it is stored ([`ImageNormalizer::ingest_sealed`]), so the store never
+/// holds a ZDR image in plaintext.
+///
 /// A `dw-img://` token already in the body is stored as is; it is authorised
 /// for the principal when the daemon dispatches the request (the edge signs
 /// nothing the principal does not own — see [`image_normalizer_middleware`]).
@@ -340,11 +424,14 @@ pub(crate) async fn normalize_value_to_tokens(
     normalizer: &Arc<dyn ImageNormalizer>,
     access_pool: Option<PgPool>,
     attribution: Option<crate::api::handlers::images::ImageAttribution>,
+    seal_key: Option<&[u8]>,
 ) -> Result<usize, NormalizeError> {
     let normalizer = normalizer.clone();
+    let seal_key: Option<Arc<[u8]>> = seal_key.map(Arc::from);
     let substitute = move |url: String| {
         let normalizer = normalizer.clone();
         let access_pool = access_pool.clone();
+        let seal_key = seal_key.clone();
         let is_data_uri = url.starts_with("data:");
         async move {
             let input = if is_data_uri {
@@ -352,7 +439,10 @@ pub(crate) async fn normalize_value_to_tokens(
             } else {
                 ImageInput::HttpUrl(url)
             };
-            let ingested = normalizer.ingest(input).await?;
+            let ingested = match seal_key {
+                Some(key) => normalizer.ingest_sealed(input, &key).await?,
+                None => normalizer.ingest(input).await?,
+            };
             // AWAITED and REQUIRED, not fire-and-forget: this row is what
             // authorises signing the token — for the daemon's dispatch of this
             // request (which can follow within the claim interval) and for the
@@ -454,6 +544,8 @@ mod tests {
             realtime_ttl: Duration::from_secs(900),
             token_ttl: Duration::from_secs(1800),
             pool: None,
+            keystore: None,
+            key_policy_cache: crate::sync::key_policy::KeyPolicyCache::empty(),
         }
     }
 
@@ -670,6 +762,8 @@ mod tests {
             realtime_ttl: Duration::from_secs(900),
             token_ttl: Duration::from_secs(1800),
             pool: None,
+            keystore: None,
+            key_policy_cache: crate::sync::key_policy::KeyPolicyCache::empty(),
         };
         let router = build_router(state);
         let body = json!({
@@ -697,11 +791,215 @@ mod tests {
                 {"type": "image_url", "image_url": {"url": TINY_PNG_DATA_URI}}
             ]}]
         });
-        let n = normalize_value_to_tokens(&mut body, &normalizer, None, None).await.unwrap();
+        let n = normalize_value_to_tokens(&mut body, &normalizer, None, None, None).await.unwrap();
         assert_eq!(n, 1);
         let url = body["messages"][0]["content"][1]["image_url"]["url"].as_str().unwrap();
         assert!(url.starts_with("dw-img://"), "expected a dw-img token, got {url}");
         assert!(!url.contains("base64"), "raw base64 must be replaced");
+    }
+
+    // ---- zero-data-retention ----
+
+    /// A state over a store the test can inspect.
+    fn state_over(store: Arc<MemoryStore>) -> ImageNormalizerMiddlewareState {
+        let mut state = state_for_tests();
+        state.normalizer = Arc::new(DefaultImageNormalizer::new(FetcherConfig::default(), store).with_unique_upload_keys(true));
+        state
+    }
+
+    #[tokio::test]
+    async fn a_realtime_zdr_callers_image_is_inlined_and_never_stored() {
+        let store = Arc::new(MemoryStore::new().with_base_url("http://test.local/dw-img"));
+        let mut state = state_over(store.clone());
+        state.key_policy_cache = crate::sync::key_policy::KeyPolicyCache::from_pairs([("sk-zdr".to_string(), true)]);
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "image_url", "image_url": {"url": TINY_PNG_DATA_URI}}
+            ]}]
+        });
+
+        let (status, echoed) = post_json_as(build_router(state), Some("sk-zdr"), body).await;
+
+        assert_eq!(status, StatusCode::OK, "{echoed}");
+        let url = echoed["messages"][0]["content"][1]["image_url"]["url"].as_str().unwrap();
+        assert_eq!(url, TINY_PNG_DATA_URI, "validated and inlined, not swapped for a signed URL");
+        assert!(store.objects().is_empty(), "a ZDR image must never reach the store");
+    }
+
+    #[tokio::test]
+    async fn a_zdr_caller_echoing_one_of_our_urls_does_not_get_it_forwarded() {
+        // A non-ZDR caller's echoed store URL passes through untouched; a ZDR
+        // caller's is fetched and inlined instead, so the provider never gets a
+        // URL into the store. MemoryStore URLs are not fetchable, so for ZDR
+        // the fetch fails rather than the URL being forwarded.
+        let store = Arc::new(MemoryStore::new().with_base_url("http://test.local/dw-img"));
+        let mut state = state_over(store);
+        state.key_policy_cache =
+            crate::sync::key_policy::KeyPolicyCache::from_pairs([("sk-zdr".to_string(), true), ("sk-plain".to_string(), false)]);
+        let ours = "http://test.local/dw-img/abcd?expires=1";
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "image_url", "image_url": {"url": ours}}
+            ]}]
+        });
+
+        let (status, echoed) = post_json_as(build_router(state.clone()), Some("sk-plain"), body.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(echoed["messages"][0]["content"][1]["image_url"]["url"], ours);
+
+        let (status, echoed) = post_json_as(build_router(state), Some("sk-zdr"), body).await;
+        assert_ne!(status, StatusCode::OK, "{echoed}");
+        assert!(!echoed.to_string().contains(ours), "ZDR must not forward a store URL: {echoed}");
+    }
+
+    #[tokio::test]
+    async fn a_non_zdr_callers_image_is_still_stored_and_signed() {
+        let store = Arc::new(MemoryStore::new().with_base_url("http://test.local/dw-img"));
+        let mut state = state_over(store.clone());
+        state.key_policy_cache = crate::sync::key_policy::KeyPolicyCache::from_pairs([("sk-plain".to_string(), false)]);
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "image_url", "image_url": {"url": TINY_PNG_DATA_URI}}
+            ]}]
+        });
+
+        let (status, echoed) = post_json_as(build_router(state), Some("sk-plain"), body).await;
+
+        assert_eq!(status, StatusCode::OK, "{echoed}");
+        let url = echoed["messages"][0]["content"][1]["image_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("http://test.local/dw-img/"), "{url}");
+        assert_eq!(store.objects().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn flex_enqueue_with_a_zdr_key_stores_only_ciphertext() {
+        let store = Arc::new(MemoryStore::new());
+        let normalizer: Arc<dyn ImageNormalizer> = Arc::new(DefaultImageNormalizer::new(FetcherConfig::default(), store.clone()));
+        let key = crate::keystore::generate_key();
+        let mut body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": TINY_PNG_DATA_URI}}
+            ]}]
+        });
+
+        let n = normalize_value_to_tokens(&mut body, &normalizer, None, None, Some(&key))
+            .await
+            .unwrap();
+
+        assert_eq!(n, 1);
+        let url = body["messages"][0]["content"][0]["image_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("dw-img://"), "{url}");
+        let objects = store.objects();
+        assert_eq!(objects.len(), 1);
+        assert!(sealed::is_sealed(&objects[0]), "ZDR image must be sealed before it is stored");
+        // The dispatch-side open recovers exactly the submitted image.
+        let inlined = open_sealed_as_data_uri(&Ok(Some(Arc::new(key.to_vec()))), &objects[0]).unwrap();
+        assert_eq!(inlined, TINY_PNG_DATA_URI);
+    }
+
+    #[test]
+    fn a_sealed_image_without_its_key_is_a_retryable_failure_not_a_url() {
+        let key = crate::keystore::generate_key();
+        let blob = sealed::seal(&key, "image/png", b"img").unwrap();
+        assert!(matches!(
+            open_sealed_as_data_uri(&Ok(None), &blob),
+            Err(NormalizeError::StoreFailed(_))
+        ));
+        assert!(matches!(
+            open_sealed_as_data_uri(&Err("redis down".into()), &blob),
+            Err(NormalizeError::StoreFailed(_))
+        ));
+        let wrong = Arc::new(crate::keystore::generate_key().to_vec());
+        assert!(matches!(
+            open_sealed_as_data_uri(&Ok(Some(wrong)), &blob),
+            Err(NormalizeError::StoreFailed(_))
+        ));
+    }
+
+    #[test]
+    fn zdr_dispatch_needs_the_marker_and_a_request_id() {
+        let id = uuid::Uuid::new_v4();
+        let req = |headers: &[(&str, &str)]| {
+            let mut b = Request::builder();
+            for (k, v) in headers {
+                b = b.header(*k, *v);
+            }
+            b.body(Body::empty()).unwrap()
+        };
+        let id_str = id.to_string();
+        assert_eq!(
+            zdr_dispatch_request_id(&req(&[("x-fusillade-batch-zdr", "1"), ("x-fusillade-request-id", &id_str)])),
+            Some(id)
+        );
+        assert_eq!(zdr_dispatch_request_id(&req(&[("x-fusillade-request-id", &id_str)])), None);
+        assert_eq!(
+            zdr_dispatch_request_id(&req(&[("x-fusillade-batch-zdr", "0"), ("x-fusillade-request-id", &id_str)])),
+            None
+        );
+        assert_eq!(zdr_dispatch_request_id(&req(&[("x-fusillade-batch-zdr", "1")])), None);
+    }
+
+    /// A ZDR dispatch never signs a sealed object: with no key to open it, the
+    /// request fails retryably instead of handing the provider a URL to
+    /// ciphertext. A plaintext token on the same dispatch still signs.
+    #[dwctl_test_macros::test]
+    async fn a_zdr_dispatch_inlines_or_refuses_sealed_tokens_and_signs_plaintext_ones(pool: sqlx::PgPool) {
+        use crate::api::models::users::Role;
+        use crate::test::utils::create_test_user;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let batch_key = hidden_batch_key_for(&pool, user.id).await;
+        let state = state_with_pool(&pool);
+        let attribution = crate::api::handlers::images::resolve_image_attribution(&pool, &batch_key)
+            .await
+            .expect("key resolves");
+        let key = crate::keystore::generate_key();
+        let sealed_ingest = state
+            .normalizer
+            .ingest_sealed(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string()), &key)
+            .await
+            .unwrap();
+        crate::api::handlers::images::record_image_access(
+            &pool,
+            attribution,
+            sealed_ingest.token,
+            &sealed_ingest.mime,
+            sealed_ingest.bytes_len,
+        )
+        .await;
+        let plain_token = ingest_for_key(&pool, &state, &batch_key).await;
+
+        let dispatch = |token: crate::image_normalizer::ImageToken| {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {batch_key}"))
+                .header("x-fusillade-batch-zdr", "1")
+                .header("x-fusillade-request-id", uuid::Uuid::new_v4().to_string())
+                .body(Body::from(serde_json::to_vec(&body_with_token(token)).unwrap()))
+                .unwrap()
+        };
+
+        // No keystore → the sealed image's key is unavailable → 503, no URL.
+        let resp = build_router(state.clone()).oneshot(dispatch(sealed_ingest.token)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains(&sealed_ingest.token.to_hex()));
+
+        // A plaintext token on a ZDR dispatch is signed as before.
+        let resp = build_router(state).oneshot(dispatch(plain_token)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let echoed: Value = serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let (url, _) = signed_url_and_ttl(&echoed);
+        assert!(url.contains(&plain_token.to_hex()), "{url}");
     }
 
     // ---- `dw-img://` token signing ----
