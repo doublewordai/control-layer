@@ -86,4 +86,18 @@ describe("SchedulingTolerations", () => {
     const alert = screen.getByRole("alert");
     expect(within(alert).getByText(/no longer a configured preset/i)).toBeInTheDocument();
   });
+
+  it("cautions that pinning makes scheduling harder whenever presets exist", () => {
+    renderControls(null);
+    expect(
+      screen.getByTestId("toleration-pinning-caution"),
+    ).toHaveTextContent(/pin as few accounts as possible/i);
+  });
+
+  it("omits the caution when no presets are configured", () => {
+    renderControls(null, true, []);
+    expect(
+      screen.queryByTestId("toleration-pinning-caution"),
+    ).not.toBeInTheDocument();
+  });
 });

@@ -356,6 +356,10 @@ heap_profiling:
 # backend, for realtime, flex and batch traffic alike, so a backend that
 # honours tolerations keeps the account's work on the capacity you intend.
 #
+# Pinning restricts where an account's requests can be placed, which makes
+# scheduling strictly harder for every account, not just the pinned one. Pin as
+# few accounts as possible and only when a customer requires it.
+#
 # This is a distinct setting from `self_hosted_only` (the account's
 # `users.self_hosted_only` / `organizations.self_hosted_only` flag): that flag
 # is the *gateway's* provider-fallback control and decides whether onwards may

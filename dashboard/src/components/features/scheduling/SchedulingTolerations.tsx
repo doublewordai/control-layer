@@ -1,4 +1,4 @@
-import { ShieldCheck } from "lucide-react";
+import { AlertTriangle, ShieldCheck } from "lucide-react";
 import type { SchedulingTolerationPreset } from "@/api/control-layer/types";
 import { Label } from "@/components/ui/label";
 import {
@@ -37,6 +37,10 @@ export function SchedulingTolerations({
   const available = presets ?? [];
   const value = preset ?? DEFAULT_TOLERATION_PRESET;
   const selected = available.find((p) => p.id === preset);
+
+  // Only worth warning about once an operator has actually configured presets
+  // that could be pinned; with none, the select offers only "Default".
+  const hasPresets = available.length > 0;
 
   // A stored id that config no longer defines would otherwise show as the
   // placeholder; surface it so the operator can re-point the account.
@@ -112,6 +116,21 @@ export function SchedulingTolerations({
 
       {selected && (
         <p className="text-xs text-gray-500">{selected.description}</p>
+      )}
+
+      {hasPresets && (
+        <p className="flex items-start gap-1.5 text-xs text-amber-600">
+          <AlertTriangle
+            className="mt-0.5 h-3.5 w-3.5 shrink-0"
+            aria-hidden="true"
+          />
+          <span data-testid="toleration-pinning-caution">
+            Pinning an account restricts where its requests can be placed. This
+            makes scheduling strictly harder for every account, not just this
+            one, so pin as few accounts as possible and only when a customer
+            requires it.
+          </span>
+        </p>
       )}
 
       {staleSelection && (

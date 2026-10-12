@@ -670,7 +670,10 @@ operator pin an account to a named list of Kubernetes-style tolerations that is
 written to every inference request from that account at
 `nvext.routing_constraints.tolerations`, for realtime, flex and batch traffic
 alike. A backend that honours tolerations uses them to decide which capacity may
-serve the request. The wording is backend-agnostic.
+serve the request. The wording is backend-agnostic. Pinning restricts where an
+account's requests can be placed, which makes scheduling strictly harder for
+every account, not just the pinned one; pin as few accounts as possible and only
+when a customer requires it.
 
 ```yaml
 scheduling:
