@@ -6,6 +6,9 @@ import { EditUserModal } from "./EditUserModal";
 const { mutateAsync } = vi.hoisted(() => ({ mutateAsync: vi.fn() }));
 vi.mock("../../../api/control-layer", () => ({
   useUpdateUser: () => ({ mutateAsync, isPending: false }),
+  useConfig: () => ({
+    data: { scheduling_toleration_presets: [], onwards: { strict_mode: false } },
+  }),
 }));
 
 describe("EditUserModal serving payload permissions", () => {

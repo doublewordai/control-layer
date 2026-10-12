@@ -169,6 +169,12 @@ export interface ConfigResponse {
     /** Whether strict mode is enabled (uses trusted flag for providers) */
     strict_mode: boolean;
   };
+  /**
+   * The scheduling-toleration presets an account may be pinned to
+   * (`scheduling.toleration_presets`). The account settings control renders
+   * these; an empty list means no presets are configured.
+   */
+  scheduling_toleration_presets?: SchedulingTolerationPreset[];
 }
 
 // Model metrics time series point
@@ -515,6 +521,10 @@ export interface User {
   granted_serving_classes?: ServingClassName[];
   default_serving_class?: ServingClassName | null;
   self_hosted_only?: boolean;
+  // Scheduling-toleration preset the account is pinned to (platform managers
+  // only). null/absent = "Default" (nothing pinned); a string is a configured
+  // preset id.
+  toleration_preset?: string | null;
   user_type?: "individual" | "organization"; // User type
   organizations?: OrganizationSummary[]; // only present when include=organizations or for current user
   active_organization_id?: string; // only present for /users/current
@@ -690,6 +700,9 @@ export interface UserUpdateRequest {
   granted_serving_classes?: ServingClassName[];
   default_serving_class?: ServingClassName | null;
   self_hosted_only?: boolean;
+  // Scheduling-toleration preset to pin the account to: platform managers
+  // only. A preset id pins it; null clears the pin ("Default").
+  toleration_preset?: string | null;
 }
 
 export interface GroupUpdateRequest {
@@ -1781,6 +1794,22 @@ export type OrgMemberRole = "owner" | "admin" | "member";
  */
 export type Modality = "realtime" | "batch";
 
+/**
+ * One operator-defined scheduling-toleration preset, declared in the
+ * deployment's `scheduling.toleration_presets`. An account stores only the
+ * preset's `id` (`toleration_preset`); the deployment resolves id to
+ * tolerations. `GET /admin/api/v1/config` exposes these for the account
+ * settings control.
+ */
+export interface SchedulingTolerationPreset {
+  /** Stable slug stored on the account. */
+  id: string;
+  /** Short human label for the control. */
+  label: string;
+  /** One or two sentences of help text (the tooltip). */
+  description: string;
+}
+
 export interface OrganizationSummary {
   id: string;
   name: string;
@@ -1818,6 +1847,11 @@ export interface Organization extends User {
    * organization owns. Empty (or absent) means everything is allowed.
    */
   disabled_modalities?: Modality[];
+  /**
+   * Scheduling-toleration preset every request from this organization is
+   * pinned to (platform managers only). null/absent = "Default".
+   */
+  toleration_preset?: string | null;
 }
 
 export interface OrganizationMember {
@@ -1850,6 +1884,9 @@ export interface OrganizationUpdateRequest {
   self_hosted_only?: boolean;
   /** Replaces the whole set; owner-only. An empty list re-enables everything. */
   disabled_modalities?: Modality[];
+  // Scheduling-toleration preset to pin the organization to: platform managers
+  // only. A preset id pins it; null clears the pin ("Default").
+  toleration_preset?: string | null;
 }
 
 export interface InviteMemberRequest {

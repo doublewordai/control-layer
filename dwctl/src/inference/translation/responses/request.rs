@@ -87,7 +87,18 @@ pub fn to_chat_request(request: &ResponsesRequest) -> ChatCompletionRequest {
         parallel_tool_calls: request.parallel_tool_calls,
         response_format: convert_text_format_to_response_format(request.text.as_ref()),
         service_tier: None,
-        extra: None,
+        // `nvext` is a dwctl routing extension the outer inference middleware
+        // writes to the body (the account's scheduling tolerations, and in
+        // strict mode onwards' router targets). It has no Responses-API
+        // equivalent, so this flat converter must carry it across explicitly:
+        // the translator sits inner to the inference middleware, and onwards
+        // reads the tolerations off the Chat Completions body this produces.
+        // Every other Responses-only field is left out, as before.
+        extra: request
+            .extra
+            .as_ref()
+            .and_then(|value| value.get("nvext"))
+            .map(|nvext| serde_json::json!({ "nvext": nvext })),
     }
 }
 
@@ -834,5 +845,33 @@ mod tests {
         }))
         .unwrap();
         assert!(to_chat_request(&blocking).stream_options.is_none());
+    }
+
+    #[test]
+    fn nvext_survives_translation_and_nothing_else_does() {
+        // The account's scheduling tolerations reach the request body as
+        // `nvext` before this translator runs, so it must carry `nvext` onto
+        // the Chat Completions body onwards reads. A Responses-only field is
+        // still dropped.
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o",
+            "input": "Hello",
+            "nvext": {"routing_constraints": {"tolerations": [{"key": "pool", "operator": "Exists"}]}},
+            "store": true
+        }))
+        .unwrap();
+
+        let chat = to_chat_request(&request);
+        let body = serde_json::to_value(&chat).unwrap();
+        assert_eq!(
+            body["nvext"]["routing_constraints"]["tolerations"],
+            serde_json::json!([{"key": "pool", "operator": "Exists"}]),
+            "the pinned tolerations survive translation: {body}"
+        );
+        assert!(body.get("store").is_none(), "a Responses-only field is not carried over: {body}");
+
+        // A request without `nvext` stays without it.
+        let plain: ResponsesRequest = serde_json::from_value(serde_json::json!({"model": "gpt-4o", "input": "Hello"})).unwrap();
+        assert!(serde_json::to_value(to_chat_request(&plain)).unwrap().get("nvext").is_none());
     }
 }

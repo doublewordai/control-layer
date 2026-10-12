@@ -2,7 +2,11 @@
 
 import { type ColumnDef } from "@tanstack/react-table";
 import { ArrowUpDown, Edit2, Trash2, Eye, Receipt } from "lucide-react";
-import type { Organization } from "@/api/control-layer/types";
+import type {
+  Organization,
+  SchedulingTolerationPreset,
+} from "@/api/control-layer/types";
+import { presetBadgeLabel } from "@/utils/schedulingPresets";
 
 interface OrganizationColumnActions {
   onView: (org: Organization) => void;
@@ -10,6 +14,8 @@ interface OrganizationColumnActions {
   onDelete: (org: Organization) => void;
   onManageBilling?: (org: Organization) => void;
   canDelete: boolean;
+  /** The configured presets, for labelling the badge. */
+  tolerationPresets?: SchedulingTolerationPreset[];
 }
 
 export const createOrganizationColumns = (
@@ -28,11 +34,25 @@ export const createOrganizationColumns = (
     ),
     cell: ({ row }) => {
       const org = row.original;
+      const badge = presetBadgeLabel(
+        org.toleration_preset,
+        actions.tolerationPresets,
+      );
       return (
         <div>
-          <p className="font-medium text-doubleword-neutral-900">
-            {org.display_name || org.username}
-          </p>
+          <div className="flex items-center gap-2">
+            <p className="font-medium text-doubleword-neutral-900">
+              {org.display_name || org.username}
+            </p>
+            {badge && (
+              <span
+                className="text-xs px-2 py-0.5 bg-gray-100 text-gray-700 rounded-full"
+                title={`Scheduling tolerations pinned: ${badge}`}
+              >
+                {badge}
+              </span>
+            )}
+          </div>
           <p className="text-sm text-doubleword-neutral-500">{org.username}</p>
         </div>
       );

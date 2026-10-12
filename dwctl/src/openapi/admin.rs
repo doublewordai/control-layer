@@ -141,6 +141,7 @@ impl Modify for AdminSecurityAddon {
             api::models::users::UserCreate,
             api::models::users::UserUpdate,
             api::models::users::UserResponse,
+            crate::api::handlers::config::TolerationPresetResponse,
             api::models::users::CurrentUser,
             api::models::users::ListUsersQuery,
             api::models::api_keys::ApiKeyCreate,

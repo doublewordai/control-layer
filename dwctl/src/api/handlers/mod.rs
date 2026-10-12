@@ -46,6 +46,33 @@ pub(crate) fn validate_elevated_serving_class(class: &str) -> crate::errors::Res
         }),
     }
 }
+
+/// Validate a scheduling-toleration preset id supplied through the API against
+/// the presets this deployment declares (`scheduling.toleration_presets`). An
+/// unknown id is refused here, so an operator sees the typo rather than the
+/// account silently falling back to the fail-closed behaviour on the request
+/// path.
+pub(crate) fn validate_toleration_preset<P: sqlx_pool_router::PoolProvider + Clone>(
+    state: &crate::AppState<P>,
+    preset: &str,
+) -> crate::errors::Result<()> {
+    let config = state.current_config();
+    if config.scheduling.preset(preset).is_some() {
+        return Ok(());
+    }
+    Err(crate::errors::Error::BadRequest {
+        message: format!(
+            "Unknown scheduling toleration preset '{preset}'. Valid values: {}.",
+            config
+                .scheduling
+                .toleration_presets
+                .iter()
+                .map(|preset| preset.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    })
+}
 pub mod auth;
 pub mod batch_requests;
 pub mod batches;

@@ -37,6 +37,19 @@ pub struct OnwardsConfigResponse {
     pub strict_mode: bool,
 }
 
+/// One scheduling-toleration preset an account may be pinned to, as declared
+/// in `scheduling.toleration_presets`. The dashboard lists these in the
+/// account settings control.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct TolerationPresetResponse {
+    /// Stable slug stored on an account (`users.toleration_preset`).
+    pub id: String,
+    /// Short human label for the control.
+    pub label: String,
+    /// One or two sentences of help text (the dashboard tooltip).
+    pub description: String,
+}
+
 /// Instance configuration and capabilities
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ConfigResponse {
@@ -67,6 +80,11 @@ pub struct ConfigResponse {
     pub ai_api_base_url: Option<String>,
     /// Onwards AI proxy configuration
     pub onwards: OnwardsConfigResponse,
+    /// The scheduling-toleration presets an account may be pinned to
+    /// (`scheduling.toleration_presets`). Operators set an account's
+    /// `toleration_preset` to one of these ids; the dashboard renders them in
+    /// the account settings control.
+    pub scheduling_toleration_presets: Vec<TolerationPresetResponse>,
 }
 
 #[utoipa::path(
@@ -135,6 +153,16 @@ pub async fn get_config(State(state): State<AppState>, _user: CurrentUser) -> im
         onwards: OnwardsConfigResponse {
             strict_mode: config.onwards.strict_mode,
         },
+        scheduling_toleration_presets: config
+            .scheduling
+            .toleration_presets
+            .iter()
+            .map(|preset| TolerationPresetResponse {
+                id: preset.id.clone(),
+                label: preset.label.clone(),
+                description: preset.description.clone(),
+            })
+            .collect(),
     };
 
     Json(response)

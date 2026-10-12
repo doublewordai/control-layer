@@ -2584,6 +2584,7 @@ mod tests {
             continuation: Default::default(),
             heap_profiling: Default::default(),
             keystore: None,
+            scheduling: Default::default(),
         };
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
 

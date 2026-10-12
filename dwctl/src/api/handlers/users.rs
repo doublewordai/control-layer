@@ -4,6 +4,7 @@ use sqlx_pool_router::PoolProvider;
 
 use crate::{
     AppState,
+    api::handlers::validate_toleration_preset,
     api::models::{
         groups::GroupResponse,
         pagination::PaginatedResponse,
@@ -96,6 +97,10 @@ pub async fn list_users<P: PoolProvider>(
     // Check if user has permission to view billing data (Credits ReadAll)
     let can_view_billing = permissions::has_permission(&current_user, Resource::Credits, Operation::ReadAll);
 
+    // Platform managers see each account's pinned scheduling tolerations in the
+    // list (drives the "dedicated capacity" badge); nobody else does.
+    let can_update_all_users = permissions::can_update_all_resources(&current_user, Resource::Users);
+
     // If includes billing AND user has permission, create balances_map.
     //
     // Both billing facts are fetched together so `include=billing` means the
@@ -133,7 +138,12 @@ pub async fn list_users<P: PoolProvider>(
 
     // Iterate through and enrich users
     for user in users {
-        let mut response_user = UserResponse::from(user);
+        let toleration_preset = if can_update_all_users {
+            user.toleration_preset.clone()
+        } else {
+            None
+        };
+        let mut response_user = UserResponse::from(user).with_toleration_preset(toleration_preset);
         // If includes groups
         if let Some(groups_map) = &groups_map
             && let Some(user_groups_map) = &user_groups_map
@@ -256,7 +266,17 @@ pub async fn get_user<P: PoolProvider>(
         id: target_user_id.to_string(),
     })?;
 
-    let mut response = UserResponse::from(user);
+    // The scheduling-toleration preset is an operator's routing decision, so
+    // only platform managers (UpdateAll on users) see it, here as well as on
+    // the PATCH. `UserResponse::from` deliberately drops the field.
+    let can_update_all_users = permissions::can_update_all_resources(&current_user, Resource::Users);
+    let toleration_preset = if can_update_all_users {
+        user.toleration_preset.clone()
+    } else {
+        None
+    };
+
+    let mut response = UserResponse::from(user).with_toleration_preset(toleration_preset);
 
     // Include billing if requested and permitted
     // Permitted if:
@@ -442,7 +462,8 @@ pub async fn update_user<P: PoolProvider>(
     if !can_update_all_users
         && (user_data.granted_serving_classes.is_some()
             || user_data.default_serving_class.is_some()
-            || user_data.self_hosted_only.is_some())
+            || user_data.self_hosted_only.is_some()
+            || user_data.toleration_preset.is_some())
     {
         return Err(Error::InsufficientPermissions {
             required: Permission::Allow(Resource::Users, Operation::UpdateAll),
@@ -457,6 +478,12 @@ pub async fn update_user<P: PoolProvider>(
         for class in classes {
             super::validate_elevated_serving_class(class)?;
         }
+    }
+    // Reject a preset id this deployment does not define, so a typo fails here
+    // rather than silently pinning the account to nothing (or, at request
+    // time, failing closed to the most restrictive list).
+    if let Some(Some(preset)) = &user_data.toleration_preset {
+        validate_toleration_preset(&state, preset)?;
     }
 
     // Validate auto-topup fields if provided
@@ -488,7 +515,14 @@ pub async fn update_user<P: PoolProvider>(
     let db_request = UserUpdateDBRequest::new(user_data);
 
     let user = repo.update(user_id, &db_request).await?;
-    Ok(Json(UserResponse::from(user)))
+    // Only a platform manager could have set a preset (the UpdateAll gate above
+    // rejects anyone else), so they are the only caller who sees it back.
+    let toleration_preset = if can_update_all_users {
+        user.toleration_preset.clone()
+    } else {
+        None
+    };
+    Ok(Json(UserResponse::from(user).with_toleration_preset(toleration_preset)))
 }
 
 // DELETE /user/{user_id} - Delete user (admin only)
