@@ -881,6 +881,12 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> ResponseStore for Fusillad
         let Some(body) = detail.body.as_deref().filter(|body| !body.is_empty()) else {
             return Ok(None);
         };
+        // A flex ZDR request remains encrypted at rest after its request key is
+        // shredded. If the owner later disables ZDR, a continuation can reach
+        // this lookup, but the prior input is permanently unavailable.
+        if crate::inference::zdr::is_zdr_body(body) {
+            return Ok(None);
+        }
         let request: serde_json::Value =
             serde_json::from_str(body).map_err(|e| StoreError::SerializationError(format!("Failed to parse previous request: {e}")))?;
         let input = request
