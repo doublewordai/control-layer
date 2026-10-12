@@ -1,5 +1,24 @@
 # Changelog
 
+## [14.0.0](https://github.com/doublewordai/control-layer/compare/v13.7.0...v14.0.0) (2026-10-12)
+
+
+### ⚠ BREAKING CHANGES
+
+* retire the generation-1 request template heap ([#1575](https://github.com/doublewordai/control-layer/issues/1575))
+
+### Features
+
+* **accounts:** per-account scheduling toleration presets ([#1954](https://github.com/doublewordai/control-layer/issues/1954)) ([124032b](https://github.com/doublewordai/control-layer/commit/124032bb7ed2857855c3428768839d803c8b5fc8))
+* **dashboard:** add dark mode with light/dark/system switcher ([#1942](https://github.com/doublewordai/control-layer/issues/1942)) ([d4a9547](https://github.com/doublewordai/control-layer/commit/d4a9547f5d2e90b16bf1a76fe1489ba03e96aade))
+* **onwards:** stop logging rejections and unsupported parameters ([#1963](https://github.com/doublewordai/control-layer/issues/1963)) ([68315f4](https://github.com/doublewordai/control-layer/commit/68315f4941a15217cdbd31f0adba3a0c22aa9478))
+* retire the generation-1 request template heap ([#1575](https://github.com/doublewordai/control-layer/issues/1575)) ([ebe9807](https://github.com/doublewordai/control-layer/commit/ebe980704bc29f751e425b86ff3df259fa841ed3))
+
+
+### Bug Fixes
+
+* keep API keys out of rate-limit and proxy debug logs ([#1960](https://github.com/doublewordai/control-layer/issues/1960)) ([43bf8e8](https://github.com/doublewordai/control-layer/commit/43bf8e84cf8e08a0d863351b86b12c913f57ec92))
+
 ## [13.7.0](https://github.com/doublewordai/control-layer/compare/v13.6.0...v13.7.0) (2026-10-10)
 
 
