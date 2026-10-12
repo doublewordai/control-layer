@@ -82,7 +82,7 @@ fn counted(alias: &str) -> bool {
 
 #[tokio::test]
 async fn flagged_params_are_counted_and_forwarded_unchanged() {
-    let alias = "log-only-model";
+    let alias = "observe-only-model";
     let mock = MockHttpClient::new(StatusCode::OK, COMPLETION);
     let server = server(alias, mock.clone(), &[]);
     let body = request(alias, json!({"logprobs": true, "top_logprobs": 3}));
