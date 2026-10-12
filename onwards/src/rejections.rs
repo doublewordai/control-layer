@@ -1,4 +1,4 @@
-//! Counting, tracing and logging of the requests onwards refuses itself.
+//! Counting and tracing of the requests onwards refuses itself.
 //!
 //! Every client error onwards decides on, as opposed to one reporting an
 //! upstream's response:
@@ -10,28 +10,15 @@
 //!   `onwards.account` and `onwards.api_key_id` (when the key has them) on the
 //!   current span, and the response status on onwards' request span. A
 //!   strict-mode refusal made before that span exists needs an embedding
-//!   gateway's request span; the standalone server has none;
-//! - is logged once at `info` with the same fields, except refusals by a rate,
-//!   concurrency or in-flight limit. A client retrying in a tight loop would
-//!   otherwise log every attempt; those are counted and traced only.
+//!   gateway's request span; the standalone server has none.
 //!
 //! Request values and bodies are never recorded.
 
 use axum::http::{HeaderMap, StatusCode};
-use tracing::info;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
-use crate::{
-    AppState,
-    client::HttpClient,
-    errors::{CONCURRENCY_LIMIT_CODE, INFLIGHT_LIMIT_CODE, OnwardsErrorResponse, RATE_LIMIT_CODE},
-    serving,
-};
-
-/// Codes of the refusals by a request limit, which are not logged. `rate_limit`
-/// covers the key's, the model's and a provider's rate limit.
-const LIMIT_CODES: &[&str] = &[RATE_LIMIT_CODE, CONCURRENCY_LIMIT_CODE, INFLIGHT_LIMIT_CODE];
+use crate::{AppState, client::HttpClient, errors::OnwardsErrorResponse, serving};
 
 /// What is known about a request when onwards refuses it.
 #[derive(Debug, Clone)]
@@ -126,45 +113,5 @@ impl RejectionContext {
         if let Some(api_key_id) = self.api_key_id {
             span.set_attribute("onwards.api_key_id", api_key_id.to_string());
         }
-
-        if !logs_rejection(code) {
-            return;
-        }
-        info!(
-            status = status.as_u16(),
-            code,
-            param = param.unwrap_or(""),
-            model,
-            account = self.account.as_deref().unwrap_or(""),
-            api_key_id = ?self.api_key_id,
-            traffic = self.traffic,
-            "Request rejected by the gateway"
-        );
-    }
-}
-
-/// Whether a rejection with `code` gets a log line as well as its count and
-/// span attributes.
-fn logs_rejection(code: &str) -> bool {
-    !LIMIT_CODES.contains(&code)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn limit_refusals_are_not_logged() {
-        assert!(!logs_rejection("rate_limit"));
-        assert!(!logs_rejection("concurrency_limit_exceeded"));
-        assert!(!logs_rejection("inflight_limit_exceeded"));
-    }
-
-    #[test]
-    fn other_rejections_are_logged() {
-        assert!(logs_rejection("unsupported_value"));
-        assert!(logs_rejection("model_not_found"));
-        assert!(logs_rejection("forbidden"));
-        assert!(logs_rejection(""));
     }
 }

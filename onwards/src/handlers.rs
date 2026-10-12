@@ -28,7 +28,8 @@ use axum::{
 };
 use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
 use serde_json::map::Entry;
-use tracing::{Instrument, debug, error, info, instrument, trace, warn};
+use tracing::{Instrument, debug, error, instrument, trace, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 /// Adapter to extract W3C trace context from an axum HeaderMap.
@@ -503,7 +504,6 @@ pub async fn target_message_handler<T: HttpClient>(
     if req.headers().contains_key("traceparent") {
         let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
         let parent_ctx = propagator.extract(&HeaderExtractor(req.headers()));
-        use tracing_opentelemetry::OpenTelemetrySpanExt;
         let _ = span.set_parent(parent_ctx);
     }
 
@@ -830,8 +830,8 @@ pub async fn target_message_handler<T: HttpClient>(
         None
     };
 
-    // Chat parameters not every worker can serve. Each is logged and counted;
-    // the configured ones are refused here.
+    // Chat parameters not every worker can serve. Each is counted and recorded
+    // on the request span; the configured ones are refused here.
     let flagged_params = match body_json.as_ref() {
         Some(body)
             if state.targets.strict_mode
@@ -860,15 +860,14 @@ pub async fn target_message_handler<T: HttpClient>(
             )
             .increment(1);
         }
-        info!(
-            params = %flagged_params.join(","),
-            rejected = %rejected.join(","),
-            model = %model_name,
-            account = account_id.as_deref().unwrap_or(""),
-            api_key_id = ?authenticated_api_key_id,
-            traffic,
-            "Request uses parameters not every worker supports"
-        );
+        let span = tracing::Span::current();
+        span.set_attribute("onwards.unsupported_params", flagged_params.join(","));
+        if let Some(account) = &account_id {
+            span.set_attribute("onwards.account", account.clone());
+        }
+        if let Some(api_key_id) = authenticated_api_key_id {
+            span.set_attribute("onwards.api_key_id", api_key_id.to_string());
+        }
         if let Some(first) = rejected.first() {
             record_response_status(400);
             return Err(OnwardsErrorResponse::invalid_request(
@@ -1503,7 +1502,6 @@ pub async fn target_message_handler<T: HttpClient>(
         //   letting the third party re-emit our trace IDs on its own outbound
         //   calls.
         if resolve_trace_propagation(target, pool.is_trusted()) {
-            use tracing_opentelemetry::OpenTelemetrySpanExt;
             let ctx = tracing::Span::current().context();
             let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
             propagator.inject_context(&ctx, &mut HeaderInjector(&mut attempt_headers));

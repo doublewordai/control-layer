@@ -170,7 +170,7 @@ pub struct AppState<T: HttpClient> {
     /// that tolerates latency and runs its own retry policy.
     pub first_token_timeout_exempt_header: Option<String>,
     /// Parameters from [`unsupported_params::params`] that get a 400 instead of
-    /// being forwarded. Every other flagged parameter is only logged and counted.
+    /// being forwarded. Every other flagged parameter is only counted and traced.
     pub rejected_params: Vec<&'static str>,
     pub inflight_limiter: Arc<dyn inflight::InflightLimiter>,
     /// Enforces the per-model batch in-flight cap. Off, dispatched batch

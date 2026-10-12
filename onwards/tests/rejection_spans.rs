@@ -1,5 +1,6 @@
-//! Span attributes for the requests onwards rejects itself, using an
-//! in-memory span exporter.
+//! Span attributes for the requests onwards rejects itself, and for those
+//! using parameters not every worker supports, using an in-memory span
+//! exporter.
 
 use std::sync::{Arc, Mutex};
 
@@ -19,6 +20,7 @@ const ALIAS: &str = "span-model";
 const KEY: &str = "sk-span-test";
 const ACCOUNT: &str = "account-1";
 const API_KEY_ID: &str = "6f1c2a7e-0b5d-4c1e-9a3f-2d8e7b6a5c41";
+const COMPLETION: &str = r#"{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"span-model","choices":[{"index":0,"message":{"role":"assistant","content":"Hi"},"finish_reason":"stop"}]}"#;
 
 #[derive(Debug, Clone, Default)]
 struct SpanRecorder(Arc<Mutex<Vec<SpanData>>>);
@@ -46,7 +48,7 @@ fn router() -> Router {
     )
     .unwrap();
     targets.strict_mode = true;
-    let mock = MockHttpClient::new(StatusCode::OK, "{}");
+    let mock = MockHttpClient::new(StatusCode::OK, COMPLETION);
     build_strict_router(AppState::with_client(targets, mock))
 }
 
@@ -155,4 +157,27 @@ async fn early_strict_rejections_are_recorded_on_the_enclosing_span() {
     );
     assert_eq!(attribute(gateway, "onwards.rejection.param"), None);
     assert_caller(gateway);
+}
+
+#[tokio::test]
+async fn forwarded_unsupported_params_are_recorded_on_the_request_span() {
+    let (status, spans) = send(
+        "/chat/completions",
+        json!({
+            "model": ALIAS,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "logprobs": true,
+            "top_logprobs": 3
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let request = span(&spans, "onwards.request");
+    assert_eq!(
+        attribute(request, "onwards.unsupported_params"),
+        Some(AttributeValue::from("logprobs,top_logprobs"))
+    );
+    assert_eq!(attribute(request, "error.type"), None);
+    assert_caller(request);
 }
