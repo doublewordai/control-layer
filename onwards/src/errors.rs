@@ -17,10 +17,12 @@ use uuid::Uuid;
 
 use crate::reasoning::ReasoningError;
 
+/// Error code for a request refused by the caller's own rate limit.
+pub(crate) const RATE_LIMIT_CODE: &str = "rate_limit";
 /// Error code for a request refused because the caller's own concurrency
 /// limit is reached.
-const CONCURRENCY_LIMIT_CODE: &str = "concurrency_limit_exceeded";
-const INFLIGHT_LIMIT_CODE: &str = "inflight_limit_exceeded";
+pub(crate) const CONCURRENCY_LIMIT_CODE: &str = "concurrency_limit_exceeded";
+pub(crate) const INFLIGHT_LIMIT_CODE: &str = "inflight_limit_exceeded";
 /// Error code for a batch request refused because the model's global batch
 /// in-flight cap is reached. A 529, never a 429: the batch dispatcher cuts its
 /// adaptive concurrency on overload, so it must back off rather than treat the
@@ -115,7 +117,7 @@ impl OnwardsErrorResponse {
                 message: "You are sending requests too quickly. Please slow down.".to_string(),
                 r#type: "rate_limit_error".to_string(),
                 param: None,
-                code: "rate_limit".to_string(),
+                code: RATE_LIMIT_CODE.to_string(),
             }),
             status: StatusCode::TOO_MANY_REQUESTS,
             serving_outcome: None,

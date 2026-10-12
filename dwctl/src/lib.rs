@@ -2390,6 +2390,13 @@ pub async fn build_router(
             realtime_ttl,
             token_ttl,
             pool: Some(sqlx_pool_router::DynPools::new(state.db.clone())),
+            keystore: state.keystore.clone(),
+            // Same policy map the inference middleware decides ZDR from, so a
+            // realtime ZDR caller's images are inlined rather than stored.
+            key_policy_cache: inference_middleware_state
+                .as_ref()
+                .map(|s| s.key_policy_cache.clone())
+                .unwrap_or_else(crate::sync::key_policy::KeyPolicyCache::empty),
         };
         onwards_router.layer(middleware::from_fn_with_state(
             image_normalizer_state,
@@ -4364,12 +4371,12 @@ impl Application {
         // No classifier is injected here.
         // Request-body edits (id-scrub, streaming usage flags) now live in dwctl's own
         // `outbound_request` middleware, so onwards needs no BodyTransformFn.
-        // One Redis pool for both in-flight limiters. The realtime per-account
-        // limit and the global batch cap share the configured connection; each
-        // has its own scope and switch. With no Redis URL the pool is `None`
-        // and both fall back to counting within this replica.
+        // One Redis connection for both in-flight limiters. The realtime
+        // per-account limit and the global batch cap share it; each has its own
+        // scope and switch. With no Redis URL it is `None` and both fall back to
+        // counting within this replica.
         let limits_redis =
-            crate::realtime_inflight::RealtimeInflightLimiter::redis_pool(config.limits.realtime_inflight.redis_url.as_deref())?;
+            crate::realtime_inflight::RealtimeInflightLimiter::shared_redis(config.limits.realtime_inflight.redis_url.as_deref())?;
         let mut onwards_app_state = onwards::AppState::new(bg_services.onwards_targets.clone())
             .with_response_transform(onwards::create_openai_sanitizer())
             .with_upstream_rate_limit_message(config.onwards.upstream_rate_limit_message.clone())

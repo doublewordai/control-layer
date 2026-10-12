@@ -1,5 +1,57 @@
 # Changelog
 
+## [13.7.0](https://github.com/doublewordai/control-layer/compare/v13.6.0...v13.7.0) (2026-10-10)
+
+
+### Features
+
+* **limits:** name the account and report its limit on in-flight metrics ([#1958](https://github.com/doublewordai/control-layer/issues/1958)) ([72c6e97](https://github.com/doublewordai/control-layer/commit/72c6e974d435a20ed5cd36f977016434b3b7be4b))
+
+## [13.6.0](https://github.com/doublewordai/control-layer/compare/v13.5.0...v13.6.0) (2026-10-10)
+
+
+### Features
+
+* **limits:** count in-flight limit checks and refusals per account ([#1957](https://github.com/doublewordai/control-layer/issues/1957)) ([f6a7486](https://github.com/doublewordai/control-layer/commit/f6a74865a43a71bb9c3d9228958dfde66c364477))
+* **onwards:** trace rejections and stop logging caller-limit refusals ([#1952](https://github.com/doublewordai/control-layer/issues/1952)) ([f051e4c](https://github.com/doublewordai/control-layer/commit/f051e4c8324f413422fc237abcf3ddac504b9650))
+
+## [13.5.0](https://github.com/doublewordai/control-layer/compare/v13.4.3...v13.5.0) (2026-10-09)
+
+
+### Features
+
+* **zdr:** encrypt images at rest for zero-data-retention requests ([#1953](https://github.com/doublewordai/control-layer/issues/1953)) ([f63e795](https://github.com/doublewordai/control-layer/commit/f63e795fc79f4871b4b85f6fc7d9cc57c0752e4b))
+
+## [13.4.3](https://github.com/doublewordai/control-layer/compare/v13.4.2...v13.4.3) (2026-10-09)
+
+
+### Bug Fixes
+
+* **db:** connect to Postgres with rustls ([#1948](https://github.com/doublewordai/control-layer/issues/1948)) ([baafb4b](https://github.com/doublewordai/control-layer/commit/baafb4b1acf066272b28aa2837eab2b219662823))
+* **images:** look up the caller only for requests with image inputs ([#1949](https://github.com/doublewordai/control-layer/issues/1949)) ([6d71346](https://github.com/doublewordai/control-layer/commit/6d7134641fc5a948bfe317ac28196d0de9303fbd))
+* **limits:** retry failed in-flight slot releases until Redis is back ([#1950](https://github.com/doublewordai/control-layer/issues/1950)) ([26d88b4](https://github.com/doublewordai/control-layer/commit/26d88b4869f2e2c886272d1a7ab2d1baa7893236))
+
+## [13.4.2](https://github.com/doublewordai/control-layer/compare/v13.4.1...v13.4.2) (2026-10-08)
+
+
+### Bug Fixes
+
+* **limits:** retry in-flight Redis reconnects every second ([#1946](https://github.com/doublewordai/control-layer/issues/1946)) ([39af83c](https://github.com/doublewordai/control-layer/commit/39af83ccdfccc1677749dc3eacfa214d6a3a2beb))
+
+## [13.4.1](https://github.com/doublewordai/control-layer/compare/v13.4.0...v13.4.1) (2026-10-08)
+
+
+### Bug Fixes
+
+* **limits:** share one Redis connection for in-flight checks ([#1940](https://github.com/doublewordai/control-layer/issues/1940)) ([1177b69](https://github.com/doublewordai/control-layer/commit/1177b69660044dd09c33bfdf153ecb23b60f2417))
+
+## [13.4.0](https://github.com/doublewordai/control-layer/compare/v13.3.1...v13.4.0) (2026-10-08)
+
+
+### Features
+
+* **responses:** accept Codex tool namespace groups ([#1935](https://github.com/doublewordai/control-layer/issues/1935)) ([9d46bf7](https://github.com/doublewordai/control-layer/commit/9d46bf782d49dec56fa0c262c76e503c3d98e422))
+
 ## [13.3.1](https://github.com/doublewordai/control-layer/compare/v13.3.0...v13.3.1) (2026-10-08)
 
 

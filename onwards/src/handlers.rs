@@ -749,16 +749,17 @@ pub async fn target_message_handler<T: HttpClient>(
     // against the pool that will serve it. Strict: a class named on the
     // request that the account does not hold, or the alias does not offer,
     // is refused rather than quietly downgraded.
-    let (account_id, key_purpose) = bearer_token
+    let (account_id, account_name, key_purpose) = bearer_token
         .as_ref()
         .and_then(|token| state.targets.key_labels.get(token))
         .map(|labels| {
             (
                 labels.get(serving::ACCOUNT_LABEL).cloned(),
+                labels.get(serving::ACCOUNT_NAME_LABEL).cloned(),
                 labels.get("purpose").cloned(),
             )
         })
-        .unwrap_or((None, None));
+        .unwrap_or((None, None, None));
     let serving_resolution: ServingResolution = {
         let account = account_id
             .as_deref()
@@ -927,6 +928,21 @@ pub async fn target_message_handler<T: HttpClient>(
     let mut inflight_slot = match (is_realtime, alias_inflight.as_deref(), account_id.as_deref()) {
         (true, Some(limits), Some(account)) => {
             let limit = limits.for_account(account);
+            let account_name = account_name.unwrap_or_default();
+            metrics::gauge!(
+                "onwards_inflight_account_limit",
+                "model" => model_name.clone(),
+                "account" => account.to_string(),
+                "account_name" => account_name.clone(),
+            )
+            .set(f64::from(limit));
+            metrics::counter!(
+                "onwards_inflight_limit_checks_total",
+                "model" => model_name.clone(),
+                "account" => account.to_string(),
+                "account_name" => account_name.clone(),
+            )
+            .increment(1);
             match state
                 .inflight_limiter
                 .try_acquire(account, &model_name, limit)
@@ -941,6 +957,8 @@ pub async fn target_message_handler<T: HttpClient>(
                     metrics::counter!(
                         "onwards_inflight_limit_refusals_total",
                         "model" => model_name.clone(),
+                        "account" => account.to_string(),
+                        "account_name" => account_name,
                     )
                     .increment(1);
                     record_response_status(429);
@@ -1001,7 +1019,10 @@ pub async fn target_message_handler<T: HttpClient>(
             && let Some(limiter) = state.targets.key_rate_limiters.get(token)
             && limiter.check().is_err()
         {
-            debug!("Per-key rate limit exceeded for token: {}", token);
+            debug!(
+                api_key_id = ?authenticated_api_key_id,
+                "Per-key rate limit exceeded"
+            );
             record_response_status(429);
             return Err(OnwardsErrorResponse::rate_limited());
         }
@@ -1041,7 +1062,10 @@ pub async fn target_message_handler<T: HttpClient>(
                 match limiter.try_acquire() {
                     Some(guard) => Some(guard),
                     None => {
-                        debug!("Per-key concurrency limit exceeded for token: {}", token);
+                        debug!(
+                            api_key_id = ?authenticated_api_key_id,
+                            "Per-key concurrency limit exceeded"
+                        );
                         return Err(OnwardsErrorResponse::concurrency_limited());
                     }
                 }

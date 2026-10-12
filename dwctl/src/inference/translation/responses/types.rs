@@ -624,6 +624,64 @@ pub enum Tool {
         /// Name of the server-side tool to enable for this request.
         name: String,
     },
+
+    /// A named group of tools (`{"type": "namespace", ...}`).
+    ///
+    /// Codex wraps its function tools in a `namespace` group on the Responses
+    /// wire — usually `functions`, sometimes an MCP server namespace, and
+    /// potentially a namespace per group. The translation layer flattens the
+    /// group into ordinary function tools (see
+    /// `request::flatten_tool_namespaces`) because Chat Completions has no
+    /// namespaced-tool concept.
+    #[serde(rename = "namespace")]
+    Namespace {
+        /// Namespace name (e.g. `functions`).
+        name: String,
+        /// Namespace description; Codex sends an empty string for the default
+        /// `functions` namespace.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        /// Grouped tools. `function` members are flattened; `custom` members
+        /// (freeform tools, e.g. `apply_patch`) are dropped, as they have no
+        /// Chat Completions equivalent.
+        tools: Vec<NamespaceTool>,
+    },
+}
+
+/// A tool nested inside a [`Tool::Namespace`] group.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum NamespaceTool {
+    #[serde(rename = "function")]
+    Function {
+        name: String,
+        description: String,
+        parameters: serde_json::Value,
+        /// Optional here rather than defaulted to `true` like the top-level
+        /// tool: the request echo must not invent a value the caller omitted.
+        /// Callers that omit it are treated as strict when flattening.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        strict: Option<bool>,
+        /// Deferred-loading hint. Chat Completions has no equivalent, so it is
+        /// not forwarded, but it is kept so the request echo is faithful.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        defer_loading: Option<bool>,
+    },
+
+    /// Freeform tool (grammar-defined input rather than a JSON Schema). Not
+    /// forwarded — Chat Completions has no equivalent — but its definition is
+    /// kept intact so the request echo is faithful.
+    #[serde(rename = "custom")]
+    Custom {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        /// Input grammar (`{type, syntax, definition}`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        defer_loading: Option<bool>,
+    },
 }
 
 /// Tool choice specification
