@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { useUpdateOrganization, useConfig } from "@/api/control-layer/hooks";
+import { useUpdateOrganization, useOrganization, useConfig } from "@/api/control-layer/hooks";
 import type { Organization, ServingClassName } from "@/api/control-layer/types";
 import { SchedulingTolerations } from "@/components/features/scheduling/SchedulingTolerations";
 import {
@@ -45,6 +45,11 @@ export function EditOrganizationModal({
   const [tolerationPreset, setTolerationPreset] = useState<string | null>(null);
   const updateOrg = useUpdateOrganization();
   const { data: config } = useConfig();
+  // List rows carry the pinned preset for platform managers, but a row from a
+  // projection that omits it would read as "Default" and clear the pin on any
+  // unrelated edit. While the modal is open, take the authoritative value from
+  // the detail endpoint.
+  const { data: detail } = useOrganization(isOpen && organization ? organization.id : "");
 
   useEffect(() => {
     if (isOpen && organization) {
@@ -57,6 +62,14 @@ export function EditOrganizationModal({
       setTolerationPreset(organization.toleration_preset ?? null);
     }
   }, [organization, isOpen]);
+
+  // The detail value wins once it arrives (and on every refetch), so the pin is
+  // only sent back as `null` when the operator actually cleared it.
+  useEffect(() => {
+    if (isOpen && detail) {
+      setTolerationPreset(detail.toleration_preset ?? null);
+    }
+  }, [detail, isOpen]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

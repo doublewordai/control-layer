@@ -105,7 +105,12 @@ fn initialize_watcher(config_path: PathBuf) -> anyhow::Result<WatcherState> {
     })
 }
 
-pub async fn watch_config_file(config_path: PathBuf, shared_config: SharedConfig, shutdown_token: CancellationToken) -> anyhow::Result<()> {
+pub async fn watch_config_file(
+    config_path: PathBuf,
+    shared_config: SharedConfig,
+    key_policy_cache: crate::sync::key_policy::KeyPolicyCache,
+    shutdown_token: CancellationToken,
+) -> anyhow::Result<()> {
     let Some(WatcherState {
         config_path,
         watch_dir,
@@ -146,7 +151,13 @@ pub async fn watch_config_file(config_path: PathBuf, shared_config: SharedConfig
                 .await
                 {
                     Ok(Ok(config)) => {
-                        shared_config.store(config);
+                        shared_config.store(config.clone());
+                        // Re-resolve the toleration presets so a reload can add,
+                        // change or drop them without a restart; a dropped id
+                        // then fails closed on the next request instead of
+                        // resolving to a stale value. The per-key map is left
+                        // alone (its own trigger-driven refresh reloads it).
+                        key_policy_cache.replace_presets(crate::scheduling::TolerationPresets::new(&config.scheduling));
                         info!(path = %config_path.display(), "Reloaded config from disk");
                     }
                     Ok(Err(error)) => {
@@ -266,6 +277,7 @@ mod tests {
         let result = watch_config_file(
             PathBuf::from("/definitely/missing/dwctl.toml"),
             SharedConfig::new(Config::default()),
+            crate::sync::key_policy::KeyPolicyCache::empty(),
             shutdown,
         )
         .await;

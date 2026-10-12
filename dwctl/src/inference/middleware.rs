@@ -1538,7 +1538,7 @@ mod tests {
             [(
                 "sk-pinned".to_string(),
                 crate::sync::key_policy::KeyPolicy {
-                    toleration_preset: Some("no-overflow".to_string()),
+                    toleration_preset: Some("no-overflow".into()),
                     ..Default::default()
                 },
             )],

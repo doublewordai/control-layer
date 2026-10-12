@@ -19,6 +19,13 @@
 -- The column lives on `users` because an account *is* a row in `users`
 -- (organizations are `user_type = 'organization'`), alongside the other
 -- account-wide flags (`zero_data_retention`, `disabled_modalities`).
+
+-- Adding a column takes an ACCESS EXCLUSIVE lock on a hot table; bound the wait
+-- so a long-running query on `users` fails this migration and lets it retry
+-- rather than queueing every subsequent request behind the lock. Same guard the
+-- other account-setting migrations use.
+SET LOCAL lock_timeout = '5s';
+
 ALTER TABLE users
     ADD COLUMN IF NOT EXISTS toleration_preset TEXT;
 

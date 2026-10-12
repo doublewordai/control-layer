@@ -163,6 +163,32 @@ impl Fixture {
             .unwrap()
     }
 
+    /// Post a Responses request carrying a client-supplied toleration and
+    /// return the Chat Completions body the upstream actually received. The
+    /// account's preset must survive the Responses-to-Chat translation.
+    async fn post_responses(&self) -> Value {
+        let body = json!({
+            "model": "plain",
+            "input": "hi",
+            "max_output_tokens": 16,
+            "nvext": {"routing_constraints": {"tolerations": [{"operator": "Exists"}]}}
+        });
+        self.server
+            .post("/ai/v1/responses")
+            .add_header("Authorization", format!("Bearer {}", self.key))
+            .json(&body)
+            .await
+            .assert_status_ok();
+        self.upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .body_json()
+            .unwrap()
+    }
+
     /// Upload a one-line batch file for this account and return the stored
     /// template body, which is what the daemon later dispatches upstream.
     async fn upload_batch(&self) -> Value {
@@ -284,6 +310,22 @@ async fn an_unconfigured_preset_at_runtime_fails_closed_to_the_empty_list(pool: 
         body["nvext"]["routing_constraints"]["tolerations"],
         json!([]),
         "an unknown preset id fails closed to the empty list: {body}"
+    );
+}
+
+/// A pinned `/responses` request keeps its tolerations through the Responses-to-
+/// Chat translation: the translator sits inner to the middleware that stamps
+/// them, so the upstream must receive the preset's list, not lose it.
+#[dwctl_test_macros::test]
+async fn a_preset_account_carries_its_tolerations_on_responses_requests(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+
+    f.set_preset(Some("gpu")).await;
+    let body = f.post_responses().await;
+    assert_eq!(
+        body["nvext"]["routing_constraints"]["tolerations"],
+        json!([{"key": "pool", "operator": "Equal", "value": "gpu"}]),
+        "the preset survives Responses translation: {body}"
     );
 }
 

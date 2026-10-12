@@ -28,6 +28,14 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+/// The sentinel the dashboard's account-settings select uses for "Default": no
+/// preset id is stored, so nothing is pinned. Radix Select forbids an
+/// empty-string item value, hence a sentinel. Reserved here so config load
+/// refuses a preset that would collide with it, rendering duplicate options and
+/// making that preset unselectable. Must stay equal to the dashboard's
+/// `DEFAULT_TOLERATION_PRESET`.
+pub const DEFAULT_PRESET_SENTINEL: &str = "__default__";
+
 /// A fixed list of scheduling tolerations.
 ///
 /// A newtype over `Vec<SchedulingToleration>` so it is a distinct schema in
@@ -119,14 +127,35 @@ impl PinnedTolerations {
 }
 
 /// The deployment's presets, resolved to the JSON the request path writes and
-/// keyed by preset id. Built once at startup from
+/// keyed by preset id. Built at startup from
 /// [`crate::config::SchedulingConfig`], and shared read-only on the request
-/// hot path.
-#[derive(Debug, Clone, Default)]
+/// hot path. Held behind an [`ArcSwap`] so a config reload can swap in new
+/// presets without a restart.
+#[derive(Debug, Clone)]
 pub struct TolerationPresets {
     /// Preset id → the toleration list as the request body JSON. The list is
     /// pre-serialised so the hot path clones an `Arc` and never re-serialises.
-    by_id: HashMap<String, Arc<serde_json::Value>>,
+    /// Behind an [`ArcSwap`] so a reload swaps the whole map atomically.
+    by_id: Arc<arc_swap::ArcSwap<HashMap<String, Arc<serde_json::Value>>>>,
+    /// The pre-resolved fail-closed value (`[]`, the most restrictive list),
+    /// shared so a retired preset does not allocate a fresh `[]` on every
+    /// request.
+    empty: Arc<serde_json::Value>,
+    /// Ids that already logged a fail-closed miss, so a single retired id a
+    /// request path references repeatedly logs once rather than on every
+    /// request. Shared across clones (a reload keeps the log history).
+    reported_unknown: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+impl Default for TolerationPresets {
+    /// No presets: every configured id fails closed to the empty list.
+    fn default() -> Self {
+        Self {
+            by_id: Arc::new(arc_swap::ArcSwap::from_pointee(HashMap::new())),
+            empty: Arc::new(serde_json::json!([])),
+            reported_unknown: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        }
+    }
 }
 
 impl TolerationPresets {
@@ -134,34 +163,60 @@ impl TolerationPresets {
     /// at config load (`SchedulingConfig::validate`), so a duplicate id here is
     /// a programming error: the last one wins.
     pub fn new(config: &crate::config::SchedulingConfig) -> Self {
+        let by_id: HashMap<String, Arc<serde_json::Value>> = config
+            .toleration_presets
+            .iter()
+            .map(|preset| (preset.id.clone(), Arc::new(PinnedTolerations(preset.tolerations.clone()).to_json())))
+            .collect();
         Self {
-            by_id: config
-                .toleration_presets
-                .iter()
-                .map(|preset| (preset.id.clone(), Arc::new(PinnedTolerations(preset.tolerations.clone()).to_json())))
-                .collect(),
+            by_id: Arc::new(arc_swap::ArcSwap::from_pointee(by_id)),
+            empty: Arc::new(serde_json::json!([])),
+            reported_unknown: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
+    }
+
+    /// Swap in a new set of presets, so a config reload can add, change or drop
+    /// them without a restart. A dropped id then fails closed (the next request
+    /// that references it resolves to the empty list) rather than continuing to
+    /// resolve to a stale value.
+    pub fn store(&self, presets: Self) {
+        let by_id = presets.by_id.load_full();
+        self.by_id.store(by_id);
     }
 
     /// Resolve an account's stored preset id to the JSON the request path
     /// writes, or `None` when the account is on "Default" (nothing pinned).
     ///
-    /// An id that is absent from this deployment's config fails closed: it is
-    /// logged and the empty list (`[]`, the most restrictive option) is
-    /// returned, rather than silently leaving the request unpinned.
+    /// An id that is absent from this deployment's config fails closed: the
+    /// empty list (`[]`, the most restrictive option) is returned rather than
+    /// silently leaving the request unpinned, and the miss is logged once per
+    /// distinct id so a single retired id does not flood the log on every
+    /// request.
     pub fn resolve(&self, preset_id: Option<&str>) -> Option<Arc<serde_json::Value>> {
         let id = preset_id?;
-        match self.by_id.get(id) {
+        match self.by_id.load().get(id) {
             Some(tolerations) => Some(tolerations.clone()),
             None => {
-                tracing::error!(
-                    preset_id = id,
-                    "account references a scheduling toleration preset that is not configured; \
-                     failing closed to the empty (most restrictive) toleration list"
-                );
-                Some(Arc::new(serde_json::json!([])))
+                if self.mark_unknown_reported(id) {
+                    tracing::error!(
+                        preset_id = id,
+                        "account references a scheduling toleration preset that is not configured; \
+                         failing closed to the empty (most restrictive) toleration list"
+                    );
+                }
+                Some(self.empty.clone())
             }
         }
+    }
+
+    /// Record that `id` is a fail-closed miss, returning `true` the first time
+    /// it is seen (and so should be logged) and `false` afterwards, so a
+    /// retired id read on a hot path logs once rather than on every request.
+    fn mark_unknown_reported(&self, id: &str) -> bool {
+        self.reported_unknown
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.to_string())
     }
 }
 
@@ -256,6 +311,19 @@ mod tests {
     }
 
     #[test]
+    fn a_repeated_unconfigured_id_logs_its_diagnostic_once() {
+        let presets = TolerationPresets::new(&SchedulingConfig::default());
+        // First sight of the id is logged; a repeat is not, so a retired id a
+        // hot request path references does not flood the log. The fail-closed
+        // value is returned either way.
+        assert!(presets.mark_unknown_reported("retired"));
+        assert!(!presets.mark_unknown_reported("retired"));
+        // A different id is still reported once.
+        assert!(presets.mark_unknown_reported("also-retired"));
+        assert_eq!(presets.resolve(Some("retired")).as_deref(), Some(&serde_json::json!([])));
+    }
+
+    #[test]
     fn preset_config_validation_rejects_duplicates_and_bad_shape() {
         let duplicate = SchedulingConfig {
             toleration_presets: vec![SchedulingConfig::default_preset(), SchedulingConfig::default_preset()],
@@ -271,6 +339,18 @@ mod tests {
             }],
         };
         assert!(empty_id.validate().unwrap_err().contains("empty id"));
+
+        // The dashboard's "Default" sentinel is reserved: a preset using it
+        // would render duplicate select options and be unselectable.
+        let sentinel = SchedulingConfig {
+            toleration_presets: vec![TolerationPreset {
+                id: DEFAULT_PRESET_SENTINEL.to_string(),
+                label: "Collides".to_string(),
+                description: "y".to_string(),
+                tolerations: vec![],
+            }],
+        };
+        assert!(sentinel.validate().unwrap_err().contains("reserved"));
 
         // An `Equal` toleration with no value would not serialise into a valid
         // body, so it is refused at load.

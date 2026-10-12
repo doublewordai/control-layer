@@ -41,7 +41,11 @@ pub struct KeyPolicy {
     /// preset whose toleration list is written verbatim to
     /// `nvext.routing_constraints.tolerations` on every request from this
     /// account. `None` means the account is on "Default" (nothing pinned).
-    pub toleration_preset: Option<String>,
+    ///
+    /// An `Arc<str>` so a per-request [`KeyPolicyCache::policy`] clone (which
+    /// every ZDR and modality read already does) copies a refcount rather than
+    /// allocating a fresh `String`.
+    pub toleration_preset: Option<Arc<str>>,
 }
 
 /// Lock-free, cheap-to-clone handle to the shared secret-to-policy map, plus
@@ -100,8 +104,26 @@ impl KeyPolicyCache {
     /// An id the config no longer defines fails closed to the empty list. Hot
     /// path safe.
     pub fn tolerations(&self, secret: &str) -> Option<Arc<serde_json::Value>> {
-        let policy = self.policy(secret);
-        self.presets.resolve(policy.toleration_preset.as_deref())
+        self.presets.resolve(self.preset_id(secret).as_deref())
+    }
+
+    /// The stored preset id for `secret`, cheaply cloned (an `Arc<str>`), so a
+    /// caller that only needs the id does not allocate a whole `KeyPolicy`.
+    fn preset_id(&self, secret: &str) -> Option<Arc<str>> {
+        self.inner.load().get(secret).and_then(|p| p.toleration_preset.clone())
+    }
+
+    /// The presets a stored id resolves against, for a caller that read an
+    /// account's policy directly rather than through this map.
+    pub fn presets(&self) -> &TolerationPresets {
+        &self.presets
+    }
+
+    /// Replace the resolved preset map, so a config reload can change or drop
+    /// presets without a restart. The account-id map is left alone; the next
+    /// `refresh` reloads it.
+    pub fn replace_presets(&self, presets: TolerationPresets) {
+        self.presets.store(presets);
     }
 
     fn replace(&self, map: HashMap<String, KeyPolicy>) {
@@ -161,7 +183,7 @@ async fn load(pool: &PgPool) -> Result<HashMap<String, KeyPolicy>, sqlx::Error> 
                 KeyPolicy {
                     zdr: r.zero_data_retention,
                     disabled_modalities: ModalitySet::from_db(&r.disabled_modalities),
-                    toleration_preset: r.toleration_preset,
+                    toleration_preset: r.toleration_preset.map(Arc::from),
                 },
             )
         })
@@ -176,6 +198,31 @@ pub async fn refresh(pool: &PgPool, cache: &KeyPolicyCache) -> Result<usize, sql
     let n = map.len();
     cache.replace(map);
     Ok(n)
+}
+
+/// The account policy for one owner, read directly from the DB. The batch
+/// ingest path uses this for an account whose hidden key was just created and
+/// cannot yet be in the map (see `upload_file`). `Ok(default)` for an unknown
+/// owner, matching the map's permissive read for an absent key.
+pub async fn load_policy(conn: &mut sqlx::PgConnection, user_id: crate::types::UserId) -> Result<KeyPolicy, sqlx::Error> {
+    let row = sqlx::query!(
+        r#"
+        SELECT zero_data_retention, disabled_modalities, toleration_preset
+        FROM users
+        WHERE id = $1
+        "#,
+        user_id
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+
+    Ok(row
+        .map(|r| KeyPolicy {
+            zdr: r.zero_data_retention,
+            disabled_modalities: ModalitySet::from_db(&r.disabled_modalities),
+            toleration_preset: r.toleration_preset.map(Arc::from),
+        })
+        .unwrap_or_default())
 }
 
 /// Load the map once, synchronously, returning a populated cache. Call at
@@ -349,14 +396,14 @@ mod tests {
                 (
                     "sk-preset".to_string(),
                     KeyPolicy {
-                        toleration_preset: Some("gpu".to_string()),
+                        toleration_preset: Some("gpu".into()),
                         ..Default::default()
                     },
                 ),
                 (
                     "sk-empty".to_string(),
                     KeyPolicy {
-                        toleration_preset: Some("no-overflow".to_string()),
+                        toleration_preset: Some("no-overflow".into()),
                         ..Default::default()
                     },
                 ),
@@ -386,7 +433,7 @@ mod tests {
             [(
                 "sk-retired".to_string(),
                 KeyPolicy {
-                    toleration_preset: Some("retired".to_string()),
+                    toleration_preset: Some("retired".into()),
                     ..Default::default()
                 },
             )],

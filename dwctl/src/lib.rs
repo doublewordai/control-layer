@@ -4442,7 +4442,12 @@ impl Application {
         if let Some(config_path) = config_path {
             bg_services.spawn(
                 "config-watcher",
-                config_watcher::watch_config_file(config_path, shared_config, bg_services.shutdown_token()),
+                config_watcher::watch_config_file(
+                    config_path,
+                    shared_config,
+                    bg_services.key_policy_cache.clone(),
+                    bg_services.shutdown_token(),
+                ),
             );
         }
 

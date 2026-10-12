@@ -1259,7 +1259,25 @@ pub async fn upload_file<P: PoolProvider>(
     // (`target_user_id` is the org in org context, else the person), so its
     // per-key policy carries the account's preset. Read it from the same policy
     // map realtime uses, so batch and realtime agree on the toleration list.
-    let tolerations = state.key_policy_cache.tolerations(&user_api_key);
+    //
+    // A just-created hidden key cannot be in the policy map yet: the map is
+    // refreshed asynchronously off the auth_config_changed notification, which
+    // this request's `api_keys` INSERT fires but the LISTEN/NOTIFY loop has not
+    // consumed. Neither can it read the account's pin straight off the users row
+    // here (fusillade's database and schema are its own, and the users table is
+    // not in its search path). So when a preset id is configured, read this
+    // upload's own account policy directly instead of falling back to
+    // "Default", which would ignore the preset on the account's first upload.
+    let tolerations = match state.key_policy_cache.tolerations(&user_api_key) {
+        Some(pinned) => Some(pinned),
+        None => {
+            let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+            let policy = crate::sync::key_policy::load_policy(&mut conn, target_user_id)
+                .await
+                .map_err(|e| Error::Database(e.into()))?;
+            state.key_policy_cache.presets().resolve(policy.toleration_preset.as_deref())
+        }
+    };
 
     // Construct batch execution endpoint (where fusillade will send requests)
     let endpoint = format!("http://{}:{}/ai", config.host, config.port);

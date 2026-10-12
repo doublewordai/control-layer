@@ -434,7 +434,19 @@ pub async fn list_organizations<P: PoolProvider>(
 
         let data = orgs
             .into_iter()
-            .map(|o| OrganizationResponse::from_user(UserResponse::from(o)))
+            .map(|o| {
+                // The pinned preset is an operator's routing decision, so it is
+                // disclosed on the same gate as the detail GET (UpdateAll), not
+                // the read gate that reaches this branch. Hiding it from a
+                // read-all caller would also clear a pin on any edit made from
+                // the list, which submits the field back as `null`.
+                let toleration_preset = if can_update_all_resources(&current_user, Resource::Organizations) {
+                    o.toleration_preset.clone()
+                } else {
+                    None
+                };
+                OrganizationResponse::from_user(UserResponse::from(o)).with_toleration_preset(toleration_preset)
+            })
             .collect();
 
         Ok(Json(PaginatedResponse {

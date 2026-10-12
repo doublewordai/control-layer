@@ -326,6 +326,13 @@ impl SchedulingConfig {
                     preset.id
                 ));
             }
+            if preset.id == crate::scheduling::DEFAULT_PRESET_SENTINEL {
+                return Err(format!(
+                    "scheduling.toleration_presets[{index}] id {:?} is reserved for the dashboard's \
+                     \"Default\" option",
+                    preset.id
+                ));
+            }
             if !seen.insert(preset.id.as_str()) {
                 return Err(format!("scheduling.toleration_presets has a duplicate id {:?}", preset.id));
             }

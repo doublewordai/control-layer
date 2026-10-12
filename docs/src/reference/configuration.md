@@ -698,7 +698,7 @@ scheduling:
 | `id` | string | Stable slug stored on the account (`users.toleration_preset`). Must be unique and non-empty; leading/trailing whitespace is rejected. |
 | `label` | string | Short human label for the dashboard control. Must be non-empty. |
 | `description` | string | One or two sentences of help text shown as the dashboard tooltip. Must be non-empty. |
-| `tolerations` | list | The toleration list written to the request, in the request-field shape (`{key, operator?, value?, effect?}`). May be empty. Validated at config load. |
+| `tolerations` | list | The request-field list (`{key, operator?, value?, effect?}`). `operator` defaults to `Equal` and then requires `value`; `Exists` forbids `value`; `effect` may be `NoSchedule` or `PreferNoSchedule`. May be empty; validated at config load. |
 
 The `GET /admin/api/v1/config` endpoint exposes the presets (id, label,
 description) so the dashboard can render the control. An account stores only the
