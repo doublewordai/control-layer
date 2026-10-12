@@ -1019,7 +1019,10 @@ pub async fn target_message_handler<T: HttpClient>(
             && let Some(limiter) = state.targets.key_rate_limiters.get(token)
             && limiter.check().is_err()
         {
-            debug!("Per-key rate limit exceeded for token: {}", token);
+            debug!(
+                api_key_id = ?authenticated_api_key_id,
+                "Per-key rate limit exceeded"
+            );
             record_response_status(429);
             return Err(OnwardsErrorResponse::rate_limited());
         }
@@ -1059,7 +1062,10 @@ pub async fn target_message_handler<T: HttpClient>(
                 match limiter.try_acquire() {
                     Some(guard) => Some(guard),
                     None => {
-                        debug!("Per-key concurrency limit exceeded for token: {}", token);
+                        debug!(
+                            api_key_id = ?authenticated_api_key_id,
+                            "Per-key concurrency limit exceeded"
+                        );
                         return Err(OnwardsErrorResponse::concurrency_limited());
                     }
                 }
