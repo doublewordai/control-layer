@@ -287,7 +287,7 @@ describe("serving setting authorization and cancellation", () => {
     const dialog = within(screen.getByRole("dialog"));
     if (canEditServing) {
       await user.click(dialog.getByRole("checkbox", { name: "Grant interactive" }));
-      await user.click(dialog.getByRole("switch", { name: "Toggle self-hosted only" }));
+      await user.click(dialog.getByRole("switch", { name: "Toggle no external-provider fallback" }));
     }
     await user.click(dialog.getByRole("button", { name: /save/i }));
     await waitFor(() => expect(submitted).toBeDefined());

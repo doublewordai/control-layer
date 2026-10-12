@@ -1,11 +1,7 @@
 import { useState, useEffect } from "react";
-import { useUpdateOrganization } from "@/api/control-layer/hooks";
-import type {
-  Organization,
-  PinnedTolerations,
-  ServingClassName,
-} from "@/api/control-layer/types";
-import { SchedulingRestrictions } from "@/components/features/scheduling/SchedulingRestrictions";
+import { useUpdateOrganization, useConfig } from "@/api/control-layer/hooks";
+import type { Organization, ServingClassName } from "@/api/control-layer/types";
+import { SchedulingTolerations } from "@/components/features/scheduling/SchedulingTolerations";
 import {
   Dialog,
   DialogContent,
@@ -46,9 +42,9 @@ export function EditOrganizationModal({
   const [grantedClasses, setGrantedClasses] = useState<ServingClassName[]>([]);
   const [defaultClass, setDefaultClass] = useState<ServingClassName | "standard">("standard");
   const [selfHostedOnly, setSelfHostedOnly] = useState(false);
-  const [pinnedTolerations, setPinnedTolerations] =
-    useState<PinnedTolerations | null>(null);
+  const [tolerationPreset, setTolerationPreset] = useState<string | null>(null);
   const updateOrg = useUpdateOrganization();
+  const { data: config } = useConfig();
 
   useEffect(() => {
     if (isOpen && organization) {
@@ -58,7 +54,7 @@ export function EditOrganizationModal({
       setGrantedClasses(organization.granted_serving_classes ?? []);
       setDefaultClass(organization.default_serving_class ?? "standard");
       setSelfHostedOnly(organization.self_hosted_only ?? false);
-      setPinnedTolerations(organization.pinned_tolerations ?? null);
+      setTolerationPreset(organization.toleration_preset ?? null);
     }
   }, [organization, isOpen]);
 
@@ -89,7 +85,7 @@ export function EditOrganizationModal({
                 default_serving_class:
                   defaultClass === "standard" ? null : defaultClass,
                 self_hosted_only: selfHostedOnly,
-                pinned_tolerations: pinnedTolerations,
+                toleration_preset: tolerationPreset,
               }
             : {}),
         },
@@ -229,24 +225,27 @@ export function EditOrganizationModal({
                 <div className="flex items-center justify-between gap-4">
                   <div className="grid gap-1">
                     <Label htmlFor="edit-self-hosted-only">
-                      Self-hosted only
+                      No external-provider fallback (gateway)
                     </Label>
                     <p className="text-sm text-muted-foreground">
-                      Never fall over to an external provider for this
-                      organisation's requests.
+                      Never fall over to a third-party (external) provider for
+                      this organisation's requests. Does not change where the
+                      inference backend places a request — that is the
+                      scheduling-tolerations setting below.
                     </p>
                   </div>
                   <Switch
                     id="edit-self-hosted-only"
                     checked={selfHostedOnly}
                     onCheckedChange={setSelfHostedOnly}
-                    aria-label="Toggle self-hosted only"
+                    aria-label="Toggle no external-provider fallback"
                   />
                 </div>
-                <SchedulingRestrictions
-                  pinned={pinnedTolerations}
+                <SchedulingTolerations
+                  preset={tolerationPreset}
+                  presets={config?.scheduling_toleration_presets}
                   canEdit={canEditServing}
-                  onChange={setPinnedTolerations}
+                  onChange={setTolerationPreset}
                 />
               </div>
             )}

@@ -2016,6 +2016,15 @@ export const handlers = [
         enabled: true,
         allowed_completion_windows: ["24h", "1h"],
       },
+      onwards: { strict_mode: false },
+      scheduling_toleration_presets: [
+        {
+          id: "no-overflow",
+          label: "No overflow capacity",
+          description:
+            "Never placed on capacity the backend marks with any taint, such as overflow capacity.",
+        },
+      ],
     });
   }),
 

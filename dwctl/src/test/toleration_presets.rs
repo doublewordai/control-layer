@@ -1,9 +1,9 @@
-//! An operator can pin an account's scheduling tolerations: every realtime,
-//! flex and batch request from the account then carries exactly the pinned
-//! list at `nvext.routing_constraints.tolerations`, the client cannot set its
-//! own, and an unpinned account is unchanged. The tests run the full
-//! application so the key-policy map, the middleware write and the batch
-//! ingest path are exercised together.
+//! An operator can pin an account to a scheduling-toleration preset: every
+//! realtime, flex and batch request from the account then carries exactly the
+//! preset's toleration list at `nvext.routing_constraints.tolerations`, the
+//! client cannot set its own, and an account on "Default" is unchanged. The
+//! tests run the full application so the key-policy map, the middleware write
+//! and the batch ingest path are exercised together.
 use axum::http::StatusCode;
 use axum_test::TestServer;
 use serde_json::{Value, json};
@@ -13,8 +13,33 @@ use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::api::models::users::Role;
+use crate::config::{SchedulingConfig, TolerationPreset};
+use crate::scheduling::{SchedulingOperator, SchedulingToleration};
 use crate::test::utils::{add_auth_headers, create_test_admin_user, create_test_config, create_test_user_with_roles};
 use crate::{Application, BackgroundServices};
+
+/// A config with two presets besides the default: an empty-list preset
+/// (`no-overflow`) and a custom one (`gpu`).
+fn test_config_with_presets() -> crate::config::Config {
+    let mut config = create_test_config();
+    config.scheduling = SchedulingConfig {
+        toleration_presets: vec![
+            SchedulingConfig::default_preset(),
+            TolerationPreset {
+                id: "gpu".to_string(),
+                label: "GPU only".to_string(),
+                description: "Pin to GPU capacity only.".to_string(),
+                tolerations: vec![SchedulingToleration {
+                    key: "pool".to_string(),
+                    operator: Some(SchedulingOperator::Equal),
+                    value: Some("gpu".to_string()),
+                    effect: None,
+                }],
+            },
+        ],
+    };
+    config
+}
 
 struct Fixture {
     server: TestServer,
@@ -40,7 +65,7 @@ impl Fixture {
             })
             .mount(&upstream)
             .await;
-        let mut config = create_test_config();
+        let mut config = test_config_with_presets();
         config.onwards.strict_mode = true;
         config.background_services.onwards_sync.enabled = true;
         let app = Application::new_with_pool(config, Some(pool.clone()), None).await.unwrap();
@@ -56,14 +81,14 @@ impl Fixture {
             .await
             .assert_status(StatusCode::CREATED);
         let key = format!("sk-{}", Uuid::new_v4());
-        sqlx::query("INSERT INTO api_keys (name,secret,user_id,created_by,purpose) VALUES ('pin-test',$1,$2,$2,'realtime')")
+        sqlx::query("INSERT INTO api_keys (name,secret,user_id,created_by,purpose) VALUES ('preset-test',$1,$2,$2,'realtime')")
             .bind(&key)
             .bind(user.id)
             .execute(pool)
             .await
             .unwrap();
         let endpoint: Uuid = sqlx::query_scalar(
-            "INSERT INTO inference_endpoints (name,url,created_by,kind) VALUES ('pin-test',$1,$2,'dynamo') RETURNING id",
+            "INSERT INTO inference_endpoints (name,url,created_by,kind) VALUES ('preset-test',$1,$2,'dynamo') RETURNING id",
         )
         .bind(upstream.uri())
         .bind(user.id)
@@ -71,7 +96,7 @@ impl Fixture {
         .await
         .unwrap();
         let member: Uuid = sqlx::query_scalar(
-            "INSERT INTO deployed_models (model_name,alias,hosted_on,created_by,type) VALUES ('pin-upstream','pin-member',$1,$2,'CHAT') RETURNING id",
+            "INSERT INTO deployed_models (model_name,alias,hosted_on,created_by,type) VALUES ('preset-upstream','preset-member',$1,$2,'CHAT') RETURNING id",
         )
         .bind(endpoint)
         .bind(user.id)
@@ -144,7 +169,7 @@ impl Fixture {
         let jsonl = format!(
             "{}\n",
             json!({
-                "custom_id": "pin-batch",
+                "custom_id": "preset-batch",
                 "method": "POST",
                 "url": "/v1/chat/completions",
                 "body": {
@@ -154,7 +179,7 @@ impl Fixture {
                 }
             })
         );
-        let file = axum_test::multipart::Part::bytes(jsonl.into_bytes()).file_name("pin.jsonl");
+        let file = axum_test::multipart::Part::bytes(jsonl.into_bytes()).file_name("preset.jsonl");
         let form = axum_test::multipart::MultipartForm::new()
             .add_part("purpose", axum_test::multipart::Part::text("batch"))
             .add_part("file", file);
@@ -174,18 +199,18 @@ impl Fixture {
 
     /// Pin the account by writing the column the operator's catalog writes and
     /// refresh the per-key policy map as the LISTEN/NOTIFY loop would.
-    async fn set_pin(&self, value: Option<Value>) {
-        match value {
-            Some(value) => {
-                sqlx::query("UPDATE users SET pinned_tolerations = $2 WHERE id = $1")
+    async fn set_preset(&self, id: Option<&str>) {
+        match id {
+            Some(id) => {
+                sqlx::query("UPDATE users SET toleration_preset = $2 WHERE id = $1")
                     .bind(self.user)
-                    .bind(value)
+                    .bind(id)
                     .execute(&self.pool)
                     .await
                     .unwrap();
             }
             None => {
-                sqlx::query("UPDATE users SET pinned_tolerations = NULL WHERE id = $1")
+                sqlx::query("UPDATE users SET toleration_preset = NULL WHERE id = $1")
                     .bind(self.user)
                     .execute(&self.pool)
                     .await
@@ -199,97 +224,131 @@ impl Fixture {
 }
 
 #[dwctl_test_macros::test]
-async fn a_pinned_account_carries_its_tolerations_and_the_client_cannot_override(pool: PgPool) {
+async fn a_preset_account_carries_its_tolerations_and_the_client_cannot_override(pool: PgPool) {
     let f = Fixture::new(&pool).await;
 
-    // Unpinned: the client's toleration is stripped and nothing replaces it.
+    // Default: the client's toleration is stripped and nothing replaces it.
     let body = f.post_realtime().await;
     assert!(
         body["nvext"]["routing_constraints"]["tolerations"].is_null(),
-        "an unpinned account carries no tolerations: {body}"
+        "a Default account carries no tolerations: {body}"
     );
 
-    // Pinned to `[]`: the account now forbids any tainted capacity.
-    f.set_pin(Some(json!([]))).await;
+    // Pinned to the empty-list preset: the account now forbids any tainted
+    // capacity.
+    f.set_preset(Some("no-overflow")).await;
     let body = f.post_realtime().await;
     assert_eq!(
         body["nvext"]["routing_constraints"]["tolerations"],
         json!([]),
-        "a pinned empty list is written verbatim: {body}"
+        "the empty-list preset is written verbatim: {body}"
     );
 
-    // Pinned to a real list: it replaces the stripped client value exactly.
-    f.set_pin(Some(json!([{"key": "dedicated", "value": "only"}]))).await;
+    // Pinned to a custom preset: it replaces the stripped client value with the
+    // preset's list verbatim (including the operator the operator configured).
+    f.set_preset(Some("gpu")).await;
     let body = f.post_realtime().await;
     assert_eq!(
         body["nvext"]["routing_constraints"]["tolerations"],
-        json!([{"key": "dedicated", "value": "only"}]),
-        "the pinned list overrides the client's: {body}"
+        json!([{"key": "pool", "operator": "Equal", "value": "gpu"}]),
+        "the preset list overrides the client's: {body}"
     );
 
-    // Clearing the pin returns the account to the default (nothing carried).
-    f.set_pin(None).await;
+    // Clearing the preset returns the account to the default (nothing carried).
+    f.set_preset(None).await;
     let body = f.post_realtime().await;
     assert!(
         body["nvext"]["routing_constraints"]["tolerations"].is_null(),
-        "clearing the pin removes the tolerations: {body}"
+        "clearing the preset removes the tolerations: {body}"
     );
 }
 
-/// The batch path affixes the pin at ingest, so the stored template the daemon
-/// later dispatches already carries the pinned list and not the client's.
+/// An account pinned to a preset id that is not in config fails closed: the
+/// request path applies the empty (most restrictive) list rather than leaving
+/// the request unpinned.
 #[dwctl_test_macros::test]
-async fn a_pinned_account_stamps_its_tolerations_on_uploaded_batch_requests(pool: PgPool) {
+async fn an_unconfigured_preset_at_runtime_fails_closed_to_the_empty_list(pool: PgPool) {
     let f = Fixture::new(&pool).await;
 
-    // Unpinned: the client's batch toleration is stripped at ingest.
+    // Write the column directly, as a config edit that dropped a preset would
+    // leave an account referencing an id.
+    sqlx::query("UPDATE users SET toleration_preset = 'retired' WHERE id = $1")
+        .bind(f.user)
+        .execute(&pool)
+        .await
+        .unwrap();
+    f.services.sync_key_policy(&pool).await.unwrap();
+
+    let body = f.post_realtime().await;
+    assert_eq!(
+        body["nvext"]["routing_constraints"]["tolerations"],
+        json!([]),
+        "an unknown preset id fails closed to the empty list: {body}"
+    );
+}
+
+/// The batch path affixes the preset at ingest, so the stored template the
+/// daemon later dispatches already carries the preset's list, not the client's.
+#[dwctl_test_macros::test]
+async fn a_preset_account_stamps_its_tolerations_on_uploaded_batch_requests(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+
+    // Default: the client's batch toleration is stripped at ingest.
     let body = f.upload_batch().await;
     assert!(
         body["nvext"]["routing_constraints"]["tolerations"].is_null(),
-        "an unpinned upload carries no tolerations: {body}"
+        "a Default upload carries no tolerations: {body}"
     );
 
-    // Pinned: the stored template carries exactly the pinned list.
-    f.set_pin(Some(json!([{"key": "dedicated", "value": "only", "effect": "NoSchedule"}])))
-        .await;
+    // Pinned: the stored template carries exactly the preset's list.
+    f.set_preset(Some("gpu")).await;
     let body = f.upload_batch().await;
     assert_eq!(
         body["nvext"]["routing_constraints"]["tolerations"],
-        json!([{"key": "dedicated", "value": "only", "effect": "NoSchedule"}]),
-        "the pin is stamped on the stored batch body: {body}"
+        json!([{"key": "pool", "operator": "Equal", "value": "gpu"}]),
+        "the preset is stamped on the stored batch body: {body}"
     );
-    // Other nvext the client sent still passes through.
+    // Other fields the client sent still pass through.
     assert_eq!(body["model"], "plain");
 }
 
-/// A platform manager sets the pin through the admin API; a non-manager
-/// cannot, and the pin is only visible back to a platform manager.
+/// A platform manager sets the preset through the admin API; a non-manager
+/// cannot, an unknown id is refused, and the preset is only visible back to a
+/// platform manager.
 #[dwctl_test_macros::test]
-async fn a_platform_manager_sets_and_clears_the_pin_through_the_admin_api(pool: PgPool) {
+async fn a_platform_manager_sets_the_preset_through_the_admin_api(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let headers = add_auth_headers(&create_test_admin_user(&pool, Role::PlatformManager).await);
     let member = create_test_user_with_roles(&pool, vec![Role::StandardUser]).await;
     let member_headers = add_auth_headers(&member);
 
-    // Setting the "dedicated capacity" toggle is the empty list; the GET must
-    // show it back to the manager.
+    // Setting the preset; the GET must show it back to the manager.
     let response = f
         .server
         .patch(&format!("/admin/api/v1/users/{}", f.user))
         .add_header(&headers[0].0, &headers[0].1)
         .add_header(&headers[1].0, &headers[1].1)
-        .json(&json!({"pinned_tolerations": []}))
+        .json(&json!({"toleration_preset": "no-overflow"}))
         .await;
     response.assert_status_ok();
     let updated = response.json::<Value>();
-    assert_eq!(updated["pinned_tolerations"], json!([]), "{updated}");
+    assert_eq!(updated["toleration_preset"], json!("no-overflow"), "{updated}");
 
-    // The pin reaches the request path on the next sync (the API write fires
+    // The preset reaches the request path on the next sync (the API write fires
     // the notify trigger; refresh the cache the way the LISTEN/NOTIFY loop
-    // would, as `set_pin` does).
+    // would, as `set_preset` does).
     f.services.sync_key_policy(&pool).await.unwrap();
     let body = f.post_realtime().await;
     assert_eq!(body["nvext"]["routing_constraints"]["tolerations"], json!([]), "{body}");
+
+    // An unknown id is refused with a 400.
+    f.server
+        .patch(&format!("/admin/api/v1/users/{}", f.user))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&json!({"toleration_preset": "does-not-exist"}))
+        .await
+        .assert_status(StatusCode::BAD_REQUEST);
 
     // A plain member's GET omits the operator's routing decision entirely.
     let as_member_response = f
@@ -300,48 +359,53 @@ async fn a_platform_manager_sets_and_clears_the_pin_through_the_admin_api(pool: 
         .await;
     as_member_response.assert_status_ok();
     let as_member = as_member_response.json::<Value>();
-    assert!(as_member.get("pinned_tolerations").is_none(), "{as_member}");
+    assert!(as_member.get("toleration_preset").is_none(), "{as_member}");
 
-    // Clearing the pin: `null` maps to no pinned tolerations.
+    // A plain member cannot set a preset on their own account.
+    f.server
+        .patch(&format!("/admin/api/v1/users/{}", member.id))
+        .add_header(&member_headers[0].0, &member_headers[0].1)
+        .add_header(&member_headers[1].0, &member_headers[1].1)
+        .json(&json!({"toleration_preset": "no-overflow"}))
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+
+    // Clearing the preset: `null` maps to no preset.
     let cleared_response = f
         .server
         .patch(&format!("/admin/api/v1/users/{}", f.user))
         .add_header(&headers[0].0, &headers[0].1)
         .add_header(&headers[1].0, &headers[1].1)
-        .json(&json!({"pinned_tolerations": null}))
+        .json(&json!({"toleration_preset": null}))
         .await;
     cleared_response.assert_status_ok();
     let cleared = cleared_response.json::<Value>();
-    assert!(cleared["pinned_tolerations"].is_null(), "{cleared}");
+    assert!(cleared["toleration_preset"].is_null(), "{cleared}");
     f.services.sync_key_policy(&pool).await.unwrap();
     let body = f.post_realtime().await;
     assert!(body["nvext"]["routing_constraints"]["tolerations"].is_null(), "{body}");
 }
 
-/// A malformed toleration is refused server-side before it reaches the column,
-/// and a plain member cannot set a pin on their own account at all.
+/// The presets are exposed on `GET /config` so the dashboard can list them.
 #[dwctl_test_macros::test]
-async fn a_malformed_pin_is_refused_and_a_member_cannot_set_one(pool: PgPool) {
+async fn config_exposes_the_scheduling_toleration_presets(pool: PgPool) {
     let f = Fixture::new(&pool).await;
-    let headers = add_auth_headers(&create_test_admin_user(&pool, Role::PlatformManager).await);
-    let member = create_test_user_with_roles(&pool, vec![Role::StandardUser]).await;
-    let member_headers = add_auth_headers(&member);
-
-    // `Equal` (the default operator) needs a value.
-    f.server
-        .patch(&format!("/admin/api/v1/users/{}", f.user))
+    let user = create_test_user_with_roles(&pool, vec![Role::StandardUser]).await;
+    let headers = add_auth_headers(&user);
+    let response = f
+        .server
+        .get("/admin/api/v1/config")
         .add_header(&headers[0].0, &headers[0].1)
         .add_header(&headers[1].0, &headers[1].1)
-        .json(&json!({"pinned_tolerations": [{"key": "dedicated"}]}))
-        .await
-        .assert_status(StatusCode::BAD_REQUEST);
-
-    // A plain member may not set the pin on their own account.
-    f.server
-        .patch(&format!("/admin/api/v1/users/{}", member.id))
-        .add_header(&member_headers[0].0, &member_headers[0].1)
-        .add_header(&member_headers[1].0, &member_headers[1].1)
-        .json(&json!({"pinned_tolerations": []}))
-        .await
-        .assert_status(StatusCode::FORBIDDEN);
+        .await;
+    response.assert_status_ok();
+    let json: Value = response.json();
+    let presets = json["scheduling_toleration_presets"].as_array().unwrap();
+    assert!(presets.iter().any(|preset| preset["id"] == "no-overflow"), "{json}");
+    assert!(
+        presets
+            .iter()
+            .all(|preset| preset["label"].is_string() && preset["description"].is_string()),
+        "{json}"
+    );
 }

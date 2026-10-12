@@ -2,13 +2,13 @@ pub mod anthropic;
 pub mod cache_classifier;
 pub mod databases;
 pub mod modalities;
-pub mod pinned_tolerations;
 pub mod responses;
 pub mod serving_classes;
 pub mod sigterm_drain;
 pub mod sla;
 pub mod strict_mode;
 pub mod template;
+pub mod toleration_presets;
 pub mod utils;
 pub mod zdr_sentinel;
 

@@ -239,6 +239,122 @@ pub struct Config {
     /// [`crate::profiling::HeapProfilingConfig`].
     #[serde(default)]
     pub heap_profiling: crate::profiling::HeapProfilingConfig,
+    /// Account scheduling tolerations: the named presets an operator may pin to
+    /// an account. See [`SchedulingConfig`].
+    #[serde(default)]
+    pub scheduling: SchedulingConfig,
+}
+
+/// Operator-defined scheduling-toleration presets.
+///
+/// Each preset affixes a fixed, Kubernetes-style toleration list to every
+/// inference request from an account pinned to it, written to
+/// `nvext.routing_constraints.tolerations` before the request reaches the
+/// upstream inference backend. An account stores only the preset's `id`
+/// (`users.toleration_preset`); the tolerations themselves live here, so an
+/// operator can retune a preset without walking every account.
+///
+/// The list is deliberately backend-agnostic: a backend that honours
+/// tolerations uses it to decide which capacity may serve the request. An
+/// empty list (`[]`) asks a backend to keep the account's work off any
+/// tainted capacity.
+///
+/// Validate with [`SchedulingConfig::validate`], which is called at load time:
+/// ids must be unique slugs and every toleration must be one the request path
+/// could serialise into a valid body.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SchedulingConfig {
+    /// The presets an account may be pinned to, in display order.
+    pub toleration_presets: Vec<TolerationPreset>,
+}
+
+/// One operator-defined scheduling-toleration preset.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TolerationPreset {
+    /// Stable slug the account stores (`users.toleration_preset`). Unique
+    /// across presets; matched case-sensitively.
+    pub id: String,
+    /// Short human label for the control (e.g. "No overflow capacity").
+    pub label: String,
+    /// One or two sentences of help text (the dashboard tooltip).
+    pub description: String,
+    /// The toleration list written to `nvext.routing_constraints.tolerations`,
+    /// in the same shape as the request field. An empty list is a real preset.
+    pub tolerations: Vec<crate::scheduling::SchedulingToleration>,
+}
+
+impl SchedulingConfig {
+    /// The generic preset shipped in the default config: pin the account's
+    /// work off any tainted capacity, the most common operator intent.
+    pub fn default_preset() -> TolerationPreset {
+        TolerationPreset {
+            id: "no-overflow".to_string(),
+            label: "No overflow capacity".to_string(),
+            description: "Never placed on capacity the backend marks with any taint, such as overflow capacity; \
+                          requests may be refused when dedicated capacity is full."
+                .to_string(),
+            tolerations: Vec::new(),
+        }
+    }
+
+    /// Look up a preset by id.
+    pub fn preset(&self, id: &str) -> Option<&TolerationPreset> {
+        self.toleration_presets.iter().find(|preset| preset.id == id)
+    }
+
+    /// Resolve an account's stored preset id to the toleration list the request
+    /// path writes. `None` (the "Default" setting) means nothing is pinned, so
+    /// the backend decides. An id that is absent from the config is a
+    /// misconfiguration the caller must fail closed on; see
+    /// [`crate::scheduling::TolerationPresets::resolve`].
+    pub fn resolve(&self, id: Option<&str>) -> Option<&[crate::scheduling::SchedulingToleration]> {
+        id.and_then(|id| self.preset(id)).map(|preset| preset.tolerations.as_slice())
+    }
+
+    /// Whether every id is a unique slug and every toleration is valid.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
+        for (index, preset) in self.toleration_presets.iter().enumerate() {
+            if preset.id.trim().is_empty() {
+                return Err(format!("scheduling.toleration_presets[{index}] has an empty id"));
+            }
+            if preset.id != preset.id.trim() {
+                return Err(format!(
+                    "scheduling.toleration_presets[{index}] id {:?} has leading or trailing whitespace",
+                    preset.id
+                ));
+            }
+            if !seen.insert(preset.id.as_str()) {
+                return Err(format!("scheduling.toleration_presets has a duplicate id {:?}", preset.id));
+            }
+            if preset.label.trim().is_empty() {
+                return Err(format!(
+                    "scheduling.toleration_presets[{index}] ({:?}) has an empty label",
+                    preset.id
+                ));
+            }
+            if preset.description.trim().is_empty() {
+                return Err(format!(
+                    "scheduling.toleration_presets[{index}] ({:?}) has an empty description",
+                    preset.id
+                ));
+            }
+            crate::scheduling::PinnedTolerations(preset.tolerations.clone())
+                .validate()
+                .map_err(|error| format!("scheduling.toleration_presets[{:?}] is invalid: {error}", preset.id))?;
+        }
+        Ok(())
+    }
+}
+
+impl Default for SchedulingConfig {
+    fn default() -> Self {
+        Self {
+            toleration_presets: vec![Self::default_preset()],
+        }
+    }
 }
 
 /// Controls exposure of the OpenAPI specs and Scalar doc UIs.
@@ -3316,6 +3432,7 @@ impl Default for Config {
             prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),
             continuation: ContinuationConfig::default(),
             heap_profiling: crate::profiling::HeapProfilingConfig::default(),
+            scheduling: SchedulingConfig::default(),
         }
     }
 }
@@ -3618,6 +3735,11 @@ impl Config {
         {
             return Err(Error::Internal {
                 operation: format!("Config validation: onwards.rejected_params names an unknown parameter: {name}"),
+            });
+        }
+        if let Err(error) = self.scheduling.validate() {
+            return Err(Error::Internal {
+                operation: format!("Config validation: {error}"),
             });
         }
         if self.background_services.batch_daemon.retention.expire_files

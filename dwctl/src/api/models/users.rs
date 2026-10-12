@@ -99,19 +99,24 @@ pub struct UserUpdate {
     /// clears it.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub default_serving_class: Option<Option<String>>,
-    /// Account setting: never fall over to an external provider; the
-    /// composite is restricted to its self-hosted members for this account's
-    /// requests. Settable only by callers with UpdateAll on users. Omit to
+    /// Account setting: never fall over to an external provider. When on,
+    /// onwards restricts the account's requests to the composite's
+    /// self-hosted members — providers whose endpoint kind is not `external`
+    /// (the `inference_endpoints.kind` column) — so a third-party provider is
+    /// never eligible. This is the *gateway's* provider-fallback setting
+    /// (`/admin/api/v1/users`); it does not influence where the inference
+    /// backend places an accepted request, which is what `toleration_preset`
+    /// controls. Settable only by callers with UpdateAll on users. Omit to
     /// leave unchanged.
     pub self_hosted_only: Option<bool>,
-    /// Account setting: a fixed scheduling toleration list pinned to every
-    /// request from this account, written to
-    /// `nvext.routing_constraints.tolerations`. `[]` keeps the account's work
-    /// off any tainted capacity; an empty/omitted body leaves it unchanged,
-    /// `null` clears the pin. Settable only by callers with UpdateAll on
-    /// users. Omit to leave unchanged.
+    /// Account setting: the id of a scheduling-toleration preset
+    /// (`scheduling.toleration_presets` in config) pinned to every request from
+    /// this account, written to `nvext.routing_constraints.tolerations`. An
+    /// unknown id is rejected with a 400; `null` clears the preset (the
+    /// "Default" setting: nothing pinned, the backend decides). Settable only
+    /// by callers with UpdateAll on users. Omit to leave unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
-    pub pinned_tolerations: Option<Option<crate::scheduling::PinnedTolerations>>,
+    pub toleration_preset: Option<Option<String>>,
 }
 
 /// Full user details returned by the API.
@@ -204,12 +209,12 @@ pub struct UserResponse {
     pub default_serving_class: Option<String>,
     /// Account setting: never fall over to an external provider.
     pub self_hosted_only: bool,
-    /// Account setting: scheduling tolerations pinned to this account's every
-    /// request. `null` when the account is not pinned; `[]` when its work is
-    /// kept on dedicated capacity. Present only for callers with UpdateAll on
-    /// users: it is an operator's routing decision, not account data.
+    /// Account setting: the id of the scheduling-toleration preset pinned to
+    /// this account's every request, or `null` for the "Default" setting
+    /// (nothing pinned). Present only for callers with UpdateAll on users: it
+    /// is an operator's routing decision, not account data.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pinned_tolerations: Option<crate::scheduling::PinnedTolerations>,
+    pub toleration_preset: Option<String>,
     /// Organizations this user belongs to (only included if `include=organizations` is specified)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organizations: Option<Vec<super::organizations::OrganizationSummary>>,
@@ -328,7 +333,7 @@ impl From<UserDBResponse> for UserResponse {
             default_serving_class: db.default_serving_class,
             self_hosted_only: db.self_hosted_only,
             // Filled in by the handler for platform managers only.
-            pinned_tolerations: None,
+            toleration_preset: None,
             organizations: None,
             active_organization_id: None,
             onboarding_redirect_url: None,
@@ -337,11 +342,10 @@ impl From<UserDBResponse> for UserResponse {
 }
 
 impl UserResponse {
-    /// Create a response with the pinned scheduling tolerations included.
-    /// Only the handlers that have already checked the caller may see them
-    /// call this.
-    pub fn with_pinned_tolerations(mut self, pinned: Option<crate::scheduling::PinnedTolerations>) -> Self {
-        self.pinned_tolerations = pinned;
+    /// Create a response with the scheduling-toleration preset included. Only
+    /// the handlers that have already checked the caller may see it call this.
+    pub fn with_toleration_preset(mut self, preset: Option<String>) -> Self {
+        self.toleration_preset = preset;
         self
     }
 

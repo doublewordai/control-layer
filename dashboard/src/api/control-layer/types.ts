@@ -169,6 +169,12 @@ export interface ConfigResponse {
     /** Whether strict mode is enabled (uses trusted flag for providers) */
     strict_mode: boolean;
   };
+  /**
+   * The scheduling-toleration presets an account may be pinned to
+   * (`scheduling.toleration_presets`). The account settings control renders
+   * these; an empty list means no presets are configured.
+   */
+  scheduling_toleration_presets?: SchedulingTolerationPreset[];
 }
 
 // Model metrics time series point
@@ -515,9 +521,10 @@ export interface User {
   granted_serving_classes?: ServingClassName[];
   default_serving_class?: ServingClassName | null;
   self_hosted_only?: boolean;
-  // Scheduling tolerations pinned to the account's requests (platform managers
-  // only). null/absent = not pinned; [] = kept on dedicated capacity.
-  pinned_tolerations?: PinnedTolerations | null;
+  // Scheduling-toleration preset the account is pinned to (platform managers
+  // only). null/absent = "Default" (nothing pinned); a string is a configured
+  // preset id.
+  toleration_preset?: string | null;
   user_type?: "individual" | "organization"; // User type
   organizations?: OrganizationSummary[]; // only present when include=organizations or for current user
   active_organization_id?: string; // only present for /users/current
@@ -693,9 +700,9 @@ export interface UserUpdateRequest {
   granted_serving_classes?: ServingClassName[];
   default_serving_class?: ServingClassName | null;
   self_hosted_only?: boolean;
-  // Scheduling tolerations pinned to the account: platform managers only.
-  // [] keeps the account on dedicated capacity; null clears the pin.
-  pinned_tolerations?: PinnedTolerations | null;
+  // Scheduling-toleration preset to pin the account to: platform managers
+  // only. A preset id pins it; null clears the pin ("Default").
+  toleration_preset?: string | null;
 }
 
 export interface GroupUpdateRequest {
@@ -1787,32 +1794,21 @@ export type OrgMemberRole = "owner" | "admin" | "member";
  */
 export type Modality = "realtime" | "batch";
 
-/** How a tolration's key is matched. */
-export type SchedulingTolerationOperator = "Equal" | "Exists";
-
-/** How strictly a matching taint must be tolerated. */
-export type SchedulingTolerationEffect = "NoSchedule" | "PreferNoSchedule";
-
 /**
- * One Kubernetes-style scheduling toleration, the shape dwctl writes to
- * `nvext.routing_constraints.tolerations`. `operator` defaults to `Equal`
- * (which needs a `value`); `effect` defaults to `NoSchedule`.
+ * One operator-defined scheduling-toleration preset, declared in the
+ * deployment's `scheduling.toleration_presets`. An account stores only the
+ * preset's `id` (`toleration_preset`); the deployment resolves id to
+ * tolerations. `GET /admin/api/v1/config` exposes these for the account
+ * settings control.
  */
-export interface SchedulingToleration {
-  key: string;
-  operator?: SchedulingTolerationOperator;
-  value?: string;
-  effect?: SchedulingTolerationEffect;
+export interface SchedulingTolerationPreset {
+  /** Stable slug stored on the account. */
+  id: string;
+  /** Short human label for the control. */
+  label: string;
+  /** One or two sentences of help text (the tooltip). */
+  description: string;
 }
-
-/**
- * A fixed list of scheduling tolerations pinned to every request from an
- * account. `null` (the field absent) means the account is not pinned; an
- * empty list (`[]`) is a real pin that keeps the account's work off any
- * tainted capacity. Platform managers set and read it; ordinary account
- * members never see it.
- */
-export type PinnedTolerations = SchedulingToleration[];
 
 export interface OrganizationSummary {
   id: string;
@@ -1852,11 +1848,10 @@ export interface Organization extends User {
    */
   disabled_modalities?: Modality[];
   /**
-   * Scheduling tolerations pinned to every request from this organization
-   * (platform managers only). null/absent = not pinned; [] = kept on
-   * dedicated capacity.
+   * Scheduling-toleration preset every request from this organization is
+   * pinned to (platform managers only). null/absent = "Default".
    */
-  pinned_tolerations?: PinnedTolerations | null;
+  toleration_preset?: string | null;
 }
 
 export interface OrganizationMember {
@@ -1889,9 +1884,9 @@ export interface OrganizationUpdateRequest {
   self_hosted_only?: boolean;
   /** Replaces the whole set; owner-only. An empty list re-enables everything. */
   disabled_modalities?: Modality[];
-  // Scheduling tolerations pinned to the organization: platform managers only.
-  // [] keeps the workspace on dedicated capacity; null clears the pin.
-  pinned_tolerations?: PinnedTolerations | null;
+  // Scheduling-toleration preset to pin the organization to: platform managers
+  // only. A preset id pins it; null clears the pin ("Default").
+  toleration_preset?: string | null;
 }
 
 export interface InviteMemberRequest {

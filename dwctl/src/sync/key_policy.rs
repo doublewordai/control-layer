@@ -4,16 +4,16 @@
 //! request policy: the `users.zero_data_retention` flag (read by
 //! [`crate::inference::zdr::is_zdr_request`]), the account's
 //! `users.disabled_modalities` (read by the inference middleware's modality
-//! gate), and any `users.pinned_tolerations` (read by the inference middleware
-//! and the batch ingest path to affix a fixed toleration list to every request
-//! from the account). All answer on the request hot path with a lock-free map
-//! read and no DB round-trip.
+//! gate), and any `users.toleration_preset` (read by the inference middleware
+//! and the batch ingest path to affix a preset's toleration list to every
+//! request from the account). All answer on the request hot path with a
+//! lock-free map read and no DB round-trip.
 //!
 //! Unlike [`crate::sync::onwards_config`], which rebuilds the whole routing
 //! table on every change, this runs one small two-table join and swaps a flat
 //! map, so refreshing it on every `auth_config_changed` notification is cheap.
 //! It reuses that channel (fired by the `api_keys` trigger and the `users`
-//! ZDR, disabled-modalities and pinned-tolerations triggers), a 100ms debounce,
+//! ZDR, disabled-modalities and toleration-preset triggers), a 100ms debounce,
 //! and a periodic fallback reload.
 
 use std::collections::HashMap;
@@ -27,32 +27,36 @@ use tracing::{debug, info};
 use crate::config::ONWARDS_CONFIG_CHANGED_CHANNEL;
 use crate::metrics::errors::component;
 use crate::modalities::ModalitySet;
+use crate::scheduling::TolerationPresets;
 
 /// The account-level policy a key inherits from its owner (`api_keys.user_id`,
-/// the organization for an org key). `Clone` (not `Copy`) because a pinned
-/// toleration list is shared behind an `Arc`, so a map read hands back a cheap
-/// clone and the caller never holds the `ArcSwap` guard across an await.
+/// the organization for an org key).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct KeyPolicy {
     /// `users.zero_data_retention` of the owning account.
     pub zdr: bool,
     /// `users.disabled_modalities` of the owning account.
     pub disabled_modalities: ModalitySet,
-    /// `users.pinned_tolerations` of the owning account: the scheduling
-    /// toleration list written verbatim to `nvext.routing_constraints
-    /// .tolerations` on every request from this account. `None` means the
-    /// account is not pinned.
-    pub pinned_tolerations: Option<Arc<serde_json::Value>>,
+    /// `users.toleration_preset` of the owning account: the id of the config
+    /// preset whose toleration list is written verbatim to
+    /// `nvext.routing_constraints.tolerations` on every request from this
+    /// account. `None` means the account is on "Default" (nothing pinned).
+    pub toleration_preset: Option<String>,
 }
 
-/// Lock-free, cheap-to-clone handle to the shared secret-to-policy map.
+/// Lock-free, cheap-to-clone handle to the shared secret-to-policy map, plus
+/// the deployment's resolved toleration presets the ids are looked up in.
 ///
 /// A secret absent from the map is a deleted or invalid key (auth rejects it
 /// before any body is stored or any request is served), so absence safely
-/// reads as the permissive default: not ZDR, nothing disabled.
+/// reads as the permissive default: not ZDR, nothing disabled, Default preset.
 #[derive(Clone)]
 pub struct KeyPolicyCache {
     inner: Arc<ArcSwap<HashMap<String, KeyPolicy>>>,
+    /// The config presets a stored `toleration_preset` id resolves against.
+    /// Shared by `Arc` (the map inside is immutable after construction), so a
+    /// clone is cheap and a hot-path resolve holds no lock.
+    presets: TolerationPresets,
 }
 
 impl KeyPolicyCache {
@@ -61,6 +65,17 @@ impl KeyPolicyCache {
     pub fn empty() -> Self {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            presets: TolerationPresets::default(),
+        }
+    }
+
+    /// An empty map that resolves toleration-preset ids against `presets`.
+    /// Callers pass the deployment's configured presets; without this, every id
+    /// would fail closed (see `TolerationPresets::resolve`).
+    pub fn with_presets(presets: TolerationPresets) -> Self {
+        Self {
+            inner: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            presets,
         }
     }
 
@@ -80,10 +95,13 @@ impl KeyPolicyCache {
         self.policy(secret).disabled_modalities
     }
 
-    /// The tolerations pinned to the account owning `secret`, or `None` when
-    /// the account is not pinned. Hot-path safe.
-    pub fn pinned_tolerations(&self, secret: &str) -> Option<Arc<serde_json::Value>> {
-        self.policy(secret).pinned_tolerations
+    /// The toleration list the account owning `secret` is pinned to, resolved
+    /// from its stored preset id, or `None` when the account is on "Default".
+    /// An id the config no longer defines fails closed to the empty list. Hot
+    /// path safe.
+    pub fn tolerations(&self, secret: &str) -> Option<Arc<serde_json::Value>> {
+        let policy = self.policy(secret);
+        self.presets.resolve(policy.toleration_preset.as_deref())
     }
 
     fn replace(&self, map: HashMap<String, KeyPolicy>) {
@@ -110,14 +128,23 @@ impl KeyPolicyCache {
         cache.replace(pairs.into_iter().collect());
         cache
     }
+
+    /// Build a cache from explicit policies that resolve preset ids against
+    /// `presets`. Test-only.
+    #[cfg(test)]
+    pub fn from_policies_with_presets<I: IntoIterator<Item = (String, KeyPolicy)>>(presets: TolerationPresets, pairs: I) -> Self {
+        let cache = Self::with_presets(presets);
+        cache.replace(pairs.into_iter().collect());
+        cache
+    }
 }
 
-/// Run the join and collect the flat secret-to-policy map. Both settings live
+/// Run the join and collect the flat secret-to-policy map. The settings live
 /// on `users` (account-wide); a key inherits its owner's via `api_keys.user_id`.
 async fn load(pool: &PgPool) -> Result<HashMap<String, KeyPolicy>, sqlx::Error> {
     let rows = sqlx::query!(
         r#"
-        SELECT ak.secret, u.zero_data_retention, u.disabled_modalities, u.pinned_tolerations
+        SELECT ak.secret, u.zero_data_retention, u.disabled_modalities, u.toleration_preset
         FROM api_keys ak
         JOIN users u ON u.id = ak.user_id
         WHERE NOT ak.is_deleted
@@ -134,7 +161,7 @@ async fn load(pool: &PgPool) -> Result<HashMap<String, KeyPolicy>, sqlx::Error> 
                 KeyPolicy {
                     zdr: r.zero_data_retention,
                     disabled_modalities: ModalitySet::from_db(&r.disabled_modalities),
-                    pinned_tolerations: r.pinned_tolerations.map(Arc::new),
+                    toleration_preset: r.toleration_preset,
                 },
             )
         })
@@ -155,8 +182,13 @@ pub async fn refresh(pool: &PgPool, cache: &KeyPolicyCache) -> Result<usize, sql
 /// startup before the server accepts traffic so the map is never empty under
 /// live traffic (an empty map reads every key as non-ZDR and would leak a ZDR
 /// account's body during warm-up).
-pub async fn initial_cache(pool: &PgPool) -> Result<KeyPolicyCache, sqlx::Error> {
-    let cache = KeyPolicyCache::empty();
+///
+/// Resolves toleration-preset ids against the deployment's configured
+/// `presets`. The serving process calls this with
+/// [`TolerationPresets::new`]`(&config.scheduling)`; without it, every stored
+/// preset id would fail closed to the empty list.
+pub async fn initial_cache(pool: &PgPool, presets: TolerationPresets) -> Result<KeyPolicyCache, sqlx::Error> {
+    let cache = KeyPolicyCache::with_presets(presets);
     refresh(pool, &cache).await?;
     Ok(cache)
 }
@@ -291,19 +323,76 @@ mod tests {
     }
 
     #[test]
-    fn pinned_tolerations_follow_the_policy_and_default_to_none() {
-        let cache = KeyPolicyCache::from_policies([(
-            "sk-pinned".to_string(),
-            KeyPolicy {
-                pinned_tolerations: Some(Arc::new(serde_json::json!([{"key": "pool", "value": "dedicated"}]))),
-                ..Default::default()
-            },
-        )]);
-        assert_eq!(
-            cache.pinned_tolerations("sk-pinned").as_deref(),
-            Some(&serde_json::json!([{"key": "pool", "value": "dedicated"}]))
+    fn tolerations_resolve_the_preset_id_and_default_to_none() {
+        use crate::config::{SchedulingConfig, TolerationPreset};
+        use crate::scheduling::{SchedulingOperator, SchedulingToleration};
+
+        let presets = TolerationPresets::new(&SchedulingConfig {
+            toleration_presets: vec![
+                SchedulingConfig::default_preset(),
+                TolerationPreset {
+                    id: "gpu".to_string(),
+                    label: "GPU".to_string(),
+                    description: "GPU capacity only.".to_string(),
+                    tolerations: vec![SchedulingToleration {
+                        key: "pool".to_string(),
+                        operator: Some(SchedulingOperator::Equal),
+                        value: Some("dedicated".to_string()),
+                        effect: None,
+                    }],
+                },
+            ],
+        });
+        let cache = KeyPolicyCache::from_policies_with_presets(
+            presets,
+            [
+                (
+                    "sk-preset".to_string(),
+                    KeyPolicy {
+                        toleration_preset: Some("gpu".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "sk-empty".to_string(),
+                    KeyPolicy {
+                        toleration_preset: Some("no-overflow".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "sk-default".to_string(),
+                    KeyPolicy {
+                        toleration_preset: None,
+                        ..Default::default()
+                    },
+                ),
+            ],
         );
-        // An unpinned account and an unknown key both read as not pinned.
-        assert!(cache.pinned_tolerations("sk-missing").is_none());
+        assert_eq!(
+            cache.tolerations("sk-preset").as_deref(),
+            Some(&serde_json::json!([{"key": "pool", "operator": "Equal", "value": "dedicated"}]))
+        );
+        assert_eq!(cache.tolerations("sk-empty").as_deref(), Some(&serde_json::json!([])));
+        // The Default setting and an unknown key are both unpinned.
+        assert!(cache.tolerations("sk-default").is_none());
+        assert!(cache.tolerations("sk-missing").is_none());
+    }
+
+    #[test]
+    fn an_unconfigured_preset_fails_closed_to_the_empty_list() {
+        let cache = KeyPolicyCache::from_policies_with_presets(
+            TolerationPresets::default(),
+            [(
+                "sk-retired".to_string(),
+                KeyPolicy {
+                    toleration_preset: Some("retired".to_string()),
+                    ..Default::default()
+                },
+            )],
+        );
+        // A preset an operator has dropped from config resolves to the most
+        // restrictive option rather than leaving the account unpinned.
+        assert_eq!(cache.tolerations("sk-retired").as_deref(), Some(&serde_json::json!([])));
     }
 }

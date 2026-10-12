@@ -57,8 +57,13 @@ pub struct OrganizationUpdate {
     /// Platform managers only. Omit to leave unchanged; null clears it.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub default_serving_class: Option<Option<String>>,
-    /// Account setting: never fall over to an external provider. Platform
-    /// managers only. Omit to leave unchanged.
+    /// Account setting: never fall over to an external provider. When on,
+    /// onwards restricts the organisation's requests to the composite's
+    /// self-hosted members — providers whose endpoint kind is not `external`
+    /// (the `inference_endpoints.kind` column). This is the gateway's
+    /// provider-fallback setting; it does not influence where the inference
+    /// backend places an accepted request, which is what `toleration_preset`
+    /// controls. Platform managers only. Omit to leave unchanged.
     pub self_hosted_only: Option<bool>,
     /// Admit signups from this workspace's claimed email domain as members
     /// automatically. Same gate as `zero_data_retention` above — an **owner**
@@ -73,14 +78,14 @@ pub struct OrganizationUpdate {
     /// Omit to leave unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled_modalities: Option<Vec<crate::modalities::Modality>>,
-    /// Account setting: a fixed scheduling toleration list pinned to every
-    /// request from this organization, written to
-    /// `nvext.routing_constraints.tolerations`. `[]` keeps the workspace's
-    /// work off any tainted capacity. Platform managers only (UpdateAll on
-    /// organizations): never the organization itself, whatever its role.
-    /// Omit to leave unchanged; `null` clears the pin.
+    /// Account setting: the id of a scheduling-toleration preset
+    /// (`scheduling.toleration_presets` in config) pinned to every request from
+    /// this organization, written to `nvext.routing_constraints.tolerations`.
+    /// An unknown id is rejected with a 400. Platform managers only (UpdateAll
+    /// on organizations): never the organization itself, whatever its role.
+    /// Omit to leave unchanged; `null` clears the preset.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
-    pub pinned_tolerations: Option<Option<crate::scheduling::PinnedTolerations>>,
+    pub toleration_preset: Option<Option<String>>,
 }
 
 /// Full organization details returned by the API.
@@ -110,13 +115,13 @@ pub struct OrganizationResponse {
     /// any member with access to the organization; only owners change it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_modalities: Option<Vec<crate::modalities::Modality>>,
-    /// Account setting: scheduling tolerations pinned to every request from
-    /// this organization. `null` when not pinned; `[]` when its work is kept
-    /// on dedicated capacity. Present only for platform managers (callers with
-    /// UpdateAll on organizations): an operator's routing decision, not
+    /// Account setting: the id of the scheduling-toleration preset pinned to
+    /// every request from this organization, or `null` for the "Default"
+    /// setting (nothing pinned). Present only for platform managers (callers
+    /// with UpdateAll on organizations): an operator's routing decision, not
     /// workspace data.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pinned_tolerations: Option<crate::scheduling::PinnedTolerations>,
+    pub toleration_preset: Option<String>,
 }
 
 impl OrganizationResponse {
@@ -127,7 +132,7 @@ impl OrganizationResponse {
             pending_email_change: None,
             auto_join_enabled: None,
             disabled_modalities: None,
-            pinned_tolerations: None,
+            toleration_preset: None,
         }
     }
 
@@ -151,10 +156,10 @@ impl OrganizationResponse {
         self
     }
 
-    /// Include the pinned scheduling tolerations. Only the handlers that have
-    /// already checked the caller may see them (platform managers only).
-    pub fn with_pinned_tolerations(mut self, pinned: Option<crate::scheduling::PinnedTolerations>) -> Self {
-        self.pinned_tolerations = pinned;
+    /// Include the scheduling-toleration preset. Only the handlers that have
+    /// already checked the caller may see it (platform managers only).
+    pub fn with_toleration_preset(mut self, preset: Option<String>) -> Self {
+        self.toleration_preset = preset;
         self
     }
 }

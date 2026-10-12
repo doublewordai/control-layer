@@ -1361,7 +1361,7 @@ mod tests {
             default_serving_class: None,
             self_hosted_only: None,
             granted_serving_classes: Default::default(),
-            pinned_tolerations: Default::default(),
+            toleration_preset: Default::default(),
         };
         users_repo.update(user.id, &update).await.unwrap();
 

@@ -64,10 +64,10 @@ pub struct UserUpdateDBRequest {
     /// Account setting: elevated serving classes held. `None` = don't change;
     /// `Some(vec![])` = revoke all.
     pub granted_serving_classes: Option<Vec<String>>,
-    /// Account setting: pinned scheduling tolerations, already serialised to
-    /// the request-body JSON. `None` = don't change, `Some(None)` = clear the
-    /// pin, `Some(Some(_))` = set the pin (the empty array is a real pin).
-    pub pinned_tolerations: Option<Option<serde_json::Value>>,
+    /// Account setting: the scheduling-toleration preset id pinned to this
+    /// account's requests. `None` = don't change, `Some(None)` = clear (back to
+    /// the "Default" setting), `Some(Some(id))` = set the preset.
+    pub toleration_preset: Option<Option<String>>,
 }
 
 impl UserUpdateDBRequest {
@@ -86,9 +86,7 @@ impl UserUpdateDBRequest {
             default_serving_class: update.default_serving_class,
             self_hosted_only: update.self_hosted_only,
             granted_serving_classes: update.granted_serving_classes,
-            // Serialised here so the DB layer never sees the tolerant struct:
-            // a `Some(None)` clears, a bare `[]` is a real pin.
-            pinned_tolerations: update.pinned_tolerations.map(|p| p.map(|pinned| pinned.to_json())),
+            toleration_preset: update.toleration_preset,
         }
     }
 }
@@ -137,7 +135,7 @@ pub struct UserDBResponse {
     pub default_serving_class: Option<String>,
     /// Account setting: never fall over to an external provider.
     pub self_hosted_only: bool,
-    /// Account setting: pinned scheduling tolerations as stored (a JSON array)
-    /// or `None` when the account is not pinned.
-    pub pinned_tolerations: Option<serde_json::Value>,
+    /// Account setting: the scheduling-toleration preset id pinned to this
+    /// account, or `None` for the "Default" setting.
+    pub toleration_preset: Option<String>,
 }

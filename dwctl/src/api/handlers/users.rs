@@ -4,6 +4,7 @@ use sqlx_pool_router::PoolProvider;
 
 use crate::{
     AppState,
+    api::handlers::validate_toleration_preset,
     api::models::{
         groups::GroupResponse,
         pagination::PaginatedResponse,
@@ -137,14 +138,12 @@ pub async fn list_users<P: PoolProvider>(
 
     // Iterate through and enrich users
     for user in users {
-        let pinned_tolerations = if can_update_all_users {
-            user.pinned_tolerations
-                .clone()
-                .and_then(|value| serde_json::from_value::<crate::scheduling::PinnedTolerations>(value).ok())
+        let toleration_preset = if can_update_all_users {
+            user.toleration_preset.clone()
         } else {
             None
         };
-        let mut response_user = UserResponse::from(user).with_pinned_tolerations(pinned_tolerations);
+        let mut response_user = UserResponse::from(user).with_toleration_preset(toleration_preset);
         // If includes groups
         if let Some(groups_map) = &groups_map
             && let Some(user_groups_map) = &user_groups_map
@@ -267,19 +266,17 @@ pub async fn get_user<P: PoolProvider>(
         id: target_user_id.to_string(),
     })?;
 
-    // Pinned scheduling tolerations are an operator's routing decision, so
-    // only platform managers (UpdateAll on users) see them, here as well as on
+    // The scheduling-toleration preset is an operator's routing decision, so
+    // only platform managers (UpdateAll on users) see it, here as well as on
     // the PATCH. `UserResponse::from` deliberately drops the field.
     let can_update_all_users = permissions::can_update_all_resources(&current_user, Resource::Users);
-    let pinned_tolerations = if can_update_all_users {
-        user.pinned_tolerations
-            .clone()
-            .and_then(|value| serde_json::from_value::<crate::scheduling::PinnedTolerations>(value).ok())
+    let toleration_preset = if can_update_all_users {
+        user.toleration_preset.clone()
     } else {
         None
     };
 
-    let mut response = UserResponse::from(user).with_pinned_tolerations(pinned_tolerations);
+    let mut response = UserResponse::from(user).with_toleration_preset(toleration_preset);
 
     // Include billing if requested and permitted
     // Permitted if:
@@ -466,7 +463,7 @@ pub async fn update_user<P: PoolProvider>(
         && (user_data.granted_serving_classes.is_some()
             || user_data.default_serving_class.is_some()
             || user_data.self_hosted_only.is_some()
-            || user_data.pinned_tolerations.is_some())
+            || user_data.toleration_preset.is_some())
     {
         return Err(Error::InsufficientPermissions {
             required: Permission::Allow(Resource::Users, Operation::UpdateAll),
@@ -482,12 +479,11 @@ pub async fn update_user<P: PoolProvider>(
             super::validate_elevated_serving_class(class)?;
         }
     }
-    // Reject a toleration the request path could not serialise into a valid
-    // body, so a malformed pin fails here rather than on every request later.
-    if let Some(Some(pinned)) = &user_data.pinned_tolerations {
-        pinned.validate().map_err(|error| Error::BadRequest {
-            message: error.to_string(),
-        })?;
+    // Reject a preset id this deployment does not define, so a typo fails here
+    // rather than silently pinning the account to nothing (or, at request
+    // time, failing closed to the most restrictive list).
+    if let Some(Some(preset)) = &user_data.toleration_preset {
+        validate_toleration_preset(&state, preset)?;
     }
 
     // Validate auto-topup fields if provided
@@ -519,16 +515,14 @@ pub async fn update_user<P: PoolProvider>(
     let db_request = UserUpdateDBRequest::new(user_data);
 
     let user = repo.update(user_id, &db_request).await?;
-    // Only a platform manager could have set a pin (the UpdateAll gate above
+    // Only a platform manager could have set a preset (the UpdateAll gate above
     // rejects anyone else), so they are the only caller who sees it back.
-    let pinned_tolerations = if can_update_all_users {
-        user.pinned_tolerations
-            .clone()
-            .and_then(|value| serde_json::from_value::<crate::scheduling::PinnedTolerations>(value).ok())
+    let toleration_preset = if can_update_all_users {
+        user.toleration_preset.clone()
     } else {
         None
     };
-    Ok(Json(UserResponse::from(user).with_pinned_tolerations(pinned_tolerations)))
+    Ok(Json(UserResponse::from(user).with_toleration_preset(toleration_preset)))
 }
 
 // DELETE /user/{user_id} - Delete user (admin only)

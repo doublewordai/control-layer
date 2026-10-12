@@ -263,6 +263,7 @@ pub fn create_test_config() -> crate::config::Config {
         database_pooled_url: None,
         clickhouse: None,
         prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),
+        scheduling: Default::default(),
         database_url: None,
         database_replica_url: None,
         database: crate::config::DatabaseConfig::External {
@@ -606,7 +607,7 @@ pub async fn get_system_user(pool: &mut PgConnection) -> UserResponse {
         default_serving_class: None,
         self_hosted_only: false,
         granted_serving_classes: Default::default(),
-        pinned_tolerations: Default::default(),
+        toleration_preset: Default::default(),
     }
 }
 
@@ -800,7 +801,7 @@ pub async fn create_test_org(pool: &PgPool, created_by: UserId) -> UserResponse 
         default_serving_class: None,
         self_hosted_only: false,
         granted_serving_classes: Default::default(),
-        pinned_tolerations: Default::default(),
+        toleration_preset: Default::default(),
     }
 }
 

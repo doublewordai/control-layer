@@ -151,9 +151,10 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
 
     let scrubbed_scheduling = strip_scheduling_priority(&mut request_value);
 
-    // The bearer token is needed below for ZDR, modality and pin decisions.
-    // Read it now (it was earlier only parsed after the body was re-serialised)
-    // so the pin can be applied to `request_value` before the bytes are rebuilt.
+    // The bearer token is needed below for ZDR, modality and toleration
+    // decisions. Read it now (it was earlier only parsed after the body was
+    // re-serialised) so the tolerations can be applied to `request_value`
+    // before the bytes are rebuilt.
     let api_key = parts
         .headers
         .get("authorization")
@@ -161,16 +162,16 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(|s| s.to_string());
 
-    // An operator can pin an account's scheduling tolerations: every request
-    // from the account then carries exactly the pinned list at
+    // An operator can pin an account to a scheduling-toleration preset: every
+    // request from the account then carries exactly the preset's list at
     // `nvext.routing_constraints.tolerations`, replacing anything the client
-    // sent (stripped by `strip_scheduling_priority` above). Answered from the
-    // per-key policy map, so this covers realtime, flex and background alike;
-    // batch JSONL files are scrubbed and pinned at ingest. An unpinned account
-    // is unchanged.
-    let pinned = pinned_tolerations(&state.key_policy_cache, api_key.as_deref());
-    let scrubbed_pinned = match pinned.as_deref() {
-        Some(tolerations) => set_pinned_tolerations(&mut request_value, tolerations),
+    // sent (stripped by `strip_scheduling_priority` above). The preset id is
+    // resolved against config through the per-key policy map, so this covers
+    // realtime, flex and background alike; batch JSONL files are scrubbed and
+    // stamped at ingest. The "Default" setting and every unpinned account are
+    // unchanged.
+    let scrubbed_pinned = match pinned_tolerations(&state.key_policy_cache, api_key.as_deref()) {
+        Some(tolerations) => set_routing_tolerations(&mut request_value, &tolerations),
         None => false,
     };
 
@@ -1419,9 +1420,9 @@ pub(crate) fn strip_scheduling_priority(value: &mut serde_json::Value) -> bool {
             }
             // Scheduling tolerations are the operator's to pin, never the
             // caller's: strip any client-supplied list the same way priority
-            // is stripped. A pinned account's list is written back afterwards
-            // by `set_pinned_tolerations`, so the only surviving value is the
-            // operator's (possibly empty) pin.
+            // is stripped. A pinned account's preset list is written back
+            // afterwards by `set_routing_tolerations`, so the only surviving
+            // value is the operator's.
             if let Some(routing) = nvext.get_mut("routing_constraints").and_then(|r| r.as_object_mut()) {
                 scrubbed |= routing.shift_remove("tolerations").is_some();
             }
@@ -1430,13 +1431,13 @@ pub(crate) fn strip_scheduling_priority(value: &mut serde_json::Value) -> bool {
     scrubbed
 }
 
-/// The tolerations pinned to the account owning the api key `secret`, or `None`
-/// when the account is not pinned. Answered from the per-key policy map.
+/// The toleration list an account is pinned to, resolved through the per-key
+/// policy map, or `None` when the account is on "Default". Hot-path safe.
 pub(crate) fn pinned_tolerations(
     cache: &crate::sync::key_policy::KeyPolicyCache,
     api_key: Option<&str>,
 ) -> Option<std::sync::Arc<serde_json::Value>> {
-    api_key.and_then(|secret| cache.pinned_tolerations(secret))
+    api_key.and_then(|secret| cache.tolerations(secret))
 }
 
 /// Write `tolerations` to `nvext.routing_constraints.tolerations`, in place,
@@ -1444,7 +1445,7 @@ pub(crate) fn pinned_tolerations(
 /// `routing_constraints` when absent, and leaves any other key (including
 /// other `routing_constraints` siblings) untouched. An existing identical
 /// value is a no-op so the common path keeps the caller's bytes.
-pub(crate) fn set_pinned_tolerations(value: &mut serde_json::Value, tolerations: &serde_json::Value) -> bool {
+pub(crate) fn set_routing_tolerations(value: &mut serde_json::Value, tolerations: &serde_json::Value) -> bool {
     let Some(obj) = value.as_object_mut() else {
         return false;
     };
@@ -1495,8 +1496,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn set_pinned_tolerations_writes_the_pinned_list_and_preserves_the_rest() {
-        // The pin replaces a client's nvext wholesale-safely: it is written
+    fn set_routing_tolerations_writes_the_preset_list_and_preserves_the_rest() {
+        // The preset replaces a client's nvext wholesale-safely: it is written
         // verbatim into routing_constraints.tolerations, and every sibling
         // (other nvext keys, other routing_constraints keys) survives.
         let mut body = serde_json::json!({
@@ -1507,36 +1508,41 @@ mod tests {
                 "routing_constraints": {"region": "eu", "tolerations": [{"operator": "Exists"}]}
             }
         });
-        let pinned = serde_json::json!([{"key": "dedicated", "value": "only"}]);
-        assert!(set_pinned_tolerations(&mut body, &pinned), "a changed value rebuilds the body");
-        assert_eq!(body["nvext"]["routing_constraints"]["tolerations"], pinned);
+        let empty = serde_json::json!([]);
+        assert!(set_routing_tolerations(&mut body, &empty), "a changed value rebuilds the body");
+        assert_eq!(body["nvext"]["routing_constraints"]["tolerations"], empty);
         assert_eq!(body["nvext"]["routing_constraints"]["region"], "eu");
         assert_eq!(body["nvext"]["agent_hints"]["max_batch_size"], 8);
 
         // Writing the same value again is a no-op, so the common path keeps the
         // caller's bytes.
-        assert!(!set_pinned_tolerations(&mut body, &pinned));
+        assert!(!set_routing_tolerations(&mut body, &empty));
 
-        // An empty pin is a real value, distinct from absent.
-        let mut empty = serde_json::json!({"model": "m"});
-        assert!(set_pinned_tolerations(&mut empty, &serde_json::json!([])));
-        assert_eq!(empty["nvext"]["routing_constraints"]["tolerations"], serde_json::json!([]));
+        // A non-empty preset list is written verbatim.
+        let list = serde_json::json!([{"key": "dedicated", "value": "only"}]);
+        let mut fresh = serde_json::json!({"model": "m"});
+        assert!(set_routing_tolerations(&mut fresh, &list));
+        assert_eq!(fresh["nvext"]["routing_constraints"]["tolerations"], list);
 
         // A non-object nvext is replaced rather than panicking.
         let mut broken = serde_json::json!({"model": "m", "nvext": "not-an-object"});
-        assert!(set_pinned_tolerations(&mut broken, &serde_json::json!([])));
+        assert!(set_routing_tolerations(&mut broken, &serde_json::json!([])));
         assert_eq!(broken["nvext"]["routing_constraints"]["tolerations"], serde_json::json!([]));
     }
 
     #[test]
     fn pinned_tolerations_reads_the_key_policy_cache() {
-        let cache = crate::sync::key_policy::KeyPolicyCache::from_policies([(
-            "sk-pinned".to_string(),
-            crate::sync::key_policy::KeyPolicy {
-                pinned_tolerations: Some(std::sync::Arc::new(serde_json::json!([]))),
-                ..Default::default()
-            },
-        )]);
+        let presets = crate::scheduling::TolerationPresets::new(&crate::config::SchedulingConfig::default());
+        let cache = crate::sync::key_policy::KeyPolicyCache::from_policies_with_presets(
+            presets,
+            [(
+                "sk-pinned".to_string(),
+                crate::sync::key_policy::KeyPolicy {
+                    toleration_preset: Some("no-overflow".to_string()),
+                    ..Default::default()
+                },
+            )],
+        );
         assert!(pinned_tolerations(&cache, Some("sk-pinned")).is_some());
         assert!(pinned_tolerations(&cache, Some("sk-other")).is_none());
         assert!(pinned_tolerations(&cache, None).is_none());
