@@ -1653,11 +1653,15 @@ export function useOrganizations(
   });
 }
 
-export function useOrganization(id: string) {
+export function useOrganization(
+  id: string,
+  options?: { enabled?: boolean },
+) {
   return useQuery({
     queryKey: queryKeys.organizations.byId(id),
     queryFn: () => dwctlApi.organizations.get(id),
     staleTime: 30 * 1000,
+    enabled: options?.enabled ?? true,
   });
 }
 

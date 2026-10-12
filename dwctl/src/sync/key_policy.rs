@@ -89,6 +89,15 @@ impl KeyPolicyCache {
         self.inner.load().get(secret).cloned().unwrap_or_default()
     }
 
+    /// The policy for `secret` if the key is present in the map, or `None` when
+    /// it is absent (a key created since the last refresh, or one auth would
+    /// reject). Unlike [`Self::policy`], this distinguishes a cache miss from a
+    /// cached account on the permissive default, so a caller can decide whether
+    /// a DB read is warranted. Hot-path safe.
+    pub fn policy_if_known(&self, secret: &str) -> Option<KeyPolicy> {
+        self.inner.load().get(secret).cloned()
+    }
+
     /// Whether the api key `secret` belongs to a ZDR account. Hot-path safe.
     pub fn is_zdr(&self, secret: &str) -> bool {
         self.policy(secret).zdr
@@ -111,6 +120,16 @@ impl KeyPolicyCache {
     /// caller that only needs the id does not allocate a whole `KeyPolicy`.
     fn preset_id(&self, secret: &str) -> Option<Arc<str>> {
         self.inner.load().get(secret).and_then(|p| p.toleration_preset.clone())
+    }
+
+    /// The tolerations for `secret` when the key is present in the map:
+    /// `Some(Some(list))` when pinned, `Some(None)` when the account is on
+    /// Default. `None` means the key is absent from the map (a key created
+    /// since the last refresh), which the caller may resolve from the DB. Hot
+    /// path safe.
+    pub fn tolerations_if_known(&self, secret: &str) -> Option<Option<Arc<serde_json::Value>>> {
+        let policy = self.policy_if_known(secret)?;
+        Some(self.presets.resolve(policy.toleration_preset.as_deref()))
     }
 
     /// The presets a stored id resolves against, for a caller that read an
@@ -424,6 +443,17 @@ mod tests {
         // The Default setting and an unknown key are both unpinned.
         assert!(cache.tolerations("sk-default").is_none());
         assert!(cache.tolerations("sk-missing").is_none());
+        // `tolerations_if_known` distinguishes a cached Default (`Some(None)`)
+        // from a key absent from the map (`None`), so the batch upload only
+        // pays for a DB read on a genuine miss.
+        assert_eq!(cache.tolerations_if_known("sk-default"), Some(None));
+        assert_eq!(cache.tolerations_if_known("sk-missing"), None);
+        assert_eq!(
+            cache.tolerations_if_known("sk-preset").map(|t| t.map(|v| v.as_ref().clone())),
+            Some(Some(
+                serde_json::json!([{"key": "pool", "operator": "Equal", "value": "dedicated"}])
+            ))
+        );
     }
 
     #[test]

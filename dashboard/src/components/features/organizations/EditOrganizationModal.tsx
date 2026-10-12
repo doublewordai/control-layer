@@ -48,8 +48,12 @@ export function EditOrganizationModal({
   // List rows carry the pinned preset for platform managers, but a row from a
   // projection that omits it would read as "Default" and clear the pin on any
   // unrelated edit. While the modal is open, take the authoritative value from
-  // the detail endpoint.
-  const { data: detail } = useOrganization(isOpen && organization ? organization.id : "");
+  // the detail endpoint. Disabled while closed so a mount with no organization
+  // does not fire a request for an empty id.
+  const { data: detail } = useOrganization(
+    organization?.id ?? "",
+    { enabled: isOpen && !!organization },
+  );
 
   useEffect(() => {
     if (isOpen && organization) {

@@ -129,13 +129,13 @@ impl PinnedTolerations {
 /// The deployment's presets, resolved to the JSON the request path writes and
 /// keyed by preset id. Built at startup from
 /// [`crate::config::SchedulingConfig`], and shared read-only on the request
-/// hot path. Held behind an [`ArcSwap`] so a config reload can swap in new
+/// hot path. Held behind an [`arc_swap::ArcSwap`] so a config reload can swap in new
 /// presets without a restart.
 #[derive(Debug, Clone)]
 pub struct TolerationPresets {
     /// Preset id → the toleration list as the request body JSON. The list is
     /// pre-serialised so the hot path clones an `Arc` and never re-serialises.
-    /// Behind an [`ArcSwap`] so a reload swaps the whole map atomically.
+    /// Behind an [`arc_swap::ArcSwap`] so a reload swaps the whole map atomically.
     by_id: Arc<arc_swap::ArcSwap<HashMap<String, Arc<serde_json::Value>>>>,
     /// The pre-resolved fail-closed value (`[]`, the most restrictive list),
     /// shared so a retired preset does not allocate a fresh `[]` on every
