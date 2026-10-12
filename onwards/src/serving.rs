@@ -76,6 +76,7 @@ pub const SUFFIX_SEPARATOR: char = ':';
 /// policy in [`crate::target::Targets::accounts`] and an alias's overlays are
 /// both keyed by its value.
 pub const ACCOUNT_LABEL: &str = "account";
+pub const ACCOUNT_NAME_LABEL: &str = "account_name";
 
 /// The dispatch mode a request is served under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

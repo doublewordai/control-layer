@@ -121,6 +121,7 @@ struct OnwardsApiKey {
     /// as the key's `account` label, through which onwards finds the
     /// account's serving settings and an alias's overlay for it.
     user_id: UserId,
+    username: String,
 }
 
 /// Every alias's overlays, keyed by alias then by account id (as a string,
@@ -263,9 +264,9 @@ async fn load_accounts_from_db(db: &PgPool) -> Result<AccountsById, anyhow::Erro
         .collect())
 }
 
-/// The labels every key carries: its purpose, the account's ZDR flag, and the
+/// The labels every key carries: its purpose, the account's ZDR flag, the
 /// account itself so onwards can find the account's serving settings and an
-/// alias's overlay for it.
+/// alias's overlay for it, and the account's username to name it in metrics.
 fn key_labels(api_key: &OnwardsApiKey) -> HashMap<String, String> {
     HashMap::from([
         ("purpose".to_string(), api_key.purpose.clone()),
@@ -273,6 +274,7 @@ fn key_labels(api_key: &OnwardsApiKey) -> HashMap<String, String> {
         // Always emitted ("true"/"false"); onwards does not act on it yet.
         ("zdr".to_string(), api_key.zero_data_retention.to_string()),
         (onwards::serving::ACCOUNT_LABEL.to_string(), api_key.user_id.to_string()),
+        (onwards::serving::ACCOUNT_NAME_LABEL.to_string(), api_key.username.clone()),
         ("api_key_id".to_string(), api_key.id.to_string()),
     ])
 }
@@ -820,7 +822,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             ak.secret as api_key_secret,
             ak.purpose as api_key_purpose,
             ak.user_zero_data_retention,
-            ak.user_id
+            ak.user_id,
+            ak.user_username
         FROM deployed_models cm
         CROSS JOIN LATERAL (
             SELECT DISTINCT
@@ -828,7 +831,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 ak.secret,
                 ak.purpose,
                 ak.user_id,
-                u.zero_data_retention as user_zero_data_retention
+                u.zero_data_retention as user_zero_data_retention,
+                u.username as user_username
             FROM api_keys ak
             JOIN users u ON u.id = ak.user_id
             WHERE (
@@ -1095,6 +1099,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     purpose: row.api_key_purpose.clone(),
                     zero_data_retention: row.user_zero_data_retention,
                     user_id: row.user_id,
+                    username: row.user_username,
                 });
             }
         }
@@ -1625,6 +1630,7 @@ pub async fn load_targets_from_db_with_batch_default(
             ak.purpose as "api_key_purpose?",
             ak.user_zero_data_retention as "api_key_user_zero_data_retention?",
             ak.user_id as "api_key_user_id?",
+            ak.user_username as "api_key_user_username?",
             dm.serving_classes
         FROM deployed_models dm
         INNER JOIN inference_endpoints ie ON dm.hosted_on = ie.id
@@ -1634,7 +1640,8 @@ pub async fn load_targets_from_db_with_batch_default(
                 ak.secret,
                 ak.purpose,
                 ak.user_id,
-                u.zero_data_retention as user_zero_data_retention
+                u.zero_data_retention as user_zero_data_retention,
+                u.username as user_username
             FROM api_keys ak
             JOIN users u ON u.id = ak.user_id
             WHERE (
@@ -1800,12 +1807,13 @@ pub async fn load_targets_from_db_with_batch_default(
             }
         });
 
-        if let (Some(api_key_id), Some(api_key_secret), Some(api_key_purpose), Some(zero_data_retention), Some(user_id)) = (
+        if let (Some(api_key_id), Some(api_key_secret), Some(api_key_purpose), Some(zero_data_retention), Some(user_id), Some(username)) = (
             row.api_key_id,
             row.api_key_secret,
             row.api_key_purpose,
             row.api_key_user_zero_data_retention,
             row.api_key_user_id,
+            row.api_key_user_username,
         ) {
             target.api_keys.push(OnwardsApiKey {
                 id: api_key_id,
@@ -1813,6 +1821,7 @@ pub async fn load_targets_from_db_with_batch_default(
                 purpose: api_key_purpose,
                 zero_data_retention,
                 user_id,
+                username,
             });
         }
     }
