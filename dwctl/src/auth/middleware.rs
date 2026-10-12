@@ -93,6 +93,7 @@ pub(crate) async fn admin_ai_proxy<P: sqlx_pool_router::PoolProvider + Clone>(
     *request.body_mut() = Body::from(body_bytes);
 
     trace!("Rewritten request URI: {}", request.uri());
+    trace!("Request headers: {:?}", request.headers());
     // Continue with the modified request
     Ok(request)
 }
