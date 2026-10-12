@@ -199,7 +199,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // `request_value` only stays removed if the bytes are rebuilt from it.
     // Every scrubber reports whether it changed something; the common case
     // (nothing to scrub, no suffix, no pin) keeps the caller's bytes untouched.
-    let body_bytes = if scrubbed_class || scrubbed_ids || scrubbed_scheduling || scrubbed_pinned {
+    let mut body_bytes = if scrubbed_class || scrubbed_ids || scrubbed_scheduling || scrubbed_pinned {
         bytes::Bytes::from(request_value.to_string())
     } else {
         body_bytes
@@ -321,6 +321,10 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 ))
                 .unwrap();
         }
+        // Realtime dispatch otherwise forwards the original caller bytes. The
+        // hydrated request must become the body sent through translation as
+        // well as the body retained for a later continuation.
+        body_bytes = bytes::Bytes::from(request_value.to_string());
     }
 
     // Parse `service_tier` and `background` from the body.
