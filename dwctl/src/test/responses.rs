@@ -702,6 +702,28 @@ async fn a_chain_can_extend_a_response_after_its_graph_moved_to_the_retained_sto
     let extended_json: serde_json::Value = extended.json();
     assert_eq!(extended_json["previous_response_id"], format!("resp_{id}"));
     assert_ne!(extended_json["id"], format!("resp_{id}"));
+
+    let upstream_requests = mock_server.received_requests().await.unwrap_or_default();
+    let continuation_requests: Vec<_> = upstream_requests
+        .iter()
+        .filter(|request| String::from_utf8_lossy(&request.body).contains("second turn"))
+        .collect();
+    assert_eq!(
+        continuation_requests.len(),
+        2,
+        "both the live and retained continuations must reach upstream"
+    );
+    for request in continuation_requests {
+        let body = String::from_utf8_lossy(&request.body);
+        assert!(
+            body.contains("first turn"),
+            "a continuation must include the original user turn; upstream body: {body}"
+        );
+        assert!(
+            body.contains("Hello from the test!"),
+            "a continuation must include the prior assistant answer; upstream body: {body}"
+        );
+    }
 }
 
 #[dwctl_test_macros::test]
