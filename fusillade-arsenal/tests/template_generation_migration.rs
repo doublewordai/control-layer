@@ -1,3 +1,6 @@
+use std::borrow::Cow;
+
+use fusillade_arsenal::MIGRATOR;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -57,7 +60,7 @@ async fn generation_two_parent_is_weekly_range_partitioned(pool: PgPool) {
     .unwrap();
     assert!(range_partitioned);
 
-    // Existing legacy templates remain available during the writer transition.
+    // The generation-1 heap is retired: nothing but the weekly store remains.
     let legacy_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'request_templates' \
                         AND relkind IN ('r', 'p'))",
@@ -65,10 +68,7 @@ async fn generation_two_parent_is_weekly_range_partitioned(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(
-        legacy_exists,
-        "the legacy template heap must remain available"
-    );
+    assert!(!legacy_exists, "the legacy template heap must be gone");
 }
 
 #[sqlx::test]
@@ -611,8 +611,24 @@ async fn batch_results_stream_finds_generation_two_templates(pool: PgPool) {
     assert_eq!(item.input_body, serde_json::json!({"gen": 2}));
 }
 
-#[sqlx::test]
-async fn active_view_reads_both_generations_identically(pool: PgPool) {
+#[sqlx::test(migrations = false)]
+async fn expanded_active_view_reads_both_generations_before_retirement(pool: PgPool) {
+    // This contract belongs to the writer transition, before heap retirement.
+    sqlx::migrate::Migrator {
+        migrations: Cow::Owned(
+            MIGRATOR
+                .iter()
+                .filter(|migration| migration.version <= 20261007160000)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    }
+    .run(&pool)
+    .await
+    .unwrap();
     let week = monday(&pool, 0).await;
     sqlx::query("SELECT ensure_request_template_partition($1, NULL)")
         .bind(week)
