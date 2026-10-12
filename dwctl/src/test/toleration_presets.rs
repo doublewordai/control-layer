@@ -88,7 +88,7 @@ impl Fixture {
             .await
             .unwrap();
         let endpoint: Uuid = sqlx::query_scalar(
-            "INSERT INTO inference_endpoints (name,url,created_by,kind) VALUES ('preset-test',$1,$2,'dynamo') RETURNING id",
+            "INSERT INTO inference_endpoints (name,url,created_by,kind) VALUES ('preset-test',$1,$2,'hosted') RETURNING id",
         )
         .bind(upstream.uri())
         .bind(user.id)

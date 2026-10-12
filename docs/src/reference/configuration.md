@@ -676,7 +676,7 @@ serve the request. The wording is backend-agnostic.
 scheduling:
   toleration_presets:
     # An empty list asks the backend to keep the account off any tainted
-    # capacity (e.g. overflow/spillover capacity).
+    # capacity (e.g. overflow capacity).
     - id: "no-overflow"
       label: "No overflow capacity"
       description: >-
