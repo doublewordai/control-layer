@@ -89,9 +89,14 @@ describe("SchedulingTolerations", () => {
 
   it("cautions that pinning can make scheduling harder whenever presets exist", () => {
     renderControls(null);
-    expect(
-      screen.getByTestId("toleration-pinning-caution"),
-    ).toHaveTextContent(/pin as few accounts as possible/i);
+    const caution = screen.getByTestId("toleration-pinning-caution");
+    // The qualification matters: tolerations do not force placement, and the
+    // effect falls on accounts sharing capacity, so an overbroad "strictly
+    // harder for every account" claim must fail this test.
+    expect(caution).toHaveTextContent(/can make scheduling harder/i);
+    expect(caution).toHaveTextContent(/accounts sharing the same capacity/i);
+    expect(caution).toHaveTextContent(/pin as few accounts as possible/i);
+    expect(caution).not.toHaveTextContent(/strictly harder for every account/i);
   });
 
   it("omits the caution when no presets are configured", () => {
