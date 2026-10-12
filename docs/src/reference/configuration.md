@@ -671,9 +671,9 @@ written to every inference request from that account at
 `nvext.routing_constraints.tolerations`, for realtime, flex and batch traffic
 alike. A backend that honours tolerations uses them to decide which capacity may
 serve the request. The wording is backend-agnostic. Pinning restricts where an
-account's requests can be placed, which makes scheduling strictly harder for
-every account, not just the pinned one; pin as few accounts as possible and only
-when a customer requires it.
+account's requests can be placed, and can make scheduling harder for accounts
+sharing the same capacity, depending on how the backend treats tolerations; pin
+as few accounts as possible and only when a customer requires it.
 
 ```yaml
 scheduling:

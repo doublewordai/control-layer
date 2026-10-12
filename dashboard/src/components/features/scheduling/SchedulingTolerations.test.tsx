@@ -87,7 +87,7 @@ describe("SchedulingTolerations", () => {
     expect(within(alert).getByText(/no longer a configured preset/i)).toBeInTheDocument();
   });
 
-  it("cautions that pinning makes scheduling harder whenever presets exist", () => {
+  it("cautions that pinning can make scheduling harder whenever presets exist", () => {
     renderControls(null);
     expect(
       screen.getByTestId("toleration-pinning-caution"),

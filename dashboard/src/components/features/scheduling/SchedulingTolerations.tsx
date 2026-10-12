@@ -125,10 +125,10 @@ export function SchedulingTolerations({
             aria-hidden="true"
           />
           <span data-testid="toleration-pinning-caution">
-            Pinning an account restricts where its requests can be placed. This
-            makes scheduling strictly harder for every account, not just this
-            one, so pin as few accounts as possible and only when a customer
-            requires it.
+            Pinning an account restricts where its requests can be placed, and
+            can make scheduling harder for accounts sharing the same capacity,
+            depending on how the backend treats tolerations. Pin as few accounts
+            as possible and only when a customer requires it.
           </span>
         </p>
       )}
