@@ -154,7 +154,7 @@ Some chat parameters are engine extensions or options that not every backend beh
 Strict mode checks every Chat Completions request against that list after schema validation and before reasoning validation:
 
 - Each matching parameter increments `onwards_unsupported_params_total{param, model, traffic, action}`. `action` is `logged` or `rejected`. A `logged` request can still be refused by a later check, such as reasoning validation.
-- The request is logged at `info` with the parameter names, model, account and API key ID. Values and request bodies are never logged.
+- The `onwards.request` trace span gets `onwards.unsupported_params`, the matching parameter names joined by commas, and `onwards.account` and `onwards.api_key_id` from the labels of the key the request presented, when it has them. Values and request bodies are never recorded.
 - If any parameter is in the gateway's reject list, the whole request gets a `400` with code `unsupported_parameter` naming the rejected parameters, for example ``Unsupported parameter(s): `logprobs` ``, and is not forwarded. A request whose flagged parameters are all outside the reject list is forwarded unchanged.
 
 The check covers Chat Completions requests, including Responses and Messages requests that an edge such as dwctl has translated into Chat Completions before they reach onwards. Native `/v1/responses` requests are forwarded to an upstream that speaks the Responses API itself and aren't checked.

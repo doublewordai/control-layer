@@ -1,8 +1,8 @@
 //! Chat request parameters that not every worker behind a model can honour.
 //!
 //! In strict mode, every chat request is checked against [`params`] before it
-//! is forwarded. Each match is logged and counted; a parameter configured as
-//! rejected (see
+//! is forwarded. Each match is counted and named on the request span; a
+//! parameter configured as rejected (see
 //! [`AppState::with_rejected_params`](crate::AppState::with_rejected_params))
 //! gets a 400 instead of being forwarded.
 //!
