@@ -822,7 +822,7 @@ impl<'c> Organizations<'c> {
     /// The approved user's id comes back so the caller can tell them — only
     /// the winner of a concurrent approval gets a `Some`, so the requester is
     /// mailed once rather than once per racing admin.
-    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), request_id = %abbrev_uuid(&request_id)), err)]
+    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), join_request_id = %abbrev_uuid(&request_id)), err)]
     pub async fn approve_join_request(&mut self, org_id: UserId, request_id: Uuid, role: &str) -> Result<Option<UserId>> {
         let approved = sqlx::query_scalar!(
             r#"
@@ -877,7 +877,7 @@ impl<'c> Organizations<'c> {
     /// Deleted rather than kept in a `declined` state so the user can ask again
     /// later - a permanent tombstone would silently block them forever via the
     /// unique constraint.
-    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), request_id = %abbrev_uuid(&request_id)), err)]
+    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), join_request_id = %abbrev_uuid(&request_id)), err)]
     pub async fn decline_join_request(&mut self, org_id: UserId, request_id: Uuid) -> Result<bool> {
         let result = sqlx::query!(
             "DELETE FROM user_organizations WHERE id = $1 AND organization_id = $2 AND status = 'requested'",

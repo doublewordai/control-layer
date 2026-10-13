@@ -1425,4 +1425,5 @@ async fn test_realtime_zdr_suppresses_stored_bodies(pool: PgPool) {
     );
 }
 
+mod request_id;
 mod trace_binding;

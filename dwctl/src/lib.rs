@@ -1628,7 +1628,12 @@ async fn setup_database(
 /// configuration. Origin/credential handling differs by mode — see [`apply_cors`].
 fn create_cors_layer(cors: &CorsConfig) -> anyhow::Result<CorsLayer> {
     // Parse exposed headers as HeaderName
-    let exposed: Vec<http::HeaderName> = cors.exposed_headers.iter().filter_map(|h| h.parse().ok()).collect();
+    let mut exposed: Vec<http::HeaderName> = cors.exposed_headers.iter().filter_map(|h| h.parse().ok()).collect();
+    // Always let browsers read the request ID so users can quote it in support requests.
+    let request_id_header = http::HeaderName::from_static(REQUEST_ID_HEADER);
+    if !exposed.contains(&request_id_header) {
+        exposed.push(request_id_header);
+    }
 
     let mut cors_layer = CorsLayer::new()
         .allow_methods([
@@ -2778,8 +2783,20 @@ pub async fn build_router(
                 let span = tracing::info_span!(
                     "request",
                     trace_id = tracing::field::Empty,
+                    x_request_id = tracing::field::Empty,
+                    edge_request_id = tracing::field::Empty,
                     otel.name = %span_name,
                 );
+
+                // IDs minted by `assign_request_id`, which runs outside this layer.
+                // Declared span fields are exported as OTel attributes by the
+                // tracing-opentelemetry layer, so no separate set_attribute is needed.
+                if let Some(ids) = request.extensions().get::<RequestIds>() {
+                    span.record("x_request_id", ids.x_request_id.as_str());
+                    if let Some(edge) = &ids.edge_request_id {
+                        span.record("edge_request_id", edge.as_str());
+                    }
+                }
 
                 // W3C Trace Context propagation (https://www.w3.org/TR/trace-context/)
                 //
@@ -2841,7 +2858,50 @@ pub async fn build_router(
             ),
     );
 
-    Ok(router)
+    // Outermost: mint the request ID before the span is created and echo it on
+    // every response, including rejections produced by inner layers.
+    Ok(router.layer(middleware::from_fn(assign_request_id)))
+}
+
+/// Header carrying the request ID, both on responses and towards providers.
+const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// Longest inbound `X-Request-ID` we keep as `edge_request_id`.
+const MAX_EDGE_REQUEST_ID_LEN: usize = 128;
+
+/// Request IDs attached to the request extensions by [`assign_request_id`].
+#[derive(Debug, Clone)]
+struct RequestIds {
+    /// Freshly minted UUIDv7; the only ID we log as `x_request_id`.
+    x_request_id: String,
+    /// Sanitised inbound `X-Request-ID` (e.g. set by an ingress), kept for correlation only.
+    edge_request_id: Option<String>,
+}
+
+/// Keep an inbound request ID only if it is short, visible ASCII.
+fn sanitise_edge_request_id(value: &http::HeaderValue) -> Option<String> {
+    let s = value.to_str().ok()?;
+    (!s.is_empty() && s.len() <= MAX_EDGE_REQUEST_ID_LEN && s.bytes().all(|b| b.is_ascii_graphic())).then(|| s.to_owned())
+}
+
+/// Middleware that mints a unique request ID for every request.
+///
+/// An inbound `X-Request-ID` is never trusted as our ID (clients and ingresses
+/// can set it, so it is not guaranteed unique). It is preserved as
+/// `edge_request_id` and overwritten with our own value, so that onwards
+/// forwards our ID to providers. The ID is echoed on every response.
+async fn assign_request_id(mut request: axum::extract::Request, next: middleware::Next) -> axum::response::Response {
+    let x_request_id = Uuid::now_v7().to_string();
+    let edge_request_id = request.headers().get(REQUEST_ID_HEADER).and_then(sanitise_edge_request_id);
+    let value = http::HeaderValue::from_str(&x_request_id).expect("UUID is a valid header value");
+    request.headers_mut().insert(REQUEST_ID_HEADER, value.clone());
+    request.extensions_mut().insert(RequestIds {
+        x_request_id,
+        edge_request_id,
+    });
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(REQUEST_ID_HEADER, value);
+    response
 }
 
 /// Middleware that records the OpenTelemetry trace ID on the current span,
