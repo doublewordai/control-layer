@@ -567,7 +567,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             )
             .await;
             match client_usage {
-                Some(include_usage) => super::stream_usage::apply(response, include_usage, state.sse_buffer_limit),
+                Some(usage) => super::stream_usage::apply(response, usage, state.sse_buffer_limit),
                 None => response,
             }
         }

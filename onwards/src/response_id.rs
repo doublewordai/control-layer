@@ -32,12 +32,15 @@ pub fn extract_override_id(headers: &HeaderMap, header_name: &str) -> Option<Str
 ///
 /// Currently: `/v1/responses` (Open Responses API), `/v1/chat/completions` and
 /// the legacy `/v1/completions`. Query strings and trailing slashes are
-/// ignored; substring matches on other routes (e.g. `/responses-logs`) are
-/// rejected.
+/// ignored; substring matches on other routes (e.g. `/responses-logs`,
+/// `/v1/fim/completions`) are rejected.
 pub fn path_supports_id_override(path_and_query: &str) -> bool {
     let path = path_and_query.split('?').next().unwrap_or(path_and_query);
     let path = path.trim_end_matches('/');
-    path.ends_with("/responses") || path.ends_with("/completions")
+    path.ends_with("/responses")
+        || path.ends_with("/chat/completions")
+        || path == "/completions"
+        || path.ends_with("/v1/completions")
 }
 
 /// Patch the `id` field in a JSON response body with the given override.
@@ -213,6 +216,7 @@ mod tests {
         assert!(!path_supports_id_override("/v1/responses-logs"));
         assert!(!path_supports_id_override("/v1/chat/completions/history"));
         assert!(!path_supports_id_override("/responses_v2"));
+        assert!(!path_supports_id_override("/v1/fim/completions"));
     }
 
     // --- patch_response_body_id ---
