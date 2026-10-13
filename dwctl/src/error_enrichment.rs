@@ -39,10 +39,12 @@ use axum::{
     middleware::Next,
     response::IntoResponse,
 };
+use onwards::{ErrorOrigin, RequestIdentity};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use sqlx::PgPool;
 use tracing::{debug, instrument};
+use uuid::Uuid;
 
 /// Request body structure for extracting model name
 #[derive(Debug, Deserialize)]
@@ -109,6 +111,18 @@ pub async fn error_enrichment_middleware(
         // unknown/invalid token, in which case the checks fall through.
         let key_info = get_api_key_user_and_purpose(pools.write().into_inner(), &key).await.ok().flatten();
 
+        // Onwards never saw these keys (they are excluded from its key set), so
+        // its response carries no identity. Attach it here, with the refusal
+        // code, so the root request span records who was refused and why.
+        let identity = key_info.as_ref().map(|owner| owner.identity(model_name.clone()));
+        let tag = |mut response: Response<Body>, code: &str| {
+            if let Some(identity) = identity.clone() {
+                response.extensions_mut().insert(identity);
+            }
+            response.extensions_mut().insert(ErrorOrigin::Gateway { code: code.to_string() });
+            response
+        };
+
         // Order matters: the more fundamental the failure, the earlier it runs, so
         // when several conditions could explain the 403 we surface the one that's
         // most useful to act on.
@@ -128,7 +142,7 @@ pub async fn error_enrichment_middleware(
 
         // 0. Non-inference key: explain why an otherwise-valid key was rejected,
         //    rather than leaving onwards' generic "forbidden" body.
-        if let Some((_, purpose)) = key_info.as_ref()
+        if let Some(ApiKeyOwner { purpose, .. }) = key_info.as_ref()
             && !crate::db::models::api_keys::is_inference_purpose(purpose)
         {
             let body = serde_json::json!({
@@ -137,50 +151,62 @@ pub async fn error_enrichment_middleware(
                     "type": "invalid_request_error"
                 }
             });
-            return Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap_or_else(|_| StatusCode::FORBIDDEN.into_response());
+            return tag(
+                Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap_or_else(|_| StatusCode::FORBIDDEN.into_response()),
+                "non_inference_key",
+            );
         }
 
         // 1. Model access via group membership
         if let Some(model) = &model_name
-            && let Some((user_id, _)) = key_info.as_ref()
+            && let Some(ApiKeyOwner { user_id, .. }) = key_info.as_ref()
             && let Ok(has_access) = check_user_has_model_access(pools.write().into_inner(), *user_id, model).await
             && !has_access
         {
-            return Error::ModelAccessDenied {
-                model_name: model.clone(),
-                message: format!(
-                    "You do not have access to '{}'. Please contact your administrator to request access.",
-                    model
-                ),
-            }
-            .into_response();
+            return tag(
+                Error::ModelAccessDenied {
+                    model_name: model.clone(),
+                    message: format!(
+                        "You do not have access to '{}'. Please contact your administrator to request access.",
+                        model
+                    ),
+                }
+                .into_response(),
+                "model_access_denied",
+            );
         }
 
         // 2. Modality blocked by a traffic routing rule on this model.
         if let Some(model) = &model_name
             && let Ok(Some(purpose)) = check_modality_blocked(pools.write().into_inner(), &key, model).await
         {
-            return Error::ModalityAccessDenied {
-                model_name: model.clone(),
-                purpose: purpose.clone(),
-                message: modality_blocked_message(&purpose, model),
-            }
-            .into_response();
+            return tag(
+                Error::ModalityAccessDenied {
+                    model_name: model.clone(),
+                    purpose: purpose.clone(),
+                    message: modality_blocked_message(&purpose, model),
+                }
+                .into_response(),
+                "modality_blocked",
+            );
         }
 
         // 3. Insufficient balance.
         if let Ok(Some(balance)) = get_balance_of_api_key(pools.write().into_inner(), &key).await
             && balance <= Decimal::ZERO
         {
-            return Error::InsufficientCredits {
-                current_balance: balance,
-                message: "Account balance too low. Please add credits to continue.".to_string(),
-            }
-            .into_response();
+            return tag(
+                Error::InsufficientCredits {
+                    current_balance: balance,
+                    message: "Account balance too low. Please add credits to continue.".to_string(),
+                }
+                .into_response(),
+                "insufficient_credits",
+            );
         }
 
         // 4. Spending cap. Read-only against the same checkpoint state and
@@ -209,11 +235,14 @@ pub async fn error_enrichment_middleware(
                         "param": null
                     }
                 });
-                return Response::builder()
-                    .status(StatusCode::PAYMENT_REQUIRED)
-                    .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap_or_else(|_| StatusCode::PAYMENT_REQUIRED.into_response());
+                return tag(
+                    Response::builder()
+                        .status(StatusCode::PAYMENT_REQUIRED)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap_or_else(|_| StatusCode::PAYMENT_REQUIRED.into_response()),
+                    "spend_cap_exceeded",
+                );
             }
 
             // The window has ROLLED but the sync hasn't readmitted the scope
@@ -243,12 +272,15 @@ pub async fn error_enrichment_middleware(
                     "param": null
                 }
             });
-            return Response::builder()
-                .status(StatusCode::TOO_MANY_REQUESTS)
-                .header("content-type", "application/json")
-                .header("retry-after", "5")
-                .body(Body::from(body.to_string()))
-                .unwrap_or_else(|_| StatusCode::TOO_MANY_REQUESTS.into_response());
+            return tag(
+                Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header("content-type", "application/json")
+                    .header("retry-after", "5")
+                    .body(Body::from(body.to_string()))
+                    .unwrap_or_else(|_| StatusCode::TOO_MANY_REQUESTS.into_response()),
+                "spend_cap_reset_pending",
+            );
         }
     }
 
@@ -450,15 +482,47 @@ pub async fn get_user_id_of_api_key(pool: PgPool, api_key: &str) -> Result<UserI
 /// lookups keeps the 403 enrichment path (and the Flex check) to one by-secret
 /// query instead of fanning out.
 #[instrument(skip_all, name = "dwctl.get_api_key_user_and_purpose")]
-async fn get_api_key_user_and_purpose(pool: PgPool, api_key: &str) -> Result<Option<(UserId, String)>, DbError> {
+async fn get_api_key_user_and_purpose(pool: PgPool, api_key: &str) -> Result<Option<ApiKeyOwner>, DbError> {
     let mut conn = pool.acquire().await?;
     let row = sqlx::query!(
-        "SELECT user_id, purpose FROM api_keys WHERE secret = $1 AND is_deleted = false",
+        r#"
+        SELECT k.id, k.user_id, k.purpose, COALESCE(u.display_name, u.username) AS account_name
+        FROM api_keys k
+        JOIN users u ON u.id = k.user_id
+        WHERE k.secret = $1 AND k.is_deleted = false
+        "#,
         api_key
     )
     .fetch_optional(&mut *conn)
     .await?;
-    Ok(row.map(|r| (r.user_id, r.purpose)))
+    Ok(row.map(|r| ApiKeyOwner {
+        api_key_id: r.id,
+        user_id: r.user_id,
+        purpose: r.purpose,
+        account_name: r.account_name,
+    }))
+}
+
+/// The key behind a request, and the account that owns it.
+struct ApiKeyOwner {
+    api_key_id: Uuid,
+    user_id: UserId,
+    purpose: String,
+    account_name: Option<String>,
+}
+
+impl ApiKeyOwner {
+    /// The caller's identity for the root request span, as onwards would have
+    /// attached it had the key been in its key set.
+    fn identity(&self, model: Option<String>) -> RequestIdentity {
+        RequestIdentity {
+            account_id: Some(self.user_id.to_string()),
+            account_name: self.account_name.clone(),
+            api_key_id: Some(self.api_key_id),
+            key_purpose: Some(self.purpose.clone()),
+            model,
+        }
+    }
 }
 
 /// An exempt account must not get a misleading insufficient-credit error when
@@ -511,7 +575,7 @@ pub async fn check_user_has_model_access(pool: PgPool, user_id: UserId, model_al
 /// could send a Flex request and skip a deny rule onwards would have enforced.
 pub async fn validate_api_key_model_access(pool: PgPool, api_key: &str, model: &str) -> Result<(), String> {
     // One by-secret lookup of the key's owner + purpose, reused below.
-    let (user_id, purpose) = get_api_key_user_and_purpose(pool.clone(), api_key)
+    let ApiKeyOwner { user_id, purpose, .. } = get_api_key_user_and_purpose(pool.clone(), api_key)
         .await
         .map_err(|_| "Invalid API key".to_string())?
         .ok_or_else(|| "Invalid API key".to_string())?;

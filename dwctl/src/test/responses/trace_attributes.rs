@@ -187,6 +187,22 @@ async fn customer_attributes_on_request_spans(pool: sqlx::PgPool) {
     let inner = onwards_request(&spans, request);
     assert_eq!(attr(inner, "http.response.status_code").as_deref(), Some("422"));
 
+    // Access revoked: onwards no longer routes this key to the model, and dwctl
+    // replaces its bare 403 with an explanation. The refusal still names the
+    // account, and is classed as a gateway decision with a specific code.
+    sqlx::query("DELETE FROM deployment_groups").execute(&pool).await.unwrap();
+    bg.sync_onwards_config(&pool).await.unwrap();
+    let denied = server.post(path_chat).add_header("Authorization", &auth).json(&chat).await;
+    assert_eq!(denied.status_code().as_u16(), 403);
+    let spans = take(&provider, &exported);
+    let request = root(&spans, path_chat);
+    assert_eq!(attr(request, "doubleword.account_id"), Some(owner.to_string()));
+    assert_eq!(attr(request, "doubleword.account_name").as_deref(), Some("Example Trading Ltd"));
+    assert_eq!(attr(request, "doubleword.api_key_id"), Some(key_id.to_string()));
+    assert_eq!(attr(request, "gen_ai.request.model").as_deref(), Some("gpt-4o"));
+    assert_eq!(attr(request, "doubleword.error.source").as_deref(), Some("gateway"));
+    assert_eq!(attr(request, "doubleword.rejection.code").as_deref(), Some("model_access_denied"));
+
     // An unknown key is a 401 with no identity.
     server
         .post(path_chat)

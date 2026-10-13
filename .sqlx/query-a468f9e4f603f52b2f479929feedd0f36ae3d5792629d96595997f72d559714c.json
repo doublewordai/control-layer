@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT k.id, k.user_id, k.purpose, COALESCE(u.display_name, u.username) AS account_name\n        FROM api_keys k\n        JOIN users u ON u.id = k.user_id\n        WHERE k.secret = $1 AND k.is_deleted = false\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "purpose",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "account_name",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "a468f9e4f603f52b2f479929feedd0f36ae3d5792629d96595997f72d559714c"
+}
