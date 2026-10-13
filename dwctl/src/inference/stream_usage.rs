@@ -160,9 +160,17 @@ fn parse(event: &[u8]) -> Frame {
         return Frame::Done;
     }
     match serde_json::from_str::<Value>(data) {
-        Ok(Value::Object(chunk)) if chunk.contains_key("choices") && !chunk.contains_key("error") => Frame::Chunk(payload, chunk),
+        Ok(Value::Object(chunk)) if chunk.contains_key("choices") && !carries_error(&chunk) => Frame::Chunk(payload, chunk),
         _ => Frame::Other,
     }
+}
+
+/// Whether a chunk carries a real provider error: an object with a `message`
+/// or `code`, the rule onwards uses. `error: null` and `error: {}` do not count.
+fn carries_error(chunk: &Map<String, Value>) -> bool {
+    chunk
+        .get("error")
+        .is_some_and(|error| error.is_object() && (error.get("message").is_some() || error.get("code").is_some()))
 }
 
 /// Byte range of the data in the event's single `data:` line; `None` for an
@@ -362,6 +370,15 @@ mod tests {
             assert!(body.starts_with(": keep-alive\n\n"), "{body}");
             assert!(body.contains(&format!("data: {ERROR}\n\n")), "{usage:?}: {body}");
             assert!(body.contains(&format!("data: {CHUNK_ERROR}\n\n")), "{usage:?}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_error_fields_are_not_errors() {
+        for error in ["null", "{}"] {
+            let usage_chunk = USAGE.replace(r#""choices":[]"#, &format!(r#""choices":[],"error":{error}"#));
+            let body = run(vec![sse(&[CONTENT, &usage_chunk, "[DONE]"])], ClientUsage::Omitted).await;
+            assert_eq!(body, sse(&[CONTENT, "[DONE]"]), "error: {error}");
         }
     }
 
