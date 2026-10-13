@@ -1846,6 +1846,12 @@ pub async fn build_router(
                     .expect("Failed to create PostgresHandler for request logging")
                     .with_request_serializer(parse_ai_request)
                     .with_response_serializer(parse_ai_response);
+            // The Postgres handler stores every captured header; strip the
+            // credential-bearing ones (authorization, x-api-key, cookie, ...)
+            // before it sees them. This wraps the Postgres handler only: the
+            // analytics handler below still needs the bearer token to attribute
+            // the request to an API key.
+            let postgres_handler = request_logging::credential_scrubber::CredentialHeaderScrubber::new(postgres_handler);
             // TRANSITIONAL (dwctl ZDR): guard the analytics logger so plaintext
             // ZDR bodies (decrypted for the upstream call, captured on the
             // loopback) never land in http_requests / http_responses. The marker
