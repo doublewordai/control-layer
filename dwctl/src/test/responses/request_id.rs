@@ -18,6 +18,30 @@ impl SpanExporter for Exported {
     }
 }
 
+/// Collects formatted log output in memory.
+#[derive(Clone, Default)]
+struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+impl LogBuffer {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+impl std::io::Write for LogBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+    type Writer = LogBuffer;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
 fn response_id(response: &axum_test::TestResponse) -> Uuid {
     let value = response.header("x-request-id");
     let id = Uuid::parse_str(value.to_str().expect("ascii header")).expect("x-request-id is a UUID");
@@ -100,10 +124,19 @@ async fn root_span_records_request_ids(pool: sqlx::PgPool) {
         .with_sampler(Sampler::AlwaysOn)
         .with_simple_exporter(exporter.clone())
         .build();
+    // Plain-text log output, as production writes it, to check the field format.
+    let logs = LogBuffer::default();
     // Thread-local default: the in-process test transport serves the request on
     // this task, so the request span is created under this subscriber.
     let _guard = tracing::subscriber::set_default(
-        tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(provider.tracer("request-id-test"))),
+        tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("request-id-test")))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .compact()
+                    .with_ansi(false)
+                    .with_writer(logs.clone()),
+            ),
     );
 
     let mock = wiremock::MockServer::start().await;
@@ -132,6 +165,16 @@ async fn root_span_records_request_ids(pool: sqlx::PgPool) {
     let span = root_for("/missing-a");
     assert_eq!(attr(&span, "x_request_id").as_deref(), Some(id.as_str()));
     assert_eq!(attr(&span, "edge_request_id").as_deref(), Some("edge-123"));
+    // Log lines carry the IDs unquoted, so `|= "x_request_id=<id>"` matches.
+    let text = logs.text();
+    assert!(
+        text.contains(&format!("x_request_id={id}")),
+        "unquoted x_request_id in logs:\n{text}"
+    );
+    assert!(
+        text.contains("edge_request_id=edge-123"),
+        "unquoted edge_request_id in logs:\n{text}"
+    );
 
     // Unusable inbound values are dropped rather than recorded.
     server.get("/missing-b").add_header("x-request-id", "x".repeat(129)).await;

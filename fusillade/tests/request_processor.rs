@@ -278,12 +278,13 @@ where
     ) {
         struct Visit<'a>(&'a mut Option<String>);
         impl tracing::field::Visit for Visit<'_> {
-            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            // Recorded with `display`, which arrives here; its Debug output is
+            // the unquoted Display form that log lines show.
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
                 if field.name() == "x_request_id" {
-                    *self.0 = Some(value.to_owned());
+                    *self.0 = Some(format!("{value:?}"));
                 }
             }
-            fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
         }
         if ctx
             .span(id)

@@ -140,7 +140,7 @@ where
                 if let Ok(response) = &result
                     && let Some(id) = &response.x_request_id
                 {
-                    process_span.record("x_request_id", id.as_str());
+                    process_span.record("x_request_id", tracing::field::display(id));
                 }
                 result
             };

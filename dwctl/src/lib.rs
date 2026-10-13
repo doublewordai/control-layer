@@ -2791,10 +2791,12 @@ pub async fn build_router(
                 // IDs minted by `assign_request_id`, which runs outside this layer.
                 // Declared span fields are exported as OTel attributes by the
                 // tracing-opentelemetry layer, so no separate set_attribute is needed.
+                // Recorded with `display` so log lines read `x_request_id=<id>`
+                // unquoted, matching `trace_id` and the line filters we document.
                 if let Some(ids) = request.extensions().get::<RequestIds>() {
-                    span.record("x_request_id", ids.x_request_id.as_str());
+                    span.record("x_request_id", tracing::field::display(&ids.x_request_id));
                     if let Some(edge) = &ids.edge_request_id {
-                        span.record("edge_request_id", edge.as_str());
+                        span.record("edge_request_id", tracing::field::display(edge));
                     }
                 }
 
