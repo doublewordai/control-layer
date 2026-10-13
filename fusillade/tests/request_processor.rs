@@ -299,11 +299,38 @@ where
 async fn default_processor_records_server_request_id(pool: sqlx::PgPool) {
     use tracing_subscriber::layer::SubscriberExt;
 
+    // Other tests in this binary install their own subscribers, and tracing
+    // caches per-callsite interest process-wide, so a thread-local subscriber
+    // here can miss the daemon's span. Run in a re-executed child that owns
+    // the global subscriber instead.
+    const CHILD: &str = "FUSILLADE_REQUEST_ID_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        pool.close().await;
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "default_processor_records_server_request_id",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("start isolated tracing test");
+        assert!(
+            output.status.success(),
+            "isolated tracing test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "child test filter must execute the tracing test"
+        );
+        return;
+    }
+
     let captured = ProcessSpanRequestId::default();
-    // Thread-local default: the test runtime is single-threaded, so the
-    // daemon's spawned tasks run under this subscriber.
-    let _guard =
-        tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
+    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(captured.clone()))
+        .expect("isolated tracing test owns its subscriber");
 
     let http_client = Arc::new(MockHttpClient::new());
     http_client.add_response(
