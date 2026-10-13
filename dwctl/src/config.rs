@@ -878,6 +878,11 @@ pub struct StripeConfig {
     /// Stripe tax code for auto top-up tax calculations (e.g. "txcd_10000000").
     /// If not set, falls back to the account-level default tax code in Stripe Tax settings.
     pub tax_code: Option<String>,
+    /// Base URL of the Stripe API (e.g. "http://localhost:12111/"). Unset in
+    /// production, which talks to `https://api.stripe.com/`; set it to point the
+    /// client at a Stripe-compatible mock server or an egress proxy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_base_url: Option<String>,
 }
 
 /// Dummy payment configuration for testing.

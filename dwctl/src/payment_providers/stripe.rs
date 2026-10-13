@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use rust_decimal::Decimal;
 use sqlx::{Connection, PgPool};
 use std::collections::HashMap;
-use stripe::{ApiErrorsCode, Client};
+use stripe::{ApiErrorsCode, Client, ClientBuilder};
 use stripe_billing::billing_portal_session::CreateBillingPortalSession;
 use stripe_checkout::checkout_session::{
     CreateCheckoutSessionConsentCollection, CreateCheckoutSessionConsentCollectionPaymentMethodReuseAgreement,
@@ -96,7 +96,11 @@ pub struct StripeProvider {
 
 impl From<crate::config::StripeConfig> for StripeProvider {
     fn from(config: crate::config::StripeConfig) -> Self {
-        let client = Client::new(&config.api_key);
+        let mut builder = ClientBuilder::new(&config.api_key);
+        if let Some(api_base_url) = &config.api_base_url {
+            builder = builder.url(api_base_url);
+        }
+        let client = builder.build().expect("invalid Stripe API key or base URL");
         Self { config, client }
     }
 }
@@ -1167,6 +1171,9 @@ impl PaymentProvider for StripeProvider {
 }
 
 #[cfg(test)]
+mod mock_api_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rust_decimal::Decimal;
@@ -1319,6 +1326,7 @@ mod tests {
             auto_topup_terms_of_service_text: None,
             setup_terms_of_service_text: None,
             tax_code: None,
+            api_base_url: None,
         };
         let provider = StripeProvider::from(config);
 
@@ -1338,6 +1346,7 @@ mod tests {
             auto_topup_terms_of_service_text: None,
             setup_terms_of_service_text: None,
             tax_code: None,
+            api_base_url: None,
         };
         let provider = StripeProvider::from(config);
 
@@ -1404,6 +1413,7 @@ mod tests {
             auto_topup_terms_of_service_text: None,
             setup_terms_of_service_text: None,
             tax_code: None,
+            api_base_url: None,
         };
         let provider = StripeProvider::from(config);
 

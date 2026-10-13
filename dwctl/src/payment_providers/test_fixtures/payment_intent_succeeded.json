@@ -1,0 +1,18 @@
+{
+  "id": "pi_ExampleAutoTopup",
+  "object": "payment_intent",
+  "amount": 6000,
+  "amount_capturable": 0,
+  "amount_received": 6000,
+  "capture_method": "automatic",
+  "confirmation_method": "automatic",
+  "created": 1780346900,
+  "currency": "usd",
+  "customer": "cus_ExampleCustomer",
+  "description": "Automatic credit top-up",
+  "livemode": false,
+  "metadata": {},
+  "payment_method": "pm_ExampleDefault",
+  "payment_method_types": ["card"],
+  "status": "succeeded"
+}
