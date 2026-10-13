@@ -123,6 +123,7 @@ async fn batch_fixed_leak_interval_eventually_refills(pool: sqlx::PgPool) {
         client.add_response(
             "POST /test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: "{}".into(),
             }),
@@ -177,6 +178,7 @@ async fn batch_leak_disabled_preserves_async_and_live_claims(pool: sqlx::PgPool)
             client.add_response(
                 "POST /test",
                 Ok(HttpResponse {
+                    x_request_id: None,
                     status: 200,
                     body: "{}".into(),
                 }),
@@ -333,6 +335,7 @@ async fn default_claims_start_while_weekly_partition_ddl_is_blocked(pool: sqlx::
     http_client.add_response(
         "POST /v1/ddl-independent",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 200,
             body: r#"{"result":"claimed"}"#.to_string(),
         }),
@@ -392,6 +395,7 @@ async fn background_tier_end_to_end(pool: sqlx::PgPool) {
             http_client.add_response_with_trigger(
                 "POST /v1/background-test",
                 Ok(HttpResponse {
+                    x_request_id: None,
                     status: 200,
                     body: format!(r#"{{"result":{index}}}"#),
                 }),
@@ -603,6 +607,7 @@ async fn test_daemon_claims_and_completes_request(pool: sqlx::PgPool) {
     http_client.add_response(
         "POST /v1/test",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 200,
             body: r#"{"result":"success"}"#.to_string(),
         }),
@@ -737,6 +742,7 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
     let trigger1 = http_client.add_response_with_trigger(
         "POST /v1/test",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 200,
             body: r#"{"result":"1"}"#.to_string(),
         }),
@@ -744,6 +750,7 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
     let trigger2 = http_client.add_response_with_trigger(
         "POST /v1/test",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 200,
             body: r#"{"result":"2"}"#.to_string(),
         }),
@@ -751,6 +758,7 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
     let trigger3 = http_client.add_response_with_trigger(
         "POST /v1/test",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 200,
             body: r#"{"result":"3"}"#.to_string(),
         }),
@@ -758,6 +766,7 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
     let trigger4 = http_client.add_response_with_trigger(
         "POST /v1/test",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 200,
             body: r#"{"result":"4"}"#.to_string(),
         }),
@@ -765,6 +774,7 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
     let trigger5 = http_client.add_response_with_trigger(
         "POST /v1/test",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 200,
             body: r#"{"result":"5"}"#.to_string(),
         }),
@@ -978,6 +988,7 @@ async fn test_daemon_cuts_claim_capacity_after_escalated_model_529(pool: sqlx::P
         http_client.add_response_with_trigger(
             "POST /v1/test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 529,
                 body: r#"{"error":"model overloaded"}"#.to_string(),
             }),
@@ -985,6 +996,7 @@ async fn test_daemon_cuts_claim_capacity_after_escalated_model_529(pool: sqlx::P
         http_client.add_response_with_trigger(
             "POST /v1/test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: r#"{"result":"success"}"#.to_string(),
             }),
@@ -992,6 +1004,7 @@ async fn test_daemon_cuts_claim_capacity_after_escalated_model_529(pool: sqlx::P
         http_client.add_response_with_trigger(
             "POST /v1/test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: r#"{"result":"success"}"#.to_string(),
             }),
@@ -999,6 +1012,7 @@ async fn test_daemon_cuts_claim_capacity_after_escalated_model_529(pool: sqlx::P
         http_client.add_response_with_trigger(
             "POST /v1/test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: r#"{"result":"success"}"#.to_string(),
             }),
@@ -1009,6 +1023,7 @@ async fn test_daemon_cuts_claim_capacity_after_escalated_model_529(pool: sqlx::P
             http_client.add_response_with_trigger(
                 "POST /v1/test",
                 Ok(HttpResponse {
+                    x_request_id: None,
                     status: 200,
                     body: r#"{"result":"success"}"#.to_string(),
                 }),
@@ -1162,6 +1177,7 @@ async fn adaptive_concurrency_grows_past_the_configured_limit(pool: sqlx::PgPool
             http_client.add_response_with_trigger(
                 "POST /v1/grow",
                 Ok(HttpResponse {
+                    x_request_id: None,
                     status: 200,
                     body: r#"{"result":"success"}"#.to_string(),
                 }),
@@ -1254,6 +1270,7 @@ async fn background_529_does_not_throttle_foreground_claims(pool: sqlx::PgPool) 
     let overload_trigger = http_client.add_response_with_trigger(
         "POST /v1/adaptive-shared",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 529,
             body: r#"{"error":"model overloaded"}"#.to_string(),
         }),
@@ -1263,6 +1280,7 @@ async fn background_529_does_not_throttle_foreground_claims(pool: sqlx::PgPool) 
             http_client.add_response_with_trigger(
                 "POST /v1/adaptive-shared",
                 Ok(HttpResponse {
+                    x_request_id: None,
                     status: 200,
                     body: r#"{"result":"success"}"#.to_string(),
                 }),
@@ -1420,6 +1438,7 @@ async fn test_daemon_retries_configured_and_default_statuses(pool: sqlx::PgPool)
     http_client.add_response(
         "POST /v1/test",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 499,
             body: r#"{"error":"arbitrary upstream cancellation"}"#.to_string(),
         }),
@@ -1429,6 +1448,7 @@ async fn test_daemon_retries_configured_and_default_statuses(pool: sqlx::PgPool)
     http_client.add_response(
         "POST /v1/test",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 503,
             body: r#"{"error":"service unavailable"}"#.to_string(),
         }),
@@ -1438,6 +1458,7 @@ async fn test_daemon_retries_configured_and_default_statuses(pool: sqlx::PgPool)
     http_client.add_response(
         "POST /v1/test",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 200,
             body: r#"{"result":"success after retries"}"#.to_string(),
         }),
@@ -1566,6 +1587,7 @@ async fn test_batch_capacity_529_does_not_spend_a_retry_attempt(pool: sqlx::PgPo
         http_client.add_response(
             "POST /v1/test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 529,
                 body: r#"{"error":{"message":"at capacity","type":"overloaded_error","code":"batch_capacity_exceeded"}}"#
                     .to_string(),
@@ -1575,6 +1597,7 @@ async fn test_batch_capacity_529_does_not_spend_a_retry_attempt(pool: sqlx::PgPo
     http_client.add_response(
         "POST /v1/test",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 200,
             body: r#"{"result":"success after capacity refusals"}"#.to_string(),
         }),
@@ -1700,6 +1723,7 @@ async fn test_batch_capacity_529_reschedules_even_when_should_retry_rejects_529(
     http_client.add_response(
         "POST /v1/test",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 529,
             body: r#"{"error":{"message":"at capacity","type":"overloaded_error","code":"batch_capacity_exceeded"}}"#
                 .to_string(),
@@ -1708,6 +1732,7 @@ async fn test_batch_capacity_529_reschedules_even_when_should_retry_rejects_529(
     http_client.add_response(
         "POST /v1/test",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 200,
             body: r#"{"result":"success after capacity refusal"}"#.to_string(),
         }),
@@ -1829,6 +1854,7 @@ async fn test_daemon_dynamically_updates_concurrency_limits(pool: sqlx::PgPool) 
         let trigger = http_client.add_response_with_trigger(
             "POST /v1/test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: format!(r#"{{"result":"{}"}}"#, i),
             }),
@@ -1992,6 +2018,7 @@ async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
         http_client.add_response(
             "POST /v1/test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 500,
                 body: r#"{"error":"server error"}"#.to_string(),
             }),
@@ -2140,6 +2167,7 @@ async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
         http_client.add_response(
             "POST /v1/test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 500,
                 body: r#"{"error":"server error"}"#.to_string(),
             }),
@@ -2288,6 +2316,7 @@ async fn test_route_at_claim_time_escalation(pool: sqlx::PgPool) {
     http_client.add_response(
         "POST /v1/test",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 200,
             body: r#"{"result":"escalated response"}"#.to_string(),
         }),
@@ -2436,6 +2465,7 @@ async fn test_route_at_claim_time_no_escalation_when_enough_time(pool: sqlx::PgP
     http_client.add_response(
         "POST /v1/test",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 200,
             body: r#"{"result":"normal response"}"#.to_string(),
         }),
@@ -2582,6 +2612,7 @@ mod batch_results_stream {
         http_client.add_response(
             "POST /v1/test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: r#"{"result":"success1"}"#.to_string(),
             }),
@@ -2589,6 +2620,7 @@ mod batch_results_stream {
         http_client.add_response(
             "POST /v1/test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: r#"{"result":"success2"}"#.to_string(),
             }),
@@ -2704,6 +2736,7 @@ mod batch_results_stream {
         http_client.add_response(
             "POST /v1/test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: r#"{"result":"success"}"#.to_string(),
             }),
@@ -2823,6 +2856,7 @@ mod batch_results_stream {
         http_client.add_response(
             "POST /v1/test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: r#"{"result":"success"}"#.to_string(),
             }),
@@ -2939,6 +2973,7 @@ mod batch_results_stream {
             http_client.add_response(
                 "POST /v1/test",
                 Ok(HttpResponse {
+                    x_request_id: None,
                     status: 200,
                     body: format!(r#"{{"result":"success{}"}}"#, i),
                 }),
@@ -3044,6 +3079,7 @@ mod batch_results_stream {
         http_client.add_response(
             "POST /v1/test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: r#"{"result":"success1"}"#.to_string(),
             }),
@@ -3051,6 +3087,7 @@ mod batch_results_stream {
         http_client.add_response(
             "POST /v1/test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: r#"{"result":"success2"}"#.to_string(),
             }),
@@ -3058,6 +3095,7 @@ mod batch_results_stream {
         http_client.add_response(
             "POST /v1/test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 500,
                 body: r#"{"error":"server error"}"#.to_string(),
             }),
@@ -3163,6 +3201,7 @@ mod batch_results_stream {
             http_client.add_response(
                 "POST /v1/test",
                 Ok(HttpResponse {
+                    x_request_id: None,
                     status: 200,
                     body: r#"{"result":"success"}"#.to_string(),
                 }),
@@ -3294,6 +3333,7 @@ mod batch_results_stream {
             http_client.add_response(
                 "POST /v1/test",
                 Ok(HttpResponse {
+                    x_request_id: None,
                     status: 429,
                     body: "rate limited".to_string(),
                 }),
@@ -3303,6 +3343,7 @@ mod batch_results_stream {
             http_client.add_response(
                 "POST /v1/test",
                 Ok(HttpResponse {
+                    x_request_id: None,
                     status: 400,
                     body: "bad request".to_string(),
                 }),
@@ -3314,6 +3355,7 @@ mod batch_results_stream {
             http_client.add_response(
                 "POST /v1/test",
                 Ok(HttpResponse {
+                    x_request_id: None,
                     status: 200,
                     body: r#"{"result":"success"}"#.to_string(),
                 }),

@@ -205,6 +205,7 @@ impl Future for DispatchProbe {
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.polls.fetch_add(1, Ordering::SeqCst);
         Poll::Ready(Ok(HttpResponse {
+            x_request_id: None,
             status: 200,
             body: "{}".into(),
         }))
@@ -234,6 +235,7 @@ async fn default_processor_preserves_batch_path(pool: sqlx::PgPool) {
     http_client.add_response(
         "POST /v1/test",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 200,
             body: r#"{"ok":true}"#.into(),
         }),
@@ -257,6 +259,79 @@ async fn default_processor_preserves_batch_path(pool: sqlx::PgPool) {
     };
     assert!(req.state.response_body.contains("\"ok\":true"));
 
+    shutdown_token.cancel();
+}
+
+/// Captures `x_request_id` when it is recorded on `fusillade.process_request`.
+#[derive(Clone, Default)]
+struct ProcessSpanRequestId(Arc<std::sync::Mutex<Option<String>>>);
+
+impl<S> tracing_subscriber::Layer<S> for ProcessSpanRequestId
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct Visit<'a>(&'a mut Option<String>);
+        impl tracing::field::Visit for Visit<'_> {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "x_request_id" {
+                    *self.0 = Some(value.to_owned());
+                }
+            }
+            fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+        }
+        if ctx
+            .span(id)
+            .is_some_and(|s| s.name() == "fusillade.process_request")
+        {
+            values.record(&mut Visit(&mut self.0.lock().unwrap()));
+        }
+    }
+}
+
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+async fn default_processor_records_server_request_id(pool: sqlx::PgPool) {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let captured = ProcessSpanRequestId::default();
+    // Thread-local default: the test runtime is single-threaded, so the
+    // daemon's spawned tasks run under this subscriber.
+    let _guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
+
+    let http_client = Arc::new(MockHttpClient::new());
+    http_client.add_response(
+        "POST /v1/test",
+        Ok(HttpResponse {
+            x_request_id: Some("server-minted-id".into()),
+            status: 200,
+            body: r#"{"ok":true}"#.into(),
+        }),
+    );
+
+    let shutdown_token = CancellationToken::new();
+    let config = fast_test_config();
+    let manager = postgres_store(pool, &config).await;
+    let daemon = Arc::new(postgres_daemon(
+        manager.clone(),
+        http_client.clone(),
+        config,
+    ));
+    let _handle = daemon.run(shutdown_token.clone()).unwrap();
+
+    assert_eq!(*captured.0.lock().unwrap(), None);
+    let request_id = submit_one_request(&manager).await;
+    wait_until_completed(&manager, request_id).await;
+
+    assert_eq!(
+        captured.0.lock().unwrap().as_deref(),
+        Some("server-minted-id")
+    );
     shutdown_token.cancel();
 }
 
@@ -293,6 +368,7 @@ async fn processing_state_is_durable_before_http_dispatch(pool: sqlx::PgPool) {
                 .process(&*manager, async move {
                     http_polls.fetch_add(1, Ordering::SeqCst);
                     Ok(HttpResponse {
+                        x_request_id: None,
                         status: 200,
                         body: "{}".into(),
                     })
@@ -439,6 +515,7 @@ async fn custom_processor_is_invoked(pool: sqlx::PgPool) {
     http_client.add_response(
         "POST /v1/test",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 200,
             body: "{}".into(),
         }),

@@ -122,13 +122,28 @@ where
         let request_id = request.data.id;
         let daemon_id = request.state.daemon_id;
         let retry_attempt = request.state.retry_attempt;
+        // The daemon's `fusillade.process_request` span, which declares
+        // `x_request_id`. Captured here, before the per-state spans below
+        // become current.
+        let process_span = tracing::Span::current();
 
         // Span 1: claimed -> processing (HTTP request kicked off)
         let processing = async {
             tracing::debug!("Sending batch request to inference endpoint");
             let request_data = request.data.clone();
             let api_key = request_data.api_key.clone();
-            let response_fut = async move { http.execute(&request_data, &api_key).await };
+            // The server mints its own request ID, so it is only known once the
+            // response arrives; record it on the process span so the outcome
+            // log lines carry it.
+            let response_fut = async move {
+                let result = http.execute(&request_data, &api_key).await;
+                if let Ok(response) = &result
+                    && let Some(id) = &response.x_request_id
+                {
+                    process_span.record("x_request_id", id.as_str());
+                }
+                result
+            };
             request.process(storage, response_fut).await
         }
         .instrument(tracing::info_span!(

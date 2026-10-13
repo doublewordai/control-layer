@@ -2624,6 +2624,7 @@ where
                     "fusillade.process_request",
                     trace_id = tracing::field::Empty,
                     otel.name = "fusillade.process_request",
+                    x_request_id = tracing::field::Empty,
                     request_id = %request_id,
                     batch_id = ?batch_id,
                     model = %model,

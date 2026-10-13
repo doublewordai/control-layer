@@ -532,6 +532,11 @@ impl ReqwestHttpClient {
         })?;
 
         let status = response.status().as_u16();
+        let x_request_id = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
 
         record_submission_ttft(request, status);
         let body = response.text().await.map_err(map_reqwest_error)?;
@@ -543,7 +548,11 @@ impl ReqwestHttpClient {
             "HTTP request completed"
         );
 
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse {
+            status,
+            body,
+            x_request_id,
+        })
     }
 }
 
@@ -633,7 +642,7 @@ impl MockHttpClient {
     /// ```ignore
     /// let trigger = mock.add_response_with_trigger(
     ///     "POST /test",
-    ///     Ok(HttpResponse { status: 200, body: "ok".to_string() })
+    ///     Ok(HttpResponse { status: 200, body: "ok".to_string(), x_request_id: None })
     /// );
     /// // ... request is now blocked waiting ...
     /// trigger.send(()).unwrap(); // Now it completes
@@ -1010,6 +1019,7 @@ mod tests {
         mock.add_response(
             "POST /test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: "success".to_string(),
             }),
@@ -1048,6 +1058,7 @@ mod tests {
         mock.add_response(
             "GET /status",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: "first".to_string(),
             }),
@@ -1055,6 +1066,7 @@ mod tests {
         mock.add_response(
             "GET /status",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: "second".to_string(),
             }),
@@ -1114,6 +1126,7 @@ mod tests {
         let trigger = mock.add_response_with_trigger(
             "POST /test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: "triggered".to_string(),
             }),
@@ -1159,6 +1172,7 @@ mod tests {
         mock.add_response(
             "POST /test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: "success".to_string(),
             }),
@@ -1327,6 +1341,49 @@ mod tests {
 
         assert_eq!(response.status, 200);
         assert_eq!(response.body, r#"{"result":"ok"}"#);
+    }
+
+    #[tokio::test]
+    async fn test_response_x_request_id_is_captured() {
+        use axum::{Router, http::StatusCode, routing::post};
+
+        let app = Router::new().route(
+            "/test",
+            post(|| async {
+                (
+                    StatusCode::BAD_REQUEST,
+                    [("x-request-id", "server-minted-id")],
+                    "nope",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let request = RequestData {
+            id: RequestId::from(uuid::Uuid::new_v4()),
+            batch_id: Some(crate::batch::BatchId::from(uuid::Uuid::new_v4())),
+            template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
+            custom_id: None,
+            endpoint: format!("http://{}", addr),
+            method: "POST".to_string(),
+            path: "/test".to_string(),
+            body: "{}".to_string(),
+            model: "test-model".to_string(),
+            api_key: "k".to_string(),
+            created_by: String::new(),
+            batch_metadata: std::collections::HashMap::new(),
+        };
+        let response = ReqwestHttpClient::default()
+            .execute(&request, "k")
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, 400);
+        assert_eq!(response.x_request_id.as_deref(), Some("server-minted-id"));
     }
 
     #[tokio::test]
