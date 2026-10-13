@@ -45,7 +45,7 @@ fn fixture(name: &str) -> Value {
     serde_json::from_str(raw).expect("fixture is valid JSON")
 }
 
-fn stripe_config(server: &MockServer) -> crate::config::StripeConfig {
+fn stripe_config_at(api_base_url: &str) -> crate::config::StripeConfig {
     crate::config::StripeConfig {
         api_key: "sk_test_fake".to_string(),
         webhook_secret: WEBHOOK_SECRET.to_string(),
@@ -54,31 +54,22 @@ fn stripe_config(server: &MockServer) -> crate::config::StripeConfig {
         auto_topup_terms_of_service_text: None,
         setup_terms_of_service_text: None,
         tax_code: None,
-        // async-stripe appends `v1/...` directly, so the base needs its slash.
-        api_base_url: Some(format!("{}/", server.uri())),
+        api_base_url: Some(api_base_url.to_string()),
     }
 }
 
-fn provider_with(config: crate::config::StripeConfig) -> StripeProvider {
-    StripeProvider::from(config)
+/// Config pointing at `server`, using its URI as-is (no trailing slash).
+fn stripe_config(server: &MockServer) -> crate::config::StripeConfig {
+    stripe_config_at(&server.uri())
 }
 
-async fn provider(server: &MockServer) -> StripeProvider {
-    provider_with(stripe_config(server))
+fn provider(server: &MockServer) -> StripeProvider {
+    StripeProvider::from(stripe_config(server))
 }
 
 /// A provider for tests that must never reach the network at all.
 fn offline_provider() -> StripeProvider {
-    provider_with(crate::config::StripeConfig {
-        api_key: "sk_test_fake".to_string(),
-        webhook_secret: WEBHOOK_SECRET.to_string(),
-        price_id: "price_ExampleCredits".to_string(),
-        enable_invoice_creation: false,
-        auto_topup_terms_of_service_text: None,
-        setup_terms_of_service_text: None,
-        tax_code: None,
-        api_base_url: Some("http://127.0.0.1:9/".to_string()),
-    })
+    StripeProvider::from(stripe_config_at("http://127.0.0.1:9"))
 }
 
 async fn mock_json(server: &MockServer, verb: &str, route: &str, status: u16, body: Value) {
@@ -377,7 +368,7 @@ async fn validate_webhook_passes_other_event_types_through_without_a_session() {
 #[dwctl_test_macros::test]
 async fn process_webhook_event_ignores_unrelated_event_types(pool: PgPool) {
     let server = MockServer::start().await;
-    let provider = provider(&server).await;
+    let provider = provider(&server);
 
     for event_type in ["charge.updated", "payment_intent.succeeded", "customer.created"] {
         let event = WebhookEvent {
@@ -406,7 +397,6 @@ async fn process_webhook_event_requires_a_session_id(pool: PgPool) {
     };
 
     let result = provider(&server)
-        .await
         .process_webhook_event(&pool, &event, &CreditsConfig::default())
         .await;
     assert!(
@@ -419,7 +409,7 @@ async fn process_webhook_event_requires_a_session_id(pool: PgPool) {
 #[dwctl_test_macros::test]
 async fn process_webhook_event_credits_for_both_completion_event_types(pool: PgPool) {
     let server = MockServer::start().await;
-    let provider = provider(&server).await;
+    let provider = provider(&server);
 
     for event_type in ["checkout.session.completed", "checkout.session.async_payment_succeeded"] {
         let user = create_test_user(&pool, Role::StandardUser).await.id;
@@ -455,7 +445,6 @@ async fn paid_session_credits_pretax_amount_and_records_the_customer(pool: PgPoo
     mock_session(&server, &payment_session(SESSION_ID, user, None)).await;
 
     provider(&server)
-        .await
         .process_payment_session(&pool, SESSION_ID, &CreditsConfig::default())
         .await
         .unwrap();
@@ -496,7 +485,6 @@ async fn unpaid_sessions_are_not_credited(pool: PgPool) {
         mock_session(&server, &session).await;
 
         let result = provider(&server)
-            .await
             .process_payment_session(&pool, &session_id, &CreditsConfig::default())
             .await;
         assert!(matches!(result, Err(PaymentError::PaymentNotCompleted)), "{case}: got {result:?}");
@@ -513,7 +501,7 @@ async fn an_unpaid_session_can_be_fulfilled_once_it_settles(pool: PgPool) {
     // `async_payment_succeeded` sees `paid` and must credit.
     let server = MockServer::start().await;
     let user = create_test_user(&pool, Role::StandardUser).await.id;
-    let provider = provider(&server).await;
+    let provider = provider(&server);
 
     let mut pending = payment_session(SESSION_ID, user, None);
     pending["payment_status"] = json!("unpaid");
@@ -535,7 +523,7 @@ async fn replayed_webhook_and_manual_confirm_credit_exactly_once(pool: PgPool) {
     let server = MockServer::start().await;
     let user = create_test_user(&pool, Role::StandardUser).await.id;
     mock_session(&server, &payment_session(SESSION_ID, user, None)).await;
-    let provider = provider(&server).await;
+    let provider = provider(&server);
     let event = WebhookEvent {
         event_type: "checkout.session.completed".to_string(),
         session_id: Some(SESSION_ID.to_string()),
@@ -571,7 +559,7 @@ async fn concurrent_fulfilment_of_one_session_credits_once(pool: PgPool) {
     let server = MockServer::start().await;
     let user = create_test_user(&pool, Role::StandardUser).await.id;
     mock_session(&server, &payment_session(SESSION_ID, user, None)).await;
-    let provider = provider(&server).await;
+    let provider = provider(&server);
     let credits_config = CreditsConfig::default();
 
     let (first, second) = tokio::join!(
@@ -594,7 +582,6 @@ async fn org_payment_credits_the_org_and_verifies_the_payer(pool: PgPool) {
     mock_session(&server, &payment_session(SESSION_ID, payer_user.id, Some(org.id))).await;
 
     provider(&server)
-        .await
         .process_payment_session(&pool, SESSION_ID, &CreditsConfig::default())
         .await
         .unwrap();
@@ -616,7 +603,7 @@ async fn org_payment_credits_the_org_and_verifies_the_payer(pool: PgPool) {
 async fn sessions_for_unknown_users_are_reported_as_foreign(pool: PgPool) {
     let server = MockServer::start().await;
     let user = create_test_user(&pool, Role::StandardUser).await.id;
-    let provider = provider(&server).await;
+    let provider = provider(&server);
 
     // Another region's creditee, and another region's payer.
     let stranger = UserId::new_v4();
@@ -639,7 +626,7 @@ async fn sessions_for_unknown_users_are_reported_as_foreign(pool: PgPool) {
 async fn malformed_sessions_are_rejected_without_crediting(pool: PgPool) {
     let server = MockServer::start().await;
     let user = create_test_user(&pool, Role::StandardUser).await.id;
-    let provider = provider(&server).await;
+    let provider = provider(&server);
 
     let mut no_reference = payment_session("cs_test_no_reference", user, None);
     no_reference["client_reference_id"] = Value::Null;
@@ -681,7 +668,6 @@ async fn stripe_api_failure_while_retrieving_a_session_is_a_provider_error(pool:
     .await;
 
     let result = provider(&server)
-        .await
         .process_payment_session(&pool, SESSION_ID, &CreditsConfig::default())
         .await;
     assert!(matches!(result, Err(PaymentError::ProviderApi(_))), "got {result:?}");
@@ -699,7 +685,6 @@ async fn first_payment_match_is_granted_on_top_of_the_purchase(pool: PgPool) {
     };
 
     provider(&server)
-        .await
         .process_payment_session(&pool, SESSION_ID, &credits_config)
         .await
         .unwrap();
@@ -714,7 +699,7 @@ async fn get_payment_session_parses_the_retrieved_session() {
     let user = UserId::new_v4();
     mock_session(&server, &payment_session(SESSION_ID, user, None)).await;
 
-    let session = provider(&server).await.get_payment_session(SESSION_ID).await.unwrap();
+    let session = provider(&server).get_payment_session(SESSION_ID).await.unwrap();
 
     assert_eq!(session.creditor_id, user);
     assert_eq!(session.creditee_id, user, "self-payment when no creditee_id metadata is present");
@@ -749,7 +734,6 @@ async fn verification_session_verifies_the_account_and_grants_signup_credits(poo
     mock_json(&server, "POST", &format!("/v1/customers/{CUSTOMER_ID}"), 200, fixture("customer")).await;
 
     provider(&server)
-        .await
         .process_payment_session(&pool, "cs_test_setup_ok", &credits_with_verification(5))
         .await
         .unwrap();
@@ -778,7 +762,7 @@ async fn verification_session_replay_does_not_grant_twice(pool: PgPool) {
     )
     .await;
     mock_json(&server, "POST", &format!("/v1/customers/{CUSTOMER_ID}"), 200, fixture("customer")).await;
-    let provider = provider(&server).await;
+    let provider = provider(&server);
 
     for _ in 0..2 {
         provider
@@ -799,7 +783,7 @@ async fn verification_with_an_instrument_held_elsewhere_is_refused(pool: PgPool)
     let first = create_test_user(&pool, Role::StandardUser).await.id;
     let second = create_test_user(&pool, Role::StandardUser).await.id;
     mock_json(&server, "POST", &format!("/v1/customers/{CUSTOMER_ID}"), 200, fixture("customer")).await;
-    let provider = provider(&server).await;
+    let provider = provider(&server);
 
     mock_session(&server, &setup_session("cs_test_first", first, "verification", Some("fp_shared"))).await;
     provider
@@ -828,7 +812,7 @@ async fn auto_topup_enrolment_with_an_instrument_held_elsewhere_succeeds_unverif
     let first = create_test_user(&pool, Role::StandardUser).await.id;
     let second = create_test_user(&pool, Role::StandardUser).await.id;
     mock_json(&server, "POST", &format!("/v1/customers/{CUSTOMER_ID}"), 200, fixture("customer")).await;
-    let provider = provider(&server).await;
+    let provider = provider(&server);
 
     mock_session(&server, &setup_session("cs_test_first", first, "verification", Some("fp_shared"))).await;
     provider
@@ -853,7 +837,7 @@ async fn payment_methods_without_a_fingerprint_cannot_verify(pool: PgPool) {
     let server = MockServer::start().await;
     let user = create_test_user(&pool, Role::StandardUser).await.id;
     mock_json(&server, "POST", &format!("/v1/customers/{CUSTOMER_ID}"), 200, fixture("customer")).await;
-    let provider = provider(&server).await;
+    let provider = provider(&server);
 
     mock_session(&server, &setup_session("cs_test_verify_nofp", user, "verification", None)).await;
     let result = provider
@@ -880,7 +864,7 @@ async fn payment_methods_without_a_fingerprint_cannot_verify(pool: PgPool) {
 async fn setup_sessions_that_did_not_complete_are_refused(pool: PgPool) {
     let server = MockServer::start().await;
     let user = create_test_user(&pool, Role::StandardUser).await.id;
-    let provider = provider(&server).await;
+    let provider = provider(&server);
 
     let mut open = setup_session("cs_test_open", user, "verification", Some("fp_open"));
     open["status"] = json!("open");
@@ -933,7 +917,6 @@ async fn failing_to_set_the_default_payment_method_does_not_block_verification(p
     .await;
 
     provider(&server)
-        .await
         .process_payment_session(&pool, "cs_test_setup_default_fails", &credits_with_verification(5))
         .await
         .unwrap();
@@ -951,7 +934,6 @@ async fn process_auto_topup_session_returns_customer_and_user_and_sets_default()
 
     let pool = PgPool::connect_lazy("postgres://unused@127.0.0.1:1/unused").unwrap();
     let result = provider(&server)
-        .await
         .process_auto_topup_session(&pool, "cs_test_topup_setup")
         .await
         .unwrap();
@@ -974,7 +956,7 @@ async fn process_auto_topup_session_returns_customer_and_user_and_sets_default()
 async fn process_auto_topup_session_refuses_incomplete_setups() {
     let server = MockServer::start().await;
     let user = UserId::new_v4();
-    let provider = provider(&server).await;
+    let provider = provider(&server);
     let pool = PgPool::connect_lazy("postgres://unused@127.0.0.1:1/unused").unwrap();
 
     let mut open = setup_session("cs_test_topup_open", user, "auto_topup", Some("fp"));
@@ -1016,7 +998,7 @@ async fn charge_auto_topup_charges_the_tax_inclusive_total_with_idempotency_keys
     let mut config = stripe_config(&server);
     config.tax_code = Some("txcd_10000000".to_string());
 
-    let id = provider_with(config)
+    let id = StripeProvider::from(config)
         .charge_auto_topup(5000, CUSTOMER_ID, "pm_ExampleDefault", "auto-topup-user-1-2026-06-01T10:00")
         .await
         .unwrap();
@@ -1055,7 +1037,6 @@ async fn charge_auto_topup_omits_the_tax_code_unless_configured() {
     mock_charge_path(&server).await;
 
     provider(&server)
-        .await
         .charge_auto_topup(5000, CUSTOMER_ID, "pm_ExampleDefault", "key-no-tax-code")
         .await
         .unwrap();
@@ -1071,7 +1052,7 @@ async fn charge_auto_topup_omits_the_tax_code_unless_configured() {
 async fn charge_auto_topup_retries_reuse_the_same_idempotency_keys() {
     let server = MockServer::start().await;
     mock_charge_path(&server).await;
-    let provider = provider(&server).await;
+    let provider = provider(&server);
 
     for _ in 0..2 {
         provider
@@ -1103,7 +1084,6 @@ async fn charge_auto_topup_maps_declines_by_how_retryable_they_are() {
         mock_json(&server, "POST", "/v1/payment_intents", 402, fixture(fixture_name)).await;
 
         let result = provider(&server)
-            .await
             .charge_auto_topup(5000, CUSTOMER_ID, "pm_ExampleDefault", "decline-key")
             .await;
         assert!(
@@ -1120,7 +1100,6 @@ async fn charge_auto_topup_treats_an_in_flight_idempotency_key_as_already_proces
     mock_json(&server, "POST", "/v1/payment_intents", 409, fixture("error_idempotency_in_use")).await;
 
     let result = provider(&server)
-        .await
         .charge_auto_topup(5000, CUSTOMER_ID, "pm_ExampleDefault", "in-flight-key")
         .await;
     assert!(matches!(result, Err(PaymentError::AlreadyProcessed)), "got {result:?}");
@@ -1140,7 +1119,6 @@ async fn charge_auto_topup_stops_when_tax_calculation_fails() {
     mock_json(&server, "POST", "/v1/payment_intents", 200, fixture("payment_intent_succeeded")).await;
 
     let result = provider(&server)
-        .await
         .charge_auto_topup(5000, CUSTOMER_ID, "pm_ExampleDefault", "no-address-key")
         .await;
 
@@ -1169,7 +1147,6 @@ async fn charge_auto_topup_maps_other_stripe_failures_to_provider_errors() {
     .await;
 
     let result = provider(&server)
-        .await
         .charge_auto_topup(5000, CUSTOMER_ID, "pm_ExampleDefault", "api-error-key")
         .await;
     assert!(
@@ -1182,7 +1159,7 @@ async fn charge_auto_topup_maps_other_stripe_failures_to_provider_errors() {
 async fn charge_auto_topup_rejects_unusable_idempotency_keys_before_calling_stripe() {
     let server = MockServer::start().await;
     mock_charge_path(&server).await;
-    let provider = provider(&server).await;
+    let provider = provider(&server);
 
     // Too long once the `_tax` suffix is added, then too long outright.
     for key in ["k".repeat(252), "k".repeat(300)] {
@@ -1207,7 +1184,7 @@ async fn default_payment_method_prefers_the_invoice_settings_default() {
     let server = MockServer::start().await;
     mock_json(&server, "GET", &format!("/v1/customers/{CUSTOMER_ID}"), 200, fixture("customer")).await;
 
-    let pm = provider(&server).await.get_default_payment_method(CUSTOMER_ID).await.unwrap();
+    let pm = provider(&server).get_default_payment_method(CUSTOMER_ID).await.unwrap();
 
     assert_eq!(pm.as_deref(), Some("pm_ExampleDefault"));
     assert_eq!(
@@ -1231,7 +1208,7 @@ async fn default_payment_method_falls_back_to_the_first_attached_method() {
     )
     .await;
 
-    let pm = provider(&server).await.get_default_payment_method(CUSTOMER_ID).await.unwrap();
+    let pm = provider(&server).get_default_payment_method(CUSTOMER_ID).await.unwrap();
 
     assert_eq!(pm.as_deref(), Some("pm_ExampleAttached"));
     let list = only_request(&server, "GET", &format!("/v1/customers/{CUSTOMER_ID}/payment_methods")).await;
@@ -1255,7 +1232,7 @@ async fn customers_without_any_payment_method_have_no_default() {
     )
     .await;
 
-    let pm = provider(&server).await.get_default_payment_method(CUSTOMER_ID).await.unwrap();
+    let pm = provider(&server).get_default_payment_method(CUSTOMER_ID).await.unwrap();
     assert_eq!(pm, None);
 
     // And a deleted customer has none either, without listing anything.
@@ -1269,11 +1246,7 @@ async fn customers_without_any_payment_method_have_no_default() {
     )
     .await;
     assert_eq!(
-        provider(&deleted_server)
-            .await
-            .get_default_payment_method(CUSTOMER_ID)
-            .await
-            .unwrap(),
+        provider(&deleted_server).get_default_payment_method(CUSTOMER_ID).await.unwrap(),
         None
     );
     assert_eq!(recorded(&deleted_server).await.len(), 1);
@@ -1284,7 +1257,7 @@ async fn default_payment_method_surfaces_stripe_failures() {
     let server = MockServer::start().await;
     let error = json!({ "error": { "type": "api_error", "message": "boom" } });
     mock_json(&server, "GET", &format!("/v1/customers/{CUSTOMER_ID}"), 500, error.clone()).await;
-    let result = provider(&server).await.get_default_payment_method(CUSTOMER_ID).await;
+    let result = provider(&server).get_default_payment_method(CUSTOMER_ID).await;
     assert!(
         matches!(result, Err(PaymentError::ProviderApi(_))),
         "retrieve failure: got {result:?}"
@@ -1295,7 +1268,7 @@ async fn default_payment_method_surfaces_stripe_failures() {
     customer["invoice_settings"]["default_payment_method"] = Value::Null;
     mock_json(&server, "GET", &format!("/v1/customers/{CUSTOMER_ID}"), 200, customer).await;
     mock_json(&server, "GET", &format!("/v1/customers/{CUSTOMER_ID}/payment_methods"), 500, error).await;
-    let result = provider(&server).await.get_default_payment_method(CUSTOMER_ID).await;
+    let result = provider(&server).get_default_payment_method(CUSTOMER_ID).await;
     assert!(matches!(result, Err(PaymentError::ProviderApi(_))), "list failure: got {result:?}");
 }
 
@@ -1319,7 +1292,6 @@ async fn create_checkout_session_for_a_new_customer() {
     let payer = payer(UserId::new_v4(), None);
 
     let url = provider(&server)
-        .await
         .create_checkout_session(
             &payer,
             Some("creditee-123"),
@@ -1356,7 +1328,7 @@ async fn create_checkout_session_reuses_an_existing_customer_and_can_create_invo
     let mut config = stripe_config(&server);
     config.enable_invoice_creation = true;
 
-    provider_with(config)
+    StripeProvider::from(config)
         .create_checkout_session(
             &payer(UserId::new_v4(), Some(CUSTOMER_ID)),
             None,
@@ -1382,7 +1354,7 @@ async fn create_checkout_session_reports_stripe_failures_and_a_missing_url() {
 
     let server = MockServer::start().await;
     mock_json(&server, "POST", "/v1/checkout/sessions", 200, created_session(None)).await;
-    let result = provider(&server).await.create_checkout_session(&payer, None, "c", "s").await;
+    let result = provider(&server).create_checkout_session(&payer, None, "c", "s").await;
     assert!(
         matches!(&result, Err(PaymentError::ProviderApi(m)) if m.contains("missing URL")),
         "got {result:?}"
@@ -1397,7 +1369,7 @@ async fn create_checkout_session_reports_stripe_failures_and_a_missing_url() {
         json!({ "error": { "type": "invalid_request_error", "message": "No such price" } }),
     )
     .await;
-    let result = provider(&server).await.create_checkout_session(&payer, None, "c", "s").await;
+    let result = provider(&server).create_checkout_session(&payer, None, "c", "s").await;
     assert!(matches!(result, Err(PaymentError::ProviderApi(_))), "got {result:?}");
 }
 
@@ -1411,7 +1383,7 @@ async fn setup_checkout_sessions_differ_in_purpose_and_offered_methods() {
     mock_json(&server, "POST", "/v1/checkout/sessions", 200, created_session(Some(CHECKOUT_URL))).await;
     let mut config = stripe_config(&server);
     config.auto_topup_terms_of_service_text = Some("auto top-up terms".to_string());
-    let verification = provider_with(config)
+    let verification = StripeProvider::from(config)
         .create_setup_checkout_session(&payer(target, None), urls.0, urls.1)
         .await
         .unwrap();
@@ -1444,7 +1416,7 @@ async fn setup_checkout_sessions_differ_in_purpose_and_offered_methods() {
     let mut config = stripe_config(&server);
     config.auto_topup_terms_of_service_text = Some("auto top-up terms".to_string());
     config.setup_terms_of_service_text = Some("verification terms".to_string());
-    provider_with(config)
+    StripeProvider::from(config)
         .create_setup_checkout_session(&payer(target, Some(CUSTOMER_ID)), urls.0, urls.1)
         .await
         .unwrap();
@@ -1460,7 +1432,6 @@ async fn setup_checkout_sessions_differ_in_purpose_and_offered_methods() {
     let server = MockServer::start().await;
     mock_json(&server, "POST", "/v1/checkout/sessions", 200, created_session(Some(CHECKOUT_URL))).await;
     provider(&server)
-        .await
         .create_auto_topup_checkout_session(&payer(target, None), urls.0, urls.1)
         .await
         .unwrap();
@@ -1481,7 +1452,6 @@ async fn setup_checkout_session_without_a_url_is_an_error() {
     let server = MockServer::start().await;
     mock_json(&server, "POST", "/v1/checkout/sessions", 200, created_session(None)).await;
     let result = provider(&server)
-        .await
         .create_auto_topup_checkout_session(&payer(UserId::new_v4(), None), "c", "s")
         .await;
     assert!(
@@ -1499,7 +1469,6 @@ async fn setup_checkout_session_without_a_url_is_an_error() {
     )
     .await;
     let result = provider(&server)
-        .await
         .create_setup_checkout_session(&payer(UserId::new_v4(), None), "c", "s")
         .await;
     assert!(matches!(result, Err(PaymentError::ProviderApi(_))), "got {result:?}");
@@ -1511,7 +1480,6 @@ async fn accrue_invoice_item_creates_a_pending_item_with_an_idempotency_key() {
     mock_json(&server, "POST", "/v1/invoiceitems", 200, fixture("invoice_item")).await;
 
     let id = provider(&server)
-        .await
         .accrue_invoice_item(5000, CUSTOMER_ID, "Auto top-up accrual", "accrue-key-1")
         .await
         .unwrap();
@@ -1533,7 +1501,7 @@ async fn accrue_invoice_item_creates_a_pending_item_with_an_idempotency_key() {
 #[tokio::test]
 async fn accrue_invoice_item_rejects_bad_keys_and_reports_stripe_failures() {
     let server = MockServer::start().await;
-    let result = provider(&server).await.accrue_invoice_item(5000, CUSTOMER_ID, "d", "").await;
+    let result = provider(&server).accrue_invoice_item(5000, CUSTOMER_ID, "d", "").await;
     assert!(matches!(result, Err(PaymentError::InvalidData(_))), "got {result:?}");
     assert!(recorded(&server).await.is_empty());
 
@@ -1545,7 +1513,7 @@ async fn accrue_invoice_item_rejects_bad_keys_and_reports_stripe_failures() {
         json!({ "error": { "type": "api_error", "message": "boom" } }),
     )
     .await;
-    let result = provider(&server).await.accrue_invoice_item(5000, CUSTOMER_ID, "d", "key").await;
+    let result = provider(&server).accrue_invoice_item(5000, CUSTOMER_ID, "d", "key").await;
     assert!(matches!(result, Err(PaymentError::ProviderApi(_))), "got {result:?}");
 }
 
@@ -1560,13 +1528,13 @@ async fn customer_has_address_reflects_the_stripe_customer() {
         fixture("customer"),
     )
     .await;
-    assert!(provider(&with_address).await.customer_has_address(CUSTOMER_ID).await.unwrap());
+    assert!(provider(&with_address).customer_has_address(CUSTOMER_ID).await.unwrap());
 
     let without = MockServer::start().await;
     let mut customer = fixture("customer");
     customer["address"] = Value::Null;
     mock_json(&without, "GET", &format!("/v1/customers/{CUSTOMER_ID}"), 200, customer).await;
-    assert!(!provider(&without).await.customer_has_address(CUSTOMER_ID).await.unwrap());
+    assert!(!provider(&without).customer_has_address(CUSTOMER_ID).await.unwrap());
 
     let deleted = MockServer::start().await;
     mock_json(
@@ -1577,7 +1545,7 @@ async fn customer_has_address_reflects_the_stripe_customer() {
         json!({ "id": CUSTOMER_ID, "object": "customer", "deleted": true }),
     )
     .await;
-    assert!(!provider(&deleted).await.customer_has_address(CUSTOMER_ID).await.unwrap());
+    assert!(!provider(&deleted).customer_has_address(CUSTOMER_ID).await.unwrap());
 
     let failing = MockServer::start().await;
     mock_json(
@@ -1588,7 +1556,7 @@ async fn customer_has_address_reflects_the_stripe_customer() {
         json!({ "error": { "type": "api_error", "message": "boom" } }),
     )
     .await;
-    let result = provider(&failing).await.customer_has_address(CUSTOMER_ID).await;
+    let result = provider(&failing).customer_has_address(CUSTOMER_ID).await;
     assert!(matches!(result, Err(PaymentError::ProviderApi(_))), "got {result:?}");
 }
 
@@ -1596,7 +1564,7 @@ async fn customer_has_address_reflects_the_stripe_customer() {
 async fn create_customer_sends_email_and_optional_name() {
     let server = MockServer::start().await;
     mock_json(&server, "POST", "/v1/customers", 200, fixture("customer")).await;
-    let provider = provider(&server).await;
+    let provider = provider(&server);
 
     assert_eq!(
         provider
@@ -1616,6 +1584,17 @@ async fn create_customer_sends_email_and_optional_name() {
 }
 
 #[tokio::test]
+async fn api_base_url_with_a_path_prefix_keeps_the_prefix() {
+    // An egress proxy mounted under a path, configured without a trailing slash.
+    let server = MockServer::start().await;
+    mock_json(&server, "POST", "/stripe/v1/customers", 200, fixture("customer")).await;
+    let provider = StripeProvider::from(stripe_config_at(&format!("{}/stripe", server.uri())));
+
+    assert_eq!(provider.create_customer("buyer@example.test", None).await.unwrap(), CUSTOMER_ID);
+    only_request(&server, "POST", "/stripe/v1/customers").await;
+}
+
+#[tokio::test]
 async fn create_customer_reports_stripe_failures() {
     let server = MockServer::start().await;
     mock_json(
@@ -1626,7 +1605,7 @@ async fn create_customer_reports_stripe_failures() {
         json!({ "error": { "type": "invalid_request_error", "message": "Invalid email" } }),
     )
     .await;
-    let result = provider(&server).await.create_customer("nope", None).await;
+    let result = provider(&server).create_customer("nope", None).await;
     assert!(matches!(result, Err(PaymentError::ProviderApi(_))), "got {result:?}");
 }
 
@@ -1641,7 +1620,7 @@ async fn create_billing_portal_session_returns_the_portal_url() {
         fixture("billing_portal_session"),
     )
     .await;
-    let provider = provider(&server).await;
+    let provider = provider(&server);
 
     let url = provider
         .create_billing_portal_session(CUSTOMER_ID, "https://app.example.test/billing")
@@ -1662,10 +1641,7 @@ async fn create_billing_portal_session_returns_the_portal_url() {
         json!({ "error": { "type": "invalid_request_error", "message": "no such customer" } }),
     )
     .await;
-    let result = self::provider(&failing)
-        .await
-        .create_billing_portal_session("cus_missing", "r")
-        .await;
+    let result = self::provider(&failing).create_billing_portal_session("cus_missing", "r").await;
     assert!(matches!(result, Err(PaymentError::ProviderApi(_))), "got {result:?}");
 }
 

@@ -97,8 +97,9 @@ pub struct StripeProvider {
 impl From<crate::config::StripeConfig> for StripeProvider {
     fn from(config: crate::config::StripeConfig) -> Self {
         let mut builder = ClientBuilder::new(&config.api_key);
-        if let Some(api_base_url) = &config.api_base_url {
-            builder = builder.url(api_base_url);
+        // `Config::validate` rejects a bad base URL at startup.
+        if let Some(api_base) = config.api_base().expect("Stripe api_base_url is validated at config load") {
+            builder = builder.url(api_base);
         }
         let client = builder.build().expect("invalid Stripe API key or base URL");
         Self { config, client }
