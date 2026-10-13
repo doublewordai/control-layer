@@ -122,6 +122,9 @@ struct OnwardsApiKey {
     /// account's serving settings and an alias's overlay for it.
     user_id: UserId,
     username: String,
+    /// The account's display name, if it has one. Emitted as the key's
+    /// `account_display_name` label, which names the account on traces.
+    display_name: Option<String>,
 }
 
 /// Every alias's overlays, keyed by alias then by account id (as a string,
@@ -266,9 +269,20 @@ async fn load_accounts_from_db(db: &PgPool) -> Result<AccountsById, anyhow::Erro
 
 /// The labels every key carries: its purpose, the account's ZDR flag, the
 /// account itself so onwards can find the account's serving settings and an
-/// alias's overlay for it, and the account's username to name it in metrics.
+/// alias's overlay for it, the account's username to name it in metrics, and
+/// the account's display name (the username when it has none) to name it on
+/// traces. `account_name` stays the username: it is a metric label, and
+/// switching it would split existing series.
 fn key_labels(api_key: &OnwardsApiKey) -> HashMap<String, String> {
+    let display_name = api_key
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&api_key.username)
+        .to_string();
     HashMap::from([
+        (ACCOUNT_DISPLAY_NAME_LABEL.to_string(), display_name),
         ("purpose".to_string(), api_key.purpose.clone()),
         // Surface the account's zero-data-retention flag to onwards as a label.
         // Always emitted ("true"/"false"); onwards does not act on it yet.
@@ -278,6 +292,9 @@ fn key_labels(api_key: &OnwardsApiKey) -> HashMap<String, String> {
         ("api_key_id".to_string(), api_key.id.to_string()),
     ])
 }
+
+/// Key label carrying the account's display name for trace attributes.
+const ACCOUNT_DISPLAY_NAME_LABEL: &str = onwards::serving::ACCOUNT_DISPLAY_NAME_LABEL;
 
 const MIN_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 const RELOAD_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
@@ -823,7 +840,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             ak.purpose as api_key_purpose,
             ak.user_zero_data_retention,
             ak.user_id,
-            ak.user_username
+            ak.user_username,
+            ak.user_display_name as "user_display_name?"
         FROM deployed_models cm
         CROSS JOIN LATERAL (
             SELECT DISTINCT
@@ -832,7 +850,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 ak.purpose,
                 ak.user_id,
                 u.zero_data_retention as user_zero_data_retention,
-                u.username as user_username
+                u.username as user_username,
+                u.display_name as user_display_name
             FROM api_keys ak
             JOIN users u ON u.id = ak.user_id
             WHERE (
@@ -1100,6 +1119,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     zero_data_retention: row.user_zero_data_retention,
                     user_id: row.user_id,
                     username: row.user_username,
+                    display_name: row.user_display_name,
                 });
             }
         }
@@ -1631,6 +1651,7 @@ pub async fn load_targets_from_db_with_batch_default(
             ak.user_zero_data_retention as "api_key_user_zero_data_retention?",
             ak.user_id as "api_key_user_id?",
             ak.user_username as "api_key_user_username?",
+            ak.user_display_name as "api_key_user_display_name?",
             dm.serving_classes
         FROM deployed_models dm
         INNER JOIN inference_endpoints ie ON dm.hosted_on = ie.id
@@ -1641,7 +1662,8 @@ pub async fn load_targets_from_db_with_batch_default(
                 ak.purpose,
                 ak.user_id,
                 u.zero_data_retention as user_zero_data_retention,
-                u.username as user_username
+                u.username as user_username,
+                u.display_name as user_display_name
             FROM api_keys ak
             JOIN users u ON u.id = ak.user_id
             WHERE (
@@ -1822,6 +1844,7 @@ pub async fn load_targets_from_db_with_batch_default(
                 zero_data_retention,
                 user_id,
                 username,
+                display_name: row.api_key_user_display_name,
             });
         }
     }

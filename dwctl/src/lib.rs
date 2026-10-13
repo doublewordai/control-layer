@@ -2844,12 +2844,26 @@ pub async fn build_router(
                 span.set_attribute("http.route", route.unwrap_or_default());
                 span.set_attribute("url.path", path.to_string());
                 span.set_attribute("url.query", request.uri().query().unwrap_or("").to_string());
+                if api_type == "ai_proxy" {
+                    // The batch daemon stamps every request it dispatches with this header.
+                    let dispatched = request.headers().contains_key("x-fusillade-batch-created-at");
+                    span.set_attribute("doubleword.traffic", if dispatched { "batch" } else { "realtime" });
+                    if let Some(window) = request
+                        .headers()
+                        .get("x-fusillade-batch-completion-window")
+                        .and_then(|value| value.to_str().ok())
+                        .filter(|_| dispatched)
+                    {
+                        span.set_attribute("doubleword.batch.completion_window", window.to_string());
+                    }
+                }
                 span
             })
             .on_request(tower_http::trace::DefaultOnRequest::new().level(tracing::Level::TRACE))
             .on_response(|response: &http::Response<_>, latency: std::time::Duration, span: &tracing::Span| {
                 let status = response.status().as_u16();
                 span.set_attribute("http.response.status_code", i64::from(status));
+                crate::telemetry::record_ai_response_attributes(response, span, status);
                 if status >= 500 {
                     span.set_attribute("otel.status_code", "ERROR");
                     span.set_attribute("error.type", status.to_string());

@@ -139,6 +139,96 @@ impl BatchNotificationInfo {
     }
 }
 
+/// How a finalized batch ended, as recorded on its `fusillade.batch_finalized` span.
+fn batch_span_outcome(completed: i64, failed: i64) -> &'static str {
+    if failed == 0 {
+        "completed"
+    } else if completed == 0 {
+        "failed"
+    } else {
+        "partially_completed"
+    }
+}
+
+/// Emits one root `fusillade.batch_finalized` span per claimed batch so batch
+/// outcomes can be alerted on from traces. Callers pass only batches this
+/// process just claimed, and a batch is claimed once, so each batch yields one
+/// span. The attributes are listed in [`crate::telemetry`].
+///
+/// Enrichment (account display names, a failure sample) is best-effort: a
+/// failed lookup is reported and the span is still emitted without it.
+async fn emit_batch_finalized_spans<P: sqlx_pool_router::PoolProvider>(
+    request_manager: &PostgresRequestManager<P>,
+    conn: &mut sqlx::PgConnection,
+    batches: &[fusillade::batch::BatchNotification],
+) {
+    let owners: Vec<Uuid> = batches
+        .iter()
+        .filter_map(|n| n.batch.created_by.parse().ok())
+        .collect::<HashSet<Uuid>>()
+        .into_iter()
+        .collect();
+    let names: std::collections::HashMap<Uuid, String> = if owners.is_empty() {
+        Default::default()
+    } else {
+        match Users::new(conn).get_bulk(owners).await {
+            Ok(users) => users
+                .into_iter()
+                .map(|(id, user)| {
+                    let name = user.display_name.filter(|name| !name.trim().is_empty()).unwrap_or(user.username);
+                    (id, name)
+                })
+                .collect(),
+            Err(e) => {
+                crate::background_error!(NOTIFICATIONS, "batch_span_account_names", Warning, error = %e, "Failed to look up account names for batch spans");
+                Default::default()
+            }
+        }
+    };
+
+    let fully_failed: Vec<_> = batches
+        .iter()
+        .filter(|n| batch_span_outcome(n.batch.completed_requests, n.batch.failed_requests) == "failed")
+        .map(|n| n.batch.id)
+        .collect();
+    let samples = if fully_failed.is_empty() {
+        Default::default()
+    } else {
+        request_manager.failed_batch_sample_classes(&fully_failed).await.unwrap_or_else(|e| {
+            crate::background_error!(NOTIFICATIONS, "batch_span_failure_sample", Warning, error = %e, "Failed to sample failures for batch spans");
+            Default::default()
+        })
+    };
+
+    for notif in batches {
+        let batch = &notif.batch;
+        let outcome = batch_span_outcome(batch.completed_requests, batch.failed_requests);
+        let account_name = batch.created_by.parse::<Uuid>().ok().and_then(|id| names.get(&id));
+        let completion_window = if batch.service_tier.as_deref() == Some("background") {
+            "background"
+        } else {
+            batch.completion_window.as_deref().unwrap_or_default()
+        };
+        let sample_error = (outcome == "failed").then(|| samples.get(&batch.id).map_or("unknown", String::as_str));
+        // A root span: the poller has no request to belong to.
+        let _span = tracing::info_span!(
+            parent: None,
+            "fusillade.batch_finalized",
+            otel.name = "fusillade.batch_finalized",
+            batch_id = %batch.id,
+            doubleword.account_id = %batch.created_by,
+            doubleword.account_name = account_name.map(String::as_str),
+            gen_ai.request.model = %notif.model,
+            completion_window = completion_window,
+            batch.total_requests = batch.total_requests,
+            batch.completed_requests = batch.completed_requests,
+            batch.failed_requests = batch.failed_requests,
+            batch.outcome = outcome,
+            batch.sample_error = sample_error,
+        );
+    }
+}
+
 pub async fn run_notification_poller(
     config: NotificationsConfig,
     app_config: crate::config::Config,
@@ -285,6 +375,10 @@ pub async fn run_notification_poller(
             Ok(batches) => {
                 if !batches.is_empty() {
                     tracing::info!(count = batches.len(), "Claimed finalized batches for notification");
+
+                    // One trace span per claimed batch, whether or not email or webhooks
+                    // are configured: every finalization path converges on this claim.
+                    emit_batch_finalized_spans(&request_manager, &mut conn, &batches).await;
 
                     let infos: Vec<_> = batches.iter().filter_map(BatchNotificationInfo::try_from_batch).collect();
 
@@ -2147,5 +2241,132 @@ mod tests {
         assert!(sent, "the org is marked as notified");
 
         std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    #[derive(Clone, Default, Debug)]
+    struct ExportedSpans(Arc<std::sync::Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>);
+    impl opentelemetry_sdk::trace::SpanExporter for ExportedSpans {
+        async fn export(&self, batch: Vec<opentelemetry_sdk::trace::SpanData>) -> opentelemetry_sdk::error::OTelSdkResult {
+            self.0.lock().unwrap().extend(batch);
+            Ok(())
+        }
+    }
+
+    fn span_attr(span: &opentelemetry_sdk::trace::SpanData, key: &str) -> Option<String> {
+        span.attributes.iter().find(|a| a.key.as_str() == key).map(|a| a.value.to_string())
+    }
+
+    #[test]
+    fn batch_span_classification() {
+        assert_eq!(batch_span_outcome(5, 0), "completed");
+        assert_eq!(batch_span_outcome(0, 5), "failed");
+        assert_eq!(batch_span_outcome(3, 2), "partially_completed");
+    }
+
+    /// Each finalized batch yields exactly one `fusillade.batch_finalized` span,
+    /// because the claim hands a batch to the poller once. Account name, counts,
+    /// outcome and a status-only failure sample ride on the span.
+    #[dwctl_test_macros::test]
+    async fn test_batch_finalized_span_emitted_once_per_claim(pool: sqlx::PgPool) {
+        use fusillade::{DaemonStorage, Storage};
+        use opentelemetry::trace::TracerProvider as _;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let exported = ExportedSpans::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exported.clone())
+            .build();
+        // The test runtime is single-threaded, so a thread-local subscriber sees every span.
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(provider.tracer("batch-span-test"))),
+        );
+
+        let owner = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        sqlx::query("UPDATE users SET display_name = 'Example Analytics Ltd' WHERE id = $1")
+            .bind(owner.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let fusillade_pool = crate::test::utils::setup_fusillade_pool(&pool).await;
+        let manager = PostgresRequestManager::new(
+            fusillade_arsenal::TestDbPools::new(fusillade_pool.clone()).await.unwrap(),
+            fusillade_arsenal::PostgresStorageConfig::default(),
+        );
+
+        let mut batch_ids = Vec::new();
+        for (name, state, status) in [("all-failed", "failed", 422), ("all-completed", "completed", 200)] {
+            let templates = (0..2)
+                .map(|i| fusillade::RequestTemplateInput {
+                    custom_id: Some(format!("{name}-{i}")),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "span-test-model".to_string(),
+                    api_key: "key".to_string(),
+                })
+                .collect();
+            let file_id = manager.create_file(format!("{name}-file"), None, templates).await.unwrap();
+            let batch = manager
+                .create_batch(fusillade::BatchInput {
+                    file_id,
+                    endpoint: "/v1/chat/completions".to_string(),
+                    completion_window: "24h".to_string(),
+                    metadata: None,
+                    created_by: Some(owner.id.to_string()),
+                    api_key_id: None,
+                    api_key: None,
+                    total_requests: None,
+                })
+                .await
+                .unwrap();
+            sqlx::query(
+                "UPDATE requests SET state = $2, response_status = $3, completed_at = NOW(), failed_at = CASE WHEN $2 = 'failed' THEN NOW() END, \
+                 response_body = CASE WHEN $2 = 'completed' THEN '{}' END, error = CASE WHEN $2 = 'failed' THEN 'secret detail' END \
+                 WHERE batch_id = $1",
+            )
+            .bind(*batch.id)
+            .bind(state)
+            .bind(status as i16)
+            .execute(&fusillade_pool)
+            .await
+            .unwrap();
+            batch_ids.push(batch.id);
+        }
+        manager.finalize_terminal_batches().await.unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let claimed = manager.claim_batch_notifications().await.unwrap();
+        assert_eq!(claimed.len(), 2);
+        emit_batch_finalized_spans(&manager, &mut conn, &claimed).await;
+        // Nothing is left to claim, so the next poll emits nothing.
+        let again = manager.claim_batch_notifications().await.unwrap();
+        assert!(again.is_empty());
+        emit_batch_finalized_spans(&manager, &mut conn, &again).await;
+
+        provider.force_flush().unwrap();
+        let spans = exported.0.lock().unwrap();
+        let spans: Vec<_> = spans.iter().filter(|s| s.name == "fusillade.batch_finalized").collect();
+        assert_eq!(spans.len(), 2, "one span per claimed batch");
+        for (batch_id, outcome, completed, failed) in [(batch_ids[0], "failed", "0", "2"), (batch_ids[1], "completed", "2", "0")] {
+            let span = spans
+                .iter()
+                .find(|s| span_attr(s, "batch_id") == Some(batch_id.to_string()))
+                .expect("span for batch");
+            assert_eq!(span_attr(span, "doubleword.account_id"), Some(owner.id.to_string()));
+            assert_eq!(span_attr(span, "doubleword.account_name").as_deref(), Some("Example Analytics Ltd"));
+            assert_eq!(span_attr(span, "gen_ai.request.model").as_deref(), Some("span-test-model"));
+            assert_eq!(span_attr(span, "completion_window").as_deref(), Some("24h"));
+            assert_eq!(span_attr(span, "batch.total_requests").as_deref(), Some("2"));
+            assert_eq!(span_attr(span, "batch.completed_requests").as_deref(), Some(completed));
+            assert_eq!(span_attr(span, "batch.failed_requests").as_deref(), Some(failed));
+            assert_eq!(span_attr(span, "batch.outcome").as_deref(), Some(outcome));
+            let sample = span_attr(span, "batch.sample_error");
+            if outcome == "failed" {
+                assert_eq!(sample.as_deref(), Some("http_422"), "status class only, never the message");
+            } else {
+                assert_eq!(sample, None);
+            }
+        }
     }
 }

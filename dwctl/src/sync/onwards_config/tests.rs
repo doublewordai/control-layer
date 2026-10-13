@@ -578,6 +578,36 @@ async fn test_cache_shape_key_labels_name_the_owning_account(pool: sqlx::PgPool)
     }
 }
 
+/// Traces name the account by display name, falling back to the username; the
+/// `account_name` label stays the username because metrics use it.
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_cache_shape_key_labels_carry_account_display_name(pool: sqlx::PgPool) {
+    sqlx::query("UPDATE users SET display_name = 'Example Display Name' WHERE username = 'cache_user_a'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE users SET display_name = '  ' WHERE username = 'cache_user_b'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+
+    let label = onwards::serving::ACCOUNT_DISPLAY_NAME_LABEL;
+    let a = targets.key_labels.get(KEY_A_SECRET).unwrap();
+    assert_eq!(a.get(label).map(String::as_str), Some("Example Display Name"));
+    assert_eq!(
+        a.get(onwards::serving::ACCOUNT_NAME_LABEL).map(String::as_str),
+        Some("cache_user_a")
+    );
+    let b = targets.key_labels.get(KEY_B_SECRET).unwrap();
+    assert_eq!(
+        b.get(label).map(String::as_str),
+        Some("cache_user_b"),
+        "blank display name falls back to the username"
+    );
+}
+
 #[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered", "cache_balance_user_a_positive")))]
 async fn test_cache_shape_metered_model_requires_positive_balance(pool: sqlx::PgPool) {
     let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();

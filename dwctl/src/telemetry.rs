@@ -12,6 +12,56 @@
 //! - `OTEL_EXPORTER_OTLP_HEADERS` - Headers as comma-separated key=value pairs. The values can have their spaces encoded URL style - i.e. replace %20 with space.
 //! - `OTEL_SERVICE_NAME` - Service name for resource identification
 //!
+//! The span batch processor honours the standard `OTEL_BSP_*` variables
+//! (`OTEL_BSP_MAX_QUEUE_SIZE`, `OTEL_BSP_MAX_EXPORT_BATCH_SIZE`,
+//! `OTEL_BSP_SCHEDULE_DELAY`, `OTEL_BSP_EXPORT_TIMEOUT`). Spans that arrive while
+//! the queue is full are dropped, so the queue must absorb bursts (a large batch
+//! dispatching tens of thousands of requests at once). The SDK default of 2048
+//! dropped most spans in such bursts; this module defaults to a queue of
+//! [`DEFAULT_BSP_MAX_QUEUE_SIZE`] spans and exports in batches of
+//! [`DEFAULT_BSP_MAX_EXPORT_BATCH_SIZE`]. Memory is the trade-off: a full queue
+//! holds up to that many finished spans (roughly 1-2 KiB each, so about 16-32 MiB
+//! at the default) per process. Raise the queue for burstier traffic or lower it on
+//! small replicas.
+//!
+//! # Span attributes for customer-facing alerts
+//!
+//! Alert and dashboard queries (for example TraceQL metrics) depend on these
+//! attribute names, so treat them as a contract. `doubleword.*` are our domain
+//! attributes; `gen_ai.*`, `http.*` and `error.type` follow OpenTelemetry
+//! semantic conventions.
+//!
+//! Root `request` span, for authenticated AI requests (set when the response is
+//! produced; see [`record_ai_response_attributes`]):
+//!
+//! | attribute | meaning |
+//! |---|---|
+//! | `doubleword.account_id` | owning account (the organization for organization keys) |
+//! | `doubleword.account_name` | account display name, falling back to its username |
+//! | `doubleword.api_key_id` | the API key used |
+//! | `doubleword.key_purpose` | the key's purpose (`realtime`, `batch`, ...) |
+//! | `gen_ai.request.model` | the model alias requested |
+//! | `doubleword.traffic` | `realtime`, or `batch` for requests dispatched by the batch daemon |
+//! | `doubleword.batch.completion_window` | the dispatching batch's completion window (batch traffic only) |
+//! | `doubleword.error.source` | for 4xx/5xx that passed through onwards: `gateway` (decided here: auth, limits, validation) or `provider` (the status is the upstream's) |
+//! | `doubleword.rejection.code` | for gateway errors: the error code, e.g. `unsupported_parameter`, `inflight_limit_exceeded` |
+//! | `http.response.status_code`, `error.type` | final status, and the status as the error type for 4xx/5xx |
+//!
+//! `onwards.request` span: `onwards.account`, `onwards.account_name`,
+//! `onwards.api_key_id`, `onwards.key_purpose`, `gen_ai.request.model`,
+//! `http.response.status_code`, plus `error.type` and `onwards.rejection.param`
+//! for gateway rejections.
+//!
+//! `fusillade.process_request` span (one per batch request attempt):
+//! `doubleword.account_id`, `completion_window`, `custom_id`, `model`, `outcome`.
+//!
+//! `fusillade.batch_finalized` span (one per batch, emitted by the notification
+//! poller when the batch is claimed after finishing): `batch_id`,
+//! `doubleword.account_id`, `doubleword.account_name`, `gen_ai.request.model`,
+//! `completion_window`, `batch.total_requests`, `batch.completed_requests`,
+//! `batch.failed_requests`, `batch.outcome` (`completed` | `partially_completed` | `failed`) and, for
+//! fully failed batches, `batch.sample_error` (an error class, never a message).
+//!
 //! Example - to enable OTLP export and send traces to a custom OTLP HTTP endpoint with basic authorization header:
 //!
 //! In config.yaml:
@@ -27,14 +77,73 @@
 //! export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic%20<token>"
 //! ```
 
+use onwards::{ErrorOrigin, RequestIdentity, ServedBy};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
 pub use opentelemetry_sdk::trace::SdkTracerProvider;
+use opentelemetry_sdk::trace::{BatchConfig, BatchConfigBuilder, BatchSpanProcessor};
 use std::collections::HashMap;
 use tracing::info;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+
+/// Default span queue size when `OTEL_BSP_MAX_QUEUE_SIZE` is unset. The SDK
+/// default (2048) dropped most spans in a large batch's dispatch burst.
+pub const DEFAULT_BSP_MAX_QUEUE_SIZE: usize = 16_384;
+/// Default export batch size when `OTEL_BSP_MAX_EXPORT_BATCH_SIZE` is unset.
+pub const DEFAULT_BSP_MAX_EXPORT_BATCH_SIZE: usize = 1_024;
+
+/// Batch processor settings: the SDK's `OTEL_BSP_*` environment handling, with
+/// larger defaults for the queue and export batch size.
+fn batch_config() -> BatchConfig {
+    let mut builder = BatchConfigBuilder::default();
+    if std::env::var_os("OTEL_BSP_MAX_QUEUE_SIZE").is_none() {
+        builder = builder.with_max_queue_size(DEFAULT_BSP_MAX_QUEUE_SIZE);
+    }
+    if std::env::var_os("OTEL_BSP_MAX_EXPORT_BATCH_SIZE").is_none() {
+        builder = builder.with_max_export_batch_size(DEFAULT_BSP_MAX_EXPORT_BATCH_SIZE);
+    }
+    builder.build()
+}
+
+/// Records who made an AI request, and where an error came from, on the root
+/// request span. Reads the extensions onwards attaches to its responses, so it
+/// covers successes, gateway refusals and provider errors alike. A request
+/// whose key was not recognised (401) has no identity and records none, and an
+/// error that did not pass through onwards has no source.
+pub fn record_ai_response_attributes<B>(response: &axum::http::Response<B>, span: &tracing::Span, status: u16) {
+    let extensions = response.extensions();
+    if let Some(identity) = extensions.get::<RequestIdentity>() {
+        let attrs = [
+            ("doubleword.account_id", identity.account_id.clone()),
+            ("doubleword.account_name", identity.account_name.clone()),
+            ("doubleword.api_key_id", identity.api_key_id.map(|id| id.to_string())),
+            ("doubleword.key_purpose", identity.key_purpose.clone()),
+            ("gen_ai.request.model", identity.model.clone()),
+        ];
+        for (key, value) in attrs {
+            if let Some(value) = value {
+                span.set_attribute(key, value);
+            }
+        }
+    }
+    if status >= 400 {
+        let (source, code) = match extensions.get::<ErrorOrigin>() {
+            Some(ErrorOrigin::Provider) => ("provider", None),
+            Some(ErrorOrigin::Gateway { code }) => ("gateway", Some(code.clone())),
+            // An upstream's response passed through unchanged.
+            None if extensions.get::<ServedBy>().is_some() => ("provider", None),
+            // Not produced by onwards (admin API, or refused before it ran).
+            None => return,
+        };
+        span.set_attribute("doubleword.error.source", source);
+        if let Some(code) = code.filter(|code| !code.is_empty()) {
+            span.set_attribute("doubleword.rejection.code", code);
+        }
+    }
+}
 
 /// Initialize tracing with optional OpenTelemetry support
 ///
@@ -138,8 +247,9 @@ fn create_otlp_tracer() -> anyhow::Result<(opentelemetry_sdk::trace::Tracer, Sdk
         .with_service_name(service_name.clone())
         .build();
 
+    let batch_processor = BatchSpanProcessor::builder(exporter).with_batch_config(batch_config()).build();
     let tracer_provider = SdkTracerProvider::builder()
-        .with_batch_exporter(exporter)
+        .with_span_processor(batch_processor)
         .with_resource(resource)
         .build();
 
