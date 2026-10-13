@@ -80,6 +80,9 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     /// Read by [`super::zdr::is_zdr_request`] on the submit path. Defaults to
     /// empty (every key reads as non-ZDR) when the sync is not wired.
     pub key_policy_cache: crate::sync::key_policy::KeyPolicyCache,
+    /// Pending-byte limit for an unfinished SSE event (`onwards.sse_buffer_limit`),
+    /// used when applying the client's usage choice to a realtime stream.
+    pub sse_buffer_limit: usize,
 }
 
 /// Middleware that routes inference requests based on service_tier and background.
@@ -546,10 +549,11 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 api_key: api_key.clone().unwrap_or_default(),
                 created_by: created_by.unwrap_or_default(),
             };
+            let client_usage = super::stream_usage::requested_usage(&endpoint, &request_value);
             // The parsed JSON is no longer needed on the realtime path. Release
             // its strings before the upstream request is held open.
             drop(request_value);
-            handle_realtime(
+            let response = handle_realtime(
                 &state,
                 realtime_input,
                 &resp_id,
@@ -561,7 +565,11 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 body_bytes,
                 next,
             )
-            .await
+            .await;
+            match client_usage {
+                Some(include_usage) => super::stream_usage::apply(response, include_usage, state.sse_buffer_limit),
+                None => response,
+            }
         }
         ServiceTier::Flex | ServiceTier::Background => {
             let is_background_tier = matches!(service_tier, ServiceTier::Background);

@@ -4364,6 +4364,7 @@ impl Application {
             flex_completion_window: config.batches.async_requests.completion_window.clone(),
             keystore: bg_services.keystore.clone(),
             key_policy_cache: bg_services.key_policy_cache.clone(),
+            sse_buffer_limit: config.onwards.sse_buffer_limit,
         };
 
         // Build onwards router from targets with body transform + response sanitization.
