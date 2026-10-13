@@ -3499,8 +3499,10 @@ mod integration_tests {
             .execute(&pool)
             .await
             .unwrap();
+        // Capture timestamps use the host clock; PostgreSQL may run in a VM.
+        let valid_from = Utc::now() - chrono::Duration::minutes(1);
         for (class, price) in [(None, Decimal::new(2, 6)), (Some("interactive"), Decimal::new(9, 6))] {
-            sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,input_price_per_token,output_price_per_token,api_key_purpose) VALUES ($1,$2,$3,'org-price',$4,$4,'realtime')").bind(model).bind(account).bind(class).bind(price).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,input_price_per_token,output_price_per_token,api_key_purpose,valid_from) VALUES ($1,$2,$3,'org-price',$4,$4,'realtime',$5)").bind(model).bind(account).bind(class).bind(price).bind(valid_from).execute(&pool).await.unwrap();
         }
         let child = {
             let mut conn = pool.acquire().await.unwrap();
