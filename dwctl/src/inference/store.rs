@@ -13,7 +13,7 @@ use fusillade_arsenal::PostgresRequestManager;
 use sqlx_pool_router::PoolProvider;
 use uuid::Uuid;
 
-use crate::inference::response_store::{ResponseStore, StoreError};
+use crate::inference::response_store::{ResponseContext, ResponseStore, StoreError};
 
 /// Header set by the inference middleware so the outlet handler knows which
 /// fusillade row to update with the response body.
@@ -866,7 +866,7 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> ResponseStore for Fusillad
         Ok(id)
     }
 
-    async fn get_context(&self, response_id: &str, owner: &str) -> Result<Option<serde_json::Value>, StoreError> {
+    async fn get_context(&self, response_id: &str, owner: &str) -> Result<Option<ResponseContext>, StoreError> {
         // Ownership is checked on the resolved row (live or retained) before
         // any content is returned: a foreign or batch response reads as absent.
         let parsed_uuid = parse_response_id(response_id)?;
@@ -878,12 +878,23 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> ResponseStore for Fusillad
         if detail.created_by != owner {
             return Ok(None);
         }
-        // Context lookups are never ZDR, so `Gone` cannot arise here; fold it
-        // into `None` alongside `NotFound` for a total mapping.
-        Ok(match self.get_response(response_id).await? {
-            ResponseLookup::Found(v) => Some(v),
-            ResponseLookup::NotFound | ResponseLookup::Gone => None,
-        })
+        let Some(body) = detail.body.as_deref().filter(|body| !body.is_empty()) else {
+            return Ok(None);
+        };
+        // A flex ZDR request remains encrypted at rest after its request key is
+        // shredded. If the owner later disables ZDR, a continuation can reach
+        // this lookup, but the prior input is permanently unavailable.
+        if crate::inference::zdr::is_zdr_body(body) {
+            return Ok(None);
+        }
+        let request: serde_json::Value =
+            serde_json::from_str(body).map_err(|e| StoreError::SerializationError(format!("Failed to parse previous request: {e}")))?;
+        let input = request
+            .get("input")
+            .cloned()
+            .ok_or_else(|| StoreError::SerializationError("Previous request has no input".to_string()))?;
+        let response = detail_to_response_object(&detail);
+        Ok(Some(ResponseContext { input, response }))
     }
 }
 

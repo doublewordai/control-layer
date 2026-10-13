@@ -177,8 +177,10 @@ async fn customer_quotes_hide_classes_and_ownerless_estimates_use_general_prices
     use crate::db::handlers::{Tariffs, analytics::get_realtime_tariffs};
     let account: Uuid = sqlx::query_scalar("INSERT INTO users (username,email,auth_source,user_type) VALUES ('review-org','review@example.com','test','organization') RETURNING id").fetch_one(&pool).await.unwrap();
     let model: Uuid = sqlx::query_scalar("INSERT INTO deployed_models (model_name,alias,is_composite,created_by) VALUES ('review-model','review-model',true,$1) RETURNING id").bind(account).fetch_one(&pool).await.unwrap();
-    sqlx::query("INSERT INTO model_tariffs (deployed_model_id,name,input_price_per_token,output_price_per_token,api_key_purpose) VALUES ($1,'general',3,3,'realtime')").bind(model).execute(&pool).await.unwrap();
-    sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,input_price_per_token,output_price_per_token,api_key_purpose,completion_window) VALUES ($1,$2,'standard','batch-deal',1,1,'batch','24h')").bind(model).bind(account).execute(&pool).await.unwrap();
+    // Lookups use the host clock; PostgreSQL may run in a VM whose clock is ahead.
+    let valid_from = Utc::now() - chrono::Duration::minutes(1);
+    sqlx::query("INSERT INTO model_tariffs (deployed_model_id,name,input_price_per_token,output_price_per_token,api_key_purpose,valid_from) VALUES ($1,'general',3,3,'realtime',$2)").bind(model).bind(valid_from).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,input_price_per_token,output_price_per_token,api_key_purpose,completion_window,valid_from) VALUES ($1,$2,'standard','batch-deal',1,1,'batch','24h',$3)").bind(model).bind(account).bind(valid_from).execute(&pool).await.unwrap();
     let mut conn = pool.acquire().await.unwrap();
     let mut tariffs = Tariffs::new(&mut conn);
     let quotes = tariffs.list_effective_for_account(&[model], account).await.unwrap();
@@ -259,9 +261,11 @@ async fn internal_purposes_never_resolve_customer_prices_or_quotes(pool: PgPool)
     use crate::db::handlers::Tariffs;
     let account: Uuid = sqlx::query_scalar("INSERT INTO users (username,email,auth_source,user_type) VALUES ('internal-price-test','internal-price@example.com','test','organization') RETURNING id").fetch_one(&pool).await.unwrap();
     let model: Uuid = sqlx::query_scalar("INSERT INTO deployed_models (model_name,alias,is_composite,created_by) VALUES ('internal-price','internal-price',true,$1) RETURNING id").bind(account).fetch_one(&pool).await.unwrap();
+    // Lookups use the host clock; PostgreSQL may run in a VM whose clock is ahead.
+    let valid_from = Utc::now() - chrono::Duration::minutes(1);
     for scope in [None, Some(account)] {
         for purpose in ["realtime", "continuation", "platform"] {
-            sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,name,input_price_per_token,output_price_per_token,api_key_purpose) VALUES ($1,$2,$3,1,2,$3)").bind(model).bind(scope).bind(purpose).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,name,input_price_per_token,output_price_per_token,api_key_purpose,valid_from) VALUES ($1,$2,$3,1,2,$3,$4)").bind(model).bind(scope).bind(purpose).bind(valid_from).execute(&pool).await.unwrap();
         }
     }
     let mut conn = pool.acquire().await.unwrap();
@@ -521,6 +525,8 @@ async fn customer_display_sort_and_usage_have_explicitly_different_class_rules(p
     use crate::db::handlers::{Deployments, Repository, Tariffs, analytics::get_realtime_tariffs, deployments::DeploymentFilter};
     let account: Uuid = sqlx::query_scalar("INSERT INTO users (username,email,auth_source,user_type) VALUES ('display-org','display@example.com','test','organization') RETURNING id").fetch_one(&pool).await.unwrap();
     let mut models = Vec::new();
+    // Lookups use the host clock; PostgreSQL may run in a VM whose clock is ahead.
+    let valid_from = Utc::now() - chrono::Duration::minutes(1);
     for alias in ["display-deal", "display-comparator"] {
         let model: Uuid = sqlx::query_scalar(
             "INSERT INTO deployed_models (model_name,alias,is_composite,created_by) VALUES ($1,$1,true,$2) RETURNING id",
@@ -530,15 +536,15 @@ async fn customer_display_sort_and_usage_have_explicitly_different_class_rules(p
         .fetch_one(&pool)
         .await
         .unwrap();
-        sqlx::query("INSERT INTO model_tariffs (deployed_model_id,name,input_price_per_token,output_price_per_token,api_key_purpose) VALUES ($1,'general',3,3,'realtime')").bind(model).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO model_tariffs (deployed_model_id,name,input_price_per_token,output_price_per_token,api_key_purpose,valid_from) VALUES ($1,'general',3,3,'realtime',$2)").bind(model).bind(valid_from).execute(&pool).await.unwrap();
         models.push(model);
     }
     let model = models[0];
     for (class, price) in [(None, 2), (Some("standard"), 9), (Some("interactive"), 0)] {
-        sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,input_price_per_token,output_price_per_token,api_key_purpose) VALUES ($1,$2,$3,'deal', $4,$4,'realtime')").bind(model).bind(account).bind(class).bind(Decimal::from(price)).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,input_price_per_token,output_price_per_token,api_key_purpose,valid_from) VALUES ($1,$2,$3,'deal', $4,$4,'realtime',$5)").bind(model).bind(account).bind(class).bind(Decimal::from(price)).bind(valid_from).execute(&pool).await.unwrap();
     }
-    sqlx::query("INSERT INTO model_tariffs (deployed_model_id,name,input_price_per_token,output_price_per_token,api_key_purpose,completion_window) VALUES ($1,'batch',1,1,'batch','24h')").bind(model).execute(&pool).await.unwrap();
-    sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,input_price_per_token,output_price_per_token,api_key_purpose,completion_window) VALUES ($1,$2,'standard','free-batch',0,0,'batch','24h')").bind(model).bind(account).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO model_tariffs (deployed_model_id,name,input_price_per_token,output_price_per_token,api_key_purpose,completion_window,valid_from) VALUES ($1,'batch',1,1,'batch','24h',$2)").bind(model).bind(valid_from).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,input_price_per_token,output_price_per_token,api_key_purpose,completion_window,valid_from) VALUES ($1,$2,'standard','free-batch',0,0,'batch','24h',$3)").bind(model).bind(account).bind(valid_from).execute(&pool).await.unwrap();
     // Future and expired rows must not replace the currently applicable deal.
     sqlx::query("UPDATE model_tariffs SET valid_until=NOW()+INTERVAL '1 hour' WHERE user_id=$1 AND serving_class IS NULL")
         .bind(account)
