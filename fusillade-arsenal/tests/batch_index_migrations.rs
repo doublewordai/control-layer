@@ -46,6 +46,16 @@ const NOTIFICATION_DUE: IndexMigrations = IndexMigrations {
           AND cancelling_at IS NULL AND deleted_at IS NULL AND total_requests > 0",
 };
 
+const FAILED_CREATED_AT: IndexMigrations = IndexMigrations {
+    name: "idx_batches_failed_created_at_id",
+    build: 20261012120000,
+    validate: 20261012120020,
+    build_sql: include_str!("../migrations/20261012120000_add_batches_failed_created_at_id.up.sql"),
+    // Missing the id tiebreak key: the page orders by (created_at DESC, id DESC).
+    wrong_definition: "CREATE INDEX idx_batches_failed_created_at_id ON batches (created_at DESC)
+        WHERE failed_at IS NOT NULL AND completed_at IS NULL AND deleted_at IS NULL",
+};
+
 /// Apply every migration that precedes the index's build migration.
 async fn migrate_to_before(pool: &PgPool, index: &IndexMigrations) {
     let baseline = Migrator {
@@ -187,4 +197,24 @@ async fn notification_due_index_repairs_an_invalid_remnant(pool: PgPool) {
 #[sqlx::test(migrations = false)]
 async fn notification_due_index_rejects_a_same_name_wrong_definition(pool: PgPool) {
     wrong_definition(pool, &NOTIFICATION_DUE).await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn failed_created_at_index_applies_fresh(pool: PgPool) {
+    fresh(pool, &FAILED_CREATED_AT).await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn failed_created_at_index_adopts_a_prebuilt_index(pool: PgPool) {
+    prebuilt(pool, &FAILED_CREATED_AT).await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn failed_created_at_index_repairs_an_invalid_remnant(pool: PgPool) {
+    invalid_remnant(pool, &FAILED_CREATED_AT).await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn failed_created_at_index_rejects_a_same_name_wrong_definition(pool: PgPool) {
+    wrong_definition(pool, &FAILED_CREATED_AT).await;
 }
