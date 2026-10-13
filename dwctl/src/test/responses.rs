@@ -451,6 +451,37 @@ async fn seed_archivable_response(pool: &PgPool, manager: &PostgresRequestManage
 }
 
 #[dwctl_test_macros::test]
+async fn response_context_treats_zdr_ciphertext_as_unavailable(pool: PgPool) {
+    let user = create_test_user(&pool, Role::StandardUser).await;
+    let (_, manager) = response_lifecycle_manager(&pool).await;
+    let request_id = uuid::Uuid::new_v4();
+    manager
+        .create_realtime(fusillade::CreateRealtimeInput {
+            request_id,
+            body: "dwzdr1:request-key-already-shredded".to_owned(),
+            model: "store-test-model".to_owned(),
+            endpoint: "https://example.invalid".to_owned(),
+            method: "POST".to_owned(),
+            path: "/v1/responses".to_owned(),
+            api_key: "store-test-key".to_owned(),
+            created_by: user.id.to_string(),
+        })
+        .await
+        .unwrap();
+    manager
+        .complete_request(fusillade::RequestId(request_id), r#"{"id":"resp_test","output":[]}"#, 200)
+        .await
+        .unwrap();
+
+    let store = crate::inference::store::FusilladeResponseStore::new(std::sync::Arc::new(manager));
+    let context = crate::inference::response_store::ResponseStore::get_context(&store, &format!("resp_{request_id}"), &user.id.to_string())
+        .await
+        .expect("ZDR ciphertext should be treated as unavailable, not invalid JSON");
+
+    assert!(context.is_none());
+}
+
+#[dwctl_test_macros::test]
 async fn complete_response_treats_active_retained_graph_as_idempotent(pool: PgPool) {
     let user = create_test_user(&pool, Role::StandardUser).await;
     let key = create_test_api_key_for_user(&pool, user.id).await;
@@ -702,6 +733,28 @@ async fn a_chain_can_extend_a_response_after_its_graph_moved_to_the_retained_sto
     let extended_json: serde_json::Value = extended.json();
     assert_eq!(extended_json["previous_response_id"], format!("resp_{id}"));
     assert_ne!(extended_json["id"], format!("resp_{id}"));
+
+    let upstream_requests = mock_server.received_requests().await.unwrap_or_default();
+    let continuation_requests: Vec<_> = upstream_requests
+        .iter()
+        .filter(|request| String::from_utf8_lossy(&request.body).contains("second turn"))
+        .collect();
+    assert_eq!(
+        continuation_requests.len(),
+        2,
+        "both the live and retained continuations must reach upstream"
+    );
+    for request in continuation_requests {
+        let body = String::from_utf8_lossy(&request.body);
+        assert!(
+            body.contains("first turn"),
+            "a continuation must include the original user turn; upstream body: {body}"
+        );
+        assert!(
+            body.contains("Hello from the test!"),
+            "a continuation must include the prior assistant answer; upstream body: {body}"
+        );
+    }
 }
 
 #[dwctl_test_macros::test]

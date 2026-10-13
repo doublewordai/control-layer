@@ -11,6 +11,16 @@ use std::fmt;
 use async_trait::async_trait;
 use serde_json::Value;
 
+/// The parts of a stored turn needed to continue a Responses conversation.
+#[derive(Debug, Clone)]
+pub struct ResponseContext {
+    /// The input sent for the stored turn. For an already-continued response,
+    /// this includes the complete input/output history hydrated into that turn.
+    pub input: Value,
+    /// The response object produced for the stored turn.
+    pub response: Value,
+}
+
 /// Error type for response store operations.
 #[derive(Debug, Clone)]
 pub enum StoreError {
@@ -44,7 +54,7 @@ pub trait ResponseStore: Send + Sync {
     /// `owner` is the caller's user id; a response created by anyone else must
     /// resolve to `None` so one tenant's turn can never be spliced into
     /// another's prompt.
-    async fn get_context(&self, response_id: &str, owner: &str) -> Result<Option<Value>, StoreError>;
+    async fn get_context(&self, response_id: &str, owner: &str) -> Result<Option<ResponseContext>, StoreError>;
 }
 
 /// No-op store: returns a generated id and never resolves context. Used where a
@@ -57,7 +67,7 @@ impl ResponseStore for NoOpResponseStore {
     async fn store(&self, _response: &Value) -> Result<String, StoreError> {
         Ok("noop".to_string())
     }
-    async fn get_context(&self, _response_id: &str, _owner: &str) -> Result<Option<Value>, StoreError> {
+    async fn get_context(&self, _response_id: &str, _owner: &str) -> Result<Option<ResponseContext>, StoreError> {
         Ok(None)
     }
 }
