@@ -2385,7 +2385,33 @@ pub async fn target_message_handler<T: HttpClient>(
     if let Err(error) = &result {
         rejection.record_error(error);
     }
+    // Every authenticated request, whatever its outcome, names its caller on
+    // this span and on the response, so an embedding gateway can attribute
+    // provider errors and successes the same way as refusals.
+    rejection.record_identity();
+    let identity = rejection.identity();
+    // The status the caller receives, on this span. Upstream responses record
+    // theirs from inside a provider-attempt span, so it is set here too.
+    let final_status = match &result {
+        Ok(response) => response.status().as_u16(),
+        Err(error) => error.status.as_u16(),
+    };
+    record_response_status(final_status);
     result
+        .map(|mut response| {
+            if let Some(identity) = identity.clone() {
+                response.extensions_mut().insert(identity);
+            }
+            // An error status on a response (rather than an `Err`) reports
+            // what an upstream answered, even when its body was sanitized.
+            if response.status().as_u16() >= 400
+                && response.extensions().get::<crate::ErrorOrigin>().is_none()
+            {
+                response.extensions_mut().insert(crate::ErrorOrigin::Provider);
+            }
+            response
+        })
+        .map_err(|error| error.with_identity(identity))
     }
     .instrument(span)
     .await

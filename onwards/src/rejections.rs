@@ -17,6 +17,11 @@
 //! covers every client error the gateway decides on.
 //!
 //! Request values and bodies are never recorded.
+//!
+//! The caller's identity ([`RequestIdentity`]) is also recorded on onwards'
+//! request span for every authenticated request, not only refusals, and
+//! attached to the response as an extension so an embedding gateway can copy
+//! it onto its own root span.
 
 use axum::http::{HeaderMap, StatusCode};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -24,12 +29,31 @@ use uuid::Uuid;
 
 use crate::{AppState, client::HttpClient, errors::OnwardsErrorResponse, serving, target::Targets};
 
+/// Who made a request, from the key labels synced by the embedding gateway.
+///
+/// Attached to every response whose bearer token matched a known key (success,
+/// gateway refusal or upstream error alike) as a response extension. It never
+/// leaves the process. Absent when the request carried no known key.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestIdentity {
+    /// Owning account (`account` key label).
+    pub account_id: Option<String>,
+    /// Display name of the owning account (`account_display_name` key label,
+    /// falling back to `account_name`).
+    pub account_name: Option<String>,
+    /// The API key used.
+    pub api_key_id: Option<Uuid>,
+    /// The key's purpose (`purpose` key label).
+    pub key_purpose: Option<String>,
+    /// The configured model alias, once the request resolved to one.
+    pub model: Option<String>,
+}
+
 /// What is known about a request when the gateway refuses it.
 #[derive(Debug, Clone)]
 pub struct RejectionContext {
-    model: Option<String>,
-    account: Option<String>,
-    api_key_id: Option<Uuid>,
+    identity: RequestIdentity,
+    authenticated: bool,
     traffic: &'static str,
 }
 
@@ -59,22 +83,24 @@ impl RejectionContext {
     /// request's API key under its own protocol's rules.
     pub fn for_api_key(targets: &Targets, api_key: Option<&str>, dispatched: bool) -> Self {
         let labels = api_key.and_then(|key| targets.key_labels.get(key));
+        let label = |name: &str| labels.as_ref().and_then(|labels| labels.get(name).cloned());
         Self {
-            model: None,
-            account: labels
-                .as_ref()
-                .and_then(|labels| labels.get(serving::ACCOUNT_LABEL).cloned()),
-            api_key_id: labels
-                .as_ref()
-                .and_then(|labels| labels.get("api_key_id"))
-                .and_then(|id| id.parse().ok()),
+            authenticated: labels.is_some(),
+            identity: RequestIdentity {
+                model: None,
+                account_id: label(serving::ACCOUNT_LABEL),
+                account_name: label(serving::ACCOUNT_DISPLAY_NAME_LABEL)
+                    .or_else(|| label(serving::ACCOUNT_NAME_LABEL)),
+                api_key_id: label("api_key_id").and_then(|id| id.parse().ok()),
+                key_purpose: label("purpose"),
+            },
             traffic: if dispatched { "dispatched" } else { "realtime" },
         }
     }
 
     /// Records `model`, which must name a configured alias.
     pub(crate) fn set_model(&mut self, model: &str) {
-        self.model = Some(model.to_string());
+        self.identity.model = Some(model.to_string());
     }
 
     /// Records the alias `model` selects, with any serving-class suffix
@@ -102,7 +128,7 @@ impl RejectionContext {
 
     /// Records a refusal with this status, error code and parameter.
     pub fn record(&self, status: StatusCode, code: &str, param: Option<&str>) {
-        let model = self.model.as_deref().unwrap_or("");
+        let model = self.identity.model.as_deref().unwrap_or("");
         metrics::counter!(
             "onwards_rejections_total",
             "model" => model.to_string(),
@@ -120,11 +146,33 @@ impl RejectionContext {
         if let Some(param) = param {
             span.set_attribute("onwards.rejection.param", param.to_string());
         }
-        if let Some(account) = &self.account {
+        self.record_identity();
+    }
+
+    /// The identity to attach to the response, if the request's key is known.
+    pub(crate) fn identity(&self) -> Option<RequestIdentity> {
+        self.authenticated.then(|| self.identity.clone())
+    }
+
+    /// Records the caller's identity on the current span. A no-op for
+    /// requests without a known key.
+    pub(crate) fn record_identity(&self) {
+        if !self.authenticated {
+            return;
+        }
+        let span = tracing::Span::current();
+        let identity = &self.identity;
+        if let Some(account) = &identity.account_id {
             span.set_attribute("onwards.account", account.clone());
         }
-        if let Some(api_key_id) = self.api_key_id {
+        if let Some(name) = &identity.account_name {
+            span.set_attribute("onwards.account_name", name.clone());
+        }
+        if let Some(api_key_id) = identity.api_key_id {
             span.set_attribute("onwards.api_key_id", api_key_id.to_string());
+        }
+        if let Some(purpose) = &identity.key_purpose {
+            span.set_attribute("onwards.key_purpose", purpose.clone());
         }
     }
 }

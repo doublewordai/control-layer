@@ -69,9 +69,11 @@ pub mod telemetry;
 pub mod unsupported_params;
 
 use client::{HttpClient, HyperClient};
+pub use errors::ErrorOrigin;
 pub use handlers::{AuthenticatedApiKeyId, HeaderExtractor, ServedBy};
 use handlers::{models as models_handler, target_message_handler};
 use models::ExtractedModel;
+pub use rejections::RequestIdentity;
 pub use serving::{
     AccountServing, ProviderKind, RequestedServingClass, ServingClass, ServingClassOutcome,
     ServingOverlay, ServingPresets, ServingTargets,

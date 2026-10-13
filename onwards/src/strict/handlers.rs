@@ -1656,6 +1656,12 @@ fn parse_provider_status_code(code: &serde_json::Value) -> Option<u16> {
 /// The actual error is logged for debugging but never sent to the client.
 async fn sanitize_error_response(mut response: Response) -> Response {
     let status = response.status();
+    // The sanitized replacement is a new response; carry over who made the
+    // request so the embedding gateway can still attribute the error.
+    let identity = response
+        .extensions()
+        .get::<crate::RequestIdentity>()
+        .cloned();
 
     // Drain the body (bounded, so a misbehaving provider cannot make us buffer
     // an arbitrarily large response) to record its length, but do NOT log its
@@ -1666,7 +1672,7 @@ async fn sanitize_error_response(mut response: Response) -> Response {
             Ok(bytes) => bytes,
             Err(e) => {
                 error!(error = %e, "Failed to read error response body");
-                return standard_error_response(status);
+                return with_error_attribution(standard_error_response(status), identity);
             }
         };
 
@@ -1677,7 +1683,21 @@ async fn sanitize_error_response(mut response: Response) -> Response {
     );
 
     // Return standard error based on status code
-    standard_error_response(status)
+    with_error_attribution(standard_error_response(status), identity)
+}
+
+/// Marks a sanitized upstream error as the provider's and restores the caller's identity.
+fn with_error_attribution(
+    mut response: Response,
+    identity: Option<crate::RequestIdentity>,
+) -> Response {
+    if let Some(identity) = identity {
+        response.extensions_mut().insert(identity);
+    }
+    response
+        .extensions_mut()
+        .insert(crate::ErrorOrigin::Provider);
+    response
 }
 
 /// Give a trusted provider's error the OpenAI envelope, keeping its status,
