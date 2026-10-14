@@ -129,28 +129,45 @@ export function EditOrganizationModal({
 
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
-      <DialogContent className="sm:max-w-[425px]">
-        <DialogHeader>
+      {/* Header and footer stay put; only the form body scrolls, so the dialog
+          never grows past the viewport however many settings it shows. */}
+      <DialogContent className="sm:max-w-2xl max-h-[90vh] flex flex-col gap-0 p-0 overflow-hidden">
+        <DialogHeader className="px-6 pt-6 pb-4 border-b">
           <DialogTitle>Edit Organization</DialogTitle>
           <DialogDescription>
             Update organization details for {organization?.username}.
           </DialogDescription>
         </DialogHeader>
-        <form onSubmit={handleSubmit}>
-          <div className="grid gap-4 py-4">
-            <div className="grid gap-2">
-              <Label htmlFor="edit-email">Email</Label>
-              <Input
-                id="edit-email"
-                type="email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-              />
-              <p className="text-xs text-muted-foreground">
-                Changing the email sends a verification link to both the
-                current and the new address. The change only takes effect once
-                both are confirmed.
-              </p>
+        <form
+          id="edit-organization-form"
+          onSubmit={handleSubmit}
+          className="flex-1 min-h-0 overflow-y-auto px-6 py-4"
+          data-testid="edit-organization-form-body"
+        >
+          <div className="grid gap-4">
+            <div className="grid gap-4 sm:grid-cols-2 sm:items-start">
+              <div className="grid gap-2">
+                <Label htmlFor="edit-email">Email</Label>
+                <Input
+                  id="edit-email"
+                  type="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Changing the email sends a verification link to both the
+                  current and the new address. The change only takes effect once
+                  both are confirmed.
+                </p>
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="edit-displayName">Display Name</Label>
+                <Input
+                  id="edit-displayName"
+                  value={displayName}
+                  onChange={(e) => setDisplayName(e.target.value)}
+                />
+              </div>
             </div>
             {organization?.pending_email_change && (
               <AlertBox variant="warning">
@@ -168,14 +185,6 @@ export function EditOrganizationModal({
                 ). Saving a different email restarts the verification.
               </AlertBox>
             )}
-            <div className="grid gap-2">
-              <Label htmlFor="edit-displayName">Display Name</Label>
-              <Input
-                id="edit-displayName"
-                value={displayName}
-                onChange={(e) => setDisplayName(e.target.value)}
-              />
-            </div>
             {canEditZdr && (
               <div className="flex items-center justify-between gap-4">
                 <div className="grid gap-1">
@@ -194,50 +203,52 @@ export function EditOrganizationModal({
             )}
             {canEditServing && (
               <div className="grid gap-4 border-t pt-4">
-                <div className="grid gap-1">
-                  <Label>Serving classes held</Label>
-                  <p className="text-sm text-muted-foreground">
-                    A request may name one of these classes; the model must
-                    offer it too. Customers never edit this.
-                  </p>
-                  <div className="flex gap-4 pt-1">
-                    {(["interactive", "throughput"] as const).map((c) => (
-                      <label
-                        key={c}
-                        className="flex items-center gap-2 text-sm"
-                      >
-                        <Checkbox
-                          checked={grantedClasses.includes(c)}
-                          onCheckedChange={(checked) =>
-                            setGrantedClasses((prev) =>
-                              checked === true
-                                ? Array.from(new Set([...prev, c]))
-                                : prev.filter((x) => x !== c),
-                            )
-                          }
-                          aria-label={`Grant ${c}`}
-                        />
-                        {c}
-                      </label>
-                    ))}
+                <div className="grid gap-4 sm:grid-cols-2 sm:items-start">
+                  <div className="grid gap-1">
+                    <Label>Serving classes held</Label>
+                    <p className="text-sm text-muted-foreground">
+                      A request may name one of these classes; the model must
+                      offer it too. Customers never edit this.
+                    </p>
+                    <div className="flex gap-4 pt-1">
+                      {(["interactive", "throughput"] as const).map((c) => (
+                        <label
+                          key={c}
+                          className="flex items-center gap-2 text-sm"
+                        >
+                          <Checkbox
+                            checked={grantedClasses.includes(c)}
+                            onCheckedChange={(checked) =>
+                              setGrantedClasses((prev) =>
+                                checked === true
+                                  ? Array.from(new Set([...prev, c]))
+                                  : prev.filter((x) => x !== c),
+                              )
+                            }
+                            aria-label={`Grant ${c}`}
+                          />
+                          {c}
+                        </label>
+                      ))}
+                    </div>
                   </div>
-                </div>
-                <div className="grid gap-1">
-                  <Label htmlFor="edit-default-class">Default class</Label>
-                  <p className="text-sm text-muted-foreground">
-                    What requests ask for when they name no class. Applies only
-                    where the class is held and the model offers it.
-                  </p>
-                  <select
-                    id="edit-default-class"
-                    className="h-9 rounded-md border border-input bg-transparent px-3 text-sm"
-                    value={defaultClass}
-                    onChange={(e) => setDefaultClass(e.target.value as ServingClassName | "standard")}
-                  >
-                    <option value="standard">standard</option>
-                    <option value="interactive">interactive</option>
-                    <option value="throughput">throughput</option>
-                  </select>
+                  <div className="grid gap-1">
+                    <Label htmlFor="edit-default-class">Default class</Label>
+                    <p className="text-sm text-muted-foreground">
+                      What requests ask for when they name no class. Applies only
+                      where the class is held and the model offers it.
+                    </p>
+                    <select
+                      id="edit-default-class"
+                      className="h-9 rounded-md border border-input bg-transparent px-3 text-sm"
+                      value={defaultClass}
+                      onChange={(e) => setDefaultClass(e.target.value as ServingClassName | "standard")}
+                    >
+                      <option value="standard">standard</option>
+                      <option value="interactive">interactive</option>
+                      <option value="throughput">throughput</option>
+                    </select>
+                  </div>
                 </div>
                 <div className="flex items-center justify-between gap-4">
                   <div className="grid gap-1">
@@ -267,15 +278,19 @@ export function EditOrganizationModal({
               </div>
             )}
           </div>
-          <DialogFooter>
-            <Button type="button" variant="outline" onClick={onClose}>
-              Cancel
-            </Button>
-            <Button type="submit" disabled={updateOrg.isPending}>
-              {updateOrg.isPending ? "Saving..." : "Save"}
-            </Button>
-          </DialogFooter>
         </form>
+        <DialogFooter className="px-6 py-4 border-t">
+          <Button type="button" variant="outline" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            type="submit"
+            form="edit-organization-form"
+            disabled={updateOrg.isPending}
+          >
+            {updateOrg.isPending ? "Saving..." : "Save"}
+          </Button>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
   );
