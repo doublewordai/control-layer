@@ -251,7 +251,7 @@ This is the only exception to strict mode's error standardization guarantees: wh
 }
 ```
 
-Here, the internal provider's error responses pass through unchanged. The external provider omits `trusted`, so it inherits the pool default (`false`) and has its error responses sanitized. This lets you mix trusted internal infrastructure with untrusted external providers inside a single pool.
+Here, the internal provider's error responses pass through unchanged, apart from the envelope (see below). The external provider omits `trusted`, so it inherits the pool default (`false`) and has its error responses sanitized. This lets you mix trusted internal infrastructure with untrusted external providers inside a single pool.
 
 ### Behavior
 
@@ -268,6 +268,7 @@ When a pool is marked as `trusted: true`:
 - Original error messages and metadata forwarded to clients
 - Provider-specific error details preserved (stack traces, debug info)
 - Custom error fields passed through unchanged
+- An error without OpenAI's `{"error": {...}}` envelope gets one: its top-level `message` (or a string `error`) becomes `error.message`, and `error.type` follows the status as for sanitized errors. Dynamo's `{"message": ..., "type": "Bad Request", "code": 400}` is the common case; its context-length refusals get the code `context_length_exceeded`
 
 This allows you to get detailed debugging information from errors while maintaining response consistency for successful requests.
 
