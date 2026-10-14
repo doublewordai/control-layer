@@ -878,6 +878,38 @@ pub struct StripeConfig {
     /// Stripe tax code for auto top-up tax calculations (e.g. "txcd_10000000").
     /// If not set, falls back to the account-level default tax code in Stripe Tax settings.
     pub tax_code: Option<String>,
+    /// Base URL of the Stripe API (e.g. "http://localhost:12111"). Unset in
+    /// production, which talks to `https://api.stripe.com/`; set it to point the
+    /// client at a Stripe-compatible mock server or an egress proxy. Must be an
+    /// http(s) URL without a query or fragment; a path prefix is allowed, with
+    /// or without a trailing slash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_base_url: Option<String>,
+}
+
+impl StripeConfig {
+    /// The configured Stripe API base, normalised to end in `/`.
+    ///
+    /// async-stripe appends `v1/...` to the base verbatim, so a path prefix
+    /// without its trailing slash (`https://proxy.example.test/stripe`) would
+    /// otherwise send requests to `.../stripev1/...`.
+    pub fn api_base(&self) -> Result<Option<String>, String> {
+        let Some(raw) = &self.api_base_url else {
+            return Ok(None);
+        };
+        let mut url = Url::parse(raw).map_err(|e| format!("payment.stripe.api_base_url {raw:?} is not a valid URL: {e}"))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(format!("payment.stripe.api_base_url {raw:?} must be an http or https URL"));
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(format!("payment.stripe.api_base_url {raw:?} must not have a query or fragment"));
+        }
+        if !url.path().ends_with('/') {
+            let path = format!("{}/", url.path());
+            url.set_path(&path);
+        }
+        Ok(Some(url.into()))
+    }
 }
 
 /// Dummy payment configuration for testing.
@@ -3751,6 +3783,15 @@ impl Config {
                 operation: format!("Config validation: onwards.rejected_params names an unknown parameter: {name}"),
             });
         }
+        // The payment provider is rebuilt from config on every request, so a
+        // bad base URL must fail here rather than panic in each handler.
+        if let Some(PaymentConfig::Stripe(stripe)) = &self.payment
+            && let Err(error) = stripe.api_base()
+        {
+            return Err(Error::Internal {
+                operation: format!("Config validation: {error}"),
+            });
+        }
         if let Err(error) = self.scheduling.validate() {
             return Err(Error::Internal {
                 operation: format!("Config validation: {error}"),
@@ -4366,6 +4407,72 @@ mod tests {
             .insert("unknown".to_string(), 60);
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("unsupported service tier"));
+    }
+
+    fn stripe_config_with_base(api_base_url: Option<&str>) -> StripeConfig {
+        StripeConfig {
+            api_key: "sk_test_fake".to_string(),
+            webhook_secret: "whsec_test".to_string(),
+            price_id: "price_ExampleCredits".to_string(),
+            enable_invoice_creation: false,
+            auto_topup_terms_of_service_text: None,
+            setup_terms_of_service_text: None,
+            tax_code: None,
+            api_base_url: api_base_url.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn stripe_api_base_is_normalised_to_a_trailing_slash() {
+        for (configured, expected) in [
+            (None, None),
+            (Some("http://localhost:12111"), Some("http://localhost:12111/")),
+            (Some("http://localhost:12111/"), Some("http://localhost:12111/")),
+            (
+                Some("https://egress.example.test/stripe"),
+                Some("https://egress.example.test/stripe/"),
+            ),
+            (
+                Some("https://egress.example.test/stripe/"),
+                Some("https://egress.example.test/stripe/"),
+            ),
+        ] {
+            assert_eq!(
+                stripe_config_with_base(configured).api_base().unwrap().as_deref(),
+                expected,
+                "{configured:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stripe_api_base_rejects_unusable_urls() {
+        for configured in [
+            "localhost:12111",
+            "not a url",
+            "ftp://files.example.test/",
+            "https://egress.example.test/stripe?region=a",
+            "https://egress.example.test/stripe#frag",
+        ] {
+            assert!(
+                stripe_config_with_base(Some(configured)).api_base().is_err(),
+                "{configured:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn config_validation_rejects_a_bad_stripe_api_base() {
+        let mut config = Config::default();
+        config.secret_key = Some("test-secret-key".to_string());
+        config.payment = Some(PaymentConfig::Stripe(stripe_config_with_base(Some(
+            "https://egress.example.test/stripe",
+        ))));
+        config.validate().unwrap();
+
+        config.payment = Some(PaymentConfig::Stripe(stripe_config_with_base(Some("not a url"))));
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("api_base_url"), "got {error}");
     }
 
     #[test]

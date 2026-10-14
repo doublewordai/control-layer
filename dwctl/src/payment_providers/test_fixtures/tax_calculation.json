@@ -1,0 +1,30 @@
+{
+  "id": "taxcalc_ExampleTaxCalculation",
+  "object": "tax.calculation",
+  "amount_total": 6000,
+  "currency": "usd",
+  "customer": "cus_ExampleCustomer",
+  "customer_details": {
+    "address": {
+      "city": null,
+      "country": "GB",
+      "line1": null,
+      "line2": null,
+      "postal_code": "EC1 1AA",
+      "state": null
+    },
+    "address_source": "billing",
+    "ip_address": null,
+    "tax_ids": [],
+    "taxability_override": "none"
+  },
+  "expires_at": 1780433266,
+  "line_items": null,
+  "livemode": false,
+  "ship_from_details": null,
+  "shipping_cost": null,
+  "tax_amount_exclusive": 1000,
+  "tax_amount_inclusive": 0,
+  "tax_breakdown": [],
+  "tax_date": 1780346867
+}

@@ -1,0 +1,17 @@
+{
+  "id": "ii_ExampleInvoiceItem",
+  "object": "invoiceitem",
+  "amount": 5000,
+  "currency": "usd",
+  "customer": "cus_ExampleCustomer",
+  "date": 1780346900,
+  "description": "Auto top-up accrual",
+  "discountable": true,
+  "invoice": null,
+  "livemode": false,
+  "metadata": {},
+  "period": { "end": 1780346900, "start": 1780346900 },
+  "proration": false,
+  "quantity": 1,
+  "quantity_decimal": "1"
+}
