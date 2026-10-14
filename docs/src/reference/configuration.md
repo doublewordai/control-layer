@@ -732,21 +732,22 @@ seconds, the priority is `-T`, and the earliest `T` is served first:
 | Traffic | `T` | Enabled by |
 |---------|-----|------------|
 | Batch and flex (dispatched by the batch daemon) | The batch deadline | `background_services.batch_daemon.inject_deadline_priority` |
-| Realtime | Arrival time | `scheduling.inject_realtime_priority` |
-| Realtime with a per-model deal or class priority | Arrival time minus that `priority`, in seconds | `scheduling.inject_realtime_priority` |
+| Realtime | Arrival time | `background_services.batch_daemon.inject_deadline_priority` |
+| Realtime with a per-model deal or class priority | Arrival time minus that `priority`, in seconds | `background_services.batch_daemon.inject_deadline_priority` |
 
 Background-tier work has no deadline. The batch daemon sends it with the
 reserved priority `i32::MIN`, below every deadline priority, so it is never
 deadline-ordered and runs only when nothing else is waiting.
 
-```yaml
-scheduling:
-  inject_realtime_priority: true   # default: false
-```
+One switch, `inject_deadline_priority`, turns on both halves. Realtime at `-T`
+is only meaningful next to batch at `-(deadline)`. Batch sent without a priority
+gets `0`, which would queue every realtime request behind all batch work.
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `inject_realtime_priority` | bool | `false` | Send realtime requests to `dynamo` endpoints with priority `-T` instead of `0`. Environment: `DWCTL_SCHEDULING__INJECT_REALTIME_PRIORITY`. |
+```yaml
+background_services:
+  batch_daemon:
+    inject_deadline_priority: true   # default: false
+```
 
 How the priority is chosen:
 
@@ -773,8 +774,8 @@ How the priority is chosen:
   `i32::MIN` for background work. After 2038 every realtime `T` maps to
   `i32::MIN + 1`, so the field must be widened before then.
 
-With `inject_realtime_priority: false`, realtime requests to `dynamo` carry
-priority `0`, which ranks them above every batch deadline.
+With `inject_deadline_priority: false`, realtime requests to `dynamo` carry
+priority `0`.
 
 ## Observability
 

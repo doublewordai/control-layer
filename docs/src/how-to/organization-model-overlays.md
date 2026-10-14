@@ -156,7 +156,7 @@ at, not only as a carrier for the priority. Requests resolve as the `custom`
 class, so `class_pricing.custom` prices apply if you declare them.
 
 When the installation sends deadline-ordered realtime priority
-(`scheduling.inject_realtime_priority`; see
+(`background_services.batch_daemon.inject_deadline_priority`; see
 [Scheduling Priority](../reference/configuration.md#scheduling-priority)), the
 `priority` is a head start in seconds. The organisation's realtime requests on
 `example-model` get effective time `T = arrival - 900`. Compared with a realtime

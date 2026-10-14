@@ -557,7 +557,7 @@ pub async fn target_message_handler<T: HttpClient>(
     // Unknown class suffixes are a 400.
     let suffix_class = req.extensions().get::<RequestedServingClass>().map(|c| c.0);
     // Deadline-ordered realtime priority: present only when the caller opted
-    // this request in (dwctl, behind `scheduling.inject_realtime_priority`).
+    // this request in (dwctl, when deadline-ordered priority is on).
     let realtime_arrival = req.extensions().get::<RealtimeArrival>().copied();
     // DWCTL has already split the body selector once. Do not reinterpret its
     // base alias (e.g. turn nonexistent `model:interactive` into `model`). A

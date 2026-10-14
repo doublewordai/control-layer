@@ -85,9 +85,11 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     /// used when applying the client's usage choice to a realtime stream.
     pub sse_buffer_limit: usize,
     /// Mark realtime requests with their arrival time so onwards sends them to
-    /// dynamo endpoints in deadline order (`scheduling.inject_realtime_priority`).
-    /// See [`realtime_arrival`].
-    pub inject_realtime_priority: bool,
+    /// dynamo endpoints in the same deadline order as batch work. Follows
+    /// `background_services.batch_daemon.inject_deadline_priority`: realtime
+    /// at `-T` is only safe next to batch at `-(deadline)`. See
+    /// [`realtime_arrival`].
+    pub deadline_priority: bool,
 }
 
 /// Middleware that routes inference requests based on service_tier and background.
@@ -123,7 +125,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // The request's arrival time: its effective time `T` for deadline-ordered
     // priority (see `realtime_arrival`). Taken before any body or database
     // work so that work does not count against the request.
-    let arrival = realtime_arrival(state.inject_realtime_priority, Utc::now());
+    let arrival = realtime_arrival(state.deadline_priority, Utc::now());
 
     // Read and parse the request body
     let (parts, body) = req.into_parts();
@@ -1342,7 +1344,7 @@ async fn handle_responses_flex_streaming<P: PoolProvider + Clone + Send + Sync +
 }
 
 /// The realtime-arrival marker for a request arriving at `now`, or `None`
-/// when deadline-ordered realtime priority is off.
+/// when deadline-ordered priority is off.
 ///
 /// Only realtime traffic reaches onwards with it: flex and background rows are
 /// dispatched later by the fusillade daemon, which re-enters with
@@ -1438,7 +1440,8 @@ fn scrub_request_id_fields(value: &mut serde_json::Value) -> bool {
 /// return, and continuation resume legs enter the stack below it. Everything
 /// parsed here is external traffic, which onwards sends to a dynamo member at
 /// realtime's priority: 0, or `-T` from the request's arrival time when
-/// `scheduling.inject_realtime_priority` is on (see [`realtime_arrival`]).
+/// `background_services.batch_daemon.inject_deadline_priority` is on (see
+/// [`realtime_arrival`]).
 ///
 /// NOTE: the `x-fusillade-request-id` early return is only safe because the
 /// sso-stack ingress strips all `x-fusillade-*` headers from external requests

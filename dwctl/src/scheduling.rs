@@ -289,7 +289,6 @@ mod tests {
                     }],
                 },
             ],
-            inject_realtime_priority: false,
         };
         let presets = TolerationPresets::new(&config);
         // Default: nothing pinned.
@@ -328,7 +327,6 @@ mod tests {
     fn preset_config_validation_rejects_duplicates_and_bad_shape() {
         let duplicate = SchedulingConfig {
             toleration_presets: vec![SchedulingConfig::default_preset(), SchedulingConfig::default_preset()],
-            inject_realtime_priority: false,
         };
         assert!(duplicate.validate().unwrap_err().contains("duplicate id"));
 
@@ -339,7 +337,6 @@ mod tests {
                 description: "y".to_string(),
                 tolerations: vec![],
             }],
-            inject_realtime_priority: false,
         };
         assert!(empty_id.validate().unwrap_err().contains("empty id"));
 
@@ -352,7 +349,6 @@ mod tests {
                 description: "y".to_string(),
                 tolerations: vec![],
             }],
-            inject_realtime_priority: false,
         };
         assert!(sentinel.validate().unwrap_err().contains("reserved"));
 
@@ -370,7 +366,6 @@ mod tests {
                     effect: None,
                 }],
             }],
-            inject_realtime_priority: false,
         };
         assert!(bad_shape.validate().unwrap_err().contains("is invalid"));
 

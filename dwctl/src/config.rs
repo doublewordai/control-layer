@@ -267,25 +267,6 @@ pub struct Config {
 pub struct SchedulingConfig {
     /// The presets an account may be pinned to, in display order.
     pub toleration_presets: Vec<TolerationPreset>,
-    /// Deadline-ordered priority for realtime traffic. When true, every
-    /// realtime request sent to a `dynamo`-kind endpoint carries
-    /// `nvext.agent_hints.priority = -T` (NVIDIA Dynamo's priority carrier;
-    /// `i32`, higher = more important), where `T` is the request's effective
-    /// time in Unix seconds: its arrival time, moved earlier by the `priority`
-    /// of the targets the request resolved to, read as seconds. Those are an
-    /// organisation's per-model deal (explicit overlay `targets` in the
-    /// organisation catalog) or a serving-class preset. This puts
-    /// realtime in the same earliest-deadline-first order as batch work, whose
-    /// `T` is the batch deadline (`background_services.batch_daemon.
-    /// inject_deadline_priority`). Requests dispatched by the batch daemon keep
-    /// their own priority, and other endpoint kinds never receive one. A
-    /// resumed stream keeps the priority of the request it continues.
-    ///
-    /// When false (the default), realtime requests to dynamo carry priority 0,
-    /// exactly as before.
-    ///
-    /// Set via environment: `DWCTL_SCHEDULING__INJECT_REALTIME_PRIORITY=true`
-    pub inject_realtime_priority: bool,
 }
 
 /// One operator-defined scheduling-toleration preset.
@@ -379,7 +360,6 @@ impl Default for SchedulingConfig {
     fn default() -> Self {
         Self {
             toleration_presets: vec![Self::default_preset()],
-            inject_realtime_priority: false,
         }
     }
 }
@@ -2394,7 +2374,16 @@ pub struct DaemonConfig {
     /// Dynamo's unified priority extension; `i32`, where higher values mean
     /// "more important" at the API layer and Dynamo normalizes per backend).
     /// The injected value is the negated Unix timestamp of the batch SLA
-    /// deadline so earlier deadlines produce larger numbers. Default: false.
+    /// deadline so earlier deadlines produce larger numbers.
+    ///
+    /// The same flag puts realtime traffic into that deadline order: when it
+    /// is on, every realtime request sent to a `dynamo`-kind endpoint carries
+    /// `-T`, where `T` is its arrival time moved earlier by the `priority` of
+    /// the targets it resolved to (an organisation's per-model deal or a
+    /// serving-class preset), read as seconds of head start. One switch keeps
+    /// the two halves consistent: realtime at `-T` next to batch at the
+    /// default 0 would queue every realtime request behind all batch work.
+    /// Default: false (realtime to dynamo carries priority 0).
     #[serde(default)]
     pub inject_deadline_priority: bool,
 

@@ -25,12 +25,13 @@ impl Fixture {
         Self::build(pool, false).await
     }
 
-    /// The same fixture with `scheduling.inject_realtime_priority` on.
+    /// The same fixture with deadline-ordered priority
+    /// (`background_services.batch_daemon.inject_deadline_priority`) on.
     async fn with_realtime_priority(pool: &PgPool) -> Self {
         Self::build(pool, true).await
     }
 
-    async fn build(pool: &PgPool, inject_realtime_priority: bool) -> Self {
+    async fn build(pool: &PgPool, deadline_priority: bool) -> Self {
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(|request: &Request| {
@@ -58,7 +59,7 @@ impl Fixture {
         let mut config = create_test_config();
         config.onwards.strict_mode = true;
         config.background_services.onwards_sync.enabled = true;
-        config.scheduling.inject_realtime_priority = inject_realtime_priority;
+        config.background_services.batch_daemon.inject_deadline_priority = deadline_priority;
         let app = Application::new_with_pool(config, Some(pool.clone()), None).await.unwrap();
         let (server, services) = app.into_test_server();
         let user = create_test_user_with_roles(pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;

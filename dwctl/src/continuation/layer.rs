@@ -153,7 +153,7 @@ pub struct RequestContext {
     pub origin: &'static str,
     /// The deadline priority onwards dispatched the original request with
     /// (its [`onwards::DeadlinePriority`] response extension), present when
-    /// `scheduling.inject_realtime_priority` gave the request one. A resume
+    /// deadline-ordered priority gave the request one. A resume
     /// leg reuses it, so a resumed stream keeps the request's original `T`
     /// instead of taking a new one (or jumping ahead of everything).
     pub deadline_priority: Option<i32>,

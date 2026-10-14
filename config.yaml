@@ -391,18 +391,6 @@ scheduling:
         overflow capacity; requests may be refused when dedicated capacity is
         full.
       tolerations: []
-  # Deadline-ordered priority for realtime traffic. When true, each realtime
-  # request sent to a `dynamo`-kind endpoint carries
-  # `nvext.agent_hints.priority = -T`, where T is its effective time in Unix
-  # seconds (earliest T is served first): the arrival time, moved earlier by
-  # the `priority` of an organisation's per-model deal (overlay `targets` in
-  # the organisation catalog) or of a serving-class preset, read as seconds of
-  # head start. Batch work
-  # already sends -(batch deadline) when
-  # background_services.batch_daemon.inject_deadline_priority is on, so both
-  # share one queue order. Other endpoint kinds never receive the field.
-  # Default false: realtime to dynamo carries priority 0, as before.
-  # inject_realtime_priority: false
 # Note: Environment variables can override top level setting, as long as they're supplied with the DWCTL_ prefix:
 # DWCTL_PORT=8080
 #
@@ -989,7 +977,11 @@ background_services:
     # `nvext.agent_hints.priority` (NVIDIA Dynamo's unified priority extension;
     # i32, higher = more important; Dynamo normalizes per backend). The value
     # is the negated Unix timestamp of the batch SLA deadline so earlier
-    # deadlines produce larger numbers.
+    # deadlines produce larger numbers. When on, realtime requests to dynamo
+    # endpoints join the same order: they carry -T, with T their arrival time
+    # moved earlier by an organisation's per-model deal (overlay `targets`
+    # priority, in seconds) or a serving-class preset's priority. When off,
+    # realtime carries 0.
     # inject_deadline_priority: false
 
   # Batch completion notifications (emails + webhooks)

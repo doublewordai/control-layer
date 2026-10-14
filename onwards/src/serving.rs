@@ -50,7 +50,7 @@
 //!
 //! **Deadline-ordered priority.** When the caller marks a request with a
 //! [`RealtimeArrival`] extension (dwctl does, behind
-//! `scheduling.inject_realtime_priority`), realtime work joins the same
+//! `background_services.batch_daemon.inject_deadline_priority`), realtime work joins the same
 //! earliest-deadline-first order batch work already uses: the priority sent to
 //! a `dynamo` member is `-T`, where `T` is the request's effective time in
 //! Unix seconds. For realtime `T` is the arrival time, moved earlier by the
@@ -451,7 +451,7 @@ pub struct RequestedServingClass(pub ServingClass);
 /// and `-T` is sent to `dynamo` members as `nvext.agent_hints.priority`.
 ///
 /// Inserted by dwctl's inference middleware on realtime traffic when
-/// `scheduling.inject_realtime_priority` is on. Absent, a `dynamo` member
+/// `background_services.batch_daemon.inject_deadline_priority` is on. Absent, a `dynamo` member
 /// gets [`DEFAULT_PRIORITY`] exactly as before. Ignored on daemon legs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RealtimeArrival(pub i64);
