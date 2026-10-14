@@ -331,6 +331,10 @@ credits:
   # target, and idempotent across the webhook/front-channel race.
   # Example: 25 gives a newly verified user 25 credits.
   verification_credits: 0
+  # Delay after a transient provider failure or first soft card decline before
+  # another automatic charge is eligible. Keep the 24h production default;
+  # staging can shorten this to exercise the complete decline lifecycle.
+  auto_topup_retry_delay: 24h
 
 # Optional feature toggles
 enable_metrics: true # Enable Prometheus metrics endpoint
