@@ -9110,7 +9110,6 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         models: &[String],
         window_secs: f64,
     ) -> Result<(DateTime<Utc>, Vec<fusillade_core::release::ModelHoldInputs>)> {
-        let now: DateTime<Utc>;
         let mut inputs: Vec<fusillade_core::release::ModelHoldInputs> = Vec::new();
         if models.is_empty() {
             return Ok((Utc::now(), inputs));
@@ -9239,8 +9238,7 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
                 last.backlog.push((deadline, cumulative));
             }
         }
-        now = read_at.unwrap_or_else(Utc::now);
-        Ok((now, inputs))
+        Ok((read_at.unwrap_or_else(Utc::now), inputs))
     }
 
     async fn purge_orphaned_rows(&self, batch_size: i64) -> Result<u64> {
