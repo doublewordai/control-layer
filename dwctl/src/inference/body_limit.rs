@@ -9,6 +9,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
+use super::rejections;
+
 /// Install outside all inference middleware, including request logging and
 /// daemon dispatch bypasses. File uploads use a separate router and limit.
 /// A zero limit retains the configured unlimited behavior.
@@ -18,8 +20,8 @@ pub async fn limit_inference_body(State(max_bytes): State<usize>, request: Reque
     }
 
     let (parts, body) = request.into_parts();
-    match read_inference_body(&parts.headers, body, max_bytes).await {
-        Ok(bytes) => next.run(Request::from_parts(parts, Body::from(bytes))).await,
+    let refused = match read_inference_body(&parts.headers, body, max_bytes).await {
+        Ok(bytes) => return next.run(Request::from_parts(parts, Body::from(bytes))).await,
         Err(crate::errors::Error::PayloadTooLarge { message }) => oversized_body(message, parts.uri.path()),
         Err(_) => (
             StatusCode::BAD_REQUEST,
@@ -30,7 +32,14 @@ pub async fn limit_inference_body(State(max_bytes): State<usize>, request: Reque
             }})),
         )
             .into_response(),
-    }
+    };
+    let code = if refused.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        "request_too_large"
+    } else {
+        "body_read_failed"
+    };
+    rejections::record(&parts.extensions, &parts.headers, refused.status(), code, None, None);
+    refused
 }
 
 /// Shared with the authenticated playground proxy, whose model parser runs
@@ -93,6 +102,40 @@ mod tests {
         Router::new()
             .route("/chat/completions", post(|body: Bytes| async move { body }))
             .layer(middleware::from_fn_with_state(limit, limit_inference_body))
+            .layer(middleware::from_fn_with_state(
+                rejections::test_support::recorder("m"),
+                rejections::attach_recorder,
+            ))
+    }
+
+    #[test]
+    fn counts_refused_bodies() {
+        let (lines, _) = rejections::test_support::rejections(async {
+            app(4)
+                .oneshot(Request::post("/chat/completions").body(Body::from("12345")).unwrap())
+                .await
+                .unwrap();
+            let failing = Body::from_stream(futures::stream::once(async { Err::<Bytes, _>(std::io::Error::other("reset")) }));
+            app(4)
+                .oneshot(Request::post("/chat/completions").body(failing).unwrap())
+                .await
+                .unwrap();
+            app(4)
+                .oneshot(Request::post("/chat/completions").body(Body::from("1234")).unwrap())
+                .await
+                .unwrap();
+        });
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("status=\"413\"") && l.contains("code=\"request_too_large\""))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("status=\"400\"") && l.contains("code=\"body_read_failed\""))
+        );
     }
 
     #[tokio::test]

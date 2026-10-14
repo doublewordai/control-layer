@@ -17,6 +17,7 @@ use futures::StreamExt;
 use tracing::{debug, warn};
 
 use super::{ProtocolTranslator, TranslationError, TranslationRegistry};
+use crate::inference::rejections;
 
 /// Generic edge translation middleware. See module docs.
 pub async fn translation_middleware(State(registry): State<TranslationRegistry>, request: Request<Body>, next: Next) -> Response {
@@ -47,6 +48,14 @@ pub async fn translation_middleware(State(registry): State<TranslationRegistry>,
         Ok(b) => b,
         Err(e) => {
             warn!(error = %e, "edge translation: request body too large or unreadable");
+            rejections::record(
+                &parts.extensions,
+                &parts.headers,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request_too_large",
+                None,
+                None,
+            );
             return error_response(translator.as_ref(), StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
         }
     };
@@ -71,6 +80,14 @@ pub async fn translation_middleware(State(registry): State<TranslationRegistry>,
     let translated = match translator.translate_request(&parts, body_bytes) {
         Ok(t) => t,
         Err(TranslationError::BadRequest(msg)) => {
+            rejections::record(
+                &parts.extensions,
+                &parts.headers,
+                StatusCode::BAD_REQUEST,
+                rejections::body_error_code(&original_request),
+                None,
+                rejections::model_of(&original_request).as_deref(),
+            );
             return error_response(translator.as_ref(), StatusCode::BAD_REQUEST, &msg);
         }
         Err(TranslationError::Internal(msg)) => {
@@ -81,6 +98,7 @@ pub async fn translation_middleware(State(registry): State<TranslationRegistry>,
 
     // The route already matched; we swap the body/headers and normalise the path
     // so downstream code reads it as chat completions (not a re-route).
+    let rejection = rejections::Scope::of(&parts.extensions, &parts.headers);
     parts.uri = translated.uri;
     parts.headers = translated.headers;
     let downstream_req = Request::from_parts(parts, Body::from(translated.body));
@@ -90,7 +108,7 @@ pub async fn translation_middleware(State(registry): State<TranslationRegistry>,
     // billing/routing metadata. Streaming cells are cloned at head time and
     // filled by the inner body before outlet reads them at completion.
     let extensions = response.extensions().clone();
-    let mut translated = translate_response_back(translator.as_ref(), &original_request, response_id.as_deref(), response).await;
+    let mut translated = translate_response_back(translator.as_ref(), &original_request, response_id.as_deref(), rejection, response).await;
     translated.extensions_mut().extend(extensions);
     translated
 }
@@ -102,6 +120,7 @@ async fn translate_response_back(
     translator: &dyn ProtocolTranslator,
     request: &Bytes,
     response_id: Option<&str>,
+    rejection: Option<rejections::Scope>,
     response: Response,
 ) -> Response {
     let (parts, body) = response.into_parts();
@@ -136,6 +155,14 @@ async fn translate_response_back(
             Ok(new_body) => json_response(status, new_body),
             Err(e) => {
                 warn!(error = %e, translator = translator.name(), "edge translation: response translate failed");
+                if let Some(rejection) = rejection {
+                    rejection.record(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "response_translation_failed",
+                        None,
+                        rejections::model_of(request).as_deref(),
+                    );
+                }
                 // Deliberately NOT a 5xx: the upstream succeeded, and the same
                 // body will fail translation identically on every attempt, so
                 // this must map to a status fusillade classifies as
@@ -365,6 +392,63 @@ mod tests {
         assert_eq!(response.status_code().as_u16(), 422);
         let body: serde_json::Value = response.json();
         assert_eq!(body["type"], "error");
+    }
+
+    /// Requests the layer refuses itself are counted; a downstream client error
+    /// it only reshapes is not.
+    #[test]
+    fn counts_its_own_refusals_only() {
+        use crate::inference::rejections::{self, test_support};
+        use tower::ServiceExt;
+
+        async fn handler(req: Request) -> Response {
+            let body = axum::body::to_bytes(req.into_body(), usize::MAX).await.unwrap();
+            if body.windows(6).any(|w| w == b"broken") {
+                json_response(StatusCode::OK, Bytes::from_static(b"not a chat completion"))
+            } else {
+                json_response(StatusCode::BAD_REQUEST, Bytes::from_static(br#"{"error":{"message":"no"}}"#))
+            }
+        }
+        let app = || {
+            let registry = TranslationRegistry::new(vec![Arc::new(AnthropicMessages::new(true))]);
+            Router::new()
+                .route("/messages", post(handler))
+                .layer(axum::middleware::from_fn_with_state(registry, translation_middleware))
+                .layer(axum::middleware::from_fn_with_state(
+                    test_support::recorder("claude-x"),
+                    rejections::attach_recorder,
+                ))
+        };
+        let message = |role: &str, content: &str| {
+            serde_json::json!({
+                "model": "claude-x", "max_tokens": 50,
+                "messages": [ { "role": role, "content": content } ]
+            })
+            .to_string()
+        };
+        let (lines, statuses) = test_support::rejections(async move {
+            let mut statuses = Vec::new();
+            for body in [
+                "{not json".to_string(),
+                message("developer", "hi"),
+                message("user", "broken"),
+                message("user", "hi"),
+            ] {
+                let request = axum::http::Request::post("/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap();
+                statuses.push(app().oneshot(request).await.unwrap().status().as_u16());
+            }
+            statuses
+        });
+
+        assert_eq!(statuses, [400, 400, 422, 400]);
+        assert_eq!(lines.len(), 3, "the downstream 400 is not counted: {lines:?}");
+        let line = |code: &str| lines.iter().find(|l| l.contains(&format!("code=\"{code}\""))).unwrap();
+        assert!(line("invalid_json").contains("model=\"\""));
+        assert!(line("schema_mismatch").contains("model=\"claude-x\""));
+        assert!(line("response_translation_failed").contains("status=\"422\""));
     }
 
     /// Non-strict onwards derives the upstream path from the inbound path. This

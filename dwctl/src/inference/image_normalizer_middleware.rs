@@ -81,6 +81,7 @@ use std::time::Duration;
 use tracing::{debug, warn};
 
 use crate::image_normalizer::{ImageInput, ImageNormalizer, ImageToken, Mode, NormalizeError, TokenParseError, sealed, walker};
+use crate::inference::rejections;
 use sqlx::PgPool;
 
 /// Shared state threaded through the middleware.
@@ -148,6 +149,14 @@ pub async fn image_normalizer_middleware(
         Ok(b) => b,
         Err(e) => {
             warn!(error = %e, "Failed to read request body in image_normalizer middleware");
+            rejections::record(
+                request.extensions(),
+                request.headers(),
+                StatusCode::BAD_REQUEST,
+                "body_read_failed",
+                None,
+                None,
+            );
             // Match the structured error shape used elsewhere so
             // OpenAI-compatible clients can parse it.
             let body = serde_json::json!({
@@ -338,6 +347,7 @@ pub async fn image_normalizer_middleware(
         Ok(n) => n,
         Err(e) => {
             warn!(error = %e, "image normalisation failed");
+            record_normalize_error(request.extensions(), request.headers(), &e, body_value["model"].as_str());
             return normalize_error_response(e);
         }
     };
@@ -476,16 +486,7 @@ pub(crate) async fn normalize_value_to_tokens(
 /// Map a [`NormalizeError`] to an HTTP response. Body shape is a small
 /// JSON object so OpenAI-compatible clients can surface it cleanly.
 pub(crate) fn normalize_error_response(err: NormalizeError) -> Response {
-    let (status, code) = match &err {
-        NormalizeError::BadInput(_) => (StatusCode::BAD_REQUEST, "image_url_rejected"),
-        NormalizeError::Unfetchable(_) => (StatusCode::UNPROCESSABLE_ENTITY, "image_url_unfetchable"),
-        NormalizeError::Transient(_) => (StatusCode::SERVICE_UNAVAILABLE, "image_fetch_transient"),
-        NormalizeError::FetchFailed(_) => (StatusCode::BAD_GATEWAY, "image_fetch_failed"),
-        NormalizeError::StoreFailed(_) => (StatusCode::SERVICE_UNAVAILABLE, "image_store_failed"),
-        NormalizeError::NotFound => (StatusCode::INTERNAL_SERVER_ERROR, "image_token_not_found"),
-        NormalizeError::Forbidden => (StatusCode::FORBIDDEN, "image_token_forbidden"),
-        NormalizeError::AccessUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "image_access_unavailable"),
-    };
+    let (status, code) = normalize_error_status(&err);
     let body = serde_json::json!({
         "error": {
             "message": err.to_string(),
@@ -494,6 +495,32 @@ pub(crate) fn normalize_error_response(err: NormalizeError) -> Response {
         }
     });
     (status, axum::Json(body)).into_response()
+}
+
+/// Counts `err` as a rejection when it is the client's to fix (a 4xx).
+pub(crate) fn record_normalize_error(
+    extensions: &axum::http::Extensions,
+    headers: &axum::http::HeaderMap,
+    err: &NormalizeError,
+    model: Option<&str>,
+) {
+    let (status, code) = normalize_error_status(err);
+    if status.is_client_error() {
+        rejections::record(extensions, headers, status, code, Some("image_url"), model);
+    }
+}
+
+fn normalize_error_status(err: &NormalizeError) -> (StatusCode, &'static str) {
+    match err {
+        NormalizeError::BadInput(_) => (StatusCode::BAD_REQUEST, "image_url_rejected"),
+        NormalizeError::Unfetchable(_) => (StatusCode::UNPROCESSABLE_ENTITY, "image_url_unfetchable"),
+        NormalizeError::Transient(_) => (StatusCode::SERVICE_UNAVAILABLE, "image_fetch_transient"),
+        NormalizeError::FetchFailed(_) => (StatusCode::BAD_GATEWAY, "image_fetch_failed"),
+        NormalizeError::StoreFailed(_) => (StatusCode::SERVICE_UNAVAILABLE, "image_store_failed"),
+        NormalizeError::NotFound => (StatusCode::INTERNAL_SERVER_ERROR, "image_token_not_found"),
+        NormalizeError::Forbidden => (StatusCode::FORBIDDEN, "image_token_forbidden"),
+        NormalizeError::AccessUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "image_access_unavailable"),
+    }
 }
 
 /// True for paths that may carry image inputs we want to normalise.
@@ -705,6 +732,37 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["code"], "image_url_rejected");
+    }
+
+    #[test]
+    fn counts_refused_images_but_not_failures_on_our_side() {
+        use crate::inference::rejections::{self, test_support};
+        let (lines, status) = test_support::rejections(async {
+            let router = build_router(state_for_tests()).layer(middleware::from_fn_with_state(
+                test_support::recorder("vision"),
+                rejections::attach_recorder,
+            ));
+            let body = json!({
+                "model": "vision",
+                "messages": [{"role": "user", "content": [{
+                    "type": "image_url",
+                    "image_url": { "url": "http://169.254.169.254/latest/meta-data/" }
+                }]}]
+            });
+            let (status, _) = post_json(router, "/chat/completions", body).await;
+
+            let mut extensions = axum::http::Extensions::new();
+            extensions.insert(test_support::recorder("vision"));
+            let headers = axum::http::HeaderMap::new();
+            record_normalize_error(&extensions, &headers, &NormalizeError::StoreFailed("down".into()), Some("vision"));
+            status
+        });
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(lines.len(), 1, "a 503 is not a rejection: {lines:?}");
+        assert!(
+            lines[0].contains("code=\"image_url_rejected\"") && lines[0].contains("model=\"vision\""),
+            "{lines:?}"
+        );
     }
 
     #[tokio::test]
