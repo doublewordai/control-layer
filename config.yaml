@@ -996,20 +996,6 @@ background_services:
     # does not may reject the request.
     # dispatch_tolerations: []
 
-    # Also release the tolerations of requests due before their model's
-    # release cutoff: the deadline before which requests that keep their
-    # tolerations are projected to miss. One daemon recomputes the cutoffs
-    # every refresh_interval_secs from requests dispatched WITH tolerations
-    # that completed in the last window_secs (count / busy seconds x in-flight) and the outstanding work
-    # by deadline; the claim applies them. Below min_samples, or with a
-    # cutoff older than 3 intervals, only the ramp/past-deadline floor applies.
-    # dispatch_tolerations_sla_release:
-    #   enabled: false
-    #   refresh_interval_secs: 300
-    #   window_secs: 900
-    #   safety_margin: 0.1          # fraction of each deadline's remaining time
-    #   min_samples: 20
-
   # Batch completion notifications (emails + webhooks)
   # notifications:
   #   poll_interval: 30s                # How often to poll for completed batches

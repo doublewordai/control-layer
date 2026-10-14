@@ -176,8 +176,8 @@ pub struct Claimed {
     /// read from the request's `data.model`). `None` for full-capacity claims.
     pub leak: Option<LeakStamp>,
     /// Whether this dispatch keeps or releases the daemon's scheduling
-    /// tolerations, as decided by the claim (and recorded on the row as
-    /// `dispatched_tolerated`). `None` when the claim path made no decision:
+    /// tolerations, as decided by the claim. Nothing is written to the row.
+    /// `None` when the claim path made no decision:
     /// tolerations are not configured, or the path (single-row claims,
     /// background) does not decide.
     pub tolerations: Option<DispatchTolerations>,
@@ -201,9 +201,6 @@ pub enum TolerationsRelease {
     Ramp,
     /// Already past its deadline (retry grace).
     PastDeadline,
-    /// Its deadline is before the model's release cutoff: projected to miss
-    /// the SLA while keeping its tolerations.
-    SlaProjection,
 }
 
 impl TolerationsRelease {
@@ -212,7 +209,6 @@ impl TolerationsRelease {
         match self {
             Self::Ramp => "ramp",
             Self::PastDeadline => "past_deadline",
-            Self::SlaProjection => "sla_projection",
         }
     }
 
@@ -221,7 +217,6 @@ impl TolerationsRelease {
         match label {
             "ramp" => Some(Self::Ramp),
             "past_deadline" => Some(Self::PastDeadline),
-            "sla_projection" => Some(Self::SlaProjection),
             _ => None,
         }
     }

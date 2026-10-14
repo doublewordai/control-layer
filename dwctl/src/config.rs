@@ -2401,12 +2401,6 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub dispatch_tolerations: Option<Vec<fusillade::daemon::Toleration>>,
 
-    /// Release a request's `dispatch_tolerations` early when it is projected
-    /// to miss its SLA with them, not only inside the deadline ramp.
-    /// Off by default (ramp-only). See [`DispatchTolerationsSlaRelease`].
-    #[serde(default)]
-    pub dispatch_tolerations_sla_release: DispatchTolerationsSlaRelease,
-
     /// Database-wide per-model ceiling below which no-SLA background work may
     /// be claimed. Zero disables background processing while leaving
     /// submission and inspection available. Background processing also
@@ -2687,79 +2681,6 @@ fn default_batch_metadata_fields_dwctl() -> Vec<String> {
     ]
 }
 
-/// Release of `dispatch_tolerations` on an SLA projection.
-///
-/// One daemon per `refresh_interval_secs` (whichever ticks first once the
-/// cutoffs are stale, serialised by a transaction-scoped advisory lock)
-/// computes, per model, the deadline before which requests are projected to
-/// miss their SLA while keeping their tolerations, and stores it in
-/// `model_release_cutoffs`. The claim query releases the tolerations of a
-/// request due before its model's cutoff, so every replica decides alike.
-///
-/// Throughput comes from the `requests` table: successful completions of
-/// requests dispatched WITH the tolerations (`dispatched_tolerated`; released
-/// ones may have run on other capacity and would inflate it) in the last `window_secs`,
-/// `count / sum(completed_at - started_at)` times the deployment-wide
-/// in-flight count. The cutoff is the shortest deadline-ordered prefix whose
-/// release lets everything due later finish within `(1 - safety_margin)` of
-/// its remaining time. When a request would miss its SLA, meeting the deadline
-/// matters more than where it runs. The deadline ramp and past-deadline release always
-/// apply; a model with fewer than `min_samples` tolerated completions in the
-/// window, or a cutoff older than three refresh intervals, gets only them.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
-pub struct DispatchTolerationsSlaRelease {
-    /// Off by default: ramp-only release.
-    pub enabled: bool,
-    /// How often the cutoffs are recomputed, in seconds. Default 300.
-    pub refresh_interval_secs: u64,
-    /// Trailing window of tolerated completions, in seconds. Default 900.
-    pub window_secs: u64,
-    /// Fraction of each deadline's remaining time kept as margin. Default 0.1.
-    pub safety_margin: f64,
-    /// Tolerated completions per model in the window before it gets a
-    /// cutoff. Default 20.
-    pub min_samples: u64,
-}
-
-impl Default for DispatchTolerationsSlaRelease {
-    fn default() -> Self {
-        let defaults = fusillade::daemon::SlaReleaseConfig::default();
-        Self {
-            enabled: false,
-            refresh_interval_secs: defaults.refresh_interval_secs,
-            window_secs: defaults.window_secs,
-            safety_margin: defaults.safety_margin,
-            min_samples: defaults.min_samples,
-        }
-    }
-}
-
-impl DispatchTolerationsSlaRelease {
-    /// `safety_margin` is a fraction of the remaining time: outside `[0, 1)`
-    /// it would silently release nearly every deadline (above 1) or drop the
-    /// margin (below 0), so it is rejected rather than clamped.
-    pub fn validate(&self) -> Result<(), String> {
-        if !(self.safety_margin.is_finite() && (0.0..1.0).contains(&self.safety_margin)) {
-            return Err(format!(
-                "safety_margin must be a finite fraction in [0, 1), got {}",
-                self.safety_margin
-            ));
-        }
-        Ok(())
-    }
-
-    /// The fusillade config, when enabled.
-    pub fn to_fusillade(&self) -> Option<fusillade::daemon::SlaReleaseConfig> {
-        self.enabled.then_some(fusillade::daemon::SlaReleaseConfig {
-            refresh_interval_secs: self.refresh_interval_secs,
-            window_secs: self.window_secs,
-            safety_margin: self.safety_margin,
-            min_samples: self.min_samples,
-        })
-    }
-}
-
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
@@ -2813,7 +2734,6 @@ impl Default for DaemonConfig {
             urgency_weight: default_urgency_weight(),
             inject_deadline_priority: false,
             dispatch_tolerations: None,
-            dispatch_tolerations_sla_release: DispatchTolerationsSlaRelease::default(),
             background_concurrency_limit: 0,
             batch_claim_size: 0,
             batch_claim_batch_size: default_batch_claim_batch_size(),
@@ -3865,11 +3785,6 @@ impl Config {
         if let Err(error) = self.background_services.batch_daemon.retention.validate() {
             return Err(Error::Internal {
                 operation: format!("Config validation: batch retention is invalid: {error}"),
-            });
-        }
-        if let Err(error) = self.background_services.batch_daemon.dispatch_tolerations_sla_release.validate() {
-            return Err(Error::Internal {
-                operation: format!("Config validation: dispatch_tolerations_sla_release is invalid: {error}"),
             });
         }
         if let Err(error) = self.background_services.task_retention.validate() {
@@ -5940,46 +5855,6 @@ background_services:
                 "[] (tolerate nothing) is not the same as unset"
             );
             assert!(!daemon.inject_deadline_priority, "tolerations do not need deadline priority");
-            assert_eq!(
-                daemon.dispatch_tolerations_sla_release.to_fusillade(),
-                None,
-                "the projection is off by default"
-            );
-
-            jail.create_file(
-                "test.yaml",
-                r#"
-secret_key: test-secret-key
-background_services:
-  batch_daemon:
-    dispatch_tolerations: []
-    dispatch_tolerations_sla_release:
-      enabled: true
-      safety_margin: 0.2
-"#,
-            )?;
-            let config = Config::load(&args)?;
-            let sla_release = config
-                .background_services
-                .batch_daemon
-                .dispatch_tolerations_sla_release
-                .to_fusillade()
-                .unwrap();
-            assert_eq!(sla_release.safety_margin, 0.2);
-            assert_eq!(sla_release.refresh_interval_secs, 300);
-            assert_eq!(sla_release.window_secs, 900);
-            assert_eq!(sla_release.min_samples, 20);
-
-            for bad in ["1.5", "-0.1", "1.0", ".nan"] {
-                jail.create_file(
-                    "test.yaml",
-                    &format!(
-                        "secret_key: test-secret-key\nbackground_services:\n  batch_daemon:\n    dispatch_tolerations: []\n    dispatch_tolerations_sla_release:\n      enabled: true\n      safety_margin: {bad}\n"
-                    ),
-                )?;
-                let error = Config::load(&args).expect_err("an out-of-range safety_margin is rejected");
-                assert!(error.to_string().contains("safety_margin"), "{bad}: {error}");
-            }
 
             jail.create_file(
                 "test.yaml",

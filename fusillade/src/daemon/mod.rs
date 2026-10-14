@@ -39,8 +39,8 @@ pub use fusillade_core::daemon_record::{
     AnyDaemonRecord, DaemonData, DaemonRecord, DaemonState, DaemonStats, DaemonStatus, Dead,
     Initializing, Running,
 };
-use fusillade_core::request::{DispatchTolerations, TolerationsRelease};
-pub use sla_release::SlaReleaseConfig;
+use fusillade_core::release::TolerationsReleaseSettings;
+use fusillade_core::request::DispatchTolerations;
 use sla_release::release_reason;
 
 /// Per-user throughput counters, reset after each emission cycle.
@@ -1723,8 +1723,6 @@ where
     /// Pre-serialised [`Daemon::with_dispatch_tolerations`] value, written into
     /// every dispatched body. `None` injects nothing.
     dispatch_tolerations: Option<serde_json::Value>,
-    /// Throughput-projection release of the tolerations; `None` is ramp-only.
-    sla_release: Option<SlaReleaseConfig>,
     /// Per-claim processing hook. Defaults to [`DefaultRequestProcessor`],
     /// which preserves the existing fire-and-store pipeline byte-for-byte.
     /// Override via [`Daemon::with_processor`] to inject custom orchestration
@@ -1829,7 +1827,6 @@ where
             retention_maintenance: RetentionMaintenanceConfig::default(),
             leak_config: None,
             dispatch_tolerations: None,
-            sla_release: None,
             processor: Arc::new(DefaultRequestProcessor),
             requests_in_flight: Arc::new(dashmap::DashMap::new()),
             adaptive_concurrency,
@@ -1896,18 +1893,6 @@ where
         // dispatched body.
         self.dispatch_tolerations =
             Some(serde_json::to_value(tolerations).expect("tolerations serialise to JSON"));
-        self
-    }
-
-    /// Also release a request's tolerations when its deadline is before its
-    /// model's release cutoff: the deadline before which tolerated requests
-    /// are projected to miss, computed by one daemon per refresh interval from
-    /// tolerated completions in the requests table and the outstanding work.
-    /// The claim query applies it. Without this only the deadline floor (ramp
-    /// and past-deadline) releases. Has no effect without
-    /// [`Daemon::with_dispatch_tolerations`].
-    pub fn with_sla_release(mut self, config: SlaReleaseConfig) -> Self {
-        self.sla_release = Some(config);
         self
     }
 
@@ -2605,13 +2590,6 @@ where
                         "reason" => reason.label()
                     )
                     .increment(1);
-                    if reason == TolerationsRelease::SlaProjection {
-                        tracing::debug!(
-                            request_id = %request.data.id,
-                            model = %capacity_model,
-                            "Releasing tolerations: due before the model's release cutoff"
-                        );
-                    }
                 }
             }
             inject_nvext_extensions(
@@ -3293,25 +3271,9 @@ where
 
         // The claim queries decide scheduling tolerations from these settings.
         self.storage
-            .configure_tolerations_release(sla_release::claim_settings(
-                self.dispatch_tolerations.is_some(),
-                self.sla_release.as_ref(),
-            ));
-        // Every daemon with foreground claim loops takes part in computing
-        // the release cutoffs; the storage lets exactly one compute per
-        // refresh interval, off the claim path.
-        if let Some(config) = self.sla_release.clone()
-            && self.dispatch_tolerations.is_some()
-            && claim_loop_kinds.iter().any(|kind| !kind.is_background())
-        {
-            let handle = tokio::spawn(sla_release::run_release_leader(
-                self.storage.clone(),
-                config,
-                Duration::from_millis(self.config.claim_query_timeout_ms),
-                self.shutdown_token.clone(),
-            ));
-            daemon_handles.push(("release_cutoffs", handle));
-        }
+            .configure_tolerations_release(TolerationsReleaseSettings {
+                tolerations_enabled: self.dispatch_tolerations.is_some(),
+            });
 
         // Spawn periodic status logging task if configured
         if let Some(interval_ms) = self.config.status_log_interval_ms {
@@ -6028,7 +5990,7 @@ mod tests {
 
     #[sqlx::test]
     async fn dispatch_tolerations_follow_the_deadline(pool: sqlx::PgPool) {
-        use crate::request::{Claimed, Request, RequestData};
+        use crate::request::{Claimed, Request, RequestData, TolerationsRelease};
 
         let storage = Arc::new(fusillade_arsenal::PostgresRequestManager::new(
             fusillade_arsenal::TestDbPools::new(pool).await.unwrap(),
@@ -6116,18 +6078,15 @@ mod tests {
             serde_json::json!([])
         );
 
-        // When the claim decided, its decision is final: it is what the row
-        // records as dispatched_tolerated, so the daemon must not second-guess
-        // it with its own clock.
+        // When the claim decided, its decision is final: every replica decides
+        // from the same rows, so the daemon must not second-guess it with its
+        // own clock.
         let decided = |deadline, decision| {
             let mut request = claimed(Some(deadline));
             request.state.tolerations = Some(decision);
             request
         };
-        let release = decided(
-            far,
-            DispatchTolerations::Release(TolerationsRelease::SlaProjection),
-        );
+        let release = decided(far, DispatchTolerations::Release(TolerationsRelease::Ramp));
         let keep = decided(past, DispatchTolerations::Keep);
         let prepared = daemon.prepare_claimed_requests(vec![release, keep], ClaimLoopKind::Batch);
         let tolerations = |deadline| -> serde_json::Value {
@@ -6138,7 +6097,7 @@ mod tests {
         assert_eq!(
             tolerations(far),
             serde_json::Value::Null,
-            "released by the cutoff"
+            "released by the claim"
         );
         assert_eq!(
             tolerations(past),
