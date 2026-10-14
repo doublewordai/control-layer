@@ -334,6 +334,39 @@ pub struct DispatchHold {
     pub tolerations: serde_json::Value,
     /// Models (as claimed, before any escalation) whose dispatches are held.
     pub models: std::collections::HashSet<String>,
+    /// How often each daemon recomputes the release decisions. Default 60s.
+    pub refresh_interval: std::time::Duration,
+    /// Trailing window of held completions and refusals the decisions are
+    /// computed from. Default 15 minutes.
+    pub window: std::time::Duration,
+    /// Fraction of a deadline's projected work added as margin. Default 0.2.
+    pub safety_margin: f64,
+    /// Held completions a model needs in the window before its own rate is
+    /// trusted. Default 20.
+    pub min_samples: u64,
+    /// Decisions older than this release every held request (the refresh is
+    /// failing). Default 5 minutes.
+    pub stale_after: std::time::Duration,
+}
+
+impl DispatchHold {
+    /// A hold with the default tuning.
+    pub fn new(tolerations: serde_json::Value, models: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            tolerations,
+            models: models.into_iter().collect(),
+            refresh_interval: std::time::Duration::from_secs(60),
+            window: std::time::Duration::from_secs(900),
+            safety_margin: 0.2,
+            min_samples: 20,
+            stale_after: std::time::Duration::from_secs(300),
+        }
+    }
+
+    /// [`Self::stale_after`] as a chrono duration.
+    pub(crate) fn stale_after_duration(&self) -> chrono::Duration {
+        chrono::Duration::from_std(self.stale_after).unwrap_or(chrono::Duration::MAX)
+    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]

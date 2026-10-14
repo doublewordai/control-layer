@@ -496,10 +496,10 @@ async fn background_tier_end_to_end(pool: sqlx::PgPool) {
     let shutdown = CancellationToken::new();
     let daemon_handle = Arc::new(
         PostgresDaemon::new(manager.clone(), http_client.clone(), config).with_dispatch_hold(
-            fusillade::daemon::DispatchHold {
-                tolerations: serde_json::json!([]),
-                models: ["spare-model".to_string()].into(),
-            },
+            fusillade::daemon::DispatchHold::new(
+                serde_json::json!([]),
+                ["spare-model".to_string()],
+            ),
         ),
     )
     .run(shutdown.clone())

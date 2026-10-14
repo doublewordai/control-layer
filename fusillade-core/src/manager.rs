@@ -1728,11 +1728,40 @@ pub trait DaemonStorage: Send + Sync {
     /// the daemon purge task for right-to-erasure compliance.
     async fn purge_orphaned_rows(&self, batch_size: i64) -> Result<u64>;
 
-    /// Tell the storage how the claim decides scheduling tolerations. Claims
-    /// that decide (the batch and batchless claim queries) then return a
-    /// [`crate::request::DispatchTolerations`] per row. The default storage
-    /// makes no decision.
-    fn configure_tolerations_release(&self, _settings: crate::release::TolerationsReleaseSettings) {
+    /// Hand the storage the dispatch hold decisions. Claims that decide (the
+    /// batch and batchless claim queries) then return a
+    /// [`crate::request::DispatchTolerations`] for each row of a held model.
+    /// `None`, and the default storage, make no decision.
+    fn set_dispatch_hold(&self, _claim: Option<crate::release::HoldClaim>) {}
+
+    /// Add one daemon's held completions and refusals to the shared
+    /// per-minute counters of `minute`. Additive: daemons flush into the same
+    /// rows. The default storage keeps nothing.
+    async fn flush_hold_stats(
+        &self,
+        _minute: chrono::DateTime<chrono::Utc>,
+        _deltas: &[crate::release::HoldStatsDelta],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Delete counters of minutes before `before`. Returns the rows deleted.
+    async fn purge_hold_stats(&self, _before: chrono::DateTime<chrono::Utc>) -> Result<u64> {
+        Ok(0)
+    }
+
+    /// Read each held model's counters over the trailing `window_secs` and
+    /// its outstanding work by deadline, with the database clock they were
+    /// read at. Models with neither may be omitted.
+    async fn read_hold_inputs(
+        &self,
+        _models: &[String],
+        _window_secs: f64,
+    ) -> Result<(
+        chrono::DateTime<chrono::Utc>,
+        Vec<crate::release::ModelHoldInputs>,
+    )> {
+        Ok((chrono::Utc::now(), Vec::new()))
     }
 
     /// Whether this backend explicitly implements the partitioned retained

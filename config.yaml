@@ -985,16 +985,30 @@ background_services:
     # writes the preset's tolerations (an id from scheduling.toleration_presets)
     # to `nvext.routing_constraints.tolerations`, but only when the stored
     # request body carries none: an account pinned to a preset keeps its own
-    # list and is never released. Background work and unlisted models are never
-    # held. A held request is released (sent as stored, so the backend may
-    # schedule it anywhere) when it would otherwise miss its completion window:
-    # inside the claim ramp (claim_ramp_exponent) or past its deadline. Off by
-    # default; with it off outbound bodies are unchanged. Rolling back is a
-    # config change: remove the model or set enabled: false.
+    # list and is never released (so it can miss its completion window by
+    # design). Background work and unlisted models are never held.
+    #
+    # A held request is released (sent as stored, so the backend may schedule
+    # it anywhere) when it would otherwise miss its completion window: inside
+    # the claim ramp (claim_ramp_exponent) or past its deadline; when the
+    # model's held dispatches are refused while fewer than min_samples
+    # complete in window_secs; when it is due at or before the latest deadline
+    # whose outstanding work cannot finish at the model's own completion rate
+    # (with safety_margin); or when the decisions are older than
+    # stale_after_secs. Each replica recomputes the decisions every
+    # refresh_interval_secs from the shared hold_stats counters.
+    #
+    # Off by default; with it off outbound bodies are unchanged. Rolling back
+    # is a config change: remove the model or set enabled: false.
     # dispatch_hold:
     #   enabled: false
     #   preset: no-overflow
     #   models: []
+    #   refresh_interval_secs: 60
+    #   window_secs: 900
+    #   safety_margin: 0.2
+    #   min_samples: 20
+    #   stale_after_secs: 300
 
   # Batch completion notifications (emails + webhooks)
   # notifications:

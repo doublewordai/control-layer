@@ -175,32 +175,39 @@ pub struct Claimed {
     /// daemon which `(user, window-class, model)` bucket to stamp (the model is
     /// read from the request's `data.model`). `None` for full-capacity claims.
     pub leak: Option<LeakStamp>,
-    /// Whether this dispatch keeps or releases the daemon's scheduling
-    /// tolerations, as decided by the claim. Nothing is written to the row.
-    /// `None` when the claim path made no decision:
-    /// tolerations are not configured, or the path (single-row claims,
-    /// background) does not decide.
+    /// Whether this dispatch is held or released, as decided by the claim for
+    /// a held model. Nothing is written to the row. `None` when the claim
+    /// made no decision: the model is not held, or the path (single-row
+    /// claims, background) does not decide.
     pub tolerations: Option<DispatchTolerations>,
 }
 
 impl RequestState for Claimed {}
 
-/// The claim's decision on a request's scheduling tolerations.
+/// The claim's decision on a held model's request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum DispatchTolerations {
-    /// Send the configured tolerations.
+    /// Hold: send the hold list (unless the body carries its own).
     Keep,
     /// Send none, so the backend may schedule the request anywhere.
     Release(TolerationsRelease),
 }
 
-/// Why a request's scheduling tolerations were released.
+/// Why a held request was released (sent as stored, without the hold list).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum TolerationsRelease {
     /// Inside the batch-claim deadline ramp.
     Ramp,
     /// Already past its deadline (retry grace).
     PastDeadline,
+    /// Due at or before its model's release cutoff: projected to miss its
+    /// completion window at the rate held dispatches complete.
+    SlaProjection,
+    /// Its model's held dispatches are refused while too few complete: there
+    /// is no capacity the hold allows to wait for.
+    NoOwnCapacity,
+    /// The hold decisions are missing or stale (the refresh is failing).
+    Stale,
 }
 
 impl TolerationsRelease {
@@ -209,6 +216,9 @@ impl TolerationsRelease {
         match self {
             Self::Ramp => "ramp",
             Self::PastDeadline => "past_deadline",
+            Self::SlaProjection => "sla_projection",
+            Self::NoOwnCapacity => "no_own_capacity",
+            Self::Stale => "stale",
         }
     }
 
@@ -217,6 +227,9 @@ impl TolerationsRelease {
         match label {
             "ramp" => Some(Self::Ramp),
             "past_deadline" => Some(Self::PastDeadline),
+            "sla_projection" => Some(Self::SlaProjection),
+            "no_own_capacity" => Some(Self::NoOwnCapacity),
+            "stale" => Some(Self::Stale),
             _ => None,
         }
     }

@@ -2679,8 +2679,21 @@ fn default_batch_metadata_fields_dwctl() -> Vec<String> {
 ///
 /// A held request is released, sent as stored without the hold list so the
 /// backend may schedule it anywhere, when it would otherwise miss its
-/// completion window: inside the batch-claim deadline ramp
-/// (`claim_ramp_exponent`) or past its deadline.
+/// completion window:
+///
+/// - inside the batch-claim deadline ramp (`claim_ramp_exponent`) or past its
+///   deadline;
+/// - when its model's held dispatches were refused in the last `window_secs`
+///   while fewer than `min_samples` completed (no capacity to wait for);
+/// - when it is due at or before the latest deadline `d` whose outstanding work
+///   cannot finish at the model's own rate: `work_due_by(d) / rate * (1 +
+///   safety_margin) > d - now`, where the rate is the held completions in the
+///   last `window_secs`. Requests sharing a deadline are released together;
+/// - when the decisions are older than `stale_after_secs` (fail open).
+///
+/// Every replica counts its held completions and refusals, flushes them into
+/// the shared `hold_stats` table and recomputes the decisions every
+/// `refresh_interval_secs`; no leader is involved.
 ///
 /// Rolling back is a config change: drop a model from `models`, or set
 /// `enabled: false`, and held requests dispatch as stored on their next claim.
@@ -2695,6 +2708,21 @@ pub struct DispatchHoldConfig {
     /// Model names (as requested, before any escalation) whose dispatches are
     /// held.
     pub models: Vec<String>,
+    /// How often each replica recomputes the release decisions, in seconds.
+    /// Default: 60.
+    pub refresh_interval_secs: u64,
+    /// Trailing window of held completions and refusals, in seconds. At
+    /// least `refresh_interval_secs`. Default: 900.
+    pub window_secs: u64,
+    /// Margin added to a deadline's projected work, as a fraction in
+    /// `[0, 1)`. Default: 0.2.
+    pub safety_margin: f64,
+    /// Held completions a model needs in the window before its own rate is
+    /// trusted. Default: 20.
+    pub min_samples: u64,
+    /// Decisions older than this (seconds) release every held request. More
+    /// than `refresh_interval_secs`. Default: 300.
+    pub stale_after_secs: u64,
 }
 
 impl Default for DispatchHoldConfig {
@@ -2703,13 +2731,40 @@ impl Default for DispatchHoldConfig {
             enabled: false,
             preset: SchedulingConfig::default_preset().id,
             models: Vec::new(),
+            refresh_interval_secs: 60,
+            window_secs: 900,
+            safety_margin: 0.2,
+            min_samples: 20,
+            stale_after_secs: 300,
         }
     }
 }
 
 impl DispatchHoldConfig {
-    /// When enabled, the preset must be defined and at least one model listed.
+    /// The tuning must be in range; when enabled, the preset must be defined
+    /// and at least one model listed.
     pub fn validate(&self, scheduling: &SchedulingConfig) -> Result<(), String> {
+        if !(self.safety_margin.is_finite() && (0.0..1.0).contains(&self.safety_margin)) {
+            return Err(format!(
+                "safety_margin must be a finite fraction in [0, 1), got {}",
+                self.safety_margin
+            ));
+        }
+        if self.refresh_interval_secs == 0 {
+            return Err("refresh_interval_secs must be positive".to_string());
+        }
+        if self.window_secs < self.refresh_interval_secs {
+            return Err(format!(
+                "window_secs ({}) must be at least refresh_interval_secs ({})",
+                self.window_secs, self.refresh_interval_secs
+            ));
+        }
+        if self.stale_after_secs <= self.refresh_interval_secs {
+            return Err(format!(
+                "stale_after_secs ({}) must exceed refresh_interval_secs ({}), or every decision is stale",
+                self.stale_after_secs, self.refresh_interval_secs
+            ));
+        }
         if !self.enabled {
             return Ok(());
         }
@@ -2726,7 +2781,7 @@ impl DispatchHoldConfig {
     }
 
     /// The fusillade hold, when enabled: the preset's tolerations as the JSON
-    /// the request body carries, and the models.
+    /// the request body carries, the models and the tuning.
     pub fn to_fusillade(&self, scheduling: &SchedulingConfig) -> Option<fusillade::daemon::DispatchHold> {
         if !self.enabled {
             return None;
@@ -2735,6 +2790,11 @@ impl DispatchHoldConfig {
         Some(fusillade::daemon::DispatchHold {
             tolerations: crate::scheduling::PinnedTolerations(preset.tolerations.clone()).to_json(),
             models: self.models.iter().cloned().collect(),
+            refresh_interval: std::time::Duration::from_secs(self.refresh_interval_secs),
+            window: std::time::Duration::from_secs(self.window_secs),
+            safety_margin: self.safety_margin,
+            min_samples: self.min_samples,
+            stale_after: std::time::Duration::from_secs(self.stale_after_secs),
         })
     }
 }
@@ -5927,6 +5987,11 @@ background_services:
             assert!(!daemon.inject_deadline_priority, "the hold does not need deadline priority");
             let hold = daemon.dispatch_hold.to_fusillade(&config.scheduling).unwrap();
             assert_eq!(hold.tolerations, serde_json::json!([]));
+            assert_eq!(hold.refresh_interval, std::time::Duration::from_secs(60));
+            assert_eq!(hold.window, std::time::Duration::from_secs(900));
+            assert_eq!(hold.safety_margin, 0.2);
+            assert_eq!(hold.min_samples, 20);
+            assert_eq!(hold.stale_after, std::time::Duration::from_secs(300));
             assert_eq!(hold.models, ["example/model-a".to_string(), "example/model-b".to_string()].into());
 
             // A custom preset resolves to its list, as the request body carries it.
@@ -5980,6 +6045,7 @@ background_services:
             enabled,
             preset: preset.to_string(),
             models: models.iter().map(|model| model.to_string()).collect(),
+            ..Default::default()
         };
 
         assert!(hold(true, "no-overflow", &["m"]).validate(&scheduling).is_ok());
@@ -5991,6 +6057,23 @@ background_services:
         // Disabled settings are not checked, so a disabled hold may name a
         // preset another environment defines.
         assert!(hold(false, "missing", &[]).validate(&scheduling).is_ok());
+
+        // Tuning is checked either way.
+        for margin in [1.0, 1.5, -0.1, f64::NAN] {
+            let mut bad = hold(false, "no-overflow", &[]);
+            bad.safety_margin = margin;
+            let error = bad.validate(&scheduling).unwrap_err();
+            assert!(error.contains("safety_margin"), "{margin}: {error}");
+        }
+        let mut bad = hold(true, "no-overflow", &["m"]);
+        bad.window_secs = 30;
+        assert!(bad.validate(&scheduling).unwrap_err().contains("window_secs"));
+        let mut bad = hold(true, "no-overflow", &["m"]);
+        bad.stale_after_secs = 60;
+        assert!(bad.validate(&scheduling).unwrap_err().contains("stale_after_secs"));
+        let mut bad = hold(true, "no-overflow", &["m"]);
+        bad.refresh_interval_secs = 0;
+        assert!(bad.validate(&scheduling).is_err());
 
         // Config::validate rejects an invalid hold.
         let mut config = Config::default();

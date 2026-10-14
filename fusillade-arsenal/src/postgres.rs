@@ -202,11 +202,10 @@ pub struct PostgresRequestManager<P: PoolProvider> {
     /// reassembly moves into dwctl.
     response_transformer: std::sync::OnceLock<Arc<dyn crate::transform::ResponseTransformer>>,
     maintenance_budget: std::time::Duration,
-    /// How the batch and batchless claims decide scheduling tolerations; set
-    /// by the daemon through `DaemonStorage::configure_tolerations_release`.
-    /// `None`: the claims make no decision.
-    tolerations_release:
-        std::sync::RwLock<Option<fusillade_core::release::TolerationsReleaseSettings>>,
+    /// The dispatch hold decisions the batch and batchless claims apply; set
+    /// by the daemon through `DaemonStorage::set_dispatch_hold`. `None`: the
+    /// claims make no decision.
+    dispatch_hold: std::sync::RwLock<Option<fusillade_core::release::HoldClaim>>,
 }
 
 struct StateWriteLimiter {
@@ -360,7 +359,7 @@ struct ClaimedRequestRow {
     leaked: bool,
     window_class: String,
     window_secs: f64,
-    /// `keep`, a release reason, or NULL when the claim made no decision.
+    /// `hold`, a release reason, or NULL when the claim made no decision.
     tolerations_decision: Option<String>,
 }
 
@@ -442,16 +441,19 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             batch_insert_strategy: BatchInsertStrategy::default(),
             response_transformer: std::sync::OnceLock::new(),
             maintenance_budget: maintenance_budget(DEFAULT_MAINTENANCE_QUERY_TIMEOUT),
-            tolerations_release: std::sync::RwLock::new(None),
+            dispatch_hold: std::sync::RwLock::new(None),
         }
     }
 
-    /// Whether the batch and batchless claims decide scheduling tolerations.
-    fn tolerations_claim_params(&self) -> bool {
-        self.tolerations_release
+    /// The claims' dispatch hold parameters at `now`: held models, their
+    /// cutoffs and their release-all reasons, aligned. Empty without a hold.
+    fn hold_claim_params(&self, now: DateTime<Utc>) -> fusillade_core::release::HoldClaimArrays {
+        self.dispatch_hold
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_some_and(|settings| settings.tolerations_enabled)
+            .as_ref()
+            .map(|claim| claim.claim_arrays(now))
+            .unwrap_or_default()
     }
 
     /// Bound daemon maintenance on the server inside the daemon's client-side
@@ -1080,15 +1082,10 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                         } else {
                             None
                         },
-                        tolerations: row.tolerations_decision.as_deref().map(|decision| {
-                            match fusillade_core::request::TolerationsRelease::from_label(decision)
-                            {
-                                Some(reason) => {
-                                    fusillade_core::request::DispatchTolerations::Release(reason)
-                                }
-                                None => fusillade_core::request::DispatchTolerations::Keep,
-                            }
-                        }),
+                        tolerations: row
+                            .tolerations_decision
+                            .as_deref()
+                            .map(fusillade_core::release::parse_claim_decision),
                     },
                     data: RequestData {
                         id: RequestId(row.id),
@@ -2510,7 +2507,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             .map(|t| self.config.service_tier_completion_windows_ms[t] as i64)
             .collect();
         let default_window_ms = self.config.default_completion_window_ms as i64;
-        let decide_tolerations = self.tolerations_claim_params();
+        let hold = self.hold_claim_params(Utc::now());
 
         let rows = sqlx::query_as!(
             ClaimedRequestRow,
@@ -2686,18 +2683,26 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 SELECT * FROM active_request_templates t WHERE t.id = tc.template_id LIMIT 1
             ) t
             CROSS JOIN LATERAL (
-                -- Scheduling-tolerations decision: released past the deadline
-                -- or inside the claim ramp (the same window_minutes ^ exponent
-                -- as the claim gate); otherwise kept.
+                -- Dispatch hold decision, only for a held model ($16, with
+                -- its cutoff $17 and release-all reason $18): released past
+                -- the deadline, inside the claim ramp (the same
+                -- window_minutes ^ exponent as the claim gate), when the whole
+                -- model is released, or when due at or before its cutoff;
+                -- otherwise held. NULL: not held, no decision.
                 SELECT CASE
-                    WHEN NOT $16::BOOLEAN OR tc.effective_expires_at IS NULL THEN NULL
+                    WHEN h.model IS NULL OR tc.effective_expires_at IS NULL THEN NULL
                     WHEN tc.effective_expires_at <= $3 THEN 'past_deadline'
                     WHEN EXTRACT(EPOCH FROM (tc.effective_expires_at - $3))
                          <= power(GREATEST(tc.window_secs, 0.0) / 60.0, $9::DOUBLE PRECISION) * 60.0
                         THEN 'ramp'
+                    WHEN h.release_all <> '' THEN h.release_all
+                    WHEN tc.effective_expires_at <= h.cutoff THEN 'sla_projection'
+                    ELSE 'hold'
                 END AS reason
-                -- Evaluate once per row (SET and RETURNING both read it).
-                OFFSET 0
+                FROM (SELECT 1) AS one
+                LEFT JOIN unnest($16::TEXT[], $17::TIMESTAMPTZ[], $18::TEXT[])
+                    AS h(model, cutoff, release_all) ON h.model = tc.model
+                LIMIT 1
             ) rel
             WHERE r.id = tc.id
             RETURNING r.id,
@@ -2725,7 +2730,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                       tc.leaked as "leaked!",
                       tc.window_class as "window_class!",
                       tc.window_secs as "window_secs!",
-                      CASE WHEN $16::BOOLEAN THEN COALESCE(rel.reason, 'keep') END as "tolerations_decision?"
+                      rel.reason as "tolerations_decision?"
             "#,
             *daemon_id as Uuid,
             limit as i64,
@@ -2742,7 +2747,9 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             &cooldown_user_arr,
             &cooldown_window_arr,
             &cooldown_model_arr,
-            decide_tolerations,
+            &hold.models,
+            &hold.cutoffs,
+            &hold.release_all,
         )
         .fetch_all(self.write_executor())
         .await
@@ -7043,7 +7050,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             cooldown_windows.push(window.clone());
             cooldown_models.push(model.clone());
         }
-        let decide_tolerations = self.tolerations_claim_params();
+        let hold = self.hold_claim_params(Utc::now());
 
         let rows = sqlx::query_as!(
             ClaimedRequestRow,
@@ -7234,18 +7241,26 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             ) t
             JOIN batches b ON tc.batch_id = b.id
             CROSS JOIN LATERAL (
-                -- Scheduling-tolerations decision: released past the deadline
-                -- or inside the claim ramp (the same window_minutes ^ exponent
-                -- as the claim gate); otherwise kept.
+                -- Dispatch hold decision, only for a held model ($16, with
+                -- its cutoff $17 and release-all reason $18): released past
+                -- the deadline, inside the claim ramp (the same
+                -- window_minutes ^ exponent as the claim gate), when the whole
+                -- model is released, or when due at or before its cutoff;
+                -- otherwise held. NULL: not held, no decision.
                 SELECT CASE
-                    WHEN NOT $16::BOOLEAN OR tc.effective_expires_at IS NULL THEN NULL
+                    WHEN h.model IS NULL OR tc.effective_expires_at IS NULL THEN NULL
                     WHEN tc.effective_expires_at <= $3 THEN 'past_deadline'
                     WHEN EXTRACT(EPOCH FROM (tc.effective_expires_at - $3))
                          <= power(GREATEST(tc.window_secs, 0.0) / 60.0, $11::DOUBLE PRECISION) * 60.0
                         THEN 'ramp'
+                    WHEN h.release_all <> '' THEN h.release_all
+                    WHEN tc.effective_expires_at <= h.cutoff THEN 'sla_projection'
+                    ELSE 'hold'
                 END AS reason
-                -- Evaluate once per row (SET and RETURNING both read it).
-                OFFSET 0
+                FROM (SELECT 1) AS one
+                LEFT JOIN unnest($16::TEXT[], $17::TIMESTAMPTZ[], $18::TEXT[])
+                    AS h(model, cutoff, release_all) ON h.model = tc.model
+                LIMIT 1
             ) rel
             WHERE r.id = tc.id
             RETURNING r.id,
@@ -7270,7 +7285,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                       tc.leaked as "leaked!",
                       tc.window_class as "window_class!",
                       tc.window_secs as "window_secs!",
-                      CASE WHEN $16::BOOLEAN THEN COALESCE(rel.reason, 'keep') END as "tolerations_decision?"
+                      rel.reason as "tolerations_decision?"
             "#,
             *daemon_id as Uuid,
             limit as i64,
@@ -7287,7 +7302,9 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             &cooldown_windows,
             &cooldown_models,
             leak_enabled,
-            decide_tolerations,
+            &hold.models,
+            &hold.cutoffs,
+            &hold.release_all,
         )
         .fetch_all(self.write_executor())
         .await
@@ -9038,14 +9055,192 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         Ok(daemons)
     }
 
-    fn configure_tolerations_release(
-        &self,
-        settings: fusillade_core::release::TolerationsReleaseSettings,
-    ) {
+    fn set_dispatch_hold(&self, claim: Option<fusillade_core::release::HoldClaim>) {
         *self
-            .tolerations_release
+            .dispatch_hold
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(settings);
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = claim;
+    }
+
+    async fn flush_hold_stats(
+        &self,
+        minute: DateTime<Utc>,
+        deltas: &[fusillade_core::release::HoldStatsDelta],
+    ) -> Result<()> {
+        if deltas.is_empty() {
+            return Ok(());
+        }
+        let models: Vec<&str> = deltas.iter().map(|d| d.model.as_str()).collect();
+        let completed: Vec<i64> = deltas.iter().map(|d| d.completed).collect();
+        let refused: Vec<i64> = deltas.iter().map(|d| d.refused).collect();
+        // Additive upsert: every daemon flushes into the same (model, minute)
+        // rows.
+        sqlx::query(
+            r#"
+            INSERT INTO hold_stats (model, minute, completed, refused)
+            SELECT d.model, $1, SUM(d.completed), SUM(d.refused)
+            FROM UNNEST($2::TEXT[], $3::BIGINT[], $4::BIGINT[]) AS d(model, completed, refused)
+            GROUP BY d.model
+            ON CONFLICT (model, minute) DO UPDATE SET
+                completed = hold_stats.completed + EXCLUDED.completed,
+                refused = hold_stats.refused + EXCLUDED.refused
+            "#,
+        )
+        .bind(minute)
+        .bind(&models)
+        .bind(&completed)
+        .bind(&refused)
+        .execute(self.write_executor())
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to flush hold_stats: {}", e)))?;
+        Ok(())
+    }
+
+    async fn purge_hold_stats(&self, before: DateTime<Utc>) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM hold_stats WHERE minute < $1")
+            .bind(before)
+            .execute(self.write_executor())
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to purge hold_stats: {}", e)))?;
+        Ok(result.rows_affected())
+    }
+
+    async fn read_hold_inputs(
+        &self,
+        models: &[String],
+        window_secs: f64,
+    ) -> Result<(DateTime<Utc>, Vec<fusillade_core::release::ModelHoldInputs>)> {
+        let now: DateTime<Utc>;
+        let mut inputs: Vec<fusillade_core::release::ModelHoldInputs> = Vec::new();
+        if models.is_empty() {
+            return Ok((Utc::now(), inputs));
+        }
+        // Batchless rows have no batch expiry: synthesize the deadline the
+        // claim uses (created_at + the service-tier window), as the pending
+        // counts do.
+        let flex_window_ms =
+            self.config
+                .service_tier_completion_windows_ms
+                .get("flex")
+                .copied()
+                .unwrap_or(self.config.default_completion_window_ms) as i64;
+        let default_window_ms = self.config.default_completion_window_ms as i64;
+        // The primary: the counters were just flushed there, and replica lag
+        // would drop new backlog. A custom plan lets the literal states and
+        // tiers match the partial indexes on requests, and the statement is
+        // bounded like the pending counts.
+        let mut tx = self.begin_write().await.map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to begin hold inputs transaction: {}", e))
+        })?;
+        sqlx::query("SET LOCAL plan_cache_mode = force_custom_plan")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to force custom plan: {}", e)))?;
+        sqlx::query(&format!(
+            "SET LOCAL statement_timeout = {}",
+            self.pending_counts_statement_timeout_ms()
+        ))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to set statement_timeout: {}", e)))?;
+        let rows = sqlx::query(
+            r#"
+            WITH held(model) AS (
+                SELECT DISTINCT m FROM UNNEST($1::TEXT[]) AS m
+            ),
+            stats AS (
+                SELECT s.model, SUM(s.completed)::BIGINT AS completed, SUM(s.refused)::BIGINT AS refused
+                FROM hold_stats s
+                WHERE s.model = ANY($1)
+                  AND s.minute >= NOW() - make_interval(secs => $2::FLOAT8)
+                GROUP BY s.model
+            ),
+            active AS (
+                SELECT r.batch_id, r.model, COUNT(*)::BIGINT AS n
+                FROM requests r
+                WHERE r.state IN ('pending', 'claimed', 'processing')
+                  AND r.batch_id IS NOT NULL
+                  AND r.template_id IS NOT NULL
+                  AND r.service_tier IS DISTINCT FROM 'background'
+                  AND r.service_tier IS DISTINCT FROM 'priority'
+                  AND r.model = ANY($1)
+                GROUP BY r.batch_id, r.model
+            ),
+            due AS (
+                -- Claimable batches only, as in the pending counts.
+                SELECT a.model, b.expires_at AS deadline, a.n
+                FROM active a
+                JOIN batches b ON b.id = a.batch_id
+                WHERE b.expires_at IS NOT NULL
+                  AND b.cancelling_at IS NULL
+                  AND b.deleted_at IS NULL
+                  AND b.completed_at IS NULL
+                  AND b.failed_at IS NULL
+                  AND b.cancelled_at IS NULL
+                UNION ALL
+                SELECT r.model,
+                       r.created_at + ((CASE WHEN r.service_tier = 'flex' THEN $3::BIGINT ELSE $4::BIGINT END) * interval '1 millisecond'),
+                       1::BIGINT
+                FROM requests r
+                WHERE r.batch_id IS NULL
+                  AND r.state IN ('pending', 'claimed', 'processing')
+                  AND r.template_id IS NOT NULL
+                  AND r.service_tier IS DISTINCT FROM 'background'
+                  AND r.service_tier IS DISTINCT FROM 'priority'
+                  AND r.model = ANY($1)
+            ),
+            buckets AS (
+                -- One point per deadline minute: the latest deadline in the
+                -- minute and every request due in it.
+                SELECT model, date_trunc('minute', deadline) AS minute,
+                       MAX(deadline) AS deadline, SUM(n)::BIGINT AS n
+                FROM due
+                GROUP BY model, date_trunc('minute', deadline)
+            )
+            SELECT h.model,
+                   COALESCE(st.completed, 0)::BIGINT AS completed,
+                   COALESCE(st.refused, 0)::BIGINT AS refused,
+                   b.deadline,
+                   (SUM(b.n) OVER (PARTITION BY h.model ORDER BY b.minute))::BIGINT AS cumulative,
+                   clock_timestamp() AS read_at
+            FROM held h
+            LEFT JOIN stats st ON st.model = h.model
+            LEFT JOIN buckets b ON b.model = h.model
+            ORDER BY h.model, b.minute
+            "#,
+        )
+        .bind(models)
+        .bind(window_secs)
+        .bind(flex_window_ms)
+        .bind(default_window_ms)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to read hold inputs: {}", e)))?;
+        tx.commit()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to end hold inputs read: {}", e)))?;
+        let mut read_at = None;
+        for row in rows {
+            let model: String = row.get("model");
+            read_at = Some(row.get::<DateTime<Utc>, _>("read_at"));
+            if inputs.last().is_none_or(|last| last.model != model) {
+                inputs.push(fusillade_core::release::ModelHoldInputs {
+                    model,
+                    completed: row.get("completed"),
+                    refused: row.get("refused"),
+                    backlog: Vec::new(),
+                });
+            }
+            let deadline: Option<DateTime<Utc>> = row.get("deadline");
+            let cumulative: Option<i64> = row.get("cumulative");
+            if let (Some(deadline), Some(cumulative), Some(last)) =
+                (deadline, cumulative, inputs.last_mut())
+            {
+                last.backlog.push((deadline, cumulative));
+            }
+        }
+        now = read_at.unwrap_or_else(Utc::now);
+        Ok((now, inputs))
     }
 
     async fn purge_orphaned_rows(&self, batch_size: i64) -> Result<u64> {

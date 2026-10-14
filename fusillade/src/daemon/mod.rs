@@ -7,8 +7,8 @@ use std::time::Duration;
 
 mod adaptive_concurrency;
 pub mod config;
+mod hold;
 mod memory_gate;
-mod sla_release;
 
 use adaptive_concurrency::{AdaptiveConcurrencyController, ConcurrencyAdjustment};
 use memory_gate::{CgroupMemorySource, MemoryGate};
@@ -39,9 +39,8 @@ pub use fusillade_core::daemon_record::{
     AnyDaemonRecord, DaemonData, DaemonRecord, DaemonState, DaemonStats, DaemonStatus, Dead,
     Initializing, Running,
 };
-use fusillade_core::release::TolerationsReleaseSettings;
 use fusillade_core::request::{DispatchTolerations, TolerationsRelease};
-use sla_release::release_reason;
+use hold::HoldState;
 
 /// Per-user throughput counters, reset after each emission cycle.
 struct UserThroughputStats {
@@ -1750,9 +1749,10 @@ where
     config: DaemonConfig,
     retention_maintenance: RetentionMaintenanceConfig,
     leak_config: Option<LeakConfig>,
-    /// [`Daemon::with_dispatch_hold`]: the opted-in models' hold list. `None`
-    /// (the default) leaves every body as it was stored.
-    dispatch_hold: Option<DispatchHold>,
+    /// [`Daemon::with_dispatch_hold`]: the opted-in models' hold list, this
+    /// daemon's held-dispatch counters and the latest release decisions.
+    /// `None` (the default) leaves every body as it was stored.
+    dispatch_hold: Option<Arc<HoldState>>,
     /// Per-claim processing hook. Defaults to [`DefaultRequestProcessor`],
     /// which preserves the existing fire-and-store pipeline byte-for-byte.
     /// Override via [`Daemon::with_processor`] to inject custom orchestration
@@ -1915,12 +1915,17 @@ where
     /// [`DaemonConfig::inject_deadline_priority`].
     ///
     /// A held request is released (sent as stored, without the hold list)
-    /// once it is inside the batch-claim deadline ramp or past its deadline:
-    /// near SLA failure, meeting the deadline matters more than where the
-    /// request runs. Counted by
+    /// when it would otherwise miss its completion window: near SLA failure,
+    /// meeting the deadline matters more than where the request runs. That is
+    /// inside the batch-claim deadline ramp or past its deadline; when its
+    /// model's held dispatches are refused while too few complete; when it is
+    /// due before the latest deadline its model's outstanding work cannot
+    /// meet at the rate held dispatches complete; or when the decisions are
+    /// stale. Every daemon computes the decisions from shared per-minute
+    /// counters (`hold_stats`). Counted by
     /// `fusillade_tolerations_released_total{model,reason}`.
     pub fn with_dispatch_hold(mut self, hold: DispatchHold) -> Self {
-        self.dispatch_hold = Some(hold);
+        self.dispatch_hold = Some(Arc::new(HoldState::new(hold, chrono::Utc::now())));
         self
     }
 
@@ -2534,36 +2539,30 @@ where
         request: &Request<Claimed>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Option<HoldWrite<'a>> {
-        let hold = self.dispatch_hold.as_ref()?;
+        let state = self.dispatch_hold.as_ref()?;
         if kind.is_background()
-            || !hold.models.contains(capacity_model)
+            || !state.hold().models.contains(capacity_model)
             || request.data.model != capacity_model
         {
             return None;
         }
         let decision = match request.state.tolerations {
             Some(decision) => decision,
-            // The claim path made no decision: apply the same deadline floor
-            // here.
-            None => {
-                request.state.batch_expires_at?;
-                match release_reason(
-                    request.state.batch_expires_at,
-                    request
-                        .data
-                        .batch_metadata
-                        .get("created_at")
-                        .map(String::as_str),
-                    self.config.claim_ramp_exponent,
-                    now,
-                ) {
-                    Some(reason) => DispatchTolerations::Release(reason),
-                    None => DispatchTolerations::Keep,
-                }
-            }
+            // The claim path made no decision: apply the same rules here.
+            None => state.decide(
+                capacity_model,
+                request.state.batch_expires_at,
+                request
+                    .data
+                    .batch_metadata
+                    .get("created_at")
+                    .map(String::as_str),
+                self.config.claim_ramp_exponent,
+                now,
+            )?,
         };
         Some(HoldWrite {
-            tolerations: &hold.tolerations,
+            tolerations: &state.hold().tolerations,
             decision,
         })
     }
@@ -2683,8 +2682,9 @@ where
                 let PreparedRequest {
                     request,
                     capacity_model,
-                    held: _held,
+                    held,
                 } = prepared_request;
+                let hold_state = self.dispatch_hold.clone().filter(|_| held);
                 let request_id = request.data.id;
                 let batch_id = request.data.batch_id;
 
@@ -2875,6 +2875,9 @@ where
                                 .record(processing_start.elapsed().as_secs_f64());
                             histogram!("fusillade_retry_attempts_on_success", "model" => model_clone.clone())
                                 .record(retry_attempt_at_completion as f64);
+                            if let Some(hold_state) = &hold_state {
+                                hold_state.record_completed(&capacity_model_clone);
+                            }
 
                             if let Some(batch_expires_at) = batch_expires_at {
                                 let completed_at = completed.state.completed_at;
@@ -2894,6 +2897,20 @@ where
                         }
                         Ok(RequestCompletionResult::Failed(failed)) => {
                             tracing::Span::current().record("outcome", "failed");
+                            // A held dispatch refused for capacity (503/529,
+                            // not the gateway's own batch cap): the capacity
+                            // the hold allows is full or absent.
+                            let held_refusal = hold_state.is_some()
+                                && is_downstream_overload(&failed.state.reason)
+                                && !failed.state.reason.is_batch_capacity_exceeded();
+                            if held_refusal && let Some(hold_state) = &hold_state {
+                                hold_state.record_refused(&capacity_model_clone);
+                                counter!(
+                                    "fusillade_hold_refusals_total",
+                                    "model" => capacity_model_clone.clone()
+                                )
+                                .increment(1);
+                            }
                             if is_downstream_overload(&failed.state.reason)
                                 && let Some(generation) = control_generation
                                 && let Some(adjustment) = adaptive_concurrency
@@ -3326,11 +3343,22 @@ where
         });
         daemon_handles.push(("heartbeat", heartbeat_handle));
 
-        // The claim queries decide scheduling tolerations from these settings.
-        self.storage
-            .configure_tolerations_release(TolerationsReleaseSettings {
-                tolerations_enabled: self.dispatch_hold.is_some(),
-            });
+        // The claim queries apply the dispatch hold decisions. Until the
+        // first refresh they hold with the deadline floor only, and release
+        // everything if no refresh succeeds within `stale_after`. The refresh
+        // task runs on every daemon with foreground claim loops.
+        if let Some(state) = &self.dispatch_hold {
+            self.storage.set_dispatch_hold(Some(state.claim()));
+            if claim_loop_kinds.iter().any(|kind| !kind.is_background()) {
+                let handle = tokio::spawn(hold::run_hold_refresh(
+                    self.storage.clone(),
+                    state.clone(),
+                    Duration::from_millis(self.config.claim_query_timeout_ms),
+                    self.shutdown_token.clone(),
+                ));
+                daemon_handles.push(("dispatch_hold", handle));
+            }
+        }
 
         // Spawn periodic status logging task if configured
         if let Some(interval_ms) = self.config.status_log_interval_ms {
@@ -5938,6 +5966,8 @@ mod tests {
         );
     }
 
+    use fusillade_core::release::ModelHold;
+
     fn hold_write(
         tolerations: &serde_json::Value,
         decision: DispatchTolerations,
@@ -6173,14 +6203,29 @@ mod tests {
             },
         )
         .await
-        .with_dispatch_hold(DispatchHold {
-            tolerations: serde_json::json!([]),
-            models: ["m".to_string()].into(),
-        });
+        .with_dispatch_hold(DispatchHold::new(serde_json::json!([]), ["m".to_string()]));
 
         const BODY: &str = r#"{"model":"m","messages":[]}"#;
         let preset = r#"{"model":"m","nvext":{"routing_constraints":{"tolerations":[{"key":"example.com/reserved","operator":"Exists"}]}}}"#;
         let now = chrono::Utc::now();
+        let state = daemon.dispatch_hold.clone().unwrap();
+        let decisions = |hold| fusillade_core::release::HoldClaim {
+            models: vec![("m".to_string(), hold)],
+            computed_at: now,
+            stale_after: chrono::Duration::minutes(5),
+        };
+        // Until the first refresh a held request is held, floor only.
+        let prepared = daemon.prepare_claimed_requests(
+            vec![claimed_request(
+                "m",
+                BODY,
+                Some(now + chrono::Duration::hours(12)),
+                now,
+            )],
+            ClaimLoopKind::Request,
+        );
+        assert!(prepared[0].held, "no decisions yet: the floor applies");
+        state.set_claim(decisions(ModelHold::Hold { cutoff: None }));
         let far = now + chrono::Duration::hours(12);
         let near = now + chrono::Duration::minutes(5);
         let past = now - chrono::Duration::minutes(5);
@@ -6259,6 +6304,39 @@ mod tests {
             serde_json::json!([]),
             "held by the claim"
         );
+
+        // Without a claim decision the daemon applies the model's decision
+        // itself: a cutoff releases what is due at or before it...
+        state.set_claim(decisions(ModelHold::Hold {
+            cutoff: Some(now + chrono::Duration::hours(6)),
+        }));
+        let prepared = daemon.prepare_claimed_requests(
+            vec![
+                claimed_request("m", BODY, Some(now + chrono::Duration::hours(5)), now),
+                claimed_request("m", BODY, Some(far), now),
+            ],
+            ClaimLoopKind::Batch,
+        );
+        assert!(!prepared[0].held, "due before the cutoff: released");
+        assert!(prepared[1].held, "due after the cutoff: held");
+        // ...releasing everything releases everything...
+        state.set_claim(decisions(ModelHold::ReleaseAll(
+            TolerationsRelease::NoOwnCapacity,
+        )));
+        let prepared = daemon.prepare_claimed_requests(
+            vec![claimed_request("m", BODY, Some(far), now)],
+            ClaimLoopKind::Batch,
+        );
+        assert!(!prepared[0].held);
+        // ...and stale decisions release everything too.
+        let mut stale = decisions(ModelHold::Hold { cutoff: None });
+        stale.computed_at = now - chrono::Duration::minutes(6);
+        state.set_claim(stale);
+        let prepared = daemon.prepare_claimed_requests(
+            vec![claimed_request("m", BODY, Some(far), now)],
+            ClaimLoopKind::Batch,
+        );
+        assert!(!prepared[0].held, "stale decisions release");
     }
 
     /// Without a dispatch hold, outbound bodies are exactly what they were
