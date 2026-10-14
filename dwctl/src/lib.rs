@@ -2756,10 +2756,14 @@ pub async fn build_router(
     }
 
     // Add tracing layer with OTel-compatible span names and HTTP semantic conventions.
-    // Only trace_id and otel.name are tracing span fields (visible in fmt log output).
-    // All other attributes are set via OpenTelemetrySpanExt::set_attribute() so they're
-    // exported to the trace backend but don't clutter log lines.
+    // Tracing span fields appear on every fmt log line in the request, so only the
+    // correlation keys are fields: trace_id, otel.name, x_request_id,
+    // edge_request_id and provider_request_id (the request IDs are what
+    // `|= "x_request_id=<id>"` log queries match on). All other attributes are set via
+    // OpenTelemetrySpanExt::set_attribute() so they're exported to the trace backend
+    // but don't clutter log lines.
     // Reference: https://opentelemetry.io/docs/specs/semconv/http/http-spans/
+    let router = router.layer(middleware::from_fn(record_provider_request_id));
     let router = router.layer(middleware::from_fn(inject_trace_id)).layer(
         TraceLayer::new_for_http()
             .make_span_with(|request: &http::Request<_>| {
@@ -2785,6 +2789,7 @@ pub async fn build_router(
                     trace_id = tracing::field::Empty,
                     x_request_id = tracing::field::Empty,
                     edge_request_id = tracing::field::Empty,
+                    provider_request_id = tracing::field::Empty,
                     otel.name = %span_name,
                 );
 
@@ -2860,16 +2865,14 @@ pub async fn build_router(
             ),
     );
 
-    // Outermost: mint the request ID before the span is created and echo it on
-    // every response, including rejections produced by inner layers.
-    Ok(router.layer(middleware::from_fn(assign_request_id)))
+    Ok(router)
 }
 
 /// Header carrying the request ID, both on responses and towards providers.
 const REQUEST_ID_HEADER: &str = "x-request-id";
 
-/// Longest inbound `X-Request-ID` we keep as `edge_request_id`.
-const MAX_EDGE_REQUEST_ID_LEN: usize = 128;
+/// Longest foreign `X-Request-ID` we keep (`edge_request_id`, `provider_request_id`).
+const MAX_INBOUND_REQUEST_ID_LEN: usize = 128;
 
 /// Request IDs attached to the request extensions by [`assign_request_id`].
 #[derive(Debug, Clone)]
@@ -2880,10 +2883,11 @@ struct RequestIds {
     edge_request_id: Option<String>,
 }
 
-/// Keep an inbound request ID only if it is short, visible ASCII.
-fn sanitise_edge_request_id(value: &http::HeaderValue) -> Option<String> {
+/// Keep a request ID we did not mint (from the edge or a provider) only if it
+/// is short, visible ASCII.
+fn sanitise_inbound_request_id(value: &http::HeaderValue) -> Option<String> {
     let s = value.to_str().ok()?;
-    (!s.is_empty() && s.len() <= MAX_EDGE_REQUEST_ID_LEN && s.bytes().all(|b| b.is_ascii_graphic())).then(|| s.to_owned())
+    (!s.is_empty() && s.len() <= MAX_INBOUND_REQUEST_ID_LEN && s.bytes().all(|b| b.is_ascii_graphic())).then(|| s.to_owned())
 }
 
 /// Middleware that mints a unique request ID for every request.
@@ -2892,9 +2896,12 @@ fn sanitise_edge_request_id(value: &http::HeaderValue) -> Option<String> {
 /// can set it, so it is not guaranteed unique). It is preserved as
 /// `edge_request_id` and overwritten with our own value, so that onwards
 /// forwards our ID to providers. The ID is echoed on every response.
+///
+/// Applied outside every other layer, including the admin AI proxy
+/// middleware, by [`Application::serve_with_listener`] and the test server.
 async fn assign_request_id(mut request: axum::extract::Request, next: middleware::Next) -> axum::response::Response {
     let x_request_id = Uuid::now_v7().to_string();
-    let edge_request_id = request.headers().get(REQUEST_ID_HEADER).and_then(sanitise_edge_request_id);
+    let edge_request_id = request.headers().get(REQUEST_ID_HEADER).and_then(sanitise_inbound_request_id);
     let value = http::HeaderValue::from_str(&x_request_id).expect("UUID is a valid header value");
     request.headers_mut().insert(REQUEST_ID_HEADER, value.clone());
     request.extensions_mut().insert(RequestIds {
@@ -2924,6 +2931,22 @@ async fn inject_trace_id(mut request: axum::extract::Request, next: middleware::
         request.headers_mut().remove("tracestate");
     }
     next.run(request).await
+}
+
+/// Records a provider's own `X-Request-ID`, which onwards passes through on
+/// proxied responses, as `provider_request_id` on the request span.
+///
+/// `assign_request_id` replaces the response header with our ID on the way
+/// out, so this is the only place the provider's value is kept. It is
+/// recorded even when the provider echoes back the ID we sent, so queries can
+/// rely on the field being present whenever the provider returned one.
+async fn record_provider_request_id(request: axum::extract::Request, next: middleware::Next) -> axum::response::Response {
+    let span = tracing::Span::current();
+    let response = next.run(request).await;
+    if let Some(provider) = response.headers().get(REQUEST_ID_HEADER).and_then(sanitise_inbound_request_id) {
+        span.record("provider_request_id", tracing::field::display(provider));
+    }
+    response
 }
 
 /// Container for background services and their lifecycle management.
@@ -4550,7 +4573,9 @@ impl Application {
     pub fn into_test_server(self) -> (axum_test::TestServer, BackgroundServices) {
         // Apply middleware before path matching for tests
         let middleware = middleware::from_fn_with_state(self.app_state, admin_ai_proxy_middleware);
-        let service = middleware.layer(self.router).into_make_service();
+        let service = middleware::from_fn(assign_request_id)
+            .layer(middleware.layer(self.router))
+            .into_make_service();
         let server = axum_test::TestServer::new(service).expect("Failed to create test server");
         (server, self.bg_services)
     }
@@ -4577,9 +4602,10 @@ impl Application {
             self.config.port
         );
 
-        // Apply middleware before path matching
+        // Apply middleware before path matching. The request ID is outermost so
+        // that responses from the admin AI proxy middleware carry it too.
         let middleware = middleware::from_fn_with_state(self.app_state, admin_ai_proxy_middleware);
-        let service = middleware.layer(self.router);
+        let service = middleware::from_fn(assign_request_id).layer(middleware.layer(self.router));
 
         // Cancel shutdown token when SIGTERM arrives, BEFORE axum starts waiting
         // for in-flight connections to close. This lets background services (e.g.,

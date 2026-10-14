@@ -182,3 +182,114 @@ async fn root_span_records_request_ids(pool: sqlx::PgPool) {
     assert!(attr(&span, "x_request_id").is_some());
     assert_eq!(attr(&span, "edge_request_id"), None);
 }
+
+/// Failures inside the admin AI proxy middleware, which runs before routing,
+/// still carry our ID.
+#[dwctl_test_macros::test]
+async fn admin_ai_proxy_failures_carry_id(pool: sqlx::PgPool) {
+    let mock = wiremock::MockServer::start().await;
+    let (server, _key, _bg) = super::setup_ai_test(pool, &mock, true).await;
+
+    // No model in the body: the middleware refuses it before any route runs.
+    let refused = server
+        .post("/admin/api/v1/ai/v1/chat/completions")
+        .json(&json!({"messages":[]}))
+        .await;
+    assert!(refused.status_code().is_client_error(), "got {}", refused.status_code());
+    response_id(&refused);
+}
+
+/// A provider's own `X-Request-ID` is replaced by ours on the response, but
+/// kept on the root span as `provider_request_id`, including when the
+/// provider echoes back the ID we sent.
+#[dwctl_test_macros::test]
+async fn provider_request_id_recorded_on_span(pool: sqlx::PgPool) {
+    use opentelemetry::trace::TracerProvider;
+    use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
+    use tracing_subscriber::layer::SubscriberExt;
+    use wiremock::matchers::{header_exists, method, path};
+    use wiremock::{Mock, Request, ResponseTemplate};
+
+    let exporter = Exported::default();
+    let provider = SdkTracerProvider::builder()
+        .with_sampler(Sampler::AlwaysOn)
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(provider.tracer("request-id-test"))),
+    );
+
+    let mock = wiremock::MockServer::start().await;
+    let completion = json!({
+        "id": "chatcmpl-test", "object": "chat.completion", "created": 1700000000, "model": "gpt-4o",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    });
+    // The provider mints its own ID unless asked to echo ours back.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(header_exists("x-echo"))
+        .respond_with({
+            let completion = completion.clone();
+            move |request: &Request| {
+                let ours = request.headers.get("x-request-id").unwrap().to_str().unwrap().to_owned();
+                ResponseTemplate::new(200)
+                    .insert_header("x-request-id", ours.as_str())
+                    .set_body_json(completion.clone())
+            }
+        })
+        .with_priority(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-request-id", "req_provider_abc123")
+                .set_body_json(completion),
+        )
+        .with_priority(2)
+        .mount(&mock)
+        .await;
+    let (server, key, _bg) = super::setup_ai_test(pool, &mock, true).await;
+    let body = json!({"model":"gpt-4o", "messages":[{"role":"user","content":"hello"}]});
+
+    let attr = |span: &SpanData, key: &str| {
+        span.attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == key)
+            .map(|kv| kv.value.to_string())
+    };
+    let root_with_id = |id: &str| {
+        exporter
+            .0
+            .lock()
+            .unwrap()
+            .clone()
+            .into_iter()
+            .find(|s| attr(s, "x_request_id").as_deref() == Some(id))
+            .expect("root request span exported")
+    };
+
+    let response = server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&body)
+        .await;
+    response.assert_status_ok();
+    let ours = response_id(&response).to_string();
+    assert_eq!(
+        attr(&root_with_id(&ours), "provider_request_id").as_deref(),
+        Some("req_provider_abc123")
+    );
+
+    let echoed = server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .add_header("x-echo", "1")
+        .json(&body)
+        .await;
+    echoed.assert_status_ok();
+    let ours = response_id(&echoed).to_string();
+    assert_eq!(attr(&root_with_id(&ours), "provider_request_id").as_deref(), Some(ours.as_str()));
+}
