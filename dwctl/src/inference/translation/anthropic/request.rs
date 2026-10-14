@@ -149,9 +149,10 @@ fn reasoning_effort(thinking: Option<&Value>, output_config: Option<&Value>) -> 
     if let Some(config) = output_config
         && !config.is_object()
     {
-        return Err(TranslationError::BadRequest(format!(
-            "output_config: expected an object, got {config}"
-        )));
+        return Err(TranslationError::InvalidParameter {
+            param: "output_config",
+            message: format!("output_config: expected an object, got {config}"),
+        });
     }
     let effort = match output_config.and_then(|config| config.get("effort")).filter(|v| !v.is_null()) {
         None => None,
@@ -159,11 +160,12 @@ fn reasoning_effort(thinking: Option<&Value>, output_config: Option<&Value>) -> 
             value
                 .as_str()
                 .and_then(|effort| ANTHROPIC_EFFORTS.into_iter().find(|known| *known == effort))
-                .ok_or_else(|| {
-                    TranslationError::BadRequest(format!(
+                .ok_or_else(|| TranslationError::InvalidParameter {
+                    param: "output_config.effort",
+                    message: format!(
                         "output_config.effort: expected one of {}, got {value}",
                         ANTHROPIC_EFFORTS.join(", ")
-                    ))
+                    ),
                 })?,
         ),
     };
@@ -183,10 +185,13 @@ fn reasoning_effort(thinking: Option<&Value>, output_config: Option<&Value>) -> 
                 "high"
             }
         }))),
-        _ => Err(TranslationError::BadRequest(format!(
-            "thinking.type: expected one of enabled, adaptive, disabled, between_tools, got {}",
-            thinking.get("type").unwrap_or(&Value::Null)
-        ))),
+        _ => Err(TranslationError::InvalidParameter {
+            param: "thinking.type",
+            message: format!(
+                "thinking.type: expected one of enabled, adaptive, disabled, between_tools, got {}",
+                thinking.get("type").unwrap_or(&Value::Null)
+            ),
+        }),
     }
 }
 
@@ -756,7 +761,7 @@ mod tests {
         ] {
             let err = effort_for(extra.clone()).unwrap_err();
             assert!(
-                matches!(&err, TranslationError::BadRequest(m) if m.contains(field)),
+                matches!(&err, TranslationError::InvalidParameter { param, message } if *param == field && message.contains(field)),
                 "{extra}: {err}"
             );
         }

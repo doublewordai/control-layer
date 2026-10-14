@@ -29,6 +29,7 @@ use crate::{
     db::errors::DbError,
     db::handlers::{Credits, api_keys::ApiKeys},
     errors::Error,
+    inference::rejections::RejectionCode,
     types::UserId,
 };
 use axum::{
@@ -93,8 +94,12 @@ pub async fn error_enrichment_middleware(
 
     // Only enrich 403 errors when we have an API key
     // Note: This middleware is applied only to the onwards router (AI proxy paths),
-    // so no path filtering is needed here
+    // so no path filtering is needed here.
+    // A 403 a dwctl layer refused with its own code (the image normaliser's
+    // `image_token_forbidden`) already says what went wrong and was counted
+    // under that code, so it passes through unchanged.
     if response.status() == StatusCode::FORBIDDEN
+        && response.extensions().get::<RejectionCode>().is_none()
         && let Some(key) = api_key
     {
         debug!("Intercepted 403 response on AI proxy path, attempting enrichment");
@@ -1017,6 +1022,55 @@ mod tests {
         assert!(body.contains("Rate limit exceeded"));
         assert!(!body.contains("balance"));
         assert!(!body.contains("access"));
+    }
+
+    /// A 403 a dwctl layer refused with its own code keeps its body and code,
+    /// even when the caller would also fail the model-access and balance checks.
+    #[dwctl_test_macros::test]
+    async fn test_error_enrichment_middleware_keeps_dwctl_layer_refusals(pool: PgPool) {
+        use crate::inference::rejections::{self, RejectionCode};
+        use tower::ServiceExt;
+
+        // No credits and no group access to the model.
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let api_key = ApiKeys::new(&mut conn)
+            .create(&ApiKeyCreateDBRequest {
+                user_id: user.id,
+                name: "Test Key".to_string(),
+                description: None,
+                purpose: ApiKeyPurpose::Realtime,
+                created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
+            })
+            .await
+            .unwrap();
+
+        let router = axum::Router::new()
+            .route(
+                "/ai/v1/chat/completions",
+                axum::routing::post(|request: Request<Body>| async move {
+                    let response = (StatusCode::FORBIDDEN, "image token forbidden").into_response();
+                    rejections::refuse(&request, response, "image_token_forbidden", None, None)
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                sqlx_pool_router::DynPools::new(pool.clone()),
+                error_enrichment_middleware,
+            ));
+        let request = Request::post("/ai/v1/chat/completions")
+            .header("authorization", format!("Bearer {}", api_key.secret))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model": "some-model", "messages": []}"#))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let code = response.extensions().get::<RejectionCode>().map(RejectionCode::code);
+        assert_eq!(code, Some("image_token_forbidden"));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"image token forbidden");
     }
 
     /// Integration test: Error enrichment middleware only affects /ai/ paths

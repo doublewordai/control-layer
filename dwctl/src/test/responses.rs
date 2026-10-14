@@ -25,6 +25,15 @@ async fn setup_ai_test(
 ) -> (axum_test::TestServer, String, crate::BackgroundServices) {
     let mut config = create_test_config();
     config.onwards.strict_mode = strict_mode;
+    setup_ai_test_with_config(pool, mock_server, config).await
+}
+
+/// As [`setup_ai_test`], starting from `config`.
+pub(super) async fn setup_ai_test_with_config(
+    pool: PgPool,
+    mock_server: &wiremock::MockServer,
+    mut config: crate::config::Config,
+) -> (axum_test::TestServer, String, crate::BackgroundServices) {
     config.background_services.onwards_sync.enabled = true;
     // 1 record per flush keeps the test deterministic: each completed
     // realtime response lands in fusillade immediately rather than

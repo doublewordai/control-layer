@@ -1,9 +1,9 @@
 //! OpenAI-compatible model listing for inference API keys.
 
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Query, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
@@ -11,7 +11,12 @@ use serde_json::json;
 use sqlx::{QueryBuilder, Row};
 use sqlx_pool_router::PoolProvider;
 
-use crate::{AppState, db::handlers::Deployments, reasoning::SupportedReasoningEfforts};
+use crate::{
+    AppState,
+    db::handlers::Deployments,
+    inference::rejections::{self, Origin, Recorder, bearer_token},
+    reasoning::SupportedReasoningEfforts,
+};
 
 const EVERYONE_GROUP_ID: uuid::Uuid = uuid::Uuid::nil();
 
@@ -34,20 +39,26 @@ enum ModelsListQueryError {
 }
 
 impl ModelsListQueryError {
-    fn into_response(self) -> Response {
+    fn refuse(self, origin: Origin) -> Response {
         match self {
-            Self::InvalidGroup => openai_error(
-                StatusCode::BAD_REQUEST,
-                "Invalid group query parameter. Expected comma-separated UUIDs.",
-                "invalid_request_error",
-                "invalid_group",
-            ),
-            Self::InvalidBoolean { param } => openai_error(
-                StatusCode::BAD_REQUEST,
-                &format!("Invalid {param} query parameter. Expected true or false."),
-                "invalid_request_error",
-                "invalid_query_parameter",
-            ),
+            Self::InvalidGroup => {
+                let response = openai_error(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid group query parameter. Expected comma-separated UUIDs.",
+                    "invalid_request_error",
+                    "invalid_group",
+                );
+                rejections::refuse(origin, response, "invalid_group", Some("group"), None)
+            }
+            Self::InvalidBoolean { param } => {
+                let response = openai_error(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid {param} query parameter. Expected true or false."),
+                    "invalid_request_error",
+                    "invalid_query_parameter",
+                );
+                rejections::refuse(origin, response, "invalid_query_parameter", Some(param), None)
+            }
         }
     }
 }
@@ -75,15 +86,6 @@ fn openai_error(status: StatusCode, message: &str, error_type: &str, code: &str)
         })),
     )
         .into_response()
-}
-
-fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?.trim();
-    let (scheme, token) = value.split_once(char::is_whitespace)?;
-    scheme
-        .eq_ignore_ascii_case("bearer")
-        .then_some(token.trim())
-        .filter(|token| !token.is_empty())
 }
 
 fn database_error(operation: &str, error: impl std::fmt::Display) -> Response {
@@ -134,23 +136,28 @@ fn parse_optional_bool(param: &'static str, value: Option<&str>) -> Result<Optio
 pub async fn list_ai_models<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Query(query): Query<ModelsListQuery>,
+    recorder: Option<Extension<Recorder>>,
+    uri: Uri,
     headers: HeaderMap,
 ) -> Result<Json<ModelsListResponse>, Response> {
+    let origin = Origin::new(recorder.as_ref().map(|Extension(recorder)| recorder), &headers, uri.path());
     let Some(token) = bearer_token(&headers) else {
-        return Err(openai_error(
+        let response = openai_error(
             StatusCode::UNAUTHORIZED,
             "Missing Authorization header",
             "authentication_error",
             "missing_authorization",
-        ));
+        );
+        return Err(rejections::refuse(origin, response, "missing_authorization", None, None));
     };
 
-    let group_ids = parse_group_filter(query.group.as_deref()).map_err(ModelsListQueryError::into_response)?;
-    let available_for_realtime = parse_optional_bool("available_for_realtime", query.available_for_realtime.as_deref())
-        .map_err(ModelsListQueryError::into_response)?;
+    let refuse_query = |error: ModelsListQueryError| error.refuse(origin);
+    let group_ids = parse_group_filter(query.group.as_deref()).map_err(refuse_query)?;
+    let available_for_realtime =
+        parse_optional_bool("available_for_realtime", query.available_for_realtime.as_deref()).map_err(refuse_query)?;
     let include_reasoning_capabilities =
         parse_optional_bool("include_reasoning_capabilities", query.include_reasoning_capabilities.as_deref())
-            .map_err(ModelsListQueryError::into_response)?
+            .map_err(refuse_query)?
             .unwrap_or(false);
 
     let mut conn = state
@@ -180,12 +187,13 @@ pub async fn list_ai_models<P: PoolProvider>(
     let Some(user_id) = user_id else {
         // See INVALID_API_KEY_MESSAGE: a wrong-region key looks identical to an
         // invalid one, so the copy nudges users to check their regional endpoint.
-        return Err(openai_error(
+        let response = openai_error(
             StatusCode::UNAUTHORIZED,
             crate::errors::INVALID_API_KEY_MESSAGE,
             "authentication_error",
             "invalid_api_key",
-        ));
+        );
+        return Err(rejections::refuse(origin, response, "invalid_api_key", None, None));
     };
 
     let mut models_query = QueryBuilder::new(
