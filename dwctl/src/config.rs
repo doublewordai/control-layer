@@ -1897,37 +1897,11 @@ pub struct BatchConfig {
     /// Default: 1000.
     pub unverified_requests_per_completion_hour: usize,
 
-    /// Count work already admitted and not yet finished in batch admission capacity checks.
-    ///
-    /// When true, admitting a batch for window `W` checks, for `W` and every longer allowed
-    /// window, that the model's outstanding batch requests due within that window (pending,
-    /// claimed or processing rows of active batches, plus the template count of batches whose
-    /// rows have not been inserted yet), plus in-flight reservations, plus the new batch, fit in
-    /// `throughput × window × relaxation`. When false, admission only counts active in-flight
-    /// reservations, which makes the check effectively per batch.
+    /// Include committed pending/claimed/processing requests in batch admission capacity checks.
+    /// When false, admission capacity checks only include active in-flight reservations.
     /// Default: false.
     #[serde(default)]
     pub pending_capacity_counts_enabled: bool,
-
-    /// Maximum age, in seconds, of a per-replica cached outstanding-work snapshot used by
-    /// batch admission when `pending_capacity_counts_enabled` is set.
-    ///
-    /// The count is proportional to a model's outstanding backlog, so it is refreshed at most
-    /// once per model per this interval per replica instead of on every submission. Using a
-    /// snapshot is safe at any age: reservations released after the snapshot was taken are
-    /// added back, so batches admitted since are still counted; a stale snapshot only
-    /// over-counts work that has completed since (under-acceptance). The effective age is
-    /// capped at half of `reservation_ttl_secs`, so a reservation its handler never released
-    /// is still counted while any snapshot taken before it is in use. `0` disables the cache
-    /// and counts on every submission. Default: 10.
-    pub pending_capacity_counts_max_age_secs: u64,
-
-    /// Statement timeout, in milliseconds, for the admission outstanding-work count. On
-    /// timeout or error admission falls back to the last usable snapshot, or to reservations
-    /// only (fail open). Must be positive (> 0): a zero timeout would fail every count and
-    /// silently turn the check off. Default: 10000.
-    #[serde(deserialize_with = "deserialize_positive_timeout_ms")]
-    pub pending_capacity_counts_timeout_ms: u64,
 }
 
 /// Configuration for the async requests feature.
@@ -2011,19 +1985,6 @@ where
     }
 }
 
-fn deserialize_positive_timeout_ms<'de, D>(deserializer: D) -> Result<u64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error;
-
-    let value = u64::deserialize(deserializer)?;
-    if value == 0 {
-        return Err(D::Error::custom("pending_capacity_counts_timeout_ms must be positive (> 0), got 0"));
-    }
-    Ok(value)
-}
-
 /// Custom deserializer that validates throughput is positive, with null/missing defaulting to 100.0
 fn deserialize_positive_throughput<'de, D>(deserializer: D) -> Result<f32, D::Error>
 where
@@ -2063,8 +2024,6 @@ impl Default for BatchConfig {
             reservation_ttl_secs: default_reservation_ttl_secs(),
             unverified_requests_per_completion_hour: 1000,
             pending_capacity_counts_enabled: false,
-            pending_capacity_counts_max_age_secs: 10,
-            pending_capacity_counts_timeout_ms: 10_000,
         }
     }
 }
@@ -5708,58 +5667,6 @@ batches:
     fn test_reservation_ttl_default() {
         let config = Config::default();
         assert_eq!(config.batches.reservation_ttl_secs, 600);
-    }
-
-    #[test]
-    fn test_pending_capacity_counts_timeout_zero_rejected() {
-        Jail::expect_with(|jail| {
-            jail.create_file(
-                "test.yaml",
-                r#"
-secret_key: "test-secret-key"
-batches:
-  pending_capacity_counts_timeout_ms: 0
-"#,
-            )?;
-
-            let args = Args {
-                config: "test.yaml".into(),
-                validate: false,
-            };
-            let result = Config::load(&args);
-            assert!(result.is_err());
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("pending_capacity_counts_timeout_ms must be positive")
-            );
-
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn test_pending_capacity_counts_timeout_explicit_value() {
-        Jail::expect_with(|jail| {
-            jail.create_file(
-                "test.yaml",
-                r#"
-secret_key: "test-secret-key"
-batches:
-  pending_capacity_counts_timeout_ms: 2500
-"#,
-            )?;
-
-            let args = Args {
-                config: "test.yaml".into(),
-                validate: false,
-            };
-            let config = Config::load(&args)?;
-            assert_eq!(config.batches.pending_capacity_counts_timeout_ms, 2500);
-
-            Ok(())
-        });
     }
 
     #[test]

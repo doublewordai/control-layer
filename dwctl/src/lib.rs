@@ -328,9 +328,6 @@ where
     /// Encrypted key custody, built from `config.keystore`. `None` means it is
     /// not configured (ZDR flex disabled).
     pub keystore: Option<crate::keystore::Keystore>,
-    /// Per-replica cache of outstanding batch work used by batch admission.
-    #[builder(default)]
-    pub admission_demand_cache: crate::api::handlers::sla_capacity::AdmissionDemandCache,
     /// Per-key account policy map (ZDR, disabled modalities, toleration
     /// preset), kept fresh by [`crate::sync::key_policy`]. The batch ingest
     /// path reads an account's resolved tolerations from here (its hidden batch

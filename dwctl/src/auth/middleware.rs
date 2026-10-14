@@ -567,7 +567,6 @@ mod tests {
             response_store: state.response_store,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
-            admission_demand_cache: Default::default(),
             key_policy_cache: state.key_policy_cache.clone(),
         };
 
@@ -684,7 +683,6 @@ mod tests {
             response_store: state.response_store,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
-            admission_demand_cache: Default::default(),
             key_policy_cache: state.key_policy_cache.clone(),
         };
 
@@ -803,7 +801,6 @@ mod tests {
             response_store: state.response_store,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
-            admission_demand_cache: Default::default(),
             key_policy_cache: state.key_policy_cache.clone(),
         };
 
@@ -991,7 +988,6 @@ mod tests {
             response_store: state.response_store,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
-            admission_demand_cache: Default::default(),
             key_policy_cache: state.key_policy_cache.clone(),
         };
 
@@ -1110,7 +1106,6 @@ mod tests {
             response_store: state.response_store,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
-            admission_demand_cache: Default::default(),
             key_policy_cache: state.key_policy_cache.clone(),
         };
 
