@@ -116,12 +116,11 @@ pub fn build_leg_body(ctx: &RequestContext, token_ids: &[u32], max_tokens: Optio
     if let Some(max_tokens) = max_tokens {
         body["max_tokens"] = json!(max_tokens);
     }
-    // Scheduling tolerations: the leg must carry the original's tolerations,
-    // or a batch stream (which the fusillade daemon marks with
-    // `dispatch_tolerations`) could finish on capacity the backend reserves
-    // for other traffic. This
-    // layer sits inside the inference middleware, so on a realtime body any
-    // client-supplied value is already stripped and only the daemon's survives.
+    // Scheduling tolerations: the leg must carry the original's tolerations (an
+    // account preset, or the batch daemon's dispatch hold), or it could finish
+    // on capacity the original was kept off. This layer sits inside the
+    // inference middleware, so on a realtime body any client-supplied value is
+    // already replaced by the account's preset or stripped.
     if let Some(tolerations) = ctx.body.pointer("/nvext/routing_constraints/tolerations").filter(|v| !v.is_null()) {
         body["nvext"]["routing_constraints"] = json!({"tolerations": tolerations});
     }

@@ -4213,8 +4213,13 @@ impl Application {
         let mut postgres_daemon = fusillade::PostgresDaemon::from_store(request_manager.clone(), fusillade_daemon_config.clone())
             .with_retention_maintenance(retention_maintenance_config)
             .with_leak_config(config.background_services.batch_daemon.leak.clone());
-        if let Some(tolerations) = &config.background_services.batch_daemon.dispatch_tolerations {
-            postgres_daemon = postgres_daemon.with_dispatch_tolerations(tolerations.clone());
+        if let Some(hold) = config
+            .background_services
+            .batch_daemon
+            .dispatch_hold
+            .to_fusillade(&config.scheduling)
+        {
+            postgres_daemon = postgres_daemon.with_dispatch_hold(hold);
         }
         let postgres_daemon = Arc::new(postgres_daemon);
         // Build the ZDR keystore once and share it across the response store, the

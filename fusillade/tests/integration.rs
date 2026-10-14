@@ -266,7 +266,7 @@ fn call_priority(call: &fusillade::http::MockCall) -> i64 {
         .expect("daemon must inject an integer priority")
 }
 
-/// The scheduling tolerations the daemon wrote into a dispatched body.
+/// The scheduling tolerations a dispatched body carries.
 fn call_tolerations(call: &fusillade::http::MockCall) -> serde_json::Value {
     serde_json::from_str::<serde_json::Value>(&call.body).unwrap()["nvext"]["routing_constraints"]
         ["tolerations"]
@@ -495,8 +495,12 @@ async fn background_tier_end_to_end(pool: sqlx::PgPool) {
 
     let shutdown = CancellationToken::new();
     let daemon_handle = Arc::new(
-        PostgresDaemon::new(manager.clone(), http_client.clone(), config)
-            .with_dispatch_tolerations(vec![]),
+        PostgresDaemon::new(manager.clone(), http_client.clone(), config).with_dispatch_hold(
+            fusillade::daemon::DispatchHold {
+                tolerations: serde_json::json!([]),
+                models: ["spare-model".to_string()].into(),
+            },
+        ),
     )
     .run(shutdown.clone())
     .unwrap();
@@ -524,8 +528,9 @@ async fn background_tier_end_to_end(pool: sqlx::PgPool) {
     assert!(calls[3].body.contains("background"));
     assert_eq!(call_priority(&calls[2]), i32::MIN as i64);
     assert_eq!(call_priority(&calls[3]), i32::MIN as i64);
-    assert_eq!(call_tolerations(&calls[2]), serde_json::json!([]));
-    assert_eq!(call_tolerations(&calls[3]), serde_json::json!([]));
+    // Background work is never held, even on an opted-in model.
+    assert_eq!(call_tolerations(&calls[2]), serde_json::Value::Null);
+    assert_eq!(call_tolerations(&calls[3]), serde_json::Value::Null);
     assert!(
         calls[2].body.contains(r#""kind":"background-batch""#)
             || calls[3].body.contains(r#""kind":"background-batch""#)

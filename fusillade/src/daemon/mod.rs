@@ -32,15 +32,15 @@ use crate::processor::{DefaultRequestProcessor, RequestProcessor};
 use crate::request::{Claimed, DaemonId, FailureReason, Request, RequestCompletionResult};
 
 pub use config::{
-    DaemonConfig, DaemonMode, LeakConfig, ModelEscalationConfig, RetentionMaintenanceConfig,
-    ShouldRetryFn, Toleration, TolerationEffect, TolerationOperator, default_should_retry,
+    DaemonConfig, DaemonMode, DispatchHold, LeakConfig, ModelEscalationConfig,
+    RetentionMaintenanceConfig, ShouldRetryFn, default_should_retry,
 };
 pub use fusillade_core::daemon_record::{
     AnyDaemonRecord, DaemonData, DaemonRecord, DaemonState, DaemonStats, DaemonStatus, Dead,
     Initializing, Running,
 };
 use fusillade_core::release::TolerationsReleaseSettings;
-use fusillade_core::request::DispatchTolerations;
+use fusillade_core::request::{DispatchTolerations, TolerationsRelease};
 use sla_release::release_reason;
 
 /// Per-user throughput counters, reset after each emission cycle.
@@ -58,6 +58,9 @@ struct UserThroughputStats {
 struct PreparedRequest {
     request: Request<Claimed>,
     capacity_model: String,
+    /// The daemon inserted its hold list into this dispatch's body: it may
+    /// only run on capacity the list tolerates (see [`DispatchHold`]).
+    held: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,64 +216,91 @@ fn object_entry<'a>(
         .expect("entry was just made an object")
 }
 
-/// What dispatch does with a body's `nvext.routing_constraints.tolerations`.
+/// The dispatch hold to apply to one outbound body.
 #[derive(Debug, Clone, Copy)]
-enum TolerationsWrite<'a> {
-    /// Tolerations are not configured: the body is not touched.
-    Leave,
-    /// Overwrite with the daemon's tolerations.
-    Set(&'a serde_json::Value),
-    /// Released: send the request without the field, whatever the stored
-    /// body holds (a body stored before uploads stripped it, or written by
-    /// another client of this library, could otherwise keep a toleration).
-    Remove,
+struct HoldWrite<'a> {
+    /// The hold list (the configured preset's tolerations).
+    tolerations: &'a serde_json::Value,
+    /// The claim's decision: hold, or release with a reason.
+    decision: DispatchTolerations,
+}
+
+/// What [`inject_nvext_extensions`] did with a [`HoldWrite`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoldOutcome {
+    /// No hold applied: none requested, or the body is not a JSON object.
+    NotApplied,
+    /// The stored body already carries `nvext.routing_constraints.tolerations`
+    /// (an account's pinned preset, stamped at upload): sent unchanged, held
+    /// or not.
+    Preset,
+    /// The hold list was inserted.
+    Held,
+    /// The claim released the request: sent without the hold list.
+    Released(TolerationsRelease),
+}
+
+/// Whether a body carries a (non-null) scheduling toleration list.
+fn has_tolerations(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+    object
+        .get("nvext")
+        .and_then(|nvext| nvext.get("routing_constraints"))
+        .and_then(|constraints| constraints.get("tolerations"))
+        .is_some_and(|tolerations| !tolerations.is_null())
 }
 
 /// Write the daemon's request extensions (`nvext`) into an outbound body in one
 /// parse and one serialise: the scheduling priority at
-/// `nvext.agent_hints.priority` and the scheduling tolerations at `nvext.routing_constraints.tolerations`. Each
-/// overwrites a value already in the body (or, for released tolerations,
-/// removes it); every other key is preserved. With nothing to write or remove,
-/// or a body that is not a JSON object, the body is untouched.
+/// `nvext.agent_hints.priority` (overwriting any value) and, for a held
+/// dispatch, the hold list at `nvext.routing_constraints.tolerations`, but
+/// only when the body carries no toleration list of its own. A list already in
+/// the body is an account preset and always wins; nothing is ever removed.
+/// Every other key is preserved. With nothing to write, or a body that is not
+/// a JSON object, the body is untouched.
 fn inject_nvext_extensions(
     body: &mut String,
     priority: Option<i32>,
-    tolerations: TolerationsWrite<'_>,
-) {
-    if priority.is_none() && matches!(tolerations, TolerationsWrite::Leave) {
-        return;
+    hold: Option<HoldWrite<'_>>,
+) -> HoldOutcome {
+    if priority.is_none() && hold.is_none() {
+        return HoldOutcome::NotApplied;
     }
     let Ok(mut json) = serde_json::from_str::<serde_json::Value>(body) else {
-        return;
+        return HoldOutcome::NotApplied;
     };
     let Some(object) = json.as_object_mut() else {
-        return;
+        return HoldOutcome::NotApplied;
     };
 
-    let mut changed = false;
-    if let TolerationsWrite::Remove = tolerations {
-        changed |= object
-            .get_mut("nvext")
-            .and_then(|nvext| nvext.get_mut("routing_constraints"))
-            .and_then(serde_json::Value::as_object_mut)
-            .is_some_and(|constraints| constraints.remove("tolerations").is_some());
-    }
+    let outcome = match hold {
+        None => HoldOutcome::NotApplied,
+        Some(_) if has_tolerations(object) => HoldOutcome::Preset,
+        Some(HoldWrite {
+            decision: DispatchTolerations::Release(reason),
+            ..
+        }) => HoldOutcome::Released(reason),
+        Some(HoldWrite {
+            tolerations,
+            decision: DispatchTolerations::Keep,
+        }) => {
+            object_entry(object_entry(object, "nvext"), "routing_constraints")
+                .insert("tolerations".to_string(), tolerations.clone());
+            HoldOutcome::Held
+        }
+    };
     if let Some(priority) = priority {
         object_entry(object_entry(object, "nvext"), "agent_hints").insert(
             "priority".to_string(),
             serde_json::Value::Number(priority.into()),
         );
-        changed = true;
-    }
-    if let TolerationsWrite::Set(tolerations) = tolerations {
-        object_entry(object_entry(object, "nvext"), "routing_constraints")
-            .insert("tolerations".to_string(), tolerations.clone());
-        changed = true;
     }
 
-    if changed && let Ok(new_body) = serde_json::to_string(&json) {
+    if (priority.is_some() || outcome == HoldOutcome::Held)
+        && let Ok(new_body) = serde_json::to_string(&json)
+    {
         *body = new_body;
     }
+    outcome
 }
 
 /// Backoff before retrying a failed claim cycle: exponential in the number of
@@ -1720,9 +1750,9 @@ where
     config: DaemonConfig,
     retention_maintenance: RetentionMaintenanceConfig,
     leak_config: Option<LeakConfig>,
-    /// Pre-serialised [`Daemon::with_dispatch_tolerations`] value, written into
-    /// every dispatched body. `None` injects nothing.
-    dispatch_tolerations: Option<serde_json::Value>,
+    /// [`Daemon::with_dispatch_hold`]: the opted-in models' hold list. `None`
+    /// (the default) leaves every body as it was stored.
+    dispatch_hold: Option<DispatchHold>,
     /// Per-claim processing hook. Defaults to [`DefaultRequestProcessor`],
     /// which preserves the existing fire-and-store pipeline byte-for-byte.
     /// Override via [`Daemon::with_processor`] to inject custom orchestration
@@ -1826,7 +1856,7 @@ where
             config,
             retention_maintenance: RetentionMaintenanceConfig::default(),
             leak_config: None,
-            dispatch_tolerations: None,
+            dispatch_hold: None,
             processor: Arc::new(DefaultRequestProcessor),
             requests_in_flight: Arc::new(dashmap::DashMap::new()),
             adaptive_concurrency,
@@ -1874,25 +1904,23 @@ where
         self
     }
 
-    /// Write these tolerations to `nvext.routing_constraints.tolerations` on
-    /// every request the daemon dispatches (batch, flex and background),
-    /// overwriting any value already in the body and leaving the rest of
-    /// `nvext` untouched. They are scheduling/routing tolerations understood
-    /// by the upstream inference backend; a backend may, for example, use
-    /// them to keep batch work off capacity reserved for other traffic, so
-    /// the request waits and is retried instead. Without this, bodies are
-    /// left byte-identical.
-    /// Independent of [`DaemonConfig::inject_deadline_priority`].
+    /// Hold the batch and flex dispatches of the opted-in models on capacity
+    /// the hold list tolerates: the list (a scheduling-toleration list the
+    /// upstream inference backend understands, such as `[]`) is written to
+    /// `nvext.routing_constraints.tolerations` of a dispatch when the stored
+    /// body carries no toleration list of its own. A body that already has one
+    /// (an account's pinned preset) is sent unchanged and never released.
+    /// Background work and models not in the list are never held. Without
+    /// this, bodies are left byte-identical. Independent of
+    /// [`DaemonConfig::inject_deadline_priority`].
     ///
-    /// Near its SLA deadline a request is sent without the field instead (see
-    /// `tolerations_released`), so the backend may schedule it anywhere: near
-    /// SLA failure, meeting the deadline matters more than where it runs.
-    /// Counted by `fusillade_tolerations_released_total{model}`.
-    pub fn with_dispatch_tolerations(mut self, tolerations: Vec<Toleration>) -> Self {
-        // Serialised once here, not per request: the same value goes on every
-        // dispatched body.
-        self.dispatch_tolerations =
-            Some(serde_json::to_value(tolerations).expect("tolerations serialise to JSON"));
+    /// A held request is released (sent as stored, without the hold list)
+    /// once it is inside the batch-claim deadline ramp or past its deadline:
+    /// near SLA failure, meeting the deadline matters more than where the
+    /// request runs. Counted by
+    /// `fusillade_tolerations_released_total{model,reason}`.
+    pub fn with_dispatch_hold(mut self, hold: DispatchHold) -> Self {
+        self.dispatch_hold = Some(hold);
         self
     }
 
@@ -2496,6 +2524,50 @@ where
         }
     }
 
+    /// The dispatch hold for one claimed request, or `None` when it is not
+    /// held: hold not configured, background work, a model that is not opted
+    /// in, a request escalated to another model, or no deadline.
+    fn hold_write<'a>(
+        &'a self,
+        kind: ClaimLoopKind,
+        capacity_model: &str,
+        request: &Request<Claimed>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<HoldWrite<'a>> {
+        let hold = self.dispatch_hold.as_ref()?;
+        if kind.is_background()
+            || !hold.models.contains(capacity_model)
+            || request.data.model != capacity_model
+        {
+            return None;
+        }
+        let decision = match request.state.tolerations {
+            Some(decision) => decision,
+            // The claim path made no decision: apply the same deadline floor
+            // here.
+            None => {
+                request.state.batch_expires_at?;
+                match release_reason(
+                    request.state.batch_expires_at,
+                    request
+                        .data
+                        .batch_metadata
+                        .get("created_at")
+                        .map(String::as_str),
+                    self.config.claim_ramp_exponent,
+                    now,
+                ) {
+                    Some(reason) => DispatchTolerations::Release(reason),
+                    None => DispatchTolerations::Keep,
+                }
+            }
+        };
+        Some(HoldWrite {
+            tolerations: &hold.tolerations,
+            decision,
+        })
+    }
+
     fn prepare_claimed_requests(
         &self,
         claimed: Vec<Request<Claimed>>,
@@ -2506,6 +2578,7 @@ where
             .map(|request| PreparedRequest {
                 capacity_model: request.data.model.clone(),
                 request,
+                held: false,
             })
             .collect();
 
@@ -2560,30 +2633,17 @@ where
             } else {
                 None
             };
-            let mut tolerations = self
-                .dispatch_tolerations
-                .as_ref()
-                .map_or(TolerationsWrite::Leave, TolerationsWrite::Set);
-            if self.dispatch_tolerations.is_some() && !kind.is_background() {
-                // The claim query decides (and records the decision on the
-                // row) whenever the storage supports it; otherwise apply the
-                // deadline floor here.
-                let reason = match request.state.tolerations {
-                    Some(DispatchTolerations::Keep) => None,
-                    Some(DispatchTolerations::Release(reason)) => Some(reason),
-                    None => release_reason(
-                        request.state.batch_expires_at,
-                        request
-                            .data
-                            .batch_metadata
-                            .get("created_at")
-                            .map(String::as_str),
-                        self.config.claim_ramp_exponent,
-                        now,
-                    ),
-                };
-                if let Some(reason) = reason {
-                    tolerations = TolerationsWrite::Remove;
+            let hold = self.hold_write(kind, capacity_model, request, now);
+            match inject_nvext_extensions(&mut request.data.body, priority, hold) {
+                HoldOutcome::Held => {
+                    prepared_request.held = true;
+                    counter!(
+                        "fusillade_hold_dispatches_total",
+                        "model" => capacity_model.clone()
+                    )
+                    .increment(1);
+                }
+                HoldOutcome::Released(reason) => {
                     counter!(
                         "fusillade_tolerations_released_total",
                         "model" => capacity_model.clone(),
@@ -2591,12 +2651,8 @@ where
                     )
                     .increment(1);
                 }
+                HoldOutcome::Preset | HoldOutcome::NotApplied => {}
             }
-            inject_nvext_extensions(
-                &mut prepared_request.request.data.body,
-                priority,
-                tolerations,
-            );
         }
 
         prepared
@@ -2627,6 +2683,7 @@ where
                 let PreparedRequest {
                     request,
                     capacity_model,
+                    held: _held,
                 } = prepared_request;
                 let request_id = request.data.id;
                 let batch_id = request.data.batch_id;
@@ -3272,7 +3329,7 @@ where
         // The claim queries decide scheduling tolerations from these settings.
         self.storage
             .configure_tolerations_release(TolerationsReleaseSettings {
-                tolerations_enabled: self.dispatch_tolerations.is_some(),
+                tolerations_enabled: self.dispatch_hold.is_some(),
             });
 
         // Spawn periodic status logging task if configured
@@ -5843,7 +5900,7 @@ mod tests {
     fn priority_injection_keeps_key_order() {
         let mut body = r#"{"model":"m","response_format":{"type":"json_schema","json_schema":{"name":"n","schema":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"string"}}}}},"messages":[]}"#.to_string();
 
-        inject_nvext_extensions(&mut body, Some(7), TolerationsWrite::Leave);
+        inject_nvext_extensions(&mut body, Some(7), None);
 
         assert_eq!(
             body,
@@ -5862,11 +5919,7 @@ mod tests {
         })
         .to_string();
 
-        inject_nvext_extensions(
-            &mut body,
-            Some(BACKGROUND_DYNAMO_PRIORITY),
-            TolerationsWrite::Leave,
-        );
+        inject_nvext_extensions(&mut body, Some(BACKGROUND_DYNAMO_PRIORITY), None);
 
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
@@ -5885,46 +5938,93 @@ mod tests {
         );
     }
 
+    fn hold_write(
+        tolerations: &serde_json::Value,
+        decision: DispatchTolerations,
+    ) -> Option<HoldWrite<'_>> {
+        Some(HoldWrite {
+            tolerations,
+            decision,
+        })
+    }
+
     #[test]
     fn no_extensions_leave_the_body_byte_identical() {
         // Odd spacing and key order a re-serialise would normalise.
         let original = r#"{ "model":"m",  "nvext":{"routing_constraints":{"tolerations":[{"operator":"Exists"}]}}, "a":1 }"#;
         let mut body = original.to_string();
-        inject_nvext_extensions(&mut body, None, TolerationsWrite::Leave);
+        assert_eq!(
+            inject_nvext_extensions(&mut body, None, None),
+            HoldOutcome::NotApplied
+        );
         assert_eq!(body, original);
 
+        let empty = serde_json::json!([]);
         // A non-object body is left alone even when something is configured.
         let mut body = "[1,2]".to_string();
-        inject_nvext_extensions(
-            &mut body,
-            Some(1),
-            TolerationsWrite::Set(&serde_json::json!([])),
+        assert_eq!(
+            inject_nvext_extensions(
+                &mut body,
+                Some(1),
+                hold_write(&empty, DispatchTolerations::Keep)
+            ),
+            HoldOutcome::NotApplied
         );
         assert_eq!(body, "[1,2]");
+
+        // A released request is sent exactly as stored.
+        let original = r#"{ "model":"m",  "a":1 }"#;
+        let mut body = original.to_string();
+        assert_eq!(
+            inject_nvext_extensions(
+                &mut body,
+                None,
+                hold_write(
+                    &empty,
+                    DispatchTolerations::Release(TolerationsRelease::Ramp)
+                )
+            ),
+            HoldOutcome::Released(TolerationsRelease::Ramp)
+        );
+        assert_eq!(body, original);
+
+        // So is a held request whose body carries an account preset.
+        let original = r#"{ "model":"m", "nvext":{"routing_constraints":{"tolerations":[]}} }"#;
+        let mut body = original.to_string();
+        assert_eq!(
+            inject_nvext_extensions(
+                &mut body,
+                None,
+                hold_write(
+                    &serde_json::json!([{"key": "k", "operator": "Exists"}]),
+                    DispatchTolerations::Keep
+                )
+            ),
+            HoldOutcome::Preset
+        );
+        assert_eq!(body, original);
     }
 
     #[test]
-    fn tolerations_overwrite_the_body_value_and_keep_siblings() {
+    fn the_hold_is_set_only_when_the_body_has_no_tolerations() {
+        let empty = serde_json::json!([]);
         let mut body = serde_json::json!({
             "model": "m",
             "nvext": {
                 "cache_control": {"enabled": true},
                 "agent_hints": {"max_batch_size": 8},
-                "routing_constraints": {
-                    "tolerations": [{"operator": "Exists"}],
-                    "required": ["a"],
-                    "preferred": {"b": 1.0}
-                }
+                "routing_constraints": {"required": ["a"], "preferred": {"b": 1.0}}
             }
         })
         .to_string();
-
-        inject_nvext_extensions(
-            &mut body,
-            None,
-            TolerationsWrite::Set(&serde_json::json!([])),
+        assert_eq!(
+            inject_nvext_extensions(
+                &mut body,
+                None,
+                hold_write(&empty, DispatchTolerations::Keep)
+            ),
+            HoldOutcome::Held
         );
-
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         let constraints = &json["nvext"]["routing_constraints"];
         assert_eq!(constraints["tolerations"], serde_json::json!([]));
@@ -5933,84 +6033,105 @@ mod tests {
         assert_eq!(json["nvext"]["cache_control"]["enabled"], true);
         assert!(
             json["nvext"]["agent_hints"].get("priority").is_none(),
-            "tolerations alone do not inject a priority"
+            "the hold alone does not inject a priority"
         );
         assert_eq!(json["nvext"]["agent_hints"]["max_batch_size"], 8);
-    }
 
-    #[test]
-    fn released_tolerations_remove_a_stored_value() {
-        let mut body = serde_json::json!({
-            "model": "m",
-            "nvext": {
-                "routing_constraints": {
-                    "tolerations": [{"operator": "Exists"}],
-                    "required": ["a"]
-                }
-            }
-        })
-        .to_string();
-
-        inject_nvext_extensions(&mut body, Some(5), TolerationsWrite::Remove);
-
-        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let constraints = &json["nvext"]["routing_constraints"];
-        assert!(
-            constraints.get("tolerations").is_none(),
-            "a released request is sent without the field"
+        // An explicit null is no list: the hold fills it.
+        let mut body =
+            r#"{"model":"m","nvext":{"routing_constraints":{"tolerations":null}}}"#.to_string();
+        assert_eq!(
+            inject_nvext_extensions(
+                &mut body,
+                None,
+                hold_write(&empty, DispatchTolerations::Keep)
+            ),
+            HoldOutcome::Held
         );
-        assert_eq!(constraints["required"], serde_json::json!(["a"]));
-        assert_eq!(json["nvext"]["agent_hints"]["priority"], 5);
+        assert_eq!(
+            body,
+            r#"{"model":"m","nvext":{"routing_constraints":{"tolerations":[]}}}"#
+        );
 
-        // Nothing to remove and nothing else to write: byte-identical.
-        let original = r#"{ "model":"m",  "a":1 }"#;
-        let mut body = original.to_string();
-        inject_nvext_extensions(&mut body, None, TolerationsWrite::Remove);
-        assert_eq!(body, original);
+        // Account presets ([] and a tolerating list) win over the hold list;
+        // the priority is still written.
+        for preset in [
+            serde_json::json!([]),
+            serde_json::json!([{"key": "example.com/reserved", "operator": "Exists"}]),
+        ] {
+            let mut body = serde_json::json!({
+                "model": "m",
+                "nvext": {"routing_constraints": {"tolerations": preset.clone()}}
+            })
+            .to_string();
+            assert_eq!(
+                inject_nvext_extensions(
+                    &mut body,
+                    Some(-5),
+                    hold_write(
+                        &serde_json::json!([{"key": "x", "operator": "Exists"}]),
+                        DispatchTolerations::Keep
+                    )
+                ),
+                HoldOutcome::Preset
+            );
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(json["nvext"]["routing_constraints"]["tolerations"], preset);
+            assert_eq!(json["nvext"]["agent_hints"]["priority"], -5);
+        }
     }
 
     #[test]
-    fn tolerations_and_priority_are_injected_together() {
-        let tolerations = serde_json::to_value(vec![Toleration {
-            key: Some("example.com/reserved".to_string()),
-            operator: Some(TolerationOperator::Exists),
-            value: None,
-            effect: Some(TolerationEffect::PreferNoSchedule),
-        }])
-        .unwrap();
+    fn hold_and_priority_are_injected_together() {
+        let tolerations =
+            serde_json::json!([{"key": "example.com/reserved", "operator": "Exists"}]);
         let mut body = r#"{"model":"m","messages":[],"nvext":"not-an-object"}"#.to_string();
 
-        inject_nvext_extensions(&mut body, Some(-42), TolerationsWrite::Set(&tolerations));
+        assert_eq!(
+            inject_nvext_extensions(
+                &mut body,
+                Some(-42),
+                hold_write(&tolerations, DispatchTolerations::Keep)
+            ),
+            HoldOutcome::Held
+        );
 
         assert_eq!(
             body,
-            r#"{"model":"m","messages":[],"nvext":{"agent_hints":{"priority":-42},"routing_constraints":{"tolerations":[{"key":"example.com/reserved","operator":"Exists","effect":"PreferNoSchedule"}]}}}"#
+            r#"{"model":"m","messages":[],"nvext":{"routing_constraints":{"tolerations":[{"key":"example.com/reserved","operator":"Exists"}]},"agent_hints":{"priority":-42}}}"#
         );
     }
 
-    #[sqlx::test]
-    async fn dispatch_tolerations_follow_the_deadline(pool: sqlx::PgPool) {
-        use crate::request::{Claimed, Request, RequestData, TolerationsRelease};
-
+    /// A daemon over a real (empty) store, for the dispatch-preparation tests.
+    async fn preparing_daemon(
+        pool: sqlx::PgPool,
+        config: DaemonConfig,
+    ) -> Daemon<
+        fusillade_arsenal::PostgresRequestManager<fusillade_arsenal::TestDbPools>,
+        crate::MockHttpClient,
+    > {
         let storage = Arc::new(fusillade_arsenal::PostgresRequestManager::new(
             fusillade_arsenal::TestDbPools::new(pool).await.unwrap(),
             fusillade_arsenal::PostgresStorageConfig::default(),
         ));
-        let daemon = Daemon::new(
+        Daemon::new(
             storage,
             Arc::new(crate::MockHttpClient::new()),
-            DaemonConfig {
-                inject_deadline_priority: true,
-                ..Default::default()
-            },
+            config,
             tokio_util::sync::CancellationToken::new(),
         )
-        .with_dispatch_tolerations(vec![]);
+    }
 
-        let now = chrono::Utc::now();
+    /// A claimed request for `model` with `body`, created 12 hours ago.
+    fn claimed_request(
+        model: &str,
+        body: &str,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Request<Claimed> {
+        use crate::request::RequestData;
         let created_at = (now - chrono::Duration::hours(12)).to_rfc3339();
-        const BODY: &str = r#"{"model":"m","messages":[]}"#;
-        let claimed = |deadline: Option<chrono::DateTime<chrono::Utc>>| Request {
+        Request {
             state: Claimed {
                 daemon_id: DaemonId(uuid::Uuid::new_v4()),
                 claimed_at: now,
@@ -6027,123 +6148,176 @@ mod tests {
                 endpoint: "http://localhost".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/chat/completions".to_string(),
-                body: BODY.to_string(),
-                model: "m".to_string(),
+                body: body.to_string(),
+                model: model.to_string(),
                 api_key: "k".to_string(),
                 created_by: "u".to_string(),
-                batch_metadata: HashMap::from([("created_at".to_string(), created_at.clone())]),
+                batch_metadata: HashMap::from([("created_at".to_string(), created_at)]),
             },
-        };
+        }
+    }
+
+    fn tolerations_of(prepared: &PreparedRequest) -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(&prepared.request.data.body).unwrap()["nvext"]
+            ["routing_constraints"]["tolerations"]
+            .clone()
+    }
+
+    #[sqlx::test]
+    async fn dispatch_hold_follows_the_model_list_the_deadline_and_the_body(pool: sqlx::PgPool) {
+        let daemon = preparing_daemon(
+            pool,
+            DaemonConfig {
+                inject_deadline_priority: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .with_dispatch_hold(DispatchHold {
+            tolerations: serde_json::json!([]),
+            models: ["m".to_string()].into(),
+        });
+
+        const BODY: &str = r#"{"model":"m","messages":[]}"#;
+        let preset = r#"{"model":"m","nvext":{"routing_constraints":{"tolerations":[{"key":"example.com/reserved","operator":"Exists"}]}}}"#;
+        let now = chrono::Utc::now();
         let far = now + chrono::Duration::hours(12);
         let near = now + chrono::Duration::minutes(5);
         let past = now - chrono::Duration::minutes(5);
         let prepared = daemon.prepare_claimed_requests(
-            vec![claimed(Some(far)), claimed(Some(near)), claimed(Some(past))],
+            vec![
+                claimed_request("m", BODY, Some(far), now),
+                claimed_request("m", BODY, Some(near), now),
+                claimed_request("m", BODY, Some(past), now),
+                claimed_request("other", BODY, Some(far), now),
+                claimed_request("m", preset, Some(far), now),
+                claimed_request("m", preset, Some(past), now),
+            ],
             ClaimLoopKind::Request,
         );
-        let bodies: Vec<serde_json::Value> = prepared
-            .iter()
-            .map(|p| serde_json::from_str(&p.request.data.body).unwrap())
-            .collect();
 
         assert_eq!(
-            bodies[0]["nvext"]["routing_constraints"]["tolerations"],
+            tolerations_of(&prepared[0]),
             serde_json::json!([]),
-            "far from its deadline, batch keeps its tolerations"
+            "far from its deadline, an opted-in model's request is held"
         );
-        for (body, deadline) in [(&bodies[1], near), (&bodies[2], past)] {
-            assert!(
-                body["nvext"].get("routing_constraints").is_none(),
-                "near or past its deadline the tolerations are released"
-            );
+        assert!(prepared[0].held);
+        for (released, deadline) in [(&prepared[1], near), (&prepared[2], past)] {
+            assert!(!released.held);
             let mut expected = BODY.to_string();
-            inject_nvext_extensions(
-                &mut expected,
-                Some(sla_priority(deadline)),
-                TolerationsWrite::Leave,
-            );
+            inject_nvext_extensions(&mut expected, Some(sla_priority(deadline)), None);
             assert_eq!(
-                prepared_body(&prepared, deadline),
-                expected,
-                "identical to injection-off apart from the priority"
+                released.request.data.body, expected,
+                "near or past its deadline it is sent as stored, apart from the priority"
+            );
+        }
+        assert!(!prepared[3].held);
+        assert_eq!(
+            tolerations_of(&prepared[3]),
+            serde_json::Value::Null,
+            "a model that is not opted in is never held"
+        );
+        for pinned in &prepared[4..] {
+            assert!(!pinned.held, "a preset is not the daemon's hold");
+            assert_eq!(
+                tolerations_of(pinned),
+                serde_json::json!([{"key": "example.com/reserved", "operator": "Exists"}]),
+                "an account preset is sent unchanged, held or released"
             );
         }
 
-        // Background work has no deadline and keeps the tolerations.
-        let prepared =
-            daemon.prepare_claimed_requests(vec![claimed(None)], ClaimLoopKind::BackgroundRequest);
-        let body: serde_json::Value = serde_json::from_str(&prepared[0].request.data.body).unwrap();
-        assert_eq!(
-            body["nvext"]["routing_constraints"]["tolerations"],
-            serde_json::json!([])
+        // Background work is never held.
+        let prepared = daemon.prepare_claimed_requests(
+            vec![claimed_request("m", BODY, None, now)],
+            ClaimLoopKind::BackgroundRequest,
         );
+        assert!(!prepared[0].held);
+        assert_eq!(tolerations_of(&prepared[0]), serde_json::Value::Null);
 
-        // When the claim decided, its decision is final: every replica decides
-        // from the same rows, so the daemon must not second-guess it with its
-        // own clock.
+        // When the claim decided, its decision is final: every replica
+        // decides from the same rows, so the daemon must not second-guess it
+        // with its own clock.
         let decided = |deadline, decision| {
-            let mut request = claimed(Some(deadline));
+            let mut request = claimed_request("m", BODY, Some(deadline), now);
             request.state.tolerations = Some(decision);
             request
         };
-        let release = decided(far, DispatchTolerations::Release(TolerationsRelease::Ramp));
-        let keep = decided(past, DispatchTolerations::Keep);
-        let prepared = daemon.prepare_claimed_requests(vec![release, keep], ClaimLoopKind::Batch);
-        let tolerations = |deadline| -> serde_json::Value {
-            serde_json::from_str::<serde_json::Value>(&prepared_body(&prepared, deadline)).unwrap()
-                ["nvext"]["routing_constraints"]["tolerations"]
-                .clone()
-        };
+        let prepared = daemon.prepare_claimed_requests(
+            vec![
+                decided(far, DispatchTolerations::Release(TolerationsRelease::Ramp)),
+                decided(past, DispatchTolerations::Keep),
+            ],
+            ClaimLoopKind::Batch,
+        );
         assert_eq!(
-            tolerations(far),
+            tolerations_of(&prepared[0]),
             serde_json::Value::Null,
             "released by the claim"
         );
         assert_eq!(
-            tolerations(past),
+            tolerations_of(&prepared[1]),
             serde_json::json!([]),
-            "kept by the claim"
+            "held by the claim"
         );
     }
 
-    fn prepared_body(
-        prepared: &[PreparedRequest],
-        deadline: chrono::DateTime<chrono::Utc>,
-    ) -> String {
-        prepared
-            .iter()
-            .find(|p| p.request.state.batch_expires_at == Some(deadline))
+    /// Without a dispatch hold, outbound bodies are exactly what they were
+    /// before the hold existed: untouched without priority injection, and
+    /// only the priority added with it.
+    #[sqlx::test]
+    async fn dispatch_without_hold_is_byte_identical(pool: sqlx::PgPool) {
+        let now = chrono::Utc::now();
+        let deadline = chrono::DateTime::parse_from_rfc3339("2026-10-15T00:00:00Z")
             .unwrap()
-            .request
-            .data
-            .body
-            .clone()
-    }
+            .with_timezone(&chrono::Utc);
+        let bodies = [
+            r#"{ "model":"m",  "messages":[] }"#,
+            r#"{"model":"m","nvext":{"routing_constraints":{"tolerations":[]}}}"#,
+        ];
 
-    #[test]
-    fn dispatch_tolerations_deserialize() {
-        let tolerations: Vec<Toleration> = serde_json::from_value(serde_json::json!([])).unwrap();
-        assert!(
-            tolerations.is_empty(),
-            "an empty list (tolerate nothing) is expressible"
+        let daemon = preparing_daemon(pool.clone(), DaemonConfig::default()).await;
+        let prepared = daemon.prepare_claimed_requests(
+            bodies
+                .iter()
+                .map(|body| claimed_request("m", body, Some(deadline), now))
+                .collect(),
+            ClaimLoopKind::Batch,
         );
+        for (prepared, body) in prepared.iter().zip(bodies) {
+            assert_eq!(prepared.request.data.body, body);
+            assert!(!prepared.held);
+        }
 
-        let tolerations: Vec<Toleration> = serde_json::from_value(serde_json::json!([
-            {"key": "example.com/reserved", "effect": "NoSchedule"},
-            {"operator": "Exists"}
-        ]))
-        .unwrap();
-        assert_eq!(tolerations[0].effect, Some(TolerationEffect::NoSchedule));
-        assert_eq!(tolerations[0].operator, None);
-        assert_eq!(tolerations[1].operator, Some(TolerationOperator::Exists));
-
-        assert!(
-            serde_json::from_value::<Vec<Toleration>>(serde_json::json!([{"effect": "NoExecute"}]))
-                .is_err(),
-            "an unknown effect is a config error, not a silent no-op"
+        let daemon = preparing_daemon(
+            pool,
+            DaemonConfig {
+                inject_deadline_priority: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        let prepared = daemon.prepare_claimed_requests(
+            bodies
+                .iter()
+                .map(|body| claimed_request("m", body, Some(deadline), now))
+                .collect(),
+            ClaimLoopKind::Batch,
         );
-        assert!(
-            serde_json::from_value::<Vec<Toleration>>(serde_json::json!([{"keys": "x"}])).is_err()
+        assert_eq!(
+            prepared[0].request.data.body,
+            r#"{"model":"m","messages":[],"nvext":{"agent_hints":{"priority":-1792022400}}}"#
+        );
+        assert_eq!(
+            prepared[1].request.data.body,
+            r#"{"model":"m","nvext":{"routing_constraints":{"tolerations":[]},"agent_hints":{"priority":-1792022400}}}"#
+        );
+        let prepared = daemon.prepare_claimed_requests(
+            vec![claimed_request("m", bodies[0], None, now)],
+            ClaimLoopKind::BackgroundBatch,
+        );
+        assert_eq!(
+            prepared[0].request.data.body,
+            r#"{"model":"m","messages":[],"nvext":{"agent_hints":{"priority":-2147483648}}}"#
         );
     }
 

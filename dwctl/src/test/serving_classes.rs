@@ -408,30 +408,12 @@ async fn json_key_order_survives_batch_upload(pool: PgPool) {
     assert!(content.text().contains(ORDERED_SCHEMA), "{}", content.text());
 }
 
-/// Scheduling tolerations may decide which capacity the upstream backend
-/// schedules a request on, so only the fusillade daemon may set them. A realtime
-/// caller's value is stripped and the body re-serialised (onwards forwards the
-/// bytes it receives, COR-522); the daemon loopback keeps its injected value.
+/// The batch daemon's dispatch hold reaches the backend: the inference
+/// middleware passes daemon loopback requests through untouched (the realtime
+/// client-strip and account-preset paths are covered in `toleration_presets`).
 #[dwctl_test_macros::test]
-async fn scheduling_tolerations_are_stripped_from_clients_and_kept_from_the_daemon(pool: PgPool) {
+async fn daemon_scheduling_tolerations_reach_the_backend(pool: PgPool) {
     let f = Fixture::new(&pool).await;
-    let response = f
-        .server
-        .post("/ai/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {}", f.key))
-        .json(&json!({"model":"policy","messages":[{"role":"user","content":"hi"}],
-            "nvext":{"routing_constraints":{"tolerations":[{"operator":"Exists"}],"keep":true},
-                "cache_control":{"enabled":true}}}))
-        .await;
-    response.assert_status_ok();
-    let forwarded = f.last_body().await;
-    assert!(
-        forwarded["nvext"]["routing_constraints"].get("tolerations").is_none(),
-        "a realtime caller must not set its own scheduling tolerations"
-    );
-    assert_eq!(forwarded["nvext"]["routing_constraints"]["keep"], true);
-    assert_eq!(forwarded["nvext"]["cache_control"]["enabled"], true);
-
     let response = f
         .server
         .post("/ai/v1/chat/completions")

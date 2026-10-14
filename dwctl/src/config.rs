@@ -2378,28 +2378,13 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub inject_deadline_priority: bool,
 
-    /// Tolerations the daemon writes to `nvext.routing_constraints.tolerations`
-    /// on every request it dispatches (batch, flex and background), replacing
-    /// any value in the body. They are Kubernetes-style scheduling/routing
-    /// tolerations understood by the upstream inference backend; a backend
-    /// may, for example, use them to keep batch work off capacity reserved for
-    /// other traffic, so the request waits and is retried instead.
-    /// Unset (the default) injects nothing and leaves bodies byte-identical.
-    /// Independent of `inject_deadline_priority`.
-    ///
-    /// Near SLA failure the daemon stops sending them: close to its deadline,
-    /// meeting the SLA matters more than where the request runs. A request within the
-    /// batch-claim deadline ramp (`claim_ramp_exponent`: `window_minutes ^
-    /// exponent` minutes before its deadline, about 59 min for 24h and 10 min
-    /// for 1h at 0.56), or already past its deadline, is sent without the field
-    /// and the backend may schedule it anywhere. Work without a
-    /// deadline (background) always carries them. Counted by
-    /// `fusillade_tolerations_released_total{model}`.
-    ///
-    /// The backend must accept `routing_constraints.tolerations`; one that
-    /// does not may reject the request.
+    /// Hold the batch and flex dispatches of selected models on the capacity
+    /// a scheduling-toleration preset allows, releasing them only when they
+    /// would otherwise miss their completion window. Off by default; with it
+    /// off (or the key absent) outbound bodies are unchanged. See
+    /// [`DispatchHoldConfig`].
     #[serde(default)]
-    pub dispatch_tolerations: Option<Vec<fusillade::daemon::Toleration>>,
+    pub dispatch_hold: DispatchHoldConfig,
 
     /// Database-wide per-model ceiling below which no-SLA background work may
     /// be claimed. Zero disables background processing while leaving
@@ -2681,6 +2666,79 @@ fn default_batch_metadata_fields_dwctl() -> Vec<String> {
     ]
 }
 
+/// Hold batch dispatches on the capacity a toleration preset allows.
+///
+/// For each model in `models`, the daemon writes the tolerations of the
+/// `preset` (an id from `scheduling.toleration_presets`) to
+/// `nvext.routing_constraints.tolerations` of every batch or flex request it
+/// dispatches, but only when the stored request body carries no toleration
+/// list of its own. A body that has one (an account pinned to a preset, stamped
+/// at upload) is sent unchanged and is never released: a batch from an account
+/// pinned to a preset that tolerates nothing can miss its completion window by
+/// design. Background work and models not listed are never held.
+///
+/// A held request is released, sent as stored without the hold list so the
+/// backend may schedule it anywhere, when it would otherwise miss its
+/// completion window: inside the batch-claim deadline ramp
+/// (`claim_ramp_exponent`) or past its deadline.
+///
+/// Rolling back is a config change: drop a model from `models`, or set
+/// `enabled: false`, and held requests dispatch as stored on their next claim.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DispatchHoldConfig {
+    /// Off by default.
+    pub enabled: bool,
+    /// The `scheduling.toleration_presets` id whose tolerations are the hold
+    /// list. Default: `no-overflow`.
+    pub preset: String,
+    /// Model names (as requested, before any escalation) whose dispatches are
+    /// held.
+    pub models: Vec<String>,
+}
+
+impl Default for DispatchHoldConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            preset: SchedulingConfig::default_preset().id,
+            models: Vec::new(),
+        }
+    }
+}
+
+impl DispatchHoldConfig {
+    /// When enabled, the preset must be defined and at least one model listed.
+    pub fn validate(&self, scheduling: &SchedulingConfig) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if scheduling.preset(&self.preset).is_none() {
+            return Err(format!("preset {:?} is not defined in scheduling.toleration_presets", self.preset));
+        }
+        if self.models.is_empty() {
+            return Err("enabled with no models: list the models to hold, or disable it".to_string());
+        }
+        if let Some(model) = self.models.iter().find(|model| model.trim().is_empty()) {
+            return Err(format!("models contains an empty name {model:?}"));
+        }
+        Ok(())
+    }
+
+    /// The fusillade hold, when enabled: the preset's tolerations as the JSON
+    /// the request body carries, and the models.
+    pub fn to_fusillade(&self, scheduling: &SchedulingConfig) -> Option<fusillade::daemon::DispatchHold> {
+        if !self.enabled {
+            return None;
+        }
+        let preset = scheduling.preset(&self.preset)?;
+        Some(fusillade::daemon::DispatchHold {
+            tolerations: crate::scheduling::PinnedTolerations(preset.tolerations.clone()).to_json(),
+            models: self.models.iter().cloned().collect(),
+        })
+    }
+}
+
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
@@ -2733,7 +2791,7 @@ impl Default for DaemonConfig {
             streamable_endpoints: Vec::new(),
             urgency_weight: default_urgency_weight(),
             inject_deadline_priority: false,
-            dispatch_tolerations: None,
+            dispatch_hold: DispatchHoldConfig::default(),
             background_concurrency_limit: 0,
             batch_claim_size: 0,
             batch_claim_batch_size: default_batch_claim_batch_size(),
@@ -3819,6 +3877,11 @@ impl Config {
         if let Err(error) = self.scheduling.validate() {
             return Err(Error::Internal {
                 operation: format!("Config validation: {error}"),
+            });
+        }
+        if let Err(error) = self.background_services.batch_daemon.dispatch_hold.validate(&self.scheduling) {
+            return Err(Error::Internal {
+                operation: format!("Config validation: background_services.batch_daemon.dispatch_hold: {error}"),
             });
         }
         if self.background_services.batch_daemon.retention.expire_files
@@ -5832,53 +5895,108 @@ background_services:
     }
 
     #[test]
-    fn test_dispatch_tolerations_yaml() {
+    fn test_dispatch_hold_yaml() {
         Jail::expect_with(|jail| {
-            jail.create_file(
-                "test.yaml",
-                r#"
-secret_key: test-secret-key
-background_services:
-  batch_daemon:
-    dispatch_tolerations: []
-"#,
-            )?;
             let args = Args {
                 config: "test.yaml".into(),
                 validate: false,
             };
-            let config = Config::load(&args)?;
-            let daemon = &config.background_services.batch_daemon;
-            assert_eq!(
-                daemon.dispatch_tolerations,
-                Some(vec![]),
-                "[] (tolerate nothing) is not the same as unset"
-            );
-            assert!(!daemon.inject_deadline_priority, "tolerations do not need deadline priority");
 
+            // Absent: off, and nothing reaches fusillade.
+            jail.create_file("test.yaml", "secret_key: test-secret-key\n")?;
+            let config = Config::load(&args)?;
+            let hold = &config.background_services.batch_daemon.dispatch_hold;
+            assert_eq!(hold, &DispatchHoldConfig::default());
+            assert!(!hold.enabled);
+            assert_eq!(hold.to_fusillade(&config.scheduling), None);
+
+            // On, with the default no-overflow preset: the hold list is [].
             jail.create_file(
                 "test.yaml",
                 r#"
 secret_key: test-secret-key
 background_services:
   batch_daemon:
-    dispatch_tolerations:
-      - key: example.com/reserved
-        effect: PreferNoSchedule
+    dispatch_hold:
+      enabled: true
+      models: [example/model-a, example/model-b]
 "#,
             )?;
             let config = Config::load(&args)?;
-            let tolerations = config.background_services.batch_daemon.dispatch_tolerations.unwrap();
-            assert_eq!(tolerations.len(), 1);
-            assert_eq!(tolerations[0].key.as_deref(), Some("example.com/reserved"));
-            assert_eq!(tolerations[0].effect, Some(fusillade::daemon::TolerationEffect::PreferNoSchedule));
+            let daemon = &config.background_services.batch_daemon;
+            assert!(!daemon.inject_deadline_priority, "the hold does not need deadline priority");
+            let hold = daemon.dispatch_hold.to_fusillade(&config.scheduling).unwrap();
+            assert_eq!(hold.tolerations, serde_json::json!([]));
+            assert_eq!(hold.models, ["example/model-a".to_string(), "example/model-b".to_string()].into());
 
-            jail.create_file("test.yaml", "secret_key: test-secret-key\n")?;
+            // A custom preset resolves to its list, as the request body carries it.
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: test-secret-key
+scheduling:
+  toleration_presets:
+    - id: reserved-ok
+      label: Reserved capacity allowed
+      description: May use reserved capacity.
+      tolerations:
+        - key: example.com/reserved
+          operator: Exists
+background_services:
+  batch_daemon:
+    dispatch_hold:
+      enabled: true
+      preset: reserved-ok
+      models: [example/model-a]
+"#,
+            )?;
             let config = Config::load(&args)?;
-            assert_eq!(config.background_services.batch_daemon.dispatch_tolerations, None);
+            let hold = config
+                .background_services
+                .batch_daemon
+                .dispatch_hold
+                .to_fusillade(&config.scheduling)
+                .unwrap();
+            assert_eq!(
+                hold.tolerations,
+                serde_json::json!([{"key": "example.com/reserved", "operator": "Exists"}])
+            );
+
+            // Unknown keys are rejected.
+            jail.create_file(
+                "test.yaml",
+                "secret_key: test-secret-key\nbackground_services:\n  batch_daemon:\n    dispatch_hold:\n      enabled: true\n      modles: [m]\n",
+            )?;
+            assert!(Config::load(&args).is_err(), "a misspelt key is an error");
 
             Ok(())
         });
+    }
+
+    #[test]
+    fn test_dispatch_hold_validation() {
+        let scheduling = SchedulingConfig::default();
+        let hold = |enabled: bool, preset: &str, models: &[&str]| DispatchHoldConfig {
+            enabled,
+            preset: preset.to_string(),
+            models: models.iter().map(|model| model.to_string()).collect(),
+        };
+
+        assert!(hold(true, "no-overflow", &["m"]).validate(&scheduling).is_ok());
+        let error = hold(true, "missing", &["m"]).validate(&scheduling).unwrap_err();
+        assert!(error.contains("missing"), "{error}");
+        let error = hold(true, "no-overflow", &[]).validate(&scheduling).unwrap_err();
+        assert!(error.contains("no models"), "{error}");
+        assert!(hold(true, "no-overflow", &[" "]).validate(&scheduling).is_err());
+        // Disabled settings are not checked, so a disabled hold may name a
+        // preset another environment defines.
+        assert!(hold(false, "missing", &[]).validate(&scheduling).is_ok());
+
+        // Config::validate rejects an invalid hold.
+        let mut config = Config::default();
+        config.background_services.batch_daemon.dispatch_hold = hold(true, "missing", &["m"]);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("dispatch_hold"), "{error}");
     }
 
     #[test]

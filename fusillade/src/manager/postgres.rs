@@ -26,7 +26,7 @@ where
     config: DaemonConfig,
     retention_maintenance: RetentionMaintenanceConfig,
     leak_config: Option<LeakConfig>,
-    dispatch_tolerations: Option<Vec<crate::daemon::Toleration>>,
+    dispatch_hold: Option<crate::daemon::DispatchHold>,
     processor: OnceLock<Arc<dyn RequestProcessor<PostgresStore<P>, H>>>,
 }
 
@@ -125,7 +125,7 @@ where
             config,
             retention_maintenance: RetentionMaintenanceConfig::default(),
             leak_config: None,
-            dispatch_tolerations: None,
+            dispatch_hold: None,
             processor: OnceLock::new(),
         }
     }
@@ -142,13 +142,10 @@ where
         self
     }
 
-    /// Mark every dispatched request with these scheduling tolerations; see
-    /// [`crate::Daemon::with_dispatch_tolerations`].
-    pub fn with_dispatch_tolerations(
-        mut self,
-        tolerations: Vec<crate::daemon::Toleration>,
-    ) -> Self {
-        self.dispatch_tolerations = Some(tolerations);
+    /// Hold the opted-in models' dispatches; see
+    /// [`crate::Daemon::with_dispatch_hold`].
+    pub fn with_dispatch_hold(mut self, hold: crate::daemon::DispatchHold) -> Self {
+        self.dispatch_hold = Some(hold);
         self
     }
 
@@ -215,8 +212,8 @@ where
         if let Some(config) = &self.leak_config {
             daemon = daemon.with_leak_config(config.clone());
         }
-        if let Some(tolerations) = &self.dispatch_tolerations {
-            daemon = daemon.with_dispatch_tolerations(tolerations.clone());
+        if let Some(hold) = &self.dispatch_hold {
+            daemon = daemon.with_dispatch_hold(hold.clone());
         }
         if let Some(processor) = self.processor.get().cloned() {
             daemon = daemon.with_processor(processor);

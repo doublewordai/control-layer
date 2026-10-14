@@ -980,21 +980,21 @@ background_services:
     # deadlines produce larger numbers.
     # inject_deadline_priority: false
 
-    # Scheduling tolerations written to `nvext.routing_constraints.tolerations`
-    # on every request the daemon dispatches (batch, flex, background),
-    # replacing any value in the body. They are Kubernetes-style
-    # scheduling/routing tolerations understood by the upstream inference
-    # backend; a backend may, for example, use them to keep batch work off
-    # capacity reserved for other traffic, so the request waits and is
-    # retried instead. Near SLA failure the tolerations are dropped: meeting
-    # the deadline matters more than where the request runs. Inside the claim
-    # ramp window (claim_ramp_exponent: window_minutes ^ exponent minutes
-    # before the deadline, ~59 min for 24h, ~10 min for 1h) or past the
-    # deadline, the field is omitted and the backend may schedule the request
-    # anywhere. Background work keeps them. Unset injects nothing. Independent
-    # of inject_deadline_priority. The backend must accept the field; one that
-    # does not may reject the request.
-    # dispatch_tolerations: []
+    # Hold batch and flex dispatches of selected models on the capacity a
+    # scheduling-toleration preset allows. For each listed model the daemon
+    # writes the preset's tolerations (an id from scheduling.toleration_presets)
+    # to `nvext.routing_constraints.tolerations`, but only when the stored
+    # request body carries none: an account pinned to a preset keeps its own
+    # list and is never released. Background work and unlisted models are never
+    # held. A held request is released (sent as stored, so the backend may
+    # schedule it anywhere) when it would otherwise miss its completion window:
+    # inside the claim ramp (claim_ramp_exponent) or past its deadline. Off by
+    # default; with it off outbound bodies are unchanged. Rolling back is a
+    # config change: remove the model or set enabled: false.
+    # dispatch_hold:
+    #   enabled: false
+    #   preset: no-overflow
+    #   models: []
 
   # Batch completion notifications (emails + webhooks)
   # notifications:
