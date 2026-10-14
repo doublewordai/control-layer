@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 import {
   useUpdateOrganization,
   useOrganization,
@@ -6,8 +6,6 @@ import {
 } from "@/api/control-layer/hooks";
 import type { Organization, ServingClassName } from "@/api/control-layer/types";
 import { SchedulingTolerations } from "@/components/features/scheduling/SchedulingTolerations";
-import { RealtimePriorityBias } from "@/components/features/scheduling/RealtimePriorityBias";
-import { parsePriorityBias } from "@/utils/priorityBias";
 import {
   Dialog,
   DialogContent,
@@ -51,11 +49,6 @@ export function EditOrganizationModal({
   >("standard");
   const [selfHostedOnly, setSelfHostedOnly] = useState(false);
   const [tolerationPreset, setTolerationPreset] = useState<string | null>(null);
-  // Raw input text; empty means no bias.
-  const [priorityBias, setPriorityBias] = useState("");
-  // Set once the operator types in the head-start field, so a detail response
-  // that lands afterwards cannot replace what they typed.
-  const priorityBiasEdited = useRef(false);
   const updateOrg = useUpdateOrganization();
   const { data: config } = useConfig();
   // List rows carry the pinned preset for platform managers, but a row from a
@@ -69,7 +62,6 @@ export function EditOrganizationModal({
 
   useEffect(() => {
     if (isOpen && organization) {
-      priorityBiasEdited.current = false;
       setEmail(organization.email || "");
       setDisplayName(organization.display_name || "");
       setZeroDataRetention(organization.zero_data_retention ?? false);
@@ -77,11 +69,6 @@ export function EditOrganizationModal({
       setDefaultClass(organization.default_serving_class ?? "standard");
       setSelfHostedOnly(organization.self_hosted_only ?? false);
       setTolerationPreset(organization.toleration_preset ?? null);
-      setPriorityBias(
-        organization.priority_bias_seconds == null
-          ? ""
-          : String(organization.priority_bias_seconds),
-      );
     }
   }, [organization, isOpen]);
 
@@ -90,25 +77,12 @@ export function EditOrganizationModal({
   useEffect(() => {
     if (isOpen && detail) {
       setTolerationPreset(detail.toleration_preset ?? null);
-      if (!priorityBiasEdited.current) {
-        setPriorityBias(
-          detail.priority_bias_seconds == null
-            ? ""
-            : String(detail.priority_bias_seconds),
-        );
-      }
     }
   }, [detail, isOpen]);
-
-  const parsedBias = parsePriorityBias(priorityBias);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!organization) return;
-    if (canEditServing && !parsedBias.ok) {
-      toast.error(`Realtime priority head start: ${parsedBias.error}`);
-      return;
-    }
 
     const requestedEmail = email.trim();
     const emailChangeRequested =
@@ -131,7 +105,6 @@ export function EditOrganizationModal({
                   defaultClass === "standard" ? null : defaultClass,
                 self_hosted_only: selfHostedOnly,
                 toleration_preset: tolerationPreset,
-                priority_bias_seconds: parsedBias.ok ? parsedBias.value : null,
               }
             : {}),
         },
@@ -303,15 +276,6 @@ export function EditOrganizationModal({
                     aria-label="Toggle no external-provider fallback"
                   />
                 </div>
-                <RealtimePriorityBias
-                  id="edit-priority-bias-seconds"
-                  value={priorityBias}
-                  canEdit={canEditServing}
-                  onChange={(next) => {
-                    priorityBiasEdited.current = true;
-                    setPriorityBias(next);
-                  }}
-                />
                 <SchedulingTolerations
                   preset={tolerationPreset}
                   presets={config?.scheduling_toleration_presets}
@@ -329,7 +293,7 @@ export function EditOrganizationModal({
           <Button
             type="submit"
             form="edit-organization-form"
-            disabled={updateOrg.isPending || (canEditServing && !parsedBias.ok)}
+            disabled={updateOrg.isPending}
           >
             {updateOrg.isPending ? "Saving..." : "Save"}
           </Button>

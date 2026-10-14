@@ -440,13 +440,12 @@ pub async fn list_organizations<P: PoolProvider>(
                 // the read gate that reaches this branch. Hiding it from a
                 // read-all caller would also clear a pin on any edit made from
                 // the list, which submits the field back as `null`.
-                let (toleration_preset, priority_bias_seconds) = if can_update_all_resources(&current_user, Resource::Organizations) {
-                    (o.toleration_preset.clone(), o.priority_bias_seconds)
+                let toleration_preset = if can_update_all_resources(&current_user, Resource::Organizations) {
+                    o.toleration_preset.clone()
                 } else {
-                    (None, None)
+                    None
                 };
-                OrganizationResponse::from_user(UserResponse::from(o).with_priority_bias_seconds(priority_bias_seconds))
-                    .with_toleration_preset(toleration_preset)
+                OrganizationResponse::from_user(UserResponse::from(o)).with_toleration_preset(toleration_preset)
             })
             .collect();
 
@@ -566,9 +565,8 @@ pub async fn get_organization<P: PoolProvider>(
     // `UserResponse::from` deliberately drops the field; we re-attach it here.
     let can_update_all = crate::auth::permissions::has_permission(&current_user, Resource::Organizations, Operation::UpdateAll);
     let toleration_preset = if can_update_all { org.toleration_preset.clone() } else { None };
-    let priority_bias_seconds = if can_update_all { org.priority_bias_seconds } else { None };
 
-    let mut response = OrganizationResponse::from_user(UserResponse::from(org).with_priority_bias_seconds(priority_bias_seconds))
+    let mut response = OrganizationResponse::from_user(UserResponse::from(org))
         .with_member_count(members.len() as i64)
         .with_auto_join_enabled(auto_join_enabled)
         .with_disabled_modalities(disabled_modalities)
@@ -657,8 +655,7 @@ pub async fn update_organization<P: PoolProvider>(
         && (data.granted_serving_classes.is_some()
             || data.default_serving_class.is_some()
             || data.self_hosted_only.is_some()
-            || data.toleration_preset.is_some()
-            || data.priority_bias_seconds.is_some())
+            || data.toleration_preset.is_some())
     {
         return Err(Error::InsufficientPermissions {
             required: Permission::Allow(Resource::Organizations, Operation::UpdateAll),
@@ -670,9 +667,6 @@ pub async fn update_organization<P: PoolProvider>(
     // rather than silently pinning the workspace to nothing.
     if let Some(Some(preset)) = &data.toleration_preset {
         super::validate_toleration_preset(&state, preset)?;
-    }
-    if let Some(Some(bias)) = data.priority_bias_seconds {
-        super::validate_priority_bias_seconds(bias)?;
     }
     if let Some(Some(class)) = &data.default_serving_class {
         validate_elevated_serving_class(class)?;
@@ -875,7 +869,6 @@ pub async fn update_organization<P: PoolProvider>(
         self_hosted_only: data.self_hosted_only,
         granted_serving_classes: data.granted_serving_classes,
         toleration_preset: data.toleration_preset,
-        priority_bias_seconds: data.priority_bias_seconds,
     };
     debug_assert!(
         db_request.email.is_none(),
@@ -916,9 +909,8 @@ pub async fn update_organization<P: PoolProvider>(
     // rejects anyone else), so they are the only caller who sees it here, the
     // same rule the GET endpoint applies.
     let toleration_preset = if can_all { org.toleration_preset.clone() } else { None };
-    let priority_bias_seconds = if can_all { org.priority_bias_seconds } else { None };
 
-    let mut response = OrganizationResponse::from_user(UserResponse::from(org).with_priority_bias_seconds(priority_bias_seconds))
+    let mut response = OrganizationResponse::from_user(UserResponse::from(org))
         .with_auto_join_enabled(auto_join_enabled)
         .with_disabled_modalities(disabled_modalities)
         .with_toleration_preset(toleration_preset);
@@ -2990,7 +2982,6 @@ pub async fn confirm_email_change<P: PoolProvider>(
             self_hosted_only: None,
             granted_serving_classes: Default::default(),
             toleration_preset: Default::default(),
-            priority_bias_seconds: Default::default(),
         };
         org_repo.update(pending.organization_id, &update).await?;
         // The `confirm_*_email_side` UPDATE above already locked this row, so

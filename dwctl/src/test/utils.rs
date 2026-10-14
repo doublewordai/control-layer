@@ -608,7 +608,6 @@ pub async fn get_system_user(pool: &mut PgConnection) -> UserResponse {
         self_hosted_only: false,
         granted_serving_classes: Default::default(),
         toleration_preset: Default::default(),
-        priority_bias_seconds: Default::default(),
     }
 }
 
@@ -803,7 +802,6 @@ pub async fn create_test_org(pool: &PgPool, created_by: UserId) -> UserResponse 
         self_hosted_only: false,
         granted_serving_classes: Default::default(),
         toleration_preset: Default::default(),
-        priority_bias_seconds: Default::default(),
     }
 }
 

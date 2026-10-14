@@ -117,14 +117,6 @@ pub struct UserUpdate {
     /// by callers with UpdateAll on users. Omit to leave unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub toleration_preset: Option<Option<String>>,
-    /// Account setting: seconds this account's realtime requests are moved
-    /// earlier in the deadline-ordered scheduling priority sent to dynamo
-    /// endpoints (`T = arrival - bias`), on every model unless a model overlay
-    /// sets its own. `0..=86400`; applied only when
-    /// `scheduling.inject_realtime_priority` is on. Settable only by callers
-    /// with UpdateAll. Omit to leave unchanged; `null` clears it (no bias).
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
-    pub priority_bias_seconds: Option<Option<i32>>,
 }
 
 /// Full user details returned by the API.
@@ -223,11 +215,6 @@ pub struct UserResponse {
     /// is an operator's routing decision, not account data.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub toleration_preset: Option<String>,
-    /// Account setting: realtime priority bias in seconds (see
-    /// `UserUpdate::priority_bias_seconds`), absent when none is set. Present
-    /// only for callers with UpdateAll, like `toleration_preset`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub priority_bias_seconds: Option<i32>,
     /// Organizations this user belongs to (only included if `include=organizations` is specified)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organizations: Option<Vec<super::organizations::OrganizationSummary>>,
@@ -347,7 +334,6 @@ impl From<UserDBResponse> for UserResponse {
             self_hosted_only: db.self_hosted_only,
             // Filled in by the handler for platform managers only.
             toleration_preset: None,
-            priority_bias_seconds: None,
             organizations: None,
             active_organization_id: None,
             onboarding_redirect_url: None,
@@ -360,13 +346,6 @@ impl UserResponse {
     /// the handlers that have already checked the caller may see it call this.
     pub fn with_toleration_preset(mut self, preset: Option<String>) -> Self {
         self.toleration_preset = preset;
-        self
-    }
-
-    /// Include the realtime priority bias. Same gate as
-    /// [`Self::with_toleration_preset`]: platform managers only.
-    pub fn with_priority_bias_seconds(mut self, bias: Option<i32>) -> Self {
-        self.priority_bias_seconds = bias;
         self
     }
 

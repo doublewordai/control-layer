@@ -138,14 +138,12 @@ pub async fn list_users<P: PoolProvider>(
 
     // Iterate through and enrich users
     for user in users {
-        let (toleration_preset, priority_bias_seconds) = if can_update_all_users {
-            (user.toleration_preset.clone(), user.priority_bias_seconds)
+        let toleration_preset = if can_update_all_users {
+            user.toleration_preset.clone()
         } else {
-            (None, None)
+            None
         };
-        let mut response_user = UserResponse::from(user)
-            .with_toleration_preset(toleration_preset)
-            .with_priority_bias_seconds(priority_bias_seconds);
+        let mut response_user = UserResponse::from(user).with_toleration_preset(toleration_preset);
         // If includes groups
         if let Some(groups_map) = &groups_map
             && let Some(user_groups_map) = &user_groups_map
@@ -272,15 +270,13 @@ pub async fn get_user<P: PoolProvider>(
     // only platform managers (UpdateAll on users) see it, here as well as on
     // the PATCH. `UserResponse::from` deliberately drops the field.
     let can_update_all_users = permissions::can_update_all_resources(&current_user, Resource::Users);
-    let (toleration_preset, priority_bias_seconds) = if can_update_all_users {
-        (user.toleration_preset.clone(), user.priority_bias_seconds)
+    let toleration_preset = if can_update_all_users {
+        user.toleration_preset.clone()
     } else {
-        (None, None)
+        None
     };
 
-    let mut response = UserResponse::from(user)
-        .with_toleration_preset(toleration_preset)
-        .with_priority_bias_seconds(priority_bias_seconds);
+    let mut response = UserResponse::from(user).with_toleration_preset(toleration_preset);
 
     // Include billing if requested and permitted
     // Permitted if:
@@ -467,8 +463,7 @@ pub async fn update_user<P: PoolProvider>(
         && (user_data.granted_serving_classes.is_some()
             || user_data.default_serving_class.is_some()
             || user_data.self_hosted_only.is_some()
-            || user_data.toleration_preset.is_some()
-            || user_data.priority_bias_seconds.is_some())
+            || user_data.toleration_preset.is_some())
     {
         return Err(Error::InsufficientPermissions {
             required: Permission::Allow(Resource::Users, Operation::UpdateAll),
@@ -489,9 +484,6 @@ pub async fn update_user<P: PoolProvider>(
     // time, failing closed to the most restrictive list).
     if let Some(Some(preset)) = &user_data.toleration_preset {
         validate_toleration_preset(&state, preset)?;
-    }
-    if let Some(Some(bias)) = user_data.priority_bias_seconds {
-        super::validate_priority_bias_seconds(bias)?;
     }
 
     // Validate auto-topup fields if provided
@@ -525,16 +517,12 @@ pub async fn update_user<P: PoolProvider>(
     let user = repo.update(user_id, &db_request).await?;
     // Only a platform manager could have set a preset (the UpdateAll gate above
     // rejects anyone else), so they are the only caller who sees it back.
-    let (toleration_preset, priority_bias_seconds) = if can_update_all_users {
-        (user.toleration_preset.clone(), user.priority_bias_seconds)
+    let toleration_preset = if can_update_all_users {
+        user.toleration_preset.clone()
     } else {
-        (None, None)
+        None
     };
-    Ok(Json(
-        UserResponse::from(user)
-            .with_toleration_preset(toleration_preset)
-            .with_priority_bias_seconds(priority_bias_seconds),
-    ))
+    Ok(Json(UserResponse::from(user).with_toleration_preset(toleration_preset)))
 }
 
 // DELETE /user/{user_id} - Delete user (admin only)
@@ -1427,61 +1415,6 @@ mod tests {
         assert_eq!(updated.granted_serving_classes, vec!["interactive", "throughput"]);
         assert_eq!(updated.default_serving_class.as_deref(), Some("interactive"));
         assert!(updated.self_hosted_only);
-    }
-
-    #[dwctl_test_macros::test]
-    #[test_log::test]
-    async fn test_priority_bias_is_platform_manager_only_bounded_and_clearable(pool: PgPool) {
-        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
-        let user = create_test_user(&pool, Role::StandardUser).await;
-        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
-        let patch = |who: &crate::api::models::users::UserResponse, body: serde_json::Value| {
-            let headers = add_auth_headers(who);
-            app.patch(&format!("/admin/api/v1/users/{}", user.id))
-                .add_header(&headers[0].0, &headers[0].1)
-                .add_header(&headers[1].0, &headers[1].1)
-                .json(&body)
-        };
-
-        // The account itself cannot set it.
-        patch(&user, json!({ "priority_bias_seconds": 900 }))
-            .await
-            .assert_status_forbidden();
-
-        // Out of range is a 400 for a platform manager.
-        for bias in [-1, 86_401] {
-            patch(&admin, json!({ "priority_bias_seconds": bias }))
-                .await
-                .assert_status_bad_request();
-        }
-
-        let response = patch(&admin, json!({ "priority_bias_seconds": 900 })).await;
-        response.assert_status_ok();
-        let updated: UserResponse = response.json();
-        assert_eq!(updated.priority_bias_seconds, Some(900));
-
-        // Omitting it leaves it alone; the account never sees it.
-        patch(&admin, json!({ "display_name": "Renamed" })).await.assert_status_ok();
-        let headers = add_auth_headers(&user);
-        let own: UserResponse = app
-            .get(&format!("/admin/api/v1/users/{}", user.id))
-            .add_header(&headers[0].0, &headers[0].1)
-            .add_header(&headers[1].0, &headers[1].1)
-            .await
-            .json();
-        assert_eq!(own.priority_bias_seconds, None, "hidden from the account itself");
-        let stored: Option<i32> = sqlx::query_scalar("SELECT priority_bias_seconds FROM users WHERE id = $1")
-            .bind(user.id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(stored, Some(900));
-
-        // null clears it.
-        let response = patch(&admin, json!({ "priority_bias_seconds": null })).await;
-        response.assert_status_ok();
-        let cleared: UserResponse = response.json();
-        assert_eq!(cleared.priority_bias_seconds, None);
     }
 
     #[dwctl_test_macros::test]

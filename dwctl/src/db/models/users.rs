@@ -68,10 +68,6 @@ pub struct UserUpdateDBRequest {
     /// account's requests. `None` = don't change, `Some(None)` = clear (back to
     /// the "Default" setting), `Some(Some(id))` = set the preset.
     pub toleration_preset: Option<Option<String>>,
-    /// Account setting: seconds this account's realtime requests are moved
-    /// earlier in the deadline-ordered priority. `None` = don't change,
-    /// `Some(None)` = clear (no bias), `Some(Some(s))` = set.
-    pub priority_bias_seconds: Option<Option<i32>>,
 }
 
 impl UserUpdateDBRequest {
@@ -91,7 +87,6 @@ impl UserUpdateDBRequest {
             self_hosted_only: update.self_hosted_only,
             granted_serving_classes: update.granted_serving_classes,
             toleration_preset: update.toleration_preset,
-            priority_bias_seconds: update.priority_bias_seconds,
         }
     }
 }
@@ -143,6 +138,4 @@ pub struct UserDBResponse {
     /// Account setting: the scheduling-toleration preset id pinned to this
     /// account, or `None` for the "Default" setting.
     pub toleration_preset: Option<String>,
-    /// Account setting: realtime priority bias in seconds, or `None` for no bias.
-    pub priority_bias_seconds: Option<i32>,
 }

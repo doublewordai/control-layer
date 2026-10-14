@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, username, email, display_name, avatar_url, auth_source, created_at, updated_at, last_login, is_admin, password_hash, external_user_id, payment_provider_id, is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent, low_balance_notification_sent, low_balance_threshold, user_type, auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, auto_topup_limit_notification_sent, verified, zero_data_retention, auto_topup_soft_failure_count, auto_topup_retry_after, invoicing_enabled, auto_join_enabled, granted_serving_classes, default_serving_class, self_hosted_only, toleration_preset, priority_bias_seconds FROM users WHERE external_user_id = $1 AND id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false",
+  "query": "\n            INSERT INTO users (id, username, email, display_name, avatar_url, auth_source, is_admin, password_hash, external_user_id)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)\n            RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at, last_login, is_admin, password_hash, external_user_id, payment_provider_id, is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent, low_balance_notification_sent, low_balance_threshold, user_type, auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, auto_topup_limit_notification_sent, verified, zero_data_retention, auto_topup_soft_failure_count, auto_topup_retry_after, invoicing_enabled, auto_join_enabled, granted_serving_classes, default_serving_class, self_hosted_only, toleration_preset\n            ",
   "describe": {
     "columns": [
       {
@@ -172,15 +172,18 @@
         "ordinal": 33,
         "name": "toleration_preset",
         "type_info": "Text"
-      },
-      {
-        "ordinal": 34,
-        "name": "priority_bias_seconds",
-        "type_info": "Int4"
       }
     ],
     "parameters": {
       "Left": [
+        "Uuid",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Bool",
+        "Text",
         "Text"
       ]
     },
@@ -218,9 +221,8 @@
       false,
       true,
       false,
-      true,
       true
     ]
   },
-  "hash": "4607935560fc6bdf41be347e11e33e1bf2bd0945ec61e997b65d8790a239c6c5"
+  "hash": "d6d7728c78dd244939db19786d634a07da7fe1fd992bb96b1d6d3047c7a2bd18"
 }

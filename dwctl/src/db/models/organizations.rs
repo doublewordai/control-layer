@@ -44,10 +44,6 @@ pub struct OrganizationUpdateDBRequest {
     /// organization's requests. `None` = don't change, `Some(None)` = clear
     /// (back to the "Default" setting), `Some(Some(id))` = set the preset.
     pub toleration_preset: Option<Option<String>>,
-    /// Account setting: seconds this organization's realtime requests are
-    /// moved earlier in the deadline-ordered priority. `None` = don't change,
-    /// `Some(None)` = clear (no bias), `Some(Some(s))` = set.
-    pub priority_bias_seconds: Option<Option<i32>>,
 }
 
 /// Database response for an organization membership

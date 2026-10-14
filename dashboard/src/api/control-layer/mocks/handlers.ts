@@ -1010,9 +1010,6 @@ export const handlers = [
     if (body.toleration_preset !== undefined) {
       user.toleration_preset = body.toleration_preset;
     }
-    if (body.priority_bias_seconds !== undefined) {
-      user.priority_bias_seconds = body.priority_bias_seconds;
-    }
 
     const updatedUser = {
       ...user,
@@ -2982,9 +2979,6 @@ export const handlers = [
     if (rest.toleration_preset !== undefined) {
       // `null` clears the pin back to Default.
       org.toleration_preset = rest.toleration_preset;
-    }
-    if (rest.priority_bias_seconds !== undefined) {
-      org.priority_bias_seconds = rest.priority_bias_seconds;
     }
     return HttpResponse.json({
       ...org,

@@ -310,16 +310,17 @@ async fn dispatch_clears_stored_targets_but_preserves_deadline_priority(pool: Pg
 }
 
 /// The priority the upstream saw, asserted to be `-T` for a `T` between
-/// `before - bias` and `after - bias` (wall-clock seconds around the request).
-fn assert_deadline_priority(body: &Value, before: i64, after: i64, bias: i64, context: &str) {
+/// `before - head_start` and `after - head_start` (wall-clock seconds around
+/// the request).
+fn assert_deadline_priority(body: &Value, before: i64, after: i64, head_start: i64, context: &str) {
     let priority = body["nvext"]["agent_hints"]["priority"]
         .as_i64()
         .unwrap_or_else(|| panic!("{context}: no priority in {body}"));
     assert!(
-        (-(after - bias)..=-(before - bias)).contains(&priority),
+        (-(after - head_start)..=-(before - head_start)).contains(&priority),
         "{context}: priority {priority} is not -T for T in [{}, {}]",
-        before - bias,
-        after - bias
+        before - head_start,
+        after - head_start
     );
 }
 
@@ -350,81 +351,45 @@ async fn realtime_priority_is_minus_arrival_and_client_priority_is_still_strippe
     assert_eq!(body["nvext"]["cache_control"]["enabled"], true);
 }
 
-#[dwctl_test_macros::test]
-async fn realtime_priority_applies_the_account_overlay_bias_on_that_model_only(pool: PgPool) {
-    let f = Fixture::with_realtime_priority(&pool).await;
+/// Give the fixture's account a per-model deal on `policy`: explicit targets
+/// whose priority is a 15-minute head start.
+async fn add_policy_deal(f: &Fixture, pool: &PgPool) {
     sqlx::query(
-        "INSERT INTO model_overlays (user_id, deployed_model_id, priority_bias_seconds) SELECT $1, id, 900 FROM deployed_models WHERE alias = 'policy'",
+        r#"INSERT INTO model_overlays (user_id, deployed_model_id, targets)
+           SELECT $1, id, '{"ttft_ms": 800, "itl_ms": 30, "priority": 900}' FROM deployed_models WHERE alias = 'policy'"#,
     )
     .bind(f.user)
-    .execute(&pool)
+    .execute(pool)
     .await
     .unwrap();
-    f.services.sync_onwards_config(&pool).await.unwrap();
-
-    let before = chrono::Utc::now().timestamp();
-    f.post("chat/completions", "policy", false).await.assert_status_ok();
-    let after = chrono::Utc::now().timestamp();
-    assert_deadline_priority(&f.last_body().await, before, after, 900, "biased model");
-
-    // No overlay on this alias: standard realtime.
-    let before = chrono::Utc::now().timestamp();
-    f.post("chat/completions", "no-offer", false).await.assert_status_ok();
-    let after = chrono::Utc::now().timestamp();
-    assert_deadline_priority(&f.last_body().await, before, after, 0, "model without an overlay");
-
-    // The database refuses a bias outside 0..=86400.
-    for bias in [-1, 86_401] {
-        let result = sqlx::query("UPDATE model_overlays SET priority_bias_seconds = $1 WHERE user_id = $2")
-            .bind(bias)
-            .bind(f.user)
-            .execute(&pool)
-            .await;
-        assert!(result.is_err(), "bias {bias} must violate the CHECK constraint");
-    }
+    f.services.sync_onwards_config(pool).await.unwrap();
 }
 
 #[dwctl_test_macros::test]
-async fn realtime_priority_uses_the_account_bias_unless_an_overlay_sets_one(pool: PgPool) {
+async fn realtime_priority_applies_the_org_deal_on_that_model_only(pool: PgPool) {
     let f = Fixture::with_realtime_priority(&pool).await;
-    sqlx::query("UPDATE users SET priority_bias_seconds = 600 WHERE id = $1")
-        .bind(f.user)
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query(
-        "INSERT INTO model_overlays (user_id, deployed_model_id, priority_bias_seconds) SELECT $1, id, 900 FROM deployed_models WHERE alias = 'policy'",
-    )
-    .bind(f.user)
-    .execute(&pool)
-    .await
-    .unwrap();
-    f.services.sync_onwards_config(&pool).await.unwrap();
+    add_policy_deal(&f, &pool).await;
 
-    // No overlay on this alias: the account's bias.
-    let before = chrono::Utc::now().timestamp();
-    f.post("chat/completions", "no-offer", false).await.assert_status_ok();
-    let after = chrono::Utc::now().timestamp();
-    assert_deadline_priority(&f.last_body().await, before, after, 600, "account bias");
-
-    // The overlay's bias replaces it on its model.
+    // The deal's priority is a head start in seconds; its targets still go out.
     let before = chrono::Utc::now().timestamp();
     f.post("chat/completions", "policy", false).await.assert_status_ok();
     let after = chrono::Utc::now().timestamp();
-    assert_deadline_priority(&f.last_body().await, before, after, 900, "overlay bias");
+    let body = f.last_body().await;
+    assert_deadline_priority(&body, before, after, 900, "model with a deal");
+    assert_eq!(body["nvext"]["router"]["ttft_target"], 800);
+    assert_eq!(body["nvext"]["router"]["itl_target"], 30);
+
+    // No deal on this alias: standard realtime.
+    let before = chrono::Utc::now().timestamp();
+    f.post("chat/completions", "no-offer", false).await.assert_status_ok();
+    let after = chrono::Utc::now().timestamp();
+    assert_deadline_priority(&f.last_body().await, before, after, 0, "model without a deal");
 }
 
 #[dwctl_test_macros::test]
 async fn realtime_priority_leaves_fusillade_dispatches_untouched(pool: PgPool) {
     let f = Fixture::with_realtime_priority(&pool).await;
-    sqlx::query(
-        "INSERT INTO model_overlays (user_id, deployed_model_id, priority_bias_seconds) SELECT $1, id, 900 FROM deployed_models WHERE alias = 'policy'",
-    )
-    .bind(f.user)
-    .execute(&pool)
-    .await
-    .unwrap();
-    f.services.sync_onwards_config(&pool).await.unwrap();
+    add_policy_deal(&f, &pool).await;
     // A daemon dispatch carries the batch deadline priority and keeps it.
     f.server
         .post("/ai/v1/chat/completions")

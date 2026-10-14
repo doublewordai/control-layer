@@ -371,8 +371,6 @@ export interface ServingOverlay {
   default_serving_class?: ServingClassName;
   targets?: ServingPreset;
   self_hosted_only?: boolean;
-  /** Realtime priority bias on this model, overriding the account's. */
-  priority_bias_seconds?: number;
   provisioning_source?: string;
   updated_at: string;
 }
@@ -394,8 +392,6 @@ export interface OrganizationServing {
   granted_serving_classes: ServingClassName[];
   default_serving_class?: ServingClassName;
   self_hosted_only: boolean;
-  /** Account realtime priority bias in seconds; absent = none. */
-  priority_bias_seconds?: number;
   overlays: ServingOverlay[];
   tariffs: ModelTariff[];
   /** Token-price model aliases, returned together to avoid per-model requests. */
@@ -529,10 +525,6 @@ export interface User {
   // only). null/absent = "Default" (nothing pinned); a string is a configured
   // preset id.
   toleration_preset?: string | null;
-  // Seconds this account's realtime requests are moved earlier in the
-  // deadline-ordered scheduling priority (platform managers only). null/absent
-  // = no bias. A model overlay's own value replaces it on that model.
-  priority_bias_seconds?: number | null;
   user_type?: "individual" | "organization"; // User type
   organizations?: OrganizationSummary[]; // only present when include=organizations or for current user
   active_organization_id?: string; // only present for /users/current
@@ -711,9 +703,6 @@ export interface UserUpdateRequest {
   // Scheduling-toleration preset to pin the account to: platform managers
   // only. A preset id pins it; null clears the pin ("Default").
   toleration_preset?: string | null;
-  // Realtime priority bias in seconds (0-86400): platform managers only.
-  // null clears it.
-  priority_bias_seconds?: number | null;
 }
 
 export interface GroupUpdateRequest {
@@ -1863,11 +1852,6 @@ export interface Organization extends User {
    * pinned to (platform managers only). null/absent = "Default".
    */
   toleration_preset?: string | null;
-  /**
-   * Seconds this organization's realtime requests are moved earlier in the
-   * deadline-ordered scheduling priority (platform managers only).
-   */
-  priority_bias_seconds?: number | null;
 }
 
 export interface OrganizationMember {
@@ -1903,9 +1887,6 @@ export interface OrganizationUpdateRequest {
   // Scheduling-toleration preset to pin the organization to: platform managers
   // only. A preset id pins it; null clears the pin ("Default").
   toleration_preset?: string | null;
-  // Realtime priority bias in seconds (0-86400): platform managers only.
-  // null clears it.
-  priority_bias_seconds?: number | null;
 }
 
 export interface InviteMemberRequest {

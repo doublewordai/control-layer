@@ -1910,15 +1910,15 @@ async fn test_cache_shape_serving_accounts_overlays_and_offered_classes(pool: sq
     .await
     .unwrap();
     sqlx::query!(
-        "UPDATE users SET granted_serving_classes = '{interactive}', default_serving_class = 'throughput', self_hosted_only = true, priority_bias_seconds = 600 WHERE id = '00000000-0000-0000-0000-0000000000a1'"
+        "UPDATE users SET granted_serving_classes = '{interactive}', default_serving_class = 'throughput', self_hosted_only = true WHERE id = '00000000-0000-0000-0000-0000000000a1'"
     )
     .execute(&pool)
     .await
     .unwrap();
     sqlx::query!(
-        r#"INSERT INTO model_overlays (user_id, deployed_model_id, default_serving_class, targets, self_hosted_only, priority_bias_seconds)
-           VALUES ('00000000-0000-0000-0000-0000000000a1', '40000000-0000-0000-0000-000000000001', 'interactive', NULL, false, NULL),
-                  ('00000000-0000-0000-0000-0000000000b1', '40000000-0000-0000-0000-000000000001', NULL, '{"ttft_ms": 800, "itl_ms": 30}', NULL, 900)"#
+        r#"INSERT INTO model_overlays (user_id, deployed_model_id, default_serving_class, targets, self_hosted_only)
+           VALUES ('00000000-0000-0000-0000-0000000000a1', '40000000-0000-0000-0000-000000000001', 'interactive', NULL, false),
+                  ('00000000-0000-0000-0000-0000000000b1', '40000000-0000-0000-0000-000000000001', NULL, '{"ttft_ms": 800, "itl_ms": 30}', NULL)"#
     )
     .execute(&pool)
     .await
@@ -1951,7 +1951,6 @@ async fn test_cache_shape_serving_accounts_overlays_and_offered_classes(pool: sq
             granted: vec![ServingClass::Interactive],
             default_class: Some(ServingClass::Throughput),
             self_hosted_only: true,
-            priority_bias_seconds: Some(600),
         }
     );
     assert!(
@@ -1979,7 +1978,6 @@ async fn test_cache_shape_serving_accounts_overlays_and_offered_classes(pool: sq
             default_class: Some(ServingClass::Interactive),
             targets: None,
             self_hosted_only: Some(false),
-            priority_bias_seconds: None,
         }
     );
     assert_eq!(
@@ -1992,7 +1990,6 @@ async fn test_cache_shape_serving_accounts_overlays_and_offered_classes(pool: sq
                 priority: 0
             }),
             self_hosted_only: None,
-            priority_bias_seconds: Some(900),
         }
     );
     let private = targets.targets.get("regular-private").unwrap();

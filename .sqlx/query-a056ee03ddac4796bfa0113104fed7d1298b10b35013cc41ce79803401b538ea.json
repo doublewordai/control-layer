@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,\n                   is_admin, password_hash, external_user_id, payment_provider_id,\n                   is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,\n                   low_balance_notification_sent, low_balance_threshold,\n                   auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, invoicing_enabled, zero_data_retention,\n                   granted_serving_classes, default_serving_class, self_hosted_only, toleration_preset, priority_bias_seconds\n            FROM users\n            WHERE (username = $1 OR username LIKE $1 || '~%')\n              AND user_type = 'organization'\n              -- A soft-deleted workspace must never receive join requests:\n              -- nobody is left to approve them, so the requester would sit on a\n              -- queue no one can see.\n              AND is_deleted = false\n              -- Same reasoning one level down: a workspace whose owners and\n              -- admins have all been deleted is still `is_deleted = false`, but\n              -- there is equally nobody home to approve anything.\n              --\n              -- `Users::delete` no longer creates these - it hands a workspace\n              -- to a successor or closes it - but it used to walk away from the\n              -- departing user's `user_organizations` rows, which stranded any\n              -- workspace whose only owner was deleted: still claiming the\n              -- domain, still offered to every colleague who signed up,\n              -- unadministrable. This covers those legacy rows, and anything\n              -- else that reaches the same state by a route we have not thought\n              -- of. `users` inside the subquery is the outer row - the inner one\n              -- is aliased.\n              AND EXISTS (\n                  SELECT 1\n                  FROM user_organizations uo\n                  JOIN users admin ON admin.id = uo.user_id\n                  WHERE uo.organization_id = users.id\n                    AND uo.role IN ('owner', 'admin')\n                    AND uo.status = 'active'\n                    AND admin.is_deleted = false\n              )\n            ORDER BY created_at ASC\n            LIMIT 1\n            ",
+  "query": "\n            SELECT id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,\n                   is_admin, password_hash, external_user_id, payment_provider_id,\n                   is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,\n                   low_balance_notification_sent, low_balance_threshold,\n                   auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, invoicing_enabled, zero_data_retention,\n                   granted_serving_classes, default_serving_class, self_hosted_only, toleration_preset\n            FROM users\n            WHERE (username = $1 OR username LIKE $1 || '~%')\n              AND user_type = 'organization'\n              -- A soft-deleted workspace must never receive join requests:\n              -- nobody is left to approve them, so the requester would sit on a\n              -- queue no one can see.\n              AND is_deleted = false\n              -- Same reasoning one level down: a workspace whose owners and\n              -- admins have all been deleted is still `is_deleted = false`, but\n              -- there is equally nobody home to approve anything.\n              --\n              -- `Users::delete` no longer creates these - it hands a workspace\n              -- to a successor or closes it - but it used to walk away from the\n              -- departing user's `user_organizations` rows, which stranded any\n              -- workspace whose only owner was deleted: still claiming the\n              -- domain, still offered to every colleague who signed up,\n              -- unadministrable. This covers those legacy rows, and anything\n              -- else that reaches the same state by a route we have not thought\n              -- of. `users` inside the subquery is the outer row - the inner one\n              -- is aliased.\n              AND EXISTS (\n                  SELECT 1\n                  FROM user_organizations uo\n                  JOIN users admin ON admin.id = uo.user_id\n                  WHERE uo.organization_id = users.id\n                    AND uo.role IN ('owner', 'admin')\n                    AND uo.status = 'active'\n                    AND admin.is_deleted = false\n              )\n            ORDER BY created_at ASC\n            LIMIT 1\n            ",
   "describe": {
     "columns": [
       {
@@ -147,11 +147,6 @@
         "ordinal": 28,
         "name": "toleration_preset",
         "type_info": "Text"
-      },
-      {
-        "ordinal": 29,
-        "name": "priority_bias_seconds",
-        "type_info": "Int4"
       }
     ],
     "parameters": {
@@ -188,9 +183,8 @@
       false,
       true,
       false,
-      true,
       true
     ]
   },
-  "hash": "6e6fb209cf8e3df4b9c7bae0f468ea80cc19ee1fa62a2225d36b2fb89a28e97d"
+  "hash": "a056ee03ddac4796bfa0113104fed7d1298b10b35013cc41ce79803401b538ea"
 }

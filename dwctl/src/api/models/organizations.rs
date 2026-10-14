@@ -86,14 +86,6 @@ pub struct OrganizationUpdate {
     /// Omit to leave unchanged; `null` clears the preset.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub toleration_preset: Option<Option<String>>,
-    /// Account setting: seconds this account's realtime requests are moved
-    /// earlier in the deadline-ordered scheduling priority sent to dynamo
-    /// endpoints (`T = arrival - bias`), on every model unless a model overlay
-    /// sets its own. `0..=86400`; applied only when
-    /// `scheduling.inject_realtime_priority` is on. Settable only by callers
-    /// with UpdateAll. Omit to leave unchanged; `null` clears it (no bias).
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
-    pub priority_bias_seconds: Option<Option<i32>>,
 }
 
 /// Full organization details returned by the API.

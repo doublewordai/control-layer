@@ -395,8 +395,9 @@ scheduling:
   # request sent to a `dynamo`-kind endpoint carries
   # `nvext.agent_hints.priority = -T`, where T is its effective time in Unix
   # seconds (earliest T is served first): the arrival time, moved earlier by
-  # the account's `priority_bias_seconds` (set per account in the console, or
-  # per model in an organisation overlay, which wins). Batch work
+  # the `priority` of an organisation's per-model deal (overlay `targets` in
+  # the organisation catalog) or of a serving-class preset, read as seconds of
+  # head start. Batch work
   # already sends -(batch deadline) when
   # background_services.batch_daemon.inject_deadline_priority is on, so both
   # share one queue order. Other endpoint kinds never receive the field.

@@ -135,37 +135,37 @@ flex use standard; flex uses the batch `1h` tariff. Prefer putting batch prices 
 the all-class `tariffs` list. `class_pricing.standard` also supports batch;
 interactive/throughput batch prices are rejected by validation.
 
-## Realtime priority bias
+## Realtime priority
 
-When the installation sends deadline-ordered realtime priority
-(`scheduling.inject_realtime_priority`; see
-[Scheduling Priority](../reference/configuration.md#scheduling-priority)), an
-organisation's realtime requests can be moved earlier in the queue. A platform
-manager sets an account-wide head start in the console. An overlay sets one for
-a single model, replacing the account value there. Set `priority_bias_seconds`
-on the model entry. The organisation and model alias below are fictional:
+An overlay's explicit `targets` are a bespoke deal on one model: latency targets
+plus a scheduling `priority`. Use them to give an organisation priority on a
+model. The organisation, model alias and values below are fictional:
 
 ```yaml
 org: example-organization
 models:
   - alias: example-model
-    priority_bias_seconds: 900
+    targets: {ttft_ms: 800, itl_ms: 30, priority: 900}
 ```
 
-The organisation's realtime requests on `example-model` get effective time
-`T = arrival - 900`. A resolved serving-class preset's or overlay target's
-`priority` is subtracted too. Compared with a realtime request that has no head
-start, one of these requests is served first if the other arrived less than 15
-minutes earlier. It is also served ahead of batch work whose deadline is later
-than `T`. On other models the organisation keeps its account head start,
-if it has one. Batch and flex requests keep their batch deadline.
+The deal applies whenever the organisation's request names no serving class. It
+is mutually exclusive with `default_class`, and no class grant is needed. The
+`ttft_ms` and `itl_ms` targets are also sent to the serving stack's router, which
+uses them to choose a pool. Set them to what the organisation should be served
+at, not only as a carrier for the priority. Requests resolve as the `custom`
+class, so `class_pricing.custom` prices apply if you declare them.
 
-The value must be a whole number from `0` to `86400` (one day). Validation
-rejects negative, fractional and larger values. An entry may contain only
-`priority_bias_seconds`. Omitting the field inherits the account head start;
-`0` removes it on this model. The bias has no
-effect while `inject_realtime_priority` is off, and it is only sent to endpoints
-of kind `dynamo`.
+When the installation sends deadline-ordered realtime priority
+(`scheduling.inject_realtime_priority`; see
+[Scheduling Priority](../reference/configuration.md#scheduling-priority)), the
+`priority` is a head start in seconds. The organisation's realtime requests on
+`example-model` get effective time `T = arrival - 900`. Compared with a realtime
+request that has no head start, one of these requests is served first if the
+other arrived less than 15 minutes earlier. It is also served ahead of batch
+work whose deadline is later than `T`. Batch and flex requests keep their batch
+deadline. Without deadline ordering, the `priority` is sent as an absolute value
+and outranks every batch deadline. Either way it is only sent to endpoints of
+kind `dynamo`.
 
 ## Billing, display and admission
 
@@ -206,8 +206,8 @@ dwctl-model-provisioning validate-org-overlays /path/to/org-overlays.d \
   --models /path/to/model-deployments
 ```
 
-The validator checks syntax, pricing precision, class/purpose compatibility,
-the `priority_bias_seconds` range and model references. You can run it locally or add it to your own CI pipeline. It
+The validator checks syntax, pricing precision, class/purpose compatibility and
+model references. You can run it locally or add it to your own CI pipeline. It
 cannot verify organization existence or future ledger rows in the target
 database. Check those prerequisites before restarting the server with an updated
 catalog.

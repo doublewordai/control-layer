@@ -144,7 +144,7 @@ impl<'c> Organizations<'c> {
                    is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,
                    low_balance_notification_sent, low_balance_threshold,
                    auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, invoicing_enabled, zero_data_retention,
-                   granted_serving_classes, default_serving_class, self_hosted_only, toleration_preset, priority_bias_seconds
+                   granted_serving_classes, default_serving_class, self_hosted_only, toleration_preset
             FROM users
             WHERE (username = $1 OR username LIKE $1 || '~%')
               AND user_type = 'organization'
@@ -218,7 +218,6 @@ impl<'c> Organizations<'c> {
                     default_serving_class: r.default_serving_class,
                     self_hosted_only: r.self_hosted_only,
                     toleration_preset: r.toleration_preset,
-                    priority_bias_seconds: r.priority_bias_seconds,
                 }))
             }
             None => Ok(None),
@@ -333,7 +332,7 @@ impl<'c> Organizations<'c> {
                       is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,
                       low_balance_notification_sent, low_balance_threshold,
                       auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, invoicing_enabled, zero_data_retention,
-                   granted_serving_classes, default_serving_class, self_hosted_only, toleration_preset, priority_bias_seconds
+                   granted_serving_classes, default_serving_class, self_hosted_only, toleration_preset
             "#,
             org_id,
             request.name,
@@ -398,7 +397,6 @@ impl<'c> Organizations<'c> {
             default_serving_class: row.default_serving_class,
             self_hosted_only: row.self_hosted_only,
             toleration_preset: row.toleration_preset,
-            priority_bias_seconds: row.priority_bias_seconds,
         })
     }
 
@@ -446,10 +444,6 @@ impl<'c> Organizations<'c> {
                     WHEN $13::boolean THEN $14
                     ELSE toleration_preset
                 END,
-                priority_bias_seconds = CASE
-                    WHEN $15::boolean THEN $16
-                    ELSE priority_bias_seconds
-                END,
                 updated_at = NOW()
             WHERE id = $1 AND user_type = 'organization' AND is_deleted = false
             RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,
@@ -457,7 +451,7 @@ impl<'c> Organizations<'c> {
                       batch_notifications_enabled, first_batch_email_sent,
                       low_balance_notification_sent, low_balance_threshold,
                       auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, invoicing_enabled, zero_data_retention,
-                   granted_serving_classes, default_serving_class, self_hosted_only, toleration_preset, priority_bias_seconds
+                   granted_serving_classes, default_serving_class, self_hosted_only, toleration_preset
             "#,
             id,
             request.display_name,
@@ -473,8 +467,6 @@ impl<'c> Organizations<'c> {
             request.granted_serving_classes.as_deref(),
             request.toleration_preset.is_some() as bool,
             request.toleration_preset.clone().flatten(),
-            request.priority_bias_seconds.is_some() as bool,
-            request.priority_bias_seconds.flatten(),
         )
         .fetch_optional(&mut *self.db)
         .await?
@@ -514,7 +506,6 @@ impl<'c> Organizations<'c> {
             default_serving_class: row.default_serving_class,
             self_hosted_only: row.self_hosted_only,
             toleration_preset: row.toleration_preset,
-            priority_bias_seconds: row.priority_bias_seconds,
         })
     }
 
@@ -1605,7 +1596,6 @@ mod tests {
                     self_hosted_only: None,
                     granted_serving_classes: Default::default(),
                     toleration_preset: Default::default(),
-                    priority_bias_seconds: Default::default(),
                 },
             )
             .await
@@ -1653,7 +1643,6 @@ mod tests {
                     self_hosted_only: None,
                     granted_serving_classes: Default::default(),
                     toleration_preset: Default::default(),
-                    priority_bias_seconds: Default::default(),
                 },
             )
             .await
@@ -1704,7 +1693,6 @@ mod tests {
                     self_hosted_only: None,
                     granted_serving_classes: Default::default(),
                     toleration_preset: Default::default(),
-                    priority_bias_seconds: Default::default(),
                 },
             )
             .await
@@ -1729,7 +1717,6 @@ mod tests {
                     self_hosted_only: None,
                     granted_serving_classes: Default::default(),
                     toleration_preset: Default::default(),
-                    priority_bias_seconds: Default::default(),
                 },
             )
             .await
@@ -1755,7 +1742,6 @@ mod tests {
                     self_hosted_only: None,
                     granted_serving_classes: Default::default(),
                     toleration_preset: Default::default(),
-                    priority_bias_seconds: Default::default(),
                 },
             )
             .await
@@ -1779,7 +1765,6 @@ mod tests {
                     self_hosted_only: None,
                     granted_serving_classes: Default::default(),
                     toleration_preset: Default::default(),
-                    priority_bias_seconds: Default::default(),
                 },
             )
             .await

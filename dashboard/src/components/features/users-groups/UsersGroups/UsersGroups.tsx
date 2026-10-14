@@ -757,7 +757,6 @@ const UsersGroups: React.FC = () => {
             default_serving_class: activeUser.default_serving_class,
             self_hosted_only: activeUser.self_hosted_only,
             toleration_preset: activeUser.toleration_preset,
-            priority_bias_seconds: activeUser.priority_bias_seconds,
           }}
           canEditZdr={isPlatformManager}
           canEditServing={isPlatformManager}

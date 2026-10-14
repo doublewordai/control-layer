@@ -79,7 +79,7 @@ model_provisioning:
 |-------|------|---------|-------------|
 | `enabled` | boolean | `false` | Apply the declarative model catalog during startup. |
 | `directory` | path | `/app/model-provisioning.d` | Directory containing one `.yaml` or `.yml` document per canonical model. |
-| `org_overlays_directory` | path | `/app/org-overlays.d` | Directory containing one `.yaml` or `.yml` document per organisation with per-model serving overrides (`default_class` or explicit `targets`, `self_hosted_only`, `priority_bias_seconds`). Applied after the model catalog when `enabled` is set. A missing directory is an empty catalog, so a deployment that does not mount one applies no overlays; an existing path that is not a directory fails startup. |
+| `org_overlays_directory` | path | `/app/org-overlays.d` | Directory containing one `.yaml` or `.yml` document per organisation with per-model serving overrides (`default_class` or explicit `targets`, `self_hosted_only`). Applied after the model catalog when `enabled` is set. A missing directory is an empty catalog, so a deployment that does not mount one applies no overlays; an existing path that is not a directory fails startup. |
 | `account_limits_directory` | path | `/app/account-limits.d` | Directory containing one `.yaml` or `.yml` document per account with its own realtime in-flight limits on virtual models. Applied after the model catalog when `enabled` is set, replacing every stored per-account limit. A missing directory changes nothing; an empty one clears every per-account limit. See [Account limits](./model-provisioning.md#account-limits). |
 
 When enabled, the directory must exist. Startup fails before any provisioning
@@ -733,7 +733,7 @@ seconds, the priority is `-T`, and the earliest `T` is served first:
 |---------|-----|------------|
 | Batch and flex (dispatched by the batch daemon) | The batch deadline | `background_services.batch_daemon.inject_deadline_priority` |
 | Realtime | Arrival time | `scheduling.inject_realtime_priority` |
-| Realtime, account with a priority bias | Arrival time minus the bias | `scheduling.inject_realtime_priority` |
+| Realtime with a per-model deal or class priority | Arrival time minus that `priority`, in seconds | `scheduling.inject_realtime_priority` |
 
 Background-tier work has no deadline. The batch daemon sends it with the
 reserved priority `i32::MIN`, below every deadline priority, so it is never
@@ -754,21 +754,16 @@ How the priority is chosen:
   `external` never get `nvext.agent_hints.priority`, and members of a named
   pool whose endpoint does not accept scheduling priority have the whole
   `nvext` object removed.
-- **Account bias.** A platform manager can give an account (user or
-  organization) a realtime priority head start, `priority_bias_seconds` (0 to
-  86400), in the console's edit dialog or with `PATCH /admin/api/v1/users/{id}`
-  or `PATCH /admin/api/v1/organizations/{id}`. Its realtime requests use
-  `T = arrival - bias`. Compared with a realtime request that has no head start,
-  it is served first if that request arrived less than `bias` seconds earlier. `null` clears it. The bias applies
-  to the account that owns the API key, and only platform managers can see or
-  change it.
-- **Per-model bias.** An organisation's
-  [model overlay](../how-to/organization-model-overlays.md#realtime-priority-bias)
-  can set `priority_bias_seconds` on one model. On that model it replaces the
-  account bias, and `0` removes the head start there.
-- **Serving-class presets.** A resolved preset's or overlay target's
-  `priority` counts as a further head start in seconds: `T` is reduced by that
-  amount.
+- **Per-model deals.** An organisation's
+  [model overlay](../how-to/organization-model-overlays.md#realtime-priority)
+  can carry explicit `targets: {ttft_ms, itl_ms, priority}` on one model. With
+  deadline ordering, that `priority` is a head start in seconds:
+  `T = arrival - priority`. Compared with a realtime request that has no head
+  start, a request on the deal is served first if the other arrived less than
+  `priority` seconds earlier. The deal applies to the organisation that owns
+  the API key, whenever the request names no serving class.
+- **Serving-class presets.** A resolved class preset's `priority` is read the
+  same way, as a head start in seconds.
 - **Batch daemon traffic is unchanged.** Requests the batch daemon dispatches
   keep the priority already in their body.
 - **Resumed streams keep their `T`.** A continuation resume leg reuses the

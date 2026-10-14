@@ -1,5 +1,4 @@
 import { useState } from "react";
-import { formatBiasDuration } from "@/utils/priorityBias";
 import { useOrganizationServing } from "@/api/control-layer/hooks";
 import type { OrganizationServing } from "@/api/control-layer/types";
 import { OverlayDetails } from "../serving/OverlayDetails";
@@ -58,7 +57,7 @@ export function OrganizationServingCard({
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-6">
-        <dl className="grid grid-cols-1 gap-4 text-sm sm:grid-cols-2 lg:grid-cols-4">
+        <dl className="grid grid-cols-1 gap-4 text-sm sm:grid-cols-3">
           <div>
             <dt className="text-xs text-gray-500">Granted classes</dt>
             <dd className="mt-1 flex flex-wrap gap-1">
@@ -83,16 +82,6 @@ export function OrganizationServingCard({
             <dt className="text-xs text-gray-500">Self-hosted only</dt>
             <dd className="mt-1 font-medium">
               {data.self_hosted_only ? "Yes" : "No"}
-            </dd>
-          </div>
-          <div>
-            <dt className="text-xs text-gray-500">
-              Realtime priority head start
-            </dt>
-            <dd className="mt-1 font-medium">
-              {data.priority_bias_seconds
-                ? formatBiasDuration(data.priority_bias_seconds)
-                : "None"}
             </dd>
           </div>
         </dl>
@@ -158,7 +147,9 @@ function OrganizationModelOverlay({
       onToggle={(event) => setOpen(event.currentTarget.open)}
     >
       <summary className="cursor-pointer p-3 text-sm">
-        <span className="font-medium">{alias ?? modelId}</span>
+        <span className="font-medium">
+          {alias ?? modelId}
+        </span>
         <span className="text-muted-foreground ml-2">
           {tokenCount} token price overrides · {cacheCount} cache overrides
         </span>

@@ -4,11 +4,6 @@ import type {
   ServingOverlay,
 } from "@/api/control-layer/types";
 import { formatTariffPrice, getTariffDisplayName } from "@/utils/formatters";
-import { formatBiasDuration } from "@/utils/priorityBias";
-
-function describeBias(seconds: number | null | undefined): string {
-  return seconds ? formatBiasDuration(seconds) : "None";
-}
 
 export function OverlayDetails({
   modelId,
@@ -44,16 +39,6 @@ export function OverlayDetails({
             {overlay?.self_hosted_only != null
               ? `${overlay.self_hosted_only ? "Yes" : "No"} · model override`
               : `Inherit account · ${serving.self_hosted_only ? "Yes" : "No"}`}
-          </dd>
-        </div>
-        <div>
-          <dt className="text-muted-foreground">
-            Realtime priority head start
-          </dt>
-          <dd>
-            {overlay?.priority_bias_seconds != null
-              ? `${describeBias(overlay.priority_bias_seconds)} · model override`
-              : `Inherit account · ${describeBias(serving.priority_bias_seconds)}`}
           </dd>
         </div>
         <div>

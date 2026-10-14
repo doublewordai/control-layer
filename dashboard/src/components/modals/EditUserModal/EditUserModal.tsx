@@ -3,13 +3,11 @@ import { User, Info } from "lucide-react";
 import { useUpdateUser, useConfig } from "../../../api/control-layer";
 import type { Role, ServingClassName } from "../../../api/control-layer/types";
 import { SchedulingTolerations } from "../../features/scheduling/SchedulingTolerations";
-import { RealtimePriorityBias } from "../../features/scheduling/RealtimePriorityBias";
 import {
   AVAILABLE_ROLES,
   SUBSET_ROLES,
   getRoleDisplayName,
 } from "../../../utils/roles";
-import { parsePriorityBias } from "../../../utils/priorityBias";
 import {
   Dialog,
   DialogContent,
@@ -39,7 +37,6 @@ interface EditUserModalProps {
     default_serving_class?: ServingClassName | null;
     self_hosted_only?: boolean;
     toleration_preset?: string | null;
-    priority_bias_seconds?: number | null;
   };
   /** Whether the current user may toggle zero data retention (admins only). */
   canEditZdr?: boolean;
@@ -78,25 +75,15 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
     self_hosted_only: currentUser.self_hosted_only ?? false,
     // null/absent both mean "Default" (no preset pinned).
     toleration_preset: currentUser.toleration_preset ?? null,
-    // Raw input text; empty means no bias.
-    priority_bias_seconds:
-      currentUser.priority_bias_seconds == null
-        ? ""
-        : String(currentUser.priority_bias_seconds),
   });
   const [error, setError] = useState<string | null>(null);
 
   const updateUserMutation = useUpdateUser();
   const { data: config } = useConfig();
-  const priorityBias = parsePriorityBias(formData.priority_bias_seconds);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
-    if (canEditServing && !priorityBias.ok) {
-      setError(`Realtime priority head start: ${priorityBias.error}`);
-      return;
-    }
 
     try {
       await updateUserMutation.mutateAsync({
@@ -122,9 +109,6 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
                 // Scheduling tolerations are platform-manager only too, and
                 // share the serving-settings gate server-side.
                 toleration_preset: formData.toleration_preset,
-                priority_bias_seconds: priorityBias.ok
-                  ? priorityBias.value
-                  : null,
               }
             : {}),
         },
@@ -435,16 +419,6 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
                   aria-label="Toggle no external-provider fallback"
                 />
               </div>
-              <RealtimePriorityBias
-                value={formData.priority_bias_seconds}
-                canEdit={canEditServing}
-                onChange={(next) =>
-                  setFormData((prev) => ({
-                    ...prev,
-                    priority_bias_seconds: next,
-                  }))
-                }
-              />
               <SchedulingTolerations
                 preset={formData.toleration_preset}
                 presets={config?.scheduling_toleration_presets}
@@ -472,10 +446,7 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
           <Button
             type="submit"
             form="edit-user-form"
-            disabled={
-              updateUserMutation.isPending ||
-              (canEditServing && !priorityBias.ok)
-            }
+            disabled={updateUserMutation.isPending}
           >
             {updateUserMutation.isPending ? (
               <>

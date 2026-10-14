@@ -271,10 +271,10 @@ pub struct SchedulingConfig {
     /// realtime request sent to a `dynamo`-kind endpoint carries
     /// `nvext.agent_hints.priority = -T` (NVIDIA Dynamo's priority carrier;
     /// `i32`, higher = more important), where `T` is the request's effective
-    /// time in Unix seconds: its arrival time, moved earlier by the owning
-    /// account's `priority_bias_seconds` (set per account in the console, or
-    /// per model in an organisation overlay, which wins) and by a resolved
-    /// serving-class preset's `priority`, read as seconds. This puts
+    /// time in Unix seconds: its arrival time, moved earlier by the `priority`
+    /// of the targets the request resolved to, read as seconds. Those are an
+    /// organisation's per-model deal (explicit overlay `targets` in the
+    /// organisation catalog) or a serving-class preset. This puts
     /// realtime in the same earliest-deadline-first order as batch work, whose
     /// `T` is the batch deadline (`background_services.batch_daemon.
     /// inject_deadline_priority`). Requests dispatched by the batch daemon keep

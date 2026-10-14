@@ -813,13 +813,8 @@ pub async fn target_message_handler<T: HttpClient>(
         .increment(1);
         // The request's deadline priority, fixed once here so every attempt
         // (and a later resume of this request) carries the same `T`.
-        let deadline_priority = serving::request_deadline_priority(
-            realtime_arrival,
-            key_purpose.as_deref(),
-            account.as_ref(),
-            overlay.as_ref(),
-            &resolution,
-        );
+        let deadline_priority =
+            serving::request_deadline_priority(realtime_arrival, key_purpose.as_deref(), &resolution);
         (resolution, deadline_priority)
     };
 

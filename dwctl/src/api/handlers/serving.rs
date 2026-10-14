@@ -32,7 +32,7 @@ const OVERLAY_COLUMNS: &str = r#"
     SELECT mo.user_id AS organization_id, u.username AS organization_name,
            u.display_name AS organization_display_name,
            mo.deployed_model_id, dm.alias, mo.default_serving_class, mo.targets,
-           mo.self_hosted_only, mo.priority_bias_seconds, mo.provisioning_source, mo.updated_at
+           mo.self_hosted_only, mo.provisioning_source, mo.updated_at
     FROM model_overlays mo
     JOIN users u ON u.id = mo.user_id
     JOIN deployed_models dm ON dm.id = mo.deployed_model_id
@@ -116,7 +116,6 @@ pub async fn get_organization_serving<P: PoolProvider>(
         granted_serving_classes: org.granted_serving_classes,
         default_serving_class: org.default_serving_class,
         self_hosted_only: org.self_hosted_only,
-        priority_bias_seconds: org.priority_bias_seconds,
         overlays: overlays.into_iter().map(OverlayResponse::from).collect(),
         tariffs,
         model_aliases,
