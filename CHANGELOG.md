@@ -1,5 +1,18 @@
 # Changelog
 
+## [14.0.1](https://github.com/doublewordai/control-layer/compare/v14.0.0...v14.0.1) (2026-10-13)
+
+
+### Bug Fixes
+
+* **fusillade:** index batches that finished after their deadline ([#1969](https://github.com/doublewordai/control-layer/issues/1969)) ([04beeb4](https://github.com/doublewordai/control-layer/commit/04beeb4760a6cca460091c67ac9119ea598100e7))
+* **responses:** preserve prior input in continuations ([#1964](https://github.com/doublewordai/control-layer/issues/1964)) ([e299065](https://github.com/doublewordai/control-layer/commit/e29906525eeff70544ab7e0c5b755f30d58174cf))
+
+
+### Tests
+
+* **pricing:** stamp fixture tariffs with the host clock ([#1967](https://github.com/doublewordai/control-layer/issues/1967)) ([86cc1d9](https://github.com/doublewordai/control-layer/commit/86cc1d9f9d4bb50de025973f5b5452e643ea3371))
+
 ## [14.0.0](https://github.com/doublewordai/control-layer/compare/v13.7.0...v14.0.0) (2026-10-12)
 
 
