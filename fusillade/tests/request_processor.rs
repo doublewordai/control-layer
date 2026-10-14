@@ -24,7 +24,7 @@ use fusillade::daemon::{DaemonConfig, default_should_retry};
 use fusillade::http::{HttpClient, HttpResponse, MockHttpClient};
 use fusillade::manager::{ModelFilter, ModelFilterState, Storage};
 use fusillade::processor::{
-    CancellationFuture, DefaultRequestProcessor, RequestProcessor, ShouldRetry,
+    CancellationFuture, DefaultRequestProcessor, ProcessContext, RequestProcessor, ShouldRetry,
 };
 use fusillade::request::{
     AnyRequest, Claimed, Completed, DaemonId, Failed, Request, RequestCompletionResult,
@@ -528,10 +528,11 @@ where
         storage: &S,
         should_retry: ShouldRetry,
         cancellation: CancellationFuture,
+        ctx: ProcessContext,
     ) -> fusillade::Result<RequestCompletionResult> {
         self.invocations.fetch_add(1, Ordering::SeqCst);
         self.inner
-            .process(request, http, storage, should_retry, cancellation)
+            .process(request, http, storage, should_retry, cancellation, ctx)
             .await
     }
 }
@@ -596,6 +597,7 @@ where
         storage: &S,
         _should_retry: ShouldRetry,
         _cancellation: CancellationFuture,
+        _ctx: ProcessContext,
     ) -> fusillade::Result<RequestCompletionResult> {
         // Synthesize a non-retriable failure so the daemon persists the
         // terminal state and we can observe it via the manager.

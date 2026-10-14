@@ -2631,6 +2631,7 @@ where
                     capacity_model = %capacity_model,
                     outcome = tracing::field::Empty,
                 );
+                let process_ctx = crate::processor::ProcessContext::new(process_span.clone());
 
                 join_set.spawn(async move {
                     let span = tracing::Span::current();
@@ -2690,6 +2691,7 @@ where
                             storage.as_ref(),
                             should_retry.clone(),
                             cancellation,
+                            process_ctx,
                         )
                         .await;
 
