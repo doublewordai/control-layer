@@ -511,7 +511,7 @@ mod tests {
             "thinking": { "type": "enabled", "budget_tokens": 4096 }
         }));
         assert_eq!(out["reasoning_effort"], "medium");
-        // disabled / absent thinking does not set reasoning_effort
+        // absent thinking does not set reasoning_effort
         let out2 = translate(json!({ "model": "m", "max_tokens": 1, "messages": [] }));
         assert!(out2.get("reasoning_effort").is_none());
     }
