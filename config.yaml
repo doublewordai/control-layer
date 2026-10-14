@@ -988,20 +988,28 @@ background_services:
     # list and is never released (so it can miss its completion window by
     # design). Background work and unlisted models are never held.
     #
-    # A held request is released (sent as stored, so the backend may schedule
-    # it anywhere) when it would otherwise miss its completion window: inside
-    # the claim ramp (claim_ramp_exponent) or past its deadline; when the
-    # model's held dispatches are refused while fewer than min_samples
-    # complete in window_secs; when it is due at or before the latest deadline
-    # whose outstanding work cannot finish at the model's own completion rate
-    # (with safety_margin); or when the decisions are older than
+    # A held request is released (sent as stored, without the hold list, so the
+    # hold no longer limits where it runs) when it would otherwise miss its
+    # completion window: inside the claim ramp (claim_ramp_exponent) or past
+    # its deadline; when the model's held dispatches were refused and none
+    # completed over a whole window_secs of holding; when it is due at or
+    # before the latest deadline
+    # whose pending work cannot finish at the model's own completion rate
+    # (with safety_margin); when a refusal could no longer be retried before
+    # stop_before_deadline_ms; or when the decisions are older than
     # stale_after_secs. Each replica recomputes the decisions every
     # refresh_interval_secs from the shared hold_stats counters.
     #
     # A held request refused for capacity (503/529) is retried after
-    # max_backoff_ms without spending a retry and without lowering the model's
-    # adaptive concurrency. Off by default; with it off outbound bodies are unchanged. Rolling back
-    # is a config change: remove the model or set enabled: false.
+    # max_backoff_ms without spending a retry, never fails for it, and neither
+    # lowers nor raises the model's adaptive concurrency. Encrypted request bodies
+    # cannot carry the list and are never held. Off by default; with it off
+    # the daemon's outbound bodies are unchanged. Rolling back is a config
+    # change: remove the model or set enabled: false.
+    #
+    # Separately from this setting, continuation legs of a resumed request
+    # carry the original request's tolerations (an account preset, or the
+    # hold list), so a leg runs where the original was allowed to.
     # dispatch_hold:
     #   enabled: false
     #   preset: no-overflow

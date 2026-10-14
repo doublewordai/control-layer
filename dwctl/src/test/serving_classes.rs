@@ -408,11 +408,14 @@ async fn json_key_order_survives_batch_upload(pool: PgPool) {
     assert!(content.text().contains(ORDERED_SCHEMA), "{}", content.text());
 }
 
-/// The batch daemon's dispatch hold reaches the backend: the inference
-/// middleware passes daemon loopback requests through untouched (the realtime
-/// client-strip and account-preset paths are covered in `toleration_presets`).
+/// The inference middleware forwards a daemon loopback request's scheduling
+/// tolerations untouched, whatever put them in the body (the daemon's hold
+/// list or an account preset stamped at upload). The body here is built by
+/// hand, as the daemon would send it; the daemon side is covered in
+/// fusillade's dispatch hold tests, and the realtime client-strip and
+/// account-preset paths in `toleration_presets`.
 #[dwctl_test_macros::test]
-async fn daemon_scheduling_tolerations_reach_the_backend(pool: PgPool) {
+async fn daemon_loopback_forwards_scheduling_tolerations_untouched(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let response = f
         .server
@@ -427,7 +430,7 @@ async fn daemon_scheduling_tolerations_reach_the_backend(pool: PgPool) {
     assert_eq!(
         forwarded["nvext"]["routing_constraints"]["tolerations"],
         json!([]),
-        "the daemon's tolerations reach the backend"
+        "a daemon request's tolerations are forwarded untouched"
     );
     assert_eq!(forwarded["nvext"]["agent_hints"]["priority"], -1700000000);
 }

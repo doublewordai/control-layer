@@ -2381,7 +2381,7 @@ pub struct DaemonConfig {
     /// Hold the batch and flex dispatches of selected models on the capacity
     /// a scheduling-toleration preset allows, releasing them only when they
     /// would otherwise miss their completion window. Off by default; with it
-    /// off (or the key absent) outbound bodies are unchanged. See
+    /// off (or the key absent) the daemon's outbound bodies are unchanged. See
     /// [`DispatchHoldConfig`].
     #[serde(default)]
     pub dispatch_hold: DispatchHoldConfig,
@@ -2678,17 +2678,24 @@ fn default_batch_metadata_fields_dwctl() -> Vec<String> {
 /// design. Background work and models not listed are never held.
 ///
 /// A held request is released, sent as stored without the hold list so the
-/// backend may schedule it anywhere, when it would otherwise miss its
-/// completion window:
+/// hold no longer limits where the backend schedules it, when it would
+/// otherwise miss its completion window:
 ///
 /// - inside the batch-claim deadline ramp (`claim_ramp_exponent`) or past its
 ///   deadline;
-/// - when its model's held dispatches were refused in the last `window_secs`
-///   while fewer than `min_samples` completed (no capacity to wait for);
-/// - when it is due at or before the latest deadline `d` whose outstanding work
+/// - when its model's held dispatches were refused and none completed over a
+///   whole `window_secs` of holding (no capacity to wait for);
+/// - when it is due at or before the latest deadline `d` whose pending work
 ///   cannot finish at the model's own rate: `work_due_by(d) / rate * (1 +
-///   safety_margin) > d - now`, where the rate is the held completions in the
-///   last `window_secs`. Requests sharing a deadline are released together;
+///   safety_margin) > d - now`, where the rate is the held completions over
+///   the time the model was held in the last `window_secs` (trusted from
+///   `min_samples` completions, or after a whole window of refusals). While a
+///   release is in the window, each replica keeps using the rate it measured
+///   before the release, so released work running on the same capacity does
+///   not drive further release. Requests sharing a deadline are released
+///   together;
+/// - when a refusal could no longer be retried before the retry cut-off
+///   (`stop_before_deadline_ms`);
 /// - when the decisions are older than `stale_after_secs` (fail open).
 ///
 /// Every replica counts its held completions and refusals, flushes them into
@@ -2696,8 +2703,14 @@ fn default_batch_metadata_fields_dwctl() -> Vec<String> {
 /// `refresh_interval_secs`; no leader is involved.
 ///
 /// A held request the backend refuses for capacity (503/529) is retried after
-/// `max_backoff_ms` without spending one of `max_retries`, and does not lower
-/// the model's adaptive concurrency.
+/// `max_backoff_ms` without spending one of `max_retries`, is never failed for
+/// it, and neither lowers nor raises the model's adaptive concurrency. A
+/// request whose stored body is encrypted cannot carry the hold list and is
+/// sent as stored (`fusillade_hold_skipped_total`).
+///
+/// With this off, the daemon's outbound bodies are unchanged. Continuation
+/// legs of a resumed request carry the original's tolerations whether or not
+/// this is on (an account preset, as well as the hold list).
 ///
 /// Rolling back is a config change: drop a model from `models`, or set
 /// `enabled: false`, and held requests dispatch as stored on their next claim.
@@ -2716,13 +2729,15 @@ pub struct DispatchHoldConfig {
     /// Default: 60.
     pub refresh_interval_secs: u64,
     /// Trailing window of held completions and refusals, in seconds. At
-    /// least `refresh_interval_secs`. Default: 900.
+    /// least `refresh_interval_secs`. The counters are kept for two windows,
+    /// and at least two hours. Default: 900.
     pub window_secs: u64,
     /// Margin added to a deadline's projected work, as a fraction in
     /// `[0, 1)`. Default: 0.2.
     pub safety_margin: f64,
     /// Held completions a model needs in the window before its own rate is
-    /// trusted. Default: 20.
+    /// trusted, unless it was refused throughout a whole window of holding.
+    /// Default: 20.
     pub min_samples: u64,
     /// Decisions older than this (seconds) release every held request. More
     /// than `refresh_interval_secs`. Default: 300.

@@ -160,6 +160,59 @@ Off by default. Set `max_total_in_flight` before turning it on. Watch
 limit that climbs without ever being cut means something that does not speak 529
 is in the way, most likely onwards' own concurrency limit, which returns 429.
 
+### Dispatch hold
+
+`Daemon::with_dispatch_hold(DispatchHold)` (and the same builder on
+`PostgresDaemon`) holds the batch and flex dispatches of selected models on the
+capacity a scheduling-toleration list allows. The list is opaque JSON, written
+to `nvext.routing_constraints.tolerations` for the upstream inference backend to
+interpret; the backend may then refuse a held request (503/529) while that
+capacity is full. Off unless the builder is called.
+
+- **Set if absent.** The list is inserted only when the stored body has no
+  `nvext.routing_constraints.tolerations` of its own. A body that already has
+  one (for example an account's pinned list, stamped at upload) is sent
+  unchanged and never released. Nothing is ever removed or overwritten.
+- **Opt in per model.** Only `DispatchHold::models` are held; background work,
+  escalated requests and other models never are. A body the daemon cannot read
+  as a JSON object (an encrypted body, decrypted later by the request
+  processor) is sent as stored and counted by
+  `fusillade_hold_skipped_total{model,reason}`.
+- **Release.** A held request is sent as stored (without the list) when it
+  would otherwise miss its completion window: past its deadline or inside the
+  batch-claim deadline ramp; when the model's held dispatches were refused and
+  none completed over a whole `window` of holding; when it is due at or before
+  the latest deadline whose pending work cannot finish at the model's own rate
+  (held completions over the time held, with `safety_margin`); when a refusal
+  could no longer be retried before `stop_before_deadline_ms`; or when the
+  decisions are older than `stale_after` (fail open). Requests sharing a
+  deadline are released together. Counted by
+  `fusillade_tolerations_released_total{model,reason}`.
+- **Refusals.** A held 503/529 is requeued after `max_backoff_ms` without
+  spending a retry, is never terminal, and neither cuts nor raises adaptive
+  concurrency.
+
+Each daemon counts its held completions and refusals in memory, flushes them
+every 10 seconds into the shared per-minute `hold_stats` table, and every
+`refresh_interval` reads them back with the pending work by deadline and
+computes each model's decision. There is no leader and nothing is written to
+the request rows. While a release is in the window, a daemon keeps projecting
+with the rate it measured before the release, so released work running on the
+same capacity does not drive further release.
+
+The decisions live in the storage. A custom `DaemonStorage` must implement all
+four hold methods for a hold to do anything: `set_dispatch_hold` (keep the
+decisions and return a `DispatchTolerations` on each claimed request of a held
+model, applying the deadline floor), `flush_hold_stats` (add per-minute
+counters, additively across daemons), `purge_hold_stats` and
+`read_hold_inputs`. The defaults are no-ops: claims make no decision, and a
+claimed request without one is sent as stored, so nothing is held.
+
+Metrics: `fusillade_hold_dispatches_total`, `fusillade_hold_refusals_total`,
+`fusillade_tolerations_released_total`, `fusillade_hold_skipped_total`,
+`fusillade_hold_own_rate`, `fusillade_projected_backlog_seconds` and
+`fusillade_hold_stats_age_seconds`.
+
 ### Database Retry Cadence
 
 `fusillade-arsenal` can retry transient SQLx pool-acquire failures such as
