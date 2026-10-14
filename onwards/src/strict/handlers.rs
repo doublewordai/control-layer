@@ -1686,9 +1686,9 @@ async fn sanitize_error_response(mut response: Response) -> Response {
 /// Not every trusted backend answers in OpenAI's shape. Dynamo sends
 /// `{"message":…,"type":"Bad Request","code":400}`, which OpenAI SDKs can't
 /// read. A body that already carries an `error` object passes through
-/// unchanged, and so does an encoded one: requests go upstream without
-/// `Accept-Encoding`, so a compressed error is a misbehaving provider's, and
-/// it can't be read.
+/// unchanged, and so do bodies that can't be read: an encoded one (requests
+/// go upstream without `Accept-Encoding`, so a compressed error is a
+/// misbehaving provider's) and one larger than [`MAX_ERROR_BODY`].
 async fn envelope_trusted_error(mut response: Response) -> Response {
     let encoded = response
         .headers()
@@ -1699,10 +1699,13 @@ async fn envelope_trusted_error(mut response: Response) -> Response {
     }
 
     let status = response.status();
-    let body = match axum::body::to_bytes(std::mem::take(response.body_mut()), MAX_ERROR_BODY).await
-    {
-        Ok(bytes) => bytes,
-        Err(e) => {
+    let body = match buffer_error_body(std::mem::take(response.body_mut())).await {
+        BufferedErrorBody::Complete(bytes) => bytes,
+        BufferedErrorBody::TooLarge(body) => {
+            *response.body_mut() = body;
+            return response;
+        }
+        BufferedErrorBody::Failed(e) => {
             error!(error = %e, status = %status, "Failed to read trusted error response body");
             Bytes::new()
         }
@@ -1723,6 +1726,35 @@ async fn envelope_trusted_error(mut response: Response) -> Response {
     response
 }
 
+enum BufferedErrorBody {
+    Complete(Bytes),
+    /// Longer than [`MAX_ERROR_BODY`]: the whole body, the part already read
+    /// followed by the rest.
+    TooLarge(Body),
+    Failed(axum::Error),
+}
+
+/// Read an error body of up to [`MAX_ERROR_BODY`], keeping a longer one
+/// intact so it can still be forwarded.
+async fn buffer_error_body(body: Body) -> BufferedErrorBody {
+    let mut stream = http_body_util::BodyExt::into_data_stream(body);
+    let mut chunks: Vec<Bytes> = Vec::new();
+    let mut len = 0;
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(e) => return BufferedErrorBody::Failed(e),
+        };
+        len += chunk.len();
+        chunks.push(chunk);
+        if len > MAX_ERROR_BODY {
+            let read = futures_util::stream::iter(chunks.into_iter().map(Ok::<_, axum::Error>));
+            return BufferedErrorBody::TooLarge(Body::from_stream(read.chain(stream)));
+        }
+    }
+    BufferedErrorBody::Complete(chunks.concat().into())
+}
+
 /// The OpenAI error envelope for an upstream error body, or `None` when the
 /// body already has one.
 ///
@@ -1741,11 +1773,14 @@ fn openai_error_envelope(status: StatusCode, body: &[u8]) -> Option<serde_json::
     }
 
     let (error_type, generic_message) = sanitized_error_for_status(status.as_u16());
-    let message = parsed
-        .get("message")
-        .or_else(|| parsed.get("error"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|message| !message.trim().is_empty())
+    let usable = |field: &str| {
+        parsed
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .filter(|message| !message.trim().is_empty())
+    };
+    let message = usable("message")
+        .or_else(|| usable("error"))
         .unwrap_or(generic_message);
     let context_length = parsed
         .pointer("/details/type")
@@ -7183,6 +7218,27 @@ mod tests {
         "invalid_request_error",
         None
     )]
+    #[case::null_message_string_error(
+        400,
+        r#"{"message":null,"error":"prompt is empty"}"#,
+        "prompt is empty",
+        "invalid_request_error",
+        None
+    )]
+    #[case::blank_message_string_error(
+        400,
+        r#"{"message":" ","error":"prompt is empty"}"#,
+        "prompt is empty",
+        "invalid_request_error",
+        None
+    )]
+    #[case::numeric_message_string_error(
+        400,
+        r#"{"message":7,"error":"prompt is empty"}"#,
+        "prompt is empty",
+        "invalid_request_error",
+        None
+    )]
     fn test_openai_error_envelope_wraps_other_shapes(
         #[case] status: u16,
         #[case] body: &str,
@@ -7234,6 +7290,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body.as_ref(), compressed);
+    }
+
+    /// A body over the buffering limit can't be inspected, so it is forwarded
+    /// whole, whether or not it already has the envelope. The body arrives in
+    /// chunks so the limit is crossed partway through one.
+    #[rstest::rstest]
+    #[case::openai_envelope(json!({"error": {"message": "x".repeat(MAX_ERROR_BODY), "type": "invalid_request_error", "param": null, "code": "context_length_exceeded"}}))]
+    #[case::dynamo_shape(json!({"message": "x".repeat(MAX_ERROR_BODY), "type": "Bad Request", "code": 400}))]
+    #[tokio::test]
+    async fn test_envelope_trusted_error_forwards_oversized_body(#[case] error: serde_json::Value) {
+        let original = Bytes::from(error.to_string());
+        let chunks: Vec<Result<Bytes, std::io::Error>> = original
+            .chunks(10_000)
+            .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+            .collect();
+        let response = Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from_stream(futures_util::stream::iter(chunks)))
+            .unwrap();
+
+        let response = envelope_trusted_error(response).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body, original);
     }
 
     /// A trusted pool for `model` whose provider answers `status` with `body`.
