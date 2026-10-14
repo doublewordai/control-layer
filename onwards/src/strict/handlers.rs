@@ -1686,8 +1686,18 @@ async fn sanitize_error_response(mut response: Response) -> Response {
 /// Not every trusted backend answers in OpenAI's shape. Dynamo sends
 /// `{"message":…,"type":"Bad Request","code":400}`, which OpenAI SDKs can't
 /// read. A body that already carries an `error` object passes through
-/// unchanged.
+/// unchanged, and so does an encoded one: requests go upstream without
+/// `Accept-Encoding`, so a compressed error is a misbehaving provider's, and
+/// it can't be read.
 async fn envelope_trusted_error(mut response: Response) -> Response {
+    let encoded = response
+        .headers()
+        .get(header::CONTENT_ENCODING)
+        .is_some_and(|encoding| encoding != "identity");
+    if encoded {
+        return response;
+    }
+
     let status = response.status();
     let body = match axum::body::to_bytes(std::mem::take(response.body_mut()), MAX_ERROR_BODY).await
     {
@@ -7202,6 +7212,28 @@ mod tests {
             openai_error_envelope(StatusCode::BAD_REQUEST, body.as_bytes()),
             None
         );
+    }
+
+    /// An encoded body can't be read, so it is forwarded as it came, with
+    /// its `Content-Encoding`, rather than replaced by a generic envelope.
+    #[tokio::test]
+    async fn test_envelope_trusted_error_leaves_encoded_body() {
+        let compressed: &'static [u8] = &[0x1f, 0x8b, 0x08, 0x00];
+        let response = Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header(header::CONTENT_ENCODING, "gzip")
+            .body(Body::from(compressed))
+            .unwrap();
+
+        let response = envelope_trusted_error(response).await;
+        assert_eq!(
+            response.headers().get(header::CONTENT_ENCODING).unwrap(),
+            "gzip"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), compressed);
     }
 
     /// A trusted pool for `model` whose provider answers `status` with `body`.

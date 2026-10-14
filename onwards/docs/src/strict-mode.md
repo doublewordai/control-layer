@@ -251,7 +251,7 @@ This is the only exception to strict mode's error standardization guarantees: wh
 }
 ```
 
-Here, the internal provider's error responses pass through unchanged, apart from the envelope (see below). The external provider omits `trusted`, so it inherits the pool default (`false`) and has its error responses sanitized. This lets you mix trusted internal infrastructure with untrusted external providers inside a single pool.
+Here, the internal provider's error responses keep their message, in the OpenAI envelope (see below). The external provider omits `trusted`, so it inherits the pool default (`false`) and has its error responses sanitized. This lets you mix trusted internal infrastructure with untrusted external providers inside a single pool.
 
 ### Behavior
 
@@ -265,10 +265,9 @@ When a pool is marked as `trusted: true`:
 - Streaming responses ARE parsed and sanitized line-by-line
 
 **Error responses (4xx, 5xx) bypass sanitization:**
-- Original error messages and metadata forwarded to clients
-- Provider-specific error details preserved (stack traces, debug info)
-- Custom error fields passed through unchanged
-- An error without OpenAI's `{"error": {...}}` envelope gets one: its top-level `message` (or a string `error`) becomes `error.message`, and `error.type` follows the status as for sanitized errors. Dynamo's `{"message": ..., "type": "Bad Request", "code": 400}` is the common case; its context-length refusals get the code `context_length_exceeded`
+- An error already in OpenAI's `{"error": {...}}` envelope is forwarded unchanged: its message, metadata, provider-specific details (stack traces, debug info) and custom fields all reach the client
+- An error in any other shape is rebuilt as an OpenAI envelope that keeps only the message: its top-level `message` (or a string `error`) becomes `error.message`, `error.type` follows the status as for sanitized errors, and the original `type`, `code`, `details` and other fields are dropped. Dynamo's `{"message": ..., "type": "Bad Request", "code": 400}` is the common case; its context-length refusals get the code `context_length_exceeded`
+- An encoded (compressed) error body is forwarded unchanged
 
 This allows you to get detailed debugging information from errors while maintaining response consistency for successful requests.
 
