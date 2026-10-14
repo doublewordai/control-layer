@@ -47,6 +47,17 @@
 //! [`DEFAULT_PRIORITY`], so every priority is relative to realtime's 0.
 //! Everything a client could send to steer this itself is scrubbed at dwctl's
 //! ingress; only the resolver sets them.
+//!
+//! **Deadline-ordered priority.** When the caller marks a request with a
+//! [`RealtimeArrival`] extension (dwctl does, behind
+//! `scheduling.inject_realtime_priority`), realtime work joins the same
+//! earliest-deadline-first order batch work already uses: the priority sent to
+//! a `dynamo` member is `-T`, where `T` is the request's effective time in
+//! Unix seconds. For realtime `T` is the arrival time, moved earlier by the
+//! organisation's per-alias [`ServingOverlay::priority_bias_seconds`] and by a
+//! resolved preset's own `priority` (read as a head start in seconds). Batch
+//! work keeps the `-(deadline)` fusillade writes. See
+//! [`realtime_deadline_priority`]. Without the extension nothing changes.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -70,6 +81,9 @@ pub const PRIORITY_FIELD: &str = "priority";
 /// The priority a request to a `dynamo` member carries when nothing set one:
 /// realtime's. Batch deadlines sit below it, continuation resumes above.
 pub const DEFAULT_PRIORITY: i32 = 0;
+/// Largest `priority_bias_seconds` an overlay may declare (one day). The
+/// catalog and the database both refuse anything outside `0..=` this.
+pub const MAX_PRIORITY_BIAS_SECONDS: u32 = 86_400;
 /// Separator between a model alias and its class suffix (`alias:class`).
 pub const SUFFIX_SEPARATOR: char = ':';
 /// Key label naming the account (organisation) that owns the key. The account
@@ -256,13 +270,11 @@ impl ServingTargets {
     }
 }
 
-/// Write [`DEFAULT_PRIORITY`] as `nvext.agent_hints.priority` unless the body
-/// already carries a priority. One already present was set by someone
-/// entitled to: the daemon (batch deadline, continuation resume), a resolved
-/// preset, or the first hop when this crate runs again inside the serving
-/// namespace; callers' own are scrubbed at dwctl's ingress. The rest of
-/// `nvext` is kept.
-pub fn stamp_default_priority(body: &mut serde_json::Map<String, serde_json::Value>) {
+/// The `nvext.agent_hints` object of a body, created (or a malformed carrier
+/// replaced) as needed. The rest of `nvext` is kept.
+fn agent_hints_mut(
+    body: &mut serde_json::Map<String, serde_json::Value>,
+) -> &mut serde_json::Map<String, serde_json::Value> {
     let nvext = body
         .entry(NVEXT_FIELD)
         .or_insert_with(|| serde_json::Value::Object(Default::default()));
@@ -280,8 +292,78 @@ pub fn stamp_default_priority(body: &mut serde_json::Map<String, serde_json::Val
     hints
         .as_object_mut()
         .expect("agent_hints was just made an object")
+}
+
+/// Write [`DEFAULT_PRIORITY`] as `nvext.agent_hints.priority` unless the body
+/// already carries a priority. One already present was set by someone
+/// entitled to: the daemon (batch deadline, continuation resume), a resolved
+/// preset, or the first hop when this crate runs again inside the serving
+/// namespace; callers' own are scrubbed at dwctl's ingress. The rest of
+/// `nvext` is kept.
+pub fn stamp_default_priority(body: &mut serde_json::Map<String, serde_json::Value>) {
+    agent_hints_mut(body)
         .entry(PRIORITY_FIELD)
         .or_insert_with(|| DEFAULT_PRIORITY.into());
+}
+
+/// Write `priority` as `nvext.agent_hints.priority`, replacing any value
+/// already there (on the first hop the only one possible is a preset's,
+/// which [`realtime_deadline_priority`] has already folded in). The rest of
+/// `nvext` is kept.
+pub fn stamp_priority(body: &mut serde_json::Map<String, serde_json::Value>, priority: i32) {
+    agent_hints_mut(body).insert(PRIORITY_FIELD.to_string(), priority.into());
+}
+
+/// The scheduling priority for an effective time `T` (Unix seconds): `-T`,
+/// so earlier times are served first. Saturates at the `i32` bounds rather
+/// than overflowing: a `T` past 2038 maps to [`i32::MIN`] (the lowest
+/// priority), a `T` before 1901 to [`i32::MAX`].
+pub fn deadline_priority(effective_epoch_secs: i64) -> i32 {
+    effective_epoch_secs
+        .saturating_neg()
+        .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+/// The deadline priority of a realtime request: `-T`, with
+///
+/// ```text
+/// T = arrival - overlay.priority_bias_seconds - preset.priority
+/// ```
+///
+/// The bias comes from the organisation's overlay on the alias that serves
+/// the request (absent overlay or field = 0). A resolved preset's or overlay
+/// target's own `priority` keeps its meaning of "relative to realtime": it is
+/// a head start in seconds on top of the arrival time. All arithmetic
+/// saturates.
+pub fn realtime_deadline_priority(
+    arrival: RealtimeArrival,
+    overlay: Option<&ServingOverlay>,
+    targets: Option<&ServingTargets>,
+) -> i32 {
+    let bias = overlay.and_then(|o| o.priority_bias_seconds).unwrap_or(0);
+    let head_start = targets.map_or(0, |t| t.priority);
+    deadline_priority(
+        arrival
+            .0
+            .saturating_sub(i64::from(bias))
+            .saturating_sub(i64::from(head_start)),
+    )
+}
+
+/// The deadline priority one request is sent with, if it gets one: only a
+/// request marked with [`RealtimeArrival`] that is not a daemon leg. Batch and
+/// flex legs keep the deadline priority already in their body, continuation
+/// legs the one their resume carries.
+pub fn request_deadline_priority(
+    arrival: Option<RealtimeArrival>,
+    purpose: Option<&str>,
+    overlay: Option<&ServingOverlay>,
+    resolution: &ServingResolution,
+) -> Option<i32> {
+    if is_daemon_purpose(purpose) {
+        return None;
+    }
+    arrival.map(|arrival| realtime_deadline_priority(arrival, overlay, resolution.targets.as_ref()))
 }
 
 /// Remove any router targets a caller put in `nvext`, returning whether
@@ -362,6 +444,24 @@ impl FromStr for ProviderKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestedServingClass(pub ServingClass);
 
+/// Request extension: opt this request into deadline-ordered priority. Holds
+/// the Unix time, in seconds, at which the request arrived; the request's
+/// effective time `T` is derived from it (see [`realtime_deadline_priority`])
+/// and `-T` is sent to `dynamo` members as `nvext.agent_hints.priority`.
+///
+/// Inserted by dwctl's inference middleware on realtime traffic when
+/// `scheduling.inject_realtime_priority` is on. Absent, a `dynamo` member
+/// gets [`DEFAULT_PRIORITY`] exactly as before. Ignored on daemon legs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RealtimeArrival(pub i64);
+
+/// Response extension: the deadline priority the request was dispatched with
+/// (present only when [`RealtimeArrival`] applied). A later leg that resumes
+/// the same request reuses it, so a resumed stream keeps its original `T`
+/// rather than taking a new arrival time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeadlinePriority(pub i32);
+
 /// Response extension: what the request asked for and what it was served as.
 ///
 /// Present on every response that went through the resolver (which is every
@@ -410,12 +510,22 @@ pub struct ServingOverlay {
     /// Overrides the account's `self_hosted_only` on this alias.
     #[serde(default)]
     pub self_hosted_only: Option<bool>,
+    /// Seconds this organisation's realtime requests on this alias are moved
+    /// earlier in the deadline order (`T = arrival - bias`). Only read when
+    /// the request carries [`RealtimeArrival`]. `None` (or 0) is no bias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority_bias_seconds: Option<u32>,
 }
 
 /// Key purposes whose requests are daemon legs: the ordering already travels
 /// as a deadline-derived (batch, flex) or fixed (continuation resume)
 /// priority in the body, and no targets are sent.
 const DAEMON_PURPOSES: [&str; 2] = ["batch", "continuation"];
+
+/// Whether a key purpose marks a daemon leg (see [`DAEMON_PURPOSES`]).
+fn is_daemon_purpose(purpose: Option<&str>) -> bool {
+    purpose.is_some_and(|p| DAEMON_PURPOSES.contains(&p))
+}
 
 /// The outcome of resolving one request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -487,7 +597,7 @@ pub fn resolve(
         .and_then(|o| o.self_hosted_only)
         .unwrap_or_else(|| account.is_some_and(|a| a.self_hosted_only));
 
-    if purpose.is_some_and(|p| DAEMON_PURPOSES.contains(&p)) {
+    if is_daemon_purpose(purpose) {
         return Ok(ServingResolution {
             requested: None,
             resolved: ServingClass::Standard,
@@ -899,6 +1009,182 @@ mod tests {
         let mut body = serde_json::json!({"nvext": {"agent_hints": 7}});
         stamp_default_priority(body.as_object_mut().unwrap());
         assert_eq!(body["nvext"]["agent_hints"]["priority"], 0);
+    }
+
+    /// A fixed arrival time well inside the i32 range (2023-11-14).
+    const ARRIVAL: RealtimeArrival = RealtimeArrival(1_700_000_000);
+
+    #[test]
+    fn deadline_priority_is_negated_time_and_saturates() {
+        assert_eq!(deadline_priority(1_700_000_000), -1_700_000_000);
+        assert_eq!(deadline_priority(0), 0);
+        // earlier is higher
+        assert!(deadline_priority(100) > deadline_priority(200));
+        // past 2038 every time saturates to the lowest priority rather than wrapping
+        assert_eq!(deadline_priority(i64::from(i32::MAX) + 1), i32::MIN);
+        assert_eq!(deadline_priority(i64::from(i32::MAX) + 2), i32::MIN);
+        assert_eq!(deadline_priority(i64::MAX), i32::MIN);
+        assert_eq!(deadline_priority(i64::MIN), i32::MAX);
+        assert_eq!(deadline_priority(-5_000_000_000), i32::MAX);
+    }
+
+    #[test]
+    fn realtime_priority_without_bias_is_minus_arrival() {
+        assert_eq!(
+            realtime_deadline_priority(ARRIVAL, None, None),
+            -1_700_000_000
+        );
+        // an overlay that says nothing about bias is no bias
+        let o = ServingOverlay {
+            default_class: Some(ServingClass::Throughput),
+            ..Default::default()
+        };
+        assert_eq!(
+            realtime_deadline_priority(ARRIVAL, Some(&o), None),
+            -1_700_000_000
+        );
+        let o = ServingOverlay {
+            priority_bias_seconds: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            realtime_deadline_priority(ARRIVAL, Some(&o), None),
+            -1_700_000_000
+        );
+    }
+
+    #[test]
+    fn overlay_bias_moves_the_effective_time_earlier() {
+        let o = ServingOverlay {
+            priority_bias_seconds: Some(900),
+            ..Default::default()
+        };
+        // T = arrival - 900, so the priority is 900 higher than standard's
+        assert_eq!(
+            realtime_deadline_priority(ARRIVAL, Some(&o), None),
+            -(1_700_000_000 - 900)
+        );
+        // a biased request that arrived 899 s later still goes first; 901 s later it does not
+        let later = |secs| RealtimeArrival(ARRIVAL.0 + secs);
+        assert!(
+            realtime_deadline_priority(later(899), Some(&o), None)
+                > realtime_deadline_priority(ARRIVAL, None, None)
+        );
+        assert!(
+            realtime_deadline_priority(later(901), Some(&o), None)
+                < realtime_deadline_priority(ARRIVAL, None, None)
+        );
+        // the largest declarable bias stays in range
+        let o = ServingOverlay {
+            priority_bias_seconds: Some(MAX_PRIORITY_BIAS_SECONDS),
+            ..Default::default()
+        };
+        assert_eq!(
+            realtime_deadline_priority(ARRIVAL, Some(&o), None),
+            -(1_700_000_000 - 86_400)
+        );
+    }
+
+    #[test]
+    fn a_preset_priority_is_a_head_start_in_seconds() {
+        let o = ServingOverlay {
+            priority_bias_seconds: Some(900),
+            ..Default::default()
+        };
+        assert_eq!(
+            realtime_deadline_priority(ARRIVAL, Some(&o), Some(&INTERACTIVE)),
+            -(1_700_000_000 - 900 - 200)
+        );
+        let slower = ServingTargets {
+            priority: -60,
+            ..THROUGHPUT
+        };
+        assert_eq!(
+            realtime_deadline_priority(ARRIVAL, None, Some(&slower)),
+            -(1_700_000_000 + 60)
+        );
+    }
+
+    #[test]
+    fn realtime_priority_saturates_after_2038() {
+        let o = ServingOverlay {
+            priority_bias_seconds: Some(900),
+            ..Default::default()
+        };
+        let year_2040 = RealtimeArrival(2_208_988_800);
+        assert_eq!(
+            realtime_deadline_priority(year_2040, Some(&o), None),
+            i32::MIN
+        );
+        assert_eq!(
+            realtime_deadline_priority(RealtimeArrival(i64::MAX), None, Some(&INTERACTIVE)),
+            i32::MIN
+        );
+        assert_eq!(
+            realtime_deadline_priority(RealtimeArrival(i64::MIN), Some(&o), None),
+            i32::MAX
+        );
+    }
+
+    #[test]
+    fn only_marked_non_daemon_requests_get_a_deadline_priority() {
+        let o = ServingOverlay {
+            priority_bias_seconds: Some(900),
+            ..Default::default()
+        };
+        let r = realtime(None, None, Some(&o), &both()).unwrap();
+        assert_eq!(
+            request_deadline_priority(Some(ARRIVAL), Some("realtime"), Some(&o), &r),
+            Some(-(1_700_000_000 - 900))
+        );
+        assert_eq!(
+            request_deadline_priority(Some(ARRIVAL), Some("playground"), None, &r),
+            Some(-1_700_000_000)
+        );
+        // not opted in: nothing changes
+        assert_eq!(
+            request_deadline_priority(None, Some("realtime"), Some(&o), &r),
+            None
+        );
+        // daemon legs keep the priority already in their body
+        for purpose in DAEMON_PURPOSES {
+            assert_eq!(
+                request_deadline_priority(Some(ARRIVAL), Some(purpose), Some(&o), &r),
+                None,
+                "{purpose}"
+            );
+        }
+    }
+
+    #[test]
+    fn stamp_priority_overwrites_and_keeps_siblings() {
+        let mut body = serde_json::json!({
+            "nvext": {"cache_control": {"enabled": true}, "agent_hints": {"priority": 200, "max_batch_size": 8}}
+        });
+        stamp_priority(body.as_object_mut().unwrap(), -1_700_000_000);
+        assert_eq!(body["nvext"]["agent_hints"]["priority"], -1_700_000_000);
+        assert_eq!(body["nvext"]["agent_hints"]["max_batch_size"], 8);
+        assert_eq!(body["nvext"]["cache_control"]["enabled"], true);
+        // the default stamp then keeps it
+        stamp_default_priority(body.as_object_mut().unwrap());
+        assert_eq!(body["nvext"]["agent_hints"]["priority"], -1_700_000_000);
+        let mut body = serde_json::json!({"model": "m"});
+        stamp_priority(body.as_object_mut().unwrap(), -1);
+        assert_eq!(
+            body["nvext"],
+            serde_json::json!({"agent_hints": {"priority": -1}})
+        );
+    }
+
+    #[test]
+    fn overlay_bias_round_trips_and_is_omitted_when_unset() {
+        let o: ServingOverlay = serde_json::from_str(r#"{"priority_bias_seconds": 900}"#).unwrap();
+        assert_eq!(o.priority_bias_seconds, Some(900));
+        assert!(
+            serde_json::from_str::<ServingOverlay>(r#"{"priority_bias_seconds": -1}"#).is_err()
+        );
+        let json = serde_json::to_value(ServingOverlay::default()).unwrap();
+        assert!(json.get("priority_bias_seconds").is_none(), "{json}");
     }
 
     #[test]
@@ -1671,6 +1957,159 @@ mod handler_tests {
             .await;
         assert_eq!(response.status_code(), 200, "{}", response.text());
         assert!(body(&mock.get_requests()[0]).get("nvext").is_none());
+    }
+
+    const ARRIVAL: RealtimeArrival = RealtimeArrival(1_700_000_000);
+
+    /// A server whose every request carries the realtime-arrival extension,
+    /// as dwctl's inference middleware inserts it when the flag is on.
+    fn server_with_arrival(s: &Setup, mock: &MockHttpClient) -> TestServer {
+        let router =
+            build_router(AppState::with_client(targets(s), mock.clone())).layer(Extension(ARRIVAL));
+        TestServer::new(router).unwrap()
+    }
+
+    fn sent_priority(req: &MockRequest) -> Option<i64> {
+        body(req)
+            .get("nvext")
+            .and_then(|n| n.get("agent_hints"))
+            .and_then(|h| h.get("priority"))
+            .and_then(|p| p.as_i64())
+    }
+
+    fn chat_request(arrival: Option<RealtimeArrival>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/chat/completions")
+            .header("authorization", format!("Bearer {KEY}"));
+        if let Some(arrival) = arrival {
+            builder = builder.extension(arrival);
+        }
+        builder
+            .body(Body::from(
+                json!({"model": ALIAS, "messages": []}).to_string(),
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn arrival_sends_minus_arrival_to_a_dynamo_member_and_reports_it() {
+        let s = setup(&[DYNAMO]);
+        let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
+        let srv = server_with_arrival(&s, &mock);
+        assert_eq!(post(&srv, "gpt-4", json!({})).await.status_code(), 200);
+        assert_eq!(sent_priority(&mock.get_requests()[0]), Some(-1_700_000_000));
+
+        // the response carries the value so a resume can reuse it
+        let response = target_message_handler(
+            State(AppState::with_client(targets(&s), mock.clone())),
+            chat_request(Some(ARRIVAL)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response.extensions().get::<DeadlinePriority>(),
+            Some(&DeadlinePriority(-1_700_000_000))
+        );
+    }
+
+    #[tokio::test]
+    async fn without_arrival_nothing_changes() {
+        let s = setup(&[DYNAMO]);
+        let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
+        let srv = server(&s, &mock);
+        assert_eq!(post(&srv, "gpt-4", json!({})).await.status_code(), 200);
+        assert_eq!(sent_priority(&mock.get_requests()[0]), Some(0));
+
+        let response = target_message_handler(
+            State(AppState::with_client(targets(&s), mock.clone())),
+            chat_request(None),
+        )
+        .await
+        .unwrap();
+        assert!(response.extensions().get::<DeadlinePriority>().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_overlay_bias_and_preset_head_start_apply_on_the_serving_alias() {
+        let mut s = setup(&[DYNAMO]);
+        s.presets = both();
+        s.account = Some(holds(&BOTH_CLASSES));
+        s.overlay = Some(ServingOverlay {
+            priority_bias_seconds: Some(900),
+            ..Default::default()
+        });
+        let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
+        let srv = server_with_arrival(&s, &mock);
+        assert_eq!(post(&srv, "gpt-4", json!({})).await.status_code(), 200);
+        assert_eq!(
+            sent_priority(&mock.get_requests()[0]),
+            Some(-(1_700_000_000 - 900))
+        );
+        // interactive's preset priority (200) is a further 200 s head start,
+        // and its router targets are still sent
+        let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
+        let srv = server_with_arrival(&s, &mock);
+        assert_eq!(
+            post(&srv, "gpt-4:interactive", json!({}))
+                .await
+                .status_code(),
+            200
+        );
+        assert_eq!(
+            sent(&mock.get_requests()[0]),
+            Some((500, 20, Some(-(1_700_000_000 - 900 - 200))))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_deadline_priority_reaches_only_dynamo_members() {
+        for member in [EXTERNAL, HOSTED] {
+            let mut s = setup(&[member]);
+            s.overlay = Some(ServingOverlay {
+                priority_bias_seconds: Some(900),
+                ..Default::default()
+            });
+            let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
+            let srv = server_with_arrival(&s, &mock);
+            assert_eq!(post(&srv, "gpt-4", json!({})).await.status_code(), 200);
+            assert!(
+                body(&mock.get_requests()[0]).get("nvext").is_none(),
+                "{:?}",
+                member.1
+            );
+        }
+        // in a composite that falls over from dynamo to a third party, only
+        // the dynamo attempt carries it
+        let s = setup(&[DYNAMO, EXTERNAL]);
+        let mock = MockHttpClient::new(StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"boom"}"#);
+        let srv = server_with_arrival(&s, &mock);
+        post(&srv, "gpt-4", json!({})).await;
+        let requests = mock.get_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(sent_priority(&requests[0]), Some(-1_700_000_000));
+        assert!(body(&requests[1]).get("nvext").is_none());
+    }
+
+    #[tokio::test]
+    async fn daemon_legs_keep_the_priority_in_their_body() {
+        for purpose in ["batch", "continuation"] {
+            let mut s = setup(&[DYNAMO]);
+            s.purpose = purpose;
+            s.overlay = Some(ServingOverlay {
+                priority_bias_seconds: Some(900),
+                ..Default::default()
+            });
+            let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
+            let srv = server_with_arrival(&s, &mock);
+            let deadline = json!({"nvext": {"agent_hints": {"priority": -1_800_000_000}}});
+            assert_eq!(post(&srv, "gpt-4", deadline).await.status_code(), 200);
+            assert_eq!(
+                sent_priority(&mock.get_requests()[0]),
+                Some(-1_800_000_000),
+                "{purpose}"
+            );
+        }
     }
 
     #[test]

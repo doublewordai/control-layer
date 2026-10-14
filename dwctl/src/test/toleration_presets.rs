@@ -37,6 +37,7 @@ fn test_config_with_presets() -> crate::config::Config {
                 }],
             },
         ],
+        inject_realtime_priority: false,
     };
     config
 }

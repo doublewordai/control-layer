@@ -187,7 +187,8 @@ fn parse_stored_targets(value: Option<serde_json::Value>) -> Option<ServingTarge
 async fn load_overlays_from_db(db: &PgPool) -> Result<OverlaysByAlias, anyhow::Error> {
     let rows = sqlx::query!(
         r#"
-        SELECT mo.user_id, dm.alias, mo.default_serving_class, mo.targets, mo.self_hosted_only
+        SELECT mo.user_id, dm.alias, mo.default_serving_class, mo.targets, mo.self_hosted_only,
+               mo.priority_bias_seconds
         FROM model_overlays mo
         INNER JOIN deployed_models dm ON dm.id = mo.deployed_model_id
         INNER JOIN users u ON u.id = mo.user_id
@@ -206,6 +207,9 @@ async fn load_overlays_from_db(db: &PgPool) -> Result<OverlaysByAlias, anyhow::E
                 default_class: parse_stored_class(row.default_serving_class.as_deref()),
                 targets: parse_stored_targets(row.targets),
                 self_hosted_only: row.self_hosted_only,
+                // The CHECK constraint bounds it to 0..=86400; anything else
+                // is schema drift and is read as no bias.
+                priority_bias_seconds: row.priority_bias_seconds.and_then(|bias| u32::try_from(bias).ok()),
             },
         );
     }

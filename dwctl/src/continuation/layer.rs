@@ -151,9 +151,22 @@ pub struct RequestContext {
     /// Metric label for the request origin (realtime / batch / playground),
     /// resolved at arm time from the API key purpose.
     pub origin: &'static str,
+    /// The deadline priority onwards dispatched the original request with
+    /// (its [`onwards::DeadlinePriority`] response extension), present when
+    /// `scheduling.inject_realtime_priority` gave the request one. A resume
+    /// leg reuses it, so a resumed stream keeps the request's original `T`
+    /// instead of taking a new one (or jumping ahead of everything).
+    pub deadline_priority: Option<i32>,
 }
 
 impl RequestContext {
+    /// The `nvext.agent_hints.priority` a resume leg of this request carries:
+    /// the original request's deadline priority when it had one, else the
+    /// configured `continuation.priority`.
+    pub fn leg_priority(&self, configured: i32) -> i32 {
+        self.deadline_priority.unwrap_or(configured)
+    }
+
     pub fn messages(&self) -> &Value {
         self.body.get("messages").unwrap_or(&Value::Null)
     }
@@ -367,9 +380,11 @@ pub async fn continuation_middleware(State(state): State<ContinuationState>, req
         response_id,
         route,
         origin: "unknown",
+        deadline_priority: None,
     };
 
     let response = next.run(forward(parts, body_bytes)).await;
+    ctx.deadline_priority = response.extensions().get::<onwards::DeadlinePriority>().map(|p| p.0);
 
     // Non-2xx and non-SSE responses pass through untouched: nothing was
     // generated, so there is nothing to continue, and error enrichment above
@@ -898,6 +913,7 @@ mod tests {
             response_id: None,
             route: RouteInfo::default(),
             origin: "realtime",
+            deadline_priority: None,
         };
         assert_eq!(ctx.messages()[0]["role"], "user");
         assert!(ctx.tools().is_some());
@@ -912,8 +928,25 @@ mod tests {
             response_id: None,
             route: RouteInfo::default(),
             origin: "realtime",
+            deadline_priority: None,
         };
         assert_eq!(ctx.max_tokens(), Some(42));
         assert!(ctx.tools().is_none());
+    }
+
+    #[test]
+    fn a_leg_keeps_the_original_deadline_priority_else_the_configured_one() {
+        let mut ctx = RequestContext {
+            model: "m".to_string(),
+            body: json!({}),
+            path: "/chat/completions".to_string(),
+            response_id: None,
+            route: RouteInfo::default(),
+            origin: "realtime",
+            deadline_priority: None,
+        };
+        assert_eq!(ctx.leg_priority(100), 100, "no deadline priority: the configured value");
+        ctx.deadline_priority = Some(-1_700_000_000);
+        assert_eq!(ctx.leg_priority(100), -1_700_000_000, "the original request's T");
     }
 }

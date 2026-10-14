@@ -267,6 +267,24 @@ pub struct Config {
 pub struct SchedulingConfig {
     /// The presets an account may be pinned to, in display order.
     pub toleration_presets: Vec<TolerationPreset>,
+    /// Deadline-ordered priority for realtime traffic. When true, every
+    /// realtime request sent to a `dynamo`-kind endpoint carries
+    /// `nvext.agent_hints.priority = -T` (NVIDIA Dynamo's priority carrier;
+    /// `i32`, higher = more important), where `T` is the request's effective
+    /// time in Unix seconds: its arrival time, moved earlier by the owning
+    /// organisation's per-model overlay `priority_bias_seconds` (and by a
+    /// resolved serving-class preset's `priority`, read as seconds). This puts
+    /// realtime in the same earliest-deadline-first order as batch work, whose
+    /// `T` is the batch deadline (`background_services.batch_daemon.
+    /// inject_deadline_priority`). Requests dispatched by the batch daemon keep
+    /// their own priority, and other endpoint kinds never receive one. A
+    /// resumed stream keeps the priority of the request it continues.
+    ///
+    /// When false (the default), realtime requests to dynamo carry priority 0,
+    /// exactly as before.
+    ///
+    /// Set via environment: `DWCTL_SCHEDULING__INJECT_REALTIME_PRIORITY=true`
+    pub inject_realtime_priority: bool,
 }
 
 /// One operator-defined scheduling-toleration preset.
@@ -360,6 +378,7 @@ impl Default for SchedulingConfig {
     fn default() -> Self {
         Self {
             toleration_presets: vec![Self::default_preset()],
+            inject_realtime_priority: false,
         }
     }
 }

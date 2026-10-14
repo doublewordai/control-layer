@@ -104,6 +104,9 @@ pub fn build_leg_body(ctx: &RequestContext, token_ids: &[u32], max_tokens: Optio
         "stream_options": {"include_usage": true},
         // Positive priority jumps the dynamo queue ahead of new realtime work:
         // this finishes a stream we already accepted, on a strict seam budget.
+        // With deadline-ordered realtime priority on, the caller passes the
+        // original request's `-T` instead, which is already ahead of every
+        // realtime request that arrived after it.
         // The dynamo frontend's ONLY priority carrier is `nvext.agent_hints.
         // priority` (the same shape fusillade injects for batch deadlines) — a
         // top-level `priority` field is REJECTED by its validation
@@ -198,7 +201,7 @@ pub async fn attempt(state: &ContinuationState, ctx: &RequestContext, continuati
     // NOTE: `route.strip_leading_bos` is deliberately NOT applied here. See
     // [`super::RouteInfo::strip_leading_bos`]: BOS-prepending is a per-MEMBER
     // property, and this body is built once, before onwards picks a member.
-    let body = build_leg_body(ctx, &render.token_ids, max_tokens, state.cfg.priority);
+    let body = build_leg_body(ctx, &render.token_ids, max_tokens, ctx.leg_priority(state.cfg.priority));
     let request = build_leg_request(&ctx.path, &state.key_secret, &body);
 
     // Dispatch accounting happens BEFORE the await: a leg that times out,
@@ -241,6 +244,7 @@ mod tests {
             response_id: None,
             route: crate::continuation::RouteInfo::default(),
             origin: "realtime",
+            deadline_priority: None,
         }
     }
 

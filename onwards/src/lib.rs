@@ -73,8 +73,8 @@ pub use handlers::{AuthenticatedApiKeyId, HeaderExtractor, ServedBy};
 use handlers::{models as models_handler, target_message_handler};
 use models::ExtractedModel;
 pub use serving::{
-    AccountServing, ProviderKind, RequestedServingClass, ServingClass, ServingClassOutcome,
-    ServingOverlay, ServingPresets, ServingTargets,
+    AccountServing, DeadlinePriority, ProviderKind, RealtimeArrival, RequestedServingClass,
+    ServingClass, ServingClassOutcome, ServingOverlay, ServingPresets, ServingTargets,
 };
 
 /// Type alias for response transformation function

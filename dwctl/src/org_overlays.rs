@@ -111,6 +111,14 @@ pub struct OrgModelOverlay {
     /// Overrides the account's `self_hosted_only` setting on this model.
     #[serde(default)]
     pub self_hosted_only: Option<bool>,
+    /// Seconds by which this organisation's realtime requests on this model
+    /// are moved earlier in the deadline-ordered scheduling priority sent to
+    /// dynamo endpoints (`T = arrival - bias`, priority `-T`). Applies only
+    /// when `scheduling.inject_realtime_priority` is on; batch and flex keep
+    /// their own deadlines. `0..=86400`; omitted = no bias.
+    #[serde(default)]
+    #[schemars(range(max = 86400))]
+    pub priority_bias_seconds: Option<u32>,
     /// The organisation's own prices on this model, per purpose and completion
     /// window, same shape as the model catalog's `tariffs`. Billing uses these
     /// through the full purpose/window fallback before the model's general prices.
@@ -132,6 +140,7 @@ impl OrgModelOverlay {
         self.default_class.is_some()
             || self.targets.is_some()
             || self.self_hosted_only.is_some()
+            || self.priority_bias_seconds.is_some()
             || !self.tariffs.is_empty()
             || self.cache_tariff.is_some()
             || !self.class_pricing.is_empty()
@@ -250,6 +259,14 @@ impl OrgCatalog {
                 if let Some(targets) = &model.targets {
                     targets.validate(&format!("{source}: overlay targets for model {:?}", model.alias))?;
                 }
+                if let Some(bias) = model.priority_bias_seconds {
+                    ensure!(
+                        bias <= onwards::serving::MAX_PRIORITY_BIAS_SECONDS,
+                        "{source}: overlay for model {:?} sets priority_bias_seconds {bias}; the maximum is {}",
+                        model.alias,
+                        onwards::serving::MAX_PRIORITY_BIAS_SECONDS
+                    );
+                }
             }
         }
         Ok(())
@@ -359,17 +376,19 @@ async fn apply_in(db: &mut PgConnection, catalog: &OrgCatalog) -> Result<()> {
                     })?;
             }
             sqlx::query(
-                r#"INSERT INTO model_overlays (user_id, deployed_model_id, default_serving_class, targets, self_hosted_only, provisioning_source)
-                   VALUES ($1, $2, $3, $4, $5, $6)
+                r#"INSERT INTO model_overlays (user_id, deployed_model_id, default_serving_class, targets, self_hosted_only, priority_bias_seconds, provisioning_source)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)
                    ON CONFLICT (user_id, deployed_model_id) DO UPDATE SET
                        default_serving_class = EXCLUDED.default_serving_class,
                        targets = EXCLUDED.targets,
                        self_hosted_only = EXCLUDED.self_hosted_only,
+                       priority_bias_seconds = EXCLUDED.priority_bias_seconds,
                        provisioning_source = EXCLUDED.provisioning_source,
                        updated_at = NOW()
                    WHERE model_overlays.default_serving_class IS DISTINCT FROM EXCLUDED.default_serving_class
                       OR model_overlays.targets IS DISTINCT FROM EXCLUDED.targets
                       OR model_overlays.self_hosted_only IS DISTINCT FROM EXCLUDED.self_hosted_only
+                      OR model_overlays.priority_bias_seconds IS DISTINCT FROM EXCLUDED.priority_bias_seconds
                       OR model_overlays.provisioning_source IS DISTINCT FROM EXCLUDED.provisioning_source"#,
             )
             .bind(org_id)
@@ -377,6 +396,8 @@ async fn apply_in(db: &mut PgConnection, catalog: &OrgCatalog) -> Result<()> {
             .bind(model.default_class.map(|class| class.as_db_str()))
             .bind(model.targets.map(serde_json::to_value).transpose().context("serialize overlay targets")?)
             .bind(model.self_hosted_only)
+            // Validated to 0..=86400 above, so the conversion cannot fail.
+            .bind(model.priority_bias_seconds.map(|bias| i32::try_from(bias).unwrap_or(i32::MAX)))
             .bind(&source)
             .execute(&mut *db)
             .await
@@ -590,6 +611,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn priority_bias_is_bounded_and_counts_as_an_override() {
+        let directory = tempdir().unwrap();
+        // A bias alone is a declaration, and the maximum is accepted.
+        write(
+            directory.path(),
+            "acme.yaml",
+            "org: acme\nmodels:\n  - alias: m\n    priority_bias_seconds: 86400\n",
+        );
+        let catalog = OrgCatalog::load(directory.path()).unwrap();
+        assert_eq!(catalog.orgs[0].document.models[0].priority_bias_seconds, Some(86_400));
+
+        // One second over a day is refused by validation.
+        write(
+            directory.path(),
+            "acme.yaml",
+            "org: acme\nmodels:\n  - alias: m\n    priority_bias_seconds: 86401\n",
+        );
+        let err = OrgCatalog::load(directory.path()).unwrap_err().to_string();
+        assert!(err.contains("priority_bias_seconds 86401"), "{err}");
+
+        // A negative bias (or a fractional one) does not parse.
+        for value in ["-1", "1.5", "\"900\""] {
+            write(
+                directory.path(),
+                "acme.yaml",
+                &format!("org: acme\nmodels:\n  - alias: m\n    priority_bias_seconds: {value}\n"),
+            );
+            assert!(OrgCatalog::load(directory.path()).is_err(), "{value} is rejected");
+        }
+    }
+
     #[dwctl_test_macros::test]
     async fn apply_materialises_and_prunes_owned_rows(pool: PgPool) {
         let org_id: Uuid = sqlx::query_scalar(
@@ -640,10 +693,10 @@ mod tests {
         write(
             directory.path(),
             "acme.yaml",
-            "org: acme\nmodels:\n  - alias: org/model\n    default_class: throughput\n    self_hosted_only: true\n",
+            "org: acme\nmodels:\n  - alias: org/model\n    default_class: throughput\n    self_hosted_only: true\n    priority_bias_seconds: 900\n",
         );
         apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();
-        let row = sqlx::query("SELECT default_serving_class, targets, self_hosted_only, provisioning_source FROM model_overlays WHERE user_id = $1 AND deployed_model_id = $2")
+        let row = sqlx::query("SELECT default_serving_class, targets, self_hosted_only, priority_bias_seconds, provisioning_source FROM model_overlays WHERE user_id = $1 AND deployed_model_id = $2")
             .bind(org_id)
             .bind(model_id)
             .fetch_one(&pool)
@@ -655,6 +708,7 @@ mod tests {
         );
         assert_eq!(row.try_get::<Option<serde_json::Value>, _>("targets").unwrap(), None);
         assert_eq!(row.try_get::<Option<bool>, _>("self_hosted_only").unwrap(), Some(true));
+        assert_eq!(row.try_get::<Option<i32>, _>("priority_bias_seconds").unwrap(), Some(900));
         assert_eq!(
             row.try_get::<Option<String>, _>("provisioning_source").unwrap().as_deref(),
             Some("org-overlays:acme.yaml")
@@ -668,7 +722,7 @@ mod tests {
         );
         apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();
         let row = sqlx::query(
-            "SELECT default_serving_class, targets, self_hosted_only FROM model_overlays WHERE user_id = $1 AND deployed_model_id = $2",
+            "SELECT default_serving_class, targets, self_hosted_only, priority_bias_seconds FROM model_overlays WHERE user_id = $1 AND deployed_model_id = $2",
         )
         .bind(org_id)
         .bind(model_id)
@@ -681,6 +735,8 @@ mod tests {
             Some(serde_json::json!({"ttft_ms": 800, "itl_ms": 30, "priority": 0}))
         );
         assert_eq!(row.try_get::<Option<bool>, _>("self_hosted_only").unwrap(), None);
+        // An omitted bias inherits (no bias), like every other omitted field.
+        assert_eq!(row.try_get::<Option<i32>, _>("priority_bias_seconds").unwrap(), None);
 
         // The organisation's prices live next to the model's general price, scoped by
         // user_id: general rows are untouched, org rows are versioned like the catalog's.

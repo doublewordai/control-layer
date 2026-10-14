@@ -103,6 +103,8 @@ struct Fake {
     /// answers 503 — the "no leg available" case.
     legs: Arc<Mutex<Vec<Vec<Chunk>>>>,
     received: Arc<Mutex<Vec<Received>>>,
+    /// The deadline priority onwards reports on leg 1's response, if any.
+    leg_one_priority: Option<i32>,
 }
 
 impl Fake {
@@ -111,7 +113,14 @@ impl Fake {
             leg_one: Arc::new(Mutex::new(leg_one)),
             legs: Arc::new(Mutex::new(legs.into_iter().rev().collect())),
             received: Arc::new(Mutex::new(Vec::new())),
+            leg_one_priority: None,
         }
+    }
+
+    /// Leg 1 is answered as onwards answers a request it gave a deadline priority.
+    fn with_leg_one_priority(mut self, priority: i32) -> Self {
+        self.leg_one_priority = Some(priority);
+        self
     }
 
     fn resume_requests(&self) -> Vec<Received> {
@@ -167,7 +176,11 @@ fn stream_script(chunks: Vec<Chunk>) -> Response {
 
 async fn leg_one_handler(State(fake): State<Fake>) -> Response {
     let chunks = fake.leg_one.lock().unwrap().clone();
-    stream_script(chunks)
+    let mut response = stream_script(chunks);
+    if let Some(priority) = fake.leg_one_priority {
+        response.extensions_mut().insert(onwards::DeadlinePriority(priority));
+    }
+    response
 }
 
 async fn leg_two_handler(State(fake): State<Fake>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
@@ -430,6 +443,27 @@ async fn the_resume_leg_asks_for_exactly_the_right_thing(pool: PgPool) {
     assert_eq!(leg.body["max_tokens"], 488, "500 requested minus the 12 already generated");
     assert_eq!(leg.body["temperature"], 0.7, "sampling parameters carry over");
     assert!(leg.body.get("messages").is_none(), "a completions leg never carries chat messages");
+}
+
+/// With deadline-ordered realtime priority on, onwards reports the priority it
+/// dispatched leg 1 with; the resume leg carries that same value (the
+/// request's original `T`) rather than the configured jump-the-queue one.
+#[dwctl_test_macros::test]
+async fn the_resume_leg_keeps_the_original_requests_deadline_priority(pool: PgPool) {
+    let fake = Fake::new(
+        vec![content("chatcmpl-1", "Hello")],
+        vec![vec![leg_text(" there", Some("stop")), leg_usage(1012, 8), done()]],
+    )
+    .with_leg_one_priority(-1_700_000_000);
+    let tokenizer = render_stub(vec![101, 202, 303], 1012, 12).await;
+    let st = state(pool, &fake, tokenizer.uri(), test_config());
+
+    let response = app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap();
+    collect_payloads(response).await;
+
+    let requests = fake.resume_requests();
+    assert_eq!(requests.len(), 1, "one death, one leg");
+    assert_eq!(requests[0].body["nvext"]["agent_hints"]["priority"], -1_700_000_000);
 }
 
 /// The inner-router path shape, discovered rather than assumed: dwctl nests the

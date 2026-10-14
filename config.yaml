@@ -391,6 +391,16 @@ scheduling:
         overflow capacity; requests may be refused when dedicated capacity is
         full.
       tolerations: []
+  # Deadline-ordered priority for realtime traffic. When true, each realtime
+  # request sent to a `dynamo`-kind endpoint carries
+  # `nvext.agent_hints.priority = -T`, where T is its effective time in Unix
+  # seconds (earliest T is served first): the arrival time, moved earlier by
+  # the organisation's per-model overlay `priority_bias_seconds`. Batch work
+  # already sends -(batch deadline) when
+  # background_services.batch_daemon.inject_deadline_priority is on, so both
+  # share one queue order. Other endpoint kinds never receive the field.
+  # Default false: realtime to dynamo carries priority 0, as before.
+  # inject_realtime_priority: false
 # Note: Environment variables can override top level setting, as long as they're supplied with the DWCTL_ prefix:
 # DWCTL_PORT=8080
 #

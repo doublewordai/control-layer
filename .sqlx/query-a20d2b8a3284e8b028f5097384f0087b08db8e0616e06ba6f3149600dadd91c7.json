@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO model_overlays (user_id, deployed_model_id, default_serving_class, targets, self_hosted_only, priority_bias_seconds)\n           VALUES ('00000000-0000-0000-0000-0000000000a1', '40000000-0000-0000-0000-000000000001', 'interactive', NULL, false, NULL),\n                  ('00000000-0000-0000-0000-0000000000b1', '40000000-0000-0000-0000-000000000001', NULL, '{\"ttft_ms\": 800, \"itl_ms\": 30}', NULL, 900)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "a20d2b8a3284e8b028f5097384f0087b08db8e0616e06ba6f3149600dadd91c7"
+}

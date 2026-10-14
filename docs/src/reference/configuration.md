@@ -79,7 +79,7 @@ model_provisioning:
 |-------|------|---------|-------------|
 | `enabled` | boolean | `false` | Apply the declarative model catalog during startup. |
 | `directory` | path | `/app/model-provisioning.d` | Directory containing one `.yaml` or `.yml` document per canonical model. |
-| `org_overlays_directory` | path | `/app/org-overlays.d` | Directory containing one `.yaml` or `.yml` document per organisation with per-model serving overrides (`default_class` or explicit `targets`, `self_hosted_only`). Applied after the model catalog when `enabled` is set. A missing directory is an empty catalog, so a deployment that does not mount one applies no overlays; an existing path that is not a directory fails startup. |
+| `org_overlays_directory` | path | `/app/org-overlays.d` | Directory containing one `.yaml` or `.yml` document per organisation with per-model serving overrides (`default_class` or explicit `targets`, `self_hosted_only`, `priority_bias_seconds`). Applied after the model catalog when `enabled` is set. A missing directory is an empty catalog, so a deployment that does not mount one applies no overlays; an existing path that is not a directory fails startup. |
 | `account_limits_directory` | path | `/app/account-limits.d` | Directory containing one `.yaml` or `.yml` document per account with its own realtime in-flight limits on virtual models. Applied after the model catalog when `enabled` is set, replacing every stored per-account limit. A missing directory changes nothing; an empty one clears every per-account limit. See [Account limits](./model-provisioning.md#account-limits). |
 
 When enabled, the directory must exist. Startup fails before any provisioning
@@ -719,6 +719,56 @@ is not `external` — so a third-party provider is never eligible regardless of
 the attempt budget. It does not influence where the inference backend places an
 accepted request; that is the tolerations setting. The API field keeps its name;
 the dashboard labels it "No external-provider fallback (gateway)".
+
+## Scheduling Priority
+
+Requests to an inference endpoint of kind `dynamo` carry a scheduling priority
+at `nvext.agent_hints.priority` (an `i32`; higher is served first). Clients
+cannot set it: dwctl strips any caller-supplied value at ingress.
+
+With deadline ordering, every request has an effective time `T` in Unix
+seconds, the priority is `-T`, and the earliest `T` is served first:
+
+| Traffic | `T` | Enabled by |
+|---------|-----|------------|
+| Batch, flex and background (dispatched by the batch daemon) | The batch deadline | `background_services.batch_daemon.inject_deadline_priority` |
+| Realtime | Arrival time | `scheduling.inject_realtime_priority` |
+| Realtime, organisation with a model overlay bias | Arrival time minus the overlay's `priority_bias_seconds` | `scheduling.inject_realtime_priority` |
+
+```yaml
+scheduling:
+  inject_realtime_priority: true   # default: false
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `inject_realtime_priority` | bool | `false` | Send realtime requests to `dynamo` endpoints with priority `-T` instead of `0`. Environment: `DWCTL_SCHEDULING__INJECT_REALTIME_PRIORITY`. |
+
+How the priority is chosen:
+
+- **Only `dynamo` endpoints receive it.** Members of kind `hosted` or
+  `external` never get `nvext.agent_hints.priority`, and members of a named
+  pool whose endpoint does not accept scheduling priority have the whole
+  `nvext` object removed.
+- **Organisation bias.** An organisation's
+  [model overlay](../how-to/organization-model-overlays.md#realtime-priority-bias)
+  can set `priority_bias_seconds` (0 to 86400) on a model. Its realtime requests
+  on that model use `T = arrival - bias`, so they are served ahead of standard
+  realtime requests that arrived up to `bias` seconds earlier. The bias applies
+  to the organisation that owns the API key.
+- **Serving-class presets.** A resolved preset's or overlay target's
+  `priority` counts as a further head start in seconds: `T` is reduced by that
+  amount.
+- **Batch daemon traffic is unchanged.** Requests the batch daemon dispatches
+  keep the priority already in their body.
+- **Resumed streams keep their `T`.** A continuation resume leg reuses the
+  priority of the request it continues. Without a deadline priority it falls
+  back to `continuation.priority`.
+- **Saturation.** `-T` is clamped to the `i32` range. After 2038 every
+  realtime `T` maps to `i32::MIN`, so the field must be widened before then.
+
+With `inject_realtime_priority: false`, realtime requests to `dynamo` carry
+priority `0`, which ranks them above every batch deadline.
 
 ## Observability
 

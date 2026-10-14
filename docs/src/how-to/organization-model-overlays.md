@@ -135,6 +135,34 @@ flex use standard; flex uses the batch `1h` tariff. Prefer putting batch prices 
 the all-class `tariffs` list. `class_pricing.standard` also supports batch;
 interactive/throughput batch prices are rejected by validation.
 
+## Realtime priority bias
+
+When the installation sends deadline-ordered realtime priority
+(`scheduling.inject_realtime_priority`; see
+[Scheduling Priority](../reference/configuration.md#scheduling-priority)), an
+overlay can move an organisation's realtime requests on one model earlier in
+the queue. Set `priority_bias_seconds` on the model entry. The organisation and
+model alias below are fictional:
+
+```yaml
+org: example-organization
+models:
+  - alias: example-model
+    priority_bias_seconds: 900
+```
+
+The organisation's realtime requests on `example-model` get effective time
+`T = arrival - 900`, so they are served ahead of standard realtime work that
+arrived up to 15 minutes earlier, and ahead of batch work whose deadline is
+later than `T`. Other models and other organisations are unaffected. Batch and
+flex requests keep their batch deadline.
+
+The value must be a whole number from `0` to `86400` (one day). Validation
+rejects negative, fractional and larger values. An entry may contain only
+`priority_bias_seconds`. Omitting the field means no bias. The bias has no
+effect while `inject_realtime_priority` is off, and it is only sent to endpoints
+of kind `dynamo`.
+
 ## Billing, display and admission
 
 Billing selects the key owner's class-specific price, then its all-class price,
@@ -174,8 +202,8 @@ dwctl-model-provisioning validate-org-overlays /path/to/org-overlays.d \
   --models /path/to/model-deployments
 ```
 
-The validator checks syntax, pricing precision, class/purpose compatibility and
-model references. You can run it locally or add it to your own CI pipeline. It
+The validator checks syntax, pricing precision, class/purpose compatibility,
+the `priority_bias_seconds` range and model references. You can run it locally or add it to your own CI pipeline. It
 cannot verify organization existence or future ledger rows in the target
 database. Check those prerequisites before restarting the server with an updated
 catalog.

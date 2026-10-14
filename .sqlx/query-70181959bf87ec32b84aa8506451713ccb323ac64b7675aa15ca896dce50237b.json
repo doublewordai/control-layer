@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT mo.user_id, dm.alias, mo.default_serving_class, mo.targets, mo.self_hosted_only\n        FROM model_overlays mo\n        INNER JOIN deployed_models dm ON dm.id = mo.deployed_model_id\n        INNER JOIN users u ON u.id = mo.user_id\n        WHERE dm.deleted = FALSE\n          AND u.is_deleted = FALSE\n        ",
+  "query": "\n        SELECT mo.user_id, dm.alias, mo.default_serving_class, mo.targets, mo.self_hosted_only,\n               mo.priority_bias_seconds\n        FROM model_overlays mo\n        INNER JOIN deployed_models dm ON dm.id = mo.deployed_model_id\n        INNER JOIN users u ON u.id = mo.user_id\n        WHERE dm.deleted = FALSE\n          AND u.is_deleted = FALSE\n        ",
   "describe": {
     "columns": [
       {
@@ -27,6 +27,11 @@
         "ordinal": 4,
         "name": "self_hosted_only",
         "type_info": "Bool"
+      },
+      {
+        "ordinal": 5,
+        "name": "priority_bias_seconds",
+        "type_info": "Int4"
       }
     ],
     "parameters": {
@@ -37,8 +42,9 @@
       false,
       true,
       true,
+      true,
       true
     ]
   },
-  "hash": "2812e4f2b125ba6710354865fa125d23761fc8f43b2a37f3e111369eae847349"
+  "hash": "70181959bf87ec32b84aa8506451713ccb323ac64b7675aa15ca896dce50237b"
 }

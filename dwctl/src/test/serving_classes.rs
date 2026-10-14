@@ -22,6 +22,15 @@ struct Fixture {
 
 impl Fixture {
     async fn new(pool: &PgPool) -> Self {
+        Self::build(pool, false).await
+    }
+
+    /// The same fixture with `scheduling.inject_realtime_priority` on.
+    async fn with_realtime_priority(pool: &PgPool) -> Self {
+        Self::build(pool, true).await
+    }
+
+    async fn build(pool: &PgPool, inject_realtime_priority: bool) -> Self {
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(|request: &Request| {
@@ -49,6 +58,7 @@ impl Fixture {
         let mut config = create_test_config();
         config.onwards.strict_mode = true;
         config.background_services.onwards_sync.enabled = true;
+        config.scheduling.inject_realtime_priority = inject_realtime_priority;
         let app = Application::new_with_pool(config, Some(pool.clone()), None).await.unwrap();
         let (server, services) = app.into_test_server();
         let user = create_test_user_with_roles(pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
@@ -297,6 +307,104 @@ async fn dispatch_clears_stored_targets_but_preserves_deadline_priority(pool: Pg
     assert!(body["nvext"].get("router").is_none());
     assert_eq!(body["nvext"]["agent_hints"]["priority"], -1700000000);
     assert_eq!(body["nvext"]["cache_control"]["enabled"], true);
+}
+
+/// The priority the upstream saw, asserted to be `-T` for a `T` between
+/// `before - bias` and `after - bias` (wall-clock seconds around the request).
+fn assert_deadline_priority(body: &Value, before: i64, after: i64, bias: i64, context: &str) {
+    let priority = body["nvext"]["agent_hints"]["priority"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("{context}: no priority in {body}"));
+    assert!(
+        (-(after - bias)..=-(before - bias)).contains(&priority),
+        "{context}: priority {priority} is not -T for T in [{}, {}]",
+        before - bias,
+        after - bias
+    );
+}
+
+#[dwctl_test_macros::test]
+async fn realtime_priority_is_minus_arrival_and_client_priority_is_still_stripped(pool: PgPool) {
+    let f = Fixture::with_realtime_priority(&pool).await;
+    for path in ["chat/completions", "responses", "messages", "completions"] {
+        let before = chrono::Utc::now().timestamp();
+        f.post(path, "policy", false).await.assert_status_ok();
+        let after = chrono::Utc::now().timestamp();
+        assert_deadline_priority(&f.last_body().await, before, after, 0, path);
+    }
+
+    // A caller's own priority never survives: the request still goes out at -now.
+    let before = chrono::Utc::now().timestamp();
+    f.server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {}", f.key))
+        .json(&json!({"model":"policy","messages":[{"role":"user","content":"hi"}],
+            "priority": 2_000_000_000,
+            "nvext":{"agent_hints":{"priority":2_000_000_000},"cache_control":{"enabled":true}}}))
+        .await
+        .assert_status_ok();
+    let after = chrono::Utc::now().timestamp();
+    let body = f.last_body().await;
+    assert!(body.get("priority").is_none());
+    assert_deadline_priority(&body, before, after, 0, "client-supplied priority");
+    assert_eq!(body["nvext"]["cache_control"]["enabled"], true);
+}
+
+#[dwctl_test_macros::test]
+async fn realtime_priority_applies_the_account_overlay_bias_on_that_model_only(pool: PgPool) {
+    let f = Fixture::with_realtime_priority(&pool).await;
+    sqlx::query(
+        "INSERT INTO model_overlays (user_id, deployed_model_id, priority_bias_seconds) SELECT $1, id, 900 FROM deployed_models WHERE alias = 'policy'",
+    )
+    .bind(f.user)
+    .execute(&pool)
+    .await
+    .unwrap();
+    f.services.sync_onwards_config(&pool).await.unwrap();
+
+    let before = chrono::Utc::now().timestamp();
+    f.post("chat/completions", "policy", false).await.assert_status_ok();
+    let after = chrono::Utc::now().timestamp();
+    assert_deadline_priority(&f.last_body().await, before, after, 900, "biased model");
+
+    // No overlay on this alias: standard realtime.
+    let before = chrono::Utc::now().timestamp();
+    f.post("chat/completions", "no-offer", false).await.assert_status_ok();
+    let after = chrono::Utc::now().timestamp();
+    assert_deadline_priority(&f.last_body().await, before, after, 0, "model without an overlay");
+
+    // The database refuses a bias outside 0..=86400.
+    for bias in [-1, 86_401] {
+        let result = sqlx::query("UPDATE model_overlays SET priority_bias_seconds = $1 WHERE user_id = $2")
+            .bind(bias)
+            .bind(f.user)
+            .execute(&pool)
+            .await;
+        assert!(result.is_err(), "bias {bias} must violate the CHECK constraint");
+    }
+}
+
+#[dwctl_test_macros::test]
+async fn realtime_priority_leaves_fusillade_dispatches_untouched(pool: PgPool) {
+    let f = Fixture::with_realtime_priority(&pool).await;
+    sqlx::query(
+        "INSERT INTO model_overlays (user_id, deployed_model_id, priority_bias_seconds) SELECT $1, id, 900 FROM deployed_models WHERE alias = 'policy'",
+    )
+    .bind(f.user)
+    .execute(&pool)
+    .await
+    .unwrap();
+    f.services.sync_onwards_config(&pool).await.unwrap();
+    // A daemon dispatch carries the batch deadline priority and keeps it.
+    f.server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {}", f.key))
+        .add_header("x-fusillade-request-id", Uuid::new_v4().to_string())
+        .json(&json!({"model":"policy","messages":[{"role":"user","content":"hi"}],
+            "nvext":{"agent_hints":{"priority":-1700000000}}}))
+        .await
+        .assert_status_ok();
+    assert_eq!(f.last_body().await["nvext"]["agent_hints"]["priority"], -1700000000);
 }
 
 #[dwctl_test_macros::test]

@@ -408,6 +408,7 @@ mod tests {
                     }],
                 },
             ],
+            inject_realtime_priority: false,
         });
         let cache = KeyPolicyCache::from_policies_with_presets(
             presets,

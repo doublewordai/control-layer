@@ -33,6 +33,11 @@ pub struct OverlayResponse {
     /// Overrides the account's `self_hosted_only` on this model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub self_hosted_only: Option<bool>,
+    /// Seconds this organisation's realtime requests on this model are moved
+    /// earlier in the deadline-ordered scheduling priority (applied only when
+    /// `scheduling.inject_realtime_priority` is on).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority_bias_seconds: Option<i32>,
     /// Which catalog file wrote the row; null = written by hand and left alone by the catalog.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provisioning_source: Option<String>,
@@ -94,6 +99,7 @@ pub(crate) struct OverlayRow {
     pub default_serving_class: Option<String>,
     pub targets: Option<serde_json::Value>,
     pub self_hosted_only: Option<bool>,
+    pub priority_bias_seconds: Option<i32>,
     pub provisioning_source: Option<String>,
     pub updated_at: DateTime<Utc>,
 }
@@ -109,6 +115,7 @@ impl From<OverlayRow> for OverlayResponse {
             default_serving_class: row.default_serving_class,
             targets: row.targets,
             self_hosted_only: row.self_hosted_only,
+            priority_bias_seconds: row.priority_bias_seconds,
             provisioning_source: row.provisioning_source,
             updated_at: row.updated_at,
         }
