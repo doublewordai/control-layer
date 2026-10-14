@@ -731,9 +731,13 @@ seconds, the priority is `-T`, and the earliest `T` is served first:
 
 | Traffic | `T` | Enabled by |
 |---------|-----|------------|
-| Batch, flex and background (dispatched by the batch daemon) | The batch deadline | `background_services.batch_daemon.inject_deadline_priority` |
+| Batch and flex (dispatched by the batch daemon) | The batch deadline | `background_services.batch_daemon.inject_deadline_priority` |
 | Realtime | Arrival time | `scheduling.inject_realtime_priority` |
 | Realtime, account with a priority bias | Arrival time minus the bias | `scheduling.inject_realtime_priority` |
+
+Background-tier work has no deadline. The batch daemon sends it with the
+reserved priority `i32::MIN`, below every deadline priority, so it is never
+deadline-ordered and runs only when nothing else is waiting.
 
 ```yaml
 scheduling:
@@ -754,8 +758,8 @@ How the priority is chosen:
   organization) a realtime priority head start, `priority_bias_seconds` (0 to
   86400), in the console's edit dialog or with `PATCH /admin/api/v1/users/{id}`
   or `PATCH /admin/api/v1/organizations/{id}`. Its realtime requests use
-  `T = arrival - bias`, so they are served ahead of standard realtime requests
-  that arrived up to `bias` seconds earlier. `null` clears it. The bias applies
+  `T = arrival - bias`. Compared with a realtime request that has no head start,
+  it is served first if that request arrived less than `bias` seconds earlier. `null` clears it. The bias applies
   to the account that owns the API key, and only platform managers can see or
   change it.
 - **Per-model bias.** An organisation's
@@ -770,8 +774,9 @@ How the priority is chosen:
 - **Resumed streams keep their `T`.** A continuation resume leg reuses the
   priority of the request it continues. Without a deadline priority it falls
   back to `continuation.priority`.
-- **Saturation.** `-T` is clamped to the `i32` range. After 2038 every
-  realtime `T` maps to `i32::MIN`, so the field must be widened before then.
+- **Saturation.** `-T` is clamped to `i32::MIN + 1 ..= i32::MAX`, keeping
+  `i32::MIN` for background work. After 2038 every realtime `T` maps to
+  `i32::MIN + 1`, so the field must be widened before then.
 
 With `inject_realtime_priority: false`, realtime requests to `dynamo` carry
 priority `0`, which ranks them above every batch deadline.

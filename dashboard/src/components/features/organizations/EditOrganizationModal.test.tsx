@@ -339,6 +339,42 @@ describe("realtime priority head start", () => {
     expect(submitted).toMatchObject({ priority_bias_seconds: 900 });
   });
 
+  it("keeps a typed value when the detail response arrives late", async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let submitted: Record<string, unknown> | undefined;
+    let detailServed = false;
+    server.use(
+      http.get("/admin/api/v1/organizations/:id", async () => {
+        await gate;
+        detailServed = true;
+        return HttpResponse.json({ ...mockOrg, priority_bias_seconds: 600 });
+      }),
+      http.patch("/admin/api/v1/organizations/:id", async ({ request }) => {
+        submitted = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json({ ...mockOrg, ...submitted });
+      }),
+    );
+    const user = userEvent.setup();
+    render(
+      <EditOrganizationModal isOpen onClose={vi.fn()} organization={mockOrg} canEditServing />,
+      { wrapper: createWrapper() },
+    );
+    const dialog = within(screen.getByRole("dialog"));
+    const input = dialog.getByLabelText("Realtime priority head start");
+    await user.type(input, "120");
+    release();
+    // Let the detail response land and render, then confirm the typed value survived.
+    await waitFor(() => expect(detailServed).toBe(true));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(input).toHaveValue(120);
+    await user.click(dialog.getByRole("button", { name: /save/i }));
+    await waitFor(() => expect(submitted).toBeDefined());
+    expect(submitted).toMatchObject({ priority_bias_seconds: 120 });
+  });
+
   it("is not shown or sent without the serving permission", async () => {
     let submitted: Record<string, unknown> | undefined;
     server.use(

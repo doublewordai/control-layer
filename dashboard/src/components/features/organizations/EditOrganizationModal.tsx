@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
   useUpdateOrganization,
   useOrganization,
@@ -53,6 +53,9 @@ export function EditOrganizationModal({
   const [tolerationPreset, setTolerationPreset] = useState<string | null>(null);
   // Raw input text; empty means no bias.
   const [priorityBias, setPriorityBias] = useState("");
+  // Set once the operator types in the head-start field, so a detail response
+  // that lands afterwards cannot replace what they typed.
+  const priorityBiasEdited = useRef(false);
   const updateOrg = useUpdateOrganization();
   const { data: config } = useConfig();
   // List rows carry the pinned preset for platform managers, but a row from a
@@ -66,6 +69,7 @@ export function EditOrganizationModal({
 
   useEffect(() => {
     if (isOpen && organization) {
+      priorityBiasEdited.current = false;
       setEmail(organization.email || "");
       setDisplayName(organization.display_name || "");
       setZeroDataRetention(organization.zero_data_retention ?? false);
@@ -86,11 +90,13 @@ export function EditOrganizationModal({
   useEffect(() => {
     if (isOpen && detail) {
       setTolerationPreset(detail.toleration_preset ?? null);
-      setPriorityBias(
-        detail.priority_bias_seconds == null
-          ? ""
-          : String(detail.priority_bias_seconds),
-      );
+      if (!priorityBiasEdited.current) {
+        setPriorityBias(
+          detail.priority_bias_seconds == null
+            ? ""
+            : String(detail.priority_bias_seconds),
+        );
+      }
     }
   }, [detail, isOpen]);
 
@@ -301,7 +307,10 @@ export function EditOrganizationModal({
                   id="edit-priority-bias-seconds"
                   value={priorityBias}
                   canEdit={canEditServing}
-                  onChange={setPriorityBias}
+                  onChange={(next) => {
+                    priorityBiasEdited.current = true;
+                    setPriorityBias(next);
+                  }}
                 />
                 <SchedulingTolerations
                   preset={tolerationPreset}

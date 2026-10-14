@@ -153,9 +153,11 @@ models:
 ```
 
 The organisation's realtime requests on `example-model` get effective time
-`T = arrival - 900`, so they are served ahead of standard realtime work that
-arrived up to 15 minutes earlier, and ahead of batch work whose deadline is
-later than `T`. On other models the organisation keeps its account head start,
+`T = arrival - 900`. A resolved serving-class preset's or overlay target's
+`priority` is subtracted too. Compared with a realtime request that has no head
+start, one of these requests is served first if the other arrived less than 15
+minutes earlier. It is also served ahead of batch work whose deadline is later
+than `T`. On other models the organisation keeps its account head start,
 if it has one. Batch and flex requests keep their batch deadline.
 
 The value must be a whole number from `0` to `86400` (one day). Validation

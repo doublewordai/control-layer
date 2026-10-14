@@ -97,7 +97,7 @@ describe("EditUserModal realtime priority head start", () => {
     expect(input).toHaveValue(600);
     await user.clear(input);
     await user.type(input, "900");
-    expect(dialog.getByText(/up to 15 min earlier/)).toBeInTheDocument();
+    expect(dialog.getByText(/less than 15 min earlier/)).toBeInTheDocument();
     await user.click(dialog.getByRole("button", { name: "Save Changes" }));
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledOnce());
     expect(mutateAsync.mock.calls[0][0].data.priority_bias_seconds).toBe(900);

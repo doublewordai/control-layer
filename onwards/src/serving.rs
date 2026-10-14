@@ -82,8 +82,14 @@ pub const PRIORITY_FIELD: &str = "priority";
 /// realtime's. Batch deadlines sit below it, continuation resumes above.
 pub const DEFAULT_PRIORITY: i32 = 0;
 /// Largest `priority_bias_seconds` an overlay may declare (one day). The
-/// catalog and the database both refuse anything outside `0..=` this.
+/// catalog, the database and config deserialization all refuse anything
+/// outside `0..=` this.
 pub const MAX_PRIORITY_BIAS_SECONDS: u32 = 86_400;
+/// Lowest priority a deadline (`-T`) may take. `i32::MIN` is reserved for
+/// background work, which the batch daemon sends strictly below every
+/// deadline priority (fusillade's `BACKGROUND_DYNAMO_PRIORITY`), so deadline
+/// priorities floor one above it, exactly as fusillade's own do.
+pub const MIN_DEADLINE_PRIORITY: i32 = i32::MIN + 1;
 /// Separator between a model alias and its class suffix (`alias:class`).
 pub const SUFFIX_SEPARATOR: char = ':';
 /// Key label naming the account (organisation) that owns the key. The account
@@ -232,8 +238,12 @@ pub struct ServingTargets {
 
 impl ServingTargets {
     /// Write the targets into a request body: `nvext.router.{ttft_target,
-    /// itl_target}` always, `nvext.agent_hints.priority` only when non-zero.
-    /// Existing values are overwritten; the rest of `nvext` is kept.
+    /// itl_target}` always (overwriting), and `nvext.agent_hints.priority`
+    /// only when non-zero and the body carries none yet. A priority already
+    /// present was set by the first hop (a deadline priority) and must survive
+    /// this crate running again inside the serving namespace, where a
+    /// `standard` preset would otherwise replace it; callers' own priorities
+    /// are scrubbed at dwctl's ingress. The rest of `nvext` is kept.
     pub fn stamp(&self, body: &mut serde_json::Map<String, serde_json::Value>) {
         let nvext = body
             .entry(NVEXT_FIELD)
@@ -265,7 +275,8 @@ impl ServingTargets {
             hints
                 .as_object_mut()
                 .expect("agent_hints was just made an object")
-                .insert(PRIORITY_FIELD.to_string(), self.priority.into());
+                .entry(PRIORITY_FIELD)
+                .or_insert_with(|| self.priority.into());
         }
     }
 }
@@ -315,13 +326,29 @@ pub fn stamp_priority(body: &mut serde_json::Map<String, serde_json::Value>, pri
 }
 
 /// The scheduling priority for an effective time `T` (Unix seconds): `-T`,
-/// so earlier times are served first. Saturates at the `i32` bounds rather
-/// than overflowing: a `T` past 2038 maps to [`i32::MIN`] (the lowest
-/// priority), a `T` before 1901 to [`i32::MAX`].
+/// so earlier times are served first. Saturates rather than overflowing: a
+/// `T` past 2038 maps to [`MIN_DEADLINE_PRIORITY`] (still above background
+/// work's reserved `i32::MIN`), a `T` before 1901 to [`i32::MAX`].
 pub fn deadline_priority(effective_epoch_secs: i64) -> i32 {
     effective_epoch_secs
         .saturating_neg()
-        .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+        .clamp(i64::from(MIN_DEADLINE_PRIORITY), i64::from(i32::MAX)) as i32
+}
+
+/// Deserialize a `priority_bias_seconds`, refusing values above
+/// [`MAX_PRIORITY_BIAS_SECONDS`] so a hand-written config cannot carry a head
+/// start the catalog and database would reject.
+fn deserialize_priority_bias<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let bias = Option::<u32>::deserialize(deserializer)?;
+    match bias {
+        Some(bias) if bias > MAX_PRIORITY_BIAS_SECONDS => Err(serde::de::Error::custom(format!(
+            "priority_bias_seconds must be at most {MAX_PRIORITY_BIAS_SECONDS}, got {bias}"
+        ))),
+        bias => Ok(bias),
+    }
 }
 
 /// The deadline priority of a realtime request: `-T`, with
@@ -498,7 +525,11 @@ pub struct AccountServing {
     /// deadline order on every alias, unless the alias's overlay sets its own
     /// [`ServingOverlay::priority_bias_seconds`]. Only read when the request
     /// carries [`RealtimeArrival`]. `None` (or 0) is no bias.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_priority_bias"
+    )]
     pub priority_bias_seconds: Option<u32>,
 }
 
@@ -533,7 +564,11 @@ pub struct ServingOverlay {
     /// account's [`AccountServing::priority_bias_seconds`] on this alias. Only
     /// read when the request carries [`RealtimeArrival`]. `None` inherits the
     /// account's bias; `Some(0)` is explicitly no bias here.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_priority_bias"
+    )]
     pub priority_bias_seconds: Option<u32>,
 }
 
@@ -1041,10 +1076,15 @@ mod tests {
         assert_eq!(deadline_priority(0), 0);
         // earlier is higher
         assert!(deadline_priority(100) > deadline_priority(200));
-        // past 2038 every time saturates to the lowest priority rather than wrapping
-        assert_eq!(deadline_priority(i64::from(i32::MAX) + 1), i32::MIN);
-        assert_eq!(deadline_priority(i64::from(i32::MAX) + 2), i32::MIN);
-        assert_eq!(deadline_priority(i64::MAX), i32::MIN);
+        // past 2038 every time saturates to the lowest deadline priority
+        // rather than wrapping, and never reaches background work's i32::MIN
+        assert_eq!(deadline_priority(i64::from(i32::MAX)), -i32::MAX);
+        assert_eq!(MIN_DEADLINE_PRIORITY, -i32::MAX);
+        assert_eq!(
+            deadline_priority(i64::from(i32::MAX) + 1),
+            MIN_DEADLINE_PRIORITY
+        );
+        assert_eq!(deadline_priority(i64::MAX), MIN_DEADLINE_PRIORITY);
         assert_eq!(deadline_priority(i64::MIN), i32::MAX);
         assert_eq!(deadline_priority(-5_000_000_000), i32::MAX);
     }
@@ -1174,11 +1214,11 @@ mod tests {
         let year_2040 = RealtimeArrival(2_208_988_800);
         assert_eq!(
             realtime_deadline_priority(year_2040, None, Some(&o), None),
-            i32::MIN
+            MIN_DEADLINE_PRIORITY
         );
         assert_eq!(
             realtime_deadline_priority(RealtimeArrival(i64::MAX), None, None, Some(&INTERACTIVE)),
-            i32::MIN
+            MIN_DEADLINE_PRIORITY
         );
         assert_eq!(
             realtime_deadline_priority(RealtimeArrival(i64::MIN), None, Some(&o), None),
@@ -1214,6 +1254,46 @@ mod tests {
                 "{purpose}"
             );
         }
+    }
+
+    #[test]
+    fn config_cannot_carry_a_bias_above_the_cap() {
+        for json in [
+            r#"{"priority_bias_seconds": 86401}"#,
+            r#"{"priority_bias_seconds": -1}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ServingOverlay>(json).is_err(),
+                "{json}"
+            );
+            assert!(
+                serde_json::from_str::<AccountServing>(json).is_err(),
+                "{json}"
+            );
+        }
+        let o: ServingOverlay =
+            serde_json::from_str(r#"{"priority_bias_seconds": 86400}"#).unwrap();
+        assert_eq!(o.priority_bias_seconds, Some(MAX_PRIORITY_BIAS_SECONDS));
+        let a: AccountServing = serde_json::from_str(r#"{"priority_bias_seconds": null}"#).unwrap();
+        assert_eq!(a.priority_bias_seconds, None);
+    }
+
+    #[test]
+    fn a_preset_priority_never_replaces_one_already_in_the_body() {
+        // The inner hop re-resolves to a standard preset with its own
+        // priority; the first hop's deadline priority must survive it.
+        let mut body = serde_json::json!({"nvext": {"agent_hints": {"priority": -1_700_000_000}}});
+        ServingTargets {
+            ttft_ms: 1,
+            itl_ms: 2,
+            priority: 50,
+        }
+        .stamp(body.as_object_mut().unwrap());
+        assert_eq!(body["nvext"]["agent_hints"]["priority"], -1_700_000_000);
+        assert_eq!(
+            body["nvext"]["router"]["ttft_target"], 1,
+            "targets still overwrite"
+        );
     }
 
     #[test]

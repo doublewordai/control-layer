@@ -78,7 +78,7 @@ export function RealtimePriorityBias({
       {parsed.ok ? (
         <p id={hintId} className="text-xs text-gray-500">
           {parsed.value
-            ? `Served ahead of standard realtime requests that arrived up to ${formatBiasDuration(parsed.value)} earlier.`
+            ? `Served ahead of realtime requests with no head start that arrived less than ${formatBiasDuration(parsed.value)} earlier.`
             : "No head start: ordered by arrival time."}
         </p>
       ) : (
