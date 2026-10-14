@@ -2175,9 +2175,10 @@ pub async fn target_message_handler<T: HttpClient>(
             }
         }
 
-        // Override the response `id` field for /responses and /chat/completions
-        // requests when the caller supplied a response ID via the configured
-        // header. Both response bodies expose a top-level `id` we can rewrite.
+        // Override the response `id` field for /responses, /chat/completions and
+        // /completions requests when the caller supplied a response ID via the
+        // configured header. All three bodies expose a top-level `id` we can
+        // rewrite; strict mode does the same for streamed chunks.
         if let Some(ref header_name) = state.response_id_header
             && crate::response_id::path_supports_id_override(&path_and_query)
             && (200..300).contains(&status)

@@ -15,6 +15,7 @@ use crate::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{Connection, FromRow, PgConnection};
+use std::time::Duration;
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -1176,22 +1177,28 @@ impl<'c> Users<'c> {
     /// is still current. Returns false when another poller already applied the
     /// same decline transition.
     #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id), expected_failure_count), err)]
-    pub async fn apply_auto_topup_soft_decline(&mut self, user_id: UserId, expected_failure_count: i32) -> Result<bool> {
+    pub async fn apply_auto_topup_soft_decline(
+        &mut self,
+        user_id: UserId,
+        expected_failure_count: i32,
+        retry_delay: Duration,
+    ) -> Result<bool> {
         let result = if expected_failure_count == 0 {
-            sqlx::query!(
+            sqlx::query(
                 r#"
                 UPDATE users
                 SET auto_topup_soft_failure_count = 1,
-                    auto_topup_retry_after = NOW() + INTERVAL '24 hours',
+                    auto_topup_retry_after = NOW() + make_interval(secs => $3),
                     updated_at = NOW()
                 WHERE id = $1
                   AND auto_topup_soft_failure_count = $2
                   AND auto_topup_amount IS NOT NULL
                   AND auto_topup_threshold IS NOT NULL
                 "#,
-                user_id,
-                expected_failure_count,
             )
+            .bind(user_id)
+            .bind(expected_failure_count)
+            .bind(retry_delay.as_secs_f64())
             .execute(&mut *self.db)
             .await?
         } else {
@@ -1224,19 +1231,20 @@ impl<'c> Users<'c> {
     ///
     /// Returns false when another poller already applied the pause.
     #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
-    pub async fn pause_auto_topup_after_provider_failure(&mut self, user_id: UserId) -> Result<bool> {
-        let result = sqlx::query!(
+    pub async fn pause_auto_topup_after_provider_failure(&mut self, user_id: UserId, retry_delay: Duration) -> Result<bool> {
+        let result = sqlx::query(
             r#"
             UPDATE users
-            SET auto_topup_retry_after = NOW() + INTERVAL '24 hours',
+            SET auto_topup_retry_after = NOW() + make_interval(secs => $2),
                 updated_at = NOW()
             WHERE id = $1
               AND auto_topup_amount IS NOT NULL
               AND auto_topup_threshold IS NOT NULL
               AND (auto_topup_retry_after IS NULL OR auto_topup_retry_after <= NOW())
             "#,
-            user_id,
         )
+        .bind(user_id)
+        .bind(retry_delay.as_secs_f64())
         .execute(&mut *self.db)
         .await?;
 
@@ -2043,7 +2051,7 @@ mod tests {
     }
 
     #[dwctl_test_macros::test]
-    async fn test_auto_topup_decline_first_soft_failure_pauses_for_24_hours(pool: PgPool) {
+    async fn test_auto_topup_decline_first_soft_failure_uses_configured_delay(pool: PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         sqlx::query!(
             r#"
@@ -2061,7 +2069,11 @@ mod tests {
 
         let started_at = Utc::now();
         let mut conn = pool.acquire().await.unwrap();
-        let applied = Users::new(&mut conn).apply_auto_topup_soft_decline(user.id, 0).await.unwrap();
+        let retry_delay = Duration::from_secs(90);
+        let applied = Users::new(&mut conn)
+            .apply_auto_topup_soft_decline(user.id, 0, retry_delay)
+            .await
+            .unwrap();
 
         assert!(applied);
         let row = sqlx::query!(
@@ -2081,11 +2093,52 @@ mod tests {
         assert_eq!(row.auto_topup_threshold, Some(10.0));
         assert_eq!(row.auto_topup_soft_failure_count, 1);
         let retry_after = row.auto_topup_retry_after.unwrap();
-        assert!(retry_after >= started_at + chrono::Duration::hours(23) + chrono::Duration::minutes(59));
-        assert!(retry_after <= Utc::now() + chrono::Duration::hours(24) + chrono::Duration::minutes(1));
+        assert!(retry_after >= started_at + chrono::Duration::seconds(89));
+        assert!(retry_after <= Utc::now() + chrono::Duration::seconds(91));
 
         let candidates = Users::new(&mut conn).users_with_auto_topup_enabled().await.unwrap();
         assert!(candidates.iter().all(|candidate| candidate.id != user.id));
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_auto_topup_provider_failure_uses_configured_delay(pool: PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        sqlx::query!(
+            r#"
+            UPDATE users
+            SET auto_topup_amount = 25.0,
+                auto_topup_threshold = 10.0,
+                payment_provider_id = 'cus_provider_failure'
+            WHERE id = $1
+            "#,
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let started_at = Utc::now();
+        let mut conn = pool.acquire().await.unwrap();
+        let applied = Users::new(&mut conn)
+            .pause_auto_topup_after_provider_failure(user.id, Duration::from_secs(45))
+            .await
+            .unwrap();
+
+        assert!(applied);
+        let retry_after = sqlx::query_scalar!("SELECT auto_topup_retry_after FROM users WHERE id = $1", user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(retry_after >= started_at + chrono::Duration::seconds(44));
+        assert!(retry_after <= Utc::now() + chrono::Duration::seconds(46));
+        assert!(
+            !Users::new(&mut conn)
+                .pause_auto_topup_after_provider_failure(user.id, Duration::from_secs(45))
+                .await
+                .unwrap(),
+            "a duplicate provider failure must not extend the active pause"
+        );
     }
 
     #[dwctl_test_macros::test]
@@ -2109,9 +2162,17 @@ mod tests {
         .unwrap();
 
         let mut conn = pool.acquire().await.unwrap();
-        assert!(Users::new(&mut conn).apply_auto_topup_soft_decline(user.id, 1).await.unwrap());
         assert!(
-            !Users::new(&mut conn).apply_auto_topup_soft_decline(user.id, 1).await.unwrap(),
+            Users::new(&mut conn)
+                .apply_auto_topup_soft_decline(user.id, 1, Duration::from_secs(60))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !Users::new(&mut conn)
+                .apply_auto_topup_soft_decline(user.id, 1, Duration::from_secs(60))
+                .await
+                .unwrap(),
             "a stale duplicate transition must not apply twice"
         );
 

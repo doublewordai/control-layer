@@ -46,6 +46,16 @@ const NOTIFICATION_DUE: IndexMigrations = IndexMigrations {
           AND cancelling_at IS NULL AND deleted_at IS NULL AND total_requests > 0",
 };
 
+const FINISHED_LATE: IndexMigrations = IndexMigrations {
+    name: "idx_batches_finished_late",
+    build: 20261013100010,
+    validate: 20261013100030,
+    build_sql: include_str!("../migrations/20261013100010_add_batches_finished_late_index.up.sql"),
+    // Missing the cancelled arm: late cancellations would scan the table.
+    wrong_definition: "CREATE INDEX idx_batches_finished_late ON batches (id)
+        WHERE deleted_at IS NULL AND (completed_at > expires_at OR failed_at > expires_at)",
+};
+
 /// Apply every migration that precedes the index's build migration.
 async fn migrate_to_before(pool: &PgPool, index: &IndexMigrations) {
     let baseline = Migrator {
@@ -187,4 +197,24 @@ async fn notification_due_index_repairs_an_invalid_remnant(pool: PgPool) {
 #[sqlx::test(migrations = false)]
 async fn notification_due_index_rejects_a_same_name_wrong_definition(pool: PgPool) {
     wrong_definition(pool, &NOTIFICATION_DUE).await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn finished_late_index_applies_fresh(pool: PgPool) {
+    fresh(pool, &FINISHED_LATE).await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn finished_late_index_adopts_a_prebuilt_index(pool: PgPool) {
+    prebuilt(pool, &FINISHED_LATE).await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn finished_late_index_repairs_an_invalid_remnant(pool: PgPool) {
+    invalid_remnant(pool, &FINISHED_LATE).await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn finished_late_index_rejects_a_same_name_wrong_definition(pool: PgPool) {
+    wrong_definition(pool, &FINISHED_LATE).await;
 }

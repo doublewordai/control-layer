@@ -1423,7 +1423,8 @@ impl Default for RequestLimitsConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OnwardsConfig {
-    /// Maximum pending bytes of an unfinished SSE event in the proxy, cache, and continuation layers.
+    /// Maximum pending bytes of an unfinished SSE event in the proxy, cache, continuation and
+    /// client usage layers.
     /// Complete events are forwarded first.
     /// Increase for providers that emit large tool-call events. Default: 65536.
     pub sse_buffer_limit: usize,
@@ -3282,6 +3283,11 @@ pub struct CreditsConfig {
     /// billing target (see `Credits::grant_verification_credits`).
     #[serde(default)]
     pub verification_credits: rust_decimal::Decimal,
+    /// Pause after a transient provider failure or the first soft card decline
+    /// before auto top-up is eligible again. Production defaults to 24 hours;
+    /// staging may shorten it to exercise the complete decline lifecycle.
+    #[serde(with = "humantime_serde")]
+    pub auto_topup_retry_delay: Duration,
 }
 
 impl Default for CreditsConfig {
@@ -3293,6 +3299,7 @@ impl Default for CreditsConfig {
             first_payment_match_up_to: rust_decimal::Decimal::ZERO,
             // Default to 0 (no signup credits on card verification)
             verification_credits: rust_decimal::Decimal::ZERO,
+            auto_topup_retry_delay: Duration::from_secs(24 * 60 * 60),
         }
     }
 }
@@ -4260,6 +4267,11 @@ mod tests {
 
     use super::*;
     use figment::Jail;
+
+    #[test]
+    fn auto_topup_retry_delay_defaults_to_24_hours() {
+        assert_eq!(CreditsConfig::default().auto_topup_retry_delay, Duration::from_secs(24 * 60 * 60));
+    }
 
     #[test]
     fn default_auth_roles_include_background_inference() {
