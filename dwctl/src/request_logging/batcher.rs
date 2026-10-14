@@ -141,6 +141,8 @@ pub struct RawAnalyticsRecord {
     pub trace_id: Option<String>,
     /// Gateway span captured by Outlet; pair with `trace_id` to locate the request's trace subtree.
     pub gateway_span_id: Option<String>,
+    /// Request ID dwctl minted and returned as `X-Request-ID`.
+    pub x_request_id: Option<Uuid>,
 }
 
 /// Enriched data resolved during batch processing
@@ -903,6 +905,7 @@ where
         let mut api_key_ids: Vec<Option<Uuid>> = Vec::with_capacity(records.len());
         let mut trace_ids: Vec<Option<String>> = Vec::with_capacity(records.len());
         let mut gateway_span_ids: Vec<Option<String>> = Vec::with_capacity(records.len());
+        let mut x_request_ids: Vec<Option<Uuid>> = Vec::with_capacity(records.len());
         let mut cache_read_vec: Vec<i64> = Vec::with_capacity(records.len());
         let mut cache_creation_total_vec: Vec<i64> = Vec::with_capacity(records.len());
         let mut cache_5m_vec: Vec<i64> = Vec::with_capacity(records.len());
@@ -958,6 +961,7 @@ where
             api_key_ids.push(record.api_key_id);
             trace_ids.push(record.raw.trace_id.clone());
             gateway_span_ids.push(record.raw.gateway_span_id.clone());
+            x_request_ids.push(record.raw.x_request_id);
 
             let c5 = record.raw.cache_creation_5m_input_tokens;
             let c1 = record.raw.cache_creation_1h_input_tokens;
@@ -1002,7 +1006,8 @@ where
                 cache_creation_5m_input_tokens, cache_creation_1h_input_tokens, cache_creation_24h_input_tokens,
                 total_cost, uncached_cost, served_by, finish_reason, user_agent, submitted_at,
                 engine_cached_tokens, stream, max_tokens, temperature, top_p, n, tool_count, message_count,
-                cache_read_source, requested_serving_class, resolved_serving_class, gateway_span_id
+                cache_read_source, requested_serving_class, resolved_serving_class, gateway_span_id,
+                x_request_id
             )
             SELECT * FROM UNNEST(
                 $1::uuid[], $2::bigint[], $3::timestamptz[], $4::text[], $5::text[], $6::text[],
@@ -1015,7 +1020,7 @@ where
                 $32::numeric[], $33::numeric[], $34::text[], $35::text[], $36::text[],
                 $37::timestamptz[],
                 $38::bigint[], $39::boolean[], $40::bigint[], $41::real[], $42::real[], $43::int[], $44::int[], $45::int[],
-                $46::text[], $47::text[], $48::text[], $49::text[]
+                $46::text[], $47::text[], $48::text[], $49::text[], $50::uuid[]
             )
             ON CONFLICT DO NOTHING
             RETURNING id, instance_id, correlation_id
@@ -1069,6 +1074,7 @@ where
             &requested_class_vec as &[Option<String>],
             &resolved_class_vec as &[Option<String>],
             &gateway_span_ids as &[Option<String>],
+            &x_request_ids as &[Option<Uuid>],
         )
         .fetch_all(&mut **tx)
         .await?;
@@ -1840,6 +1846,7 @@ mod tests {
             batch_request_source: "".to_string(),
             trace_id: None,
             gateway_span_id: None,
+            x_request_id: None,
         };
 
         assert_eq!(record.correlation_id, 123);
@@ -1847,6 +1854,14 @@ mod tests {
         let payload = serde_json::to_value(&record).unwrap();
         let restored: RawAnalyticsRecord = serde_json::from_value(payload).unwrap();
         assert_eq!(restored.api_key_id, Some(api_key_id));
+    }
+
+    #[test]
+    fn outbox_payload_without_x_request_id_deserializes() {
+        let mut payload = serde_json::to_value(cost_record(10, 20, 0, 0, 0, 0)).unwrap();
+        payload.as_object_mut().unwrap().remove("x_request_id");
+        let record: RawAnalyticsRecord = serde_json::from_value(payload).unwrap();
+        assert_eq!(record.x_request_id, None);
     }
 
     #[test]
@@ -1907,6 +1922,7 @@ mod tests {
             batch_request_source: String::new(),
             trace_id: None,
             gateway_span_id: None,
+            x_request_id: None,
         }
     }
 
@@ -2201,6 +2217,7 @@ mod integration_tests {
             batch_request_source: String::new(),
             trace_id: None,
             gateway_span_id: None,
+            x_request_id: None,
         }
     }
 
@@ -2320,6 +2337,24 @@ mod integration_tests {
                 assert_eq!(record.total_cost, Some(expected * factor));
             }
         }
+    }
+
+    #[dwctl_test_macros::test]
+    async fn projector_writes_x_request_id(pool: sqlx::PgPool) {
+        create_test_model(&pool, "cor935").await;
+        let config = crate::test::utils::create_test_config();
+        let (batcher, writer) = AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
+        let mut record = create_raw_record("cor935", None, 10, 5);
+        record.x_request_id = Some(Uuid::now_v7());
+        writer.publish(record.clone()).await.unwrap();
+
+        assert_eq!(batcher.project_outbox_batch().await.unwrap(), 1);
+
+        let stored: Option<Uuid> = sqlx::query_scalar("SELECT x_request_id FROM http_analytics")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, record.x_request_id);
     }
 
     #[dwctl_test_macros::test]

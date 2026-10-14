@@ -2803,12 +2803,14 @@ where
                     "fusillade.process_request",
                     trace_id = tracing::field::Empty,
                     otel.name = "fusillade.process_request",
+                    x_request_id = tracing::field::Empty,
                     request_id = %request_id,
                     batch_id = ?batch_id,
                     model = %model,
                     capacity_model = %capacity_model,
                     outcome = tracing::field::Empty,
                 );
+                let process_ctx = crate::processor::ProcessContext::new(process_span.clone());
 
                 join_set.spawn(async move {
                     let span = tracing::Span::current();
@@ -2868,6 +2870,7 @@ where
                             storage.as_ref(),
                             should_retry.clone(),
                             cancellation,
+                            process_ctx,
                         )
                         .await;
 

@@ -175,6 +175,7 @@ fn map_reqwest_error(error: reqwest::Error) -> crate::error::FusilladeError {
 impl HttpClient for ReqwestHttpClient {
     #[tracing::instrument(name = "fusillade.execute", skip(self, request, api_key), fields(
         otel.name = %format!("{} {}", request.method, request.path),
+        x_request_id = tracing::field::Empty,
     ))]
     async fn execute(&self, request: &RequestData, api_key: &str) -> Result<HttpResponse> {
         let url = format!("{}{}", request.endpoint, request.path);
@@ -210,7 +211,6 @@ impl HttpClient for ReqwestHttpClient {
         }
 
         // Add fusillade request ID header for analytics correlation in dwctl
-        // Use the full UUID (request.id.0) instead of the Display impl which only shows 8 chars
         req = req.header("X-Fusillade-Request-Id", request.id.0.to_string());
 
         // Add batch metadata as headers (x-fusillade-batch-COLUMN-NAME)
@@ -532,9 +532,30 @@ impl ReqwestHttpClient {
         })?;
 
         let status = response.status().as_u16();
+        let x_request_id = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        // Record it on `fusillade.execute` (the current span: this is called
+        // straight from `execute`) as soon as the headers arrive, so an attempt
+        // whose body read fails below can still be correlated with the server's logs.
+        if let Some(id) = &x_request_id {
+            tracing::Span::current().record("x_request_id", tracing::field::display(id));
+        }
 
         record_submission_ttft(request, status);
-        let body = response.text().await.map_err(map_reqwest_error)?;
+        let body = response.text().await.map_err(|e| {
+            // Still inside `fusillade.execute`, which now holds `x_request_id`,
+            // so this line carries the server's ID for the failed attempt.
+            tracing::warn!(
+                request_id = %request.id,
+                status = status,
+                error = %e,
+                "HTTP response body read failed"
+            );
+            map_reqwest_error(e)
+        })?;
 
         tracing::debug!(
             request_id = %request.id,
@@ -543,7 +564,11 @@ impl ReqwestHttpClient {
             "HTTP request completed"
         );
 
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse {
+            status,
+            body,
+            x_request_id,
+        })
     }
 }
 
@@ -633,7 +658,7 @@ impl MockHttpClient {
     /// ```ignore
     /// let trigger = mock.add_response_with_trigger(
     ///     "POST /test",
-    ///     Ok(HttpResponse { status: 200, body: "ok".to_string() })
+    ///     Ok(HttpResponse { status: 200, body: "ok".to_string(), x_request_id: None })
     /// );
     /// // ... request is now blocked waiting ...
     /// trigger.send(()).unwrap(); // Now it completes
@@ -1010,6 +1035,7 @@ mod tests {
         mock.add_response(
             "POST /test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: "success".to_string(),
             }),
@@ -1048,6 +1074,7 @@ mod tests {
         mock.add_response(
             "GET /status",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: "first".to_string(),
             }),
@@ -1055,6 +1082,7 @@ mod tests {
         mock.add_response(
             "GET /status",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: "second".to_string(),
             }),
@@ -1114,6 +1142,7 @@ mod tests {
         let trigger = mock.add_response_with_trigger(
             "POST /test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: "triggered".to_string(),
             }),
@@ -1159,6 +1188,7 @@ mod tests {
         mock.add_response(
             "POST /test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: "success".to_string(),
             }),
@@ -1327,6 +1357,218 @@ mod tests {
 
         assert_eq!(response.status, 200);
         assert_eq!(response.body, r#"{"result":"ok"}"#);
+    }
+
+    #[tokio::test]
+    async fn test_response_x_request_id_is_captured() {
+        use axum::{Router, http::StatusCode, routing::post};
+
+        let app = Router::new().route(
+            "/test",
+            post(|| async {
+                (
+                    StatusCode::BAD_REQUEST,
+                    [("x-request-id", "server-minted-id")],
+                    "nope",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let request = RequestData {
+            id: RequestId::from(uuid::Uuid::new_v4()),
+            batch_id: Some(crate::batch::BatchId::from(uuid::Uuid::new_v4())),
+            template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
+            custom_id: None,
+            endpoint: format!("http://{}", addr),
+            method: "POST".to_string(),
+            path: "/test".to_string(),
+            body: "{}".to_string(),
+            model: "test-model".to_string(),
+            api_key: "k".to_string(),
+            created_by: String::new(),
+            batch_metadata: std::collections::HashMap::new(),
+        };
+        let response = ReqwestHttpClient::default()
+            .execute(&request, "k")
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, 400);
+        assert_eq!(response.x_request_id.as_deref(), Some("server-minted-id"));
+    }
+
+    /// Collects formatted log output in memory.
+    #[derive(Clone, Default)]
+    struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl LogBuffer {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+        type Writer = LogBuffer;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Captures `x_request_id` when it is recorded on `fusillade.execute`.
+    #[derive(Clone, Default)]
+    struct ExecuteSpanRequestId(std::sync::Arc<std::sync::Mutex<Option<String>>>);
+
+    impl<S> tracing_subscriber::Layer<S> for ExecuteSpanRequestId
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Visit<'a>(&'a mut Option<String>);
+            impl tracing::field::Visit for Visit<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "x_request_id" {
+                        *self.0 = Some(format!("{value:?}"));
+                    }
+                }
+            }
+            if ctx
+                .span(id)
+                .is_some_and(|s| s.name() == "fusillade.execute")
+            {
+                values.record(&mut Visit(&mut self.0.lock().unwrap()));
+            }
+        }
+    }
+
+    /// The server's request ID is recorded as soon as the headers arrive, so
+    /// an attempt whose body read fails can still be correlated.
+    #[tokio::test]
+    async fn test_x_request_id_recorded_when_body_read_fails() {
+        use axum::{Router, body::Body, http::Response, routing::post};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        // Tracing caches per-callsite interest process-wide, and other tests in
+        // this binary install subscribers, so run in a re-executed child that
+        // owns the global subscriber.
+        const CHILD: &str = "FUSILLADE_EXECUTE_REQUEST_ID_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "http::tests::test_x_request_id_recorded_when_body_read_fails",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .expect("start isolated tracing test");
+            assert!(
+                output.status.success(),
+                "isolated tracing test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "child test filter must execute the tracing test"
+            );
+            return;
+        }
+
+        let captured = ExecuteSpanRequestId::default();
+        let logs = LogBuffer::default();
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::registry().with(captured.clone()).with(
+                tracing_subscriber::fmt::layer()
+                    .compact()
+                    .with_ansi(false)
+                    .with_writer(logs.clone()),
+            ),
+        )
+        .expect("isolated tracing test owns its subscriber");
+
+        // Headers arrive, then the body stream fails part-way through.
+        let app = Router::new().route(
+            "/test",
+            post(|| async {
+                // The first chunk flushes the headers; the error then simulates a
+                // connection dropped mid-body. The pause lets the headers reach the
+                // client first, as they would from a real upstream.
+                let chunks = futures::stream::unfold(0u8, |step| async move {
+                    match step {
+                        0 => Some((Ok(bytes::Bytes::from_static(b"{\"partial\":")), 1)),
+                        1 => {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            Some((Err(std::io::Error::other("connection reset mid-body")), 2))
+                        }
+                        _ => None,
+                    }
+                });
+                Response::builder()
+                    .header("x-request-id", "server-minted-id")
+                    .body(Body::from_stream(chunks))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let request = RequestData {
+            id: RequestId::from(uuid::Uuid::new_v4()),
+            batch_id: None,
+            template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
+            custom_id: None,
+            endpoint: format!("http://{}", addr),
+            method: "POST".to_string(),
+            path: "/test".to_string(),
+            body: "{}".to_string(),
+            model: "test-model".to_string(),
+            api_key: "k".to_string(),
+            created_by: String::new(),
+            batch_metadata: std::collections::HashMap::new(),
+        };
+        assert_eq!(*captured.0.lock().unwrap(), None);
+        let result = ReqwestHttpClient::default().execute(&request, "k").await;
+
+        assert!(result.is_err(), "body read should fail");
+        assert_eq!(
+            captured.0.lock().unwrap().as_deref(),
+            Some("server-minted-id")
+        );
+        // The failure is logged with the server's ID, for support to quote.
+        let text = logs.text();
+        assert!(
+            text.lines()
+                .any(|line| line.contains("HTTP response body read failed")
+                    && line.contains("x_request_id=server-minted-id")),
+            "body-read failure logged with x_request_id:\n{text}"
+        );
     }
 
     #[tokio::test]

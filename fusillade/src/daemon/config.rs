@@ -863,6 +863,7 @@ mod tests {
 
     fn response(status: u16, body: &str) -> HttpResponse {
         HttpResponse {
+            x_request_id: None,
             status,
             body: body.to_string(),
         }
