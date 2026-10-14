@@ -144,6 +144,14 @@ const ANTHROPIC_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 /// wins, then a `budget_tokens` bucket for `enabled`; with neither, the model's
 /// default applies.
 fn reasoning_effort(thinking: Option<&Value>, output_config: Option<&Value>) -> Result<Option<&'static str>, TranslationError> {
+    let output_config = output_config.filter(|v| !v.is_null());
+    if let Some(config) = output_config
+        && !config.is_object()
+    {
+        return Err(TranslationError::BadRequest(format!(
+            "output_config: expected an object, got {config}"
+        )));
+    }
     let effort = match output_config.and_then(|config| config.get("effort")).filter(|v| !v.is_null()) {
         None => None,
         Some(value) => Some(
@@ -738,6 +746,8 @@ mod tests {
             (json!({"thinking": {}}), "thinking.type"),
             (json!({"output_config": {"effort": "none"}}), "output_config.effort"),
             (json!({"output_config": {"effort": 3}}), "output_config.effort"),
+            (json!({"output_config": "high"}), "output_config"),
+            (json!({"output_config": ["high"]}), "output_config"),
         ] {
             let err = effort_for(extra.clone()).unwrap_err();
             assert!(
