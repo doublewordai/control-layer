@@ -267,7 +267,7 @@ When a pool is marked as `trusted: true`:
 **Error responses (4xx, 5xx) bypass sanitization:**
 - An error already in OpenAI's `{"error": {...}}` envelope is forwarded unchanged: its message, metadata, provider-specific details (stack traces, debug info) and custom fields all reach the client
 - An error in any other shape is rebuilt as an OpenAI envelope that keeps only the message: its top-level `message` (or a string `error`) becomes `error.message`, `error.type` follows the status as for sanitized errors, and the original `type`, `code`, `details` and other fields are dropped. Dynamo's `{"message": ..., "type": "Bad Request", "code": 400}` is the common case; its context-length refusals get the code `context_length_exceeded`
-- An error body that can't be read is forwarded unchanged: an encoded (compressed) one, or one larger than 64 KiB
+- An encoded (compressed) error body, or one larger than 64 KiB, is forwarded unchanged. If reading the body fails, the client gets the generic envelope for the status
 
 This allows you to get detailed debugging information from errors while maintaining response consistency for successful requests.
 

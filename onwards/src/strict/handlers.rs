@@ -1745,6 +1745,9 @@ async fn buffer_error_body(body: Body) -> BufferedErrorBody {
             Ok(chunk) => chunk,
             Err(e) => return BufferedErrorBody::Failed(e),
         };
+        if chunk.is_empty() {
+            continue;
+        }
         len += chunk.len();
         chunks.push(chunk);
         if len > MAX_ERROR_BODY {
