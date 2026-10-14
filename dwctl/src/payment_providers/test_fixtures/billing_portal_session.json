@@ -1,0 +1,10 @@
+{
+  "id": "bps_ExamplePortalSession",
+  "object": "billing_portal.session",
+  "configuration": "bpc_ExampleConfiguration",
+  "created": 1780346900,
+  "customer": "cus_ExampleCustomer",
+  "livemode": false,
+  "return_url": "https://console.example.test/cost-management",
+  "url": "https://billing.stripe.test/session/example"
+}

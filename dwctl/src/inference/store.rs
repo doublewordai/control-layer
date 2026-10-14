@@ -654,9 +654,9 @@ pub fn detail_to_chat_completion_object(detail: &fusillade::RequestDetail) -> (u
 /// chunk carrying `finish_reason`. The terminating `data: [DONE]` sentinel
 /// is emitted by the caller, not included here.
 ///
-/// `include_usage` mirrors `stream_options.include_usage`: when set, a
-/// trailing usage-only chunk (empty `choices`, populated `usage`) is
-/// appended, matching OpenAI's behaviour.
+/// `include_usage` mirrors `stream_options.include_usage`: when set, every
+/// chunk carries `usage: null` and a trailing usage-only chunk (empty
+/// `choices`, populated `usage`) is appended, matching OpenAI's behaviour.
 ///
 /// `completion` is expected to be a successful (`object: "chat.completion"`)
 /// body. If it has no `choices` array the result is just the optional usage
@@ -686,6 +686,9 @@ pub fn chat_completion_to_stream_chunks(completion: &serde_json::Value, include_
         });
         if let Some(fp) = system_fingerprint.clone() {
             chunk["system_fingerprint"] = fp;
+        }
+        if include_usage {
+            chunk["usage"] = serde_json::Value::Null;
         }
         chunk
     };
@@ -971,6 +974,13 @@ mod tests {
         let usage_chunk = chunks.last().unwrap();
         assert_eq!(usage_chunk["choices"], serde_json::json!([]));
         assert_eq!(usage_chunk["usage"]["total_tokens"], 7);
+        for chunk in &chunks[..3] {
+            assert_eq!(chunk.get("usage"), Some(&serde_json::Value::Null), "{chunk}");
+        }
+
+        let chunks = chat_completion_to_stream_chunks(&completion, false);
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks.iter().all(|chunk| chunk.get("usage").is_none()));
     }
 
     #[test]

@@ -188,6 +188,7 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
     let resolved_model =
         extract_model_from_request(&headers, &body_bytes).unwrap_or(original_model.clone());
     let sse_buffer_limit = state.sse_buffer_limit;
+    let response_id_override = caller_response_id(&state, &headers);
     let ForwardResult {
         response,
         trusted,
@@ -216,8 +217,14 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
         }
 
         if is_streaming || response_is_sse {
-            sanitize_streaming_chat_response(response, resolved_model, trusted, sse_buffer_limit)
-                .await
+            sanitize_streaming_chat_response(
+                response,
+                resolved_model,
+                trusted,
+                sse_buffer_limit,
+                response_id_override,
+            )
+            .await
         } else {
             sanitize_chat_response(response, resolved_model).await
         }
@@ -308,10 +315,7 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     );
 
     // Extract response ID override from configured header (if any).
-    let response_id_override = state
-        .response_id_header
-        .as_ref()
-        .and_then(|name| crate::response_id::extract_override_id(&headers, name));
+    let response_id_override = caller_response_id(&state, &headers);
 
     // Reject malformed canonical reasoning controls here, with a Responses-shaped
     // error, rather than letting the upstream produce an arbitrary one.
@@ -561,6 +565,7 @@ pub async fn completions_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     let resolved_model =
         extract_model_from_request(&headers, &body_bytes).unwrap_or(original_model);
     let sse_buffer_limit = state.sse_buffer_limit;
+    let response_id_override = caller_response_id(&state, &headers);
     let ForwardResult {
         response,
         trusted,
@@ -584,6 +589,7 @@ pub async fn completions_handler<T: HttpClient + Clone + Send + Sync + 'static>(
                 resolved_model,
                 trusted,
                 sse_buffer_limit,
+                response_id_override,
             )
             .await
         } else {
@@ -684,6 +690,18 @@ fn error_response(status: StatusCode, error_type: &str, message: &str) -> Respon
     });
 
     (status, Json(body)).into_response()
+}
+
+/// The response ID the caller supplied through
+/// [`AppState::response_id_header`](crate::AppState::response_id_header), if any.
+fn caller_response_id<T: HttpClient + Clone + Send + Sync + 'static>(
+    state: &AppState<T>,
+    headers: &HeaderMap,
+) -> Option<String> {
+    state
+        .response_id_header
+        .as_deref()
+        .and_then(|name| crate::response_id::extract_override_id(headers, name))
 }
 
 /// Sanitize non-streaming chat completion response
@@ -805,6 +823,7 @@ async fn sanitize_streaming_chat_response(
     original_model: String,
     trusted: bool,
     sse_buffer_limit: usize,
+    response_id_override: Option<String>,
 ) -> Response {
     // Wrap with SseBufferedStream to ensure we receive complete SSE events (delimited by \n\n).
     // Providers may send partial chunks that split JSON across network packets.
@@ -878,6 +897,9 @@ async fn sanitize_streaming_chat_response(
                             Ok(mut chunk_data) => {
                                 // Rewrite model field
                                 chunk_data.model = original_model.clone();
+                                if let Some(id) = &response_id_override {
+                                    chunk_data.id.clone_from(id);
+                                }
 
                                 // Same reasoning canonicalisation as the
                                 // non-streaming path, applied per delta.
@@ -1030,6 +1052,7 @@ async fn sanitize_streaming_completions_response(
     original_model: String,
     trusted: bool,
     sse_buffer_limit: usize,
+    response_id_override: Option<String>,
 ) -> Response {
     let body_stream =
         http_body_util::BodyExt::into_data_stream(std::mem::take(response.body_mut()));
@@ -1087,6 +1110,9 @@ async fn sanitize_streaming_completions_response(
                         match serde_json::from_value::<CompletionChunk>(raw_chunk) {
                             Ok(mut chunk_data) => {
                                 chunk_data.model = original_model.clone();
+                                if let Some(id) = &response_id_override {
+                                    chunk_data.id.clone_from(id);
+                                }
                                 match serde_json::to_string(&chunk_data) {
                                     Ok(json) => sanitized_lines.push(format!("data: {json}")),
                                     Err(e) => {
@@ -6752,6 +6778,7 @@ mod tests {
             "test-model".to_string(),
             true,
             crate::sse::DEFAULT_SSE_BUFFER_LIMIT,
+            None,
         )
         .await;
         // HTTP status stays 200 — error is in the SSE body
@@ -6778,6 +6805,7 @@ mod tests {
             "test-model".to_string(),
             false,
             crate::sse::DEFAULT_SSE_BUFFER_LIMIT,
+            None,
         )
         .await;
         assert_eq!(result.status(), StatusCode::OK);
@@ -6817,6 +6845,7 @@ mod tests {
             "test-model".to_string(),
             false,
             crate::sse::DEFAULT_SSE_BUFFER_LIMIT,
+            None,
         )
         .await;
         assert_eq!(result.status(), StatusCode::OK);
@@ -6867,6 +6896,7 @@ mod tests {
             "test-model".to_string(),
             true,
             crate::sse::DEFAULT_SSE_BUFFER_LIMIT,
+            None,
         )
         .await;
         assert_eq!(result.status(), StatusCode::OK);
