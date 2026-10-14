@@ -16,6 +16,8 @@
 //! - **outbound_request**: last-mile streaming usage-flag injection
 //!   (`stream_options`, and forcing `stream` on batch traffic) before onwards. The id-scrub lives
 //!   in this module's own request parse (`scrub_request_id_fields`), not here.
+//! - **stream_usage**: the client's `include_usage` choice on streamed chat and
+//!   legacy completions, applied outside request logging.
 //! - **engine**: the multi-step Open Responses orchestration loop and the
 //!   daemon-side request processor.
 
@@ -26,6 +28,7 @@ pub mod middleware;
 pub mod outbound_request;
 pub mod response_store;
 pub mod store;
+pub mod stream_usage;
 pub mod streaming;
 
 pub mod engine;

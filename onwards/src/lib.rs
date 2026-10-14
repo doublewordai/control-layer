@@ -146,12 +146,13 @@ pub struct AppState<T: HttpClient> {
     pub response_transform_fn: Option<ResponseTransformFn>,
     /// Optional public message for upstream 429 responses; local limits are unaffected.
     pub upstream_rate_limit_message: Option<String>,
-    /// Header name whose value overrides the generated `id` in Responses API
-    /// responses. When set, the handler reads this header from the incoming
-    /// request and uses its value (prefixed with `resp_` if not already) as the
-    /// response object's `id` field. This lets callers (e.g. dwctl, fusillade)
-    /// correlate responses with pre-created tracking records without needing to
-    /// patch the response body after the fact.
+    /// Header name whose value overrides the upstream's `id` in Responses,
+    /// chat completions and legacy completions responses. When set, the handler
+    /// reads this header from the incoming request and uses its value (prefixed
+    /// with `resp_` if not already) as the response object's `id` field, and in
+    /// strict mode as the `id` of every streamed chunk. This lets callers (e.g.
+    /// dwctl, fusillade) correlate responses with pre-created tracking records
+    /// without needing to patch the response body after the fact.
     pub response_id_header: Option<String>,
     /// Maximum request body size in bytes, enforced by both routers. Without
     /// this, the strict router's `Json` extractors fall back to Axum's 2 MB
@@ -273,7 +274,7 @@ impl<T: HttpClient> AppState<T> {
         self
     }
 
-    /// Set the header name whose value overrides the Responses API `id` field.
+    /// Set the header name whose value overrides the response `id` field.
     pub fn with_response_id_header(mut self, header: impl Into<String>) -> Self {
         self.response_id_header = Some(header.into());
         self
