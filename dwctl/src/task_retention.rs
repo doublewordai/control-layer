@@ -203,19 +203,6 @@ mod tests {
         id
     }
 
-    /// `pg_locks` predicate matching the granted sweep lock in this test's database.
-    const SWEEP_LOCK_GRANTED: &str = "locktype = 'advisory' AND granted
-        AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
-        AND classid::bigint = ($1::bigint >> 32) AND objid::bigint = ($1::bigint & 4294967295) AND objsubid = 1";
-
-    async fn sweep_lock_held(pool: &PgPool) -> bool {
-        sqlx::query_scalar(&format!("SELECT EXISTS (SELECT 1 FROM pg_locks WHERE {SWEEP_LOCK_GRANTED})"))
-            .bind(SWEEP_LOCK_KEY)
-            .fetch_one(pool)
-            .await
-            .unwrap()
-    }
-
     async fn remaining(pool: &PgPool) -> Vec<uuid::Uuid> {
         sqlx::query_scalar("SELECT id FROM underway.task ORDER BY created_at")
             .fetch_all(pool)
@@ -417,10 +404,14 @@ mod tests {
         })
         .await
         .expect("first batch should finish");
-        // Terminate only this test database's retention lock holder.
-        let terminated: bool = sqlx::query_scalar(&format!(
-            "SELECT pg_terminate_backend(pid) FROM pg_locks WHERE {SWEEP_LOCK_GRANTED}"
-        ))
+        // Terminate only this test database's retention lock holder, waiting for it to exit
+        // so its lock is released before the final sweep below.
+        let terminated: bool = sqlx::query_scalar(
+            "SELECT pg_terminate_backend(pid, 10000) FROM pg_locks
+             WHERE locktype = 'advisory' AND granted
+               AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+               AND classid::bigint = ($1::bigint >> 32) AND objid::bigint = ($1::bigint & 4294967295) AND objsubid = 1",
+        )
         .bind(SWEEP_LOCK_KEY)
         .fetch_one(&pool)
         .await
@@ -428,15 +419,6 @@ mod tests {
         assert!(terminated);
         assert!(sweeper.await.unwrap().is_err());
         assert_eq!(remaining(&pool).await.len(), 2, "no deletes after the lock is lost");
-        // The terminated backend releases the lock as it exits, which can be after the
-        // sweeper has already seen its connection fail.
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while sweep_lock_held(&pool).await {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("terminated backend should release the lock");
         assert_eq!(sweep(&pool, &config, &CancellationToken::new()).await.unwrap(), Some(2));
     }
 
