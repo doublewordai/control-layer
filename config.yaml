@@ -998,7 +998,9 @@ background_services:
     # stale_after_secs. Each replica recomputes the decisions every
     # refresh_interval_secs from the shared hold_stats counters.
     #
-    # Off by default; with it off outbound bodies are unchanged. Rolling back
+    # A held request refused for capacity (503/529) is retried after
+    # max_backoff_ms without spending a retry and without lowering the model's
+    # adaptive concurrency. Off by default; with it off outbound bodies are unchanged. Rolling back
     # is a config change: remove the model or set enabled: false.
     # dispatch_hold:
     #   enabled: false

@@ -297,7 +297,7 @@ impl Request<Failed> {
         retry_attempt: u32,
         config: RetryConfig,
     ) -> std::result::Result<Request<Pending>, Box<Self>> {
-        self.reschedule_retry(retry_attempt, config, true)
+        self.reschedule_retry(retry_attempt, config, true, false)
     }
 
     /// Reschedule this failure without spending a retry attempt.
@@ -313,7 +313,25 @@ impl Request<Failed> {
         retry_attempt: u32,
         config: RetryConfig,
     ) -> std::result::Result<Request<Pending>, Box<Self>> {
-        self.reschedule_retry(retry_attempt, config, false)
+        self.reschedule_retry(retry_attempt, config, false, false)
+    }
+
+    /// Reschedule a held dispatch the backend refused for capacity (503/529)
+    /// without spending a retry attempt, after the maximum backoff.
+    ///
+    /// A held request carries the daemon's hold list, so the backend refuses
+    /// it while the capacity the list allows is full: that is the hold
+    /// working, not a failed attempt. Charging attempts would let a long hold
+    /// exhaust `max_retries` before the request is released. The attempt count
+    /// does not grow, so the exponential ladder would retry at its first rung
+    /// forever; the maximum backoff is used instead. The deadline cut-off is
+    /// the same as [`Self::can_retry`].
+    pub fn can_retry_held_refusal(
+        self,
+        retry_attempt: u32,
+        config: RetryConfig,
+    ) -> std::result::Result<Request<Pending>, Box<Self>> {
+        self.reschedule_retry(retry_attempt, config, false, true)
     }
 
     fn reschedule_retry(
@@ -321,9 +339,12 @@ impl Request<Failed> {
         retry_attempt: u32,
         config: RetryConfig,
         spend_attempt: bool,
+        max_backoff: bool,
     ) -> std::result::Result<Request<Pending>, Box<Self>> {
         // Calculate exponential backoff: backoff_ms * (backoff_factor ^ retry_attempt)
-        let backoff_duration = {
+        let backoff_duration = if max_backoff {
+            config.max_backoff_ms
+        } else {
             let exponential = config
                 .backoff_ms
                 .saturating_mul(config.backoff_factor.saturating_pow(retry_attempt));
@@ -711,6 +732,39 @@ mod background_tests {
             "the refusal must not consume a retry attempt"
         );
         assert!(pending.state.not_before.is_some(), "normal backoff applies");
+    }
+
+    #[test]
+    fn held_refusal_reschedules_at_max_backoff_without_spending_an_attempt() {
+        let request = failed_request_with_reason(
+            FailureReason::RetriableHttpStatus {
+                status: 529,
+                body: r#"{"error":{"type":"overloaded_error"}}"#.to_string(),
+            },
+            2,
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        );
+        let before = chrono::Utc::now();
+        let pending = request
+            .can_retry_held_refusal(2, retry_config())
+            .expect("a held refusal is rescheduled past max_retries");
+        assert_eq!(pending.state.retry_attempt, 2, "no attempt spent");
+        let wait = pending.state.not_before.unwrap() - before;
+        assert!(
+            wait >= chrono::Duration::milliseconds(10),
+            "the maximum backoff, not the first rung: {wait}"
+        );
+
+        // The deadline still stops it.
+        let expired = failed_request_with_reason(
+            FailureReason::RetriableHttpStatus {
+                status: 529,
+                body: String::new(),
+            },
+            0,
+            Some(chrono::Utc::now()),
+        );
+        assert!(expired.can_retry_held_refusal(0, retry_config()).is_err());
     }
 
     #[test]

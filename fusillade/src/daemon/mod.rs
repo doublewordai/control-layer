@@ -162,6 +162,23 @@ fn is_downstream_overload(reason: &FailureReason) -> bool {
     }
 }
 
+/// Whether a failure is a held dispatch refused for capacity: a 503/529 on a
+/// request that carried the daemon's hold list, other than the gateway's own
+/// batch in-flight cap. The capacity the hold allows is full or absent; the
+/// request was not attempted, and the refusal says nothing about how many
+/// released requests the model can take.
+fn is_held_refusal(held: bool, reason: &FailureReason) -> bool {
+    held && is_downstream_overload(reason) && !reason.is_batch_capacity_exceeded()
+}
+
+/// Whether a failure lowers the model's adaptive concurrency. A held refusal
+/// does not: released requests, which are what rescues a model's deadlines,
+/// share the same limit, and cutting it on refusals the hold causes by design
+/// would throttle them exactly when they are needed.
+fn shrinks_adaptive_concurrency(held: bool, reason: &FailureReason) -> bool {
+    is_downstream_overload(reason) && !is_held_refusal(held, reason)
+}
+
 fn emit_concurrency_decrease(model: &str, adjustment: ConcurrencyAdjustment, status: &str) {
     counter!("fusillade_adaptive_concurrency_decreases_total", "model" => model.to_owned())
         .increment(1);
@@ -2897,12 +2914,11 @@ where
                         }
                         Ok(RequestCompletionResult::Failed(failed)) => {
                             tracing::Span::current().record("outcome", "failed");
-                            // A held dispatch refused for capacity (503/529,
-                            // not the gateway's own batch cap): the capacity
-                            // the hold allows is full or absent.
-                            let held_refusal = hold_state.is_some()
-                                && is_downstream_overload(&failed.state.reason)
-                                && !failed.state.reason.is_batch_capacity_exceeded();
+                            // A held dispatch refused for capacity: counted for
+                            // the release decision, requeued without spending
+                            // an attempt, and not an overload signal.
+                            let held_refusal =
+                                is_held_refusal(hold_state.is_some(), &failed.state.reason);
                             if held_refusal && let Some(hold_state) = &hold_state {
                                 hold_state.record_refused(&capacity_model_clone);
                                 counter!(
@@ -2911,7 +2927,7 @@ where
                                 )
                                 .increment(1);
                             }
-                            if is_downstream_overload(&failed.state.reason)
+                            if shrinks_adaptive_concurrency(held_refusal, &failed.state.reason)
                                 && let Some(generation) = control_generation
                                 && let Some(adjustment) = adaptive_concurrency
                                     .record_overload(&capacity_model_clone, generation)
@@ -2932,6 +2948,7 @@ where
                             // a terminal failure.
                             if failed.state.reason.is_retriable()
                                 || failed.state.reason.is_batch_capacity_exceeded()
+                                || held_refusal
                             {
                                 // The gateway's per-model batch in-flight cap
                                 // refuses with a 529 carrying
@@ -2940,7 +2957,12 @@ where
                                 // off (and still counts as downstream overload
                                 // above), but must not spend a retry attempt.
                                 let spends_attempt = !failed.state.reason.is_batch_capacity_exceeded();
-                                let retry_result = if spends_attempt {
+                                let retry_result = if held_refusal {
+                                    failed.can_retry_held_refusal(
+                                        retry_attempt,
+                                        retry_config.clone(),
+                                    )
+                                } else if spends_attempt {
                                     failed.can_retry(retry_attempt, retry_config.clone())
                                 } else {
                                     failed.can_retry_without_spending_attempt(
@@ -6109,6 +6131,34 @@ mod tests {
             assert_eq!(json["nvext"]["routing_constraints"]["tolerations"], preset);
             assert_eq!(json["nvext"]["agent_hints"]["priority"], -5);
         }
+    }
+
+    #[test]
+    fn held_refusals_neither_spend_retries_nor_shrink_concurrency() {
+        let refusal = |status| FailureReason::RetriableHttpStatus {
+            status,
+            body: r#"{"error":{"type":"overloaded_error"}}"#.to_string(),
+        };
+        let capacity_cap = FailureReason::RetriableHttpStatus {
+            status: 529,
+            body: format!(
+                r#"{{"error":{{"code":"{}"}}}}"#,
+                crate::request::BATCH_CAPACITY_EXCEEDED_CODE
+            ),
+        };
+        for status in [503, 529] {
+            assert!(is_held_refusal(true, &refusal(status)));
+            assert!(!shrinks_adaptive_concurrency(true, &refusal(status)));
+            // Released (or never held): exactly as before.
+            assert!(!is_held_refusal(false, &refusal(status)));
+            assert!(shrinks_adaptive_concurrency(false, &refusal(status)));
+        }
+        // The gateway's own batch cap is not the hold: unchanged.
+        assert!(!is_held_refusal(true, &capacity_cap));
+        assert!(shrinks_adaptive_concurrency(true, &capacity_cap));
+        // Other failures are not refusals.
+        assert!(!is_held_refusal(true, &refusal(500)));
+        assert!(!shrinks_adaptive_concurrency(true, &refusal(500)));
     }
 
     #[test]

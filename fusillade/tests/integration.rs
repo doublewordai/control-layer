@@ -3963,3 +3963,155 @@ mod unverified_volume_counts {
         );
     }
 }
+
+/// A 529 on a held dispatch is the hold working, not a failed attempt: with
+/// `max_retries: Some(0)` an ordinary 529 fails the request terminally, but a
+/// held one is requeued (at the maximum backoff) until capacity opens, and is
+/// counted in `hold_stats.refused`. The same 529 on a model that is not held
+/// behaves exactly as before: terminal.
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+async fn held_refusals_do_not_spend_retries(pool: sqlx::PgPool) {
+    let http_client = Arc::new(MockHttpClient::new());
+    let refusal = || {
+        Ok(HttpResponse {
+            status: 529,
+            body: r#"{"error":{"message":"no capacity","type":"overloaded_error"}}"#.to_string(),
+        })
+    };
+    for _ in 0..3 {
+        http_client.add_response("POST /v1/held", refusal());
+    }
+    http_client.add_response(
+        "POST /v1/held",
+        Ok(HttpResponse {
+            status: 200,
+            body: r#"{"result":"served after the hold"}"#.to_string(),
+        }),
+    );
+    http_client.add_response("POST /v1/open", refusal());
+
+    let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
+    model_concurrency_limits.insert("held-model".to_string(), 10);
+    model_concurrency_limits.insert("open-model".to_string(), 10);
+    let config = DaemonConfig {
+        claim_batch_size: 10,
+        claim_interval_ms: 10,
+        model_concurrency_limits,
+        max_retries: Some(0),
+        stop_before_deadline_ms: None,
+        backoff_ms: 5,
+        backoff_factor: 1,
+        max_backoff_ms: 5,
+        status_log_interval_ms: None,
+        heartbeat_interval_ms: 10000,
+        should_retry: Arc::new(default_should_retry),
+        claim_timeout_ms: 60000,
+        processing_timeout_ms: 600000,
+        cancellation_poll_interval_ms: 100,
+        ..Default::default()
+    };
+    let manager = postgres_store(pool.clone(), &config).await;
+
+    let mut ids = Vec::new();
+    for (model, path) in [("held-model", "/v1/held"), ("open-model", "/v1/open")] {
+        let file_id = manager
+            .create_file(
+                format!("{model}-file"),
+                None,
+                vec![fusillade::RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: path.to_string(),
+                    body: r#"{"prompt":"test"}"#.to_string(),
+                    model: model.to_string(),
+                    api_key: "test-key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+        let batch = manager
+            .create_batch(fusillade::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+        ids.push(manager.get_batch_requests(batch.id).await.unwrap()[0].id());
+    }
+    mark_models_live_for_test(manager.as_ref(), &["held-model", "open-model"]).await;
+
+    let shutdown = CancellationToken::new();
+    let handle = Arc::new(
+        PostgresDaemon::new(manager.clone(), http_client.clone(), config).with_dispatch_hold(
+            fusillade::daemon::DispatchHold::new(serde_json::json!([]), ["held-model".to_string()]),
+        ),
+    )
+    .run(shutdown.clone())
+    .unwrap();
+
+    let start = tokio::time::Instant::now();
+    let (mut held_done, mut open_failed) = (false, false);
+    while start.elapsed() < Duration::from_secs(10) && !(held_done && open_failed) {
+        for (index, result) in manager
+            .get_requests(ids.clone())
+            .await
+            .unwrap()
+            .into_iter()
+            .enumerate()
+        {
+            match (index, result.unwrap()) {
+                (0, fusillade::AnyRequest::Completed(_)) => held_done = true,
+                (0, fusillade::AnyRequest::Failed(_)) => {
+                    panic!("a held refusal failed terminally instead of requeueing")
+                }
+                (1, fusillade::AnyRequest::Failed(_)) => open_failed = true,
+                (1, fusillade::AnyRequest::Completed(_)) => {
+                    panic!("the model that is not held must not be retried")
+                }
+                _ => {}
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(held_done, "the held request completed once capacity opened");
+    assert!(
+        open_failed,
+        "an ordinary 529 with no retries left is terminal"
+    );
+    let attempts: i32 = sqlx::query_scalar("SELECT retry_attempt FROM requests WHERE id = $1")
+        .bind(ids[0].0)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(attempts, 0, "the refusals spent no attempt");
+
+    // Every held dispatch carried the hold list; the unheld one did not.
+    for call in http_client.get_calls() {
+        let expected = if call.path == "/v1/held" {
+            serde_json::json!([])
+        } else {
+            serde_json::Value::Null
+        };
+        assert_eq!(call_tolerations(&call), expected, "{}", call.path);
+    }
+
+    // Shutdown flushes this daemon's counters: three refusals and one
+    // completion of the held model.
+    shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
+    let (completed, refused): (i64, i64) = sqlx::query_as(
+        "SELECT COALESCE(SUM(completed), 0)::BIGINT, COALESCE(SUM(refused), 0)::BIGINT
+         FROM hold_stats WHERE model = 'held-model'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((completed, refused), (1, 3));
+}

@@ -2695,6 +2695,10 @@ fn default_batch_metadata_fields_dwctl() -> Vec<String> {
 /// the shared `hold_stats` table and recomputes the decisions every
 /// `refresh_interval_secs`; no leader is involved.
 ///
+/// A held request the backend refuses for capacity (503/529) is retried after
+/// `max_backoff_ms` without spending one of `max_retries`, and does not lower
+/// the model's adaptive concurrency.
+///
 /// Rolling back is a config change: drop a model from `models`, or set
 /// `enabled: false`, and held requests dispatch as stored on their next claim.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
