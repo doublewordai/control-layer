@@ -130,6 +130,16 @@ The chunk wrapper is stripped so the emitted SSE data line begins with `{"error"
 
 This applies to both bare error chunks and chunks that carry completion fields alongside the error. Untrusted upstreams additionally have the embedded `error.code` masked (per the table above) and the prose replaced with a generic message; trusted targets forward the envelope verbatim.
 
+## Streams the upstream breaks off
+
+A stream can also stop without any error from the upstream: the connection drops, an event is malformed or exceeds the SSE buffer limit, or the body ends without `[DONE]`. Strict mode never ends such a stream with a transport error or a quiet close. On chat completions, completions and Responses streams it sends one last event and closes the body normally:
+
+```text
+data: {"error":{"message":"The response stream was interrupted before it finished. Retry the request.","type":"api_error","param":null,"code":502}}
+```
+
+Official OpenAI SDKs raise this as an API error, and the batch reassembler reclassifies it as a retryable `502`. If every choice had already finished, or the final usage had arrived, only the trailer was lost, and the stream ends with `data: [DONE]` instead. Nothing is added after the stream's own `[DONE]`, an embedded error event, or a final Responses event.
+
 ## Supported endpoints
 
 Strict mode currently supports:
