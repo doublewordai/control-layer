@@ -2374,16 +2374,7 @@ pub struct DaemonConfig {
     /// Dynamo's unified priority extension; `i32`, where higher values mean
     /// "more important" at the API layer and Dynamo normalizes per backend).
     /// The injected value is the negated Unix timestamp of the batch SLA
-    /// deadline so earlier deadlines produce larger numbers.
-    ///
-    /// The same flag puts realtime traffic into that deadline order: when it
-    /// is on, every realtime request sent to a `dynamo`-kind endpoint carries
-    /// `-T`, where `T` is its arrival time moved earlier by the `priority` of
-    /// the targets it resolved to (an organisation's per-model deal or a
-    /// serving-class preset), read as seconds of head start. One switch keeps
-    /// the two halves consistent: realtime at `-T` next to batch at the
-    /// default 0 would queue every realtime request behind all batch work.
-    /// Default: false (realtime to dynamo carries priority 0).
+    /// deadline so earlier deadlines produce larger numbers. Default: false.
     #[serde(default)]
     pub inject_deadline_priority: bool,
 

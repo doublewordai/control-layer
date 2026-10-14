@@ -720,63 +720,6 @@ the attempt budget. It does not influence where the inference backend places an
 accepted request; that is the tolerations setting. The API field keeps its name;
 the dashboard labels it "No external-provider fallback (gateway)".
 
-## Scheduling Priority
-
-Requests to an inference endpoint of kind `dynamo` carry a scheduling priority
-at `nvext.agent_hints.priority` (an `i32`; higher is served first). Clients
-cannot set it: dwctl strips any caller-supplied value at ingress.
-
-With deadline ordering, every request has an effective time `T` in Unix
-seconds, the priority is `-T`, and the earliest `T` is served first:
-
-| Traffic | `T` | Enabled by |
-|---------|-----|------------|
-| Batch and flex (dispatched by the batch daemon) | The batch deadline | `background_services.batch_daemon.inject_deadline_priority` |
-| Realtime | Arrival time | `background_services.batch_daemon.inject_deadline_priority` |
-| Realtime with a per-model deal or class priority | Arrival time minus that `priority`, in seconds | `background_services.batch_daemon.inject_deadline_priority` |
-
-Background-tier work has no deadline. The batch daemon sends it with the
-reserved priority `i32::MIN`, below every deadline priority, so it is never
-deadline-ordered and runs only when nothing else is waiting.
-
-One switch, `inject_deadline_priority`, turns on both halves. Realtime at `-T`
-is only meaningful next to batch at `-(deadline)`. Batch sent without a priority
-gets `0`, which would queue every realtime request behind all batch work.
-
-```yaml
-background_services:
-  batch_daemon:
-    inject_deadline_priority: true   # default: false
-```
-
-How the priority is chosen:
-
-- **Only `dynamo` endpoints receive it.** Members of kind `hosted` or
-  `external` never get `nvext.agent_hints.priority`, and members of a named
-  pool whose endpoint does not accept scheduling priority have the whole
-  `nvext` object removed.
-- **Per-model deals.** An organisation's
-  [model overlay](../how-to/organization-model-overlays.md#realtime-priority)
-  can carry explicit `targets: {ttft_ms, itl_ms, priority}` on one model. With
-  deadline ordering, that `priority` is a head start in seconds:
-  `T = arrival - priority`. Compared with a realtime request that has no head
-  start, a request on the deal is served first if the other arrived less than
-  `priority` seconds earlier. The deal applies to the organisation that owns
-  the API key, whenever the request names no serving class.
-- **Serving-class presets.** A resolved class preset's `priority` is read the
-  same way, as a head start in seconds.
-- **Batch daemon traffic is unchanged.** Requests the batch daemon dispatches
-  keep the priority already in their body.
-- **Resumed streams keep their `T`.** A continuation resume leg reuses the
-  priority of the request it continues. Without a deadline priority it falls
-  back to `continuation.priority`.
-- **Saturation.** `-T` is clamped to `i32::MIN + 1 ..= i32::MAX`, keeping
-  `i32::MIN` for background work. After 2038 every realtime `T` maps to
-  `i32::MIN + 1`, so the field must be widened before then.
-
-With `inject_deadline_priority: false`, realtime requests to `dynamo` carry
-priority `0`.
-
 ## Observability
 
 ### Metrics

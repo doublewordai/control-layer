@@ -1,9 +1,5 @@
 import { useState, useEffect } from "react";
-import {
-  useUpdateOrganization,
-  useOrganization,
-  useConfig,
-} from "@/api/control-layer/hooks";
+import { useUpdateOrganization, useOrganization, useConfig } from "@/api/control-layer/hooks";
 import type { Organization, ServingClassName } from "@/api/control-layer/types";
 import { SchedulingTolerations } from "@/components/features/scheduling/SchedulingTolerations";
 import {
@@ -44,9 +40,7 @@ export function EditOrganizationModal({
   const [displayName, setDisplayName] = useState("");
   const [zeroDataRetention, setZeroDataRetention] = useState(false);
   const [grantedClasses, setGrantedClasses] = useState<ServingClassName[]>([]);
-  const [defaultClass, setDefaultClass] = useState<
-    ServingClassName | "standard"
-  >("standard");
+  const [defaultClass, setDefaultClass] = useState<ServingClassName | "standard">("standard");
   const [selfHostedOnly, setSelfHostedOnly] = useState(false);
   const [tolerationPreset, setTolerationPreset] = useState<string | null>(null);
   const updateOrg = useUpdateOrganization();
@@ -56,9 +50,10 @@ export function EditOrganizationModal({
   // unrelated edit. While the modal is open, take the authoritative value from
   // the detail endpoint. Disabled while closed so a mount with no organization
   // does not fire a request for an empty id.
-  const { data: detail } = useOrganization(organization?.id ?? "", {
-    enabled: isOpen && !!organization,
-  });
+  const { data: detail } = useOrganization(
+    organization?.id ?? "",
+    { enabled: isOpen && !!organization },
+  );
 
   useEffect(() => {
     if (isOpen && organization) {
@@ -87,7 +82,8 @@ export function EditOrganizationModal({
     const requestedEmail = email.trim();
     const emailChangeRequested =
       requestedEmail !== "" &&
-      requestedEmail.toLowerCase() !== (organization.email ?? "").toLowerCase();
+      requestedEmail.toLowerCase() !==
+        (organization.email ?? "").toLowerCase();
 
     try {
       const updated = await updateOrg.mutateAsync({
@@ -95,7 +91,9 @@ export function EditOrganizationModal({
         data: {
           display_name: displayName || undefined,
           email: requestedEmail || undefined,
-          ...(canEditZdr ? { zero_data_retention: zeroDataRetention } : {}),
+          ...(canEditZdr
+            ? { zero_data_retention: zeroDataRetention }
+            : {}),
           // Serving settings are platform-manager only server-side; sending
           // them as anyone else fails the whole request with a 403.
           ...(canEditServing
@@ -124,9 +122,7 @@ export function EditOrganizationModal({
       onClose();
     } catch (error) {
       toast.error(
-        error instanceof Error
-          ? error.message
-          : "Failed to update organization",
+        error instanceof Error ? error.message : "Failed to update organization",
       );
     }
   };
@@ -146,6 +142,7 @@ export function EditOrganizationModal({
           id="edit-organization-form"
           onSubmit={handleSubmit}
           className="flex-1 min-h-0 overflow-y-auto px-6 py-4"
+          data-testid="edit-organization-form-body"
         >
           <div className="grid gap-4">
             <div className="grid gap-4 sm:grid-cols-2 sm:items-start">
@@ -238,18 +235,14 @@ export function EditOrganizationModal({
                   <div className="grid gap-1">
                     <Label htmlFor="edit-default-class">Default class</Label>
                     <p className="text-sm text-muted-foreground">
-                      What requests ask for when they name no class. Applies
-                      only where the class is held and the model offers it.
+                      What requests ask for when they name no class. Applies only
+                      where the class is held and the model offers it.
                     </p>
                     <select
                       id="edit-default-class"
                       className="h-9 rounded-md border border-input bg-transparent px-3 text-sm"
                       value={defaultClass}
-                      onChange={(e) =>
-                        setDefaultClass(
-                          e.target.value as ServingClassName | "standard",
-                        )
-                      }
+                      onChange={(e) => setDefaultClass(e.target.value as ServingClassName | "standard")}
                     >
                       <option value="standard">standard</option>
                       <option value="interactive">interactive</option>

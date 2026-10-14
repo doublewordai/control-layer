@@ -12,8 +12,7 @@ use crate::inflight::{BATCH_INFLIGHT_SCOPE, InflightSlot};
 use crate::models::ListModelResponse;
 use crate::rejections::RejectionContext;
 use crate::serving::{
-    self, DeadlinePriority, ProviderKind, RealtimeArrival, RequestedServingClass,
-    ServingClassOutcome, ServingResolution,
+    self, ProviderKind, RequestedServingClass, ServingClassOutcome, ServingResolution,
 };
 use crate::sse::SseBufferedStream;
 use crate::target::{ConcurrencyGuard, RequestClass, RoutingAction, Target};
@@ -556,9 +555,6 @@ pub async fn target_message_handler<T: HttpClient>(
     // it and hands it over as an extension; standalone callers are parsed here.
     // Unknown class suffixes are a 400.
     let suffix_class = req.extensions().get::<RequestedServingClass>().map(|c| c.0);
-    // Deadline-ordered realtime priority: present only when the caller opted
-    // this request in (dwctl, when deadline-ordered priority is on).
-    let realtime_arrival = req.extensions().get::<RealtimeArrival>().copied();
     // DWCTL has already split the body selector once. Do not reinterpret its
     // base alias (e.g. turn nonexistent `model:interactive` into `model`). A
     // Model-Override header is a separate selector and still needs resolution.
@@ -764,7 +760,7 @@ pub async fn target_message_handler<T: HttpClient>(
             )
         })
         .unwrap_or((None, None, None));
-    let (serving_resolution, deadline_priority): (ServingResolution, Option<i32>) = {
+    let serving_resolution: ServingResolution = {
         let account = account_id
             .as_deref()
             .and_then(|id| state.targets.accounts.get(id).map(|r| r.value().clone()));
@@ -811,11 +807,7 @@ pub async fn target_message_handler<T: HttpClient>(
             "resolved" => resolution.resolved.as_str(),
         )
         .increment(1);
-        // The request's deadline priority, fixed once here so every attempt
-        // (and a later resume of this request) carries the same `T`.
-        let deadline_priority =
-            serving::request_deadline_priority(realtime_arrival, key_purpose.as_deref(), &resolution);
-        (resolution, deadline_priority)
+        resolution
     };
 
     // Realtime traffic is everything the batch dispatcher did not stamp with
@@ -1398,11 +1390,9 @@ pub async fn target_message_handler<T: HttpClient>(
         // only serving stack that reads them, as `nvext.router` targets plus
         // (when the preset carries one) `nvext.agent_hints.priority`. Every
         // JSON request to a `dynamo` member also carries a priority (unless
-        // the capability strip above refused scheduling fields for it): the
-        // request's deadline priority when it has one (`RealtimeArrival`,
-        // which already folds in a preset's priority), otherwise whatever the
-        // body or preset set, otherwise realtime's 0, so the dynamo frontend
-        // is never left to pick a value for a missing one.
+        // the capability strip above refused scheduling fields for it): when
+        // neither the body nor the preset sets one, realtime's 0, so the
+        // dynamo frontend is never left to pick a value for a missing one.
         // A priority already present is kept, and targets overwrite rather
         // than remove: this same crate runs again as the hop inside the
         // serving namespace, with no key policy of its own, and must forward
@@ -1417,9 +1407,6 @@ pub async fn target_message_handler<T: HttpClient>(
                             targets.stamp(object);
                         }
                         if !scheduling_fields_refused {
-                            if let Some(priority) = deadline_priority {
-                                serving::stamp_priority(object, priority);
-                            }
                             serving::stamp_default_priority(object);
                         }
                         attempt_body = match serde_json::to_vec(&body) {
@@ -2235,11 +2222,6 @@ pub async fn target_message_handler<T: HttpClient>(
         response
             .extensions_mut()
             .insert::<ServingClassOutcome>(serving_resolution.outcome());
-        if let Some(priority) = deadline_priority {
-            response
-                .extensions_mut()
-                .insert(DeadlinePriority(priority));
-        }
         if let Some(api_key_id) = authenticated_api_key_id {
             response
                 .extensions_mut()

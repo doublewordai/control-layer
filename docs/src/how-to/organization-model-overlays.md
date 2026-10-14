@@ -135,38 +135,6 @@ flex use standard; flex uses the batch `1h` tariff. Prefer putting batch prices 
 the all-class `tariffs` list. `class_pricing.standard` also supports batch;
 interactive/throughput batch prices are rejected by validation.
 
-## Realtime priority
-
-An overlay's explicit `targets` are a bespoke deal on one model: latency targets
-plus a scheduling `priority`. Use them to give an organisation priority on a
-model. The organisation, model alias and values below are fictional:
-
-```yaml
-org: example-organization
-models:
-  - alias: example-model
-    targets: {ttft_ms: 800, itl_ms: 30, priority: 900}
-```
-
-The deal applies whenever the organisation's request names no serving class. It
-is mutually exclusive with `default_class`, and no class grant is needed. The
-`ttft_ms` and `itl_ms` targets are also sent to the serving stack's router, which
-uses them to choose a pool. Set them to what the organisation should be served
-at, not only as a carrier for the priority. Requests resolve as the `custom`
-class, so `class_pricing.custom` prices apply if you declare them.
-
-When the installation sends deadline-ordered realtime priority
-(`background_services.batch_daemon.inject_deadline_priority`; see
-[Scheduling Priority](../reference/configuration.md#scheduling-priority)), the
-`priority` is a head start in seconds. The organisation's realtime requests on
-`example-model` get effective time `T = arrival - 900`. Compared with a realtime
-request that has no head start, one of these requests is served first if the
-other arrived less than 15 minutes earlier. It is also served ahead of batch
-work whose deadline is later than `T`. Batch and flex requests keep their batch
-deadline. Without deadline ordering, the `priority` is sent as an absolute value
-and outranks every batch deadline. Either way it is only sent to endpoints of
-kind `dynamo`.
-
 ## Billing, display and admission
 
 Billing selects the key owner's class-specific price, then its all-class price,

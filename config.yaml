@@ -977,11 +977,7 @@ background_services:
     # `nvext.agent_hints.priority` (NVIDIA Dynamo's unified priority extension;
     # i32, higher = more important; Dynamo normalizes per backend). The value
     # is the negated Unix timestamp of the batch SLA deadline so earlier
-    # deadlines produce larger numbers. When on, realtime requests to dynamo
-    # endpoints join the same order: they carry -T, with T their arrival time
-    # moved earlier by an organisation's per-model deal (overlay `targets`
-    # priority, in seconds) or a serving-class preset's priority. When off,
-    # realtime carries 0.
+    # deadlines produce larger numbers.
     # inject_deadline_priority: false
 
   # Batch completion notifications (emails + webhooks)

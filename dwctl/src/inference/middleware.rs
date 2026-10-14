@@ -32,7 +32,6 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use chrono::{DateTime, Utc};
 use fusillade_arsenal::PostgresRequestManager;
 use sqlx_pool_router::PoolProvider;
 
@@ -84,12 +83,6 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     /// Pending-byte limit for an unfinished SSE event (`onwards.sse_buffer_limit`),
     /// used when applying the client's usage choice to a realtime stream.
     pub sse_buffer_limit: usize,
-    /// Mark realtime requests with their arrival time so onwards sends them to
-    /// dynamo endpoints in the same deadline order as batch work. Follows
-    /// `background_services.batch_daemon.inject_deadline_priority`: realtime
-    /// at `-T` is only safe next to batch at `-(deadline)`. See
-    /// [`realtime_arrival`].
-    pub deadline_priority: bool,
 }
 
 /// Middleware that routes inference requests based on service_tier and background.
@@ -121,11 +114,6 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         }
         return next.run(req).await;
     }
-
-    // The request's arrival time: its effective time `T` for deadline-ordered
-    // priority (see `realtime_arrival`). Taken before any body or database
-    // work so that work does not count against the request.
-    let arrival = realtime_arrival(state.deadline_priority, Utc::now());
 
     // Read and parse the request body
     let (parts, body) = req.into_parts();
@@ -573,7 +561,6 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 background,
                 zdr,
                 requested_class,
-                arrival,
                 parts,
                 body_bytes,
                 next,
@@ -957,7 +944,6 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     background: bool,
     zdr: bool,
     requested_class: Option<onwards::ServingClass>,
-    arrival: Option<onwards::RealtimeArrival>,
     parts: axum::http::request::Parts,
     body_bytes: bytes::Bytes,
     next: Next,
@@ -988,12 +974,6 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     let mut req = Request::from_parts(parts, Body::from(body_bytes));
     if let Some(class) = requested_class {
         req.extensions_mut().insert(onwards::RequestedServingClass(class));
-    }
-    // Deadline-ordered priority: onwards turns the arrival time (and the
-    // organisation's overlay bias on the serving alias) into
-    // `nvext.agent_hints.priority` on dynamo members only.
-    if let Some(arrival) = arrival {
-        req.extensions_mut().insert(arrival);
     }
     req.headers_mut()
         .insert("x-fusillade-request-id", raw_id.parse().expect("response_id is valid header value"));
@@ -1343,18 +1323,6 @@ async fn handle_responses_flex_streaming<P: PoolProvider + Clone + Send + Sync +
     .await
 }
 
-/// The realtime-arrival marker for a request arriving at `now`, or `None`
-/// when deadline-ordered priority is off.
-///
-/// Only realtime traffic reaches onwards with it: flex and background rows are
-/// dispatched later by the fusillade daemon, which re-enters with
-/// `x-fusillade-request-id` (skipping this middleware) and carries its own
-/// `-(deadline)` priority. Onwards ignores the marker on daemon-purpose keys
-/// too, so a batch or continuation leg can never be given a new `T`.
-pub(crate) fn realtime_arrival(enabled: bool, now: DateTime<Utc>) -> Option<onwards::RealtimeArrival> {
-    enabled.then(|| onwards::RealtimeArrival(now.timestamp()))
-}
-
 /// Check if a request should be intercepted by this middleware.
 ///
 /// `/messages` is included because this middleware now runs OUTER to the edge
@@ -1439,9 +1407,7 @@ fn scrub_request_id_fields(value: &mut serde_json::Value) -> bool {
 /// (deadline-derived batch priority) take the `x-fusillade-request-id` early
 /// return, and continuation resume legs enter the stack below it. Everything
 /// parsed here is external traffic, which onwards sends to a dynamo member at
-/// realtime's priority: 0, or `-T` from the request's arrival time when
-/// `background_services.batch_daemon.inject_deadline_priority` is on (see
-/// [`realtime_arrival`]).
+/// realtime's priority 0.
 ///
 /// NOTE: the `x-fusillade-request-id` early return is only safe because the
 /// sso-stack ingress strips all `x-fusillade-*` headers from external requests
@@ -1598,13 +1564,6 @@ mod tests {
         assert!(pinned_tolerations(&cache, Some("sk-pinned")).is_some());
         assert!(pinned_tolerations(&cache, Some("sk-other")).is_none());
         assert!(pinned_tolerations(&cache, None).is_none());
-    }
-
-    #[test]
-    fn realtime_arrival_is_marked_only_when_the_flag_is_on() {
-        let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        assert_eq!(realtime_arrival(false, now), None, "off by default: nothing changes");
-        assert_eq!(realtime_arrival(true, now), Some(onwards::RealtimeArrival(1_700_000_000)));
     }
 
     #[test]
