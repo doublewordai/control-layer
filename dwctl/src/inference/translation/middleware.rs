@@ -90,6 +90,17 @@ pub async fn translation_middleware(State(registry): State<TranslationRegistry>,
             );
             return error_response(translator.as_ref(), StatusCode::BAD_REQUEST, &msg);
         }
+        Err(TranslationError::InvalidParameter { param, message }) => {
+            rejections::record(
+                &parts.extensions,
+                &parts.headers,
+                StatusCode::BAD_REQUEST,
+                "invalid_parameter",
+                Some(param),
+                rejections::model_of(&original_request).as_deref(),
+            );
+            return error_response(translator.as_ref(), StatusCode::BAD_REQUEST, &message);
+        }
         Err(TranslationError::Internal(msg)) => {
             warn!(error = %msg, translator = translator.name(), "edge translation: request translate failed");
             return error_response(translator.as_ref(), StatusCode::INTERNAL_SERVER_ERROR, &msg);
@@ -433,6 +444,11 @@ mod tests {
                 message("developer", "hi"),
                 message("user", "broken"),
                 message("user", "hi"),
+                serde_json::json!({
+                    "model": "claude-x", "max_tokens": 50, "thinking": {"type": "sometimes"},
+                    "messages": [ { "role": "user", "content": "hi" } ]
+                })
+                .to_string(),
             ] {
                 let request = axum::http::Request::post("/messages")
                     .header("content-type", "application/json")
@@ -443,12 +459,13 @@ mod tests {
             statuses
         });
 
-        assert_eq!(statuses, [400, 400, 422, 400]);
-        assert_eq!(lines.len(), 3, "the downstream 400 is not counted: {lines:?}");
+        assert_eq!(statuses, [400, 400, 422, 400, 400]);
+        assert_eq!(lines.len(), 4, "the downstream 400 is not counted: {lines:?}");
         let line = |code: &str| lines.iter().find(|l| l.contains(&format!("code=\"{code}\""))).unwrap();
         assert!(line("invalid_json").contains("model=\"\""));
         assert!(line("schema_mismatch").contains("model=\"claude-x\""));
         assert!(line("response_translation_failed").contains("status=\"422\""));
+        assert!(line("invalid_parameter").contains("model=\"claude-x\""));
     }
 
     /// Non-strict onwards derives the upstream path from the inbound path. This
