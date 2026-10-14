@@ -293,3 +293,35 @@ async fn provider_request_id_recorded_on_span(pool: sqlx::PgPool) {
     let ours = response_id(&echoed).to_string();
     assert_eq!(attr(&root_with_id(&ours), "provider_request_id").as_deref(), Some(ours.as_str()));
 }
+
+/// The analytics row for a request stores the ID the client received.
+#[dwctl_test_macros::test]
+async fn analytics_row_stores_request_id(pool: sqlx::PgPool) {
+    let mock = wiremock::MockServer::start().await;
+    super::mount_chat_completions_mock(&mock).await;
+    let (server, key, _bg) = super::setup_ai_test(pool.clone(), &mock, true).await;
+    let fetch =
+        || sqlx::query_scalar::<_, Option<Uuid>>("SELECT x_request_id FROM http_analytics WHERE model = 'gpt-4o'").fetch_optional(&pool);
+    assert_eq!(fetch().await.unwrap(), None, "no row before the request");
+
+    let response = server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({"model":"gpt-4o", "messages":[{"role":"user","content":"hello"}]}))
+        .await;
+    response.assert_status_ok();
+    let id = response_id(&response);
+
+    // The row is written asynchronously by the analytics projector.
+    let stored = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            if let Some(stored) = fetch().await.unwrap() {
+                return stored;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("analytics row was not written");
+    assert_eq!(stored, Some(id));
+}

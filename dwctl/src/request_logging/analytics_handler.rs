@@ -327,6 +327,7 @@ impl RequestHandler for AnalyticsHandler {
                 batch_request_source,
                 trace_id: request_data.trace_id.clone(),
                 gateway_span_id: request_data.span_id.clone(),
+                x_request_id: extract_header_as_uuid(&request_data, "x-request-id"),
             };
 
             // The first handoff is durable: write the raw record directly to
