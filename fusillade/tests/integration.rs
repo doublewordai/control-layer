@@ -4115,3 +4115,131 @@ async fn held_refusals_do_not_spend_retries(pool: sqlx::PgPool) {
     .unwrap();
     assert_eq!((completed, refused), (1, 3));
 }
+
+/// The dispatch hold composes with account presets. Upload stamps an account's
+/// pinned preset into the stored body (covered by dwctl's `toleration_presets`
+/// tests); these bodies are as upload leaves them. A no-overflow account's
+/// request carries `[]` whether held or due for release, and a prefer-own
+/// account's keeps its list: a preset is never replaced or released. A default
+/// account's request is held with the hold list and, once released, is sent
+/// with no toleration list at all.
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+async fn dispatch_hold_keeps_account_presets_and_releases_default_accounts(pool: sqlx::PgPool) {
+    const PREFER_OWN: &str = r#"[{"key":"example.com/restricted","operator":"Exists"}]"#;
+    let http_client = Arc::new(MockHttpClient::new());
+    for _ in 0..6 {
+        http_client.add_response(
+            "POST /v1/presets",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"ok":true}"#.to_string(),
+            }),
+        );
+    }
+    let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
+    model_concurrency_limits.insert("held-model".to_string(), 10);
+    let config = DaemonConfig {
+        claim_batch_size: 10,
+        claim_interval_ms: 10,
+        model_concurrency_limits,
+        status_log_interval_ms: None,
+        heartbeat_interval_ms: 10000,
+        claim_timeout_ms: 60000,
+        processing_timeout_ms: 600000,
+        cancellation_poll_interval_ms: 100,
+        ..Default::default()
+    };
+    let manager = postgres_store(pool.clone(), &config).await;
+
+    let accounts = [
+        ("no-overflow", Some("[]")),
+        ("prefer-own", Some(PREFER_OWN)),
+        ("default", None),
+    ];
+    for stage in ["held", "released"] {
+        let templates = accounts
+            .iter()
+            .map(|(account, preset)| {
+                let nvext = preset
+                    .map(|list| {
+                        format!(r#","nvext":{{"routing_constraints":{{"tolerations":{list}}}}}"#)
+                    })
+                    .unwrap_or_default();
+                fusillade::RequestTemplateInput {
+                    custom_id: Some(format!("{stage}-{account}")),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/presets".to_string(),
+                    body: format!(
+                        r#"{{"model":"held-model","account":"{account}","stage":"{stage}"{nvext}}}"#
+                    ),
+                    model: "held-model".to_string(),
+                    api_key: "test-key".to_string(),
+                }
+            })
+            .collect();
+        let file_id = manager
+            .create_file(format!("{stage}-file"), None, templates)
+            .await
+            .unwrap();
+        let batch = manager
+            .create_batch(fusillade::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+        if stage == "released" {
+            // Five minutes left of a 24h window: inside the deadline ramp.
+            sqlx::query("UPDATE batches SET created_at = NOW() - INTERVAL '1435 minutes', expires_at = NOW() + INTERVAL '5 minutes' WHERE id = $1")
+                .bind(*batch.id as uuid::Uuid)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    }
+    mark_models_live_for_test(manager.as_ref(), &["held-model"]).await;
+
+    let shutdown = CancellationToken::new();
+    Arc::new(
+        PostgresDaemon::new(manager.clone(), http_client.clone(), config).with_dispatch_hold(
+            fusillade::daemon::DispatchHold::new(serde_json::json!([]), ["held-model".to_string()]),
+        ),
+    )
+    .run(shutdown.clone())
+    .unwrap();
+    wait_for_mock_calls(&http_client, 6).await;
+    shutdown.cancel();
+
+    let mut seen = std::collections::HashMap::new();
+    for call in http_client.get_calls() {
+        let body: serde_json::Value = serde_json::from_str(&call.body).unwrap();
+        seen.insert(
+            format!(
+                "{}-{}",
+                body["stage"].as_str().unwrap(),
+                body["account"].as_str().unwrap()
+            ),
+            call_tolerations(&call),
+        );
+    }
+    let prefer_own: serde_json::Value = serde_json::from_str(PREFER_OWN).unwrap();
+    let expected = [
+        ("held-no-overflow", serde_json::json!([])),
+        ("released-no-overflow", serde_json::json!([])),
+        ("held-prefer-own", prefer_own.clone()),
+        ("released-prefer-own", prefer_own),
+        ("held-default", serde_json::json!([])),
+        ("released-default", serde_json::Value::Null),
+    ];
+    assert_eq!(seen.len(), expected.len(), "{seen:?}");
+    for (key, tolerations) in expected {
+        assert_eq!(seen[key], tolerations, "{key}");
+    }
+}
