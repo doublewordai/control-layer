@@ -210,8 +210,13 @@ See [Authentication](authentication.md) for details.
 Non-strict gateways forward provider-native reasoning fields such as
 `chat_template_kwargs.enable_thinking` unchanged. This permits an internal
 gateway to receive requests already translated by a public gateway. Strict
-mode rejects these fields in favor of canonical reasoning controls. Configured
-`reasoning_effort` translations still apply in either mode.
+mode rejects these fields in favor of canonical reasoning controls, except the
+boolean thinking switches `chat_template_kwargs.enable_thinking` and
+`chat_template_kwargs.thinking`. Strict mode reads `false` as a reasoning
+effort of `none` and `true` as the model's default, and forwards the canonical
+field in their place; a switch that contradicts the effort in the same request
+is refused. Configured `reasoning_effort` translations still apply in either
+mode.
 
 ## Streaming response buffering
 

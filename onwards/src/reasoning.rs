@@ -444,50 +444,43 @@ pub(crate) fn parse_reasoning_request(
     }
 
     let unsupported = match surface {
-        ApiSurface::ChatCompletions => [
-            (
-                "/chat_template_kwargs/thinking",
-                "chat_template_kwargs.thinking",
-            ),
-            (
-                "/chat_template_kwargs/enable_thinking",
-                "chat_template_kwargs.enable_thinking",
-            ),
-            ("/chat_template_kwargs", "chat_template_kwargs"),
-            ("/thinking", "thinking"),
-            ("/thinking_token_budget", "thinking_token_budget"),
-            ("/reasoning", "reasoning"),
-        ]
-        .into_iter()
-        .find(|(pointer, _)| body.pointer(pointer).is_some()),
-        ApiSurface::Responses => [
-            (
-                "/chat_template_kwargs/thinking",
-                "chat_template_kwargs.thinking",
-            ),
-            (
-                "/chat_template_kwargs/enable_thinking",
-                "chat_template_kwargs.enable_thinking",
-            ),
-            ("/chat_template_kwargs", "chat_template_kwargs"),
-            ("/thinking", "thinking"),
-            ("/thinking_token_budget", "thinking_token_budget"),
-            ("/reasoning_effort", "reasoning_effort"),
-        ]
-        .into_iter()
-        .find(|(pointer, _)| body.pointer(pointer).is_some()),
+        ApiSurface::ChatCompletions => unsupported_chat_template_kwarg(body).or_else(|| {
+            [
+                ("/thinking", "thinking"),
+                ("/thinking_token_budget", "thinking_token_budget"),
+                ("/reasoning", "reasoning"),
+            ]
+            .into_iter()
+            .find(|(pointer, _)| body.pointer(pointer).is_some())
+            .map(|(_, param)| param.to_string())
+        }),
+        ApiSurface::Responses => unsupported_chat_template_kwarg(body).or_else(|| {
+            [
+                ("/thinking", "thinking"),
+                ("/thinking_token_budget", "thinking_token_budget"),
+                ("/reasoning_effort", "reasoning_effort"),
+            ]
+            .into_iter()
+            .find(|(pointer, _)| body.pointer(pointer).is_some())
+            .map(|(_, param)| param.to_string())
+        }),
         ApiSurface::Completions | ApiSurface::Other => None,
     };
-    if strict && let Some((_, param)) = unsupported {
+    if strict && let Some(param) = unsupported {
         let canonical = surface
             .parameter_name()
             .expect("reasoning API surfaces have canonical parameters");
         return Err(ReasoningError::new(
             format!("Unsupported parameter '{param}'; use '{canonical}'."),
-            Some(param),
+            Some(&param),
             "unsupported_parameter",
         ));
     }
+    let toggle = if strict {
+        parse_thinking_toggle(body)?
+    } else {
+        None
+    };
 
     if surface == ApiSurface::Responses
         && let Some(reasoning) = body.get("reasoning").filter(|value| !value.is_null())
@@ -503,30 +496,145 @@ pub(crate) fn parse_reasoning_request(
     let Some(canonical_path) = surface.canonical_path() else {
         return Ok(None);
     };
-    let Some(value) = body.pointer(canonical_path) else {
-        return Ok(None);
-    };
-    if value.is_null() {
-        return Ok(None);
-    }
     let param = surface
         .parameter_name()
         .expect("canonical reasoning surfaces have parameter names");
-    let value = value.as_str().ok_or_else(|| {
-        ReasoningError::new(
-            format!("Invalid type for '{param}'. Expected a string."),
-            Some(param),
-            "invalid_type",
-        )
-    })?;
-    let effort = value
-        .parse::<ReasoningEffort>()
-        .map_err(|_| ReasoningError::invalid_effort(value, param))?;
+    let effort = match body
+        .pointer(canonical_path)
+        .filter(|value| !value.is_null())
+    {
+        Some(value) => {
+            let value = value.as_str().ok_or_else(|| {
+                ReasoningError::new(
+                    format!("Invalid type for '{param}'. Expected a string."),
+                    Some(param),
+                    "invalid_type",
+                )
+            })?;
+            Some(
+                value
+                    .parse::<ReasoningEffort>()
+                    .map_err(|_| ReasoningError::invalid_effort(value, param))?,
+            )
+        }
+        None => None,
+    };
+    let (effort, effort_param) = match (effort, toggle) {
+        (Some(effort), Some(toggle)) if toggle.enabled == (effort == ReasoningEffort::None) => {
+            return Err(ReasoningError::new(
+                format!(
+                    "'{}' is {} but '{param}' is '{effort}'. Send one of them, or values that agree.",
+                    toggle.param, toggle.enabled
+                ),
+                Some(toggle.param),
+                "invalid_value",
+            ));
+        }
+        (Some(effort), _) => (effort, param),
+        (None, Some(toggle)) if !toggle.enabled => (ReasoningEffort::None, toggle.param),
+        (None, _) => return Ok(None),
+    };
     Ok(Some(CanonicalReasoningRequest {
         effort,
-        effort_param: param,
+        effort_param,
         output_limit: normalize_output_limit(surface, body),
     }))
+}
+
+/// Boolean chat-template switches that vLLM and SGLang clients send to turn
+/// thinking on or off. Strict mode accepts them as a spelling of the canonical
+/// effort: `false` is `none` and `true` is the model's default.
+const THINKING_TOGGLES: [(&str, &str); 2] = [
+    (
+        "/chat_template_kwargs/enable_thinking",
+        "chat_template_kwargs.enable_thinking",
+    ),
+    (
+        "/chat_template_kwargs/thinking",
+        "chat_template_kwargs.thinking",
+    ),
+];
+
+#[derive(Debug, Clone, Copy)]
+struct ThinkingToggle {
+    enabled: bool,
+    param: &'static str,
+}
+
+fn parse_thinking_toggle(body: &Value) -> Result<Option<ThinkingToggle>, ReasoningError> {
+    let mut found: Option<ThinkingToggle> = None;
+    for (pointer, param) in THINKING_TOGGLES {
+        let Some(value) = body.pointer(pointer).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        let enabled = value.as_bool().ok_or_else(|| {
+            ReasoningError::new(
+                format!("Invalid type for '{param}'. Expected a boolean."),
+                Some(param),
+                "invalid_type",
+            )
+        })?;
+        if let Some(previous) = found
+            && previous.enabled != enabled
+        {
+            return Err(ReasoningError::new(
+                format!(
+                    "'{}' is {} but '{param}' is {enabled}. Send one of them, or values that agree.",
+                    previous.param, previous.enabled
+                ),
+                Some(param),
+                "invalid_value",
+            ));
+        }
+        found.get_or_insert(ThinkingToggle { enabled, param });
+    }
+    Ok(found)
+}
+
+/// The first `chat_template_kwargs` entry strict mode refuses: anything other
+/// than an object holding only the thinking switches.
+fn unsupported_chat_template_kwarg(body: &Value) -> Option<String> {
+    let kwargs = body.get("chat_template_kwargs")?;
+    let Some(kwargs) = kwargs.as_object() else {
+        return Some("chat_template_kwargs".to_string());
+    };
+    kwargs
+        .keys()
+        .find(|key| {
+            !THINKING_TOGGLES
+                .iter()
+                .any(|(pointer, _)| pointer.rsplit('/').next() == Some(key.as_str()))
+        })
+        .map(|key| format!("chat_template_kwargs.{key}"))
+}
+
+/// Replace accepted thinking switches with the canonical effort field, so
+/// provider translations are the only writers of provider-native fields.
+/// Call only on a body [`validate_canonical_reasoning`] accepted. Returns
+/// whether the body changed.
+pub fn canonicalize_thinking_toggle(path: &str, body: &mut Value) -> bool {
+    let surface = ApiSurface::from_path(path);
+    let Some(canonical_path) = surface.canonical_path() else {
+        return false;
+    };
+    let mut disabled = false;
+    let mut changed = false;
+    for (pointer, _) in THINKING_TOGGLES {
+        if let Some(value) = body.pointer(pointer) {
+            disabled |= value == &Value::Bool(false);
+            remove_json_pointer(body, pointer);
+            changed = true;
+        }
+    }
+    if disabled && body.pointer(canonical_path).is_none_or(Value::is_null) {
+        set_json_pointer(
+            body,
+            canonical_path,
+            Value::String(ReasoningEffort::None.as_str().to_string()),
+        )
+        .expect("canonical reasoning paths are valid object paths");
+    }
+    changed
 }
 
 fn normalize_output_limit(surface: ApiSurface, body: &Value) -> OutputLimit {
@@ -1193,18 +1301,172 @@ mod tests {
     }
 
     #[test]
-    fn rejects_provider_native_chat_thinking_controls() {
+    fn thinking_switch_off_is_effort_none_on_both_surfaces() {
+        for (path, body) in [
+            (
+                "/chat/completions",
+                json!({"model": "model", "messages": [], "chat_template_kwargs": {"enable_thinking": false}}),
+            ),
+            (
+                "/responses",
+                json!({"model": "model", "input": "Hello", "chat_template_kwargs": {"thinking": false}}),
+            ),
+        ] {
+            let request = validate_canonical_reasoning(path, &body).unwrap().unwrap();
+
+            assert_eq!(request.effort(), ReasoningEffort::None, "{path}");
+        }
+    }
+
+    #[test]
+    fn thinking_switch_on_leaves_the_model_default() {
+        let body = json!({
+            "model": "model",
+            "messages": [],
+            "chat_template_kwargs": {"enable_thinking": true}
+        });
+
+        assert_eq!(
+            validate_canonical_reasoning("/chat/completions", &body),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn thinking_switch_agreeing_with_the_effort_is_accepted() {
+        for (switch, effort) in [(false, "none"), (true, "high")] {
+            let body = json!({
+                "model": "model",
+                "messages": [],
+                "reasoning_effort": effort,
+                "chat_template_kwargs": {"thinking": switch}
+            });
+
+            let request = validate_canonical_reasoning("/chat/completions", &body)
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(request.effort().as_str(), effort);
+            assert_eq!(request.effort_param(), "reasoning_effort");
+        }
+    }
+
+    #[test]
+    fn rejects_thinking_switch_that_conflicts_with_the_effort() {
+        for (switch, effort) in [(false, "high"), (true, "none")] {
+            let body = json!({
+                "model": "model",
+                "messages": [],
+                "reasoning_effort": effort,
+                "chat_template_kwargs": {"enable_thinking": switch}
+            });
+
+            let error = validate_canonical_reasoning("/chat/completions", &body).unwrap_err();
+
+            assert_eq!(error.param(), Some("chat_template_kwargs.enable_thinking"));
+            assert_eq!(error.code(), "invalid_value");
+            assert!(error.message().contains("reasoning_effort"));
+        }
+    }
+
+    #[test]
+    fn rejects_thinking_switches_that_disagree() {
+        let body = json!({
+            "model": "model",
+            "messages": [],
+            "chat_template_kwargs": {"enable_thinking": true, "thinking": false}
+        });
+
+        let error = validate_canonical_reasoning("/chat/completions", &body).unwrap_err();
+
+        assert_eq!(error.param(), Some("chat_template_kwargs.thinking"));
+        assert_eq!(error.code(), "invalid_value");
+    }
+
+    #[test]
+    fn rejects_non_boolean_thinking_switch() {
+        let body = json!({
+            "model": "model",
+            "messages": [],
+            "chat_template_kwargs": {"enable_thinking": "false"}
+        });
+
+        let error = validate_canonical_reasoning("/chat/completions", &body).unwrap_err();
+
+        assert_eq!(error.param(), Some("chat_template_kwargs.enable_thinking"));
+        assert_eq!(error.code(), "invalid_type");
+    }
+
+    #[test]
+    fn rejects_other_chat_template_kwargs() {
+        for (kwargs, param) in [
+            (
+                json!({"enable_thinking": false, "thinking_mode": "chat"}),
+                "chat_template_kwargs.thinking_mode",
+            ),
+            (json!("enable_thinking"), "chat_template_kwargs"),
+        ] {
+            let body = json!({"model": "model", "messages": [], "chat_template_kwargs": kwargs});
+
+            let error = validate_canonical_reasoning("/chat/completions", &body).unwrap_err();
+
+            assert_eq!(error.param(), Some(param));
+            assert_eq!(error.code(), "unsupported_parameter");
+            assert!(error.message().contains("reasoning_effort"));
+        }
+    }
+
+    #[test]
+    fn non_strict_parsing_ignores_thinking_switches() {
         let body = json!({
             "model": "model",
             "messages": [],
             "chat_template_kwargs": {"thinking": false}
         });
 
-        let error = validate_canonical_reasoning("/chat/completions", &body).unwrap_err();
+        assert_eq!(
+            parse_reasoning_request("/chat/completions", &body, false),
+            Ok(None)
+        );
+    }
 
-        assert_eq!(error.param(), Some("chat_template_kwargs.thinking"));
-        assert_eq!(error.code(), "unsupported_parameter");
-        assert!(error.message().contains("reasoning_effort"));
+    #[test]
+    fn canonicalizes_thinking_switches_into_the_effort_field() {
+        for (path, mut body, expected) in [
+            (
+                "/chat/completions",
+                json!({"messages": [], "chat_template_kwargs": {"enable_thinking": false}}),
+                json!({"messages": [], "reasoning_effort": "none"}),
+            ),
+            (
+                "/chat/completions",
+                json!({"messages": [], "chat_template_kwargs": {"thinking": true}}),
+                json!({"messages": []}),
+            ),
+            (
+                "/chat/completions",
+                json!({"reasoning_effort": "low", "chat_template_kwargs": {"thinking": true}}),
+                json!({"reasoning_effort": "low"}),
+            ),
+            (
+                "/responses",
+                json!({"input": "Hello", "chat_template_kwargs": {"enable_thinking": false}}),
+                json!({"input": "Hello", "reasoning": {"effort": "none"}}),
+            ),
+        ] {
+            assert!(canonicalize_thinking_toggle(path, &mut body));
+            assert_eq!(body, expected, "{path}");
+        }
+
+        let mut untouched = json!({"messages": [], "reasoning_effort": "high"});
+        assert!(!canonicalize_thinking_toggle(
+            "/chat/completions",
+            &mut untouched
+        ));
+        assert_eq!(
+            untouched,
+            json!({"messages": [], "reasoning_effort": "high"})
+        );
     }
 
     #[test]

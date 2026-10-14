@@ -820,7 +820,7 @@ pub async fn target_message_handler<T: HttpClient>(
     // batch backlog retrying against the same model.
     let traffic = if is_realtime { "realtime" } else { "dispatched" };
 
-    let body_json = if !body_bytes.is_empty()
+    let mut body_json = if !body_bytes.is_empty()
         && crate::reasoning::uses_reasoning_contract(&canonical_request_path)
     {
         Some(serde_json::from_slice::<serde_json::Value>(&body_bytes).map_err(|_| {
@@ -891,6 +891,18 @@ pub async fn target_message_handler<T: HttpClient>(
         ).map_err(|error| OnwardsErrorResponse::reasoning(&error))?
     } else {
         None
+    };
+    let body_bytes = match body_json.as_mut() {
+        Some(body) if state.targets.strict_mode => {
+            if crate::reasoning::canonicalize_thinking_toggle(&canonical_request_path, body) {
+                axum::body::Bytes::from(
+                    serde_json::to_vec(body).map_err(|_| OnwardsErrorResponse::internal())?,
+                )
+            } else {
+                body_bytes
+            }
+        }
+        _ => body_bytes,
     };
     // Not needed past here; don't hold the parsed body while the upstream works.
     drop(body_json);

@@ -135,7 +135,7 @@ async fn handler_rejections_are_recorded_on_the_request_span() {
     );
     assert_eq!(
         attribute(request, "onwards.rejection.param"),
-        Some(AttributeValue::from("chat_template_kwargs"))
+        Some(AttributeValue::from("chat_template_kwargs.custom_flag"))
     );
     assert_caller(request);
 }

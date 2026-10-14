@@ -165,7 +165,7 @@ async fn params_are_counted_before_reasoning_validation_refuses_the_request() {
     response.assert_status(StatusCode::BAD_REQUEST);
     assert_eq!(
         response.json::<Value>()["error"]["param"],
-        "chat_template_kwargs"
+        "chat_template_kwargs.custom_flag"
     );
     assert!(mock.get_requests().is_empty());
     assert_eq!(count(alias, "logprobs", "logged"), Some(1.0));

@@ -10,8 +10,8 @@
 //! proxy worker refuses (`UNSUPPORTED_FIELDS`, `NEUTRAL_VALUES` and
 //! `UNSUPPORTED_BOOLEANS` in dynamo's `lib/spillover/proxy-core/src/chat_request.rs`),
 //! so the gateway sees the same requests the proxy would refuse. Keep the two
-//! lists in step. `chat_template_kwargs` is left out: strict mode refuses it
-//! outright in favour of `reasoning_effort`.
+//! lists in step. `chat_template_kwargs` is left out: strict mode translates its
+//! thinking switches to `reasoning_effort` and refuses any other key.
 
 use serde_json::Value;
 

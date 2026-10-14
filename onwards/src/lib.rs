@@ -5127,6 +5127,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_strict_mode_translates_thinking_switch_for_each_provider() {
+        let lowest_level = serde_json::from_value(json!({
+            "chat_completions": {
+                "unsupported_efforts": [],
+                "writes": [{
+                    "target_path": "/reasoning_effort",
+                    "values": {
+                        "none": "low", "minimal": "low", "low": "low", "medium": "medium",
+                        "high": "high", "xhigh": "high", "max": "high"
+                    }
+                }]
+            }
+        }))
+        .unwrap();
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "no-off-switch".to_string(),
+            pool(
+                Target::builder()
+                    .url("https://engine.example.com".parse().unwrap())
+                    .reasoning_translation(lowest_level)
+                    .build(),
+            ),
+        );
+        targets_map.insert(
+            "untranslated".to_string(),
+            pool(
+                Target::builder()
+                    .url("https://engine.example.com".parse().unwrap())
+                    .build(),
+            ),
+        );
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+        let mock_client = MockHttpClient::new(StatusCode::OK, "{}");
+        let server = TestServer::new(build_router(AppState::with_client(
+            targets,
+            mock_client.clone(),
+        )))
+        .unwrap();
+
+        for (model, expected_effort) in [("no-off-switch", "low"), ("untranslated", "none")] {
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "chat_template_kwargs": {"enable_thinking": false}
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), StatusCode::OK, "{model}");
+            let requests = mock_client.get_requests();
+            let upstream_body: serde_json::Value =
+                serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+            assert_eq!(
+                upstream_body["reasoning_effort"],
+                json!(expected_effort),
+                "{model}"
+            );
+            assert!(
+                upstream_body.get("chat_template_kwargs").is_none(),
+                "{model}"
+            );
+        }
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "no-off-switch",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "reasoning_effort": "high",
+                "chat_template_kwargs": {"enable_thinking": false}
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(mock_client.get_requests().len(), 2);
+    }
+
+    #[tokio::test]
     async fn test_missing_output_limit_returns_422_before_upstream_request() {
         let reasoning_translation = serde_json::from_value(json!({
             "chat_completions": {

@@ -149,7 +149,7 @@ Requests to unsupported endpoints will return `404 Not Found` when strict mode i
 
 ## Parameters not every backend supports
 
-Some chat parameters are engine extensions or options that not every backend behind a model can honour, for example `n` greater than 1, `logprobs`, `guided_json` or `min_tokens`. The full list, with the values that count as absent (such as `n: 1`, `logprobs: false` or `top_logprobs: 0`), is the catalog in `onwards::unsupported_params`. `chat_template_kwargs` isn't in it: strict mode refuses that field outright and points to `reasoning_effort` instead.
+Some chat parameters are engine extensions or options that not every backend behind a model can honour, for example `n` greater than 1, `logprobs`, `guided_json` or `min_tokens`. The full list, with the values that count as absent (such as `n: 1`, `logprobs: false` or `top_logprobs: 0`), is the catalog in `onwards::unsupported_params`. `chat_template_kwargs` isn't in it: strict mode accepts only its boolean thinking switches, `enable_thinking` and `thinking`, which it translates to `reasoning_effort`, and refuses any other key in favour of `reasoning_effort`.
 
 Strict mode checks every Chat Completions request against that list after schema validation and before reasoning validation:
 
