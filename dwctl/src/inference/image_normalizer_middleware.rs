@@ -149,14 +149,6 @@ pub async fn image_normalizer_middleware(
         Ok(b) => b,
         Err(e) => {
             warn!(error = %e, "Failed to read request body in image_normalizer middleware");
-            rejections::record(
-                request.extensions(),
-                request.headers(),
-                StatusCode::BAD_REQUEST,
-                "body_read_failed",
-                None,
-                None,
-            );
             // Match the structured error shape used elsewhere so
             // OpenAI-compatible clients can parse it.
             let body = serde_json::json!({
@@ -166,7 +158,8 @@ pub async fn image_normalizer_middleware(
                     "code": "body_read_failed",
                 }
             });
-            return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
+            let response = (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
+            return rejections::refuse(&request, response, "body_read_failed", None, None);
         }
     };
 
@@ -347,8 +340,7 @@ pub async fn image_normalizer_middleware(
         Ok(n) => n,
         Err(e) => {
             warn!(error = %e, "image normalisation failed");
-            record_normalize_error(request.extensions(), request.headers(), &e, body_value["model"].as_str());
-            return normalize_error_response(e);
+            return refuse_normalize_error(&request, e, body_value["model"].as_str());
         }
     };
 
@@ -497,16 +489,15 @@ pub(crate) fn normalize_error_response(err: NormalizeError) -> Response {
     (status, axum::Json(body)).into_response()
 }
 
-/// Counts `err` as a rejection when it is the client's to fix (a 4xx).
-pub(crate) fn record_normalize_error(
-    extensions: &axum::http::Extensions,
-    headers: &axum::http::HeaderMap,
-    err: &NormalizeError,
-    model: Option<&str>,
-) {
-    let (status, code) = normalize_error_status(err);
+/// [`normalize_error_response`], counted as a rejection when it is the
+/// client's to fix (a 4xx).
+pub(crate) fn refuse_normalize_error<'a>(origin: impl Into<rejections::Origin<'a>>, err: NormalizeError, model: Option<&str>) -> Response {
+    let (status, code) = normalize_error_status(&err);
+    let response = normalize_error_response(err);
     if status.is_client_error() {
-        rejections::record(extensions, headers, status, code, Some("image_url"), model);
+        rejections::refuse(origin, response, code, Some("image_url"), model)
+    } else {
+        response
     }
 }
 
@@ -738,10 +729,7 @@ mod tests {
     fn counts_refused_images_but_not_failures_on_our_side() {
         use crate::inference::rejections::{self, test_support};
         let (lines, status) = test_support::rejections(async {
-            let router = build_router(state_for_tests()).layer(middleware::from_fn_with_state(
-                test_support::recorder("vision"),
-                rejections::attach_recorder,
-            ));
+            let router = build_router(state_for_tests()).layer(test_support::layer("vision"));
             let body = json!({
                 "model": "vision",
                 "messages": [{"role": "user", "content": [{
@@ -751,10 +739,11 @@ mod tests {
             });
             let (status, _) = post_json(router, "/chat/completions", body).await;
 
-            let mut extensions = axum::http::Extensions::new();
-            extensions.insert(test_support::recorder("vision"));
+            let recorder = test_support::recorder("vision");
             let headers = axum::http::HeaderMap::new();
-            record_normalize_error(&extensions, &headers, &NormalizeError::StoreFailed("down".into()), Some("vision"));
+            let origin = rejections::Origin::new(Some(&recorder), &headers, "/chat/completions");
+            let unavailable = refuse_normalize_error(origin, NormalizeError::StoreFailed("down".into()), Some("vision"));
+            assert!(unavailable.extensions().get::<rejections::RejectionCode>().is_none());
             status
         });
         assert_eq!(status, StatusCode::BAD_REQUEST);

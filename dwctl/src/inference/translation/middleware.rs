@@ -48,15 +48,8 @@ pub async fn translation_middleware(State(registry): State<TranslationRegistry>,
         Ok(b) => b,
         Err(e) => {
             warn!(error = %e, "edge translation: request body too large or unreadable");
-            rejections::record(
-                &parts.extensions,
-                &parts.headers,
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "request_too_large",
-                None,
-                None,
-            );
-            return error_response(translator.as_ref(), StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
+            let response = error_response(translator.as_ref(), StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
+            return rejections::refuse(&parts, response, "request_too_large", None, None);
         }
     };
 
@@ -80,26 +73,15 @@ pub async fn translation_middleware(State(registry): State<TranslationRegistry>,
     let translated = match translator.translate_request(&parts, body_bytes) {
         Ok(t) => t,
         Err(TranslationError::BadRequest(msg)) => {
-            rejections::record(
-                &parts.extensions,
-                &parts.headers,
-                StatusCode::BAD_REQUEST,
-                rejections::body_error_code(&original_request),
-                None,
-                rejections::model_of(&original_request).as_deref(),
-            );
-            return error_response(translator.as_ref(), StatusCode::BAD_REQUEST, &msg);
+            let response = error_response(translator.as_ref(), StatusCode::BAD_REQUEST, &msg);
+            let code = rejections::body_error_code(&original_request);
+            let model = rejections::model_of(&original_request);
+            return rejections::refuse(&parts, response, code, None, model.as_deref());
         }
         Err(TranslationError::InvalidParameter { param, message }) => {
-            rejections::record(
-                &parts.extensions,
-                &parts.headers,
-                StatusCode::BAD_REQUEST,
-                "invalid_parameter",
-                Some(param),
-                rejections::model_of(&original_request).as_deref(),
-            );
-            return error_response(translator.as_ref(), StatusCode::BAD_REQUEST, &message);
+            let response = error_response(translator.as_ref(), StatusCode::BAD_REQUEST, &message);
+            let model = rejections::model_of(&original_request);
+            return rejections::refuse(&parts, response, "invalid_parameter", Some(param), model.as_deref());
         }
         Err(TranslationError::Internal(msg)) => {
             warn!(error = %msg, translator = translator.name(), "edge translation: request translate failed");
@@ -109,7 +91,7 @@ pub async fn translation_middleware(State(registry): State<TranslationRegistry>,
 
     // The route already matched; we swap the body/headers and normalise the path
     // so downstream code reads it as chat completions (not a re-route).
-    let rejection = rejections::Scope::of(&parts.extensions, &parts.headers);
+    let rejection = rejections::Scope::of(&parts);
     parts.uri = translated.uri;
     parts.headers = translated.headers;
     let downstream_req = Request::from_parts(parts, Body::from(translated.body));
@@ -131,7 +113,7 @@ async fn translate_response_back(
     translator: &dyn ProtocolTranslator,
     request: &Bytes,
     response_id: Option<&str>,
-    rejection: Option<rejections::Scope>,
+    rejection: rejections::Scope,
     response: Response,
 ) -> Response {
     let (parts, body) = response.into_parts();
@@ -166,21 +148,15 @@ async fn translate_response_back(
             Ok(new_body) => json_response(status, new_body),
             Err(e) => {
                 warn!(error = %e, translator = translator.name(), "edge translation: response translate failed");
-                if let Some(rejection) = rejection {
-                    rejection.record(
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        "response_translation_failed",
-                        None,
-                        rejections::model_of(request).as_deref(),
-                    );
-                }
                 // Deliberately NOT a 5xx: the upstream succeeded, and the same
                 // body will fail translation identically on every attempt, so
                 // this must map to a status fusillade classifies as
                 // non-retriable (it retries >=500, 429, 408 and 404) or a
                 // daemon-dispatched request retry-loops on it forever
                 // (COR-630).
-                error_response(translator, StatusCode::UNPROCESSABLE_ENTITY, "response translation failed")
+                let response = error_response(translator, StatusCode::UNPROCESSABLE_ENTITY, "response translation failed");
+                let model = rejections::model_of(request);
+                rejection.refuse(response, "response_translation_failed", None, model.as_deref())
             }
         }
     } else {
@@ -409,7 +385,7 @@ mod tests {
     /// it only reshapes is not.
     #[test]
     fn counts_its_own_refusals_only() {
-        use crate::inference::rejections::{self, test_support};
+        use crate::inference::rejections::test_support;
         use tower::ServiceExt;
 
         async fn handler(req: Request) -> Response {
@@ -425,10 +401,7 @@ mod tests {
             Router::new()
                 .route("/messages", post(handler))
                 .layer(axum::middleware::from_fn_with_state(registry, translation_middleware))
-                .layer(axum::middleware::from_fn_with_state(
-                    test_support::recorder("claude-x"),
-                    rejections::attach_recorder,
-                ))
+                .layer(test_support::layer("claude-x"))
         };
         let message = |role: &str, content: &str| {
             serde_json::json!({

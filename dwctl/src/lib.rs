@@ -2612,10 +2612,9 @@ pub async fn build_router(
 
     // Outermost, so every layer above can count the requests it refuses
     // alongside onwards' own (`onwards_rejections_total`).
-    let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
-        crate::inference::rejections::Recorder::new(state.onwards_targets.clone().unwrap_or_default()),
-        crate::inference::rejections::attach_recorder,
-    ));
+    let onwards_router = onwards_router.layer(axum::Extension(crate::inference::rejections::Recorder::new(
+        state.onwards_targets.clone().unwrap_or_default(),
+    )));
 
     // Build the app with admin API and onwards proxy nested. serve the (restricted) openai spec.
     // Strict mode requires different nesting:
@@ -2855,7 +2854,14 @@ pub async fn build_router(
                     span.set_attribute("otel.status_code", "ERROR");
                     span.set_attribute("error.type", status.to_string());
                 } else if status >= 400 {
-                    span.set_attribute("error.type", status.to_string());
+                    // A dwctl layer that refused the request reports its
+                    // rejection code instead of the bare status, and has
+                    // already set it when it recorded on this span.
+                    match response.extensions().get::<crate::inference::rejections::RejectionCode>() {
+                        Some(rejection) if rejection.recorded_on(span) => {}
+                        Some(rejection) => span.set_attribute("error.type", rejection.code()),
+                        None => span.set_attribute("error.type", status.to_string()),
+                    }
                 }
                 tracing::info!(
                     http.response.status_code = status,

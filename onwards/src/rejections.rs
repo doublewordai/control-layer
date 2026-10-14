@@ -47,12 +47,18 @@ impl RejectionContext {
     /// The caller, from the request's bearer token and `targets`' key labels.
     /// `dispatched` marks traffic sent by a batch dispatcher rather than a
     /// client waiting for the answer.
-    pub fn new(targets: &Targets, headers: &HeaderMap, dispatched: bool) -> Self {
-        let labels = headers
+    pub(crate) fn new(targets: &Targets, headers: &HeaderMap, dispatched: bool) -> Self {
+        let api_key = headers
             .get("authorization")
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .and_then(|token| targets.key_labels.get(token));
+            .and_then(|value| value.strip_prefix("Bearer "));
+        Self::for_api_key(targets, api_key, dispatched)
+    }
+
+    /// As [`new`](Self::new), for a gateway that has already resolved the
+    /// request's API key under its own protocol's rules.
+    pub fn for_api_key(targets: &Targets, api_key: Option<&str>, dispatched: bool) -> Self {
+        let labels = api_key.and_then(|key| targets.key_labels.get(key));
         Self {
             model: None,
             account: labels

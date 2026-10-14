@@ -35,7 +35,7 @@ use axum::{
 use fusillade_arsenal::PostgresRequestManager;
 use sqlx_pool_router::PoolProvider;
 
-use super::image_normalizer_middleware::{normalize_error_response, normalize_value_to_tokens, record_normalize_error};
+use super::image_normalizer_middleware::{normalize_error_response, normalize_value_to_tokens, refuse_normalize_error};
 use super::rejections;
 use super::store::{self as response_store, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
 use super::streaming::{ReplayFrame, flex_stream_response};
@@ -96,17 +96,12 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // Routing, cache identity and billing must all use the body's model.
     // Model-Override is a standalone Onwards feature, not a Control Layer API.
     if req.headers().contains_key("model-override") {
-        return refuse(
-            req.extensions(),
-            req.headers(),
+        return invalid_request(
+            &req,
             None,
-            invalid_request_response(
-                "Model-Override is not supported; select the model in the request body",
-                "unsupported_header",
-                "Model-Override",
-            ),
+            "Model-Override is not supported; select the model in the request body",
             "unsupported_header",
-            Some("Model-Override"),
+            "Model-Override",
         );
     }
 
@@ -130,7 +125,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         Err(e) => {
             tracing::error!(error = %e, "Failed to read request body in inference middleware");
             let response = Response::builder().status(StatusCode::BAD_REQUEST).body(Body::empty()).unwrap();
-            return refuse(&parts.extensions, &parts.headers, None, response, "body_read_failed", None);
+            return rejections::refuse(&parts, response, "body_read_failed", None, None);
         }
     };
 
@@ -139,7 +134,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         Err(e) => {
             tracing::error!(error = %e, "Failed to parse request body in inference middleware");
             let response = Response::builder().status(StatusCode::BAD_REQUEST).body(Body::empty()).unwrap();
-            return refuse(&parts.extensions, &parts.headers, None, response, "invalid_json", None);
+            return rejections::refuse(&parts, response, "invalid_json", None, None);
         }
     };
 
@@ -204,14 +199,8 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                         .to_string(),
                 ))
                 .unwrap();
-            return refuse(
-                &parts.extensions,
-                &parts.headers,
-                request_value["model"].as_str(),
-                response,
-                "invalid_serving_class",
-                Some("model"),
-            );
+            let model = request_value["model"].as_str();
+            return rejections::refuse(&parts, response, "invalid_serving_class", Some("model"), model);
         }
     };
 
@@ -228,6 +217,10 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
 
     let model = request_value["model"].as_str().unwrap_or("unknown").to_string();
     let model = model.as_str();
+    // Refusals from here on, attributed to this request and its model.
+    let refuse =
+        |response: Response, code: &'static str, param: Option<&str>| rejections::refuse(&parts, response, code, param, Some(model));
+    let invalid = |message: &str, code: &'static str, param: &'static str| invalid_request(&parts, Some(model), message, code, param);
     // The router is nested at /ai/v1, so the path here is e.g. "/responses".
     // Prepend /v1 for the full API path used by the loopback and fusillade templates.
     let endpoint = format!("/v1{nested_path}");
@@ -251,26 +244,21 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             .disabled_modalities(key)
             .contains(crate::modalities::Modality::Realtime)
     {
-        let response = modality_disabled_response(crate::modalities::Modality::Realtime);
-        return refuse(&parts.extensions, &parts.headers, Some(model), response, "modality_disabled", None);
+        return refuse(
+            modality_disabled_response(crate::modalities::Modality::Realtime),
+            "modality_disabled",
+            None,
+        );
     }
     if is_responses_api {
         if let Some(include) = request_value.get("include")
             && !include.is_null()
         {
             let Ok(_) = serde_json::from_value::<Vec<crate::inference::translation::responses::types::Include>>(include.clone()) else {
-                let response = invalid_request_response(
+                return invalid(
                     "include must contain only supported Responses API projection values",
                     "invalid_parameter",
                     "include",
-                );
-                return refuse(
-                    &parts.extensions,
-                    &parts.headers,
-                    Some(model),
-                    response,
-                    "invalid_parameter",
-                    Some("include"),
                 );
             };
             // Accept reasoning.encrypted_content as a compatibility no-op. The
@@ -288,34 +276,18 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 })
             });
         if has_encrypted_reasoning_replay {
-            let response = invalid_request_response(
+            return invalid(
                 "encrypted reasoning item replay is not supported by this Responses API implementation",
                 "unsupported_parameter",
                 "input",
             );
-            return refuse(
-                &parts.extensions,
-                &parts.headers,
-                Some(model),
-                response,
-                "unsupported_parameter",
-                Some("input"),
-            );
         }
     }
     if is_responses_api && zdr && request_value.get("previous_response_id").is_some_and(|id| !id.is_null()) {
-        let response = invalid_request_response(
+        return invalid(
             "previous_response_id is not supported when zero-data retention is enabled",
             "zdr_state_not_supported",
             "previous_response_id",
-        );
-        return refuse(
-            &parts.extensions,
-            &parts.headers,
-            Some(model),
-            response,
-            "zdr_state_not_supported",
-            Some("previous_response_id"),
         );
     }
 
@@ -367,14 +339,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 ))
                 .unwrap();
             if status.is_client_error() {
-                return refuse(
-                    &parts.extensions,
-                    &parts.headers,
-                    Some(model),
-                    response,
-                    "previous_response_not_found",
-                    Some("previous_response_id"),
-                );
+                return refuse(response, "previous_response_not_found", Some("previous_response_id"));
             }
             return response;
         }
@@ -426,14 +391,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             ))
             .unwrap();
         let param = if is_responses_api { "background" } else { "service_tier" };
-        return refuse(
-            &parts.extensions,
-            &parts.headers,
-            Some(model),
-            response,
-            "invalid_parameter",
-            Some(param),
-        );
+        return refuse(response, "invalid_parameter", Some(param));
     }
     tracing::debug!(
         model = %model,
@@ -463,7 +421,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                         serde_json::json!({"error": {"message": "API key required", "type": "invalid_request_error"}}).to_string(),
                     ))
                     .unwrap();
-                return refuse(&parts.extensions, &parts.headers, Some(model), response, "unauthenticated", None);
+                return refuse(response, "unauthenticated", None);
             }
             Some(key) => {
                 if let Err(msg) =
@@ -476,7 +434,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                             serde_json::json!({"error": {"message": msg, "type": "invalid_request_error"}}).to_string(),
                         ))
                         .unwrap();
-                    return refuse(&parts.extensions, &parts.headers, Some(model), response, "forbidden", None);
+                    return refuse(response, "forbidden", None);
                 }
             }
         }
@@ -499,7 +457,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                         .to_string(),
                     ))
                     .unwrap();
-                return refuse(&parts.extensions, &parts.headers, Some(model), response, "forbidden", None);
+                return refuse(response, "forbidden", None);
             }
             Ok(None) => {
                 let response = Response::builder()
@@ -509,7 +467,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                         serde_json::json!({"error": {"message": "Invalid API key", "type": "invalid_request_error"}}).to_string(),
                     ))
                     .unwrap();
-                return refuse(&parts.extensions, &parts.headers, Some(model), response, "invalid_api_key", None);
+                return refuse(response, "invalid_api_key", None);
             }
             Err(e) => {
                 tracing::error!(error = %e, "Failed to resolve background-inference role");
@@ -544,7 +502,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                         serde_json::json!({"error": {"message": "Invalid API key", "type": "invalid_request_error"}}).to_string(),
                     ))
                     .unwrap();
-                return refuse(&parts.extensions, &parts.headers, Some(model), response, "invalid_api_key", None);
+                return refuse(response, "invalid_api_key", None);
             }
             Err(e) => {
                 tracing::error!(error = %e, service_tier = %service_tier, "Failed to resolve queued hidden batch key");
@@ -598,14 +556,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             ))
             .unwrap();
         if response.status().is_client_error() {
-            return refuse(
-                &parts.extensions,
-                &parts.headers,
-                Some(model),
-                response,
-                "unverified_volume_limit",
-                None,
-            );
+            return refuse(response, "unverified_volume_limit", None);
         }
         return response;
     }
@@ -717,8 +668,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, service_tier = %service_tier, "Queued image normalisation failed");
-                        record_normalize_error(&parts.extensions, &parts.headers, &e, Some(model));
-                        return normalize_error_response(e);
+                        return refuse_normalize_error(&parts, e, Some(model));
                     }
                 }
             }
@@ -1441,17 +1391,15 @@ fn modality_disabled_response(modality: crate::modalities::Modality) -> Response
         .unwrap()
 }
 
-/// Counts `response`, a refusal this layer decided on, and returns it.
-fn refuse(
-    extensions: &axum::http::Extensions,
-    headers: &axum::http::HeaderMap,
+/// A 400 naming `param`, counted as refused for `code`.
+fn invalid_request<'a>(
+    origin: impl Into<rejections::Origin<'a>>,
     model: Option<&str>,
-    response: Response,
-    code: &str,
-    param: Option<&str>,
+    message: &str,
+    code: &'static str,
+    param: &'static str,
 ) -> Response {
-    rejections::record(extensions, headers, response.status(), code, param, model);
-    response
+    rejections::refuse(origin, invalid_request_response(message, code, param), code, Some(param), model)
 }
 
 fn invalid_request_response(message: &str, code: &str, param: &str) -> Response {

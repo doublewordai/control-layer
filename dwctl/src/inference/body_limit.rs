@@ -20,26 +20,25 @@ pub async fn limit_inference_body(State(max_bytes): State<usize>, request: Reque
     }
 
     let (parts, body) = request.into_parts();
-    let refused = match read_inference_body(&parts.headers, body, max_bytes).await {
-        Ok(bytes) => return next.run(Request::from_parts(parts, Body::from(bytes))).await,
-        Err(crate::errors::Error::PayloadTooLarge { message }) => oversized_body(message, parts.uri.path()),
-        Err(_) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": {
-                "message": "Failed to read request body",
-                "type": "invalid_request_error",
-                "code": "body_read_failed"
-            }})),
-        )
-            .into_response(),
-    };
-    let code = if refused.status() == StatusCode::PAYLOAD_TOO_LARGE {
-        "request_too_large"
-    } else {
-        "body_read_failed"
-    };
-    rejections::record(&parts.extensions, &parts.headers, refused.status(), code, None, None);
-    refused
+    match read_inference_body(&parts.headers, body, max_bytes).await {
+        Ok(bytes) => next.run(Request::from_parts(parts, Body::from(bytes))).await,
+        Err(crate::errors::Error::PayloadTooLarge { message }) => {
+            let response = oversized_body(message, parts.uri.path());
+            rejections::refuse(&parts, response, "request_too_large", None, None)
+        }
+        Err(_) => {
+            let response = (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": {
+                    "message": "Failed to read request body",
+                    "type": "invalid_request_error",
+                    "code": "body_read_failed"
+                }})),
+            )
+                .into_response();
+            rejections::refuse(&parts, response, "body_read_failed", None, None)
+        }
+    }
 }
 
 /// Shared with the authenticated playground proxy, whose model parser runs
@@ -102,10 +101,7 @@ mod tests {
         Router::new()
             .route("/chat/completions", post(|body: Bytes| async move { body }))
             .layer(middleware::from_fn_with_state(limit, limit_inference_body))
-            .layer(middleware::from_fn_with_state(
-                rejections::test_support::recorder("m"),
-                rejections::attach_recorder,
-            ))
+            .layer(rejections::test_support::layer("m"))
     }
 
     #[test]

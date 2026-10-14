@@ -143,7 +143,10 @@ pub async fn outbound_request_middleware(State(cfg): State<OutboundConfig>, requ
     // with no extra limit here can't widen the exposure.
     let bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(b) => b,
-        Err(_) => return (StatusCode::BAD_REQUEST, "failed to read request body").into_response(),
+        Err(_) => {
+            let response = (StatusCode::BAD_REQUEST, "failed to read request body").into_response();
+            return super::rejections::refuse(&parts, response, "body_read_failed", None, None);
+        }
     };
 
     let response = match transform(&bytes, force_stream, stream_usage) {
