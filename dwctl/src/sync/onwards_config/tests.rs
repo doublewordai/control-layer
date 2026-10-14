@@ -1701,10 +1701,13 @@ async fn test_onwards_config_reconnects_after_connection_loss(pool: sqlx::PgPool
     println!("Initial connection established");
 
     // Kill the LISTEN connection to simulate network interruption
-    // First, get the PIDs of LISTEN connections
+    // First, get the PIDs of LISTEN connections. pg_stat_activity spans the
+    // whole server, so stay in this test's database: concurrent tests listen on
+    // the same channel and would silently lose notifications while reconnecting.
     let pids: Vec<i32> = sqlx::query_scalar(
         "SELECT pid FROM pg_stat_activity
-             WHERE query LIKE '%LISTEN%auth_config_changed%'
+             WHERE datname = current_database()
+             AND query LIKE '%LISTEN%auth_config_changed%'
              AND pid != pg_backend_pid()",
     )
     .fetch_all(&pool)
