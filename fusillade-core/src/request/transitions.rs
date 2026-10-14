@@ -329,7 +329,8 @@ impl Request<Failed> {
     /// Never terminal: a held request is released before it can miss its
     /// window, so failing it for a refusal the hold caused would be wrong.
     /// When the maximum backoff would land at or past the retry cut-off
-    /// (`stop_before_deadline_ms`), the request is made claimable at once
+    /// (`stop_before_deadline_ms` before the deadline, or the deadline itself
+    /// when that is unset), the request is made claimable at once
     /// instead, and its next claim releases it (the daemon releases held
     /// requests that close to the cut-off, and the claim releases any past
     /// the deadline). A released dispatch that fails is retried, or failed,

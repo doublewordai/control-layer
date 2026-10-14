@@ -4378,14 +4378,25 @@ async fn a_refresh_releases_a_model_whose_held_work_is_only_refused(pool: sqlx::
     let id = manager.get_batch_requests(batch.id).await.unwrap()[0].id();
     mark_models_live_for_test(manager.as_ref(), &["held-model"]).await;
 
-    // A one-minute window, so one minute of refusals is a whole window, and
-    // a one-second refresh.
+    // The shortest window and a one-second refresh. Another daemon's counters
+    // show the model's held work refused since the start of the window (two
+    // minutes of them, so one is always at the window's start whatever second
+    // the test starts in), so once this daemon's own refusals show it is
+    // still refused, the model has been refused throughout the window.
     let mut hold =
         fusillade::daemon::DispatchHold::new(serde_json::json!([]), ["held-model".to_string()]);
     hold.refresh_interval = Duration::from_secs(1);
-    hold.window = Duration::from_secs(60);
+    hold.window = fusillade::daemon::DispatchHold::MIN_WINDOW;
     hold.min_samples = 1;
     hold.stale_after = Duration::from_secs(60);
+    sqlx::query(
+        "INSERT INTO hold_stats (model, minute, completed, refused)
+         VALUES ('held-model', date_trunc('minute', NOW()) - INTERVAL '4 minutes', 0, 3),
+                ('held-model', date_trunc('minute', NOW()) - INTERVAL '3 minutes', 0, 3)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     let shutdown = CancellationToken::new();
     let handle = Arc::new(
         PostgresDaemon::new(manager.clone(), Arc::new(backend.clone()), config)

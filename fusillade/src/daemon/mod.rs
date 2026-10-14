@@ -254,11 +254,13 @@ enum HoldOutcome {
     Held,
     /// The claim released the request: sent without the hold list.
     Released(TolerationsRelease),
-    /// The claim held the request, but the stored body is not a readable
-    /// JSON object, so nothing could be inserted: sent as stored, not held.
-    /// An encrypted body is in this state when the daemon prepares it (it is
-    /// decrypted later, by the request processor), so encrypted requests are
-    /// never held.
+    /// The stored body is not a readable JSON object, so the hold list could
+    /// not be inserted whatever the claim decided: sent as stored, neither
+    /// held nor released (like a body with an account preset, it could never
+    /// carry the hold list, so a release would lift nothing). An encrypted
+    /// body is in this state when the daemon prepares it (it is decrypted
+    /// later, by the request processor), so encrypted requests are never
+    /// held.
     Unreadable,
 }
 
@@ -267,14 +269,7 @@ impl HoldOutcome {
     fn unreadable(hold: Option<HoldWrite<'_>>) -> Self {
         match hold {
             None => Self::NotApplied,
-            Some(HoldWrite {
-                decision: DispatchTolerations::Release(reason),
-                ..
-            }) => Self::Released(reason),
-            Some(HoldWrite {
-                decision: DispatchTolerations::Keep,
-                ..
-            }) => Self::Unreadable,
+            Some(_) => Self::Unreadable,
         }
     }
 }
@@ -1987,6 +1982,11 @@ where
     /// direct library users.
     pub(crate) fn validate_startup(&self, mode: DaemonMode) -> Result<()> {
         validate_daemon_intervals(&self.config)?;
+        if let Some(state) = &self.dispatch_hold {
+            state.hold().validate().map_err(|error| {
+                FusilladeError::Other(anyhow::anyhow!("invalid dispatch hold: {error}"))
+            })?;
+        }
         let claim_loop_kinds = claim_loop_kinds_for_mode(
             mode,
             self.storage.supports_batch_claims(),
@@ -2588,9 +2588,12 @@ where
     /// claim queries are the one place the release rules live).
     ///
     /// A request the claim holds is released anyway when it is so close to
-    /// the retry cut-off (`stop_before_deadline_ms`) that a held refusal could
-    /// not be retried before it: being refused is what the hold expects, and
-    /// a refusal there would otherwise leave it no time to be released.
+    /// the retry cut-off (`stop_before_deadline_ms` before the deadline, or
+    /// the deadline itself when that is unset, as for the retry) that a held
+    /// refusal could not be retried before it: being refused is what the hold
+    /// expects, and a refusal there would otherwise leave it no time to be
+    /// released. Without this, such a refusal is requeued claimable at once
+    /// and could be held and refused again until the claim ramp releases it.
     fn hold_write<'a>(
         &'a self,
         kind: ClaimLoopKind,
@@ -2608,8 +2611,9 @@ where
         let mut decision = request.state.tolerations?;
         if decision == DispatchTolerations::Keep
             && let Some(deadline) = request.state.batch_expires_at
-            && let Some(stop_before_deadline_ms) = self.config.stop_before_deadline_ms
         {
+            // The retry's own cut-off: the deadline when no margin is set.
+            let stop_before_deadline_ms = self.config.stop_before_deadline_ms.unwrap_or(0);
             let retry_cut_off = chrono::Duration::try_milliseconds(stop_before_deadline_ms)
                 .and_then(|stop_before| deadline.checked_sub_signed(stop_before));
             let held_retry_at = i64::try_from(self.config.max_backoff_ms)
@@ -2822,14 +2826,23 @@ where
                 // quiet, so a background rejection means background overflowed -
                 // reacting to it would shrink the SLA-bearing traffic because
                 // the spare-capacity traffic bounced.
+                //
+                // A held dispatch is stamped without counting toward the next
+                // raise: it counts once its outcome is known and is not a held
+                // refusal (see `stamp_held`).
                 let control_generation =
                     (!is_background && self.config.adaptive_concurrency).then(|| {
                         let seed = model_concurrency_limits
                             .get(&capacity_model_clone)
                             .map(|limit| *limit)
                             .unwrap_or(0);
-                        adaptive_concurrency.stamp(&capacity_model_clone, seed)
+                        if held {
+                            adaptive_concurrency.stamp_held(&capacity_model_clone, seed)
+                        } else {
+                            adaptive_concurrency.stamp(&capacity_model_clone, seed)
+                        }
                     });
+                let held_generation = control_generation.filter(|_| held);
 
                 if is_background {
                     gauge!("fusillade_background_requests_in_flight", "model" => model_clone.clone())
@@ -2950,6 +2963,10 @@ where
                             if let Some(hold_state) = &hold_state {
                                 hold_state.record_completed(&capacity_model_clone);
                             }
+                            if let Some(generation) = held_generation {
+                                adaptive_concurrency
+                                    .record_held_dispatch(&capacity_model_clone, generation);
+                            }
 
                             if let Some(batch_expires_at) = batch_expires_at {
                                 let completed_at = completed.state.completed_at;
@@ -2981,12 +2998,9 @@ where
                                     "model" => capacity_model_clone.clone()
                                 )
                                 .increment(1);
-                                // Not a cut (below), and not growth evidence.
-                                if control_generation.is_some() {
-                                    adaptive_concurrency
-                                        .record_held_refusal(&capacity_model_clone);
-                                }
                             }
+                            // A held refusal is neither a cut (here) nor growth
+                            // evidence (it was stamped without counting).
                             if shrinks_adaptive_concurrency(held_refusal, &failed.state.reason)
                                 && let Some(generation) = control_generation
                                 && let Some(adjustment) = adaptive_concurrency
@@ -2997,6 +3011,14 @@ where
                                     adjustment,
                                     &failed.state.reason.status_code_label(),
                                 );
+                            }
+                            // Any other outcome of a held dispatch counts, as
+                            // an unheld dispatch does when sent (after a cut
+                            // above, its generation is gone and it counts for
+                            // nothing).
+                            if !held_refusal && let Some(generation) = held_generation {
+                                adaptive_concurrency
+                                    .record_held_dispatch(&capacity_model_clone, generation);
                             }
                             let retry_attempt = failed.state.retry_attempt;
                             let reason_label = failed.state.reason.metric_label();
@@ -6070,9 +6092,10 @@ mod tests {
         assert_eq!(body, original);
 
         let empty = serde_json::json!([]);
-        // A non-object body is left alone even when something is configured:
-        // a held one is reported as unreadable (not held), a released one as
-        // released.
+        // A non-object body is left alone even when something is configured,
+        // and is reported as unreadable (skipped) whether the claim held or
+        // released it: it could never carry the hold list, so there was no
+        // hold to release.
         for unreadable in ["[1,2]", "dwzdr1:ciphertext"] {
             let mut body = unreadable.to_string();
             assert_eq!(
@@ -6092,7 +6115,7 @@ mod tests {
                         DispatchTolerations::Release(TolerationsRelease::Stale)
                     )
                 ),
-                HoldOutcome::Released(TolerationsRelease::Stale)
+                HoldOutcome::Unreadable
             );
             assert_eq!(
                 inject_nvext_extensions(&mut body, Some(1), None),
@@ -6428,10 +6451,17 @@ mod tests {
         assert!(!prepared[0].held);
         assert_eq!(tolerations_of(&prepared[0]), serde_json::Value::Null);
 
-        // The claim's decision is final: every replica decides from the same
-        // rows, so the daemon does not second-guess it with its own clock.
+        // Apart from the retry cut-off, the claim's decision is final: every
+        // replica decides from the same rows, so the daemon does not
+        // second-guess it with its own clock. Held well before the deadline:
         let prepared = daemon.prepare_claimed_requests(
-            vec![decided_request("m", BODY, Some(past), keep, now)],
+            vec![decided_request(
+                "m",
+                BODY,
+                Some(now + chrono::Duration::minutes(1)),
+                keep,
+                now,
+            )],
             ClaimLoopKind::Batch,
         );
         assert_eq!(
@@ -6500,6 +6530,54 @@ mod tests {
         assert!(!prepared[2].held, "already inside the cut-off");
         assert_eq!(tolerations_of(&prepared[2]), serde_json::Value::Null);
 
+        // Without stop_before_deadline_ms the retry's cut-off is the deadline
+        // itself, and so is the hold's: a held refusal whose retry would land
+        // at or past the deadline is requeued claimable at once, so it must
+        // not be held (and refused) again.
+        let daemon = preparing_daemon(
+            pool.clone(),
+            DaemonConfig {
+                stop_before_deadline_ms: None,
+                max_backoff_ms: 10_000,
+                ..Default::default()
+            },
+        )
+        .await
+        .with_dispatch_hold(DispatchHold::new(serde_json::json!([]), ["m".to_string()]));
+        let prepared = daemon.prepare_claimed_requests(
+            vec![
+                decided_request(
+                    "m",
+                    BODY,
+                    Some(now + chrono::Duration::seconds(60)),
+                    keep,
+                    now,
+                ),
+                decided_request(
+                    "m",
+                    BODY,
+                    Some(now + chrono::Duration::seconds(5)),
+                    keep,
+                    now,
+                ),
+                decided_request(
+                    "m",
+                    BODY,
+                    Some(now - chrono::Duration::minutes(5)),
+                    keep,
+                    now,
+                ),
+            ],
+            ClaimLoopKind::Batch,
+        );
+        assert!(
+            prepared[0].held,
+            "a retry 10s out lands before the deadline"
+        );
+        assert!(!prepared[1].held, "a retry would land past the deadline");
+        assert!(!prepared[2].held, "past the deadline");
+        assert_eq!(tolerations_of(&prepared[1]), serde_json::Value::Null);
+
         // A negative cut-off (retry past the deadline) never releases early.
         let daemon = preparing_daemon(
             pool,
@@ -6521,6 +6599,30 @@ mod tests {
             ClaimLoopKind::Batch,
         );
         assert!(prepared[0].held);
+    }
+
+    /// A hold window outside the supported range (too short for the per-minute
+    /// counters, or too long to compute with) fails startup.
+    #[sqlx::test]
+    async fn a_dispatch_hold_window_out_of_range_fails_startup(pool: sqlx::PgPool) {
+        for (window, ok) in [
+            (DispatchHold::MIN_WINDOW, true),
+            (DispatchHold::MAX_WINDOW, true),
+            (Duration::from_secs(60), false),
+            (DispatchHold::MAX_WINDOW + Duration::from_secs(1), false),
+            (Duration::MAX, false),
+        ] {
+            let mut hold = DispatchHold::new(serde_json::json!([]), ["m".to_string()]);
+            hold.window = window;
+            let daemon = preparing_daemon(pool.clone(), DaemonConfig::default())
+                .await
+                .with_dispatch_hold(hold);
+            let result = daemon.validate_startup(DaemonMode::RequestOnly);
+            assert_eq!(result.is_ok(), ok, "{window:?}: {result:?}");
+            if let Err(error) = result {
+                assert!(error.to_string().contains("dispatch hold"), "{error}");
+            }
+        }
     }
 
     /// Without a dispatch hold, outbound bodies are exactly what they were

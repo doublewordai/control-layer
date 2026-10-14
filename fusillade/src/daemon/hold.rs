@@ -9,18 +9,19 @@
 //!
 //! - it is past its deadline, or inside the batch-claim deadline ramp (the
 //!   floor, always; applied by the claim queries);
-//! - its model's held dispatches were refused while none completed over a
-//!   whole window of holding, or the decisions are stale
-//!   ([`ModelHold::ReleaseAll`]);
+//! - its model's held dispatches were refused throughout a whole window of
+//!   holding (from its start to its recent part) while none completed, or the
+//!   decisions are stale ([`ModelHold::ReleaseAll`]);
 //! - it is due at or before its model's cutoff: the latest deadline whose work
 //!   cannot finish at the model's own rate ([`ModelHold::Hold`]);
 //! - it is so close to the retry cut-off that a held refusal could not be
 //!   retried before it (applied when the dispatch is prepared).
 //!
-//! Every daemon counts its held completions and held refusals in memory,
-//! flushes them every few seconds into the shared per-minute `hold_stats`
-//! table, and every refresh interval reads the counters and the outstanding
-//! work back and computes every held model's decision
+//! Every daemon counts its held completions and held refusals in memory, by
+//! the minute they happened in, flushes them every few seconds into the
+//! shared per-minute `hold_stats` table (counts a failed flush kept back still
+//! land in their own minute), and every refresh interval reads the counters
+//! and the outstanding work back and computes every held model's decision
 //! (`fusillade_core::release`). The claim queries apply the decisions, passed
 //! as parameters, so no leader, lock or extra table of decisions is needed and
 //! nothing is written to the request rows. Only a storage whose claims make
@@ -53,11 +54,22 @@ pub(crate) fn stats_retention(window: Duration) -> chrono::Duration {
         .max(MIN_STATS_RETENTION)
 }
 
+/// Counter minutes before this are past retention at `now`: the purge removes
+/// them and the read never counts them. `None` when the retention reaches
+/// past the earliest representable time (nothing is that old).
+fn retention_cutoff(now: DateTime<Utc>, window: Duration) -> Option<DateTime<Utc>> {
+    now.checked_sub_signed(stats_retention(window))
+}
+
+/// Per (model, minute counted in): (held completions, held refusals) since
+/// the last flush.
+type Counters = HashMap<(String, DateTime<Utc>), (i64, i64)>;
+
 /// One daemon's hold state: its unflushed counters and the latest decisions.
 pub(crate) struct HoldState {
     hold: DispatchHold,
-    /// Per model: (held completions, held refusals) since the last flush.
-    counters: Mutex<HashMap<String, (i64, i64)>>,
+    /// This daemon's counters since the last flush.
+    counters: Mutex<Counters>,
     /// The decisions the claim queries were last given.
     claim: RwLock<HoldClaim>,
     /// Per model: what the decision remembers between refreshes.
@@ -98,27 +110,27 @@ impl HoldState {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = claim;
     }
 
-    fn add(&self, model: &str, completed: i64, refused: i64) {
+    fn add(&self, model: &str, minute: DateTime<Utc>, completed: i64, refused: i64) {
         let mut counters = self
             .counters
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let entry = counters.entry(model.to_string()).or_default();
+        let entry = counters.entry((model.to_string(), minute)).or_default();
         entry.0 += completed;
         entry.1 += refused;
     }
 
     /// A held dispatch completed successfully.
     pub(crate) fn record_completed(&self, model: &str) {
-        self.add(model, 1, 0);
+        self.add(model, minute_of(Utc::now()), 1, 0);
     }
 
     /// A held dispatch was refused (503/529).
     pub(crate) fn record_refused(&self, model: &str) {
-        self.add(model, 0, 1);
+        self.add(model, minute_of(Utc::now()), 0, 1);
     }
 
-    /// Take the counters for a flush.
+    /// Take the counters for a flush, one delta per model and minute.
     fn take(&self) -> Vec<HoldStatsDelta> {
         let mut counters = self
             .counters
@@ -127,18 +139,24 @@ impl HoldState {
         counters
             .drain()
             .filter(|(_, (completed, refused))| *completed > 0 || *refused > 0)
-            .map(|(model, (completed, refused))| HoldStatsDelta {
+            .map(|((model, minute), (completed, refused))| HoldStatsDelta {
                 model,
+                minute,
                 completed,
                 refused,
             })
             .collect()
     }
 
-    /// Put back counters a flush failed to write.
-    fn restore(&self, deltas: Vec<HoldStatsDelta>) {
+    /// Put back counters a flush failed to write, under the minutes they were
+    /// counted in. Those already past retention are dropped: the purge would
+    /// remove them and the read would never count them.
+    fn restore(&self, deltas: Vec<HoldStatsDelta>, now: DateTime<Utc>) {
+        let cutoff = retention_cutoff(now, self.hold.window);
         for delta in deltas {
-            self.add(&delta.model, delta.completed, delta.refused);
+            if cutoff.is_none_or(|cutoff| delta.minute >= cutoff) {
+                self.add(&delta.model, delta.minute, delta.completed, delta.refused);
+            }
         }
     }
 
@@ -200,7 +218,7 @@ pub(crate) async fn run_hold_refresh<S>(
                 // Last flush, bounded, so a draining pod's counts are not lost.
                 let deltas = state.take();
                 if !deltas.is_empty() {
-                    let flush = storage.flush_hold_stats(minute_of(Utc::now()), &deltas);
+                    let flush = storage.flush_hold_stats(&deltas);
                     match tokio::time::timeout(query_timeout, flush).await {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => {
@@ -215,22 +233,21 @@ pub(crate) async fn run_hold_refresh<S>(
 
         let deltas = state.take();
         if !deltas.is_empty() {
-            let minute = minute_of(Utc::now());
             match super::maintenance_query(
                 &shutdown,
                 "hold_stats flush",
                 query_timeout,
-                storage.flush_hold_stats(minute, &deltas),
+                storage.flush_hold_stats(&deltas),
             )
             .await
             {
                 Ok(Some(())) => {}
                 Ok(None) => {
-                    state.restore(deltas);
+                    state.restore(deltas, Utc::now());
                     continue;
                 }
                 Err(error) => {
-                    state.restore(deltas);
+                    state.restore(deltas, Utc::now());
                     crate::background_error!(
                         "hold_stats_flush",
                         Warning,
@@ -317,17 +334,20 @@ async fn refresh<S>(
 where
     S: DaemonStorage + ?Sized,
 {
-    let retention = stats_retention(state.hold().window);
-    let Some(_) = super::maintenance_query(
-        shutdown,
-        "hold_stats purge",
-        query_timeout,
-        storage.purge_hold_stats(Utc::now() - retention),
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
+    // Checked: a window too long to subtract from now (the configuration
+    // rejects one) leaves nothing old enough to purge, rather than panicking.
+    if let Some(before) = retention_cutoff(Utc::now(), state.hold().window) {
+        let Some(_) = super::maintenance_query(
+            shutdown,
+            "hold_stats purge",
+            query_timeout,
+            storage.purge_hold_stats(before),
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+    }
     let Some((now, inputs)) = super::maintenance_query(
         shutdown,
         "hold inputs",
@@ -401,38 +421,127 @@ mod tests {
         )
     }
 
+    fn sorted(mut deltas: Vec<HoldStatsDelta>) -> Vec<HoldStatsDelta> {
+        deltas.sort_by(|a, b| (&a.model, a.minute).cmp(&(&b.model, b.minute)));
+        deltas
+    }
+
     #[test]
     fn counters_are_taken_once_and_restored_after_a_failed_flush() {
         let state = state();
+        let before = minute_of(Utc::now());
         state.record_completed("m");
         state.record_completed("m");
         state.record_refused("m");
         state.record_refused("n");
-        let mut deltas = state.take();
-        deltas.sort_by(|a, b| a.model.cmp(&b.model));
-        assert_eq!(
-            deltas,
-            vec![
-                HoldStatsDelta {
-                    model: "m".to_string(),
-                    completed: 2,
-                    refused: 1
-                },
-                HoldStatsDelta {
-                    model: "n".to_string(),
-                    completed: 0,
-                    refused: 1
-                },
-            ]
-        );
+        let after = minute_of(Utc::now());
+        let deltas = sorted(state.take());
+        if before == after {
+            assert_eq!(
+                deltas,
+                vec![
+                    HoldStatsDelta {
+                        model: "m".to_string(),
+                        minute: before,
+                        completed: 2,
+                        refused: 1
+                    },
+                    HoldStatsDelta {
+                        model: "n".to_string(),
+                        minute: before,
+                        completed: 0,
+                        refused: 1
+                    },
+                ]
+            );
+        }
         assert!(state.take().is_empty(), "taken once");
 
-        // A failed flush puts them back, added to what arrived since.
-        state.restore(deltas);
-        state.record_completed("m");
-        let mut deltas = state.take();
-        deltas.sort_by(|a, b| a.model.cmp(&b.model));
-        assert_eq!((deltas[0].completed, deltas[0].refused), (3, 1));
+        // A failed flush puts them back, added to what arrived since in the
+        // same minute.
+        let minute = minute_of(Utc::now());
+        let failed = vec![HoldStatsDelta {
+            model: "m".to_string(),
+            minute,
+            completed: 2,
+            refused: 1,
+        }];
+        state.restore(failed, Utc::now());
+        state.add("m", minute, 1, 0);
+        assert_eq!(
+            state.take(),
+            vec![HoldStatsDelta {
+                model: "m".to_string(),
+                minute,
+                completed: 3,
+                refused: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn counts_kept_back_by_a_failed_flush_stay_in_the_minute_they_happened() {
+        // Five minutes of completions kept back by failed flushes are written
+        // under their own minutes, not packed into the minute the flush
+        // finally succeeds in (which would make them look like one minute's
+        // work and inflate the rate).
+        let state = state();
+        let now = minute_of(Utc::now());
+        let kept: Vec<_> = (1..=5)
+            .map(|ago| HoldStatsDelta {
+                model: "m".to_string(),
+                minute: now - chrono::Duration::minutes(ago),
+                completed: 10,
+                refused: 0,
+            })
+            .collect();
+        state.restore(kept.clone(), now);
+        state.add("m", now, 10, 0);
+        let mut expected = kept;
+        expected.push(HoldStatsDelta {
+            model: "m".to_string(),
+            minute: now,
+            completed: 10,
+            refused: 0,
+        });
+        assert_eq!(sorted(state.take()), sorted(expected));
+
+        // Counts past retention are dropped: no read would count them.
+        let ancient = HoldStatsDelta {
+            model: "m".to_string(),
+            minute: now - chrono::Duration::hours(3),
+            completed: 1,
+            refused: 1,
+        };
+        state.restore(vec![ancient], now);
+        assert!(state.take().is_empty());
+    }
+
+    #[test]
+    fn an_unrepresentable_window_does_not_overflow_the_purge_cutoff() {
+        let now = Utc::now();
+        assert_eq!(
+            retention_cutoff(now, Duration::MAX),
+            None,
+            "nothing is old enough to purge"
+        );
+        assert_eq!(
+            retention_cutoff(now, Duration::from_secs(900)),
+            Some(now - chrono::Duration::hours(2))
+        );
+        // Restoring under such a window keeps everything.
+        let mut hold = DispatchHold::new(serde_json::json!([]), ["m".to_string()]);
+        hold.window = Duration::MAX;
+        let state = HoldState::new(hold, now);
+        let minute = minute_of(now) - chrono::Duration::hours(3);
+        let delta = HoldStatsDelta {
+            model: "m".to_string(),
+            minute,
+            completed: 1,
+            refused: 0,
+        };
+        state.restore(vec![delta.clone()], now);
+        assert_eq!(state.take(), vec![delta]);
     }
 
     #[test]
@@ -448,6 +557,7 @@ mod tests {
             completed: 0,
             refused: 4,
             held_since: Some(now - chrono::Duration::minutes(15)),
+            last_refused: Some(now - chrono::Duration::minutes(1)),
             backlog: vec![(now + chrono::Duration::hours(1), 10)],
         }];
         let models = ["busy".to_string(), "quiet".to_string()];

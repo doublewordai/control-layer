@@ -9064,30 +9064,31 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
 
     async fn flush_hold_stats(
         &self,
-        minute: DateTime<Utc>,
         deltas: &[fusillade_core::release::HoldStatsDelta],
     ) -> Result<()> {
         if deltas.is_empty() {
             return Ok(());
         }
         let models: Vec<&str> = deltas.iter().map(|d| d.model.as_str()).collect();
+        let minutes: Vec<DateTime<Utc>> = deltas.iter().map(|d| d.minute).collect();
         let completed: Vec<i64> = deltas.iter().map(|d| d.completed).collect();
         let refused: Vec<i64> = deltas.iter().map(|d| d.refused).collect();
         // Additive upsert: every daemon flushes into the same (model, minute)
-        // rows.
+        // rows, each delta under the minute it was counted in.
         sqlx::query(
             r#"
             INSERT INTO hold_stats (model, minute, completed, refused)
-            SELECT d.model, $1, SUM(d.completed), SUM(d.refused)
-            FROM UNNEST($2::TEXT[], $3::BIGINT[], $4::BIGINT[]) AS d(model, completed, refused)
-            GROUP BY d.model
+            SELECT d.model, date_trunc('minute', d.minute), SUM(d.completed), SUM(d.refused)
+            FROM UNNEST($1::TEXT[], $2::TIMESTAMPTZ[], $3::BIGINT[], $4::BIGINT[])
+                AS d(model, minute, completed, refused)
+            GROUP BY d.model, date_trunc('minute', d.minute)
             ON CONFLICT (model, minute) DO UPDATE SET
                 completed = hold_stats.completed + EXCLUDED.completed,
                 refused = hold_stats.refused + EXCLUDED.refused
             "#,
         )
-        .bind(minute)
         .bind(&models)
+        .bind(&minutes)
         .bind(&completed)
         .bind(&refused)
         .execute(self.write_executor())
@@ -9148,10 +9149,13 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
                 SELECT DISTINCT m FROM UNNEST($1::TEXT[]) AS m
             ),
             stats AS (
-                -- The window's counters, and the first minute counted in
-                -- it: how long the model has been held within the window.
+                -- The window's counters, the first minute counted in it
+                -- (how long the model has been held within the window) and
+                -- the last minute with a refusal (whether it was refused
+                -- lately).
                 SELECT s.model, SUM(s.completed)::BIGINT AS completed, SUM(s.refused)::BIGINT AS refused,
-                       MIN(s.minute) AS held_since
+                       MIN(s.minute) AS held_since,
+                       MAX(s.minute) FILTER (WHERE s.refused > 0) AS last_refused
                 FROM hold_stats s
                 WHERE s.model = ANY($1)
                   AND s.minute >= NOW() - make_interval(secs => $2::FLOAT8)
@@ -9209,6 +9213,7 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
                    COALESCE(st.completed, 0)::BIGINT AS completed,
                    COALESCE(st.refused, 0)::BIGINT AS refused,
                    st.held_since,
+                   st.last_refused,
                    b.deadline,
                    (SUM(b.n) OVER (PARTITION BY h.model ORDER BY b.minute))::BIGINT AS cumulative,
                    clock_timestamp() AS read_at
@@ -9238,6 +9243,7 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
                     completed: row.get("completed"),
                     refused: row.get("refused"),
                     held_since: row.get("held_since"),
+                    last_refused: row.get("last_refused"),
                     backlog: Vec::new(),
                 });
             }

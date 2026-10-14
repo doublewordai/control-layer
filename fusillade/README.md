@@ -180,22 +180,33 @@ capacity is full. Off unless the builder is called.
   `fusillade_hold_skipped_total{model,reason}`.
 - **Release.** A held request is sent as stored (without the list) when it
   would otherwise miss its completion window: past its deadline or inside the
-  batch-claim deadline ramp; when the model's held dispatches were refused and
-  none completed over a whole `window` of holding; when it is due at or before
-  the latest deadline whose pending work cannot finish at the model's own rate
-  (held completions over the time held, with `safety_margin`); when a refusal
-  could no longer be retried before `stop_before_deadline_ms`; or when the
-  decisions are older than `stale_after` (fail open). Requests sharing a
-  deadline are released together. Counted by
+  batch-claim deadline ramp; when the model's held dispatches were refused
+  throughout a whole `window` of holding and none completed; when it is due at
+  or before the latest deadline whose pending work cannot finish at the
+  model's own rate (held completions over the time held, with
+  `safety_margin`); when a refusal could no longer be retried before the retry
+  cut-off (`stop_before_deadline_ms` before the deadline, or the deadline when
+  unset); or when the decisions are older than `stale_after` (fail open).
+  Requests sharing a deadline are released together. Counted by
   `fusillade_tolerations_released_total{model,reason}`.
+- **Window.** `window` is between 5 minutes and one day (checked at startup).
+  The counters are per minute, so "throughout a whole window" is to within a
+  minute: the first refusal counted at least `window` less a minute ago, and
+  the latest in the last quarter of the window (at least the last two
+  minutes). Neither a first refusal nor one old refusal releases everything.
 - **Refusals.** A held 503/529 is requeued after `max_backoff_ms` without
-  spending a retry, is never terminal, and neither cuts nor raises adaptive
-  concurrency.
+  spending a retry, is never terminal, and neither cuts adaptive concurrency
+  nor counts toward raising it (a held dispatch counts toward a raise only
+  once it finishes some other way). The gateway's own batch in-flight cap (a
+  529 with `batch_capacity_exceeded`) is not a held refusal: it is handled
+  exactly as without the hold, so it spends no retry but cuts adaptive
+  concurrency and can fail the request at the retry cut-off.
 
-Each daemon counts its held completions and refusals in memory, flushes them
-every 10 seconds into the shared per-minute `hold_stats` table, and every
-`refresh_interval` reads them back with the pending work by deadline and
-computes each model's decision. There is no leader and nothing is written to
+Each daemon counts its held completions and refusals in memory, by the minute
+they happened in, flushes them every 10 seconds into the shared per-minute
+`hold_stats` table (counts a failed flush kept back are written under their
+own minutes later), and every `refresh_interval` reads them back with the
+pending work by deadline and computes each model's decision. There is no leader and nothing is written to
 the request rows. While a release is in the window, a daemon keeps projecting
 with the rate it measured before the release, so released work running on the
 same capacity does not drive further release.
@@ -204,7 +215,8 @@ The decisions live in the storage. A custom `DaemonStorage` must implement all
 four hold methods for a hold to do anything: `set_dispatch_hold` (keep the
 decisions and return a `DispatchTolerations` on each claimed request of a held
 model, applying the deadline floor), `flush_hold_stats` (add per-minute
-counters, additively across daemons), `purge_hold_stats` and
+counters under each delta's own minute, additively across daemons),
+`purge_hold_stats` and
 `read_hold_inputs`. The defaults are no-ops: claims make no decision, and a
 claimed request without one is sent as stored, so nothing is held.
 

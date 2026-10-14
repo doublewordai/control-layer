@@ -297,9 +297,10 @@ async fn stats(pool: &PgPool) -> Vec<(String, DateTime<Utc>, i64, i64)> {
     .unwrap()
 }
 
-fn delta(model: &str, completed: i64, refused: i64) -> HoldStatsDelta {
+fn delta(model: &str, minute: DateTime<Utc>, completed: i64, refused: i64) -> HoldStatsDelta {
     HoldStatsDelta {
         model: model.to_string(),
+        minute,
         completed,
         refused,
     }
@@ -311,24 +312,39 @@ async fn counter_flushes_add_up_across_daemons_and_old_rows_are_purged(pool: PgP
     let now = minute(Utc::now());
 
     // Two daemons flush into the same (model, minute): the counts add.
-    a.flush_hold_stats(now, &[delta("m", 3, 1), delta("n", 0, 2)])
+    a.flush_hold_stats(&[delta("m", now, 3, 1), delta("n", now, 0, 2)])
         .await
         .unwrap();
-    b.flush_hold_stats(now, &[delta("m", 4, 0)]).await.unwrap();
-    a.flush_hold_stats(now, &[]).await.unwrap();
+    b.flush_hold_stats(&[delta("m", now, 4, 0)]).await.unwrap();
+    a.flush_hold_stats(&[]).await.unwrap();
     assert_eq!(
         stats(&pool).await,
         vec![("m".to_string(), now, 7, 1), ("n".to_string(), now, 0, 2),]
     );
 
+    // One flush writes each delta under its own minute: counts a failed
+    // flush kept back land in the minute they happened in.
+    let earlier = now - Duration::minutes(4);
+    a.flush_hold_stats(&[delta("m", earlier, 5, 0), delta("m", now, 1, 0)])
+        .await
+        .unwrap();
+    assert_eq!(
+        stats(&pool).await,
+        vec![
+            ("m".to_string(), earlier, 5, 0),
+            ("m".to_string(), now, 8, 1),
+            ("n".to_string(), now, 0, 2),
+        ]
+    );
+
     // Purge removes rows before the cutoff and keeps the rest.
     let old = now - Duration::hours(3);
-    b.flush_hold_stats(old, &[delta("m", 9, 9)]).await.unwrap();
+    b.flush_hold_stats(&[delta("m", old, 9, 9)]).await.unwrap();
     assert_eq!(
         a.purge_hold_stats(now - Duration::hours(2)).await.unwrap(),
         1
     );
-    assert_eq!(stats(&pool).await.len(), 2);
+    assert_eq!(stats(&pool).await.len(), 3);
 }
 
 #[sqlx::test]
@@ -339,13 +355,22 @@ async fn every_daemon_reads_the_same_inputs_and_decides_alike(pool: PgPool) {
 
     // In the window: 900 completions and some refusals; outside it, more
     // that must not count.
-    a.flush_hold_stats(now, &[delta("m", 500, 3)])
+    a.flush_hold_stats(&[delta("m", now - Duration::minutes(2), 0, 2)])
         .await
         .unwrap();
-    b.flush_hold_stats(now - Duration::minutes(5), &[delta("m", 400, 0)])
+    a.flush_hold_stats(&[delta("m", now, 500, 1)])
         .await
         .unwrap();
-    a.flush_hold_stats(now - Duration::minutes(30), &[delta("m", 10_000, 10_000)])
+    b.flush_hold_stats(&[delta("m", now - Duration::minutes(5), 400, 0)])
+        .await
+        .unwrap();
+    a.flush_hold_stats(&[delta("m", now - Duration::minutes(30), 10_000, 10_000)])
+        .await
+        .unwrap();
+    b.flush_hold_stats(&[delta("idle", now - Duration::minutes(3), 0, 1)])
+        .await
+        .unwrap();
+    b.flush_hold_stats(&[delta("idle", now - Duration::minutes(1), 2, 0)])
         .await
         .unwrap();
 
@@ -405,6 +430,11 @@ async fn every_daemon_reads_the_same_inputs_and_decides_alike(pool: PgPool) {
         "the first minute counted in the window"
     );
     assert_eq!(
+        m.last_refused,
+        Some(now),
+        "the last minute with a refusal in the window"
+    );
+    assert_eq!(
         m.backlog_requests(),
         3,
         "pending and not overdue, this model only: not in flight"
@@ -424,7 +454,12 @@ async fn every_daemon_reads_the_same_inputs_and_decides_alike(pool: PgPool) {
         .unwrap();
     assert_eq!(
         (idle.completed, idle.refused, idle.backlog.len()),
-        (0, 0, 0)
+        (2, 1, 0)
+    );
+    assert_eq!(
+        idle.last_refused,
+        Some(now - Duration::minutes(3)),
+        "a later minute without refusals does not move it"
     );
 
     // Same inputs, same decisions: 900 completions over the 5 minutes the

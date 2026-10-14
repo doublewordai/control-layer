@@ -208,15 +208,15 @@ pub enum TolerationsRelease {
     /// Due at or before its model's release cutoff: projected to miss its
     /// completion window at the rate held dispatches complete.
     SlaProjection,
-    /// Its model's held dispatches were refused and none completed over a
-    /// whole window of holding: there is no capacity the hold allows to wait
-    /// for.
+    /// Its model's held dispatches were refused throughout a whole window of
+    /// holding and none completed: there is no capacity the hold allows to
+    /// wait for.
     NoOwnCapacity,
     /// The hold decisions are missing or stale (the refresh is failing).
     Stale,
     /// Too close to its deadline for a held refusal to be retried before the
-    /// retry cut-off (`stop_before_deadline_ms`): released so a refusal
-    /// cannot fail it.
+    /// retry cut-off (`stop_before_deadline_ms` before the deadline, or the
+    /// deadline itself when unset): released so a refusal cannot fail it.
     RetryCutoff,
 }
 

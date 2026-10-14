@@ -2683,8 +2683,12 @@ fn default_batch_metadata_fields_dwctl() -> Vec<String> {
 ///
 /// - inside the batch-claim deadline ramp (`claim_ramp_exponent`) or past its
 ///   deadline;
-/// - when its model's held dispatches were refused and none completed over a
-///   whole `window_secs` of holding (no capacity to wait for);
+/// - when its model's held dispatches were refused throughout a whole
+///   `window_secs` of holding and none completed (no capacity to wait for).
+///   The counters are kept per minute, so "whole" is to within a minute: the
+///   first refusal counted at least `window_secs - 60` seconds ago, and the
+///   latest in the last quarter of the window (at least the last two
+///   minutes), so neither a first refusal nor one old refusal releases;
 /// - when it is due at or before the latest deadline `d` whose pending work
 ///   cannot finish at the model's own rate: `work_due_by(d) / rate * (1 +
 ///   safety_margin) > d - now`, where the rate is the held completions over
@@ -2695,7 +2699,8 @@ fn default_batch_metadata_fields_dwctl() -> Vec<String> {
 ///   not drive further release. Requests sharing a deadline are released
 ///   together;
 /// - when a refusal could no longer be retried before the retry cut-off
-///   (`stop_before_deadline_ms`);
+///   (`stop_before_deadline_ms` before the deadline, or the deadline itself
+///   when that is unset);
 /// - when the decisions are older than `stale_after_secs` (fail open).
 ///
 /// Every replica counts its held completions and refusals, flushes them into
@@ -2704,7 +2709,11 @@ fn default_batch_metadata_fields_dwctl() -> Vec<String> {
 ///
 /// A held request the backend refuses for capacity (503/529) is retried after
 /// `max_backoff_ms` without spending one of `max_retries`, is never failed for
-/// it, and neither lowers nor raises the model's adaptive concurrency. A
+/// it, and neither lowers nor raises the model's adaptive concurrency. The
+/// gateway's own batch in-flight cap (a 529 with `batch_capacity_exceeded`)
+/// is not such a refusal: it is handled as it is without the hold (no retry
+/// spent, but it lowers adaptive concurrency and can fail the request at the
+/// retry cut-off). A
 /// request whose stored body is encrypted cannot carry the hold list and is
 /// sent as stored (`fusillade_hold_skipped_total`).
 ///
@@ -2728,9 +2737,10 @@ pub struct DispatchHoldConfig {
     /// How often each replica recomputes the release decisions, in seconds.
     /// Default: 60.
     pub refresh_interval_secs: u64,
-    /// Trailing window of held completions and refusals, in seconds. At
-    /// least `refresh_interval_secs`. The counters are kept for two windows,
-    /// and at least two hours. Default: 900.
+    /// Trailing window of held completions and refusals, in seconds. Between
+    /// 300 (the counters are per minute, so a window spans several of them)
+    /// and 86400, and at least `refresh_interval_secs`. The counters are kept
+    /// for two windows, and at least two hours. Default: 900.
     pub window_secs: u64,
     /// Margin added to a deadline's projected work, as a fraction in
     /// `[0, 1)`. Default: 0.2.
@@ -2771,6 +2781,16 @@ impl DispatchHoldConfig {
         }
         if self.refresh_interval_secs == 0 {
             return Err("refresh_interval_secs must be positive".to_string());
+        }
+        let (min_window, max_window) = (
+            fusillade::daemon::DispatchHold::MIN_WINDOW.as_secs(),
+            fusillade::daemon::DispatchHold::MAX_WINDOW.as_secs(),
+        );
+        if !(min_window..=max_window).contains(&self.window_secs) {
+            return Err(format!(
+                "window_secs must be between {min_window} and {max_window}, got {}",
+                self.window_secs
+            ));
         }
         if self.window_secs < self.refresh_interval_secs {
             return Err(format!(
@@ -6084,9 +6104,24 @@ background_services:
             let error = bad.validate(&scheduling).unwrap_err();
             assert!(error.contains("safety_margin"), "{margin}: {error}");
         }
-        let mut bad = hold(true, "no-overflow", &["m"]);
-        bad.window_secs = 30;
-        assert!(bad.validate(&scheduling).unwrap_err().contains("window_secs"));
+        // The window spans several counter minutes, and is not so long that
+        // it cannot be subtracted from the clock.
+        for window_secs in [30, 60, 299, 86_401, u64::MAX] {
+            let mut bad = hold(true, "no-overflow", &["m"]);
+            bad.window_secs = window_secs;
+            let error = bad.validate(&scheduling).unwrap_err();
+            assert!(error.contains("window_secs"), "{window_secs}: {error}");
+        }
+        for window_secs in [300, 86_400] {
+            let mut good = hold(true, "no-overflow", &["m"]);
+            good.window_secs = window_secs;
+            assert!(good.validate(&scheduling).is_ok(), "{window_secs}");
+            assert_eq!(
+                good.to_fusillade(&scheduling).unwrap().validate(),
+                Ok(()),
+                "what dwctl accepts, fusillade runs with"
+            );
+        }
         let mut bad = hold(true, "no-overflow", &["m"]);
         bad.stale_after_secs = 60;
         assert!(bad.validate(&scheduling).unwrap_err().contains("stale_after_secs"));

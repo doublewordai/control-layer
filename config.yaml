@@ -991,18 +991,24 @@ background_services:
     # A held request is released (sent as stored, without the hold list, so the
     # hold no longer limits where it runs) when it would otherwise miss its
     # completion window: inside the claim ramp (claim_ramp_exponent) or past
-    # its deadline; when the model's held dispatches were refused and none
-    # completed over a whole window_secs of holding; when it is due at or
-    # before the latest deadline
-    # whose pending work cannot finish at the model's own completion rate
-    # (with safety_margin); when a refusal could no longer be retried before
-    # stop_before_deadline_ms; or when the decisions are older than
+    # its deadline; when the model's held dispatches were refused throughout a
+    # whole window_secs of holding and none completed (to within the counters'
+    # one-minute resolution: the first refusal at least window_secs - 60s ago
+    # and the latest in the last quarter of the window, at least the last two
+    # minutes); when it is due at or before the latest deadline whose pending
+    # work cannot finish at the model's own completion rate (with
+    # safety_margin); when a refusal could no longer be retried before the
+    # retry cut-off (stop_before_deadline_ms before the deadline, or the
+    # deadline itself when unset); or when the decisions are older than
     # stale_after_secs. Each replica recomputes the decisions every
-    # refresh_interval_secs from the shared hold_stats counters.
+    # refresh_interval_secs from the shared hold_stats counters. window_secs
+    # is between 300 and 86400.
     #
     # A held request refused for capacity (503/529) is retried after
     # max_backoff_ms without spending a retry, never fails for it, and neither
-    # lowers nor raises the model's adaptive concurrency. Encrypted request bodies
+    # lowers nor raises the model's adaptive concurrency. The gateway's own
+    # batch cap (a 529 with batch_capacity_exceeded) is not such a refusal and
+    # is handled as without the hold: it can fail at the retry cut-off. Encrypted request bodies
     # cannot carry the list and are never held. Off by default; with it off
     # the daemon's outbound bodies are unchanged. Rolling back is a config
     # change: remove the model or set enabled: false.

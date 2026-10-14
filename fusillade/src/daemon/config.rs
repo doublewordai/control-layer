@@ -337,7 +337,8 @@ pub struct DispatchHold {
     /// How often each daemon recomputes the release decisions. Default 60s.
     pub refresh_interval: std::time::Duration,
     /// Trailing window of held completions and refusals the decisions are
-    /// computed from. Default 15 minutes.
+    /// computed from, between [`Self::MIN_WINDOW`] and [`Self::MAX_WINDOW`].
+    /// Default 15 minutes.
     pub window: std::time::Duration,
     /// Fraction of a deadline's projected work added as margin. Default 0.2.
     pub safety_margin: f64,
@@ -350,6 +351,29 @@ pub struct DispatchHold {
 }
 
 impl DispatchHold {
+    /// The shortest supported [`Self::window`]: the counters are kept per
+    /// minute, so a window must span several minutes for "held, and refused,
+    /// throughout the window" to mean more than one minute's counts.
+    pub const MIN_WINDOW: std::time::Duration =
+        std::time::Duration::from_secs(fusillade_core::release::MIN_WINDOW_SECS);
+    /// The longest supported [`Self::window`]: one day.
+    pub const MAX_WINDOW: std::time::Duration =
+        std::time::Duration::from_secs(fusillade_core::release::MAX_WINDOW_SECS);
+
+    /// Check the tuning the daemon cannot run with: a window outside
+    /// [`Self::MIN_WINDOW`]..=[`Self::MAX_WINDOW`].
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if !(Self::MIN_WINDOW..=Self::MAX_WINDOW).contains(&self.window) {
+            return Err(format!(
+                "window must be between {}s and {}s, got {}s",
+                Self::MIN_WINDOW.as_secs(),
+                Self::MAX_WINDOW.as_secs(),
+                self.window.as_secs_f64()
+            ));
+        }
+        Ok(())
+    }
+
     /// A hold with the default tuning.
     pub fn new(tolerations: serde_json::Value, models: impl IntoIterator<Item = String>) -> Self {
         Self {

@@ -1735,13 +1735,9 @@ pub trait DaemonStorage: Send + Sync {
     fn set_dispatch_hold(&self, _claim: Option<crate::release::HoldClaim>) {}
 
     /// Add one daemon's held completions and refusals to the shared
-    /// per-minute counters of `minute`. Additive: daemons flush into the same
-    /// rows. The default storage keeps nothing.
-    async fn flush_hold_stats(
-        &self,
-        _minute: chrono::DateTime<chrono::Utc>,
-        _deltas: &[crate::release::HoldStatsDelta],
-    ) -> Result<()> {
+    /// per-minute counters, each delta under its own minute. Additive:
+    /// daemons flush into the same rows. The default storage keeps nothing.
+    async fn flush_hold_stats(&self, _deltas: &[crate::release::HoldStatsDelta]) -> Result<()> {
         Ok(())
     }
 
@@ -1750,8 +1746,9 @@ pub trait DaemonStorage: Send + Sync {
         Ok(0)
     }
 
-    /// Read each held model's counters over the trailing `window_secs` (and
-    /// the first counter minute in it) and its pending work that is not yet
+    /// Read each held model's counters over the trailing `window_secs` (with
+    /// the first counter minute in it, and the last one with a refusal) and
+    /// its pending work that is not yet
     /// overdue, cumulative by deadline, with the database clock they were
     /// read at. Models with neither may be omitted.
     async fn read_hold_inputs(
