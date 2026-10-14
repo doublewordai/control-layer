@@ -19173,6 +19173,7 @@ mod tests {
         let trigger1 = http_client.add_response_with_trigger(
             "POST /test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: "ok".to_string(),
             }),
@@ -19180,6 +19181,7 @@ mod tests {
         let _trigger2 = http_client.add_response_with_trigger(
             "POST /test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: "ok".to_string(),
             }),

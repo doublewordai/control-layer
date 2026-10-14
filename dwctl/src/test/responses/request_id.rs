@@ -1,0 +1,327 @@
+//! `X-Request-ID` is minted by dwctl for every request, echoed on every
+//! response and forwarded to providers; inbound values are never trusted.
+
+use opentelemetry_sdk::{
+    error::OTelSdkResult,
+    trace::{SpanData, SpanExporter},
+};
+use serde_json::json;
+use std::sync::{Arc, Mutex};
+use uuid::Uuid;
+
+#[derive(Clone, Debug, Default)]
+struct Exported(Arc<Mutex<Vec<SpanData>>>);
+impl SpanExporter for Exported {
+    async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+        self.0.lock().unwrap().extend(batch);
+        Ok(())
+    }
+}
+
+/// Collects formatted log output in memory.
+#[derive(Clone, Default)]
+struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+impl LogBuffer {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+impl std::io::Write for LogBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+    type Writer = LogBuffer;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+fn response_id(response: &axum_test::TestResponse) -> Uuid {
+    let value = response.header("x-request-id");
+    let id = Uuid::parse_str(value.to_str().expect("ascii header")).expect("x-request-id is a UUID");
+    assert_eq!(id.get_version_num(), 7, "x-request-id should be a UUIDv7");
+    id
+}
+
+#[dwctl_test_macros::test]
+async fn response_carries_minted_id_not_inbound(pool: sqlx::PgPool) {
+    let mock = wiremock::MockServer::start().await;
+    super::mount_chat_completions_mock(&mock).await;
+    let (server, key, _bg) = super::setup_ai_test(pool, &mock, true).await;
+    let body = json!({"model":"gpt-4o", "messages":[{"role":"user","content":"hello"}]});
+
+    let inbound = "edge-supplied-id-123";
+    let ok = server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .add_header("x-request-id", inbound)
+        .json(&body)
+        .await;
+    ok.assert_status_ok();
+    let first = response_id(&ok);
+    assert_ne!(first.to_string(), inbound, "inbound value must not be echoed");
+
+    // The provider receives our ID, not the client's.
+    let upstream = mock.received_requests().await.unwrap();
+    let sent = upstream
+        .last()
+        .unwrap()
+        .headers
+        .get("x-request-id")
+        .expect("provider receives x-request-id")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(sent, first.to_string());
+
+    // Every request gets a fresh ID.
+    let second = server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&body)
+        .await;
+    assert_ne!(response_id(&second), first);
+}
+
+#[dwctl_test_macros::test]
+async fn rejected_and_unrouted_responses_carry_id(pool: sqlx::PgPool) {
+    let mock = wiremock::MockServer::start().await;
+    super::mount_chat_completions_mock(&mock).await;
+    let (server, _key, _bg) = super::setup_ai_test(pool, &mock, true).await;
+
+    // Rejected by onwards authentication.
+    let unauthorized = server
+        .post("/ai/v1/chat/completions")
+        .add_header("x-request-id", "client-chosen")
+        .json(&json!({"model":"gpt-4o","messages":[]}))
+        .await;
+    unauthorized.assert_status(axum::http::StatusCode::UNAUTHORIZED);
+    response_id(&unauthorized);
+
+    // Unknown route, and an admin API route.
+    let missing = server.get("/does-not-exist").await;
+    response_id(&missing);
+    let admin = server.get("/admin/api/v1/users").await;
+    response_id(&admin);
+}
+
+/// The root request span carries our ID and the sanitised edge ID, both as
+/// log fields and as exported OTel attributes.
+#[dwctl_test_macros::test]
+async fn root_span_records_request_ids(pool: sqlx::PgPool) {
+    use opentelemetry::trace::TracerProvider;
+    use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let exporter = Exported::default();
+    let provider = SdkTracerProvider::builder()
+        .with_sampler(Sampler::AlwaysOn)
+        .with_simple_exporter(exporter.clone())
+        .build();
+    // Plain-text log output, as production writes it, to check the field format.
+    let logs = LogBuffer::default();
+    // Thread-local default: the in-process test transport serves the request on
+    // this task, so the request span is created under this subscriber.
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("request-id-test")))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .compact()
+                    .with_ansi(false)
+                    .with_writer(logs.clone()),
+            ),
+    );
+
+    let mock = wiremock::MockServer::start().await;
+    let (server, _key, _bg) = super::setup_ai_test(pool, &mock, true).await;
+    exporter.0.lock().unwrap().clear();
+
+    let attr = |span: &SpanData, key: &str| {
+        span.attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == key)
+            .map(|kv| kv.value.to_string())
+    };
+    let root_for = |path: &str| {
+        exporter
+            .0
+            .lock()
+            .unwrap()
+            .clone()
+            .into_iter()
+            .find(|s| attr(s, "url.path").as_deref() == Some(path))
+            .expect("root request span exported")
+    };
+
+    let response = server.get("/missing-a").add_header("x-request-id", "edge-123").await;
+    let id = response.header("x-request-id").to_str().unwrap().to_owned();
+    let span = root_for("/missing-a");
+    assert_eq!(attr(&span, "x_request_id").as_deref(), Some(id.as_str()));
+    assert_eq!(attr(&span, "edge_request_id").as_deref(), Some("edge-123"));
+    // Log lines carry the IDs unquoted, so `|= "x_request_id=<id>"` matches.
+    let text = logs.text();
+    assert!(
+        text.contains(&format!("x_request_id={id}")),
+        "unquoted x_request_id in logs:\n{text}"
+    );
+    assert!(
+        text.contains("edge_request_id=edge-123"),
+        "unquoted edge_request_id in logs:\n{text}"
+    );
+
+    // Unusable inbound values are dropped rather than recorded.
+    server.get("/missing-b").add_header("x-request-id", "x".repeat(129)).await;
+    let span = root_for("/missing-b");
+    assert!(attr(&span, "x_request_id").is_some());
+    assert_eq!(attr(&span, "edge_request_id"), None);
+}
+
+/// Failures inside the admin AI proxy middleware, which runs before routing,
+/// still carry our ID.
+#[dwctl_test_macros::test]
+async fn admin_ai_proxy_failures_carry_id(pool: sqlx::PgPool) {
+    let mock = wiremock::MockServer::start().await;
+    let (server, _key, _bg) = super::setup_ai_test(pool, &mock, true).await;
+
+    // No model in the body: the middleware refuses it before any route runs.
+    let refused = server
+        .post("/admin/api/v1/ai/v1/chat/completions")
+        .json(&json!({"messages":[]}))
+        .await;
+    assert!(refused.status_code().is_client_error(), "got {}", refused.status_code());
+    response_id(&refused);
+}
+
+/// A provider's own `X-Request-ID` is replaced by ours on the response, but
+/// kept on the root span as `provider_request_id`, including when the
+/// provider echoes back the ID we sent.
+#[dwctl_test_macros::test]
+async fn provider_request_id_recorded_on_span(pool: sqlx::PgPool) {
+    use opentelemetry::trace::TracerProvider;
+    use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
+    use tracing_subscriber::layer::SubscriberExt;
+    use wiremock::matchers::{header_exists, method, path};
+    use wiremock::{Mock, Request, ResponseTemplate};
+
+    let exporter = Exported::default();
+    let provider = SdkTracerProvider::builder()
+        .with_sampler(Sampler::AlwaysOn)
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(provider.tracer("request-id-test"))),
+    );
+
+    let mock = wiremock::MockServer::start().await;
+    let completion = json!({
+        "id": "chatcmpl-test", "object": "chat.completion", "created": 1700000000, "model": "gpt-4o",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    });
+    // The provider mints its own ID unless asked to echo ours back.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(header_exists("x-echo"))
+        .respond_with({
+            let completion = completion.clone();
+            move |request: &Request| {
+                let ours = request.headers.get("x-request-id").unwrap().to_str().unwrap().to_owned();
+                ResponseTemplate::new(200)
+                    .insert_header("x-request-id", ours.as_str())
+                    .set_body_json(completion.clone())
+            }
+        })
+        .with_priority(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-request-id", "req_provider_abc123")
+                .set_body_json(completion),
+        )
+        .with_priority(2)
+        .mount(&mock)
+        .await;
+    let (server, key, _bg) = super::setup_ai_test(pool, &mock, true).await;
+    let body = json!({"model":"gpt-4o", "messages":[{"role":"user","content":"hello"}]});
+
+    let attr = |span: &SpanData, key: &str| {
+        span.attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == key)
+            .map(|kv| kv.value.to_string())
+    };
+    let root_with_id = |id: &str| {
+        exporter
+            .0
+            .lock()
+            .unwrap()
+            .clone()
+            .into_iter()
+            .find(|s| attr(s, "x_request_id").as_deref() == Some(id))
+            .expect("root request span exported")
+    };
+
+    let response = server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&body)
+        .await;
+    response.assert_status_ok();
+    let ours = response_id(&response).to_string();
+    assert_eq!(
+        attr(&root_with_id(&ours), "provider_request_id").as_deref(),
+        Some("req_provider_abc123")
+    );
+
+    let echoed = server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .add_header("x-echo", "1")
+        .json(&body)
+        .await;
+    echoed.assert_status_ok();
+    let ours = response_id(&echoed).to_string();
+    assert_eq!(attr(&root_with_id(&ours), "provider_request_id").as_deref(), Some(ours.as_str()));
+}
+
+/// The analytics row for a request stores the ID the client received.
+#[dwctl_test_macros::test]
+async fn analytics_row_stores_request_id(pool: sqlx::PgPool) {
+    let mock = wiremock::MockServer::start().await;
+    super::mount_chat_completions_mock(&mock).await;
+    let (server, key, _bg) = super::setup_ai_test(pool.clone(), &mock, true).await;
+    let fetch =
+        || sqlx::query_scalar::<_, Option<Uuid>>("SELECT x_request_id FROM http_analytics WHERE model = 'gpt-4o'").fetch_optional(&pool);
+    assert_eq!(fetch().await.unwrap(), None, "no row before the request");
+
+    let response = server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({"model":"gpt-4o", "messages":[{"role":"user","content":"hello"}]}))
+        .await;
+    response.assert_status_ok();
+    let id = response_id(&response);
+
+    // The row is written asynchronously by the analytics projector.
+    let stored = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            if let Some(stored) = fetch().await.unwrap() {
+                return stored;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("analytics row was not written");
+    assert_eq!(stored, Some(id));
+}
