@@ -139,12 +139,13 @@ const ANTHROPIC_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
 /// Anthropic `thinking` and `output_config.effort` -> OpenAI `reasoning_effort`.
 ///
-/// Turning thinking off (`disabled`, or `between_tools` on models that refuse
-/// `disabled`) is `none` whatever the effort. Otherwise `output_config.effort`
-/// wins, then a `budget_tokens` bucket for `enabled`; with neither, the model's
-/// default applies.
+/// `disabled` is `none` whatever the effort. So is `between_tools`, although
+/// Anthropic's models still think between tool calls under it: none of ours has
+/// that mode, and `none` is the closest we can serve. Otherwise
+/// `output_config.effort` wins, then a `budget_tokens` bucket for `enabled`;
+/// with neither, the model's default applies. The effort is validated first,
+/// so a malformed one is refused even when thinking is off.
 fn reasoning_effort(thinking: Option<&Value>, output_config: Option<&Value>) -> Result<Option<&'static str>, TranslationError> {
-    let output_config = output_config.filter(|v| !v.is_null());
     if let Some(config) = output_config
         && !config.is_object()
     {
@@ -166,22 +167,22 @@ fn reasoning_effort(thinking: Option<&Value>, output_config: Option<&Value>) -> 
                 })?,
         ),
     };
-    let Some(thinking) = thinking.filter(|v| !v.is_null()) else {
+    let Some(thinking) = thinking else {
         return Ok(effort);
     };
     match thinking.get("type").and_then(Value::as_str) {
         Some("disabled" | "between_tools") => Ok(Some("none")),
         Some("adaptive") => Ok(effort),
-        Some("enabled") => Ok(effort.or_else(|| {
+        Some("enabled") => Ok(Some(effort.unwrap_or_else(|| {
             let budget = thinking.get("budget_tokens").and_then(Value::as_u64).unwrap_or(0);
-            Some(if budget <= 2048 {
+            if budget <= 2048 {
                 "low"
             } else if budget <= 8192 {
                 "medium"
             } else {
                 "high"
-            })
-        })),
+            }
+        }))),
         _ => Err(TranslationError::BadRequest(format!(
             "thinking.type: expected one of enabled, adaptive, disabled, between_tools, got {}",
             thinking.get("type").unwrap_or(&Value::Null)
@@ -746,6 +747,10 @@ mod tests {
             (json!({"thinking": {}}), "thinking.type"),
             (json!({"output_config": {"effort": "none"}}), "output_config.effort"),
             (json!({"output_config": {"effort": 3}}), "output_config.effort"),
+            (
+                json!({"thinking": {"type": "disabled"}, "output_config": {"effort": "turbo"}}),
+                "output_config.effort",
+            ),
             (json!({"output_config": "high"}), "output_config"),
             (json!({"output_config": ["high"]}), "output_config"),
         ] {
