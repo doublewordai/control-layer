@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { EditUserModal } from "./EditUserModal";
@@ -7,7 +7,10 @@ const { mutateAsync } = vi.hoisted(() => ({ mutateAsync: vi.fn() }));
 vi.mock("../../../api/control-layer", () => ({
   useUpdateUser: () => ({ mutateAsync, isPending: false }),
   useConfig: () => ({
-    data: { scheduling_toleration_presets: [], onwards: { strict_mode: false } },
+    data: {
+      scheduling_toleration_presets: [],
+      onwards: { strict_mode: false },
+    },
   }),
 }));
 
@@ -59,4 +62,95 @@ describe("EditUserModal serving payload permissions", () => {
       }
     },
   );
+});
+
+describe("EditUserModal realtime priority head start", () => {
+  beforeEach(() => {
+    mutateAsync.mockReset().mockResolvedValue({});
+  });
+
+  function renderModal(priority_bias_seconds: number | null) {
+    return render(
+      <EditUserModal
+        isOpen
+        onClose={vi.fn()}
+        onSuccess={vi.fn()}
+        userId="user-test"
+        canEditServing
+        currentUser={{
+          name: "Test",
+          email: "test@example.com",
+          username: "test",
+          roles: ["StandardUser"],
+          zero_data_retention: false,
+          priority_bias_seconds,
+        }}
+      />,
+    );
+  }
+
+  it("shows the stored value and sends an edited one", async () => {
+    const user = userEvent.setup();
+    renderModal(600);
+    const dialog = within(screen.getByRole("dialog"));
+    const input = dialog.getByLabelText("Realtime priority head start");
+    expect(input).toHaveValue(600);
+    await user.clear(input);
+    await user.type(input, "900");
+    expect(dialog.getByText(/up to 15 min earlier/)).toBeInTheDocument();
+    await user.click(dialog.getByRole("button", { name: "Save Changes" }));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledOnce());
+    expect(mutateAsync.mock.calls[0][0].data.priority_bias_seconds).toBe(900);
+  });
+
+  it("clears the bias when the field is emptied", async () => {
+    const user = userEvent.setup();
+    renderModal(600);
+    const dialog = within(screen.getByRole("dialog"));
+    await user.clear(dialog.getByLabelText("Realtime priority head start"));
+    await user.click(dialog.getByRole("button", { name: "Save Changes" }));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledOnce());
+    expect(mutateAsync.mock.calls[0][0].data.priority_bias_seconds).toBeNull();
+  });
+
+  it("refuses to save an out-of-range value", async () => {
+    const user = userEvent.setup();
+    renderModal(null);
+    const dialog = within(screen.getByRole("dialog"));
+    await user.type(
+      dialog.getByLabelText("Realtime priority head start"),
+      "86401",
+    );
+    expect(dialog.getByText(/maximum is 86400 seconds/)).toBeInTheDocument();
+    expect(dialog.getByRole("button", { name: "Save Changes" })).toBeDisabled();
+    expect(mutateAsync).not.toHaveBeenCalled();
+  });
+});
+
+describe("EditUserModal layout", () => {
+  it("scrolls the form body while the actions stay outside it", () => {
+    render(
+      <EditUserModal
+        isOpen
+        onClose={vi.fn()}
+        onSuccess={vi.fn()}
+        userId="user-test"
+        canEditServing
+        canEditZdr
+        currentUser={{
+          name: "Test",
+          email: "test@example.com",
+          username: "test",
+          roles: ["StandardUser"],
+          zero_data_retention: false,
+        }}
+      />,
+    );
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.className).toContain("max-h-[90vh]");
+    const body = within(dialog).getByTestId("edit-user-form-body");
+    expect(body.className).toContain("overflow-y-auto");
+    const save = within(dialog).getByRole("button", { name: "Save Changes" });
+    expect(body.contains(save)).toBe(false);
+  });
 });

@@ -519,6 +519,7 @@ pub async fn confirm_password_reset<P: PoolProvider>(
         self_hosted_only: None,
         granted_serving_classes: Default::default(),
         toleration_preset: Default::default(),
+        priority_bias_seconds: Default::default(),
     };
 
     let mut tx = state.db.write().begin().await.unwrap();
@@ -660,6 +661,7 @@ pub async fn change_password<P: PoolProvider>(
         self_hosted_only: None,
         granted_serving_classes: Default::default(),
         toleration_preset: Default::default(),
+        priority_bias_seconds: Default::default(),
     };
 
     user_repo.update(current_user.id, &update_request).await?;

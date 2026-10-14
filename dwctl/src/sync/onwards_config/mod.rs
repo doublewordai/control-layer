@@ -244,10 +244,11 @@ async fn load_inflight_overrides_from_db(db: &PgPool) -> Result<InflightOverride
 async fn load_accounts_from_db(db: &PgPool) -> Result<AccountsById, anyhow::Error> {
     let rows = sqlx::query!(
         r#"
-        SELECT id, granted_serving_classes, default_serving_class, self_hosted_only
+        SELECT id, granted_serving_classes, default_serving_class, self_hosted_only, priority_bias_seconds
         FROM users
         WHERE is_deleted = FALSE
-          AND (granted_serving_classes <> '{}' OR default_serving_class IS NOT NULL OR self_hosted_only)
+          AND (granted_serving_classes <> '{}' OR default_serving_class IS NOT NULL OR self_hosted_only
+               OR priority_bias_seconds IS NOT NULL)
         "#
     )
     .fetch_all(db)
@@ -262,6 +263,9 @@ async fn load_accounts_from_db(db: &PgPool) -> Result<AccountsById, anyhow::Erro
                     granted: parse_stored_classes(&row.granted_serving_classes),
                     default_class: parse_stored_class(row.default_serving_class.as_deref()),
                     self_hosted_only: row.self_hosted_only,
+                    // The CHECK constraint bounds it to 0..=86400; anything
+                    // else is schema drift and is read as no bias.
+                    priority_bias_seconds: row.priority_bias_seconds.and_then(|bias| u32::try_from(bias).ok()),
                 },
             )
         })

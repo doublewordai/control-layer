@@ -52,6 +52,18 @@ pub(crate) fn validate_elevated_serving_class(class: &str) -> crate::errors::Res
 /// unknown id is refused here, so an operator sees the typo rather than the
 /// account silently falling back to the fail-closed behaviour on the request
 /// path.
+/// Reject an account priority bias outside `0..=MAX_PRIORITY_BIAS_SECONDS`
+/// (the database CHECK enforces the same range).
+pub(crate) fn validate_priority_bias_seconds(bias: i32) -> crate::errors::Result<()> {
+    let max = onwards::serving::MAX_PRIORITY_BIAS_SECONDS;
+    if u32::try_from(bias).is_ok_and(|bias| bias <= max) {
+        return Ok(());
+    }
+    Err(crate::errors::Error::BadRequest {
+        message: format!("priority_bias_seconds must be between 0 and {max}, got {bias}."),
+    })
+}
+
 pub(crate) fn validate_toleration_preset<P: sqlx_pool_router::PoolProvider + Clone>(
     state: &crate::AppState<P>,
     preset: &str,

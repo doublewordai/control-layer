@@ -816,6 +816,7 @@ pub async fn target_message_handler<T: HttpClient>(
         let deadline_priority = serving::request_deadline_priority(
             realtime_arrival,
             key_purpose.as_deref(),
+            account.as_ref(),
             overlay.as_ref(),
             &resolution,
         );

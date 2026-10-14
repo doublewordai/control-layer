@@ -1910,7 +1910,7 @@ async fn test_cache_shape_serving_accounts_overlays_and_offered_classes(pool: sq
     .await
     .unwrap();
     sqlx::query!(
-        "UPDATE users SET granted_serving_classes = '{interactive}', default_serving_class = 'throughput', self_hosted_only = true WHERE id = '00000000-0000-0000-0000-0000000000a1'"
+        "UPDATE users SET granted_serving_classes = '{interactive}', default_serving_class = 'throughput', self_hosted_only = true, priority_bias_seconds = 600 WHERE id = '00000000-0000-0000-0000-0000000000a1'"
     )
     .execute(&pool)
     .await
@@ -1951,6 +1951,7 @@ async fn test_cache_shape_serving_accounts_overlays_and_offered_classes(pool: sq
             granted: vec![ServingClass::Interactive],
             default_class: Some(ServingClass::Throughput),
             self_hosted_only: true,
+            priority_bias_seconds: Some(600),
         }
     );
     assert!(

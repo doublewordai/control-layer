@@ -76,6 +76,10 @@ pub struct OrganizationServingResponse {
     pub default_serving_class: Option<String>,
     /// Never fall over to an external provider.
     pub self_hosted_only: bool,
+    /// Account realtime priority bias in seconds; a model overlay's own value
+    /// replaces it on that model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority_bias_seconds: Option<i32>,
     /// Per-model overrides, one per model the organisation has a deal on.
     pub overlays: Vec<OverlayResponse>,
     /// The organisation's own active token prices, across models

@@ -116,6 +116,7 @@ pub async fn get_organization_serving<P: PoolProvider>(
         granted_serving_classes: org.granted_serving_classes,
         default_serving_class: org.default_serving_class,
         self_hosted_only: org.self_hosted_only,
+        priority_bias_seconds: org.priority_bias_seconds,
         overlays: overlays.into_iter().map(OverlayResponse::from).collect(),
         tariffs,
         model_aliases,

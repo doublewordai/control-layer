@@ -1,7 +1,13 @@
 import { useState, useEffect } from "react";
-import { useUpdateOrganization, useOrganization, useConfig } from "@/api/control-layer/hooks";
+import {
+  useUpdateOrganization,
+  useOrganization,
+  useConfig,
+} from "@/api/control-layer/hooks";
 import type { Organization, ServingClassName } from "@/api/control-layer/types";
 import { SchedulingTolerations } from "@/components/features/scheduling/SchedulingTolerations";
+import { RealtimePriorityBias } from "@/components/features/scheduling/RealtimePriorityBias";
+import { parsePriorityBias } from "@/utils/priorityBias";
 import {
   Dialog,
   DialogContent,
@@ -40,9 +46,13 @@ export function EditOrganizationModal({
   const [displayName, setDisplayName] = useState("");
   const [zeroDataRetention, setZeroDataRetention] = useState(false);
   const [grantedClasses, setGrantedClasses] = useState<ServingClassName[]>([]);
-  const [defaultClass, setDefaultClass] = useState<ServingClassName | "standard">("standard");
+  const [defaultClass, setDefaultClass] = useState<
+    ServingClassName | "standard"
+  >("standard");
   const [selfHostedOnly, setSelfHostedOnly] = useState(false);
   const [tolerationPreset, setTolerationPreset] = useState<string | null>(null);
+  // Raw input text; empty means no bias.
+  const [priorityBias, setPriorityBias] = useState("");
   const updateOrg = useUpdateOrganization();
   const { data: config } = useConfig();
   // List rows carry the pinned preset for platform managers, but a row from a
@@ -50,10 +60,9 @@ export function EditOrganizationModal({
   // unrelated edit. While the modal is open, take the authoritative value from
   // the detail endpoint. Disabled while closed so a mount with no organization
   // does not fire a request for an empty id.
-  const { data: detail } = useOrganization(
-    organization?.id ?? "",
-    { enabled: isOpen && !!organization },
-  );
+  const { data: detail } = useOrganization(organization?.id ?? "", {
+    enabled: isOpen && !!organization,
+  });
 
   useEffect(() => {
     if (isOpen && organization) {
@@ -64,6 +73,11 @@ export function EditOrganizationModal({
       setDefaultClass(organization.default_serving_class ?? "standard");
       setSelfHostedOnly(organization.self_hosted_only ?? false);
       setTolerationPreset(organization.toleration_preset ?? null);
+      setPriorityBias(
+        organization.priority_bias_seconds == null
+          ? ""
+          : String(organization.priority_bias_seconds),
+      );
     }
   }, [organization, isOpen]);
 
@@ -72,18 +86,28 @@ export function EditOrganizationModal({
   useEffect(() => {
     if (isOpen && detail) {
       setTolerationPreset(detail.toleration_preset ?? null);
+      setPriorityBias(
+        detail.priority_bias_seconds == null
+          ? ""
+          : String(detail.priority_bias_seconds),
+      );
     }
   }, [detail, isOpen]);
+
+  const parsedBias = parsePriorityBias(priorityBias);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!organization) return;
+    if (canEditServing && !parsedBias.ok) {
+      toast.error(`Realtime priority head start: ${parsedBias.error}`);
+      return;
+    }
 
     const requestedEmail = email.trim();
     const emailChangeRequested =
       requestedEmail !== "" &&
-      requestedEmail.toLowerCase() !==
-        (organization.email ?? "").toLowerCase();
+      requestedEmail.toLowerCase() !== (organization.email ?? "").toLowerCase();
 
     try {
       const updated = await updateOrg.mutateAsync({
@@ -91,9 +115,7 @@ export function EditOrganizationModal({
         data: {
           display_name: displayName || undefined,
           email: requestedEmail || undefined,
-          ...(canEditZdr
-            ? { zero_data_retention: zeroDataRetention }
-            : {}),
+          ...(canEditZdr ? { zero_data_retention: zeroDataRetention } : {}),
           // Serving settings are platform-manager only server-side; sending
           // them as anyone else fails the whole request with a 403.
           ...(canEditServing
@@ -103,6 +125,7 @@ export function EditOrganizationModal({
                   defaultClass === "standard" ? null : defaultClass,
                 self_hosted_only: selfHostedOnly,
                 toleration_preset: tolerationPreset,
+                priority_bias_seconds: parsedBias.ok ? parsedBias.value : null,
               }
             : {}),
         },
@@ -122,35 +145,53 @@ export function EditOrganizationModal({
       onClose();
     } catch (error) {
       toast.error(
-        error instanceof Error ? error.message : "Failed to update organization",
+        error instanceof Error
+          ? error.message
+          : "Failed to update organization",
       );
     }
   };
 
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
-      <DialogContent className="sm:max-w-[425px]">
-        <DialogHeader>
+      {/* Header and footer stay put; only the form body scrolls, so the dialog
+          never grows past the viewport however many settings it shows. */}
+      <DialogContent className="sm:max-w-2xl max-h-[90vh] flex flex-col gap-0 p-0 overflow-hidden">
+        <DialogHeader className="px-6 pt-6 pb-4 border-b">
           <DialogTitle>Edit Organization</DialogTitle>
           <DialogDescription>
             Update organization details for {organization?.username}.
           </DialogDescription>
         </DialogHeader>
-        <form onSubmit={handleSubmit}>
-          <div className="grid gap-4 py-4">
-            <div className="grid gap-2">
-              <Label htmlFor="edit-email">Email</Label>
-              <Input
-                id="edit-email"
-                type="email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-              />
-              <p className="text-xs text-muted-foreground">
-                Changing the email sends a verification link to both the
-                current and the new address. The change only takes effect once
-                both are confirmed.
-              </p>
+        <form
+          id="edit-organization-form"
+          onSubmit={handleSubmit}
+          className="flex-1 min-h-0 overflow-y-auto px-6 py-4"
+        >
+          <div className="grid gap-4">
+            <div className="grid gap-4 sm:grid-cols-2 sm:items-start">
+              <div className="grid gap-2">
+                <Label htmlFor="edit-email">Email</Label>
+                <Input
+                  id="edit-email"
+                  type="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Changing the email sends a verification link to both the
+                  current and the new address. The change only takes effect once
+                  both are confirmed.
+                </p>
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="edit-displayName">Display Name</Label>
+                <Input
+                  id="edit-displayName"
+                  value={displayName}
+                  onChange={(e) => setDisplayName(e.target.value)}
+                />
+              </div>
             </div>
             {organization?.pending_email_change && (
               <AlertBox variant="warning">
@@ -168,14 +209,6 @@ export function EditOrganizationModal({
                 ). Saving a different email restarts the verification.
               </AlertBox>
             )}
-            <div className="grid gap-2">
-              <Label htmlFor="edit-displayName">Display Name</Label>
-              <Input
-                id="edit-displayName"
-                value={displayName}
-                onChange={(e) => setDisplayName(e.target.value)}
-              />
-            </div>
             {canEditZdr && (
               <div className="flex items-center justify-between gap-4">
                 <div className="grid gap-1">
@@ -194,50 +227,56 @@ export function EditOrganizationModal({
             )}
             {canEditServing && (
               <div className="grid gap-4 border-t pt-4">
-                <div className="grid gap-1">
-                  <Label>Serving classes held</Label>
-                  <p className="text-sm text-muted-foreground">
-                    A request may name one of these classes; the model must
-                    offer it too. Customers never edit this.
-                  </p>
-                  <div className="flex gap-4 pt-1">
-                    {(["interactive", "throughput"] as const).map((c) => (
-                      <label
-                        key={c}
-                        className="flex items-center gap-2 text-sm"
-                      >
-                        <Checkbox
-                          checked={grantedClasses.includes(c)}
-                          onCheckedChange={(checked) =>
-                            setGrantedClasses((prev) =>
-                              checked === true
-                                ? Array.from(new Set([...prev, c]))
-                                : prev.filter((x) => x !== c),
-                            )
-                          }
-                          aria-label={`Grant ${c}`}
-                        />
-                        {c}
-                      </label>
-                    ))}
+                <div className="grid gap-4 sm:grid-cols-2 sm:items-start">
+                  <div className="grid gap-1">
+                    <Label>Serving classes held</Label>
+                    <p className="text-sm text-muted-foreground">
+                      A request may name one of these classes; the model must
+                      offer it too. Customers never edit this.
+                    </p>
+                    <div className="flex gap-4 pt-1">
+                      {(["interactive", "throughput"] as const).map((c) => (
+                        <label
+                          key={c}
+                          className="flex items-center gap-2 text-sm"
+                        >
+                          <Checkbox
+                            checked={grantedClasses.includes(c)}
+                            onCheckedChange={(checked) =>
+                              setGrantedClasses((prev) =>
+                                checked === true
+                                  ? Array.from(new Set([...prev, c]))
+                                  : prev.filter((x) => x !== c),
+                              )
+                            }
+                            aria-label={`Grant ${c}`}
+                          />
+                          {c}
+                        </label>
+                      ))}
+                    </div>
                   </div>
-                </div>
-                <div className="grid gap-1">
-                  <Label htmlFor="edit-default-class">Default class</Label>
-                  <p className="text-sm text-muted-foreground">
-                    What requests ask for when they name no class. Applies only
-                    where the class is held and the model offers it.
-                  </p>
-                  <select
-                    id="edit-default-class"
-                    className="h-9 rounded-md border border-input bg-transparent px-3 text-sm"
-                    value={defaultClass}
-                    onChange={(e) => setDefaultClass(e.target.value as ServingClassName | "standard")}
-                  >
-                    <option value="standard">standard</option>
-                    <option value="interactive">interactive</option>
-                    <option value="throughput">throughput</option>
-                  </select>
+                  <div className="grid gap-1">
+                    <Label htmlFor="edit-default-class">Default class</Label>
+                    <p className="text-sm text-muted-foreground">
+                      What requests ask for when they name no class. Applies
+                      only where the class is held and the model offers it.
+                    </p>
+                    <select
+                      id="edit-default-class"
+                      className="h-9 rounded-md border border-input bg-transparent px-3 text-sm"
+                      value={defaultClass}
+                      onChange={(e) =>
+                        setDefaultClass(
+                          e.target.value as ServingClassName | "standard",
+                        )
+                      }
+                    >
+                      <option value="standard">standard</option>
+                      <option value="interactive">interactive</option>
+                      <option value="throughput">throughput</option>
+                    </select>
+                  </div>
                 </div>
                 <div className="flex items-center justify-between gap-4">
                   <div className="grid gap-1">
@@ -258,6 +297,12 @@ export function EditOrganizationModal({
                     aria-label="Toggle no external-provider fallback"
                   />
                 </div>
+                <RealtimePriorityBias
+                  id="edit-priority-bias-seconds"
+                  value={priorityBias}
+                  canEdit={canEditServing}
+                  onChange={setPriorityBias}
+                />
                 <SchedulingTolerations
                   preset={tolerationPreset}
                   presets={config?.scheduling_toleration_presets}
@@ -267,15 +312,19 @@ export function EditOrganizationModal({
               </div>
             )}
           </div>
-          <DialogFooter>
-            <Button type="button" variant="outline" onClick={onClose}>
-              Cancel
-            </Button>
-            <Button type="submit" disabled={updateOrg.isPending}>
-              {updateOrg.isPending ? "Saving..." : "Save"}
-            </Button>
-          </DialogFooter>
         </form>
+        <DialogFooter className="px-6 py-4 border-t">
+          <Button type="button" variant="outline" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            type="submit"
+            form="edit-organization-form"
+            disabled={updateOrg.isPending || (canEditServing && !parsedBias.ok)}
+          >
+            {updateOrg.isPending ? "Saving..." : "Save"}
+          </Button>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
   );

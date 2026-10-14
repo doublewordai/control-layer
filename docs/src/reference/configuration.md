@@ -733,7 +733,7 @@ seconds, the priority is `-T`, and the earliest `T` is served first:
 |---------|-----|------------|
 | Batch, flex and background (dispatched by the batch daemon) | The batch deadline | `background_services.batch_daemon.inject_deadline_priority` |
 | Realtime | Arrival time | `scheduling.inject_realtime_priority` |
-| Realtime, organisation with a model overlay bias | Arrival time minus the overlay's `priority_bias_seconds` | `scheduling.inject_realtime_priority` |
+| Realtime, account with a priority bias | Arrival time minus the bias | `scheduling.inject_realtime_priority` |
 
 ```yaml
 scheduling:
@@ -750,12 +750,18 @@ How the priority is chosen:
   `external` never get `nvext.agent_hints.priority`, and members of a named
   pool whose endpoint does not accept scheduling priority have the whole
   `nvext` object removed.
-- **Organisation bias.** An organisation's
+- **Account bias.** A platform manager can give an account (user or
+  organization) a realtime priority head start, `priority_bias_seconds` (0 to
+  86400), in the console's edit dialog or with `PATCH /admin/api/v1/users/{id}`
+  or `PATCH /admin/api/v1/organizations/{id}`. Its realtime requests use
+  `T = arrival - bias`, so they are served ahead of standard realtime requests
+  that arrived up to `bias` seconds earlier. `null` clears it. The bias applies
+  to the account that owns the API key, and only platform managers can see or
+  change it.
+- **Per-model bias.** An organisation's
   [model overlay](../how-to/organization-model-overlays.md#realtime-priority-bias)
-  can set `priority_bias_seconds` (0 to 86400) on a model. Its realtime requests
-  on that model use `T = arrival - bias`, so they are served ahead of standard
-  realtime requests that arrived up to `bias` seconds earlier. The bias applies
-  to the organisation that owns the API key.
+  can set `priority_bias_seconds` on one model. On that model it replaces the
+  account bias, and `0` removes the head start there.
 - **Serving-class presets.** A resolved preset's or overlay target's
   `priority` counts as a further head start in seconds: `T` is reduced by that
   amount.

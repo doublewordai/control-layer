@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE users SET granted_serving_classes = '{interactive}', default_serving_class = 'throughput', self_hosted_only = true, priority_bias_seconds = 600 WHERE id = '00000000-0000-0000-0000-0000000000a1'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "ebd74ec0ac413a9e10186368244041462a4ef5a0df27751278988bc9fc598277"
+}

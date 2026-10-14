@@ -1362,6 +1362,7 @@ mod tests {
             self_hosted_only: None,
             granted_serving_classes: Default::default(),
             toleration_preset: Default::default(),
+            priority_bias_seconds: Default::default(),
         };
         users_repo.update(user.id, &update).await.unwrap();
 

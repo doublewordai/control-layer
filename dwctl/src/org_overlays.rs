@@ -115,7 +115,8 @@ pub struct OrgModelOverlay {
     /// are moved earlier in the deadline-ordered scheduling priority sent to
     /// dynamo endpoints (`T = arrival - bias`, priority `-T`). Applies only
     /// when `scheduling.inject_realtime_priority` is on; batch and flex keep
-    /// their own deadlines. `0..=86400`; omitted = no bias.
+    /// their own deadlines. `0..=86400`; omitted inherits the account's bias
+    /// (set in the console), `0` removes it on this model.
     #[serde(default)]
     #[schemars(range(max = 86400))]
     pub priority_bias_seconds: Option<u32>,

@@ -385,6 +385,36 @@ async fn realtime_priority_applies_the_account_overlay_bias_on_that_model_only(p
 }
 
 #[dwctl_test_macros::test]
+async fn realtime_priority_uses_the_account_bias_unless_an_overlay_sets_one(pool: PgPool) {
+    let f = Fixture::with_realtime_priority(&pool).await;
+    sqlx::query("UPDATE users SET priority_bias_seconds = 600 WHERE id = $1")
+        .bind(f.user)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO model_overlays (user_id, deployed_model_id, priority_bias_seconds) SELECT $1, id, 900 FROM deployed_models WHERE alias = 'policy'",
+    )
+    .bind(f.user)
+    .execute(&pool)
+    .await
+    .unwrap();
+    f.services.sync_onwards_config(&pool).await.unwrap();
+
+    // No overlay on this alias: the account's bias.
+    let before = chrono::Utc::now().timestamp();
+    f.post("chat/completions", "no-offer", false).await.assert_status_ok();
+    let after = chrono::Utc::now().timestamp();
+    assert_deadline_priority(&f.last_body().await, before, after, 600, "account bias");
+
+    // The overlay's bias replaces it on its model.
+    let before = chrono::Utc::now().timestamp();
+    f.post("chat/completions", "policy", false).await.assert_status_ok();
+    let after = chrono::Utc::now().timestamp();
+    assert_deadline_priority(&f.last_body().await, before, after, 900, "overlay bias");
+}
+
+#[dwctl_test_macros::test]
 async fn realtime_priority_leaves_fusillade_dispatches_untouched(pool: PgPool) {
     let f = Fixture::with_realtime_priority(&pool).await;
     sqlx::query(

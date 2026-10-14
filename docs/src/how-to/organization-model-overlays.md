@@ -140,9 +140,10 @@ interactive/throughput batch prices are rejected by validation.
 When the installation sends deadline-ordered realtime priority
 (`scheduling.inject_realtime_priority`; see
 [Scheduling Priority](../reference/configuration.md#scheduling-priority)), an
-overlay can move an organisation's realtime requests on one model earlier in
-the queue. Set `priority_bias_seconds` on the model entry. The organisation and
-model alias below are fictional:
+organisation's realtime requests can be moved earlier in the queue. A platform
+manager sets an account-wide head start in the console. An overlay sets one for
+a single model, replacing the account value there. Set `priority_bias_seconds`
+on the model entry. The organisation and model alias below are fictional:
 
 ```yaml
 org: example-organization
@@ -154,12 +155,13 @@ models:
 The organisation's realtime requests on `example-model` get effective time
 `T = arrival - 900`, so they are served ahead of standard realtime work that
 arrived up to 15 minutes earlier, and ahead of batch work whose deadline is
-later than `T`. Other models and other organisations are unaffected. Batch and
-flex requests keep their batch deadline.
+later than `T`. On other models the organisation keeps its account head start,
+if it has one. Batch and flex requests keep their batch deadline.
 
 The value must be a whole number from `0` to `86400` (one day). Validation
 rejects negative, fractional and larger values. An entry may contain only
-`priority_bias_seconds`. Omitting the field means no bias. The bias has no
+`priority_bias_seconds`. Omitting the field inherits the account head start;
+`0` removes it on this model. The bias has no
 effect while `inject_realtime_priority` is off, and it is only sent to endpoints
 of kind `dynamo`.
 
