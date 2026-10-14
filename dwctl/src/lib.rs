@@ -1632,7 +1632,12 @@ async fn setup_database(
 /// configuration. Origin/credential handling differs by mode — see [`apply_cors`].
 fn create_cors_layer(cors: &CorsConfig) -> anyhow::Result<CorsLayer> {
     // Parse exposed headers as HeaderName
-    let exposed: Vec<http::HeaderName> = cors.exposed_headers.iter().filter_map(|h| h.parse().ok()).collect();
+    let mut exposed: Vec<http::HeaderName> = cors.exposed_headers.iter().filter_map(|h| h.parse().ok()).collect();
+    // Always let browsers read the request ID so users can quote it in support requests.
+    let request_id_header = http::HeaderName::from_static(REQUEST_ID_HEADER);
+    if !exposed.contains(&request_id_header) {
+        exposed.push(request_id_header);
+    }
 
     let mut cors_layer = CorsLayer::new()
         .allow_methods([
@@ -2762,10 +2767,14 @@ pub async fn build_router(
     }
 
     // Add tracing layer with OTel-compatible span names and HTTP semantic conventions.
-    // Only trace_id and otel.name are tracing span fields (visible in fmt log output).
-    // All other attributes are set via OpenTelemetrySpanExt::set_attribute() so they're
-    // exported to the trace backend but don't clutter log lines.
+    // Tracing span fields appear on every fmt log line in the request, so only the
+    // correlation keys are fields: trace_id, otel.name, x_request_id,
+    // edge_request_id and provider_request_id (the request IDs are what
+    // `|= "x_request_id=<id>"` log queries match on). All other attributes are set via
+    // OpenTelemetrySpanExt::set_attribute() so they're exported to the trace backend
+    // but don't clutter log lines.
     // Reference: https://opentelemetry.io/docs/specs/semconv/http/http-spans/
+    let router = router.layer(middleware::from_fn(record_provider_request_id));
     let router = router.layer(middleware::from_fn(inject_trace_id)).layer(
         TraceLayer::new_for_http()
             .make_span_with(|request: &http::Request<_>| {
@@ -2789,8 +2798,23 @@ pub async fn build_router(
                 let span = tracing::info_span!(
                     "request",
                     trace_id = tracing::field::Empty,
+                    x_request_id = tracing::field::Empty,
+                    edge_request_id = tracing::field::Empty,
+                    provider_request_id = tracing::field::Empty,
                     otel.name = %span_name,
                 );
+
+                // IDs minted by `assign_request_id`, which runs outside this layer.
+                // Declared span fields are exported as OTel attributes by the
+                // tracing-opentelemetry layer, so no separate set_attribute is needed.
+                // Recorded with `display` so log lines read `x_request_id=<id>`
+                // unquoted, matching `trace_id` and the line filters we document.
+                if let Some(ids) = request.extensions().get::<RequestIds>() {
+                    span.record("x_request_id", tracing::field::display(&ids.x_request_id));
+                    if let Some(edge) = &ids.edge_request_id {
+                        span.record("edge_request_id", tracing::field::display(edge));
+                    }
+                }
 
                 // W3C Trace Context propagation (https://www.w3.org/TR/trace-context/)
                 //
@@ -2855,6 +2879,51 @@ pub async fn build_router(
     Ok(router)
 }
 
+/// Header carrying the request ID, both on responses and towards providers.
+const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// Longest foreign `X-Request-ID` we keep (`edge_request_id`, `provider_request_id`).
+const MAX_INBOUND_REQUEST_ID_LEN: usize = 128;
+
+/// Request IDs attached to the request extensions by [`assign_request_id`].
+#[derive(Debug, Clone)]
+struct RequestIds {
+    /// Freshly minted UUIDv7; the only ID we log as `x_request_id`.
+    x_request_id: String,
+    /// Sanitised inbound `X-Request-ID` (e.g. set by an ingress), kept for correlation only.
+    edge_request_id: Option<String>,
+}
+
+/// Keep a request ID we did not mint (from the edge or a provider) only if it
+/// is short, visible ASCII.
+fn sanitise_inbound_request_id(value: &http::HeaderValue) -> Option<String> {
+    let s = value.to_str().ok()?;
+    (!s.is_empty() && s.len() <= MAX_INBOUND_REQUEST_ID_LEN && s.bytes().all(|b| b.is_ascii_graphic())).then(|| s.to_owned())
+}
+
+/// Middleware that mints a unique request ID for every request.
+///
+/// An inbound `X-Request-ID` is never trusted as our ID (clients and ingresses
+/// can set it, so it is not guaranteed unique). It is preserved as
+/// `edge_request_id` and overwritten with our own value, so that onwards
+/// forwards our ID to providers. The ID is echoed on every response.
+///
+/// Applied outside every other layer, including the admin AI proxy
+/// middleware, by [`Application::serve_with_listener`] and the test server.
+async fn assign_request_id(mut request: axum::extract::Request, next: middleware::Next) -> axum::response::Response {
+    let x_request_id = Uuid::now_v7().to_string();
+    let edge_request_id = request.headers().get(REQUEST_ID_HEADER).and_then(sanitise_inbound_request_id);
+    let value = http::HeaderValue::from_str(&x_request_id).expect("UUID is a valid header value");
+    request.headers_mut().insert(REQUEST_ID_HEADER, value.clone());
+    request.extensions_mut().insert(RequestIds {
+        x_request_id,
+        edge_request_id,
+    });
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(REQUEST_ID_HEADER, value);
+    response
+}
+
 /// Middleware that records the OpenTelemetry trace ID on the current span,
 /// making it visible in fmt log output for Loki → Tempo correlation.
 ///
@@ -2873,6 +2942,22 @@ async fn inject_trace_id(mut request: axum::extract::Request, next: middleware::
         request.headers_mut().remove("tracestate");
     }
     next.run(request).await
+}
+
+/// Records a provider's own `X-Request-ID`, which onwards passes through on
+/// proxied responses, as `provider_request_id` on the request span.
+///
+/// `assign_request_id` replaces the response header with our ID on the way
+/// out, so this is the only place the provider's value is kept. It is
+/// recorded even when the provider echoes back the ID we sent, so queries can
+/// rely on the field being present whenever the provider returned one.
+async fn record_provider_request_id(request: axum::extract::Request, next: middleware::Next) -> axum::response::Response {
+    let span = tracing::Span::current();
+    let response = next.run(request).await;
+    if let Some(provider) = response.headers().get(REQUEST_ID_HEADER).and_then(sanitise_inbound_request_id) {
+        span.record("provider_request_id", tracing::field::display(provider));
+    }
+    response
 }
 
 /// Container for background services and their lifecycle management.
@@ -4501,7 +4586,9 @@ impl Application {
     pub fn into_test_server(self) -> (axum_test::TestServer, BackgroundServices) {
         // Apply middleware before path matching for tests
         let middleware = middleware::from_fn_with_state(self.app_state, admin_ai_proxy_middleware);
-        let service = middleware.layer(self.router).into_make_service();
+        let service = middleware::from_fn(assign_request_id)
+            .layer(middleware.layer(self.router))
+            .into_make_service();
         let server = axum_test::TestServer::new(service).expect("Failed to create test server");
         (server, self.bg_services)
     }
@@ -4528,9 +4615,10 @@ impl Application {
             self.config.port
         );
 
-        // Apply middleware before path matching
+        // Apply middleware before path matching. The request ID is outermost so
+        // that responses from the admin AI proxy middleware carry it too.
         let middleware = middleware::from_fn_with_state(self.app_state, admin_ai_proxy_middleware);
-        let service = middleware.layer(self.router);
+        let service = middleware::from_fn(assign_request_id).layer(middleware.layer(self.router));
 
         // Cancel shutdown token when SIGTERM arrives, BEFORE axum starts waiting
         // for in-flight connections to close. This lets background services (e.g.,
