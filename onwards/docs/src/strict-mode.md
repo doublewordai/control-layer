@@ -138,15 +138,16 @@ A stream can also stop without any error from the upstream: the connection drops
 data: {"error":{"message":"The response stream was interrupted before it finished. Retry the request.","type":"api_error","param":null,"code":502}}
 ```
 
-Official OpenAI SDKs raise this as an API error, and the batch reassembler reclassifies it as a retryable `502`. If every choice had already finished, or the final usage had arrived, only the trailer was lost, and the stream ends with `data: [DONE]` instead. Nothing is added after the stream's own `[DONE]`, an embedded error event, or a final Responses event.
+Official OpenAI SDKs raise this as an API error, and the batch reassembler reclassifies it as a retryable `502`. If every requested choice (`n`) had already finished, or the usage-only chunk that follows them had arrived, only the trailer was lost, and the stream ends with `data: [DONE]` instead. Usage on a content chunk (`continuous_usage_stats`) doesn't count. The stream ends at its own `[DONE]`, an embedded error event, or a final Responses event; anything the upstream sends after that isn't forwarded.
 
 ## Supported endpoints
 
 Strict mode currently supports:
 
 - `/v1/chat/completions` (streaming and non-streaming) - Full sanitization
+- `/v1/completions` (streaming and non-streaming) - Full sanitization
 - `/v1/embeddings` - Full sanitization
-- `/v1/responses` (Open Responses API, non-streaming) - Full sanitization
+- `/v1/responses` (Open Responses API, streaming and non-streaming) - Full sanitization
 - `/v1/models` - Model listing (no sanitization needed)
 
 All supported endpoints include:
