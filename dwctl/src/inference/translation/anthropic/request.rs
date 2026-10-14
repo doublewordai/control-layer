@@ -55,7 +55,7 @@ pub fn to_chat_completions(req: MessagesRequest, cache_enabled: bool) -> Result<
     {
         out.insert("tool_choice".into(), v);
     }
-    if let Some(effort) = thinking_to_reasoning_effort(req.thinking.as_ref()) {
+    if let Some(effort) = reasoning_effort(req.thinking.as_ref(), req.output_config.as_ref())? {
         out.insert("reasoning_effort".into(), json!(effort));
     }
     // Only forward `service_tier` to engage dwctl's flex tier. Anthropic's
@@ -133,21 +133,61 @@ fn strip_cache_control_markers(out: &mut serde_json::Map<String, Value>) {
     }
 }
 
-/// Anthropic `thinking` config -> OpenAI `reasoning_effort` bucket. Only enabled
-/// thinking maps; absent or disabled leaves the backend at its default.
-fn thinking_to_reasoning_effort(thinking: Option<&Value>) -> Option<&'static str> {
-    let t = thinking?;
-    if t.get("type").and_then(Value::as_str) != Some("enabled") {
-        return None;
+/// Effort levels Anthropic accepts in `output_config.effort`; each has the same
+/// name as an OpenAI `reasoning_effort` value.
+const ANTHROPIC_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// Anthropic `thinking` and `output_config.effort` -> OpenAI `reasoning_effort`.
+///
+/// `disabled` is `none` whatever the effort. So is `between_tools`, although
+/// Anthropic's models still think between tool calls under it: none of ours has
+/// that mode, and `none` is the closest we can serve. Otherwise
+/// `output_config.effort` wins, then a `budget_tokens` bucket for `enabled`;
+/// with neither, the model's default applies. The effort is validated first,
+/// so a malformed one is refused even when thinking is off.
+fn reasoning_effort(thinking: Option<&Value>, output_config: Option<&Value>) -> Result<Option<&'static str>, TranslationError> {
+    if let Some(config) = output_config
+        && !config.is_object()
+    {
+        return Err(TranslationError::BadRequest(format!(
+            "output_config: expected an object, got {config}"
+        )));
     }
-    let budget = t.get("budget_tokens").and_then(Value::as_u64).unwrap_or(0);
-    Some(if budget <= 2048 {
-        "low"
-    } else if budget <= 8192 {
-        "medium"
-    } else {
-        "high"
-    })
+    let effort = match output_config.and_then(|config| config.get("effort")).filter(|v| !v.is_null()) {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .and_then(|effort| ANTHROPIC_EFFORTS.into_iter().find(|known| *known == effort))
+                .ok_or_else(|| {
+                    TranslationError::BadRequest(format!(
+                        "output_config.effort: expected one of {}, got {value}",
+                        ANTHROPIC_EFFORTS.join(", ")
+                    ))
+                })?,
+        ),
+    };
+    let Some(thinking) = thinking else {
+        return Ok(effort);
+    };
+    match thinking.get("type").and_then(Value::as_str) {
+        Some("disabled" | "between_tools") => Ok(Some("none")),
+        Some("adaptive") => Ok(effort),
+        Some("enabled") => Ok(Some(effort.unwrap_or_else(|| {
+            let budget = thinking.get("budget_tokens").and_then(Value::as_u64).unwrap_or(0);
+            if budget <= 2048 {
+                "low"
+            } else if budget <= 8192 {
+                "medium"
+            } else {
+                "high"
+            }
+        }))),
+        _ => Err(TranslationError::BadRequest(format!(
+            "thinking.type: expected one of enabled, adaptive, disabled, between_tools, got {}",
+            thinking.get("type").unwrap_or(&Value::Null)
+        ))),
+    }
 }
 
 /// System content (the top-level `system` field, or a `role: "system"` entry in
@@ -646,5 +686,79 @@ mod tests {
         .unwrap();
         let err = to_chat_completions(req, true).unwrap_err();
         assert!(matches!(err, TranslationError::BadRequest(m) if m.contains("developer")));
+    }
+
+    fn effort_for(extra: Value) -> Result<Option<Value>, TranslationError> {
+        let mut body = json!({"model": "m", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}]});
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let out = to_chat_completions(serde_json::from_value::<MessagesRequest>(body).unwrap(), true)?;
+        Ok(out.get("reasoning_effort").cloned())
+    }
+
+    #[test]
+    fn thinking_off_maps_to_effort_none_whatever_the_effort() {
+        for kind in ["disabled", "between_tools"] {
+            for extra in [
+                json!({"thinking": {"type": kind}}),
+                json!({"thinking": {"type": kind}, "output_config": {"effort": "high"}}),
+            ] {
+                assert_eq!(effort_for(extra.clone()).unwrap(), Some(json!("none")), "{extra}");
+            }
+        }
+    }
+
+    #[test]
+    fn output_config_effort_maps_by_name() {
+        for effort in ["low", "medium", "high", "xhigh", "max"] {
+            for extra in [
+                json!({"output_config": {"effort": effort}}),
+                json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": effort}}),
+                json!({"thinking": {"type": "enabled", "budget_tokens": 32000}, "output_config": {"effort": effort}}),
+            ] {
+                assert_eq!(effort_for(extra.clone()).unwrap(), Some(json!(effort)), "{extra}");
+            }
+        }
+    }
+
+    #[test]
+    fn adaptive_thinking_without_effort_leaves_the_model_default() {
+        assert_eq!(
+            effort_for(json!({"thinking": {"type": "adaptive", "display": "summarized"}})).unwrap(),
+            None
+        );
+        assert_eq!(
+            effort_for(json!({"thinking": null, "output_config": {"format": {}}})).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn enabled_thinking_without_effort_buckets_the_budget() {
+        for (budget, effort) in [(1024, "low"), (4096, "medium"), (32000, "high")] {
+            let extra = json!({"thinking": {"type": "enabled", "budget_tokens": budget}});
+            assert_eq!(effort_for(extra).unwrap(), Some(json!(effort)), "{budget}");
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_thinking_types_and_effort_values() {
+        for (extra, field) in [
+            (json!({"thinking": {"type": "sometimes"}}), "thinking.type"),
+            (json!({"thinking": {}}), "thinking.type"),
+            (json!({"output_config": {"effort": "none"}}), "output_config.effort"),
+            (json!({"output_config": {"effort": 3}}), "output_config.effort"),
+            (
+                json!({"thinking": {"type": "disabled"}, "output_config": {"effort": "turbo"}}),
+                "output_config.effort",
+            ),
+            (json!({"output_config": "high"}), "output_config"),
+            (json!({"output_config": ["high"]}), "output_config"),
+        ] {
+            let err = effort_for(extra.clone()).unwrap_err();
+            assert!(
+                matches!(&err, TranslationError::BadRequest(m) if m.contains(field)),
+                "{extra}: {err}"
+            );
+        }
     }
 }

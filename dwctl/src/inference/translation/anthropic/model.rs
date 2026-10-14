@@ -39,10 +39,14 @@ pub struct MessagesRequest {
     pub tools: Option<Vec<Tool>>,
     #[serde(default)]
     pub tool_choice: Option<Value>,
-    /// Extended-thinking config, e.g. `{"type":"enabled","budget_tokens":N}`.
-    /// Mapped to OpenAI `reasoning_effort` on the request.
+    /// Extended-thinking config, e.g. `{"type":"enabled","budget_tokens":N}`,
+    /// `{"type":"adaptive"}` or `{"type":"disabled"}`. Mapped to OpenAI
+    /// `reasoning_effort` on the request, together with `output_config.effort`.
     #[serde(default)]
     pub thinking: Option<Value>,
+    /// Output settings. Only `effort` is read; it maps to `reasoning_effort`.
+    #[serde(default)]
+    pub output_config: Option<Value>,
     /// Processing-tier hint. Anthropic's standard values (`auto`,
     /// `standard_only`) are priority-vs-standard and don't change dwctl
     /// routing. The dwctl-specific value `flex` opts the request into the
