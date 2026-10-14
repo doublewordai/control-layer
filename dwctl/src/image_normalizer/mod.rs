@@ -22,6 +22,13 @@
 //! 2. **Sign** ([`ImageNormalizer::sign`]) — exchange a token for a
 //!    short-lived signed URL ready to hand to an upstream provider.
 //!
+//! Zero-data-retention requests never put a plaintext image in the store. A
+//! ZDR flex request ingests with [`ImageNormalizer::ingest_sealed`], which
+//! encrypts the bytes with the request's ZDR key before upload (see
+//! [`sealed`]); the edge decrypts at dispatch and inlines a `data:` URI. A
+//! realtime ZDR request uses [`ImageNormalizer::load`] to fetch and validate
+//! the image without storing it at all.
+//!
 //! Realtime requests are single-stage (sign immediately at middleware
 //! time, ~15min TTL because the request completes in seconds). Queued
 //! requests (flex, batch files) are two-stage: ingest at submission (the
@@ -44,6 +51,7 @@
 //! - [`data_uri`] — minimal `data:` URI decoder.
 //! - [`walker`] — body-traversal helpers for both endpoint shapes and
 //!   for both ingest-time substitution and dispatch-time JIT signing.
+//! - [`sealed`] — encrypted-at-rest envelope for zero-data-retention images.
 //! - [`store`] — object-store trait + in-memory impl (for tests / local
 //!   dev) and a GCS-backed impl scaffold (full wiring pending).
 use async_trait::async_trait;
@@ -56,6 +64,7 @@ pub mod config;
 pub mod data_uri;
 pub mod fetcher;
 pub mod ip_filter;
+pub mod sealed;
 pub mod store;
 pub mod token;
 pub mod walker;
@@ -155,6 +164,31 @@ pub trait ImageNormalizer: Send + Sync {
     /// endpoint (after authorisation).
     async fn read(&self, token: ImageToken) -> Result<(String, Bytes), NormalizeError>;
 
+    /// Fetch (or decode) `input` and apply the same size / MIME policy as
+    /// [`ingest`](Self::ingest), WITHOUT storing anything. Returns
+    /// `(mime, bytes)`. Used for realtime zero-data-retention requests, whose
+    /// images are inlined for the provider instead of being written to the
+    /// store.
+    async fn load(&self, _input: ImageInput) -> Result<(String, Bytes), NormalizeError> {
+        Err(NormalizeError::BadInput("image normalisation is disabled".into()))
+    }
+
+    /// Like [`ingest`](Self::ingest), but the bytes are encrypted with `key`
+    /// before they reach the store (see [`sealed`]), so the store never holds
+    /// the plaintext. Used for zero-data-retention flex requests, with the
+    /// request's ZDR key. The token's hash is over the sealed object, not the
+    /// plaintext, so the object key cannot confirm a known image either.
+    async fn ingest_sealed(&self, _input: ImageInput, _key: &[u8]) -> Result<IngestResult, NormalizeError> {
+        Err(NormalizeError::BadInput("image normalisation is disabled".into()))
+    }
+
+    /// The raw sealed object for `token`, or `None` if the stored object is a
+    /// plaintext image. Decrypt with [`sealed::open`].
+    async fn read_sealed(&self, token: ImageToken) -> Result<Option<Bytes>, NormalizeError> {
+        let (_, bytes) = self.read(token).await?;
+        Ok(sealed::is_sealed(&bytes).then_some(bytes))
+    }
+
     /// True if `url` already points at an object in our own store (a URL we
     /// previously signed). Callers use this to avoid re-ingesting/re-signing
     /// an already-normalised URL — which would waste a re-fetch and clobber a
@@ -212,31 +246,7 @@ impl<S: ImageStore> DefaultImageNormalizer<S> {
 #[async_trait]
 impl<S: ImageStore + 'static> ImageNormalizer for DefaultImageNormalizer<S> {
     async fn ingest(&self, input: ImageInput) -> Result<IngestResult, NormalizeError> {
-        let (mime, bytes) = match input {
-            ImageInput::HttpUrl(url) => {
-                let fetched = self.fetcher.fetch(&url).await?;
-                (fetched.mime, fetched.bytes)
-            }
-            ImageInput::DataUri(uri) => {
-                let decoded = data_uri::parse(&uri)?;
-                // Enforce the same size and MIME policy as the HTTP fetch
-                // path — a `data:` URI must not bypass the normaliser's
-                // content limits (an oversized payload is a memory/storage
-                // DoS, and a non-image MIME would otherwise be stored and
-                // signed for a downstream provider).
-                let len = decoded.bytes.len() as u64;
-                if len > self.fetcher.max_bytes() {
-                    return Err(NormalizeError::BadInput(format!(
-                        "data: URI payload {len} bytes exceeds cap {}",
-                        self.fetcher.max_bytes()
-                    )));
-                }
-                if !self.fetcher.mime_allowed(&decoded.mime) {
-                    return Err(NormalizeError::BadInput(format!("mime not allowed: {}", decoded.mime)));
-                }
-                (decoded.mime, Bytes::from(decoded.bytes))
-            }
-        };
+        let (mime, bytes) = self.load(input).await?;
         let bytes_len = bytes.len() as u64;
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
@@ -271,6 +281,65 @@ impl<S: ImageStore + 'static> ImageNormalizer for DefaultImageNormalizer<S> {
             }
             token
         };
+        Ok(IngestResult { token, mime, bytes_len })
+    }
+
+    async fn load(&self, input: ImageInput) -> Result<(String, Bytes), NormalizeError> {
+        let (mime, bytes) = match input {
+            ImageInput::HttpUrl(url) => {
+                let fetched = self.fetcher.fetch(&url).await?;
+                (fetched.mime, fetched.bytes)
+            }
+            ImageInput::DataUri(uri) => {
+                // Bound the encoded payload before decoding it, so an oversized
+                // `data:` URI is refused without allocating its decoded size.
+                let max_encoded_len = self.fetcher.max_bytes().div_ceil(3).saturating_mul(4);
+                if uri
+                    .split_once(',')
+                    .is_some_and(|(_, payload)| payload.len() as u64 > max_encoded_len)
+                {
+                    return Err(NormalizeError::BadInput(format!(
+                        "data: URI payload exceeds cap {}",
+                        self.fetcher.max_bytes()
+                    )));
+                }
+                let decoded = data_uri::parse(&uri)?;
+                // Enforce the same size and MIME policy as the HTTP fetch
+                // path — a `data:` URI must not bypass the normaliser's
+                // content limits (an oversized payload is a memory/storage
+                // DoS, and a non-image MIME would otherwise be stored and
+                // signed for a downstream provider).
+                let len = decoded.bytes.len() as u64;
+                if len > self.fetcher.max_bytes() {
+                    return Err(NormalizeError::BadInput(format!(
+                        "data: URI payload {len} bytes exceeds cap {}",
+                        self.fetcher.max_bytes()
+                    )));
+                }
+                if !self.fetcher.mime_allowed(&decoded.mime) {
+                    return Err(NormalizeError::BadInput(format!("mime not allowed: {}", decoded.mime)));
+                }
+                (decoded.mime, Bytes::from(decoded.bytes))
+            }
+        };
+        // No image format starts with the sealed-object prefix. Refusing it here
+        // keeps that prefix an unambiguous marker: a stored plaintext image can
+        // never be mistaken for a sealed one.
+        if sealed::is_sealed(&bytes) {
+            return Err(NormalizeError::BadInput("payload is not a supported image".into()));
+        }
+        Ok((mime, bytes))
+    }
+
+    async fn ingest_sealed(&self, input: ImageInput, key: &[u8]) -> Result<IngestResult, NormalizeError> {
+        let (mime, bytes) = self.load(input).await?;
+        let bytes_len = bytes.len() as u64;
+        let blob = sealed::seal(key, &mime, &bytes).map_err(|e| NormalizeError::StoreFailed(format!("sealing image failed: {e}")))?;
+        let sha: [u8; 32] = Sha256::digest(&blob).into();
+        // Always its own object: a sealed object is readable only with this
+        // request's key, so it can never be shared with another upload.
+        let token = ImageToken::new_unique(sha);
+        self.store.put(token, sealed::SEALED_CONTENT_TYPE, Bytes::from(blob)).await?;
         Ok(IngestResult { token, mime, bytes_len })
     }
 
@@ -444,6 +513,98 @@ mod tests {
         let token = n.ingest(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string())).await.unwrap().token;
         assert_eq!(token.1, None);
         assert_eq!(n.read(token).await.unwrap().0, "image/png");
+    }
+
+    #[tokio::test]
+    async fn ingest_sealed_never_stores_plaintext() {
+        let store = Arc::new(MemoryStore::new());
+        let n = DefaultImageNormalizer::new(FetcherConfig::default(), store.clone());
+        let key = crate::keystore::generate_key();
+
+        let sealed_result = n
+            .ingest_sealed(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string()), &key)
+            .await
+            .unwrap();
+        assert_eq!(sealed_result.mime, "image/png");
+        assert!(sealed_result.token.1.is_some(), "a sealed object is always its own upload");
+
+        // The only stored object is ciphertext: no PNG signature anywhere in it.
+        let objects = store.objects();
+        assert_eq!(objects.len(), 1);
+        assert!(sealed::is_sealed(&objects[0]));
+        assert!(!objects[0].windows(4).any(|w| w == b"\x89PNG"));
+
+        // The token hash is not the plaintext hash, so the object key cannot
+        // confirm a known image.
+        let plain = DefaultImageNormalizer::new(FetcherConfig::default(), Arc::new(MemoryStore::new()))
+            .ingest(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string()))
+            .await
+            .unwrap();
+        assert_ne!(sealed_result.token.0, plain.token.0);
+
+        // Only the key opens it.
+        let blob = n.read_sealed(sealed_result.token).await.unwrap().expect("sealed object");
+        let (mime, bytes) = sealed::open(&key, &blob).unwrap();
+        assert_eq!(mime, "image/png");
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        assert!(sealed::open(&crate::keystore::generate_key(), &blob).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_payload_that_looks_sealed_is_refused() {
+        // An "image" carrying the sealed prefix must never be stored as
+        // plaintext, or a ZDR dispatch would try to open it as sealed.
+        use base64::Engine as _;
+        let mut spoof = sealed::SEALED_MAGIC.to_vec();
+        spoof.extend_from_slice(b"not really sealed");
+        let uri = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(&spoof));
+        let store = Arc::new(MemoryStore::new());
+        let n = DefaultImageNormalizer::new(FetcherConfig::default(), store.clone());
+        let err = n.ingest(ImageInput::DataUri(uri)).await.unwrap_err();
+        assert!(matches!(err, NormalizeError::BadInput(_)), "got {err:?}");
+        assert!(store.objects().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_oversized_data_uri_is_refused_before_decoding() {
+        let cfg = FetcherConfig {
+            max_bytes: 8,
+            ..FetcherConfig::default()
+        };
+        let n = DefaultImageNormalizer::new(cfg, Arc::new(MemoryStore::new()));
+        // Not even valid base64: proves the length check runs before the decode.
+        let uri = format!("data:image/png;base64,{}", "!".repeat(64));
+        let err = n.load(ImageInput::DataUri(uri)).await.unwrap_err();
+        match err {
+            NormalizeError::BadInput(m) => assert!(m.contains("exceeds cap"), "{m}"),
+            other => panic!("got {other:?}"),
+        }
+        // A payload at the cap still decodes.
+        let ok = format!("data:image/png;base64,{}", "AAAAAAAAAAA=");
+        assert!(n.load(ImageInput::DataUri(ok)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn read_sealed_is_none_for_plaintext_objects() {
+        let n = DefaultImageNormalizer::new(FetcherConfig::default(), Arc::new(MemoryStore::new()));
+        let token = n.ingest(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string())).await.unwrap().token;
+        assert!(n.read_sealed(token).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn load_validates_without_storing() {
+        let store = Arc::new(MemoryStore::new());
+        let n = DefaultImageNormalizer::new(FetcherConfig::default(), store.clone());
+        let (mime, bytes) = n.load(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string())).await.unwrap();
+        assert_eq!(mime, "image/png");
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        assert!(store.objects().is_empty());
+        // Same MIME policy as ingest.
+        let err = n
+            .load(ImageInput::DataUri("data:text/html;base64,PGgxPmhpPC9oMT4=".to_string()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, NormalizeError::BadInput(_)), "got {err:?}");
     }
 
     #[tokio::test]

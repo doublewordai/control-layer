@@ -40,6 +40,10 @@ pub struct OrganizationUpdateDBRequest {
     pub self_hosted_only: Option<bool>,
     /// Account setting: elevated serving classes held. `None` = don't change.
     pub granted_serving_classes: Option<Vec<String>>,
+    /// Account setting: the scheduling-toleration preset id pinned to this
+    /// organization's requests. `None` = don't change, `Some(None)` = clear
+    /// (back to the "Default" setting), `Some(Some(id))` = set the preset.
+    pub toleration_preset: Option<Option<String>>,
 }
 
 /// Database response for an organization membership

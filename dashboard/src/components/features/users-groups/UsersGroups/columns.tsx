@@ -4,6 +4,8 @@ import { type ColumnDef } from "@tanstack/react-table";
 import { ArrowUpDown, Edit2, Users, Trash2, Receipt } from "lucide-react";
 import { Checkbox, UserAvatar } from "@/components";
 import type { DisplayUser, DisplayGroup } from "@/types/display.ts";
+import type { SchedulingTolerationPreset } from "@/api/control-layer/types";
+import { presetBadgeLabel } from "@/utils/schedulingPresets";
 
 interface UserColumnActions {
   onEdit: (user: DisplayUser) => void;
@@ -12,6 +14,8 @@ interface UserColumnActions {
   onViewTransactions: (user: DisplayUser) => void;
   groups: DisplayGroup[];
   showTransactions?: boolean;
+  /** The configured presets, for labelling the badge. */
+  tolerationPresets?: SchedulingTolerationPreset[];
 }
 
 // Predefined color classes that Tailwind will include
@@ -76,6 +80,10 @@ export const createUserColumns = (
     },
     cell: ({ row }) => {
       const user = row.original;
+      const badge = presetBadgeLabel(
+        user.toleration_preset,
+        actions.tolerationPresets,
+      );
       return (
         <div className="flex items-center gap-3">
           <UserAvatar user={user} size="lg" />
@@ -87,6 +95,14 @@ export const createUserColumns = (
               {user.isAdmin && (
                 <span className="text-xs px-2 py-0.5 bg-doubleword-primary text-white rounded-full">
                   Admin
+                </span>
+              )}
+              {badge && (
+                <span
+                  className="text-xs px-2 py-0.5 bg-gray-100 text-gray-700 rounded-full"
+                  title={`Scheduling tolerations pinned: ${badge}`}
+                >
+                  {badge}
                 </span>
               )}
             </div>

@@ -331,6 +331,10 @@ credits:
   # target, and idempotent across the webhook/front-channel race.
   # Example: 25 gives a newly verified user 25 credits.
   verification_credits: 0
+  # Delay after a transient provider failure or first soft card decline before
+  # another automatic charge is eligible. Keep the 24h production default;
+  # staging can shorten this to exercise the complete decline lifecycle.
+  auto_topup_retry_delay: 24h
 
 # Optional feature toggles
 enable_metrics: true # Enable Prometheus metrics endpoint
@@ -346,6 +350,47 @@ heap_profiling:
   enabled: false # Default: false
   bind_address: "127.0.0.1:6060" # Default: 127.0.0.1:6060
   dump_timeout: 30s # Default: 30s
+
+# Scheduling toleration presets.
+#
+# An operator can pin an account (a user or an organization) to one of these
+# presets through the admin API / dashboard. Every inference request from a
+# pinned account then carries the preset's toleration list at
+# `nvext.routing_constraints.tolerations` before it reaches the inference
+# backend, for realtime, flex and batch traffic alike, so a backend that
+# honours tolerations keeps the account's work on the capacity you intend.
+#
+# Pinning restricts where an account's requests can be placed, and can make
+# scheduling harder for accounts sharing the same capacity, depending on how
+# the backend treats tolerations. Pin as few accounts as possible and only
+# when a customer requires it.
+#
+# This is a distinct setting from `self_hosted_only` (the account's
+# `users.self_hosted_only` / `organizations.self_hosted_only` flag): that flag
+# is the *gateway's* provider-fallback control and decides whether onwards may
+# route a request to a third-party (`external`) provider at all. These presets
+# say nothing about which provider is chosen; they only constrain where the
+# chosen backend may place an accepted request.
+#
+# `tolerations` uses the same shape as the request field: a list of
+# Kubernetes-style entries, each `{key, operator?, value?, effect?}` where
+# `operator` is `Equal` (the default, needs a `value`) or `Exists`, and
+# `effect` is `NoSchedule` (the default) or `PreferNoSchedule`. An empty list
+# asks the backend to keep the account off any tainted capacity. Wording here
+# is deliberately backend-agnostic.
+#
+# An account stores only the preset's `id` (`users.toleration_preset`). An id
+# the config no longer defines is a misconfiguration: the request path logs it
+# and fails closed by applying the empty (most restrictive) list.
+scheduling:
+  toleration_presets:
+    - id: "no-overflow"
+      label: "No overflow capacity"
+      description: >-
+        Never placed on capacity the backend marks with any taint, such as
+        overflow capacity; requests may be refused when dedicated capacity is
+        full.
+      tolerations: []
 # Note: Environment variables can override top level setting, as long as they're supplied with the DWCTL_ prefix:
 # DWCTL_PORT=8080
 #
@@ -573,7 +618,7 @@ onwards:
   # Override through the model API's aimd object, or set aimd.enabled=false to opt out.
   # See onwards/docs/src/load-aware-failover.md for coverage and tuning.
   # Strict-mode chat parameters refused with a 400 instead of forwarded.
-  # Onwards logs and counts every parameter not every worker can serve
+  # Onwards counts and traces every parameter not every worker can serve
   # (onwards_unsupported_params_total); only the ones listed here are refused.
   # Names come from onwards::unsupported_params::params(), e.g. [n, logprobs].
   # Set via environment: DWCTL_ONWARDS__REJECTED_PARAMS='[n,logprobs]'
@@ -879,8 +924,8 @@ background_services:
     # batch_archive_retirement_enabled: false
     # batch_archive_retention_days: <positive days>
     # DEPRECATED and ignored: request templates are always written to the
-    # weekly generation-2 partitions. Existing generation-1 rows remain
-    # readable. The key still parses so existing values files keep loading,
+    # weekly generation-2 partitions now that the generation-1 heap has been
+    # retired. The key still parses so existing values files keep loading,
     # but it logs a warning at startup. Remove it.
     # template_generation_writes_enabled: false
     # File-content expiry + weekly template partition retirement. Tombstones

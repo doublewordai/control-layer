@@ -1,0 +1,24 @@
+{
+  "id": "cus_ExampleCustomer",
+  "object": "customer",
+  "address": {
+    "city": null,
+    "country": "GB",
+    "line1": null,
+    "line2": null,
+    "postal_code": "EC1 1AA",
+    "state": null
+  },
+  "balance": 0,
+  "created": 1780346000,
+  "email": "buyer@example.test",
+  "invoice_settings": {
+    "custom_fields": null,
+    "default_payment_method": "pm_ExampleDefault",
+    "footer": null,
+    "rendering_options": null
+  },
+  "livemode": false,
+  "metadata": {},
+  "name": "Example Buyer Ltd"
+}

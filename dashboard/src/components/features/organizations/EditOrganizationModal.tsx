@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
-import { useUpdateOrganization } from "@/api/control-layer/hooks";
+import { useUpdateOrganization, useOrganization, useConfig } from "@/api/control-layer/hooks";
 import type { Organization, ServingClassName } from "@/api/control-layer/types";
+import { SchedulingTolerations } from "@/components/features/scheduling/SchedulingTolerations";
 import {
   Dialog,
   DialogContent,
@@ -41,7 +42,18 @@ export function EditOrganizationModal({
   const [grantedClasses, setGrantedClasses] = useState<ServingClassName[]>([]);
   const [defaultClass, setDefaultClass] = useState<ServingClassName | "standard">("standard");
   const [selfHostedOnly, setSelfHostedOnly] = useState(false);
+  const [tolerationPreset, setTolerationPreset] = useState<string | null>(null);
   const updateOrg = useUpdateOrganization();
+  const { data: config } = useConfig();
+  // List rows carry the pinned preset for platform managers, but a row from a
+  // projection that omits it would read as "Default" and clear the pin on any
+  // unrelated edit. While the modal is open, take the authoritative value from
+  // the detail endpoint. Disabled while closed so a mount with no organization
+  // does not fire a request for an empty id.
+  const { data: detail } = useOrganization(
+    organization?.id ?? "",
+    { enabled: isOpen && !!organization },
+  );
 
   useEffect(() => {
     if (isOpen && organization) {
@@ -51,8 +63,17 @@ export function EditOrganizationModal({
       setGrantedClasses(organization.granted_serving_classes ?? []);
       setDefaultClass(organization.default_serving_class ?? "standard");
       setSelfHostedOnly(organization.self_hosted_only ?? false);
+      setTolerationPreset(organization.toleration_preset ?? null);
     }
   }, [organization, isOpen]);
+
+  // The detail value wins once it arrives (and on every refetch), so the pin is
+  // only sent back as `null` when the operator actually cleared it.
+  useEffect(() => {
+    if (isOpen && detail) {
+      setTolerationPreset(detail.toleration_preset ?? null);
+    }
+  }, [detail, isOpen]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -81,6 +102,7 @@ export function EditOrganizationModal({
                 default_serving_class:
                   defaultClass === "standard" ? null : defaultClass,
                 self_hosted_only: selfHostedOnly,
+                toleration_preset: tolerationPreset,
               }
             : {}),
         },
@@ -220,20 +242,28 @@ export function EditOrganizationModal({
                 <div className="flex items-center justify-between gap-4">
                   <div className="grid gap-1">
                     <Label htmlFor="edit-self-hosted-only">
-                      Self-hosted only
+                      No external-provider fallback (gateway)
                     </Label>
                     <p className="text-sm text-muted-foreground">
-                      Never fall over to an external provider for this
-                      organisation's requests.
+                      Never fall over to a third-party (external) provider for
+                      this organisation's requests. Does not change where the
+                      inference backend places a request — that is the
+                      scheduling-tolerations setting below.
                     </p>
                   </div>
                   <Switch
                     id="edit-self-hosted-only"
                     checked={selfHostedOnly}
                     onCheckedChange={setSelfHostedOnly}
-                    aria-label="Toggle self-hosted only"
+                    aria-label="Toggle no external-provider fallback"
                   />
                 </div>
+                <SchedulingTolerations
+                  preset={tolerationPreset}
+                  presets={config?.scheduling_toleration_presets}
+                  canEdit={canEditServing}
+                  onChange={setTolerationPreset}
+                />
               </div>
             )}
           </div>

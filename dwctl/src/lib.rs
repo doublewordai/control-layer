@@ -179,6 +179,7 @@ pub mod reasoning;
 mod recompute;
 mod request_logging;
 pub mod sample_files;
+pub mod scheduling;
 mod static_assets;
 mod sync;
 pub mod task_retention;
@@ -330,6 +331,11 @@ where
     /// Per-replica cache of outstanding batch work used by batch admission.
     #[builder(default)]
     pub admission_demand_cache: crate::api::handlers::sla_capacity::AdmissionDemandCache,
+    /// Per-key account policy map (ZDR, disabled modalities, toleration
+    /// preset), kept fresh by [`crate::sync::key_policy`]. The batch ingest
+    /// path reads an account's resolved tolerations from here (its hidden batch
+    /// key belongs to that account) so batch matches realtime.
+    pub key_policy_cache: crate::sync::key_policy::KeyPolicyCache,
 }
 
 impl<P> AppState<P>
@@ -2393,6 +2399,13 @@ pub async fn build_router(
             realtime_ttl,
             token_ttl,
             pool: Some(sqlx_pool_router::DynPools::new(state.db.clone())),
+            keystore: state.keystore.clone(),
+            // Same policy map the inference middleware decides ZDR from, so a
+            // realtime ZDR caller's images are inlined rather than stored.
+            key_policy_cache: inference_middleware_state
+                .as_ref()
+                .map(|s| s.key_policy_cache.clone())
+                .unwrap_or_else(crate::sync::key_policy::KeyPolicyCache::empty),
         };
         onwards_router.layer(middleware::from_fn_with_state(
             image_normalizer_state,
@@ -3487,13 +3500,16 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         (onwards::target::Targets::from_config(empty_config)?, None)
     };
 
-    // Per-key account policy map (ZDR flag, disabled modalities): an initial
-    // synchronous load ALWAYS runs, so the map is never empty under live
-    // traffic (an empty map reads every key as non-ZDR and would silently leak
-    // a ZDR account's body). The LISTEN/NOTIFY refresh loop has its own switch,
-    // independent of onwards routing sync: the realtime modality gate enforces
-    // from this map, so it must keep refreshing even where routing sync is off.
-    let key_policy_cache = crate::sync::key_policy::initial_cache(&db_pools.write()).await?;
+    // Per-key account policy map (ZDR flag, disabled modalities, toleration
+    // preset): an initial synchronous load ALWAYS runs, so the map is never
+    // empty under live traffic (an empty map reads every key as non-ZDR and
+    // would silently leak a ZDR account's body). The LISTEN/NOTIFY refresh loop
+    // has its own switch, independent of onwards routing sync: the realtime
+    // modality gate enforces from this map, so it must keep refreshing even
+    // where routing sync is off. The map also carries the config's resolved
+    // toleration presets, so a stored preset id resolves on the hot path.
+    let key_policy_cache =
+        crate::sync::key_policy::initial_cache(&db_pools.write(), crate::scheduling::TolerationPresets::new(&config.scheduling)).await?;
     if config.background_services.key_policy_sync.enabled {
         let policy_pool = dyn_pools.clone();
         let policy_listener_pool = direct_pools.clone();
@@ -4361,6 +4377,7 @@ impl Application {
             flex_completion_window: config.batches.async_requests.completion_window.clone(),
             keystore: bg_services.keystore.clone(),
             key_policy_cache: bg_services.key_policy_cache.clone(),
+            sse_buffer_limit: config.onwards.sse_buffer_limit,
         };
 
         // Build onwards router from targets with body transform + response sanitization.
@@ -4436,6 +4453,7 @@ impl Application {
             .task_runner(bg_services.task_runner.clone())
             .maybe_outlet_db(outlet_pools.clone())
             .limiters(limiters)
+            .key_policy_cache(bg_services.key_policy_cache.clone())
             .maybe_connections_encryption_key(bg_services.connections_encryption_key.clone())
             .maybe_keystore(bg_services.keystore.clone())
             .response_store(response_store)
@@ -4445,7 +4463,12 @@ impl Application {
         if let Some(config_path) = config_path {
             bg_services.spawn(
                 "config-watcher",
-                config_watcher::watch_config_file(config_path, shared_config, bg_services.shutdown_token()),
+                config_watcher::watch_config_file(
+                    config_path,
+                    shared_config,
+                    bg_services.key_policy_cache.clone(),
+                    bg_services.shutdown_token(),
+                ),
             );
         }
 

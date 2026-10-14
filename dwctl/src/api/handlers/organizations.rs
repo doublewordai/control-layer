@@ -434,7 +434,19 @@ pub async fn list_organizations<P: PoolProvider>(
 
         let data = orgs
             .into_iter()
-            .map(|o| OrganizationResponse::from_user(UserResponse::from(o)))
+            .map(|o| {
+                // The pinned preset is an operator's routing decision, so it is
+                // disclosed on the same gate as the detail GET (UpdateAll), not
+                // the read gate that reaches this branch. Hiding it from a
+                // read-all caller would also clear a pin on any edit made from
+                // the list, which submits the field back as `null`.
+                let toleration_preset = if can_update_all_resources(&current_user, Resource::Organizations) {
+                    o.toleration_preset.clone()
+                } else {
+                    None
+                };
+                OrganizationResponse::from_user(UserResponse::from(o)).with_toleration_preset(toleration_preset)
+            })
             .collect();
 
         Ok(Json(PaginatedResponse {
@@ -547,10 +559,18 @@ pub async fn get_organization<P: PoolProvider>(
     let auto_join_enabled = org_repo.auto_join_enabled(id).await?;
     let disabled_modalities = org_repo.disabled_modalities(id).await?;
 
+    // The scheduling-toleration preset is an operator's routing decision, so
+    // only platform managers (UpdateAll on organizations) see it, in the GET as
+    // well as the PATCH. `org` is materialised from `users`, and
+    // `UserResponse::from` deliberately drops the field; we re-attach it here.
+    let can_update_all = crate::auth::permissions::has_permission(&current_user, Resource::Organizations, Operation::UpdateAll);
+    let toleration_preset = if can_update_all { org.toleration_preset.clone() } else { None };
+
     let mut response = OrganizationResponse::from_user(UserResponse::from(org))
         .with_member_count(members.len() as i64)
         .with_auto_join_enabled(auto_join_enabled)
-        .with_disabled_modalities(disabled_modalities);
+        .with_disabled_modalities(disabled_modalities)
+        .with_toleration_preset(toleration_preset);
     if let Some(pending) = pending_email_change {
         response = response.with_pending_email_change(PendingEmailChangeResponse::from(pending));
     }
@@ -631,12 +651,22 @@ pub async fn update_organization<P: PoolProvider>(
     // prioritised fleet-wide. They are operated by platform managers only,
     // never by the organisation itself, whatever its role: customers meet
     // serving classes only as a model suffix. Same rule as the users endpoint.
-    if !can_all && (data.granted_serving_classes.is_some() || data.default_serving_class.is_some() || data.self_hosted_only.is_some()) {
+    if !can_all
+        && (data.granted_serving_classes.is_some()
+            || data.default_serving_class.is_some()
+            || data.self_hosted_only.is_some()
+            || data.toleration_preset.is_some())
+    {
         return Err(Error::InsufficientPermissions {
             required: Permission::Allow(Resource::Organizations, Operation::UpdateAll),
             action: Operation::UpdateAll,
             resource: format!("serving settings for organization {id}"),
         });
+    }
+    // Reject a preset id this deployment does not define, so a typo fails here
+    // rather than silently pinning the workspace to nothing.
+    if let Some(Some(preset)) = &data.toleration_preset {
+        super::validate_toleration_preset(&state, preset)?;
     }
     if let Some(Some(class)) = &data.default_serving_class {
         validate_elevated_serving_class(class)?;
@@ -838,6 +868,7 @@ pub async fn update_organization<P: PoolProvider>(
         default_serving_class: data.default_serving_class,
         self_hosted_only: data.self_hosted_only,
         granted_serving_classes: data.granted_serving_classes,
+        toleration_preset: data.toleration_preset,
     };
     debug_assert!(
         db_request.email.is_none(),
@@ -874,9 +905,15 @@ pub async fn update_organization<P: PoolProvider>(
             .map(PendingEmailChangeResponse::from),
     };
 
+    // Only a platform manager could have set a preset (the UpdateAll gate above
+    // rejects anyone else), so they are the only caller who sees it here, the
+    // same rule the GET endpoint applies.
+    let toleration_preset = if can_all { org.toleration_preset.clone() } else { None };
+
     let mut response = OrganizationResponse::from_user(UserResponse::from(org))
         .with_auto_join_enabled(auto_join_enabled)
-        .with_disabled_modalities(disabled_modalities);
+        .with_disabled_modalities(disabled_modalities)
+        .with_toleration_preset(toleration_preset);
     if let Some(info) = pending_email_change {
         response = response.with_pending_email_change(info);
     }
@@ -2944,6 +2981,7 @@ pub async fn confirm_email_change<P: PoolProvider>(
             default_serving_class: None,
             self_hosted_only: None,
             granted_serving_classes: Default::default(),
+            toleration_preset: Default::default(),
         };
         org_repo.update(pending.organization_id, &update).await?;
         // The `confirm_*_email_side` UPDATE above already locked this row, so

@@ -1,5 +1,59 @@
 # Changelog
 
+## [14.0.1](https://github.com/doublewordai/control-layer/compare/v14.0.0...v14.0.1) (2026-10-13)
+
+
+### Bug Fixes
+
+* **fusillade:** index batches that finished after their deadline ([#1969](https://github.com/doublewordai/control-layer/issues/1969)) ([04beeb4](https://github.com/doublewordai/control-layer/commit/04beeb4760a6cca460091c67ac9119ea598100e7))
+* **responses:** preserve prior input in continuations ([#1964](https://github.com/doublewordai/control-layer/issues/1964)) ([e299065](https://github.com/doublewordai/control-layer/commit/e29906525eeff70544ab7e0c5b755f30d58174cf))
+
+
+### Tests
+
+* **pricing:** stamp fixture tariffs with the host clock ([#1967](https://github.com/doublewordai/control-layer/issues/1967)) ([86cc1d9](https://github.com/doublewordai/control-layer/commit/86cc1d9f9d4bb50de025973f5b5452e643ea3371))
+
+## [14.0.0](https://github.com/doublewordai/control-layer/compare/v13.7.0...v14.0.0) (2026-10-12)
+
+
+### ⚠ BREAKING CHANGES
+
+* retire the generation-1 request template heap ([#1575](https://github.com/doublewordai/control-layer/issues/1575))
+
+### Features
+
+* **accounts:** per-account scheduling toleration presets ([#1954](https://github.com/doublewordai/control-layer/issues/1954)) ([124032b](https://github.com/doublewordai/control-layer/commit/124032bb7ed2857855c3428768839d803c8b5fc8))
+* **dashboard:** add dark mode with light/dark/system switcher ([#1942](https://github.com/doublewordai/control-layer/issues/1942)) ([d4a9547](https://github.com/doublewordai/control-layer/commit/d4a9547f5d2e90b16bf1a76fe1489ba03e96aade))
+* **onwards:** stop logging rejections and unsupported parameters ([#1963](https://github.com/doublewordai/control-layer/issues/1963)) ([68315f4](https://github.com/doublewordai/control-layer/commit/68315f4941a15217cdbd31f0adba3a0c22aa9478))
+* retire the generation-1 request template heap ([#1575](https://github.com/doublewordai/control-layer/issues/1575)) ([ebe9807](https://github.com/doublewordai/control-layer/commit/ebe980704bc29f751e425b86ff3df259fa841ed3))
+
+
+### Bug Fixes
+
+* keep API keys out of rate-limit and proxy debug logs ([#1960](https://github.com/doublewordai/control-layer/issues/1960)) ([43bf8e8](https://github.com/doublewordai/control-layer/commit/43bf8e84cf8e08a0d863351b86b12c913f57ec92))
+
+## [13.7.0](https://github.com/doublewordai/control-layer/compare/v13.6.0...v13.7.0) (2026-10-10)
+
+
+### Features
+
+* **limits:** name the account and report its limit on in-flight metrics ([#1958](https://github.com/doublewordai/control-layer/issues/1958)) ([72c6e97](https://github.com/doublewordai/control-layer/commit/72c6e974d435a20ed5cd36f977016434b3b7be4b))
+
+## [13.6.0](https://github.com/doublewordai/control-layer/compare/v13.5.0...v13.6.0) (2026-10-10)
+
+
+### Features
+
+* **limits:** count in-flight limit checks and refusals per account ([#1957](https://github.com/doublewordai/control-layer/issues/1957)) ([f6a7486](https://github.com/doublewordai/control-layer/commit/f6a74865a43a71bb9c3d9228958dfde66c364477))
+* **onwards:** trace rejections and stop logging caller-limit refusals ([#1952](https://github.com/doublewordai/control-layer/issues/1952)) ([f051e4c](https://github.com/doublewordai/control-layer/commit/f051e4c8324f413422fc237abcf3ddac504b9650))
+
+## [13.5.0](https://github.com/doublewordai/control-layer/compare/v13.4.3...v13.5.0) (2026-10-09)
+
+
+### Features
+
+* **zdr:** encrypt images at rest for zero-data-retention requests ([#1953](https://github.com/doublewordai/control-layer/issues/1953)) ([f63e795](https://github.com/doublewordai/control-layer/commit/f63e795fc79f4871b4b85f6fc7d9cc57c0752e4b))
+
 ## [13.4.3](https://github.com/doublewordai/control-layer/compare/v13.4.2...v13.4.3) (2026-10-09)
 
 

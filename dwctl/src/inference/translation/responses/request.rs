@@ -87,21 +87,19 @@ pub fn to_chat_request(request: &ResponsesRequest) -> ChatCompletionRequest {
         parallel_tool_calls: request.parallel_tool_calls,
         response_format: convert_text_format_to_response_format(request.text.as_ref()),
         service_tier: None,
-        extra: nvext_passthrough(request),
+        // `nvext` is a dwctl routing extension the outer inference middleware
+        // writes to the body (the account's scheduling tolerations, and in
+        // strict mode onwards' router targets). It has no Responses-API
+        // equivalent, so this flat converter must carry it across explicitly:
+        // the translator sits inner to the inference middleware, and onwards
+        // reads the tolerations off the Chat Completions body this produces.
+        // Every other Responses-only field is left out, as before.
+        extra: request
+            .extra
+            .as_ref()
+            .and_then(|value| value.get("nvext"))
+            .map(|nvext| serde_json::json!({ "nvext": nvext })),
     }
-}
-
-/// The request extensions (`nvext`) carried onto the Chat Completions body.
-/// They hold the fusillade daemon's scheduling priority and scheduling
-/// tolerations for a batch-dispatched `/v1/responses` request; dropping them
-/// here would let the backend schedule a batch request as if it carried
-/// neither. A realtime
-/// client's own priority and tolerations are stripped by the inference
-/// middleware, which runs before translation, so whatever survives to here is
-/// either trusted or harmless.
-fn nvext_passthrough(request: &ResponsesRequest) -> Option<serde_json::Value> {
-    let nvext = request.extra.as_ref()?.get("nvext").filter(|v| v.is_object())?;
-    Some(serde_json::json!({ "nvext": nvext }))
 }
 
 /// Convert Responses API input to Chat Completions messages.
@@ -850,27 +848,30 @@ mod tests {
     }
 
     #[test]
-    fn nvext_survives_conversion() {
+    fn nvext_survives_translation_and_nothing_else_does() {
+        // The account's scheduling tolerations reach the request body as
+        // `nvext` before this translator runs, so it must carry `nvext` onto
+        // the Chat Completions body onwards reads. A Responses-only field is
+        // still dropped.
         let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
-            "model": "m",
-            "input": "hi",
-            "stream": true,
-            "nvext": {
-                "agent_hints": {"priority": -1_700_000_000},
-                "routing_constraints": {"tolerations": []}
-            }
+            "model": "gpt-4o",
+            "input": "Hello",
+            "nvext": {"routing_constraints": {"tolerations": [{"key": "pool", "operator": "Exists"}]}},
+            "store": true
         }))
         .unwrap();
-        let chat = serde_json::to_value(to_chat_request(&request)).unwrap();
-        assert_eq!(
-            chat["nvext"]["routing_constraints"]["tolerations"],
-            serde_json::json!([]),
-            "a batch request must keep the daemon's tolerations"
-        );
-        assert_eq!(chat["nvext"]["agent_hints"]["priority"], -1_700_000_000);
 
-        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({"model": "m", "input": "hi"})).unwrap();
-        let chat = serde_json::to_value(to_chat_request(&request)).unwrap();
-        assert!(chat.get("nvext").is_none(), "nothing to carry, nothing added");
+        let chat = to_chat_request(&request);
+        let body = serde_json::to_value(&chat).unwrap();
+        assert_eq!(
+            body["nvext"]["routing_constraints"]["tolerations"],
+            serde_json::json!([{"key": "pool", "operator": "Exists"}]),
+            "the pinned tolerations survive translation: {body}"
+        );
+        assert!(body.get("store").is_none(), "a Responses-only field is not carried over: {body}");
+
+        // A request without `nvext` stays without it.
+        let plain: ResponsesRequest = serde_json::from_value(serde_json::json!({"model": "gpt-4o", "input": "Hello"})).unwrap();
+        assert!(serde_json::to_value(to_chat_request(&plain)).unwrap().get("nvext").is_none());
     }
 }

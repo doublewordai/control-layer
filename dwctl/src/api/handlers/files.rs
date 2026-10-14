@@ -177,6 +177,7 @@ impl OpenAIBatchRequest {
         api_key: String,
         accessible_models: &HashMap<String, AccessibleBatchModel>,
         allowed_url_paths: &[String],
+        tolerations: Option<&serde_json::Value>,
     ) -> Result<fusillade::RequestTemplateInput> {
         // Validate custom_id is safe for HTTP headers
         validate_custom_id(&self.custom_id)?;
@@ -233,6 +234,13 @@ impl OpenAIBatchRequest {
         let mut sanitized_body = self.body.clone();
         sanitized_body["model"] = model.clone().into();
         crate::inference::middleware::strip_scheduling_priority(&mut sanitized_body);
+
+        // A preset-pinned account's batch requests carry its preset's fixed
+        // toleration list, exactly as its realtime and flex requests do. Applied
+        // after the strip above so the client can never override it.
+        if let Some(tolerations) = tolerations {
+            crate::inference::middleware::set_routing_tolerations(&mut sanitized_body, tolerations);
+        }
 
         // Serialize sanitized body back to string
         let body = serde_json::to_string(&sanitized_body).map_err(|e| Error::BadRequest {
@@ -689,6 +697,11 @@ struct FileRequestContext {
     api_key: String,
     accessible_models: HashMap<String, AccessibleBatchModel>,
     allowed_url_paths: Vec<String>,
+    /// The toleration list the account that owns this upload is pinned to,
+    /// resolved from its preset, or `None` when it is on "Default". Written
+    /// verbatim to `nvext.routing_constraints.tolerations` on every template
+    /// body.
+    tolerations: Option<serde_json::Value>,
 }
 
 struct AccessibleBatchModel {
@@ -728,6 +741,7 @@ fn create_file_stream(
         api_key,
         accessible_models,
         allowed_url_paths,
+        tolerations,
     } = req_ctx;
     let normalizer = config.normalizer.clone();
     let normalizer_mode = config.normalizer_mode;
@@ -927,8 +941,13 @@ fn create_file_stream(
                                     match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
                                         Ok(openai_req) => {
                                             // Transform to internal format (includes model access validation)
-                                            match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models, &allowed_url_paths)
-                                            {
+                                            match openai_req.to_internal(
+                                                &endpoint,
+                                                api_key.clone(),
+                                                &accessible_models,
+                                                &allowed_url_paths,
+                                                tolerations.as_ref(),
+                                            ) {
                                                 Ok(mut template) => {
                                                     // Normalise image URLs in the per-template body
                                                     // before the size cap check, since substitution
@@ -1019,7 +1038,13 @@ fn create_file_stream(
 
                             match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
                                 Ok(openai_req) => {
-                                    match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models, &allowed_url_paths) {
+                                    match openai_req.to_internal(
+                                        &endpoint,
+                                        api_key.clone(),
+                                        &accessible_models,
+                                        &allowed_url_paths,
+                                        tolerations.as_ref(),
+                                    ) {
                                         Ok(mut template) => {
                                             // Normalise image URLs in the trailing line as well.
                                             if let Err(e) = normalize_template_body_in_place(
@@ -1229,6 +1254,29 @@ pub async fn upload_file<P: PoolProvider>(
         .await
         .map_err(Error::Database)?;
 
+    // The account's resolved scheduling tolerations, if it is pinned to a
+    // preset. The hidden batch key belongs to the account that owns the batch
+    // (`target_user_id` is the org in org context, else the person), so its
+    // per-key policy carries the account's preset. Read it from the same policy
+    // map realtime uses, so batch and realtime agree on the toleration list.
+    //
+    // A just-created hidden key cannot be in the policy map yet: the map is
+    // refreshed asynchronously off the auth_config_changed notification, which
+    // this request's `api_keys` INSERT fires but the LISTEN/NOTIFY loop has not
+    // consumed. Only in that case (the key is absent from the map) read the
+    // account's policy straight off the users row, reusing the connection `conn`
+    // this handler already holds — a cached account on Default is not a miss, so
+    // an ordinary upload never takes a second connection.
+    let tolerations = match state.key_policy_cache.tolerations_if_known(&user_api_key) {
+        Some(resolved) => resolved,
+        None => {
+            let policy = crate::sync::key_policy::load_policy(&mut conn, target_user_id)
+                .await
+                .map_err(|e| Error::Database(e.into()))?;
+            state.key_policy_cache.presets().resolve(policy.toleration_preset.as_deref())
+        }
+    };
+
     // Construct batch execution endpoint (where fusillade will send requests)
     let endpoint = format!("http://{}:{}/ai", config.host, config.port);
 
@@ -1271,6 +1319,7 @@ pub async fn upload_file<P: PoolProvider>(
             api_key: user_api_key,
             accessible_models,
             allowed_url_paths: config.batches.allowed_url_paths.clone(),
+            tolerations: tolerations.map(|t| (*t).clone()),
         },
         Some(api_key_id),
     );
@@ -3102,7 +3151,7 @@ mod tests {
         add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
 
         // Upload file with priority field that user is trying to manipulate
-        let jsonl_content = r#"{"custom_id": "priority-hijack", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8", "messages": [{"role": "user", "content": "urgent"}], "priority": -999999, "nvext": {"router": {"ttft_target": 1, "itl_target": 2, "keep": true}, "agent_hints": {"priority": 999, "keep": true}, "routing_constraints": {"tolerations": [{"operator": "Exists"}], "keep": true}, "keep": true}}}"#;
+        let jsonl_content = r#"{"custom_id": "priority-hijack", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8", "messages": [{"role": "user", "content": "urgent"}], "priority": -999999, "nvext": {"router": {"ttft_target": 1, "itl_target": 2, "keep": true}, "agent_hints": {"priority": 999, "keep": true}, "keep": true}}}"#;
 
         let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-priority.jsonl");
 
@@ -3146,10 +3195,6 @@ mod tests {
         assert_eq!(body["nvext"]["router"]["keep"], true);
         assert_eq!(body["nvext"]["agent_hints"]["keep"], true);
         assert_eq!(body["nvext"]["keep"], true);
-        // Scheduling tolerations are the daemon's to set, never the uploader's;
-        // other routing constraints pass through.
-        assert!(body["nvext"]["routing_constraints"].get("tolerations").is_none());
-        assert_eq!(body["nvext"]["routing_constraints"]["keep"], true);
 
         // Verify other fields are preserved
         assert_eq!(

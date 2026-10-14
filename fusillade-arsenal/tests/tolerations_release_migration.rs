@@ -5,7 +5,7 @@
 
 use fusillade_arsenal::MIGRATOR;
 
-const FIRST: i64 = 20261008120000;
+const FIRST: i64 = 20261014120000;
 
 async fn exists(pool: &sqlx::PgPool) -> (bool, bool, bool, bool) {
     sqlx::query_as(

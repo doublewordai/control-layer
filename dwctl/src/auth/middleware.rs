@@ -93,7 +93,6 @@ pub(crate) async fn admin_ai_proxy<P: sqlx_pool_router::PoolProvider + Clone>(
     *request.body_mut() = Body::from(body_bytes);
 
     trace!("Rewritten request URI: {}", request.uri());
-    trace!("Request headers: {:?}", request.headers());
     // Continue with the modified request
     Ok(request)
 }
@@ -569,6 +568,7 @@ mod tests {
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
             admission_demand_cache: Default::default(),
+            key_policy_cache: state.key_policy_cache.clone(),
         };
 
         let request = axum::http::Request::builder()
@@ -685,6 +685,7 @@ mod tests {
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
             admission_demand_cache: Default::default(),
+            key_policy_cache: state.key_policy_cache.clone(),
         };
 
         let header_external_user_id = header_user.external_user_id.as_ref().unwrap_or(&header_user.username);
@@ -803,6 +804,7 @@ mod tests {
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
             admission_demand_cache: Default::default(),
+            key_policy_cache: state.key_policy_cache.clone(),
         };
 
         // Request with JWT cookie - should be ignored since native auth is disabled
@@ -990,6 +992,7 @@ mod tests {
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
             admission_demand_cache: Default::default(),
+            key_policy_cache: state.key_policy_cache.clone(),
         };
 
         let external_user_id = user.external_user_id.as_ref().unwrap_or(&user.username);
@@ -1108,6 +1111,7 @@ mod tests {
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
             admission_demand_cache: Default::default(),
+            key_policy_cache: state.key_policy_cache.clone(),
         };
 
         let request = axum::http::Request::builder()

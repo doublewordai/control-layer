@@ -1004,6 +1004,13 @@ export const handlers = [
       demoState = setCurrentUserRoles(demoState, body.roles);
     }
 
+    // Persist the pinned preset so the GET the update hook refetches (usersData
+    // is the source for the detail and list endpoints) shows it instead of the
+    // fixture. `null` clears the pin back to Default.
+    if (body.toleration_preset !== undefined) {
+      user.toleration_preset = body.toleration_preset;
+    }
+
     const updatedUser = {
       ...user,
       ...body,
@@ -2016,6 +2023,15 @@ export const handlers = [
         enabled: true,
         allowed_completion_windows: ["24h", "1h"],
       },
+      onwards: { strict_mode: false },
+      scheduling_toleration_presets: [
+        {
+          id: "no-overflow",
+          label: "No overflow capacity",
+          description:
+            "Never placed on capacity the backend marks with any taint, such as overflow capacity.",
+        },
+      ],
     });
   }),
 
@@ -2955,10 +2971,14 @@ export const handlers = [
     }
     const emailChanged =
       newEmail !== undefined && newEmail !== org.email.toLowerCase();
-    // Persist the owner's modality switches so the follow-up GET (the update
-    // hook invalidates and refetches) shows the new state instead of the fixture.
+    // Persist owner-only settings so the GET the update hook refetches shows
+    // the new state instead of the fixture.
     if (rest.disabled_modalities !== undefined) {
       org.disabled_modalities = rest.disabled_modalities;
+    }
+    if (rest.toleration_preset !== undefined) {
+      // `null` clears the pin back to Default.
+      org.toleration_preset = rest.toleration_preset;
     }
     return HttpResponse.json({
       ...org,

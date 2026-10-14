@@ -2,6 +2,7 @@ import { BrowserRouter, Routes, Route, Navigate, useLocation } from "react-route
 import { Component, useEffect, Suspense, type ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ReactQueryDevtools } from "@tanstack/react-query-devtools";
+import { ThemeProvider } from "next-themes";
 import { Toaster } from "./components/ui/sonner";
 import { AppLayout } from "./components/layout";
 import {
@@ -661,18 +662,20 @@ function AppRoutes() {
 function App() {
   return (
     <ErrorBoundary>
-      <QueryClientProvider client={queryClient}>
-        <SettingsProvider>
-          <AuthProvider>
-            <TelemetryIdentity />
-            <OrganizationProvider>
-              <AppRoutes />
-            </OrganizationProvider>
-          </AuthProvider>
-        </SettingsProvider>
-        {import.meta.env.DEV && <ReactQueryDevtools initialIsOpen={false} />}
-        <Toaster />
-      </QueryClientProvider>
+      <ThemeProvider attribute="class" defaultTheme="system" enableSystem>
+        <QueryClientProvider client={queryClient}>
+          <SettingsProvider>
+            <AuthProvider>
+              <TelemetryIdentity />
+              <OrganizationProvider>
+                <AppRoutes />
+              </OrganizationProvider>
+            </AuthProvider>
+          </SettingsProvider>
+          {import.meta.env.DEV && <ReactQueryDevtools initialIsOpen={false} />}
+          <Toaster />
+        </QueryClientProvider>
+      </ThemeProvider>
     </ErrorBoundary>
   );
 }

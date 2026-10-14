@@ -661,6 +661,65 @@ over the cap is refused with `529` and code `batch_capacity_exceeded` (never
 `429`), naming the model and its cap, so the batch dispatcher backs off without
 spending a retry attempt and reschedules the request later.
 
+## Account Scheduling: Tolerations and Provider Fallback
+
+Two account settings influence scheduling, and they are deliberately separate.
+
+**Scheduling-toleration presets** (`scheduling.toleration_presets`) let an
+operator pin an account to a named list of Kubernetes-style tolerations that is
+written to every inference request from that account at
+`nvext.routing_constraints.tolerations`, for realtime, flex and batch traffic
+alike. A backend that honours tolerations uses them to decide which capacity may
+serve the request. The wording is backend-agnostic. Pinning restricts where an
+account's requests can be placed, and can make scheduling harder for accounts
+sharing the same capacity, depending on how the backend treats tolerations; pin
+as few accounts as possible and only when a customer requires it.
+
+```yaml
+scheduling:
+  toleration_presets:
+    # An empty list asks the backend to keep the account off any tainted
+    # capacity (e.g. overflow capacity).
+    - id: "no-overflow"
+      label: "No overflow capacity"
+      description: >-
+        Never placed on capacity the backend marks with any taint, such as
+        overflow capacity; requests may be refused when dedicated capacity is
+        full.
+      tolerations: []
+    - id: "gpu-only"
+      label: "GPU only"
+      description: "Only serve this account on GPU capacity."
+      tolerations:
+        - key: "pool"
+          operator: Equal
+          value: "gpu"
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Stable slug stored on the account (`users.toleration_preset`). Must be unique and non-empty; leading/trailing whitespace is rejected. |
+| `label` | string | Short human label for the dashboard control. Must be non-empty. |
+| `description` | string | One or two sentences of help text shown as the dashboard tooltip. Must be non-empty. |
+| `tolerations` | list | The request-field list (`{key, operator?, value?, effect?}`). `operator` defaults to `Equal` and then requires `value`; `Exists` forbids `value`; `effect` may be `NoSchedule` or `PreferNoSchedule`. May be empty; validated at config load. |
+
+The `GET /admin/api/v1/config` endpoint exposes the presets (id, label,
+description) so the dashboard can render the control. An account stores only the
+preset's id; an id the config no longer defines is logged and the request path
+**fails closed** by applying the empty (most restrictive) list. A preset id that
+is not configured is rejected with a 400 on write. This setting is independent
+of `self_hosted_only`: it says nothing about which provider is chosen, only
+where the chosen backend may place an accepted request.
+
+**`self_hosted_only`** (per account: `users.self_hosted_only`,
+`organizations.self_hosted_only`) is the gateway's provider-fallback control.
+When on, onwards restricts the account's requests to the composite's
+self-hosted members — providers whose endpoint kind (`inference_endpoints.kind`)
+is not `external` — so a third-party provider is never eligible regardless of
+the attempt budget. It does not influence where the inference backend places an
+accepted request; that is the tolerations setting. The API field keeps its name;
+the dashboard labels it "No external-provider fallback (gateway)".
+
 ## Observability
 
 ### Metrics

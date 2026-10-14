@@ -141,6 +141,7 @@ pub async fn apply(pool: &PgPool, catalog: &AccountLimitsCatalog) -> Result<()> 
     .execute(&mut *transaction)
     .await
     .context("write account limits")?;
+
     transaction.commit().await.context("commit account limits")?;
     Ok(())
 }
@@ -275,6 +276,9 @@ mod tests {
                 "must be positive",
             ),
             (vec![("a.yaml", "account: acme\nrealtime:\n  org/model: 10\n")], "unknown field"),
+            // A file with no `realtime_inflight` at all is refused rather than
+            // read as an empty (and therefore clearing) declaration.
+            (vec![("a.yaml", "account: acme\n")], "missing field `realtime_inflight`"),
             (
                 vec![("a.yaml", "account: acme\nrealtime_inflight:\n  org/model: 10\n  org/model: 20\n")],
                 "duplicate entry",

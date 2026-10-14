@@ -968,7 +968,10 @@ async fn process_auto_topups(
             }
             Err(e) => {
                 crate::background_error!(AUTO_TOPUP, "payment_method_lookup", Error, user_id = %user.id, error = %e, "Failed to fetch default payment method");
-                if let Err(state_error) = Users::new(&mut *conn).pause_auto_topup_after_provider_failure(user.id).await {
+                if let Err(state_error) = Users::new(&mut *conn)
+                    .pause_auto_topup_after_provider_failure(user.id, credits_config.auto_topup_retry_delay)
+                    .await
+                {
                     crate::background_error!(
                         AUTO_TOPUP, "provider_backoff_state", Error,
                         user_id = %user.id,
@@ -1005,7 +1008,11 @@ async fn process_auto_topups(
                     match kind {
                         AutoTopupDeclineKind::Soft => {
                             users
-                                .apply_auto_topup_soft_decline(user.id, user.auto_topup_soft_failure_count)
+                                .apply_auto_topup_soft_decline(
+                                    user.id,
+                                    user.auto_topup_soft_failure_count,
+                                    credits_config.auto_topup_retry_delay,
+                                )
                                 .await
                         }
                         AutoTopupDeclineKind::Hard => users.disable_auto_topup_after_hard_decline(user.id).await,
@@ -1075,7 +1082,10 @@ async fn process_auto_topups(
                     "Failed to charge auto top-up"
                 );
 
-                let transition_applied = match Users::new(&mut *conn).pause_auto_topup_after_provider_failure(user.id).await {
+                let transition_applied = match Users::new(&mut *conn)
+                    .pause_auto_topup_after_provider_failure(user.id, credits_config.auto_topup_retry_delay)
+                    .await
+                {
                     Ok(applied) => applied,
                     Err(state_error) => {
                         crate::background_error!(

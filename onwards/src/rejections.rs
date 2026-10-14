@@ -1,14 +1,21 @@
-//! Counting and logging of the requests onwards refuses itself.
+//! Counting and tracing of the requests onwards refuses itself.
 //!
 //! Every client error onwards decides on, as opposed to one reporting an
-//! upstream's response, increments
-//! `onwards_rejections_total{model, status, code, traffic}` and is logged once
-//! at `info` with its code, parameter, model, account and API key ID. Request
-//! values and bodies are never logged. `model` is set only for configured
-//! aliases, so the label stays bounded whatever a client sends.
+//! upstream's response:
+//!
+//! - increments `onwards_rejections_total{model, status, code, traffic}`.
+//!   `model` is set only for configured aliases, so the label stays bounded
+//!   whatever a client sends;
+//! - sets `error.type` (the error code), `onwards.rejection.param`,
+//!   `onwards.account` and `onwards.api_key_id` (when the key has them) on the
+//!   current span, and the response status on onwards' request span. A
+//!   strict-mode refusal made before that span exists needs an embedding
+//!   gateway's request span; the standalone server has none.
+//!
+//! Request values and bodies are never recorded.
 
 use axum::http::{HeaderMap, StatusCode};
-use tracing::info;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 use crate::{AppState, client::HttpClient, errors::OnwardsErrorResponse, serving};
@@ -67,7 +74,7 @@ impl RejectionContext {
         }
     }
 
-    /// Counts and logs `error` if onwards decided on it itself.
+    /// Records `error` if onwards decided on it itself.
     pub(crate) fn record_error(&self, error: &OnwardsErrorResponse) {
         if !error.is_gateway_rejection() {
             return;
@@ -80,7 +87,7 @@ impl RejectionContext {
         self.record(error.status, code, param);
     }
 
-    /// Counts and logs a refusal with this status, error code and parameter.
+    /// Records a refusal with this status, error code and parameter.
     pub(crate) fn record(&self, status: StatusCode, code: &str, param: Option<&str>) {
         let model = self.model.as_deref().unwrap_or("");
         metrics::counter!(
@@ -91,15 +98,20 @@ impl RejectionContext {
             "traffic" => self.traffic,
         )
         .increment(1);
-        info!(
-            status = status.as_u16(),
-            code,
-            param = param.unwrap_or(""),
-            model,
-            account = self.account.as_deref().unwrap_or(""),
-            api_key_id = ?self.api_key_id,
-            traffic = self.traffic,
-            "Request rejected by the gateway"
-        );
+
+        let span = tracing::Span::current();
+        // A no-op on spans that don't declare the field, such as an embedding
+        // gateway's, which records the response status itself.
+        span.record("http.response.status_code", status.as_u16());
+        span.set_attribute("error.type", code.to_string());
+        if let Some(param) = param {
+            span.set_attribute("onwards.rejection.param", param.to_string());
+        }
+        if let Some(account) = &self.account {
+            span.set_attribute("onwards.account", account.clone());
+        }
+        if let Some(api_key_id) = self.api_key_id {
+            span.set_attribute("onwards.api_key_id", api_key_id.to_string());
+        }
     }
 }

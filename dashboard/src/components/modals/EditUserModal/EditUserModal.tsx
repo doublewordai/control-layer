@@ -1,7 +1,11 @@
 import React, { useState } from "react";
 import { User, Info } from "lucide-react";
-import { useUpdateUser } from "../../../api/control-layer";
-import type { Role, ServingClassName } from "../../../api/control-layer/types";
+import { useUpdateUser, useConfig } from "../../../api/control-layer";
+import type {
+  Role,
+  ServingClassName,
+} from "../../../api/control-layer/types";
+import { SchedulingTolerations } from "../../features/scheduling/SchedulingTolerations";
 import { AVAILABLE_ROLES, SUBSET_ROLES, getRoleDisplayName } from "../../../utils/roles";
 import {
   Dialog,
@@ -31,6 +35,7 @@ interface EditUserModalProps {
     granted_serving_classes?: ServingClassName[];
     default_serving_class?: ServingClassName | null;
     self_hosted_only?: boolean;
+    toleration_preset?: string | null;
   };
   /** Whether the current user may toggle zero data retention (admins only). */
   canEditZdr?: boolean;
@@ -55,10 +60,13 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
     granted_serving_classes: currentUser.granted_serving_classes ?? [],
     default_serving_class: (currentUser.default_serving_class ?? "standard") as ServingClassName | "standard",
     self_hosted_only: currentUser.self_hosted_only ?? false,
+    // null/absent both mean "Default" (no preset pinned).
+    toleration_preset: currentUser.toleration_preset ?? null,
   });
   const [error, setError] = useState<string | null>(null);
 
   const updateUserMutation = useUpdateUser();
+  const { data: config } = useConfig();
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -85,6 +93,9 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
                     ? null
                     : formData.default_serving_class,
                 self_hosted_only: formData.self_hosted_only,
+                // Scheduling tolerations are platform-manager only too, and
+                // share the serving-settings gate server-side.
+                toleration_preset: formData.toleration_preset,
               }
             : {}),
         },
@@ -339,12 +350,29 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
                   </select>
                 </div>
                 <div className="flex items-center justify-between gap-4">
-                  <label
-                    htmlFor="self_hosted_only"
-                    className="text-sm text-gray-700"
-                  >
-                    Self-hosted only
-                  </label>
+                  <div className="flex items-center gap-1">
+                    <label
+                      htmlFor="self_hosted_only"
+                      className="text-sm text-gray-700"
+                    >
+                      No external-provider fallback (gateway)
+                    </label>
+                    <HoverCard openDelay={150} closeDelay={200}>
+                      <HoverCardTrigger asChild>
+                        <Info className="w-3 h-3 text-gray-400 cursor-pointer" />
+                      </HoverCardTrigger>
+                      <HoverCardContent side="top" align="end">
+                        <p className="text-sm">
+                          When on, this account's requests will never fail over
+                          to a third-party (external) provider: the gateway
+                          may only route them to self-hosted endpoints. It does
+                          not change where the inference backend places a
+                          request — that is the scheduling-tolerations setting
+                          below.
+                        </p>
+                      </HoverCardContent>
+                    </HoverCard>
+                  </div>
                   <Switch
                     id="self_hosted_only"
                     checked={formData.self_hosted_only}
@@ -354,9 +382,20 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
                         self_hosted_only: checked,
                       }))
                     }
-                    aria-label="Toggle self-hosted only"
+                    aria-label="Toggle no external-provider fallback"
                   />
                 </div>
+                <SchedulingTolerations
+                  preset={formData.toleration_preset}
+                  presets={config?.scheduling_toleration_presets}
+                  canEdit={canEditServing}
+                  onChange={(next) =>
+                    setFormData((prev) => ({
+                      ...prev,
+                      toleration_preset: next,
+                    }))
+                  }
+                />
               </div>
             )}
 

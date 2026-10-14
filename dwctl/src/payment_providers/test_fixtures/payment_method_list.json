@@ -1,0 +1,25 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "pm_ExampleAttached",
+      "object": "payment_method",
+      "billing_details": {},
+      "card": {
+        "brand": "visa",
+        "exp_month": 12,
+        "exp_year": 2034,
+        "fingerprint": "fp_ExampleCardFingerprint",
+        "funding": "credit",
+        "last4": "4242"
+      },
+      "created": 1780346899,
+      "customer": "cus_ExampleCustomer",
+      "livemode": false,
+      "metadata": {},
+      "type": "card"
+    }
+  ],
+  "has_more": false,
+  "url": "/v1/customers/cus_ExampleCustomer/payment_methods"
+}

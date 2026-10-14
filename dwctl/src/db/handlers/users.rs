@@ -15,6 +15,7 @@ use crate::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{Connection, FromRow, PgConnection};
+use std::time::Duration;
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -125,6 +126,9 @@ struct User {
     pub default_serving_class: Option<String>,
     /// Account setting: never fall over to an external provider (migration 149).
     pub self_hosted_only: bool,
+    /// Account setting: the scheduling-toleration preset id pinned to this
+    /// account, or NULL for the "Default" setting.
+    pub toleration_preset: Option<String>,
     /// Organizations only: admit signups from the claimed domain without
     /// review.
     ///
@@ -173,6 +177,7 @@ impl From<(Vec<Role>, User)> for UserDBResponse {
             granted_serving_classes: user.granted_serving_classes,
             default_serving_class: user.default_serving_class,
             self_hosted_only: user.self_hosted_only,
+            toleration_preset: user.toleration_preset,
         }
     }
 }
@@ -197,7 +202,7 @@ impl<'c> Repository for Users<'c> {
             r#"
             INSERT INTO users (id, username, email, display_name, avatar_url, auth_source, is_admin, password_hash, external_user_id)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at, last_login, is_admin, password_hash, external_user_id, payment_provider_id, is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent, low_balance_notification_sent, low_balance_threshold, user_type, auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, auto_topup_limit_notification_sent, verified, zero_data_retention, auto_topup_soft_failure_count, auto_topup_retry_after, invoicing_enabled, auto_join_enabled, granted_serving_classes, default_serving_class, self_hosted_only
+            RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at, last_login, is_admin, password_hash, external_user_id, payment_provider_id, is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent, low_balance_notification_sent, low_balance_threshold, user_type, auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, auto_topup_limit_notification_sent, verified, zero_data_retention, auto_topup_soft_failure_count, auto_topup_retry_after, invoicing_enabled, auto_join_enabled, granted_serving_classes, default_serving_class, self_hosted_only, toleration_preset
             "#,
             user_id,
             request.username,
@@ -276,11 +281,12 @@ impl<'c> Repository for Users<'c> {
                 u.granted_serving_classes,
                 u.default_serving_class,
                 u.self_hosted_only,
+                u.toleration_preset,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = $1 AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.auto_topup_limit_notification_sent, u.user_type, u.verified, u.invoicing_enabled, u.zero_data_retention, u.granted_serving_classes, u.default_serving_class, u.self_hosted_only
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.auto_topup_limit_notification_sent, u.user_type, u.verified, u.invoicing_enabled, u.zero_data_retention, u.granted_serving_classes, u.default_serving_class, u.self_hosted_only, u.toleration_preset
             "#,
             id
         )
@@ -321,6 +327,7 @@ impl<'c> Repository for Users<'c> {
                 granted_serving_classes: row.granted_serving_classes,
                 default_serving_class: row.default_serving_class,
                 self_hosted_only: row.self_hosted_only,
+                toleration_preset: row.toleration_preset,
                 // Not projected by this query; never read from `User`. See the field doc.
                 auto_join_enabled: false,
             };
@@ -373,11 +380,12 @@ impl<'c> Repository for Users<'c> {
                 u.granted_serving_classes,
                 u.default_serving_class,
                 u.self_hosted_only,
+                u.toleration_preset,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = ANY($1) AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.auto_topup_limit_notification_sent, u.user_type, u.verified, u.invoicing_enabled, u.zero_data_retention, u.granted_serving_classes, u.default_serving_class, u.self_hosted_only
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.auto_topup_limit_notification_sent, u.user_type, u.verified, u.invoicing_enabled, u.zero_data_retention, u.granted_serving_classes, u.default_serving_class, u.self_hosted_only, u.toleration_preset
             "#,
             ids.as_slice()
         )
@@ -420,6 +428,7 @@ impl<'c> Repository for Users<'c> {
                 granted_serving_classes: row.granted_serving_classes,
                 default_serving_class: row.default_serving_class,
                 self_hosted_only: row.self_hosted_only,
+                toleration_preset: row.toleration_preset,
                 // Not projected by this query; never read from `User`. See the field doc.
                 auto_join_enabled: false,
             };
@@ -436,7 +445,7 @@ impl<'c> Repository for Users<'c> {
         use sqlx::QueryBuilder;
 
         let mut query = QueryBuilder::new(
-            "SELECT id, username, email, display_name, avatar_url, auth_source, created_at, updated_at, last_login, is_admin, password_hash, external_user_id, payment_provider_id, is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent, low_balance_notification_sent, low_balance_threshold, user_type, auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, auto_topup_limit_notification_sent, verified, zero_data_retention, auto_topup_soft_failure_count, auto_topup_retry_after, invoicing_enabled, auto_join_enabled, granted_serving_classes, default_serving_class, self_hosted_only FROM users WHERE id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false AND user_type = ",
+            "SELECT id, username, email, display_name, avatar_url, auth_source, created_at, updated_at, last_login, is_admin, password_hash, external_user_id, payment_provider_id, is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent, low_balance_notification_sent, low_balance_threshold, user_type, auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, auto_topup_limit_notification_sent, verified, zero_data_retention, auto_topup_soft_failure_count, auto_topup_retry_after, invoicing_enabled, auto_join_enabled, granted_serving_classes, default_serving_class, self_hosted_only, toleration_preset FROM users WHERE id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false AND user_type = ",
         );
         query.push_bind(filter.user_type.clone());
 
@@ -723,9 +732,13 @@ impl<'c> Repository for Users<'c> {
                 END,
                 self_hosted_only = COALESCE($17, self_hosted_only),
                 granted_serving_classes = COALESCE($18, granted_serving_classes),
+                toleration_preset = CASE
+                    WHEN $19::boolean THEN $20
+                    ELSE toleration_preset
+                END,
                 updated_at = NOW()
             WHERE id = $1
-            RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at, last_login, is_admin, password_hash, external_user_id, payment_provider_id, is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent, low_balance_notification_sent, low_balance_threshold, user_type, auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, auto_topup_limit_notification_sent, verified, zero_data_retention, auto_topup_soft_failure_count, auto_topup_retry_after, invoicing_enabled, auto_join_enabled, granted_serving_classes, default_serving_class, self_hosted_only
+            RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at, last_login, is_admin, password_hash, external_user_id, payment_provider_id, is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent, low_balance_notification_sent, low_balance_threshold, user_type, auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, auto_topup_limit_notification_sent, verified, zero_data_retention, auto_topup_soft_failure_count, auto_topup_retry_after, invoicing_enabled, auto_join_enabled, granted_serving_classes, default_serving_class, self_hosted_only, toleration_preset
             "#,
                 id,
                 request.display_name,
@@ -745,6 +758,8 @@ impl<'c> Repository for Users<'c> {
                 request.default_serving_class.clone().flatten(),
                 request.self_hosted_only,
                 request.granted_serving_classes.as_deref(),
+                request.toleration_preset.is_some() as bool,
+                request.toleration_preset.clone().flatten(),
             )
             .fetch_optional(&mut *tx)
             .await?
@@ -819,7 +834,7 @@ impl<'c> Users<'c> {
     pub async fn get_user_by_email(&mut self, email: &str) -> Result<Option<UserDBResponse>> {
         let user = sqlx::query_as!(
             User,
-            "SELECT id, username, email, display_name, avatar_url, auth_source, created_at, updated_at, last_login, is_admin, password_hash, external_user_id, payment_provider_id, is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent, low_balance_notification_sent, low_balance_threshold, user_type, auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, auto_topup_limit_notification_sent, verified, zero_data_retention, auto_topup_soft_failure_count, auto_topup_retry_after, invoicing_enabled, auto_join_enabled, granted_serving_classes, default_serving_class, self_hosted_only FROM users WHERE email = $1 AND id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false AND user_type = 'individual'",
+            "SELECT id, username, email, display_name, avatar_url, auth_source, created_at, updated_at, last_login, is_admin, password_hash, external_user_id, payment_provider_id, is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent, low_balance_notification_sent, low_balance_threshold, user_type, auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, auto_topup_limit_notification_sent, verified, zero_data_retention, auto_topup_soft_failure_count, auto_topup_retry_after, invoicing_enabled, auto_join_enabled, granted_serving_classes, default_serving_class, self_hosted_only, toleration_preset FROM users WHERE email = $1 AND id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false AND user_type = 'individual'",
             email
         )
         .fetch_optional(&mut *self.db)
@@ -843,7 +858,7 @@ impl<'c> Users<'c> {
     pub async fn get_user_by_external_user_id(&mut self, external_user_id: &str) -> Result<Option<UserDBResponse>> {
         let user = sqlx::query_as!(
             User,
-            "SELECT id, username, email, display_name, avatar_url, auth_source, created_at, updated_at, last_login, is_admin, password_hash, external_user_id, payment_provider_id, is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent, low_balance_notification_sent, low_balance_threshold, user_type, auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, auto_topup_limit_notification_sent, verified, zero_data_retention, auto_topup_soft_failure_count, auto_topup_retry_after, invoicing_enabled, auto_join_enabled, granted_serving_classes, default_serving_class, self_hosted_only FROM users WHERE external_user_id = $1 AND id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false",
+            "SELECT id, username, email, display_name, avatar_url, auth_source, created_at, updated_at, last_login, is_admin, password_hash, external_user_id, payment_provider_id, is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent, low_balance_notification_sent, low_balance_threshold, user_type, auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, auto_topup_limit_notification_sent, verified, zero_data_retention, auto_topup_soft_failure_count, auto_topup_retry_after, invoicing_enabled, auto_join_enabled, granted_serving_classes, default_serving_class, self_hosted_only, toleration_preset FROM users WHERE external_user_id = $1 AND id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false",
             external_user_id
         )
         .fetch_optional(&mut *self.db)
@@ -1162,22 +1177,28 @@ impl<'c> Users<'c> {
     /// is still current. Returns false when another poller already applied the
     /// same decline transition.
     #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id), expected_failure_count), err)]
-    pub async fn apply_auto_topup_soft_decline(&mut self, user_id: UserId, expected_failure_count: i32) -> Result<bool> {
+    pub async fn apply_auto_topup_soft_decline(
+        &mut self,
+        user_id: UserId,
+        expected_failure_count: i32,
+        retry_delay: Duration,
+    ) -> Result<bool> {
         let result = if expected_failure_count == 0 {
-            sqlx::query!(
+            sqlx::query(
                 r#"
                 UPDATE users
                 SET auto_topup_soft_failure_count = 1,
-                    auto_topup_retry_after = NOW() + INTERVAL '24 hours',
+                    auto_topup_retry_after = NOW() + make_interval(secs => $3),
                     updated_at = NOW()
                 WHERE id = $1
                   AND auto_topup_soft_failure_count = $2
                   AND auto_topup_amount IS NOT NULL
                   AND auto_topup_threshold IS NOT NULL
                 "#,
-                user_id,
-                expected_failure_count,
             )
+            .bind(user_id)
+            .bind(expected_failure_count)
+            .bind(retry_delay.as_secs_f64())
             .execute(&mut *self.db)
             .await?
         } else {
@@ -1210,19 +1231,20 @@ impl<'c> Users<'c> {
     ///
     /// Returns false when another poller already applied the pause.
     #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
-    pub async fn pause_auto_topup_after_provider_failure(&mut self, user_id: UserId) -> Result<bool> {
-        let result = sqlx::query!(
+    pub async fn pause_auto_topup_after_provider_failure(&mut self, user_id: UserId, retry_delay: Duration) -> Result<bool> {
+        let result = sqlx::query(
             r#"
             UPDATE users
-            SET auto_topup_retry_after = NOW() + INTERVAL '24 hours',
+            SET auto_topup_retry_after = NOW() + make_interval(secs => $2),
                 updated_at = NOW()
             WHERE id = $1
               AND auto_topup_amount IS NOT NULL
               AND auto_topup_threshold IS NOT NULL
               AND (auto_topup_retry_after IS NULL OR auto_topup_retry_after <= NOW())
             "#,
-            user_id,
         )
+        .bind(user_id)
+        .bind(retry_delay.as_secs_f64())
         .execute(&mut *self.db)
         .await?;
 
@@ -1588,6 +1610,7 @@ mod tests {
             default_serving_class: None,
             self_hosted_only: None,
             granted_serving_classes: Default::default(),
+            toleration_preset: Default::default(),
         };
 
         let updated_user = repo.update(created_user.id, &update_request).await.unwrap();
@@ -1613,6 +1636,7 @@ mod tests {
             default_serving_class: None,
             self_hosted_only: None,
             granted_serving_classes: Default::default(),
+            toleration_preset: Default::default(),
         };
 
         let updated_user = repo.update(created_user.id, &update_request).await.unwrap();
@@ -1652,6 +1676,7 @@ mod tests {
                 default_serving_class: None,
                 self_hosted_only: None,
                 granted_serving_classes: Default::default(),
+                toleration_preset: Default::default(),
             };
             repo.update(user.id, &update).await.unwrap();
         }
@@ -1904,6 +1929,7 @@ mod tests {
             default_serving_class: None,
             self_hosted_only: None,
             granted_serving_classes: Default::default(),
+            toleration_preset: Default::default(),
         };
         let updated = users.update(user_id, &update).await.unwrap();
         assert!(!updated.low_balance_notification_sent);
@@ -2025,7 +2051,7 @@ mod tests {
     }
 
     #[dwctl_test_macros::test]
-    async fn test_auto_topup_decline_first_soft_failure_pauses_for_24_hours(pool: PgPool) {
+    async fn test_auto_topup_decline_first_soft_failure_uses_configured_delay(pool: PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         sqlx::query!(
             r#"
@@ -2043,7 +2069,11 @@ mod tests {
 
         let started_at = Utc::now();
         let mut conn = pool.acquire().await.unwrap();
-        let applied = Users::new(&mut conn).apply_auto_topup_soft_decline(user.id, 0).await.unwrap();
+        let retry_delay = Duration::from_secs(90);
+        let applied = Users::new(&mut conn)
+            .apply_auto_topup_soft_decline(user.id, 0, retry_delay)
+            .await
+            .unwrap();
 
         assert!(applied);
         let row = sqlx::query!(
@@ -2063,11 +2093,52 @@ mod tests {
         assert_eq!(row.auto_topup_threshold, Some(10.0));
         assert_eq!(row.auto_topup_soft_failure_count, 1);
         let retry_after = row.auto_topup_retry_after.unwrap();
-        assert!(retry_after >= started_at + chrono::Duration::hours(23) + chrono::Duration::minutes(59));
-        assert!(retry_after <= Utc::now() + chrono::Duration::hours(24) + chrono::Duration::minutes(1));
+        assert!(retry_after >= started_at + chrono::Duration::seconds(89));
+        assert!(retry_after <= Utc::now() + chrono::Duration::seconds(91));
 
         let candidates = Users::new(&mut conn).users_with_auto_topup_enabled().await.unwrap();
         assert!(candidates.iter().all(|candidate| candidate.id != user.id));
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_auto_topup_provider_failure_uses_configured_delay(pool: PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        sqlx::query!(
+            r#"
+            UPDATE users
+            SET auto_topup_amount = 25.0,
+                auto_topup_threshold = 10.0,
+                payment_provider_id = 'cus_provider_failure'
+            WHERE id = $1
+            "#,
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let started_at = Utc::now();
+        let mut conn = pool.acquire().await.unwrap();
+        let applied = Users::new(&mut conn)
+            .pause_auto_topup_after_provider_failure(user.id, Duration::from_secs(45))
+            .await
+            .unwrap();
+
+        assert!(applied);
+        let retry_after = sqlx::query_scalar!("SELECT auto_topup_retry_after FROM users WHERE id = $1", user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(retry_after >= started_at + chrono::Duration::seconds(44));
+        assert!(retry_after <= Utc::now() + chrono::Duration::seconds(46));
+        assert!(
+            !Users::new(&mut conn)
+                .pause_auto_topup_after_provider_failure(user.id, Duration::from_secs(45))
+                .await
+                .unwrap(),
+            "a duplicate provider failure must not extend the active pause"
+        );
     }
 
     #[dwctl_test_macros::test]
@@ -2091,9 +2162,17 @@ mod tests {
         .unwrap();
 
         let mut conn = pool.acquire().await.unwrap();
-        assert!(Users::new(&mut conn).apply_auto_topup_soft_decline(user.id, 1).await.unwrap());
         assert!(
-            !Users::new(&mut conn).apply_auto_topup_soft_decline(user.id, 1).await.unwrap(),
+            Users::new(&mut conn)
+                .apply_auto_topup_soft_decline(user.id, 1, Duration::from_secs(60))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !Users::new(&mut conn)
+                .apply_auto_topup_soft_decline(user.id, 1, Duration::from_secs(60))
+                .await
+                .unwrap(),
             "a stale duplicate transition must not apply twice"
         );
 

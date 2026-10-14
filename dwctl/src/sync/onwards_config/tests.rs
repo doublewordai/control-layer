@@ -568,6 +568,16 @@ async fn test_cache_shape_zero_data_retention_label_reflects_owner(pool: sqlx::P
     );
 }
 
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_cache_shape_key_labels_name_the_owning_account(pool: sqlx::PgPool) {
+    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+
+    for (secret, username) in [(KEY_A_SECRET, "cache_user_a"), (KEY_B_SECRET, "cache_user_b")] {
+        let labels = targets.key_labels.get(secret).unwrap();
+        assert_eq!(labels.get(onwards::serving::ACCOUNT_NAME_LABEL).map(String::as_str), Some(username));
+    }
+}
+
 #[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered", "cache_balance_user_a_positive")))]
 async fn test_cache_shape_metered_model_requires_positive_balance(pool: sqlx::PgPool) {
     let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();

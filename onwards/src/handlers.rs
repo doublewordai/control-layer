@@ -28,7 +28,8 @@ use axum::{
 };
 use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
 use serde_json::map::Entry;
-use tracing::{Instrument, debug, error, info, instrument, trace, warn};
+use tracing::{Instrument, debug, error, instrument, trace, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 /// Adapter to extract W3C trace context from an axum HeaderMap.
@@ -503,7 +504,6 @@ pub async fn target_message_handler<T: HttpClient>(
     if req.headers().contains_key("traceparent") {
         let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
         let parent_ctx = propagator.extract(&HeaderExtractor(req.headers()));
-        use tracing_opentelemetry::OpenTelemetrySpanExt;
         let _ = span.set_parent(parent_ctx);
     }
 
@@ -749,16 +749,17 @@ pub async fn target_message_handler<T: HttpClient>(
     // against the pool that will serve it. Strict: a class named on the
     // request that the account does not hold, or the alias does not offer,
     // is refused rather than quietly downgraded.
-    let (account_id, key_purpose) = bearer_token
+    let (account_id, account_name, key_purpose) = bearer_token
         .as_ref()
         .and_then(|token| state.targets.key_labels.get(token))
         .map(|labels| {
             (
                 labels.get(serving::ACCOUNT_LABEL).cloned(),
+                labels.get(serving::ACCOUNT_NAME_LABEL).cloned(),
                 labels.get("purpose").cloned(),
             )
         })
-        .unwrap_or((None, None));
+        .unwrap_or((None, None, None));
     let serving_resolution: ServingResolution = {
         let account = account_id
             .as_deref()
@@ -829,8 +830,8 @@ pub async fn target_message_handler<T: HttpClient>(
         None
     };
 
-    // Chat parameters not every worker can serve. Each is logged and counted;
-    // the configured ones are refused here.
+    // Chat parameters not every worker can serve. Each is counted and recorded
+    // on the request span; the configured ones are refused here.
     let flagged_params = match body_json.as_ref() {
         Some(body)
             if state.targets.strict_mode
@@ -859,15 +860,14 @@ pub async fn target_message_handler<T: HttpClient>(
             )
             .increment(1);
         }
-        info!(
-            params = %flagged_params.join(","),
-            rejected = %rejected.join(","),
-            model = %model_name,
-            account = account_id.as_deref().unwrap_or(""),
-            api_key_id = ?authenticated_api_key_id,
-            traffic,
-            "Request uses parameters not every worker supports"
-        );
+        let span = tracing::Span::current();
+        span.set_attribute("onwards.unsupported_params", flagged_params.join(","));
+        if let Some(account) = &account_id {
+            span.set_attribute("onwards.account", account.clone());
+        }
+        if let Some(api_key_id) = authenticated_api_key_id {
+            span.set_attribute("onwards.api_key_id", api_key_id.to_string());
+        }
         if let Some(first) = rejected.first() {
             record_response_status(400);
             return Err(OnwardsErrorResponse::invalid_request(
@@ -927,6 +927,21 @@ pub async fn target_message_handler<T: HttpClient>(
     let mut inflight_slot = match (is_realtime, alias_inflight.as_deref(), account_id.as_deref()) {
         (true, Some(limits), Some(account)) => {
             let limit = limits.for_account(account);
+            let account_name = account_name.unwrap_or_default();
+            metrics::gauge!(
+                "onwards_inflight_account_limit",
+                "model" => model_name.clone(),
+                "account" => account.to_string(),
+                "account_name" => account_name.clone(),
+            )
+            .set(f64::from(limit));
+            metrics::counter!(
+                "onwards_inflight_limit_checks_total",
+                "model" => model_name.clone(),
+                "account" => account.to_string(),
+                "account_name" => account_name.clone(),
+            )
+            .increment(1);
             match state
                 .inflight_limiter
                 .try_acquire(account, &model_name, limit)
@@ -941,6 +956,8 @@ pub async fn target_message_handler<T: HttpClient>(
                     metrics::counter!(
                         "onwards_inflight_limit_refusals_total",
                         "model" => model_name.clone(),
+                        "account" => account.to_string(),
+                        "account_name" => account_name,
                     )
                     .increment(1);
                     record_response_status(429);
@@ -1001,7 +1018,10 @@ pub async fn target_message_handler<T: HttpClient>(
             && let Some(limiter) = state.targets.key_rate_limiters.get(token)
             && limiter.check().is_err()
         {
-            debug!("Per-key rate limit exceeded for token: {}", token);
+            debug!(
+                api_key_id = ?authenticated_api_key_id,
+                "Per-key rate limit exceeded"
+            );
             record_response_status(429);
             return Err(OnwardsErrorResponse::rate_limited());
         }
@@ -1041,7 +1061,10 @@ pub async fn target_message_handler<T: HttpClient>(
                 match limiter.try_acquire() {
                     Some(guard) => Some(guard),
                     None => {
-                        debug!("Per-key concurrency limit exceeded for token: {}", token);
+                        debug!(
+                            api_key_id = ?authenticated_api_key_id,
+                            "Per-key concurrency limit exceeded"
+                        );
                         return Err(OnwardsErrorResponse::concurrency_limited());
                     }
                 }
@@ -1479,7 +1502,6 @@ pub async fn target_message_handler<T: HttpClient>(
         //   letting the third party re-emit our trace IDs on its own outbound
         //   calls.
         if resolve_trace_propagation(target, pool.is_trusted()) {
-            use tracing_opentelemetry::OpenTelemetrySpanExt;
             let ctx = tracing::Span::current().context();
             let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
             propagator.inject_context(&ctx, &mut HeaderInjector(&mut attempt_headers));
@@ -2153,9 +2175,10 @@ pub async fn target_message_handler<T: HttpClient>(
             }
         }
 
-        // Override the response `id` field for /responses and /chat/completions
-        // requests when the caller supplied a response ID via the configured
-        // header. Both response bodies expose a top-level `id` we can rewrite.
+        // Override the response `id` field for /responses, /chat/completions and
+        // /completions requests when the caller supplied a response ID via the
+        // configured header. All three bodies expose a top-level `id` we can
+        // rewrite; strict mode does the same for streamed chunks.
         if let Some(ref header_name) = state.response_id_header
             && crate::response_id::path_supports_id_override(&path_and_query)
             && (200..300).contains(&status)

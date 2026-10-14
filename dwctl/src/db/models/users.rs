@@ -64,6 +64,10 @@ pub struct UserUpdateDBRequest {
     /// Account setting: elevated serving classes held. `None` = don't change;
     /// `Some(vec![])` = revoke all.
     pub granted_serving_classes: Option<Vec<String>>,
+    /// Account setting: the scheduling-toleration preset id pinned to this
+    /// account's requests. `None` = don't change, `Some(None)` = clear (back to
+    /// the "Default" setting), `Some(Some(id))` = set the preset.
+    pub toleration_preset: Option<Option<String>>,
 }
 
 impl UserUpdateDBRequest {
@@ -82,6 +86,7 @@ impl UserUpdateDBRequest {
             default_serving_class: update.default_serving_class,
             self_hosted_only: update.self_hosted_only,
             granted_serving_classes: update.granted_serving_classes,
+            toleration_preset: update.toleration_preset,
         }
     }
 }
@@ -130,4 +135,7 @@ pub struct UserDBResponse {
     pub default_serving_class: Option<String>,
     /// Account setting: never fall over to an external provider.
     pub self_hosted_only: bool,
+    /// Account setting: the scheduling-toleration preset id pinned to this
+    /// account, or `None` for the "Default" setting.
+    pub toleration_preset: Option<String>,
 }

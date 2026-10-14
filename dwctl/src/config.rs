@@ -239,6 +239,129 @@ pub struct Config {
     /// [`crate::profiling::HeapProfilingConfig`].
     #[serde(default)]
     pub heap_profiling: crate::profiling::HeapProfilingConfig,
+    /// Account scheduling tolerations: the named presets an operator may pin to
+    /// an account. See [`SchedulingConfig`].
+    #[serde(default)]
+    pub scheduling: SchedulingConfig,
+}
+
+/// Operator-defined scheduling-toleration presets.
+///
+/// Each preset affixes a fixed, Kubernetes-style toleration list to every
+/// inference request from an account pinned to it, written to
+/// `nvext.routing_constraints.tolerations` before the request reaches the
+/// upstream inference backend. An account stores only the preset's `id`
+/// (`users.toleration_preset`); the tolerations themselves live here, so an
+/// operator can retune a preset without walking every account.
+///
+/// The list is deliberately backend-agnostic: a backend that honours
+/// tolerations uses it to decide which capacity may serve the request. An
+/// empty list (`[]`) asks a backend to keep the account's work off any
+/// tainted capacity.
+///
+/// Validate with [`SchedulingConfig::validate`], which is called at load time:
+/// ids must be unique slugs and every toleration must be one the request path
+/// could serialise into a valid body.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SchedulingConfig {
+    /// The presets an account may be pinned to, in display order.
+    pub toleration_presets: Vec<TolerationPreset>,
+}
+
+/// One operator-defined scheduling-toleration preset.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TolerationPreset {
+    /// Stable slug the account stores (`users.toleration_preset`). Unique
+    /// across presets; matched case-sensitively.
+    pub id: String,
+    /// Short human label for the control (e.g. "No overflow capacity").
+    pub label: String,
+    /// One or two sentences of help text (the dashboard tooltip).
+    pub description: String,
+    /// The toleration list written to `nvext.routing_constraints.tolerations`,
+    /// in the same shape as the request field. An empty list is a real preset.
+    pub tolerations: Vec<crate::scheduling::SchedulingToleration>,
+}
+
+impl SchedulingConfig {
+    /// The generic preset shipped in the default config: pin the account's
+    /// work off any tainted capacity, the most common operator intent.
+    pub fn default_preset() -> TolerationPreset {
+        TolerationPreset {
+            id: "no-overflow".to_string(),
+            label: "No overflow capacity".to_string(),
+            description: "Never placed on capacity the backend marks with any taint, such as overflow capacity; \
+                          requests may be refused when dedicated capacity is full."
+                .to_string(),
+            tolerations: Vec::new(),
+        }
+    }
+
+    /// Look up a preset by id.
+    pub fn preset(&self, id: &str) -> Option<&TolerationPreset> {
+        self.toleration_presets.iter().find(|preset| preset.id == id)
+    }
+
+    /// Resolve an account's stored preset id to the toleration list the request
+    /// path writes. `None` (the "Default" setting) means nothing is pinned, so
+    /// the backend decides. An id that is absent from the config is a
+    /// misconfiguration the caller must fail closed on; see
+    /// [`crate::scheduling::TolerationPresets::resolve`].
+    pub fn resolve(&self, id: Option<&str>) -> Option<&[crate::scheduling::SchedulingToleration]> {
+        id.and_then(|id| self.preset(id)).map(|preset| preset.tolerations.as_slice())
+    }
+
+    /// Whether every id is a unique slug and every toleration is valid.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
+        for (index, preset) in self.toleration_presets.iter().enumerate() {
+            if preset.id.trim().is_empty() {
+                return Err(format!("scheduling.toleration_presets[{index}] has an empty id"));
+            }
+            if preset.id != preset.id.trim() {
+                return Err(format!(
+                    "scheduling.toleration_presets[{index}] id {:?} has leading or trailing whitespace",
+                    preset.id
+                ));
+            }
+            if preset.id == crate::scheduling::DEFAULT_PRESET_SENTINEL {
+                return Err(format!(
+                    "scheduling.toleration_presets[{index}] id {:?} is reserved for the dashboard's \
+                     \"Default\" option",
+                    preset.id
+                ));
+            }
+            if !seen.insert(preset.id.as_str()) {
+                return Err(format!("scheduling.toleration_presets has a duplicate id {:?}", preset.id));
+            }
+            if preset.label.trim().is_empty() {
+                return Err(format!(
+                    "scheduling.toleration_presets[{index}] ({:?}) has an empty label",
+                    preset.id
+                ));
+            }
+            if preset.description.trim().is_empty() {
+                return Err(format!(
+                    "scheduling.toleration_presets[{index}] ({:?}) has an empty description",
+                    preset.id
+                ));
+            }
+            crate::scheduling::PinnedTolerations(preset.tolerations.clone())
+                .validate()
+                .map_err(|error| format!("scheduling.toleration_presets[{:?}] is invalid: {error}", preset.id))?;
+        }
+        Ok(())
+    }
+}
+
+impl Default for SchedulingConfig {
+    fn default() -> Self {
+        Self {
+            toleration_presets: vec![Self::default_preset()],
+        }
+    }
 }
 
 /// Controls exposure of the OpenAPI specs and Scalar doc UIs.
@@ -755,6 +878,38 @@ pub struct StripeConfig {
     /// Stripe tax code for auto top-up tax calculations (e.g. "txcd_10000000").
     /// If not set, falls back to the account-level default tax code in Stripe Tax settings.
     pub tax_code: Option<String>,
+    /// Base URL of the Stripe API (e.g. "http://localhost:12111"). Unset in
+    /// production, which talks to `https://api.stripe.com/`; set it to point the
+    /// client at a Stripe-compatible mock server or an egress proxy. Must be an
+    /// http(s) URL without a query or fragment; a path prefix is allowed, with
+    /// or without a trailing slash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_base_url: Option<String>,
+}
+
+impl StripeConfig {
+    /// The configured Stripe API base, normalised to end in `/`.
+    ///
+    /// async-stripe appends `v1/...` to the base verbatim, so a path prefix
+    /// without its trailing slash (`https://proxy.example.test/stripe`) would
+    /// otherwise send requests to `.../stripev1/...`.
+    pub fn api_base(&self) -> Result<Option<String>, String> {
+        let Some(raw) = &self.api_base_url else {
+            return Ok(None);
+        };
+        let mut url = Url::parse(raw).map_err(|e| format!("payment.stripe.api_base_url {raw:?} is not a valid URL: {e}"))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(format!("payment.stripe.api_base_url {raw:?} must be an http or https URL"));
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(format!("payment.stripe.api_base_url {raw:?} must not have a query or fragment"));
+        }
+        if !url.path().ends_with('/') {
+            let path = format!("{}/", url.path());
+            url.set_path(&path);
+        }
+        Ok(Some(url.into()))
+    }
 }
 
 /// Dummy payment configuration for testing.
@@ -1268,7 +1423,8 @@ impl Default for RequestLimitsConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OnwardsConfig {
-    /// Maximum pending bytes of an unfinished SSE event in the proxy, cache, and continuation layers.
+    /// Maximum pending bytes of an unfinished SSE event in the proxy, cache, continuation and
+    /// client usage layers.
     /// Complete events are forwarded first.
     /// Increase for providers that emit large tool-call events. Default: 65536.
     pub sse_buffer_limit: usize,
@@ -1290,10 +1446,10 @@ pub struct OnwardsConfig {
     /// target rate, later requests shift to the alternates. Set to 0 to disable.
     pub first_token_timeout_ms: u64,
     /// Strict-mode chat parameters that get a 400 instead of being forwarded.
-    /// Every parameter onwards flags as not servable by every worker is logged
-    /// and counted (`onwards_unsupported_params_total`); only the ones listed
+    /// Every parameter onwards flags as not servable by every worker is counted
+    /// (`onwards_unsupported_params_total`) and traced; only the ones listed
     /// here are refused. Names must come from `onwards::unsupported_params::params()`.
-    /// Default: empty (log only).
+    /// Default: empty (observe only).
     pub rejected_params: Vec<String>,
 }
 
@@ -2208,7 +2364,7 @@ pub struct DaemonConfig {
     pub batch_archive_retirement_enabled: bool,
 
     /// Deprecated and ignored: the weekly generation-2 template store is the
-    /// only write path. Existing generation-1 rows remain readable. The key is
+    /// only write path since the generation-1 heap was retired. The key is
     /// still accepted so existing values files keep parsing; a warning is
     /// logged at startup when it is set. Remove it from your configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3272,6 +3428,11 @@ pub struct CreditsConfig {
     /// billing target (see `Credits::grant_verification_credits`).
     #[serde(default)]
     pub verification_credits: rust_decimal::Decimal,
+    /// Pause after a transient provider failure or the first soft card decline
+    /// before auto top-up is eligible again. Production defaults to 24 hours;
+    /// staging may shorten it to exercise the complete decline lifecycle.
+    #[serde(with = "humantime_serde")]
+    pub auto_topup_retry_delay: Duration,
 }
 
 impl Default for CreditsConfig {
@@ -3283,6 +3444,7 @@ impl Default for CreditsConfig {
             first_payment_match_up_to: rust_decimal::Decimal::ZERO,
             // Default to 0 (no signup credits on card verification)
             verification_credits: rust_decimal::Decimal::ZERO,
+            auto_topup_retry_delay: Duration::from_secs(24 * 60 * 60),
         }
     }
 }
@@ -3461,6 +3623,7 @@ impl Default for Config {
             prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),
             continuation: ContinuationConfig::default(),
             heap_profiling: crate::profiling::HeapProfilingConfig::default(),
+            scheduling: SchedulingConfig::default(),
         }
     }
 }
@@ -3768,6 +3931,20 @@ impl Config {
         {
             return Err(Error::Internal {
                 operation: format!("Config validation: onwards.rejected_params names an unknown parameter: {name}"),
+            });
+        }
+        // The payment provider is rebuilt from config on every request, so a
+        // bad base URL must fail here rather than panic in each handler.
+        if let Some(PaymentConfig::Stripe(stripe)) = &self.payment
+            && let Err(error) = stripe.api_base()
+        {
+            return Err(Error::Internal {
+                operation: format!("Config validation: {error}"),
+            });
+        }
+        if let Err(error) = self.scheduling.validate() {
+            return Err(Error::Internal {
+                operation: format!("Config validation: {error}"),
             });
         }
         if self.background_services.batch_daemon.retention.expire_files
@@ -4242,6 +4419,11 @@ mod tests {
     use figment::Jail;
 
     #[test]
+    fn auto_topup_retry_delay_defaults_to_24_hours() {
+        assert_eq!(CreditsConfig::default().auto_topup_retry_delay, Duration::from_secs(24 * 60 * 60));
+    }
+
+    #[test]
     fn default_auth_roles_include_background_inference() {
         assert!(AuthConfig::default().default_user_roles.contains(&Role::BackgroundInferenceUser));
     }
@@ -4375,6 +4557,72 @@ mod tests {
             .insert("unknown".to_string(), 60);
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("unsupported service tier"));
+    }
+
+    fn stripe_config_with_base(api_base_url: Option<&str>) -> StripeConfig {
+        StripeConfig {
+            api_key: "sk_test_fake".to_string(),
+            webhook_secret: "whsec_test".to_string(),
+            price_id: "price_ExampleCredits".to_string(),
+            enable_invoice_creation: false,
+            auto_topup_terms_of_service_text: None,
+            setup_terms_of_service_text: None,
+            tax_code: None,
+            api_base_url: api_base_url.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn stripe_api_base_is_normalised_to_a_trailing_slash() {
+        for (configured, expected) in [
+            (None, None),
+            (Some("http://localhost:12111"), Some("http://localhost:12111/")),
+            (Some("http://localhost:12111/"), Some("http://localhost:12111/")),
+            (
+                Some("https://egress.example.test/stripe"),
+                Some("https://egress.example.test/stripe/"),
+            ),
+            (
+                Some("https://egress.example.test/stripe/"),
+                Some("https://egress.example.test/stripe/"),
+            ),
+        ] {
+            assert_eq!(
+                stripe_config_with_base(configured).api_base().unwrap().as_deref(),
+                expected,
+                "{configured:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stripe_api_base_rejects_unusable_urls() {
+        for configured in [
+            "localhost:12111",
+            "not a url",
+            "ftp://files.example.test/",
+            "https://egress.example.test/stripe?region=a",
+            "https://egress.example.test/stripe#frag",
+        ] {
+            assert!(
+                stripe_config_with_base(Some(configured)).api_base().is_err(),
+                "{configured:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn config_validation_rejects_a_bad_stripe_api_base() {
+        let mut config = Config::default();
+        config.secret_key = Some("test-secret-key".to_string());
+        config.payment = Some(PaymentConfig::Stripe(stripe_config_with_base(Some(
+            "https://egress.example.test/stripe",
+        ))));
+        config.validate().unwrap();
+
+        config.payment = Some(PaymentConfig::Stripe(stripe_config_with_base(Some("not a url"))));
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("api_base_url"), "got {error}");
     }
 
     #[test]
