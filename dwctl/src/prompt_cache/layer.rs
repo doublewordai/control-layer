@@ -1946,7 +1946,13 @@ mod tests {
             .layer(from_fn_with_state(
                 CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
                 cache_middleware,
-            ));
+            ))
+            .layer(rejections::test_support::layer(ALIAS));
+        // The test macro runs this body on one thread, so a thread-local
+        // recorder sees every refusal.
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
         let marker = serde_json::json!({
             "model": ALIAS,
             "messages": [{"role": "system", "content": [
@@ -1969,6 +1975,15 @@ mod tests {
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             let rejection = response.extensions().get::<rejections::RejectionCode>().map(|r| r.code());
             assert_eq!(rejection, Some(code));
+        }
+        let rendered = metrics.render();
+        for code in ["invalid_cache_control", "invalid_cache_breakpoint"] {
+            assert!(
+                rendered
+                    .lines()
+                    .any(|line| line.starts_with("onwards_rejections_total{") && line.contains(&format!("code=\"{code}\""))),
+                "{code} not counted:\n{rendered}"
+            );
         }
     }
 

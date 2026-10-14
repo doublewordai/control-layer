@@ -138,10 +138,21 @@ impl Scope {
 /// absent, `x-api-key`.
 fn api_key<'a>(path: &str, headers: &'a HeaderMap) -> Option<&'a str> {
     match headers.get(AUTHORIZATION) {
-        Some(value) => value.to_str().ok()?.strip_prefix("Bearer "),
+        Some(_) => bearer_token(headers),
         None if anthropic::accepts_x_api_key(path, headers) => headers.get("x-api-key")?.to_str().ok(),
         None => None,
     }
+}
+
+/// The token of a bearer `Authorization` header. The scheme is matched
+/// case-insensitively, as `/models` authenticates it.
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(AUTHORIZATION)?.to_str().ok()?.trim();
+    let (scheme, token) = value.split_once(char::is_whitespace)?;
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then_some(token.trim())
+        .filter(|token| !token.is_empty())
 }
 
 /// The `model` of a JSON request body, if it has one.
@@ -300,6 +311,12 @@ mod tests {
         assert_eq!(api_key("/ai/v1/models", &models), Some("sk-x"));
         let both = headers(&[("authorization", "Bearer sk-a"), ("x-api-key", "sk-x")]);
         assert_eq!(api_key("/ai/v1/messages", &both), Some("sk-a"), "Authorization wins");
+        let lowercase = headers(&[("authorization", "bearer sk-a")]);
+        assert_eq!(
+            api_key("/ai/v1/models", &lowercase),
+            Some("sk-a"),
+            "the scheme is case-insensitive, as /models accepts it"
+        );
         let basic = headers(&[("authorization", "Basic abc"), ("x-api-key", "sk-x")]);
         assert_eq!(
             api_key("/ai/v1/messages", &basic),

@@ -3,7 +3,7 @@
 use axum::{
     Extension, Json,
     extract::{Query, State},
-    http::{HeaderMap, StatusCode, Uri, header},
+    http::{HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,7 @@ use sqlx_pool_router::PoolProvider;
 use crate::{
     AppState,
     db::handlers::Deployments,
-    inference::rejections::{self, Origin, Recorder},
+    inference::rejections::{self, Origin, Recorder, bearer_token},
     reasoning::SupportedReasoningEfforts,
 };
 
@@ -86,15 +86,6 @@ fn openai_error(status: StatusCode, message: &str, error_type: &str, code: &str)
         })),
     )
         .into_response()
-}
-
-fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?.trim();
-    let (scheme, token) = value.split_once(char::is_whitespace)?;
-    scheme
-        .eq_ignore_ascii_case("bearer")
-        .then_some(token.trim())
-        .filter(|token| !token.is_empty())
 }
 
 fn database_error(operation: &str, error: impl std::fmt::Display) -> Response {
