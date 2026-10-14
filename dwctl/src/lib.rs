@@ -333,6 +333,9 @@ where
     /// path reads an account's resolved tolerations from here (its hidden batch
     /// key belongs to that account) so batch matches realtime.
     pub key_policy_cache: crate::sync::key_policy::KeyPolicyCache,
+    /// Per-replica cache of outstanding batch work used by batch admission.
+    #[builder(default)]
+    pub admission_demand_cache: crate::api::handlers::sla_capacity::AdmissionDemandCache,
 }
 
 impl<P> AppState<P>
