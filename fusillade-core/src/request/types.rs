@@ -192,7 +192,9 @@ impl RequestState for Claimed {}
 pub enum DispatchTolerations {
     /// Hold: send the hold list (unless the body carries its own).
     Keep,
-    /// Send none, so the backend may schedule the request anywhere.
+    /// Send the stored body as it is, without the hold list: the hold no
+    /// longer limits where the backend schedules the request (constraints
+    /// the body itself carries still apply).
     Release(TolerationsRelease),
 }
 
@@ -206,11 +208,16 @@ pub enum TolerationsRelease {
     /// Due at or before its model's release cutoff: projected to miss its
     /// completion window at the rate held dispatches complete.
     SlaProjection,
-    /// Its model's held dispatches are refused while too few complete: there
-    /// is no capacity the hold allows to wait for.
+    /// Its model's held dispatches were refused and none completed over a
+    /// whole window of holding: there is no capacity the hold allows to wait
+    /// for.
     NoOwnCapacity,
     /// The hold decisions are missing or stale (the refresh is failing).
     Stale,
+    /// Too close to its deadline for a held refusal to be retried before the
+    /// retry cut-off (`stop_before_deadline_ms`): released so a refusal
+    /// cannot fail it.
+    RetryCutoff,
 }
 
 impl TolerationsRelease {
@@ -222,6 +229,7 @@ impl TolerationsRelease {
             Self::SlaProjection => "sla_projection",
             Self::NoOwnCapacity => "no_own_capacity",
             Self::Stale => "stale",
+            Self::RetryCutoff => "retry_cutoff",
         }
     }
 
@@ -233,6 +241,7 @@ impl TolerationsRelease {
             "sla_projection" => Some(Self::SlaProjection),
             "no_own_capacity" => Some(Self::NoOwnCapacity),
             "stale" => Some(Self::Stale),
+            "retry_cutoff" => Some(Self::RetryCutoff),
             _ => None,
         }
     }

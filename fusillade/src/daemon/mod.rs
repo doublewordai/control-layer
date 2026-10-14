@@ -254,6 +254,29 @@ enum HoldOutcome {
     Held,
     /// The claim released the request: sent without the hold list.
     Released(TolerationsRelease),
+    /// The claim held the request, but the stored body is not a readable
+    /// JSON object, so nothing could be inserted: sent as stored, not held.
+    /// An encrypted body is in this state when the daemon prepares it (it is
+    /// decrypted later, by the request processor), so encrypted requests are
+    /// never held.
+    Unreadable,
+}
+
+impl HoldOutcome {
+    /// The outcome for a body that cannot be edited.
+    fn unreadable(hold: Option<HoldWrite<'_>>) -> Self {
+        match hold {
+            None => Self::NotApplied,
+            Some(HoldWrite {
+                decision: DispatchTolerations::Release(reason),
+                ..
+            }) => Self::Released(reason),
+            Some(HoldWrite {
+                decision: DispatchTolerations::Keep,
+                ..
+            }) => Self::Unreadable,
+        }
+    }
 }
 
 /// Whether a body carries a (non-null) scheduling toleration list.
@@ -282,10 +305,10 @@ fn inject_nvext_extensions(
         return HoldOutcome::NotApplied;
     }
     let Ok(mut json) = serde_json::from_str::<serde_json::Value>(body) else {
-        return HoldOutcome::NotApplied;
+        return HoldOutcome::unreadable(hold);
     };
     let Some(object) = json.as_object_mut() else {
-        return HoldOutcome::NotApplied;
+        return HoldOutcome::unreadable(hold);
     };
 
     let outcome = match hold {
@@ -1935,12 +1958,24 @@ where
     /// when it would otherwise miss its completion window: near SLA failure,
     /// meeting the deadline matters more than where the request runs. That is
     /// inside the batch-claim deadline ramp or past its deadline; when its
-    /// model's held dispatches are refused while too few complete; when it is
-    /// due before the latest deadline its model's outstanding work cannot
-    /// meet at the rate held dispatches complete; or when the decisions are
-    /// stale. Every daemon computes the decisions from shared per-minute
-    /// counters (`hold_stats`). Counted by
-    /// `fusillade_tolerations_released_total{model,reason}`.
+    /// model's held dispatches were refused while none completed over a whole
+    /// window of holding; when it is due before the latest deadline its
+    /// model's outstanding work cannot meet at the rate held dispatches
+    /// complete; when it is too close to the retry cut-off for a held refusal
+    /// to be retried; or when the decisions are stale. Every daemon computes
+    /// the decisions from shared per-minute counters (`hold_stats`). Counted
+    /// by `fusillade_tolerations_released_total{model,reason}`.
+    ///
+    /// The release decisions are made by the storage's claim queries
+    /// ([`DaemonStorage::set_dispatch_hold`]) from counters the storage keeps
+    /// ([`DaemonStorage::flush_hold_stats`],
+    /// [`DaemonStorage::purge_hold_stats`],
+    /// [`DaemonStorage::read_hold_inputs`]). The PostgreSQL storage
+    /// implements all four; with a storage that does not, nothing is held.
+    ///
+    /// A body that is not a readable JSON object when the dispatch is
+    /// prepared (an encrypted body) cannot carry the hold list and is sent as
+    /// stored, counted by `fusillade_hold_skipped_total{model,reason}`.
     pub fn with_dispatch_hold(mut self, hold: DispatchHold) -> Self {
         self.dispatch_hold = Some(Arc::new(HoldState::new(hold, chrono::Utc::now())));
         self
@@ -2548,7 +2583,14 @@ where
 
     /// The dispatch hold for one claimed request, or `None` when it is not
     /// held: hold not configured, background work, a model that is not opted
-    /// in, a request escalated to another model, or no deadline.
+    /// in, a request escalated to another model, or a claim that made no
+    /// decision (no deadline, or a storage whose claims do not decide: the
+    /// claim queries are the one place the release rules live).
+    ///
+    /// A request the claim holds is released anyway when it is so close to
+    /// the retry cut-off (`stop_before_deadline_ms`) that a held refusal could
+    /// not be retried before it: being refused is what the hold expects, and
+    /// a refusal there would otherwise leave it no time to be released.
     fn hold_write<'a>(
         &'a self,
         kind: ClaimLoopKind,
@@ -2563,21 +2605,23 @@ where
         {
             return None;
         }
-        let decision = match request.state.tolerations {
-            Some(decision) => decision,
-            // The claim path made no decision: apply the same rules here.
-            None => state.decide(
-                capacity_model,
-                request.state.batch_expires_at,
-                request
-                    .data
-                    .batch_metadata
-                    .get("created_at")
-                    .map(String::as_str),
-                self.config.claim_ramp_exponent,
-                now,
-            )?,
-        };
+        let mut decision = request.state.tolerations?;
+        if decision == DispatchTolerations::Keep
+            && let Some(deadline) = request.state.batch_expires_at
+            && let Some(stop_before_deadline_ms) = self.config.stop_before_deadline_ms
+        {
+            let retry_cut_off = chrono::Duration::try_milliseconds(stop_before_deadline_ms)
+                .and_then(|stop_before| deadline.checked_sub_signed(stop_before));
+            let held_retry_at = i64::try_from(self.config.max_backoff_ms)
+                .ok()
+                .and_then(chrono::Duration::try_milliseconds)
+                .and_then(|backoff| now.checked_add_signed(backoff));
+            if let (Some(retry_cut_off), Some(held_retry_at)) = (retry_cut_off, held_retry_at)
+                && held_retry_at >= retry_cut_off
+            {
+                decision = DispatchTolerations::Release(TolerationsRelease::RetryCutoff);
+            }
+        }
         Some(HoldWrite {
             tolerations: &state.hold().tolerations,
             decision,
@@ -2664,6 +2708,14 @@ where
                         "fusillade_tolerations_released_total",
                         "model" => capacity_model.clone(),
                         "reason" => reason.label()
+                    )
+                    .increment(1);
+                }
+                HoldOutcome::Unreadable => {
+                    counter!(
+                        "fusillade_hold_skipped_total",
+                        "model" => capacity_model.clone(),
+                        "reason" => "unreadable_body"
                     )
                     .increment(1);
                 }
@@ -2929,6 +2981,11 @@ where
                                     "model" => capacity_model_clone.clone()
                                 )
                                 .increment(1);
+                                // Not a cut (below), and not growth evidence.
+                                if control_generation.is_some() {
+                                    adaptive_concurrency
+                                        .record_held_refusal(&capacity_model_clone);
+                                }
                             }
                             if shrinks_adaptive_concurrency(held_refusal, &failed.state.reason)
                                 && let Some(generation) = control_generation
@@ -5991,8 +6048,6 @@ mod tests {
         );
     }
 
-    use fusillade_core::release::ModelHold;
-
     fn hold_write(
         tolerations: &serde_json::Value,
         decision: DispatchTolerations,
@@ -6015,17 +6070,36 @@ mod tests {
         assert_eq!(body, original);
 
         let empty = serde_json::json!([]);
-        // A non-object body is left alone even when something is configured.
-        let mut body = "[1,2]".to_string();
-        assert_eq!(
-            inject_nvext_extensions(
-                &mut body,
-                Some(1),
-                hold_write(&empty, DispatchTolerations::Keep)
-            ),
-            HoldOutcome::NotApplied
-        );
-        assert_eq!(body, "[1,2]");
+        // A non-object body is left alone even when something is configured:
+        // a held one is reported as unreadable (not held), a released one as
+        // released.
+        for unreadable in ["[1,2]", "dwzdr1:ciphertext"] {
+            let mut body = unreadable.to_string();
+            assert_eq!(
+                inject_nvext_extensions(
+                    &mut body,
+                    Some(1),
+                    hold_write(&empty, DispatchTolerations::Keep)
+                ),
+                HoldOutcome::Unreadable
+            );
+            assert_eq!(
+                inject_nvext_extensions(
+                    &mut body,
+                    Some(1),
+                    hold_write(
+                        &empty,
+                        DispatchTolerations::Release(TolerationsRelease::Stale)
+                    )
+                ),
+                HoldOutcome::Released(TolerationsRelease::Stale)
+            );
+            assert_eq!(
+                inject_nvext_extensions(&mut body, Some(1), None),
+                HoldOutcome::NotApplied
+            );
+            assert_eq!(body, unreadable);
+        }
 
         // A released request is sent exactly as stored.
         let original = r#"{ "model":"m",  "a":1 }"#;
@@ -6246,12 +6320,26 @@ mod tests {
             .clone()
     }
 
+    /// A claimed request carrying the claim's hold decision.
+    fn decided_request(
+        model: &str,
+        body: &str,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+        decision: Option<DispatchTolerations>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Request<Claimed> {
+        let mut request = claimed_request(model, body, deadline, now);
+        request.state.tolerations = decision;
+        request
+    }
+
     #[sqlx::test]
-    async fn dispatch_hold_follows_the_model_list_the_deadline_and_the_body(pool: sqlx::PgPool) {
+    async fn dispatch_hold_follows_the_claim_the_model_list_and_the_body(pool: sqlx::PgPool) {
         let daemon = preparing_daemon(
             pool,
             DaemonConfig {
                 inject_deadline_priority: true,
+                stop_before_deadline_ms: None,
                 ..Default::default()
             },
         )
@@ -6261,35 +6349,37 @@ mod tests {
         const BODY: &str = r#"{"model":"m","messages":[]}"#;
         let preset = r#"{"model":"m","nvext":{"routing_constraints":{"tolerations":[{"key":"example.com/reserved","operator":"Exists"}]}}}"#;
         let now = chrono::Utc::now();
-        let state = daemon.dispatch_hold.clone().unwrap();
-        let decisions = |hold| fusillade_core::release::HoldClaim {
-            models: vec![("m".to_string(), hold)],
-            computed_at: now,
-            stale_after: chrono::Duration::minutes(5),
-        };
-        // Until the first refresh a held request is held, floor only.
-        let prepared = daemon.prepare_claimed_requests(
-            vec![claimed_request(
-                "m",
-                BODY,
-                Some(now + chrono::Duration::hours(12)),
-                now,
-            )],
-            ClaimLoopKind::Request,
-        );
-        assert!(prepared[0].held, "no decisions yet: the floor applies");
-        state.set_claim(decisions(ModelHold::Hold { cutoff: None }));
         let far = now + chrono::Duration::hours(12);
-        let near = now + chrono::Duration::minutes(5);
         let past = now - chrono::Duration::minutes(5);
+        let keep = Some(DispatchTolerations::Keep);
+        let release = |reason| Some(DispatchTolerations::Release(reason));
         let prepared = daemon.prepare_claimed_requests(
             vec![
-                claimed_request("m", BODY, Some(far), now),
-                claimed_request("m", BODY, Some(near), now),
-                claimed_request("m", BODY, Some(past), now),
-                claimed_request("other", BODY, Some(far), now),
-                claimed_request("m", preset, Some(far), now),
-                claimed_request("m", preset, Some(past), now),
+                decided_request("m", BODY, Some(far), keep, now),
+                decided_request(
+                    "m",
+                    BODY,
+                    Some(far),
+                    release(TolerationsRelease::SlaProjection),
+                    now,
+                ),
+                decided_request(
+                    "m",
+                    BODY,
+                    Some(past),
+                    release(TolerationsRelease::PastDeadline),
+                    now,
+                ),
+                decided_request("m", BODY, Some(far), None, now),
+                decided_request("other", BODY, Some(far), None, now),
+                decided_request("m", preset, Some(far), keep, now),
+                decided_request(
+                    "m",
+                    preset,
+                    Some(past),
+                    release(TolerationsRelease::PastDeadline),
+                    now,
+                ),
             ],
             ClaimLoopKind::Request,
         );
@@ -6297,25 +6387,31 @@ mod tests {
         assert_eq!(
             tolerations_of(&prepared[0]),
             serde_json::json!([]),
-            "far from its deadline, an opted-in model's request is held"
+            "held by the claim, an opted-in model's request carries the hold list"
         );
         assert!(prepared[0].held);
-        for (released, deadline) in [(&prepared[1], near), (&prepared[2], past)] {
+        for (released, deadline) in [(&prepared[1], far), (&prepared[2], past)] {
             assert!(!released.held);
             let mut expected = BODY.to_string();
             inject_nvext_extensions(&mut expected, Some(sla_priority(deadline)), None);
             assert_eq!(
                 released.request.data.body, expected,
-                "near or past its deadline it is sent as stored, apart from the priority"
+                "released by the claim, it is sent as stored, apart from the priority"
             );
         }
         assert!(!prepared[3].held);
         assert_eq!(
             tolerations_of(&prepared[3]),
             serde_json::Value::Null,
+            "without a claim decision nothing is held"
+        );
+        assert!(!prepared[4].held);
+        assert_eq!(
+            tolerations_of(&prepared[4]),
+            serde_json::Value::Null,
             "a model that is not opted in is never held"
         );
-        for pinned in &prepared[4..] {
+        for pinned in &prepared[5..] {
             assert!(!pinned.held, "a preset is not the daemon's hold");
             assert_eq!(
                 tolerations_of(pinned),
@@ -6324,72 +6420,107 @@ mod tests {
             );
         }
 
-        // Background work is never held.
+        // Background work is never held, whatever the decision says.
         let prepared = daemon.prepare_claimed_requests(
-            vec![claimed_request("m", BODY, None, now)],
+            vec![decided_request("m", BODY, None, keep, now)],
             ClaimLoopKind::BackgroundRequest,
         );
         assert!(!prepared[0].held);
         assert_eq!(tolerations_of(&prepared[0]), serde_json::Value::Null);
 
-        // When the claim decided, its decision is final: every replica
-        // decides from the same rows, so the daemon must not second-guess it
-        // with its own clock.
-        let decided = |deadline, decision| {
-            let mut request = claimed_request("m", BODY, Some(deadline), now);
-            request.state.tolerations = Some(decision);
-            request
-        };
+        // The claim's decision is final: every replica decides from the same
+        // rows, so the daemon does not second-guess it with its own clock.
         let prepared = daemon.prepare_claimed_requests(
-            vec![
-                decided(far, DispatchTolerations::Release(TolerationsRelease::Ramp)),
-                decided(past, DispatchTolerations::Keep),
-            ],
+            vec![decided_request("m", BODY, Some(past), keep, now)],
             ClaimLoopKind::Batch,
         );
         assert_eq!(
             tolerations_of(&prepared[0]),
-            serde_json::Value::Null,
-            "released by the claim"
-        );
-        assert_eq!(
-            tolerations_of(&prepared[1]),
             serde_json::json!([]),
             "held by the claim"
         );
 
-        // Without a claim decision the daemon applies the model's decision
-        // itself: a cutoff releases what is due at or before it...
-        state.set_claim(decisions(ModelHold::Hold {
-            cutoff: Some(now + chrono::Duration::hours(6)),
-        }));
+        // A body the daemon cannot read (an encrypted one) cannot carry the
+        // hold list: sent as stored, not held.
+        let opaque = "dwzdr1:not-json";
+        let prepared = daemon.prepare_claimed_requests(
+            vec![decided_request("m", opaque, Some(far), keep, now)],
+            ClaimLoopKind::Request,
+        );
+        assert!(!prepared[0].held);
+        assert_eq!(prepared[0].request.data.body, opaque);
+    }
+
+    /// A held request is released when a refusal could no longer be retried
+    /// before the retry cut-off, so being refused cannot fail it.
+    #[sqlx::test]
+    async fn dispatch_hold_releases_requests_at_the_retry_cut_off(pool: sqlx::PgPool) {
+        let daemon = preparing_daemon(
+            pool.clone(),
+            DaemonConfig {
+                stop_before_deadline_ms: Some(900_000),
+                max_backoff_ms: 10_000,
+                ..Default::default()
+            },
+        )
+        .await
+        .with_dispatch_hold(DispatchHold::new(serde_json::json!([]), ["m".to_string()]));
+        const BODY: &str = r#"{"model":"m","messages":[]}"#;
+        let now = chrono::Utc::now();
+        let keep = Some(DispatchTolerations::Keep);
         let prepared = daemon.prepare_claimed_requests(
             vec![
-                claimed_request("m", BODY, Some(now + chrono::Duration::hours(5)), now),
-                claimed_request("m", BODY, Some(far), now),
+                // Cut-off 15 minutes before the deadline, retry 10s out.
+                decided_request(
+                    "m",
+                    BODY,
+                    Some(now + chrono::Duration::minutes(16)),
+                    keep,
+                    now,
+                ),
+                decided_request(
+                    "m",
+                    BODY,
+                    Some(now + chrono::Duration::seconds(905)),
+                    keep,
+                    now,
+                ),
+                decided_request(
+                    "m",
+                    BODY,
+                    Some(now + chrono::Duration::minutes(12)),
+                    keep,
+                    now,
+                ),
             ],
             ClaimLoopKind::Batch,
         );
-        assert!(!prepared[0].held, "due before the cutoff: released");
-        assert!(prepared[1].held, "due after the cutoff: held");
-        // ...releasing everything releases everything...
-        state.set_claim(decisions(ModelHold::ReleaseAll(
-            TolerationsRelease::NoOwnCapacity,
-        )));
+        assert!(prepared[0].held, "a refusal could still be retried in time");
+        assert!(!prepared[1].held, "a retry would land past the cut-off");
+        assert!(!prepared[2].held, "already inside the cut-off");
+        assert_eq!(tolerations_of(&prepared[2]), serde_json::Value::Null);
+
+        // A negative cut-off (retry past the deadline) never releases early.
+        let daemon = preparing_daemon(
+            pool,
+            DaemonConfig {
+                stop_before_deadline_ms: Some(-7 * 24 * 3_600_000),
+                ..Default::default()
+            },
+        )
+        .await
+        .with_dispatch_hold(DispatchHold::new(serde_json::json!([]), ["m".to_string()]));
         let prepared = daemon.prepare_claimed_requests(
-            vec![claimed_request("m", BODY, Some(far), now)],
+            vec![decided_request(
+                "m",
+                BODY,
+                Some(now + chrono::Duration::minutes(1)),
+                keep,
+                now,
+            )],
             ClaimLoopKind::Batch,
         );
-        assert!(!prepared[0].held);
-        // ...and stale decisions release everything too.
-        let mut stale = decisions(ModelHold::Hold { cutoff: None });
-        stale.computed_at = now - chrono::Duration::minutes(6);
-        state.set_claim(stale);
-        let prepared = daemon.prepare_claimed_requests(
-            vec![claimed_request("m", BODY, Some(far), now)],
-            ClaimLoopKind::Batch,
-        );
-        assert!(!prepared[0].held, "stale decisions release");
+        assert!(prepared[0].held);
     }
 
     /// Without a dispatch hold, outbound bodies are exactly what they were

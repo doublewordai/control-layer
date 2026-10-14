@@ -9148,16 +9148,23 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
                 SELECT DISTINCT m FROM UNNEST($1::TEXT[]) AS m
             ),
             stats AS (
-                SELECT s.model, SUM(s.completed)::BIGINT AS completed, SUM(s.refused)::BIGINT AS refused
+                -- The window's counters, and the first minute counted in
+                -- it: how long the model has been held within the window.
+                SELECT s.model, SUM(s.completed)::BIGINT AS completed, SUM(s.refused)::BIGINT AS refused,
+                       MIN(s.minute) AS held_since
                 FROM hold_stats s
                 WHERE s.model = ANY($1)
                   AND s.minute >= NOW() - make_interval(secs => $2::FLOAT8)
                 GROUP BY s.model
             ),
+            -- Pending work only. Requests in flight are about one request
+            -- latency of work (Little's law), and some are released and
+            -- running elsewhere; counting them would overstate the work
+            -- ahead of every deadline.
             active AS (
                 SELECT r.batch_id, r.model, COUNT(*)::BIGINT AS n
                 FROM requests r
-                WHERE r.state IN ('pending', 'claimed', 'processing')
+                WHERE r.state = 'pending'
                   AND r.batch_id IS NOT NULL
                   AND r.template_id IS NOT NULL
                   AND r.service_tier IS DISTINCT FROM 'background'
@@ -9182,7 +9189,7 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
                        1::BIGINT
                 FROM requests r
                 WHERE r.batch_id IS NULL
-                  AND r.state IN ('pending', 'claimed', 'processing')
+                  AND r.state = 'pending'
                   AND r.template_id IS NOT NULL
                   AND r.service_tier IS DISTINCT FROM 'background'
                   AND r.service_tier IS DISTINCT FROM 'priority'
@@ -9190,15 +9197,18 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             ),
             buckets AS (
                 -- One point per deadline minute: the latest deadline in the
-                -- minute and every request due in it.
+                -- minute and every request due in it. Overdue work is left
+                -- out: the claim releases it whatever the projection says.
                 SELECT model, date_trunc('minute', deadline) AS minute,
                        MAX(deadline) AS deadline, SUM(n)::BIGINT AS n
                 FROM due
+                WHERE deadline > NOW()
                 GROUP BY model, date_trunc('minute', deadline)
             )
             SELECT h.model,
                    COALESCE(st.completed, 0)::BIGINT AS completed,
                    COALESCE(st.refused, 0)::BIGINT AS refused,
+                   st.held_since,
                    b.deadline,
                    (SUM(b.n) OVER (PARTITION BY h.model ORDER BY b.minute))::BIGINT AS cumulative,
                    clock_timestamp() AS read_at
@@ -9227,6 +9237,7 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
                     model,
                     completed: row.get("completed"),
                     refused: row.get("refused"),
+                    held_since: row.get("held_since"),
                     backlog: Vec::new(),
                 });
             }

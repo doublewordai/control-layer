@@ -378,6 +378,13 @@ async fn every_daemon_reads_the_same_inputs_and_decides_alike(pool: PgPool) {
         .execute(&pool)
         .await
         .unwrap();
+    // Overdue and still pending (retry grace): the claim releases it anyway.
+    let overdue = flex(&a, "m", 1).await;
+    sqlx::query("UPDATE requests SET created_at = NOW() - INTERVAL '2 days' WHERE id = $1")
+        .bind(overdue[0])
+        .execute(&pool)
+        .await
+        .unwrap();
     flex(&a, "unheld", 2).await;
 
     let (read_at_a, inputs_a) = a
@@ -393,9 +400,14 @@ async fn every_daemon_reads_the_same_inputs_and_decides_alike(pool: PgPool) {
     let m = inputs_a.iter().find(|inputs| inputs.model == "m").unwrap();
     assert_eq!((m.completed, m.refused), (900, 3));
     assert_eq!(
+        m.held_since,
+        Some(now - Duration::minutes(5)),
+        "the first minute counted in the window"
+    );
+    assert_eq!(
         m.backlog_requests(),
-        4,
-        "pending and in flight, this model only"
+        3,
+        "pending and not overdue, this model only: not in flight"
     );
     assert_eq!(
         m.backlog.len(),
@@ -404,7 +416,7 @@ async fn every_daemon_reads_the_same_inputs_and_decides_alike(pool: PgPool) {
         m.backlog
     );
     assert_eq!(m.backlog[0].1, 1, "the earlier request alone");
-    assert_eq!(m.backlog[1].1, 4, "cumulative");
+    assert_eq!(m.backlog[1].1, 3, "cumulative");
     assert!(m.backlog[0].0 < m.backlog[1].0);
     let idle = inputs_a
         .iter()
@@ -415,13 +427,19 @@ async fn every_daemon_reads_the_same_inputs_and_decides_alike(pool: PgPool) {
         (0, 0, 0)
     );
 
-    // Same inputs, same decisions: 1 completion/s clears the backlog in
-    // seconds, so there is no cutoff.
+    // Same inputs, same decisions: 900 completions over the 5 minutes the
+    // model has been counted clear the backlog in seconds, so there is no
+    // cutoff.
     let decide = |inputs: &[fusillade_core::release::ModelHoldInputs], at| {
         inputs
             .iter()
             .map(|inputs| {
-                let decision = decide_model_hold(inputs, PARAMS, at);
+                let decision = decide_model_hold(
+                    inputs,
+                    PARAMS,
+                    at,
+                    &mut fusillade_core::release::ModelHoldMemory::default(),
+                );
                 (decision.model, decision.hold, decision.own_rate)
             })
             .collect::<Vec<_>>()
@@ -432,20 +450,24 @@ async fn every_daemon_reads_the_same_inputs_and_decides_alike(pool: PgPool) {
     assert!(read_at_b >= read_at_a);
     let (_, hold, own_rate) = decisions_a.iter().find(|d| d.0 == "m").unwrap();
     assert_eq!(*hold, ModelHold::Hold { cutoff: None });
-    assert!((own_rate - 1.0).abs() < 1e-9, "{own_rate}");
+    let held_secs = (read_at_a - (now - Duration::minutes(5))).num_milliseconds() as f64 / 1000.0;
+    assert!(
+        (own_rate - 900.0 / held_secs).abs() < 1e-9,
+        "the rate over the time held, not the whole window: {own_rate}"
+    );
 }
 
 #[test]
-fn the_hold_stats_migration_is_the_newest_and_follows_main() {
-    let newest = fusillade_arsenal::MIGRATOR
+fn the_hold_stats_migration_follows_main() {
+    let migration = fusillade_arsenal::MIGRATOR
         .iter()
-        .filter(|migration| migration.migration_type.is_up_migration())
-        .max_by_key(|migration| migration.version)
-        .unwrap();
-    assert_eq!(newest.version, 20261014130000);
-    assert_eq!(newest.description, "add hold stats");
+        .find(|migration| {
+            migration.migration_type.is_up_migration() && migration.version == 20261014130000
+        })
+        .expect("the hold_stats migration exists");
+    assert_eq!(migration.description, "add hold stats");
     assert!(
-        newest.version > 20261013100030,
+        migration.version > 20261013100030,
         "sorts after the finished-late index migrations"
     );
 }

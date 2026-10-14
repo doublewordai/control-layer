@@ -191,6 +191,21 @@ impl AdaptiveConcurrencyController {
         })
     }
 
+    /// A held dispatch (one sent with the daemon's dispatch hold) was refused
+    /// for the capacity the hold allows. Not an overload, so nothing is cut,
+    /// but not evidence for a raise either: the dispatch is taken back out of
+    /// the count a raise must earn. Without this a model whose held work is
+    /// refused would fill every slot each cycle, earn a raise each cycle, and
+    /// with nothing cutting climb toward its whole backlog.
+    ///
+    /// Taken from the current count whatever the request's stamp: if the
+    /// limit moved since it was sent, this errs toward not raising.
+    pub(super) fn record_held_refusal(&self, model: &str) {
+        if let Some(mut state) = self.states.get_mut(model) {
+            state.dispatched = state.dispatched.saturating_sub(1);
+        }
+    }
+
     /// Raise the limit.
     ///
     /// Only call this for a model that used every slot it was offered on the
@@ -328,6 +343,36 @@ mod tests {
         }
 
         assert_eq!(limit, 1, "sustained rejection should walk the limit down");
+    }
+
+    #[test]
+    fn a_model_whose_held_work_is_refused_does_not_climb() {
+        // Held refusals do not cut (the hold causes them by design), so they
+        // must not earn raises either: every cycle fills every slot with held
+        // work that is refused at once, and nothing would stop the climb.
+        let controller = controller();
+        let start = controller.limit("m", 150);
+        for _ in 0..200 {
+            let limit = controller.limit("m", 150);
+            for _ in 0..limit {
+                controller.stamp("m", 150);
+            }
+            for _ in 0..limit {
+                controller.record_held_refusal("m");
+            }
+            controller.try_grow("m");
+            assert_eq!(controller.limit("m", 150), start, "neither cut nor raised");
+        }
+
+        // Held work that completes, and released work, still earn raises.
+        let raise = (start as f64 * GROWTH).ceil() as usize - start;
+        for _ in 0..raise {
+            controller.stamp("m", 150);
+        }
+        controller.record_held_refusal("m");
+        assert_eq!(controller.try_grow("m"), None, "one short of the raise");
+        controller.stamp("m", 150);
+        assert!(controller.try_grow("m").is_some());
     }
 
     #[test]

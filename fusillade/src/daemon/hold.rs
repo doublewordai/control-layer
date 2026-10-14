@@ -4,15 +4,18 @@
 //! A held request carries the hold list (see [`super::DispatchHold`]); the
 //! upstream inference backend may then refuse it while the capacity the list
 //! allows is full. Near SLA failure, meeting the deadline matters more than
-//! where the request runs, so it is released (sent as stored, and the backend
-//! may then schedule it anywhere) when:
+//! where the request runs, so it is released (sent as stored, without the hold
+//! list, so the hold no longer limits where the backend schedules it) when:
 //!
 //! - it is past its deadline, or inside the batch-claim deadline ramp (the
-//!   floor, always; [`release_reason`]);
-//! - its model's held dispatches are refused while too few complete, or the
-//!   decisions are stale ([`ModelHold::ReleaseAll`]);
+//!   floor, always; applied by the claim queries);
+//! - its model's held dispatches were refused while none completed over a
+//!   whole window of holding, or the decisions are stale
+//!   ([`ModelHold::ReleaseAll`]);
 //! - it is due at or before its model's cutoff: the latest deadline whose work
-//!   cannot finish at the model's own rate ([`ModelHold::Hold`]).
+//!   cannot finish at the model's own rate ([`ModelHold::Hold`]);
+//! - it is so close to the retry cut-off that a held refusal could not be
+//!   retried before it (applied when the dispatch is prepared).
 //!
 //! Every daemon counts its held completions and held refusals in memory,
 //! flushes them every few seconds into the shared per-minute `hold_stats`
@@ -20,7 +23,8 @@
 //! work back and computes every held model's decision
 //! (`fusillade_core::release`). The claim queries apply the decisions, passed
 //! as parameters, so no leader, lock or extra table of decisions is needed and
-//! nothing is written to the request rows.
+//! nothing is written to the request rows. Only a storage whose claims make
+//! the decision can hold: a claimed request without one is sent as stored.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -29,9 +33,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use fusillade_core::manager::DaemonStorage;
 use fusillade_core::release::{
-    HoldClaim, HoldParams, HoldStatsDelta, ModelHold, apply_model_hold, decide_model_hold,
+    HoldClaim, HoldParams, HoldStatsDelta, ModelHold, ModelHoldMemory, decide_model_hold,
 };
-use fusillade_core::request::{DispatchTolerations, TolerationsRelease};
 use metrics::gauge;
 use tokio_util::sync::CancellationToken;
 
@@ -39,32 +42,15 @@ use super::DispatchHold;
 
 /// How often each daemon flushes its counters into `hold_stats`.
 const FLUSH_INTERVAL: Duration = Duration::from_secs(10);
-/// How long `hold_stats` rows are kept: well past any window.
-const STATS_RETENTION: chrono::Duration = chrono::Duration::hours(2);
+/// How long `hold_stats` rows are kept at least.
+const MIN_STATS_RETENTION: chrono::Duration = chrono::Duration::hours(2);
 
-/// The deadline floor, for claims that made no decision themselves (storage
-/// that does not decide): released past the deadline, or within
-/// `window_minutes ^ ramp_exponent` minutes of it, where the window runs from
-/// `created_at` to the deadline (about 59 minutes for 24h and 10 for 1h at
-/// 0.56), matching the batch-claim gate. No deadline (background): never. An
-/// unreadable `created_at` keeps the hold until the deadline passes.
-pub(crate) fn release_reason(
-    deadline: Option<DateTime<Utc>>,
-    created_at: Option<&str>,
-    ramp_exponent: f64,
-    now: DateTime<Utc>,
-) -> Option<TolerationsRelease> {
-    let deadline = deadline?;
-    let remaining_secs = (deadline - now).num_milliseconds() as f64 / 1000.0;
-    if remaining_secs <= 0.0 {
-        return Some(TolerationsRelease::PastDeadline);
-    }
-    let created_at = created_at
-        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
-        .map(|created_at| created_at.with_timezone(&Utc))?;
-    let window_secs = ((deadline - created_at).num_milliseconds() as f64 / 1000.0).max(0.0);
-    (remaining_secs <= (window_secs / 60.0).powf(ramp_exponent) * 60.0)
-        .then_some(TolerationsRelease::Ramp)
+/// How long `hold_stats` rows are kept: two windows, and at least two hours,
+/// so the read always sees the whole window.
+pub(crate) fn stats_retention(window: Duration) -> chrono::Duration {
+    chrono::Duration::from_std(window.saturating_mul(2))
+        .unwrap_or(chrono::Duration::MAX)
+        .max(MIN_STATS_RETENTION)
 }
 
 /// One daemon's hold state: its unflushed counters and the latest decisions.
@@ -74,6 +60,8 @@ pub(crate) struct HoldState {
     counters: Mutex<HashMap<String, (i64, i64)>>,
     /// The decisions the claim queries were last given.
     claim: RwLock<HoldClaim>,
+    /// Per model: what the decision remembers between refreshes.
+    memory: Mutex<HashMap<String, ModelHoldMemory>>,
 }
 
 impl HoldState {
@@ -87,6 +75,7 @@ impl HoldState {
             hold,
             counters: Mutex::new(HashMap::new()),
             claim: RwLock::new(claim),
+            memory: Mutex::new(HashMap::new()),
         }
     }
 
@@ -153,29 +142,21 @@ impl HoldState {
         }
     }
 
-    /// The decision for one claimed request of a held model when the claim
-    /// path made none: the deadline floor, then the model's decision. `None`
-    /// without a deadline (never held).
-    pub(crate) fn decide(
+    /// Every held model's decision from the inputs read on one refresh,
+    /// updating what each model's decision remembers.
+    fn decide(
         &self,
-        model: &str,
-        deadline: Option<DateTime<Utc>>,
-        created_at: Option<&str>,
-        ramp_exponent: f64,
+        models: &[String],
+        inputs: &[fusillade_core::release::ModelHoldInputs],
+        params: HoldParams,
         now: DateTime<Utc>,
-    ) -> Option<DispatchTolerations> {
-        let deadline_at = deadline?;
-        if let Some(reason) = release_reason(deadline, created_at, ramp_exponent, now) {
-            return Some(DispatchTolerations::Release(reason));
-        }
-        let claim = self
-            .claim
-            .read()
+        stale_after: chrono::Duration,
+    ) -> (HoldClaim, Vec<fusillade_core::release::ModelHoldDecision>) {
+        let mut memory = self
+            .memory
+            .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let hold = claim
-            .model_hold(model, now)
-            .unwrap_or(ModelHold::ReleaseAll(TolerationsRelease::Stale));
-        Some(apply_model_hold(hold, deadline_at))
+        decide_all(models, inputs, params, now, stale_after, &mut memory)
     }
 }
 
@@ -266,6 +247,7 @@ pub(crate) async fn run_hold_refresh<S>(
         if due {
             match refresh(
                 &*storage,
+                &state,
                 &models,
                 params,
                 stale_after,
@@ -325,6 +307,7 @@ fn minute_of(now: DateTime<Utc>) -> DateTime<Utc> {
 /// and decide. `Ok(None)` on shutdown.
 async fn refresh<S>(
     storage: &S,
+    state: &HoldState,
     models: &[String],
     params: HoldParams,
     stale_after: chrono::Duration,
@@ -334,11 +317,12 @@ async fn refresh<S>(
 where
     S: DaemonStorage + ?Sized,
 {
+    let retention = stats_retention(state.hold().window);
     let Some(_) = super::maintenance_query(
         shutdown,
         "hold_stats purge",
         query_timeout,
-        storage.purge_hold_stats(Utc::now() - STATS_RETENTION),
+        storage.purge_hold_stats(Utc::now() - retention),
     )
     .await?
     else {
@@ -354,18 +338,27 @@ where
     else {
         return Ok(None);
     };
-    Ok(Some(decide_all(models, &inputs, params, now, stale_after)))
+    Ok(Some(state.decide(
+        models,
+        &inputs,
+        params,
+        now,
+        stale_after,
+    )))
 }
 
 /// Every held model's decision from the inputs read on one refresh (a model
-/// with no counters and no work has empty inputs).
+/// with no counters and no work has empty inputs), updating each model's
+/// memory.
 pub(crate) fn decide_all(
     models: &[String],
     inputs: &[fusillade_core::release::ModelHoldInputs],
     params: HoldParams,
     now: DateTime<Utc>,
     stale_after: chrono::Duration,
+    memory: &mut HashMap<String, ModelHoldMemory>,
 ) -> (HoldClaim, Vec<fusillade_core::release::ModelHoldDecision>) {
+    memory.retain(|model, _| models.contains(model));
     let decisions: Vec<_> = models
         .iter()
         .map(|model| {
@@ -377,7 +370,12 @@ pub(crate) fn decide_all(
                 .iter()
                 .find(|inputs| &inputs.model == model)
                 .unwrap_or(&empty);
-            decide_model_hold(inputs, params, now)
+            decide_model_hold(
+                inputs,
+                params,
+                now,
+                memory.entry(model.clone()).or_default(),
+            )
         })
         .collect();
     let claim = HoldClaim {
@@ -394,52 +392,7 @@ pub(crate) fn decide_all(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn ts(raw: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(raw)
-            .unwrap()
-            .with_timezone(&Utc)
-    }
-
-    const CREATED: &str = "2026-10-08T00:00:00.000000Z";
-
-    #[test]
-    fn ramp_and_deadline_floor() {
-        let created = ts(CREATED);
-        let day = created + chrono::Duration::hours(24);
-        let hour = created + chrono::Duration::hours(1);
-        let at = |deadline: DateTime<Utc>, minutes_left: i64| {
-            deadline - chrono::Duration::minutes(minutes_left)
-        };
-        let reason = |deadline, created_at, now| release_reason(deadline, created_at, 0.56, now);
-
-        // 24h window at 0.56: 1440 ^ 0.56 ~= 58.7 minutes.
-        assert_eq!(reason(Some(day), Some(CREATED), at(day, 600)), None);
-        assert_eq!(reason(Some(day), Some(CREATED), at(day, 60)), None);
-        assert_eq!(
-            reason(Some(day), Some(CREATED), at(day, 58)),
-            Some(TolerationsRelease::Ramp)
-        );
-        // 1h window at 0.56: 60 ^ 0.56 ~= 9.9 minutes.
-        assert_eq!(reason(Some(hour), Some(CREATED), at(hour, 11)), None);
-        assert_eq!(
-            reason(Some(hour), Some(CREATED), at(hour, 9)),
-            Some(TolerationsRelease::Ramp)
-        );
-        // Past the deadline (retry grace): released whatever the window.
-        assert_eq!(
-            reason(Some(day), Some(CREATED), at(day, -1)),
-            Some(TolerationsRelease::PastDeadline)
-        );
-        assert_eq!(
-            reason(Some(day), None, at(day, -1)),
-            Some(TolerationsRelease::PastDeadline)
-        );
-        // No deadline (background): never released.
-        assert_eq!(reason(None, Some(CREATED), at(day, -1)), None);
-        // Unreadable created_at: kept until the deadline passes.
-        assert_eq!(reason(Some(day), Some("yesterday"), at(day, 1)), None);
-    }
+    use fusillade_core::request::TolerationsRelease;
 
     fn state() -> HoldState {
         HoldState::new(
@@ -494,15 +447,25 @@ mod tests {
             model: "busy".to_string(),
             completed: 0,
             refused: 4,
+            held_since: Some(now - chrono::Duration::minutes(15)),
             backlog: vec![(now + chrono::Duration::hours(1), 10)],
         }];
-        let (claim, decisions) = decide_all(
-            &["busy".to_string(), "quiet".to_string()],
-            &inputs,
-            params,
-            now,
-            chrono::Duration::minutes(5),
-        );
+        let models = ["busy".to_string(), "quiet".to_string()];
+        // Every daemon reading the same counters and work decides alike.
+        let decide = |memory: &mut HashMap<String, ModelHoldMemory>| {
+            decide_all(
+                &models,
+                &inputs,
+                params,
+                now,
+                chrono::Duration::minutes(5),
+                memory,
+            )
+        };
+        let mut a = HashMap::from([("gone".to_string(), ModelHoldMemory::default())]);
+        let mut b = HashMap::new();
+        let (claim, decisions) = decide(&mut a);
+        assert_eq!(decide(&mut b).0.models, claim.models);
         assert_eq!(decisions.len(), 2);
         assert_eq!(
             claim.model_hold("busy", now),
@@ -514,34 +477,28 @@ mod tests {
             "a model with no counters and no work is held, floor only"
         );
         assert_eq!(claim.stale_after, chrono::Duration::minutes(5));
+        assert_eq!(
+            a.get("busy").and_then(|memory| memory.last_release_at),
+            Some(now),
+            "the release is remembered"
+        );
+        assert!(
+            !a.contains_key("gone"),
+            "models no longer held are forgotten"
+        );
     }
 
     #[test]
-    fn the_in_process_decision_matches_the_claim() {
-        let state = state();
-        let now = Utc::now();
-        let created = (now - chrono::Duration::hours(1)).to_rfc3339();
-        let due = now + chrono::Duration::hours(23);
-        let decide = |deadline| state.decide("m", deadline, Some(&created), 0.56, now);
-        assert_eq!(decide(None), None, "no deadline: not held");
-        assert_eq!(decide(Some(due)), Some(DispatchTolerations::Keep));
-        state.set_claim(HoldClaim {
-            models: vec![("m".to_string(), ModelHold::Hold { cutoff: Some(due) })],
-            computed_at: now,
-            stale_after: chrono::Duration::minutes(5),
-        });
+    fn counters_outlive_the_window() {
+        // At least two hours, and two windows of a longer window, so the read
+        // never divides a whole window's time into part of its counters.
         assert_eq!(
-            decide(Some(due)),
-            Some(DispatchTolerations::Release(
-                TolerationsRelease::SlaProjection
-            ))
+            stats_retention(Duration::from_secs(900)),
+            chrono::Duration::hours(2)
         );
         assert_eq!(
-            decide(Some(now - chrono::Duration::minutes(1))),
-            Some(DispatchTolerations::Release(
-                TolerationsRelease::PastDeadline
-            )),
-            "the floor first"
+            stats_retention(Duration::from_secs(4 * 3600)),
+            chrono::Duration::hours(8)
         );
     }
 }

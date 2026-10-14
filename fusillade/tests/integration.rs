@@ -4016,6 +4016,7 @@ async fn held_refusals_do_not_spend_retries(pool: sqlx::PgPool) {
     let http_client = Arc::new(MockHttpClient::new());
     let refusal = || {
         Ok(HttpResponse {
+            x_request_id: None,
             status: 529,
             body: r#"{"error":{"message":"no capacity","type":"overloaded_error"}}"#.to_string(),
         })
@@ -4026,6 +4027,7 @@ async fn held_refusals_do_not_spend_retries(pool: sqlx::PgPool) {
     http_client.add_response(
         "POST /v1/held",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 200,
             body: r#"{"result":"served after the hold"}"#.to_string(),
         }),
@@ -4158,6 +4160,275 @@ async fn held_refusals_do_not_spend_retries(pool: sqlx::PgPool) {
     assert_eq!((completed, refused), (1, 3));
 }
 
+/// Run one model's two requests through two immediate 529s each and then
+/// blocking successes, with adaptive concurrency on and a limit of 2, and
+/// report whether both successes were ever in flight at once (the limit was
+/// not cut).
+async fn reaches_its_limit_after_two_refusals(pool: sqlx::PgPool, model: &str, held: bool) -> bool {
+    let http_client = Arc::new(MockHttpClient::new());
+    let path = format!("/v1/{model}");
+    let key = format!("POST {path}");
+    for _ in 0..2 {
+        http_client.add_response(
+            &key,
+            Ok(HttpResponse {
+                x_request_id: None,
+                status: 529,
+                body: r#"{"error":{"message":"no capacity","type":"overloaded_error"}}"#
+                    .to_string(),
+            }),
+        );
+    }
+    let triggers: Vec<_> = (0..2)
+        .map(|_| {
+            http_client.add_response_with_trigger(
+                &key,
+                Ok(HttpResponse {
+                    x_request_id: None,
+                    status: 200,
+                    body: r#"{"ok":true}"#.to_string(),
+                }),
+            )
+        })
+        .collect();
+
+    let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
+    model_concurrency_limits.insert(model.to_string(), 2);
+    let config = DaemonConfig {
+        claim_batch_size: 10,
+        claim_interval_ms: 10,
+        model_concurrency_limits,
+        adaptive_concurrency: true,
+        memory_gate_high_fraction: 0.75,
+        max_retries: Some(10),
+        stop_before_deadline_ms: None,
+        backoff_ms: 5,
+        backoff_factor: 1,
+        max_backoff_ms: 5,
+        status_log_interval_ms: None,
+        throughput_log_interval_ms: None,
+        heartbeat_interval_ms: 10_000,
+        cancellation_poll_interval_ms: 100,
+        purge_interval_ms: 0,
+        ..Default::default()
+    };
+    let manager = postgres_store(pool, &config).await;
+    let file_id = manager
+        .create_file(
+            format!("{model}-file"),
+            None,
+            (0..2)
+                .map(|index| fusillade::RequestTemplateInput {
+                    custom_id: Some(format!("{model}-{index}")),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: path.clone(),
+                    body: r#"{"prompt":"test"}"#.to_string(),
+                    model: model.to_string(),
+                    api_key: "test-key".to_string(),
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+    manager
+        .create_batch(fusillade::batch::BatchInput {
+            file_id,
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+            created_by: None,
+            api_key_id: None,
+            api_key: None,
+            total_requests: None,
+        })
+        .await
+        .unwrap();
+    mark_models_live_for_test(manager.as_ref(), &[model]).await;
+
+    let mut daemon = PostgresDaemon::new(manager.clone(), http_client.clone(), config);
+    if held {
+        daemon = daemon.with_dispatch_hold(fusillade::daemon::DispatchHold::new(
+            serde_json::json!([]),
+            [model.to_string()],
+        ));
+    }
+    let shutdown = CancellationToken::new();
+    let handle = Arc::new(daemon).run(shutdown.clone()).unwrap();
+
+    // Both refusals come back at once; then the requests are claimed again
+    // under whatever limit the refusals left.
+    let reached = tokio::time::timeout(Duration::from_secs(3), async {
+        while http_client.in_flight_count() < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .is_ok();
+
+    shutdown.cancel();
+    for trigger in triggers {
+        let _ = trigger.send(());
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
+    reached
+}
+
+/// A 529 on a held dispatch is the hold working: it does not cut the model's
+/// adaptive concurrency, which released requests share. The same 529s on a
+/// model that is not held cut it, exactly as before.
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+async fn held_refusals_do_not_cut_adaptive_concurrency(pool: sqlx::PgPool) {
+    assert!(
+        reaches_its_limit_after_two_refusals(pool.clone(), "held-model", true).await,
+        "held refusals left the limit at 2"
+    );
+    assert!(
+        !reaches_its_limit_after_two_refusals(pool, "open-model", false).await,
+        "ordinary 529s cut the limit to 1"
+    );
+}
+
+/// A backend that refuses (529) every dispatch carrying a toleration list and
+/// serves every dispatch without one, as one with no capacity the hold list
+/// allows would.
+#[derive(Clone, Default)]
+struct NoCapacityForHeldWork {
+    tolerations: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+}
+
+#[async_trait::async_trait]
+impl fusillade::http::HttpClient for NoCapacityForHeldWork {
+    async fn execute(
+        &self,
+        request: &fusillade::request::RequestData,
+        _api_key: &str,
+    ) -> fusillade::Result<HttpResponse> {
+        let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+        let tolerations = body["nvext"]["routing_constraints"]["tolerations"].clone();
+        let refused = !tolerations.is_null();
+        self.tolerations.lock().unwrap().push(tolerations);
+        Ok(HttpResponse {
+            x_request_id: None,
+            status: if refused { 529 } else { 200 },
+            body: if refused {
+                r#"{"error":{"message":"no capacity","type":"overloaded_error"}}"#.to_string()
+            } else {
+                r#"{"ok":true}"#.to_string()
+            },
+        })
+    }
+}
+
+/// End to end through a real refresh: held dispatches of a model with no
+/// capacity the hold allows are refused, the refusals are flushed into
+/// `hold_stats`, the refresh decides the model has no own capacity, the
+/// decision reaches the claim queries, and the next claim releases the
+/// request, which is then served without the hold list.
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+async fn a_refresh_releases_a_model_whose_held_work_is_only_refused(pool: sqlx::PgPool) {
+    let backend = NoCapacityForHeldWork::default();
+    let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
+    model_concurrency_limits.insert("held-model".to_string(), 10);
+    let config = DaemonConfig {
+        claim_batch_size: 10,
+        claim_interval_ms: 10,
+        model_concurrency_limits,
+        stop_before_deadline_ms: None,
+        backoff_ms: 50,
+        backoff_factor: 1,
+        max_backoff_ms: 50,
+        status_log_interval_ms: None,
+        heartbeat_interval_ms: 10_000,
+        claim_timeout_ms: 60_000,
+        processing_timeout_ms: 600_000,
+        cancellation_poll_interval_ms: 100,
+        ..Default::default()
+    };
+    let manager = postgres_store(pool.clone(), &config).await;
+    let file_id = manager
+        .create_file(
+            "held-file".to_string(),
+            None,
+            vec![fusillade::RequestTemplateInput {
+                custom_id: None,
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/held".to_string(),
+                body: r#"{"model":"held-model","prompt":"test"}"#.to_string(),
+                model: "held-model".to_string(),
+                api_key: "test-key".to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+    let batch = manager
+        .create_batch(fusillade::batch::BatchInput {
+            file_id,
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+            created_by: None,
+            api_key_id: None,
+            api_key: None,
+            total_requests: None,
+        })
+        .await
+        .unwrap();
+    let id = manager.get_batch_requests(batch.id).await.unwrap()[0].id();
+    mark_models_live_for_test(manager.as_ref(), &["held-model"]).await;
+
+    // A one-minute window, so one minute of refusals is a whole window, and
+    // a one-second refresh.
+    let mut hold =
+        fusillade::daemon::DispatchHold::new(serde_json::json!([]), ["held-model".to_string()]);
+    hold.refresh_interval = Duration::from_secs(1);
+    hold.window = Duration::from_secs(60);
+    hold.min_samples = 1;
+    hold.stale_after = Duration::from_secs(60);
+    let shutdown = CancellationToken::new();
+    let handle = Arc::new(
+        PostgresDaemon::new(manager.clone(), Arc::new(backend.clone()), config)
+            .with_dispatch_hold(hold),
+    )
+    .run(shutdown.clone())
+    .unwrap();
+
+    let completed = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(fusillade::AnyRequest::Completed(_)) =
+                manager.get_requests(vec![id]).await.unwrap().remove(0)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .is_ok();
+    shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
+    assert!(
+        completed,
+        "the refresh released the request and it was served"
+    );
+
+    let tolerations = backend.tolerations.lock().unwrap().clone();
+    let (last, held) = tolerations.split_last().unwrap();
+    assert!(!held.is_empty(), "held first: {tolerations:?}");
+    assert!(
+        held.iter().all(|list| *list == serde_json::json!([])),
+        "every dispatch before the release carried the hold list: {tolerations:?}"
+    );
+    assert_eq!(*last, serde_json::Value::Null, "released: sent as stored");
+    let attempts: i32 = sqlx::query_scalar("SELECT retry_attempt FROM requests WHERE id = $1")
+        .bind(id.0)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(attempts, 0, "the held refusals spent no attempt");
+}
+
 /// The dispatch hold composes with account presets. Upload stamps an account's
 /// pinned preset into the stored body (covered by dwctl's `toleration_presets`
 /// tests); these bodies are as upload leaves them. A no-overflow account's
@@ -4173,6 +4444,7 @@ async fn dispatch_hold_keeps_account_presets_and_releases_default_accounts(pool:
         http_client.add_response(
             "POST /v1/presets",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: r#"{"ok":true}"#.to_string(),
             }),

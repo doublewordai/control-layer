@@ -1750,8 +1750,9 @@ pub trait DaemonStorage: Send + Sync {
         Ok(0)
     }
 
-    /// Read each held model's counters over the trailing `window_secs` and
-    /// its outstanding work by deadline, with the database clock they were
+    /// Read each held model's counters over the trailing `window_secs` (and
+    /// the first counter minute in it) and its pending work that is not yet
+    /// overdue, cumulative by deadline, with the database clock they were
     /// read at. Models with neither may be omitted.
     async fn read_hold_inputs(
         &self,
