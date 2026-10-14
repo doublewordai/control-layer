@@ -35,7 +35,7 @@
 
 use async_trait::async_trait;
 use fusillade::request::{Claimed, Failed, FailureReason, Request, RequestCompletionResult};
-use fusillade::{CancellationFuture, DefaultRequestProcessor, HttpClient, RequestProcessor, ShouldRetry, Storage};
+use fusillade::{CancellationFuture, DefaultRequestProcessor, HttpClient, ProcessContext, RequestProcessor, ShouldRetry, Storage};
 
 /// Prepares a claimed request for dispatch, then delegates to the default
 /// processor. Construct with [`DispatchProcessor::new`] and wire the optional
@@ -123,6 +123,7 @@ where
         storage: &S,
         should_retry: ShouldRetry,
         cancellation: CancellationFuture,
+        ctx: ProcessContext,
     ) -> fusillade::Result<RequestCompletionResult> {
         // ZDR: the stored request body is a self-describing ciphertext envelope.
         // Decrypt it here, before dispatch, so the rest of the flow (and the
@@ -240,7 +241,7 @@ where
         // re-enters the full dwctl edge, which owns translation, id-scrub and the
         // streaming usage flags. No path-based branching here - the multi-step
         // tool loop that used to intercept `/v1/responses` is retired (COR-536).
-        self.default.process(request, http, storage, should_retry, cancellation).await
+        self.default.process(request, http, storage, should_retry, cancellation, ctx).await
     }
 }
 

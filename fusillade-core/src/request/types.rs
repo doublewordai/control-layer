@@ -21,6 +21,9 @@ pub struct HttpResponse {
     pub status: u16,
     /// Response body as a string.
     pub body: String,
+    /// `X-Request-ID` the server returned, if any. Used to correlate batch
+    /// attempts with server-side logs; never sent back to the server.
+    pub x_request_id: Option<String>,
 }
 
 /// Database state for filtering and querying requests.
@@ -427,8 +430,8 @@ pub struct RequestId(pub Uuid);
 
 impl std::fmt::Display for RequestId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Display only first 8 characters for readability in logs
-        write!(f, "{}", &self.0.to_string()[..8])
+        // Full UUID so log lines can be joined with database rows and traces.
+        write!(f, "{}", self.0)
     }
 }
 
@@ -452,8 +455,8 @@ pub struct DaemonId(pub Uuid);
 
 impl std::fmt::Display for DaemonId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Display only first 8 characters for readability in logs
-        write!(f, "{}", &self.0.to_string()[..8])
+        // Full UUID so log lines can be joined with database rows and traces.
+        write!(f, "{}", self.0)
     }
 }
 
