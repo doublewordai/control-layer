@@ -39,9 +39,10 @@ use crate::daemon::{
 };
 use crate::error::{FusilladeError, Result};
 use crate::manager::{
-    RetainedResponseArchiveCutoffs, RetainedResponseArchiveOutcome,
-    RetainedResponsePartitionRunway, RetainedResponseRetirementOutcome, RetainedResponseWriteError,
-    RetentionPolicy, TrailingDemandCount,
+    FileExpiryCursor, FileExpiryStep, RetainedResponseArchiveCutoffs,
+    RetainedResponseArchiveOutcome, RetainedResponsePartitionRunway,
+    RetainedResponseRetirementOutcome, RetainedResponseWriteError, RetentionPolicy,
+    TrailingDemandCount,
 };
 use crate::request::{
     Canceled, CascadeTargetState, Claimed, Completed, CreateBackgroundInput, CreateFlexInput,
@@ -8638,8 +8639,13 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             .await
     }
 
-    async fn expire_file_content(&self, retention_days: i32, batch_size: i64) -> Result<u64> {
-        template_retirement::expire_file_content(self, retention_days, batch_size).await
+    async fn expire_file_content(
+        &self,
+        retention_days: i32,
+        scan_limit: i64,
+        after: Option<FileExpiryCursor>,
+    ) -> Result<FileExpiryStep> {
+        template_retirement::expire_file_content(self, retention_days, scan_limit, after).await
     }
 
     async fn cleanup_retired_template_routes(&self, limit: i64) -> Result<u64> {
@@ -9765,6 +9771,22 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
     }
 
     async fn ensure_request_template_partitions(&self, weeks_ahead: i32) -> Result<(i64, i64)> {
+        let map_err = |e: sqlx::Error| {
+            FusilladeError::Other(anyhow!(
+                "Failed to ensure request template partitions: {}",
+                e
+            ))
+        };
+        let mut tx = self.begin_maintenance_write().await.map_err(map_err)?;
+        // Attaching a partition clones request_templates_g2's foreign key to
+        // `files`, which needs a lock that waits for every open transaction
+        // that has written `files`. While it waits, every new write to `files`
+        // (uploads, batch creation) queues behind it. Give up quickly instead:
+        // the runway is weeks long, so a later daily tick can retry.
+        sqlx::query("SET LOCAL lock_timeout = '1s'")
+            .execute(&mut *tx)
+            .await
+            .map_err(map_err)?;
         let (created, ahead): (i32, i64) = sqlx::query_as(
             r#"
             SELECT ensure_request_template_partitions(
@@ -9780,11 +9802,10 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             "#,
         )
         .bind(weeks_ahead)
-        .fetch_one(self.write_executor())
+        .fetch_one(&mut *tx)
         .await
-        .map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to ensure request template partitions: {}", e))
-        })?;
+        .map_err(map_err)?;
+        tx.commit().await.map_err(map_err)?;
         Ok((i64::from(created), ahead))
     }
 
