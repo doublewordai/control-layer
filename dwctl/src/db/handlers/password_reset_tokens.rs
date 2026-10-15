@@ -33,7 +33,7 @@ impl<'c> Repository for PasswordResetTokens<'c> {
     type Id = Uuid;
     type Filter = PasswordResetTokenFilter;
 
-    #[instrument(skip(self, request), err)]
+    #[instrument(level = "debug", skip(self, request), err)]
     async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
         let token_hash = password::hash_string_with_params(&request.raw_token, Some(request.argon2_params))
             .map_err(|e| DbError::Other(anyhow::anyhow!(e)))?;
@@ -55,7 +55,7 @@ impl<'c> Repository for PasswordResetTokens<'c> {
         Ok(token)
     }
 
-    #[instrument(skip(self, id), err)]
+    #[instrument(level = "debug", skip(self, id), err)]
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let token = sqlx::query_as!(
             PasswordResetToken,
@@ -68,7 +68,7 @@ impl<'c> Repository for PasswordResetTokens<'c> {
         Ok(token)
     }
 
-    #[instrument(skip(self, ids), fields(count = ids.len()), err)]
+    #[instrument(level = "debug", skip(self, ids), fields(count = ids.len()), err)]
     async fn get_bulk(&mut self, ids: Vec<Self::Id>) -> Result<HashMap<Self::Id, Self::Response>> {
         let tokens = sqlx::query_as!(
             PasswordResetToken,
@@ -81,7 +81,7 @@ impl<'c> Repository for PasswordResetTokens<'c> {
         Ok(tokens.into_iter().map(|t| (t.id, t)).collect())
     }
 
-    #[instrument(skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
+    #[instrument(level = "debug", skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
         let mut query =
             String::from("SELECT id, user_id, token_hash, expires_at, created_at, used_at FROM password_reset_tokens WHERE 1=1");
@@ -108,7 +108,7 @@ impl<'c> Repository for PasswordResetTokens<'c> {
         Ok(tokens)
     }
 
-    #[instrument(skip(self, id, request), err)]
+    #[instrument(level = "debug", skip(self, id, request), err)]
     async fn update(&mut self, id: Self::Id, request: &Self::UpdateRequest) -> Result<Self::Response> {
         let token = sqlx::query_as!(
             PasswordResetToken,
@@ -127,7 +127,7 @@ impl<'c> Repository for PasswordResetTokens<'c> {
         Ok(token)
     }
 
-    #[instrument(skip(self, id), err)]
+    #[instrument(level = "debug", skip(self, id), err)]
     async fn delete(&mut self, id: Self::Id) -> Result<bool> {
         let result = sqlx::query!("DELETE FROM password_reset_tokens WHERE id = $1", id)
             .execute(&mut *self.db)
@@ -144,7 +144,7 @@ impl<'c> PasswordResetTokens<'c> {
 
     /// Create a password reset token for a user
     /// TODO: why does this return the token, and then an object that wraps the token
-    #[instrument(skip(self, config), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self, config), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn create_for_user(&mut self, user_id: UserId, config: &Config) -> Result<(String, PasswordResetToken)> {
         let raw_token = password::generate_reset_token();
         let expires_at = Utc::now()
@@ -166,7 +166,7 @@ impl<'c> PasswordResetTokens<'c> {
     }
 
     /// Find a valid token by ID and verify the raw token
-    #[instrument(skip(self, raw_token), err)]
+    #[instrument(level = "debug", skip(self, raw_token), err)]
     pub async fn find_valid_token_by_id(&mut self, token_id: Uuid, raw_token: &str) -> Result<Option<PasswordResetToken>> {
         let token = self.get_by_id(token_id).await?;
 
@@ -194,7 +194,7 @@ impl<'c> PasswordResetTokens<'c> {
     }
 
     /// Invalidate all tokens for a user
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn invalidate_for_user(&mut self, user_id: UserId) -> Result<u64> {
         let result = sqlx::query!(
             r#"

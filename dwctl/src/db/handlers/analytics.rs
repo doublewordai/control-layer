@@ -110,7 +110,7 @@ struct BulkTimeSeriesRow {
 }
 
 /// Get total request count
-#[instrument(skip(db), err)]
+#[instrument(level = "debug", skip(db), err)]
 async fn get_total_requests(
     db: &PgPool,
     time_range_start: DateTime<Utc>,
@@ -148,7 +148,7 @@ async fn get_total_requests(
 }
 
 /// Get time series data with configurable granularity
-#[instrument(skip(db), err)]
+#[instrument(level = "debug", skip(db), err)]
 async fn get_time_series(
     db: &PgPool,
     time_range_start: DateTime<Utc>,
@@ -163,7 +163,7 @@ async fn get_time_series(
 }
 
 /// Get time series data with hourly granularity (existing implementation)
-#[instrument(skip(db), err)]
+#[instrument(level = "debug", skip(db), err)]
 async fn get_time_series_hourly(
     db: &PgPool,
     time_range_start: DateTime<Utc>,
@@ -243,7 +243,7 @@ async fn get_time_series_hourly(
 }
 
 /// Get time series data with 10-minute granularity
-#[instrument(skip(db), err)]
+#[instrument(level = "debug", skip(db), err)]
 async fn get_time_series_ten_minutes(
     db: &PgPool,
     time_range_start: DateTime<Utc>,
@@ -455,7 +455,7 @@ fn fill_missing_intervals_for_sparklines(
 }
 
 /// Get status code breakdown (raw counts, percentages calculated later)
-#[instrument(skip(db), err)]
+#[instrument(level = "debug", skip(db), err)]
 async fn get_status_codes(
     db: &PgPool,
     time_range_start: DateTime<Utc>,
@@ -490,7 +490,7 @@ async fn get_status_codes(
 }
 
 /// Get model usage data (raw counts, percentages calculated later)
-#[instrument(skip(db), err)]
+#[instrument(level = "debug", skip(db), err)]
 async fn get_model_usage(db: &PgPool, time_range_start: DateTime<Utc>, time_range_end: DateTime<Utc>) -> Result<Vec<ModelUsageRow>> {
     let mut tx = begin_dashboard_read(db).await?;
     let rows = sqlx::query_as!(
@@ -508,7 +508,7 @@ async fn get_model_usage(db: &PgPool, time_range_start: DateTime<Utc>, time_rang
 }
 
 /// Get aggregated analytics data for HTTP requests
-#[instrument(skip(db), err)]
+#[instrument(level = "debug", skip(db), err)]
 pub async fn get_requests_aggregate(
     db: &PgPool,
     time_range_start: DateTime<Utc>,
@@ -585,7 +585,7 @@ pub async fn get_requests_aggregate(
 }
 
 /// Get aggregated metrics for one or more models (with 60s cache)
-#[instrument(skip(db), err)]
+#[instrument(level = "debug", skip(db), err)]
 pub async fn get_model_metrics(db: &PgPool, mut model_aliases: Vec<String>) -> Result<HashMap<String, ModelMetrics>> {
     if model_aliases.is_empty() {
         return Ok(HashMap::new());
@@ -741,7 +741,7 @@ struct UserUsageRow {
 /// requests don't inflate the counts. Because it is keyed by UTC `usage_date`,
 /// the range is whole-UTC-day and `last_active_at` is day-granular
 /// (`MAX(usage_date)`), not the exact last-request timestamp.
-#[instrument(skip(db), err)]
+#[instrument(level = "debug", skip(db), err)]
 pub async fn get_model_user_usage(
     db: &PgPool,
     model_alias: &str,
@@ -833,7 +833,7 @@ pub async fn get_model_user_usage(
 /// means the batch predates the read model and its raw analytics have aged out — the caller
 /// surfaces this as a 404 ("analytics no longer available") rather than a misleading all-zero
 /// result. (It also covers a batch that never had a foldable request, e.g. all-non-2xx.)
-#[instrument(skip(pool))]
+#[instrument(level = "debug", skip(pool))]
 pub async fn get_batch_analytics(pool: &PgPool, batch_id: &Uuid) -> Result<Option<BatchAnalytics>> {
     let row = sqlx::query!(
         r#"
@@ -912,7 +912,7 @@ fn batch_analytics_from_row(
 }
 
 /// Get aggregated analytics metrics for multiple batches in a single query
-#[instrument(skip(pool))]
+#[instrument(level = "debug", skip(pool))]
 pub async fn get_batches_analytics_bulk(pool: &PgPool, batch_ids: &[Uuid]) -> Result<HashMap<Uuid, BatchAnalytics>> {
     if batch_ids.is_empty() {
         return Ok(HashMap::new());
@@ -995,7 +995,7 @@ struct HttpAnalyticsRow {
 }
 
 /// List HTTP analytics entries with filtering and pagination
-#[instrument(skip(pool), err)]
+#[instrument(level = "debug", skip(pool), err)]
 pub async fn list_http_analytics(
     pool: &PgPool,
     skip: i64,
@@ -1121,7 +1121,7 @@ struct ModelBreakdownRow {
 /// Returns (batch_count, avg_requests_per_batch, total_cost).
 /// Batch count and avg can't be derived from per-model breakdown
 /// (batches may span multiple models). Cost is already aggregated here.
-#[instrument(skip(pool), err)]
+#[instrument(level = "debug", skip(pool), err)]
 pub async fn get_user_batch_counts(pool: &PgPool, user_id: Uuid) -> Result<(i64, f64, String)> {
     let row = sqlx::query_as!(
         BatchCountRow,
@@ -1162,7 +1162,7 @@ const USAGE_DAILY_REFRESH_LOCK: i64 = 0x4457_4354_5553_4744;
 /// The `WHERE id > last_processed_id` scan is disjoint from the one-off backfill's
 /// `WHERE id <= backfill_watermark`, so the two can run concurrently without double
 /// counting (a day straddling the boundary gets each side summed via the additive upsert).
-#[instrument(skip(pool), err)]
+#[instrument(level = "debug", skip(pool), err)]
 pub async fn refresh_user_model_usage_daily(pool: &PgPool) -> Result<()> {
     let mut tx = pool.begin().await?;
 
@@ -1239,7 +1239,7 @@ pub async fn refresh_user_model_usage_daily(pool: &PgPool) -> Result<()> {
 /// Load current realtime tariff rates keyed by model alias.
 /// Returns a map of model alias → (input_price_per_token, output_price_per_token).
 /// Only resolve models present in this usage response, including retired models.
-#[instrument(skip(pool), err)]
+#[instrument(level = "debug", skip(pool), err)]
 pub async fn get_realtime_tariffs(pool: &PgPool, account: Uuid, models: &[String]) -> Result<HashMap<String, (Decimal, Decimal)>> {
     let rows = sqlx::query!(
         r#"
@@ -1273,7 +1273,7 @@ pub async fn get_realtime_tariffs(pool: &PgPool, account: Uuid, models: &[String
 /// Get all-time per-model breakdown from the pre-aggregated `user_model_usage_daily`
 /// rollup, summed across every day. Totals (tokens, cost, request count) are derived from
 /// these results by the handler.
-#[instrument(skip(pool), err)]
+#[instrument(level = "debug", skip(pool), err)]
 pub async fn get_user_model_breakdown(pool: &PgPool, user_id: Uuid) -> Result<Vec<ModelBreakdownEntry>> {
     let rows = sqlx::query_as!(
         ModelBreakdownRow,
@@ -1314,7 +1314,7 @@ pub async fn get_user_model_breakdown(pool: &PgPool, user_id: Uuid) -> Result<Ve
 /// The rollup is keyed by UTC `usage_date`, so the range is matched at **day** granularity:
 /// the start/end timestamps are truncated to their UTC date. Sub-day ranges therefore
 /// collapse to whole days — callers (and the UI) present usage at day granularity.
-#[instrument(skip(pool), err)]
+#[instrument(level = "debug", skip(pool), err)]
 pub async fn get_user_model_breakdown_for_range(
     pool: &PgPool,
     user_id: Uuid,
@@ -1360,7 +1360,7 @@ pub async fn get_user_model_breakdown_for_range(
 /// Get distinct batch count for a date range from `batch_aggregates` (one row per batch,
 /// filtered by `created_at`). Batch counts are not summable across day boundaries, so they
 /// come from `batch_aggregates` rather than the daily rollup.
-#[instrument(skip(pool), err)]
+#[instrument(level = "debug", skip(pool), err)]
 pub async fn get_user_batch_count_for_range(pool: &PgPool, user_id: Uuid, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<i64> {
     let row = sqlx::query_scalar!(
         r#"

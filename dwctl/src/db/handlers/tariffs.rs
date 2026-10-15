@@ -24,7 +24,7 @@ impl<'c> Tariffs<'c> {
     }
 
     /// Create a new tariff for a deployed model
-    #[instrument(skip(self, request), fields(deployed_model_id = %request.deployed_model_id, name = %request.name), err)]
+    #[instrument(level = "debug", skip(self, request), fields(deployed_model_id = %request.deployed_model_id, name = %request.name), err)]
     pub async fn create(&mut self, request: &TariffCreateDBRequest) -> Result<TariffDBResponse> {
         // Convert ApiKeyPurpose enum to string for database
         let purpose_str = request.api_key_purpose.as_ref().map(|p| match p {
@@ -62,7 +62,7 @@ impl<'c> Tariffs<'c> {
     }
 
     /// Get a tariff by ID
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn get_by_id(&mut self, id: Uuid) -> Result<Option<TariffDBResponse>> {
         let tariff = sqlx::query_as!(
             ModelTariff,
@@ -82,7 +82,7 @@ impl<'c> Tariffs<'c> {
 
     /// List the current (active) GENERAL tariffs for a deployed model: the model's
     /// own price, without any organisation's rows.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn list_current_by_model(&mut self, deployed_model_id: DeploymentId) -> Result<Vec<TariffDBResponse>> {
         let tariffs = sqlx::query_as!(
             ModelTariff,
@@ -103,7 +103,7 @@ impl<'c> Tariffs<'c> {
 
     /// List every current (active) tariff for a deployed model, general and
     /// organisation-scoped alike. Operator views group them by `user_id`.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn list_current_by_model_all_scopes(&mut self, deployed_model_id: DeploymentId) -> Result<Vec<TariffDBResponse>> {
         let tariffs = sqlx::query_as!(
             ModelTariff,
@@ -137,7 +137,7 @@ impl<'c> Tariffs<'c> {
     }
 
     /// List one organisation's current (active) tariffs across every model.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn list_current_by_account(&mut self, user_id: Uuid) -> Result<Vec<TariffDBResponse>> {
         let tariffs = sqlx::query_as!(
             ModelTariff,
@@ -160,7 +160,7 @@ impl<'c> Tariffs<'c> {
     /// Customer catalogue prices: all-class account deal, then model price,
     /// per purpose/window. Class-specific deals remain internal until the public
     /// UX supports them. Actual billing still uses the resolved class.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn list_effective_for_account(
         &mut self,
         deployed_model_ids: &[DeploymentId],
@@ -214,7 +214,7 @@ impl<'c> Tariffs<'c> {
     }
 
     /// List all tariffs (including historical) for a deployed model
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn list_all_by_model(&mut self, deployed_model_id: DeploymentId) -> Result<Vec<TariffDBResponse>> {
         let tariffs = sqlx::query_as!(
             ModelTariff,
@@ -235,7 +235,7 @@ impl<'c> Tariffs<'c> {
 
     /// Compatibility wrapper: playground may fall back to realtime; batch stays
     /// within its purpose and window. All callers share the effective resolver.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn get_pricing_at_timestamp_with_fallback(
         &mut self,
         deployed_model_id: DeploymentId,
@@ -254,7 +254,7 @@ impl<'c> Tariffs<'c> {
     }
 
     /// Resolve the general model price at the request's original timestamp.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn get_pricing_at_timestamp(
         &mut self,
         deployed_model_id: DeploymentId,
@@ -275,7 +275,7 @@ impl<'c> Tariffs<'c> {
 
     /// Close multiple tariffs by setting valid_until to the current time
     /// More efficient than calling close_tariff in a loop
-    #[instrument(skip(self), fields(count = ids.len()), err)]
+    #[instrument(level = "debug", skip(self), fields(count = ids.len()), err)]
     pub async fn close_tariffs_batch(&mut self, ids: &[Uuid]) -> Result<u64> {
         if ids.is_empty() {
             return Ok(0);
@@ -287,7 +287,7 @@ impl<'c> Tariffs<'c> {
     }
 
     /// Delete a tariff (hard delete - only use for mistakes, prefer close_tariff for normal operations)
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn delete(&mut self, id: Uuid) -> Result<bool> {
         let result = sqlx::query!(
             r#"
