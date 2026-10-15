@@ -26,6 +26,7 @@ pub mod handler;
 pub mod image_normalizer_middleware;
 pub mod middleware;
 pub mod outbound_request;
+pub mod rejections;
 pub mod response_store;
 pub mod store;
 pub mod stream_usage;

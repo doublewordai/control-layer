@@ -333,6 +333,10 @@ where
     /// path reads an account's resolved tolerations from here (its hidden batch
     /// key belongs to that account) so batch matches realtime.
     pub key_policy_cache: crate::sync::key_policy::KeyPolicyCache,
+    /// The live onwards targets, which dwctl's own inference rejections are
+    /// labelled from (see [`crate::inference::rejections`]). `None` labels them
+    /// with neither model nor account.
+    pub onwards_targets: Option<onwards::target::Targets>,
 }
 
 impl<P> AppState<P>
@@ -2606,6 +2610,12 @@ pub async fn build_router(
         crate::inference::body_limit::limit_inference_body,
     ));
 
+    // Outermost, so every layer above can count the requests it refuses
+    // alongside onwards' own (`onwards_rejections_total`).
+    let onwards_router = onwards_router.layer(axum::Extension(crate::inference::rejections::Recorder::new(
+        state.onwards_targets.clone().unwrap_or_default(),
+    )));
+
     // Build the app with admin API and onwards proxy nested. serve the (restricted) openai spec.
     // Strict mode requires different nesting:
     // - Batches routes (no /v1 prefix) need to be at /ai/v1/files, /ai/v1/batches
@@ -2844,7 +2854,14 @@ pub async fn build_router(
                     span.set_attribute("otel.status_code", "ERROR");
                     span.set_attribute("error.type", status.to_string());
                 } else if status >= 400 {
-                    span.set_attribute("error.type", status.to_string());
+                    // A dwctl layer that refused the request reports its
+                    // rejection code instead of the bare status, and has
+                    // already set it when it recorded on this span.
+                    match response.extensions().get::<crate::inference::rejections::RejectionCode>() {
+                        Some(rejection) if rejection.recorded_on(span) => {}
+                        Some(rejection) => span.set_attribute("error.type", rejection.code()),
+                        None => span.set_attribute("error.type", status.to_string()),
+                    }
                 }
                 tracing::info!(
                     http.response.status_code = status,
@@ -4484,7 +4501,7 @@ impl Application {
             // Realtime traffic never carries it (the realtime path only adds
             // `x-fusillade-request-id`), so it exempts exactly the daemon
             // traffic, which tolerates latency and runs its own retries.
-            .with_first_token_timeout_exempt_header("x-fusillade-batch-created-at")
+            .with_first_token_timeout_exempt_header(crate::inference::rejections::DISPATCHED_HEADER)
             .with_inflight_limiter(Arc::new(crate::realtime_inflight::RealtimeInflightLimiter::from_parts(
                 "realtime",
                 config.limits.realtime_inflight.enforce,
@@ -4530,6 +4547,7 @@ impl Application {
             .maybe_keystore(bg_services.keystore.clone())
             .response_store(response_store)
             .image_normalizer(image_normalizer)
+            .onwards_targets(bg_services.onwards_targets.clone())
             .build();
 
         if let Some(config_path) = config_path {

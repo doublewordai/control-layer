@@ -46,6 +46,7 @@ use tracing::{debug, warn};
 
 use crate::config::ContinuationConfig;
 use crate::db::models::api_keys::ApiKeyPurpose;
+use crate::inference::rejections;
 use crate::inference::store::ONWARDS_RESPONSE_ID_HEADER;
 use crate::prompt_cache::sse::SseBufferedStream;
 
@@ -296,7 +297,8 @@ pub async fn continuation_middleware(State(state): State<ContinuationState>, req
                     "code": "body_read_failed",
                 }
             });
-            return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
+            let response = (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
+            return rejections::refuse(&parts, response, "body_read_failed", None, None);
         }
     };
 

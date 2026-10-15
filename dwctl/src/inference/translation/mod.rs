@@ -57,6 +57,10 @@ pub enum TranslationError {
     /// The inbound foreign request was malformed (maps to a 400).
     #[error("{0}")]
     BadRequest(String),
+    /// A field of the inbound request has a value we can't accept (maps to a
+    /// 400 naming the field).
+    #[error("{message}")]
+    InvalidParameter { param: &'static str, message: String },
     /// Something went wrong on our side translating (maps to a 5xx).
     #[error("{0}")]
     Internal(String),

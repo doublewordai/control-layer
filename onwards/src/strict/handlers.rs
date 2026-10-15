@@ -131,7 +131,7 @@ fn rejection_context<C: HttpClient>(
 ) -> RejectionContext {
     let mut rejection = RejectionContext::from_request(state, headers);
     if let Some(model) = model {
-        rejection.set_model_if_configured(state, model);
+        rejection.set_model_if_configured(&state.targets, model);
     }
     rejection
 }

@@ -111,6 +111,12 @@ fn normalize_auth(headers: &mut HeaderMap) {
     }
 }
 
+/// Whether an Anthropic translator claims this request, so that its
+/// `x-api-key` stands in for a missing `Authorization` (see [`normalize_auth`]).
+pub(crate) fn accepts_x_api_key(path: &str, headers: &HeaderMap) -> bool {
+    AnthropicMessages::new(false).detect(path, headers) || models::AnthropicModels.detect(path, headers)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,7 +517,7 @@ mod tests {
             "thinking": { "type": "enabled", "budget_tokens": 4096 }
         }));
         assert_eq!(out["reasoning_effort"], "medium");
-        // disabled / absent thinking does not set reasoning_effort
+        // absent thinking does not set reasoning_effort
         let out2 = translate(json!({ "model": "m", "max_tokens": 1, "messages": [] }));
         assert!(out2.get("reasoning_effort").is_none());
     }
