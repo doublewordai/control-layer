@@ -190,6 +190,17 @@ async fn schema_mismatches_record_where_but_never_what() {
             json!({"model": ALIAS, "input": "Hello", "max_output_tokens": SECRET}),
             "max_output_tokens",
         ),
+        (
+            // A free-form object that fails beneath a client key: with
+            // serde_json's `raw_value` feature this key must hold a string.
+            "/chat/completions",
+            json!({
+                "model": ALIAS,
+                "messages": [],
+                "logit_bias": {SECRET: {"$serde_json::private::RawValue": 1}}
+            }),
+            "logit_bias.*.*",
+        ),
     ] {
         let (_, spans) = send(path, body).await;
 

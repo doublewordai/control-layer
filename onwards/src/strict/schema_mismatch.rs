@@ -2,21 +2,178 @@
 //! without any of the request's content, so it can be recorded for every
 //! caller, including those whose bodies must not be kept.
 //!
-//! The path names only fields the schemas declare. Array positions become
-//! `[]`, and every free-form object in the schemas is a `serde_json::Value`,
-//! which accepts anything, so deserialisation never fails beneath a key the
-//! client chose. Keep it that way: a typed map would put client keys in the
-//! path. A key that doesn't look like a field name is replaced by `*` all the
-//! same. serde's message, which can quote the offending value, is reduced to
-//! a fixed reason.
+//! Array positions become `[]`, and a key is kept only if the schemas declare
+//! it as a field; anything else becomes `*`. Checking keys against the schemas
+//! rather than their shape matters: a free-form `serde_json::Value` can fail
+//! beneath keys the client chose (with serde_json's `raw_value` feature, an
+//! object keyed `$serde_json::private::RawValue` must hold a string). serde's
+//! message, which can quote the offending value, is reduced to a fixed reason.
 
 use serde::de::DeserializeOwned;
 use serde_path_to_error::Segment;
 
 /// Longest path recorded; anything longer is cut at a segment boundary.
 const MAX_PATH_LEN: usize = 200;
-/// Longest key kept as a field name.
-const MAX_FIELD_LEN: usize = 64;
+/// The field names and renames the strict request and response schemas
+/// declare, sorted. A name missing here is recorded as `*`, so the list can
+/// only hide too much; a test keeps it in step with the schemas.
+const DECLARED_FIELDS: &[&str] = &[
+    "allowed_tools",
+    "annotation_type",
+    "annotations",
+    "arguments",
+    "background",
+    "best_of",
+    "cached_tokens",
+    "call_id",
+    "call_type",
+    "chat_template_kwargs",
+    "choices",
+    "code",
+    "code_interpreter",
+    "completed_at",
+    "completion_tokens",
+    "completion_tokens_details",
+    "computer_use_preview",
+    "container",
+    "content",
+    "content_filter",
+    "created",
+    "created_at",
+    "custom",
+    "data",
+    "defer_loading",
+    "delta",
+    "description",
+    "detail",
+    "dimensions",
+    "display_height",
+    "display_width",
+    "echo",
+    "effort",
+    "embedding",
+    "encoding_format",
+    "encrypted_content",
+    "environment",
+    "error",
+    "error_type",
+    "event_type",
+    "extra",
+    "fallback_id",
+    "fallback_model",
+    "fallback_response_id",
+    "file_id",
+    "file_search",
+    "filename",
+    "filters",
+    "finish_reason",
+    "format",
+    "format_type",
+    "frequency_penalty",
+    "function",
+    "headers",
+    "hosted_tool",
+    "id",
+    "ignore_eos",
+    "image_url",
+    "include_stop_str_in_output",
+    "include_usage",
+    "incomplete_details",
+    "index",
+    "input",
+    "input_file",
+    "input_image",
+    "input_text",
+    "input_tokens",
+    "input_tokens_details",
+    "instructions",
+    "json_object",
+    "json_schema",
+    "logit_bias",
+    "logprobs",
+    "max_completion_tokens",
+    "max_num_results",
+    "max_output_tokens",
+    "max_tokens",
+    "max_tool_calls",
+    "mcp",
+    "message",
+    "messages",
+    "metadata",
+    "min_tokens",
+    "model",
+    "n",
+    "name",
+    "namespace",
+    "object",
+    "output",
+    "output_text",
+    "output_tokens",
+    "output_tokens_details",
+    "parallel_tool_calls",
+    "param",
+    "parameters",
+    "presence_penalty",
+    "previous_response_id",
+    "priority",
+    "prompt",
+    "prompt_cache_key",
+    "prompt_tokens",
+    "prompt_tokens_details",
+    "reason",
+    "reasoning",
+    "reasoning_content",
+    "reasoning_details",
+    "reasoning_effort",
+    "reasoning_text",
+    "reasoning_tokens",
+    "refusal",
+    "require_approval",
+    "response",
+    "response_format",
+    "role",
+    "safety_identifier",
+    "schema",
+    "search_context_size",
+    "seed",
+    "sequence_number",
+    "server_label",
+    "server_url",
+    "service_tier",
+    "skip_special_tokens",
+    "status",
+    "stop",
+    "stop_token_ids",
+    "store",
+    "stream",
+    "stream_options",
+    "strict",
+    "suffix",
+    "summary",
+    "summary_text",
+    "system_fingerprint",
+    "temperature",
+    "text",
+    "thinking",
+    "thinking_token_budget",
+    "tool_call_id",
+    "tool_calls",
+    "tool_choice",
+    "tool_type",
+    "tools",
+    "top_logprobs",
+    "top_p",
+    "total_tokens",
+    "truncation",
+    "type",
+    "url",
+    "usage",
+    "user",
+    "user_location",
+    "value",
+    "vector_store_ids",
+    "web_search_preview",
+];
 
 /// Where and how a body failed to deserialise.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,7 +197,7 @@ pub(crate) fn locate<T: DeserializeOwned>(body: &[u8]) -> Option<SchemaMismatch>
     // serde reports a missing field at its parent and names it in the message;
     // the name comes from the schema, not the request.
     if reason == "missing_field"
-        && let Some(field) = backquoted(&message).filter(|name| is_field_name(name))
+        && let Some(field) = backquoted(&message).filter(|name| is_declared(name))
     {
         push_key(&mut path, field);
     }
@@ -73,20 +230,15 @@ fn push_key(path: &mut String, key: &str) {
     if !path.is_empty() {
         path.push('.');
     }
-    if key == "?" || is_field_name(key) {
+    if key == "?" || is_declared(key) {
         path.push_str(key);
     } else {
         path.push('*');
     }
 }
 
-fn is_field_name(key: &str) -> bool {
-    let mut chars = key.chars();
-    key.len() <= MAX_FIELD_LEN
-        && chars
-            .next()
-            .is_some_and(|first| first.is_ascii_lowercase() || first == '_')
-        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+fn is_declared(key: &str) -> bool {
+    DECLARED_FIELDS.binary_search(&key).is_ok()
 }
 
 /// The first `` `name` `` in a serde message.
@@ -116,6 +268,7 @@ fn reason(message: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::strict::schemas::chat_completions::ChatCompletionRequest;
     use serde::Deserialize;
     use serde_json::{Value, json};
 
@@ -200,25 +353,34 @@ mod tests {
     }
 
     #[test]
-    fn keys_that_are_not_field_names_are_hidden() {
+    fn keys_the_schemas_do_not_declare_are_hidden() {
         let mut path = String::new();
         push_key(&mut path, "messages");
+        push_key(&mut path, "client_secret");
         push_key(&mut path, "Customer Key");
-        push_key(&mut path, &"a".repeat(MAX_FIELD_LEN + 1));
         assert_eq!(path, "messages.*.*");
+    }
+
+    #[test]
+    fn client_keys_inside_free_form_values_are_hidden() {
+        // With serde_json's `raw_value` feature, this object must hold a
+        // string, so the free-form `logit_bias` fails beneath a client key.
+        let body = br#"{"model":"m","messages":[],"logit_bias":{"client_secret":{"$serde_json::private::RawValue":1}}}"#;
+        let found = locate::<ChatCompletionRequest>(body).expect("the body should not match");
+        assert_eq!(found.path.as_deref(), Some("logit_bias.*.*"));
     }
 
     #[test]
     fn long_paths_are_cut_at_a_segment() {
         let segments = vec![
             Segment::Map {
-                key: "nested".to_string(),
+                key: "messages".to_string(),
             };
             100
         ];
         let described = describe(&segments);
         assert!(described.len() <= MAX_PATH_LEN + 3, "{described}");
-        assert!(described.ends_with("nested..."), "{described}");
+        assert!(described.ends_with("messages..."), "{described}");
     }
 
     #[test]
@@ -228,5 +390,69 @@ mod tests {
             reason("invalid type: string \"x\", expected u32"),
             "invalid_type"
         );
+    }
+    /// Every field name and serde rename declared outside the tests of a
+    /// schema source file. A line scan rather than a parser: it may find a
+    /// few names that aren't JSON keys, which only widens the list.
+    fn declared_in(source: &str) -> Vec<String> {
+        let source = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let mut names = Vec::new();
+        for line in source.lines().map(str::trim) {
+            for marker in ["rename = \"", "alias = \""] {
+                let mut rest = line;
+                while let Some(start) = rest.find(marker) {
+                    rest = &rest[start + marker.len()..];
+                    if let Some(end) = rest.find('"') {
+                        names.push(rest[..end].to_string());
+                    }
+                }
+            }
+            if line.starts_with("//") || line.starts_with("let ") {
+                continue;
+            }
+            let field = line
+                .strip_prefix("pub(crate) ")
+                .or_else(|| line.strip_prefix("pub "))
+                .unwrap_or(line);
+            let field = field.strip_prefix("r#").unwrap_or(field);
+            let len = field
+                .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+                .unwrap_or(field.len());
+            let after = field[len..].trim_start();
+            if len > 0
+                && field.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+                && after.starts_with(':')
+                && !after.starts_with("::")
+            {
+                names.push(field[..len].to_string());
+            }
+        }
+        names
+    }
+
+    fn schema_names() -> std::collections::BTreeSet<String> {
+        [
+            include_str!("schemas/chat_completions.rs"),
+            include_str!("schemas/completions.rs"),
+            include_str!("schemas/embeddings.rs"),
+            include_str!("schemas/responses.rs"),
+        ]
+        .into_iter()
+        .flat_map(declared_in)
+        .collect()
+    }
+
+    #[test]
+    fn declared_fields_are_sorted_and_unique() {
+        assert!(DECLARED_FIELDS.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn declared_fields_cover_the_schemas() {
+        let missing: Vec<_> = schema_names()
+            .into_iter()
+            .filter(|name| !is_declared(name))
+            .collect();
+        assert!(missing.is_empty(), "add to DECLARED_FIELDS: {missing:?}");
     }
 }
