@@ -2697,11 +2697,13 @@ fn default_batch_metadata_fields_dwctl() -> Vec<String> {
 ///   were refused throughout the window: from its first two minutes to its
 ///   last quarter, and in at least three quarters of its minutes. A model
 ///   whose held work is not refused (it has spare capacity, so its rate is
-///   its demand, and nothing is being held back) gets no cutoff however much
-///   work arrives. While a release is in the window, each replica keeps using
-///   the rate it measured before the release, so released work running on
-///   the same capacity does not drive further release. Requests sharing a
-///   deadline are released together;
+///   its demand, and nothing is being held back) gets no cutoff of this kind
+///   however much work arrives; the other releases listed here still apply.
+///   While a release is in the window, each replica keeps using the rate it
+///   last measured from a saturated window with no release in it (for up to
+///   four windows), even when the current window is not saturated, so
+///   released work running on the same capacity does not drive further
+///   release. Requests sharing a deadline are released together;
 /// - when a refusal could no longer be retried before the retry cut-off
 ///   (`stop_before_deadline_ms` before the deadline, or the deadline itself
 ///   when that is unset);

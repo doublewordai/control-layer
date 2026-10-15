@@ -195,15 +195,17 @@ capacity is full. Off unless the builder is called.
   the latest in the last quarter of the window (at least the last two
   minutes). Neither a first refusal nor one old refusal releases everything.
 - **Rate.** Held completions are the model's capacity only while that
-  capacity is full, so the rate is used only once the model's held dispatches
-  were refused throughout the window: first refused within two minutes of
-  its start, last refused in its last quarter (at least the last two
-  minutes), and refused in at least three quarters of its minutes. A model
-  whose held work is not refused has spare capacity: its completions are its
-  demand, and projecting a large new backlog from them would release most of
-  it while the model's own workers sit idle. Such a model gets no cutoff
-  however much work arrives; only the deadline floor releases. Nothing is
-  being held back from it in the meantime.
+  capacity is full, so a rate is measured only from a window in which the
+  model's held dispatches were refused throughout: first refused within two
+  minutes of its start, last refused in its last quarter (at least the last
+  two minutes), and refused in at least three quarters of its minutes. A
+  model whose held work is not refused has spare capacity: its completions
+  are its demand, and projecting a large new backlog from them would release
+  most of it while the model's own workers sit idle. Without such a window,
+  and without a remembered rate (below), a model gets no rate-based cutoff
+  however much work arrives. The deadline floor, the retry cut-off and stale
+  decisions still release its requests. Nothing is being held back from it in
+  the meantime.
 - **Refusals.** A held 503/529 is requeued after `max_backoff_ms` without
   spending a retry, is never terminal, and neither cuts adaptive concurrency
   nor counts toward raising it (a held dispatch counts toward a raise only
@@ -219,7 +221,11 @@ own minutes later), and every `refresh_interval` reads them back with the
 pending work by deadline and computes each model's decision. There is no leader and nothing is written to
 the request rows. While a release is in the window, a daemon keeps projecting
 with the rate it measured before the release, so released work running on the
-same capacity does not drive further release.
+same capacity does not drive further release. That remembered rate is the
+last one measured from a saturated window with no release in it, and it is
+used for up to four windows even when the current window is not saturated:
+it is a capacity measurement, and the released work is what keeps the window
+from showing it again.
 
 The decisions live in the storage. A custom `DaemonStorage` must implement all
 four hold methods for a hold to do anything: `set_dispatch_hold` (keep the

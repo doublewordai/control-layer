@@ -1001,7 +1001,8 @@ background_services:
     # were refused throughout the window, from its first two minutes to its
     # last quarter and in three quarters of its minutes, because until its
     # own capacity is full the rate is demand, not capacity, and nothing is
-    # held back); when a refusal could no longer be retried before the
+    # held back; after a release, a replica keeps projecting with the rate
+    # it measured before it, for up to four windows); when a refusal could no longer be retried before the
     # retry cut-off (stop_before_deadline_ms before the deadline, or the
     # deadline itself when unset); or when the decisions are older than
     # stale_after_secs. Each replica recomputes the decisions every

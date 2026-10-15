@@ -22,7 +22,9 @@
 //! dispatch that could run did. On a model that is not saturated the rate
 //! measures demand, which says nothing about how fast a new backlog would be
 //! served, and nothing is being kept off the capacity the hold does not allow
-//! anyway, so such a model is held with only the deadline floor releasing.
+//! anyway, so such a model gets no rate-based cutoff (the deadline floor, the
+//! retry cut-off and stale decisions still release). The exception is a rate
+//! remembered from an earlier saturated window across a release (below).
 //!
 //! The decision fails open: a model whose held dispatches were refused
 //! throughout a whole window of holding, while none completed, has no own
@@ -142,8 +144,8 @@ impl ModelHoldInputs {
 /// floor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelHold {
-    /// Hold, releasing requests due at or before `cutoff` (`None`: only the
-    /// deadline floor releases).
+    /// Hold, releasing requests due at or before `cutoff` (`None`: no
+    /// rate-based cutoff; the deadline floor still applies).
     Hold { cutoff: Option<DateTime<Utc>> },
     /// Release every request of the model.
     ReleaseAll(TolerationsRelease),
@@ -189,7 +191,13 @@ pub struct ModelHoldMemory {
 /// the demand, and a quiet model's demand projected onto a large new backlog
 /// would release most of it at once, to run elsewhere, while its own workers
 /// sat idle. While a release is in the window, the larger of the measured
-/// rate and the remembered clean rate is used. Then:
+/// rate and the remembered clean rate is used, and the clean rate alone when
+/// nothing is measured. The clean rate is the rate last measured with no
+/// release in the window, so it too comes from a saturated window: it is a
+/// capacity measurement, and it is used for up to [`CLEAN_RATE_MAX_WINDOWS`]
+/// windows even when the current window is not saturated, since released work
+/// running on the same capacity is what keeps the window from showing it.
+/// Then:
 ///
 /// - with a rate, the cutoff is [`release_cutoff`] of the outstanding work;
 /// - counted for the whole window, refused lately and nothing completed, and
@@ -202,7 +210,8 @@ pub struct ModelHoldMemory {
 ///   refusal on a quiet model;
 /// - otherwise there is no capacity measurement (a new hold, saturation that
 ///   began inside the window, or a model whose held work is not refused, so
-///   nothing is being held back); only the deadline floor releases.
+///   nothing is being held back), and no rate-based cutoff. The deadline
+///   floor, the retry cut-off and stale decisions still release.
 pub fn decide_model_hold(
     inputs: &ModelHoldInputs,
     params: HoldParams,
@@ -767,6 +776,18 @@ mod tests {
                 cutoff: Some(at(3_000))
             }
         );
+
+        // Nor while held work is no longer refused at all: no rate is measured
+        // from this window, but the remembered one came from a saturated
+        // window, so it still projects.
+        let unsaturated = decide_at(150, 300, 0);
+        assert_eq!(
+            unsaturated.hold,
+            ModelHold::Hold {
+                cutoff: Some(at(3_000))
+            }
+        );
+        assert_eq!(unsaturated.own_rate, 1.0);
 
         // A higher measured rate (more capacity) is still used.
         let faster = decide_at(180, 2_700, 5);

@@ -16,7 +16,8 @@
 //!   cannot finish at the model's own rate ([`ModelHold::Hold`]). The rate is
 //!   measured only while the model's held work was refused throughout the
 //!   window (its own capacity was full); otherwise the held completions are
-//!   the demand, not the capacity, and there is no cutoff;
+//!   the demand, not the capacity, and there is no cutoff, unless a rate
+//!   measured in an earlier saturated window is remembered across a release;
 //! - it is so close to the retry cut-off that a held refusal could not be
 //!   retried before it (applied when the dispatch is prepared).
 //!
