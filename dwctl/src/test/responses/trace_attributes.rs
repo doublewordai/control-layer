@@ -187,7 +187,8 @@ async fn customer_attributes_on_request_spans(pool: sqlx::PgPool) {
     assert_eq!(attr(inner, "onwards.api_key_id"), Some(key_id.to_string()));
     assert_eq!(attr(inner, "http.response.status_code").as_deref(), Some("404"));
 
-    // A dwctl layer's refusal, before onwards runs, is a gateway decision too.
+    // A dwctl layer's refusal, before onwards runs, is a gateway decision too,
+    // and names the caller.
     let invalid = server
         .post(path_chat)
         .add_header("Authorization", &auth)
@@ -199,6 +200,21 @@ async fn customer_attributes_on_request_spans(pool: sqlx::PgPool) {
     let request = root(&spans, path_chat);
     assert_eq!(attr(request, "doubleword.error.source").as_deref(), Some("gateway"));
     assert_eq!(attr(request, "doubleword.rejection.code").as_deref(), Some("invalid_json"));
+    assert_eq!(attr(request, "doubleword.account_id"), Some(owner.to_string()));
+
+    // A body strict mode refuses before forwarding (valid JSON, wrong shape).
+    let wrong_shape = server
+        .post(path_chat)
+        .add_header("Authorization", &auth)
+        .json(&json!({"model":"gpt-4o", "messages":"hello"}))
+        .await;
+    assert_eq!(wrong_shape.status_code().as_u16(), 422);
+    let spans = take(&provider, &exported);
+    let request = root(&spans, path_chat);
+    assert_eq!(attr(request, "doubleword.error.source").as_deref(), Some("gateway"));
+    assert_eq!(attr(request, "doubleword.rejection.code").as_deref(), Some("schema_mismatch"));
+    assert_eq!(attr(request, "doubleword.account_id"), Some(owner.to_string()));
+    assert_eq!(attr(request, "gen_ai.request.model").as_deref(), Some("gpt-4o"));
 
     // A provider-side 4xx: source is provider, with account and model on the
     // same span, and no gateway rejection code.

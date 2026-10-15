@@ -151,10 +151,12 @@ fn parse_strict_request<T: serde::de::DeserializeOwned, C: HttpClient>(
             (StatusCode::BAD_REQUEST, "invalid_json")
         };
         let model = extract_model_from_request(headers, body);
-        rejection_context(state, headers, model.as_deref()).record(status, code, None);
-        error_response(
+        refused_invalid(
+            state,
+            headers,
+            model.as_deref(),
             status,
-            "invalid_request_error",
+            code,
             &format!("Invalid request: {e}"),
         )
     })
@@ -180,8 +182,34 @@ fn rejected<C: HttpClient>(
     model: Option<&str>,
     error: OnwardsErrorResponse,
 ) -> Response {
-    rejection_context(state, headers, model).record_error(&error);
-    error.into_response()
+    let rejection = rejection_context(state, headers, model);
+    rejection.record_error(&error);
+    error.with_identity(rejection.identity()).into_response()
+}
+
+/// Counts an invalid request refused before it is forwarded, and returns its
+/// `invalid_request_error` response tagged with the caller and the refusal
+/// code, as onwards' other refusals are.
+fn refused_invalid<C: HttpClient>(
+    state: &AppState<C>,
+    headers: &HeaderMap,
+    model: Option<&str>,
+    status: StatusCode,
+    code: &str,
+    message: &str,
+) -> Response {
+    let rejection = rejection_context(state, headers, model);
+    rejection.record(status, code, None);
+    let mut response = error_response(status, "invalid_request_error", message);
+    if let Some(identity) = rejection.identity() {
+        response.extensions_mut().insert(identity);
+    }
+    response
+        .extensions_mut()
+        .insert(crate::ErrorOrigin::Gateway {
+            code: code.to_string(),
+        });
+    response
 }
 
 /// Handler for POST /v1/chat/completions
@@ -311,14 +339,12 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         Ok(bytes) => bytes,
         Err(e) => {
             error!(error = %e, "Failed to read responses request");
-            rejection_context(&state, &headers, None).record(
+            return refused_invalid(
+                &state,
+                &headers,
+                None,
                 StatusCode::BAD_REQUEST,
                 "invalid_body",
-                None,
-            );
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
                 &format!("Invalid request: {}", e),
             );
         }
@@ -336,14 +362,12 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
                 _ => "invalid_json",
             };
             let model = extract_model_from_request(&headers, &body_bytes);
-            rejection_context(&state, &headers, model.as_deref()).record(
+            return refused_invalid(
+                &state,
+                &headers,
+                model.as_deref(),
                 StatusCode::BAD_REQUEST,
                 code,
-                None,
-            );
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
                 &format!("Invalid request: {}", e),
             );
         }

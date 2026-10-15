@@ -15022,6 +15022,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(samples[&failed], "timeout");
+
+        // Once the frozen batch's rows move to the archive, they are sampled
+        // from there.
+        manager.get_batch(failed).await.unwrap(); // freeze-on-read
+        assert_eq!(
+            manager.archive_batch(failed).await.unwrap(),
+            ArchiveOutcome::Archived { rows: 2 }
+        );
+        let (_, _, live, archived) = archive_state(&pool, failed).await;
+        assert_eq!((live, archived), (0, 2));
+        let samples = manager
+            .failed_batch_sample_classes(&[failed, ok])
+            .await
+            .unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[&failed], "timeout");
     }
 
     #[sqlx::test]

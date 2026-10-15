@@ -1426,6 +1426,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_strict_refusals_before_forwarding_keep_the_caller_and_code() {
+        use std::collections::HashMap;
+        use tower::ServiceExt;
+
+        let refusal = |body: String, body_limit: usize| async move {
+            let targets = fallback_targets("gpt-4", 1, vec![]);
+            targets.key_labels.insert(
+                "sk-acct".to_string(),
+                HashMap::from([(serving::ACCOUNT_LABEL.to_string(), "acct-1".to_string())]),
+            );
+            let state = AppState::with_client(targets, MockHttpClient::new(StatusCode::OK, "{}"))
+                .with_body_limit(body_limit);
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-acct")
+                .body(axum::body::Body::from(body))
+                .unwrap();
+            let response = crate::strict::build_strict_router(state)
+                .oneshot(request)
+                .await
+                .unwrap();
+            let account = response
+                .extensions()
+                .get::<crate::RequestIdentity>()
+                .and_then(|identity| identity.account_id.clone());
+            (
+                response.status().as_u16(),
+                account,
+                response.extensions().get::<crate::ErrorOrigin>().cloned(),
+            )
+        };
+        let expected = |status, code: &str| {
+            (
+                status,
+                Some("acct-1".to_string()),
+                Some(crate::ErrorOrigin::Gateway {
+                    code: code.to_string(),
+                }),
+            )
+        };
+
+        // Valid JSON in the wrong shape.
+        let wrong_shape = json!({"model": "gpt-4", "messages": "hello"}).to_string();
+        assert_eq!(
+            refusal(wrong_shape, 1024).await,
+            expected(422, "schema_mismatch")
+        );
+        assert_eq!(
+            refusal("{not json".to_string(), 1024).await,
+            expected(400, "invalid_json")
+        );
+        let chat = json!({"model": "gpt-4", "messages": [{"role": "user", "content": "Hello"}]});
+        assert_eq!(
+            refusal(chat.to_string(), 8).await,
+            expected(413, "payload_too_large")
+        );
+    }
+
+    #[tokio::test]
     async fn test_strict_sanitized_errors_keep_the_caller_and_name_the_provider() {
         use std::collections::HashMap;
         use tower::ServiceExt;

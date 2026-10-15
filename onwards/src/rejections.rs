@@ -148,7 +148,7 @@ impl RejectionContext {
     }
 
     /// The identity to attach to the response, if the request's key is known.
-    pub(crate) fn identity(&self) -> Option<RequestIdentity> {
+    pub fn identity(&self) -> Option<RequestIdentity> {
         self.authenticated.then(|| self.identity.clone())
     }
 

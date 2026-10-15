@@ -37,7 +37,7 @@
 //! | attribute | meaning |
 //! |---|---|
 //! | `doubleword.account_id` | owning account (the organization for organization keys) |
-//! | `doubleword.account_name` | account display name, falling back to its username |
+//! | `doubleword.account_name` | account display name, falling back to its username; at most 128 characters |
 //! | `doubleword.api_key_id` | the API key used |
 //! | `doubleword.key_purpose` | the key's purpose (`realtime`, `batch`, ...) |
 //! | `gen_ai.request.model` | the model alias requested |
@@ -57,10 +57,14 @@
 //!
 //! `fusillade.batch_finalized` span (one per batch, emitted by the notification
 //! poller when the batch is claimed after finishing): `batch_id`,
-//! `doubleword.account_id`, `doubleword.account_name`, `gen_ai.request.model`,
+//! `doubleword.account_id`, `doubleword.account_name`, `gen_ai.request.model`
+//! (every model, joined with `, `, for display), `batch.models` (the same
+//! models as a string array, for filtering),
 //! `completion_window`, `batch.total_requests`, `batch.completed_requests`,
-//! `batch.failed_requests`, `batch.outcome` (`completed` | `partially_completed` | `failed`) and, for
-//! fully failed batches, `batch.sample_error` (an error class, never a message).
+//! `batch.failed_requests`, `batch.canceled_requests`, `batch.outcome`
+//! (`completed` | `partially_completed` | `failed`, with cancelled requests
+//! counted against the batch), `batch.finalized_at` and, for failed batches,
+//! `batch.sample_error` (an error class, never a message).
 //!
 //! Example - to enable OTLP export and send traces to a custom OTLP HTTP endpoint with basic authorization header:
 //!
@@ -111,6 +115,22 @@ fn batch_config() -> BatchConfig {
     builder.build()
 }
 
+/// Longest account name recorded on a span. Display names are free text, and
+/// the name rides on every authenticated request's spans.
+const MAX_SPAN_ACCOUNT_NAME_CHARS: usize = 128;
+
+/// The name an account goes by on spans: its display name, or its username
+/// when it has none or it is blank, cut to [`MAX_SPAN_ACCOUNT_NAME_CHARS`].
+pub fn span_account_name(display_name: Option<&str>, username: &str) -> String {
+    display_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(username)
+        .chars()
+        .take(MAX_SPAN_ACCOUNT_NAME_CHARS)
+        .collect()
+}
+
 /// The completion window the batch daemon stamps on a request it dispatches,
 /// carried onto the response so the root span can record it once the key
 /// behind the request says it is batch traffic.
@@ -135,7 +155,7 @@ pub async fn carry_batch_completion_window(request: Request, next: Next) -> Resp
 /// Records who made an AI request, and where an error came from, on the root
 /// request span. Reads the extensions onwards attaches to its responses, so it
 /// covers successes, gateway refusals and provider errors alike, and the code
-/// a dwctl layer refused a request with. A request whose key was not
+/// and caller a dwctl layer refused a request with. A request whose key was not
 /// recognised (401) has no identity and records none, and an error neither
 /// onwards nor a dwctl layer decided on has no source.
 pub fn record_ai_response_attributes<B>(response: &axum::http::Response<B>, span: &tracing::Span, status: u16) {
@@ -296,6 +316,15 @@ fn create_otlp_tracer() -> anyhow::Result<(opentelemetry_sdk::trace::Tracer, Sdk
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn span_account_name_falls_back_and_is_bounded() {
+        assert_eq!(span_account_name(Some(" Example Co "), "user"), "Example Co");
+        assert_eq!(span_account_name(Some("   "), "user"), "user");
+        assert_eq!(span_account_name(None, "user"), "user");
+        let long = "é".repeat(MAX_SPAN_ACCOUNT_NAME_CHARS + 10);
+        assert_eq!(span_account_name(Some(&long), "user").chars().count(), MAX_SPAN_ACCOUNT_NAME_CHARS);
+    }
 
     #[test]
     fn otlp_tracer_builds_with_http_client() {

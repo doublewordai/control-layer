@@ -27,10 +27,12 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use fusillade_arsenal::PostgresRequestManager;
 use metrics::counter;
+use opentelemetry::{Array, StringValue, Value};
 use rust_decimal::prelude::ToPrimitive;
 use sqlx::postgres::PgListener;
 use sqlx_pool_router::DbPools;
 use tokio_util::sync::CancellationToken;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 use crate::config::NotificationsConfig;
@@ -41,6 +43,7 @@ use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransac
 use crate::db::models::webhooks::WebhookDeliveryCreateDBRequest;
 use crate::email::EmailService;
 use crate::payment_providers::{self, AutoTopupDeclineKind, PaymentError, PaymentProvider};
+use crate::telemetry::span_account_name;
 use crate::webhooks::WebhookDispatcher;
 use crate::webhooks::events::{WebhookEvent, WebhookEventType};
 
@@ -139,15 +142,28 @@ impl BatchNotificationInfo {
     }
 }
 
-/// How a finalized batch ended, as recorded on its `fusillade.batch_finalized` span.
-fn batch_span_outcome(completed: i64, failed: i64) -> &'static str {
-    if failed == 0 {
+/// How a finalized batch ended, as recorded on its `fusillade.batch_finalized`
+/// span. Cancelled requests count against the batch like failed ones: a batch
+/// that answered none of its requests failed, whatever stopped them.
+fn batch_span_outcome(completed: i64, failed: i64, canceled: i64) -> &'static str {
+    if failed == 0 && canceled == 0 {
         "completed"
     } else if completed == 0 {
         "failed"
     } else {
         "partially_completed"
     }
+}
+
+/// Outcome of `batch`, see [`batch_span_outcome`].
+fn batch_outcome(batch: &fusillade::batch::Batch) -> &'static str {
+    batch_span_outcome(batch.completed_requests, batch.failed_requests, batch.canceled_requests)
+}
+
+/// The models a claimed batch's requests named. The claim reports them joined
+/// with `", "`.
+fn batch_models(notif: &fusillade::batch::BatchNotification) -> Vec<&str> {
+    notif.model.split(", ").filter(|model| !model.is_empty()).collect()
 }
 
 /// Emits one root `fusillade.batch_finalized` span per claimed batch so batch
@@ -174,10 +190,7 @@ async fn emit_batch_finalized_spans<P: sqlx_pool_router::PoolProvider>(
         match Users::new(conn).get_bulk(owners).await {
             Ok(users) => users
                 .into_iter()
-                .map(|(id, user)| {
-                    let name = user.display_name.filter(|name| !name.trim().is_empty()).unwrap_or(user.username);
-                    (id, name)
-                })
+                .map(|(id, user)| (id, span_account_name(user.display_name.as_deref(), &user.username)))
                 .collect(),
             Err(e) => {
                 crate::background_error!(NOTIFICATIONS, "batch_span_account_names", Warning, error = %e, "Failed to look up account names for batch spans");
@@ -188,7 +201,7 @@ async fn emit_batch_finalized_spans<P: sqlx_pool_router::PoolProvider>(
 
     let fully_failed: Vec<_> = batches
         .iter()
-        .filter(|n| batch_span_outcome(n.batch.completed_requests, n.batch.failed_requests) == "failed")
+        .filter(|n| batch_outcome(&n.batch) == "failed")
         .map(|n| n.batch.id)
         .collect();
     let samples = if fully_failed.is_empty() {
@@ -202,30 +215,47 @@ async fn emit_batch_finalized_spans<P: sqlx_pool_router::PoolProvider>(
 
     for notif in batches {
         let batch = &notif.batch;
-        let outcome = batch_span_outcome(batch.completed_requests, batch.failed_requests);
+        let outcome = batch_outcome(batch);
         let account_name = batch.created_by.parse::<Uuid>().ok().and_then(|id| names.get(&id));
         let completion_window = if batch.service_tier.as_deref() == Some("background") {
             "background"
         } else {
             batch.completion_window.as_deref().unwrap_or_default()
         };
-        let sample_error = (outcome == "failed").then(|| samples.get(&batch.id).map_or("unknown", String::as_str));
+        // A batch nothing answered and nothing failed in was cancelled request
+        // by request, so there is no failure to sample.
+        let sample_error = (outcome == "failed").then(|| match samples.get(&batch.id) {
+            Some(class) => class.as_str(),
+            None if batch.failed_requests == 0 => "canceled",
+            None => "unknown",
+        });
+        // When the batch finished; the span itself starts when the poller claims it.
+        let finalized_at = batch.completed_at.or(batch.failed_at).map(|at| at.to_rfc3339());
         // A root span: the poller has no request to belong to.
-        let _span = tracing::info_span!(
+        let span = tracing::info_span!(
             parent: None,
             "fusillade.batch_finalized",
             otel.name = "fusillade.batch_finalized",
             batch_id = %batch.id,
             doubleword.account_id = %batch.created_by,
             doubleword.account_name = account_name.map(String::as_str),
+            // For display: every model, joined with ", ". Filter on `batch.models`.
             gen_ai.request.model = %notif.model,
             completion_window = completion_window,
             batch.total_requests = batch.total_requests,
             batch.completed_requests = batch.completed_requests,
             batch.failed_requests = batch.failed_requests,
+            batch.canceled_requests = batch.canceled_requests,
             batch.outcome = outcome,
             batch.sample_error = sample_error,
+            batch.finalized_at = finalized_at.as_deref(),
         );
+        // An array attribute, so a trace query can match any one of the models.
+        let models = batch_models(notif)
+            .into_iter()
+            .map(|model| StringValue::from(model.to_string()))
+            .collect();
+        span.set_attribute("batch.models", Value::Array(Array::String(models)));
     }
 }
 
@@ -2256,11 +2286,25 @@ mod tests {
         span.attributes.iter().find(|a| a.key.as_str() == key).map(|a| a.value.to_string())
     }
 
+    /// The `batch.models` array attribute, sorted.
+    fn span_models(span: &opentelemetry_sdk::trace::SpanData) -> Vec<String> {
+        let value = span.attributes.iter().find(|a| a.key.as_str() == "batch.models").map(|a| &a.value);
+        let Some(Value::Array(Array::String(models))) = value else {
+            panic!("batch.models is not a string array: {value:?}");
+        };
+        let mut models: Vec<String> = models.iter().map(|model| model.to_string()).collect();
+        models.sort();
+        models
+    }
+
     #[test]
     fn batch_span_classification() {
-        assert_eq!(batch_span_outcome(5, 0), "completed");
-        assert_eq!(batch_span_outcome(0, 5), "failed");
-        assert_eq!(batch_span_outcome(3, 2), "partially_completed");
+        assert_eq!(batch_span_outcome(5, 0, 0), "completed");
+        assert_eq!(batch_span_outcome(0, 5, 0), "failed");
+        assert_eq!(batch_span_outcome(3, 2, 0), "partially_completed");
+        // Cancelled requests are not answered, so they count against the batch.
+        assert_eq!(batch_span_outcome(0, 0, 5), "failed");
+        assert_eq!(batch_span_outcome(3, 0, 2), "partially_completed");
     }
 
     /// Each finalized batch yields exactly one `fusillade.batch_finalized` span,
@@ -2294,15 +2338,22 @@ mod tests {
         );
 
         let mut batch_ids = Vec::new();
-        for (name, state, status) in [("all-failed", "failed", 422), ("all-completed", "completed", 200)] {
-            let templates = (0..2)
-                .map(|i| fusillade::RequestTemplateInput {
+        let one_model = ["span-test-model", "span-test-model"];
+        for (name, state, status, models) in [
+            ("all-failed", "failed", 422, one_model),
+            ("all-completed", "completed", 200, one_model),
+            ("all-canceled", "canceled", 0, ["span-model-a", "span-model-b"]),
+        ] {
+            let templates = models
+                .iter()
+                .enumerate()
+                .map(|(i, model)| fusillade::RequestTemplateInput {
                     custom_id: Some(format!("{name}-{i}")),
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
                     path: "/test".to_string(),
                     body: "{}".to_string(),
-                    model: "span-test-model".to_string(),
+                    model: model.to_string(),
                     api_key: "key".to_string(),
                 })
                 .collect();
@@ -2321,7 +2372,9 @@ mod tests {
                 .await
                 .unwrap();
             sqlx::query(
-                "UPDATE requests SET state = $2, response_status = $3, completed_at = NOW(), failed_at = CASE WHEN $2 = 'failed' THEN NOW() END, \
+                "UPDATE requests SET state = $2, response_status = NULLIF($3, 0), \
+                 completed_at = CASE WHEN $2 <> 'canceled' THEN NOW() END, failed_at = CASE WHEN $2 = 'failed' THEN NOW() END, \
+                 canceled_at = CASE WHEN $2 = 'canceled' THEN NOW() END, \
                  response_body = CASE WHEN $2 = 'completed' THEN '{}' END, error = CASE WHEN $2 = 'failed' THEN 'secret detail' END \
                  WHERE batch_id = $1",
             )
@@ -2337,7 +2390,7 @@ mod tests {
 
         let mut conn = pool.acquire().await.unwrap();
         let claimed = manager.claim_batch_notifications().await.unwrap();
-        assert_eq!(claimed.len(), 2);
+        assert_eq!(claimed.len(), 3);
         emit_batch_finalized_spans(&manager, &mut conn, &claimed).await;
         // Nothing is left to claim, so the next poll emits nothing.
         let again = manager.claim_batch_notifications().await.unwrap();
@@ -2347,20 +2400,25 @@ mod tests {
         provider.force_flush().unwrap();
         let spans = exported.0.lock().unwrap();
         let spans: Vec<_> = spans.iter().filter(|s| s.name == "fusillade.batch_finalized").collect();
-        assert_eq!(spans.len(), 2, "one span per claimed batch");
-        for (batch_id, outcome, completed, failed) in [(batch_ids[0], "failed", "0", "2"), (batch_ids[1], "completed", "2", "0")] {
-            let span = spans
+        assert_eq!(spans.len(), 3, "one span per claimed batch");
+        let span_of = |batch_id: fusillade::BatchId| {
+            spans
                 .iter()
                 .find(|s| span_attr(s, "batch_id") == Some(batch_id.to_string()))
-                .expect("span for batch");
+                .expect("span for batch")
+        };
+        for (batch_id, outcome, completed, failed) in [(batch_ids[0], "failed", "0", "2"), (batch_ids[1], "completed", "2", "0")] {
+            let span = span_of(batch_id);
             assert_eq!(span_attr(span, "doubleword.account_id"), Some(owner.id.to_string()));
             assert_eq!(span_attr(span, "doubleword.account_name").as_deref(), Some("Example Analytics Ltd"));
             assert_eq!(span_attr(span, "gen_ai.request.model").as_deref(), Some("span-test-model"));
+            assert_eq!(span_models(span), vec!["span-test-model"]);
             assert_eq!(span_attr(span, "completion_window").as_deref(), Some("24h"));
             assert_eq!(span_attr(span, "batch.total_requests").as_deref(), Some("2"));
             assert_eq!(span_attr(span, "batch.completed_requests").as_deref(), Some(completed));
             assert_eq!(span_attr(span, "batch.failed_requests").as_deref(), Some(failed));
             assert_eq!(span_attr(span, "batch.outcome").as_deref(), Some(outcome));
+            assert!(span_attr(span, "batch.finalized_at").is_some(), "the batch's own finish time");
             let sample = span_attr(span, "batch.sample_error");
             if outcome == "failed" {
                 assert_eq!(sample.as_deref(), Some("http_422"), "status class only, never the message");
@@ -2368,5 +2426,18 @@ mod tests {
                 assert_eq!(sample, None);
             }
         }
+
+        // Cancelled request by request: nothing answered, so the batch failed,
+        // with nothing failed to sample. Both its models are shown, and each
+        // can be filtered on.
+        let canceled = span_of(batch_ids[2]);
+        assert_eq!(span_attr(canceled, "batch.outcome").as_deref(), Some("failed"));
+        assert_eq!(span_attr(canceled, "batch.canceled_requests").as_deref(), Some("2"));
+        assert_eq!(span_attr(canceled, "batch.sample_error").as_deref(), Some("canceled"));
+        assert_eq!(
+            span_attr(canceled, "gen_ai.request.model").as_deref(),
+            Some("span-model-a, span-model-b")
+        );
+        assert_eq!(span_models(canceled), vec!["span-model-a", "span-model-b"]);
     }
 }

@@ -2,6 +2,7 @@
 
 use crate::db::models::deployments::DEFAULT_COMPONENT_POOL;
 use crate::metrics::errors::component::ONWARDS_SYNC;
+use crate::telemetry::span_account_name;
 use crate::types::UserId;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -274,13 +275,7 @@ async fn load_accounts_from_db(db: &PgPool) -> Result<AccountsById, anyhow::Erro
 /// traces. `account_name` stays the username: it is a metric label, and
 /// switching it would split existing series.
 fn key_labels(api_key: &OnwardsApiKey) -> HashMap<String, String> {
-    let display_name = api_key
-        .display_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .unwrap_or(&api_key.username)
-        .to_string();
+    let display_name = span_account_name(api_key.display_name.as_deref(), &api_key.username);
     HashMap::from([
         (ACCOUNT_DISPLAY_NAME_LABEL.to_string(), display_name),
         ("purpose".to_string(), api_key.purpose.clone()),

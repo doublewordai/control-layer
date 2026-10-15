@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT k.id, k.user_id, k.purpose, COALESCE(NULLIF(BTRIM(u.display_name), ''), u.username) AS account_name\n        FROM api_keys k\n        JOIN users u ON u.id = k.user_id\n        WHERE k.secret = $1 AND k.is_deleted = false\n        ",
+  "query": "\n        SELECT k.id, k.user_id, k.purpose, u.display_name, u.username\n        FROM api_keys k\n        JOIN users u ON u.id = k.user_id\n        WHERE k.secret = $1 AND k.is_deleted = false\n        ",
   "describe": {
     "columns": [
       {
@@ -20,8 +20,13 @@
       },
       {
         "ordinal": 3,
-        "name": "account_name",
-        "type_info": "Text"
+        "name": "display_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "username",
+        "type_info": "Varchar"
       }
     ],
     "parameters": {
@@ -33,8 +38,9 @@
       false,
       false,
       false,
-      null
+      true,
+      false
     ]
   },
-  "hash": "8ec0f0dd5105c3c238267404924c12b2cce5e1a1ce111c099240f70b3833f9fb"
+  "hash": "95b9724b577aa55950d83aafcf37cde311730e6fb33cb2004f7091d8e4478947"
 }

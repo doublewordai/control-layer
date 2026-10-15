@@ -30,6 +30,7 @@ use crate::{
     db::handlers::{Credits, api_keys::ApiKeys},
     errors::Error,
     inference::rejections::{Recorder, RejectionCode},
+    telemetry::span_account_name,
     types::UserId,
 };
 use axum::{
@@ -492,7 +493,7 @@ async fn get_api_key_user_and_purpose(pool: PgPool, api_key: &str) -> Result<Opt
     let mut conn = pool.acquire().await?;
     let row = sqlx::query!(
         r#"
-        SELECT k.id, k.user_id, k.purpose, COALESCE(NULLIF(BTRIM(u.display_name), ''), u.username) AS account_name
+        SELECT k.id, k.user_id, k.purpose, u.display_name, u.username
         FROM api_keys k
         JOIN users u ON u.id = k.user_id
         WHERE k.secret = $1 AND k.is_deleted = false
@@ -505,7 +506,7 @@ async fn get_api_key_user_and_purpose(pool: PgPool, api_key: &str) -> Result<Opt
         api_key_id: r.id,
         user_id: r.user_id,
         purpose: r.purpose,
-        account_name: r.account_name,
+        account_name: span_account_name(r.display_name.as_deref(), &r.username),
     }))
 }
 
@@ -514,7 +515,7 @@ struct ApiKeyOwner {
     api_key_id: Uuid,
     user_id: UserId,
     purpose: String,
-    account_name: Option<String>,
+    account_name: String,
 }
 
 impl ApiKeyOwner {
@@ -523,7 +524,7 @@ impl ApiKeyOwner {
     fn identity(&self, model: Option<String>) -> RequestIdentity {
         RequestIdentity {
             account_id: Some(self.user_id.to_string()),
-            account_name: self.account_name.clone(),
+            account_name: Some(self.account_name.clone()),
             api_key_id: Some(self.api_key_id),
             key_purpose: Some(self.purpose.clone()),
             model,
