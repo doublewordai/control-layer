@@ -13,7 +13,10 @@
 //!   holding (from its start to its recent part) while none completed, or the
 //!   decisions are stale ([`ModelHold::ReleaseAll`]);
 //! - it is due at or before its model's cutoff: the latest deadline whose work
-//!   cannot finish at the model's own rate ([`ModelHold::Hold`]);
+//!   cannot finish at the model's own rate ([`ModelHold::Hold`]). The rate is
+//!   measured only while the model's held work was refused throughout the
+//!   window (its own capacity was full); otherwise the held completions are
+//!   the demand, not the capacity, and there is no cutoff;
 //! - it is so close to the retry cut-off that a held refusal could not be
 //!   retried before it (applied when the dispatch is prepared).
 //!
@@ -203,7 +206,6 @@ pub(crate) async fn run_hold_refresh<S>(
     let params = HoldParams {
         window_secs: hold.window.as_secs_f64(),
         safety_margin: hold.safety_margin,
-        min_samples: i64::try_from(hold.min_samples).unwrap_or(i64::MAX),
     };
     let stale_after = hold.stale_after_duration();
     let refresh_interval = hold.refresh_interval.max(Duration::from_secs(1));
@@ -549,7 +551,6 @@ mod tests {
         let params = HoldParams {
             window_secs: 900.0,
             safety_margin: 0.2,
-            min_samples: 20,
         };
         let now = Utc::now();
         let inputs = [fusillade_core::release::ModelHoldInputs {
@@ -557,7 +558,9 @@ mod tests {
             completed: 0,
             refused: 4,
             held_since: Some(now - chrono::Duration::minutes(15)),
+            first_refused: Some(now - chrono::Duration::minutes(15)),
             last_refused: Some(now - chrono::Duration::minutes(1)),
+            refused_minutes: 4,
             backlog: vec![(now + chrono::Duration::hours(1), 10)],
         }];
         let models = ["busy".to_string(), "quiet".to_string()];

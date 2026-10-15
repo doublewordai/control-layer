@@ -29,7 +29,6 @@ async fn manager(pool: &PgPool) -> Arc<Manager> {
 const PARAMS: HoldParams = HoldParams {
     window_secs: 900.0,
     safety_margin: 0.2,
-    min_samples: 20,
 };
 
 /// `count` pending flex requests (1h window) for `model`.
@@ -430,10 +429,16 @@ async fn every_daemon_reads_the_same_inputs_and_decides_alike(pool: PgPool) {
         "the first minute counted in the window"
     );
     assert_eq!(
+        m.first_refused,
+        Some(now - Duration::minutes(2)),
+        "the first minute with a refusal in the window"
+    );
+    assert_eq!(
         m.last_refused,
         Some(now),
         "the last minute with a refusal in the window"
     );
+    assert_eq!(m.refused_minutes, 2, "minutes with a refusal in the window");
     assert_eq!(
         m.backlog_requests(),
         3,
@@ -461,10 +466,15 @@ async fn every_daemon_reads_the_same_inputs_and_decides_alike(pool: PgPool) {
         Some(now - Duration::minutes(3)),
         "a later minute without refusals does not move it"
     );
+    assert_eq!(
+        (idle.first_refused, idle.refused_minutes),
+        (Some(now - Duration::minutes(3)), 1)
+    );
 
-    // Same inputs, same decisions: 900 completions over the 5 minutes the
-    // model has been counted clear the backlog in seconds, so there is no
-    // cutoff.
+    // Same inputs, same decisions: the model was not refused throughout the
+    // window (it has been counted for 5 minutes of 15), so the 900
+    // completions are not a capacity measurement and there is no cutoff. The
+    // raw rate is still reported.
     let decide = |inputs: &[fusillade_core::release::ModelHoldInputs], at| {
         inputs
             .iter()

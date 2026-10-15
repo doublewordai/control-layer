@@ -997,7 +997,11 @@ background_services:
     # and the latest in the last quarter of the window, at least the last two
     # minutes); when it is due at or before the latest deadline whose pending
     # work cannot finish at the model's own completion rate (with
-    # safety_margin); when a refusal could no longer be retried before the
+    # safety_margin; the rate counts only once the model's held dispatches
+    # were refused throughout the window, from its first two minutes to its
+    # last quarter and in three quarters of its minutes, because until its
+    # own capacity is full the rate is demand, not capacity, and nothing is
+    # held back); when a refusal could no longer be retried before the
     # retry cut-off (stop_before_deadline_ms before the deadline, or the
     # deadline itself when unset); or when the decisions are older than
     # stale_after_secs. Each replica recomputes the decisions every
@@ -1023,7 +1027,6 @@ background_services:
     #   refresh_interval_secs: 60
     #   window_secs: 900
     #   safety_margin: 0.2
-    #   min_samples: 20
     #   stale_after_secs: 300
 
   # Batch completion notifications (emails + webhooks)

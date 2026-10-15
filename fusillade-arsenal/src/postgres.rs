@@ -9246,12 +9246,15 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             ),
             stats AS (
                 -- The window's counters, the first minute counted in it
-                -- (how long the model has been held within the window) and
-                -- the last minute with a refusal (whether it was refused
-                -- lately).
+                -- (how long the model has been held within the window), and
+                -- the first and last minutes with a refusal and how many
+                -- minutes had one (whether it was refused throughout the
+                -- window, and lately).
                 SELECT s.model, SUM(s.completed)::BIGINT AS completed, SUM(s.refused)::BIGINT AS refused,
                        MIN(s.minute) AS held_since,
-                       MAX(s.minute) FILTER (WHERE s.refused > 0) AS last_refused
+                       MIN(s.minute) FILTER (WHERE s.refused > 0) AS first_refused,
+                       MAX(s.minute) FILTER (WHERE s.refused > 0) AS last_refused,
+                       COUNT(*) FILTER (WHERE s.refused > 0)::BIGINT AS refused_minutes
                 FROM hold_stats s
                 WHERE s.model = ANY($1)
                   AND s.minute >= NOW() - make_interval(secs => $2::FLOAT8)
@@ -9309,7 +9312,9 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
                    COALESCE(st.completed, 0)::BIGINT AS completed,
                    COALESCE(st.refused, 0)::BIGINT AS refused,
                    st.held_since,
+                   st.first_refused,
                    st.last_refused,
+                   COALESCE(st.refused_minutes, 0)::BIGINT AS refused_minutes,
                    b.deadline,
                    (SUM(b.n) OVER (PARTITION BY h.model ORDER BY b.minute))::BIGINT AS cumulative,
                    clock_timestamp() AS read_at
@@ -9339,7 +9344,9 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
                     completed: row.get("completed"),
                     refused: row.get("refused"),
                     held_since: row.get("held_since"),
+                    first_refused: row.get("first_refused"),
                     last_refused: row.get("last_refused"),
+                    refused_minutes: row.get("refused_minutes"),
                     backlog: Vec::new(),
                 });
             }

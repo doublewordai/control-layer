@@ -342,9 +342,6 @@ pub struct DispatchHold {
     pub window: std::time::Duration,
     /// Fraction of a deadline's projected work added as margin. Default 0.2.
     pub safety_margin: f64,
-    /// Held completions a model needs in the window before its own rate is
-    /// trusted. Default 20.
-    pub min_samples: u64,
     /// Decisions older than this release every held request (the refresh is
     /// failing). Default 5 minutes.
     pub stale_after: std::time::Duration,
@@ -382,7 +379,6 @@ impl DispatchHold {
             refresh_interval: std::time::Duration::from_secs(60),
             window: std::time::Duration::from_secs(900),
             safety_margin: 0.2,
-            min_samples: 20,
             stale_after: std::time::Duration::from_secs(300),
         }
     }

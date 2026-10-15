@@ -4387,7 +4387,6 @@ async fn a_refresh_releases_a_model_whose_held_work_is_only_refused(pool: sqlx::
         fusillade::daemon::DispatchHold::new(serde_json::json!([]), ["held-model".to_string()]);
     hold.refresh_interval = Duration::from_secs(1);
     hold.window = fusillade::daemon::DispatchHold::MIN_WINDOW;
-    hold.min_samples = 1;
     hold.stale_after = Duration::from_secs(60);
     sqlx::query(
         "INSERT INTO hold_stats (model, minute, completed, refused)

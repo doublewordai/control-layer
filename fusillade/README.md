@@ -184,7 +184,7 @@ capacity is full. Off unless the builder is called.
   throughout a whole `window` of holding and none completed; when it is due at
   or before the latest deadline whose pending work cannot finish at the
   model's own rate (held completions over the time held, with
-  `safety_margin`); when a refusal could no longer be retried before the retry
+  `safety_margin`; see **Rate**); when a refusal could no longer be retried before the retry
   cut-off (`stop_before_deadline_ms` before the deadline, or the deadline when
   unset); or when the decisions are older than `stale_after` (fail open).
   Requests sharing a deadline are released together. Counted by
@@ -194,6 +194,16 @@ capacity is full. Off unless the builder is called.
   minute: the first refusal counted at least `window` less a minute ago, and
   the latest in the last quarter of the window (at least the last two
   minutes). Neither a first refusal nor one old refusal releases everything.
+- **Rate.** Held completions are the model's capacity only while that
+  capacity is full, so the rate is used only once the model's held dispatches
+  were refused throughout the window: first refused within two minutes of
+  its start, last refused in its last quarter (at least the last two
+  minutes), and refused in at least three quarters of its minutes. A model
+  whose held work is not refused has spare capacity: its completions are its
+  demand, and projecting a large new backlog from them would release most of
+  it while the model's own workers sit idle. Such a model gets no cutoff
+  however much work arrives; only the deadline floor releases. Nothing is
+  being held back from it in the meantime.
 - **Refusals.** A held 503/529 is requeued after `max_backoff_ms` without
   spending a retry, is never terminal, and neither cuts adaptive concurrency
   nor counts toward raising it (a held dispatch counts toward a raise only

@@ -1956,7 +1956,8 @@ where
     /// model's held dispatches were refused while none completed over a whole
     /// window of holding; when it is due before the latest deadline its
     /// model's outstanding work cannot meet at the rate held dispatches
-    /// complete; when it is too close to the retry cut-off for a held refusal
+    /// complete, measured only while they were refused throughout the window
+    /// (before that the rate is demand, not capacity); when it is too close to the retry cut-off for a held refusal
     /// to be retried; or when the decisions are stale. Every daemon computes
     /// the decisions from shared per-minute counters (`hold_stats`). Counted
     /// by `fusillade_tolerations_released_total{model,reason}`.

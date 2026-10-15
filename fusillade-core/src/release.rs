@@ -17,6 +17,13 @@
 //! batch-claim ramp), to each row they claim. Nothing is written to the
 //! request rows.
 //!
+//! The held completion rate is the model's own capacity only while that
+//! capacity is full: held work refused throughout the window, so every held
+//! dispatch that could run did. On a model that is not saturated the rate
+//! measures demand, which says nothing about how fast a new backlog would be
+//! served, and nothing is being kept off the capacity the hold does not allow
+//! anyway, so such a model is held with only the deadline floor releasing.
+//!
 //! The decision fails open: a model whose held dispatches were refused
 //! throughout a whole window of holding, while none completed, has no own
 //! capacity to wait for, and missing or stale decisions release everything,
@@ -59,6 +66,19 @@ pub const MAX_WINDOW_SECS: u64 = 86_400;
 /// counted in.
 pub const RECENT_REFUSAL_FRACTION: f64 = 0.25;
 
+/// How close to the start of the window the model's first refusal in it must
+/// be, in seconds, for the model to count as refused throughout the window:
+/// two counter minutes (a minute's rounding, and a held refusal is retried
+/// only after the maximum backoff), never more than half the window.
+pub const EARLY_REFUSAL_SECS: f64 = 2.0 * STATS_BUCKET_SECS;
+
+/// The share of the window's counter minutes that must have a refusal for the
+/// model to count as refused throughout the window. Refused at both ends of
+/// the window is not enough: two separate bursts with a quiet spell between
+/// them would let the quiet spell's demand-limited completions pass for
+/// capacity.
+pub const REFUSED_MINUTES_FRACTION: f64 = 0.75;
+
 /// How many windows a remembered clean rate is used for while releases keep
 /// the window from being clean. Past that the measured rate is used even
 /// though it is diluted: it errs toward releasing, which is the safe side.
@@ -73,10 +93,6 @@ pub struct HoldParams {
     /// `d` is behind when `work_due_by(d) / rate * (1 + safety_margin)`
     /// exceeds the time left until `d`.
     pub safety_margin: f64,
-    /// Held completions a model needs before its own rate is trusted, unless
-    /// it was refused throughout a whole window of holding (then whatever
-    /// completed is its rate).
-    pub min_samples: i64,
 }
 
 /// One model's counters and outstanding work, as read on a refresh.
@@ -94,11 +110,18 @@ pub struct ModelHoldInputs {
     /// were counted in, not the minute they were flushed in, so a delayed
     /// flush does not shorten this span.
     pub held_since: Option<DateTime<Utc>>,
+    /// The first counter minute in the window with a refusal. `None` without
+    /// refusals. A model counts as refused throughout the window only if it
+    /// was refused at the start of the window: refusals that began inside it
+    /// leave the completions before them, which measure demand, in the rate.
+    pub first_refused: Option<DateTime<Utc>>,
     /// The last counter minute in the window with a refusal. `None` without
     /// refusals. A model counts as refused throughout the window only if it
     /// was refused lately too: one old refusal is not evidence that the
     /// capacity the hold allows is full now.
     pub last_refused: Option<DateTime<Utc>>,
+    /// Counter minutes in the window with a refusal.
+    pub refused_minutes: i64,
     /// Pending requests of the model that are not yet overdue, cumulative by
     /// deadline: `(d, n)` means `n` requests are due at or before `d`.
     /// Ascending in `d` and `n`. Requests in flight are left out: by Little's
@@ -132,7 +155,7 @@ pub struct ModelHoldDecision {
     pub model: String,
     pub hold: ModelHold,
     /// The own rate the decision used, in held completions per second (the
-    /// raw held rate when there was too little to project from).
+    /// raw held rate when it was not a capacity measurement).
     pub own_rate: f64,
     pub backlog_requests: i64,
     /// Seconds to clear the backlog at `own_rate` (NaN without a rate).
@@ -154,26 +177,32 @@ pub struct ModelHoldMemory {
 /// One model's decision, updating what the daemon remembers about it.
 ///
 /// The held rate is `completed / held_secs`, where `held_secs` is how long
-/// the model has been counted within the window. The model was refused
-/// throughout the window when it has been counted for the whole window (to
-/// within one counter minute) and its last refusal is recent (in the last
+/// the model has been counted within the window. It is the capacity the hold
+/// allows only when that capacity was full for the whole window, so the rate
+/// is measured only when the model was refused throughout the window: counted
+/// for the whole window (to within one counter minute), first refused at its
+/// start (within [`EARLY_REFUSAL_SECS`]), last refused recently (in the last
 /// [`RECENT_REFUSAL_FRACTION`] of the window, and at least the last two
-/// minutes). The rate is measured once `min_samples` held dispatches
-/// completed, or once the model was refused throughout the window (then
-/// whatever completed is the capacity the hold allows). While a release is in
-/// the window, the larger of it and the remembered clean rate is used. Then:
+/// minutes), refused in at least [`REFUSED_MINUTES_FRACTION`] of its minutes,
+/// and with something completed. However many held dispatches completed
+/// otherwise, the rate is not measured: on a model with spare capacity it is
+/// the demand, and a quiet model's demand projected onto a large new backlog
+/// would release most of it at once, to run elsewhere, while its own workers
+/// sat idle. While a release is in the window, the larger of the measured
+/// rate and the remembered clean rate is used. Then:
 ///
 /// - with a rate, the cutoff is [`release_cutoff`] of the outstanding work;
-/// - refused throughout the window with nothing completed, and no clean rate
-///   to go on: the capacity the hold allows is absent, so everything is
-///   released ([`TolerationsRelease::NoOwnCapacity`]). With nothing completed
-///   in the window, every counter minute in it has refusals, so the refusals
-///   span the window from its first minute to its recent part. Refusals early
-///   in a hold are not enough (a held refusal is immediate while a completion
-///   takes a request's latency), nor is one old refusal on a quiet model;
-/// - otherwise there is nothing to project from yet (a new hold, a slow first
-///   window, or a quiet model that is never refused); only the deadline floor
-///   releases.
+/// - counted for the whole window, refused lately and nothing completed, and
+///   no clean rate to go on: the capacity the hold allows is absent, so
+///   everything is released ([`TolerationsRelease::NoOwnCapacity`]). With
+///   nothing completed in the window, every counter minute in it has
+///   refusals, so the refusals span the window from its first minute to its
+///   recent part. Refusals early in a hold are not enough (a held refusal is
+///   immediate while a completion takes a request's latency), nor is one old
+///   refusal on a quiet model;
+/// - otherwise there is no capacity measurement (a new hold, saturation that
+///   began inside the window, or a model whose held work is not refused, so
+///   nothing is being held back); only the deadline floor releases.
 pub fn decide_model_hold(
     inputs: &ModelHoldInputs,
     params: HoldParams,
@@ -199,11 +228,21 @@ pub fn decide_model_hold(
         && inputs
             .last_refused
             .is_some_and(|at| secs_since(at) <= recent_secs);
-    let refused_throughout = whole_window && refused_lately;
+    // With nothing completed, every counter minute has refusals, so a model
+    // counted for the whole window and refused lately was refused from the
+    // window's first minute to its recent part.
+    let no_own_capacity = completed == 0 && whole_window && refused_lately;
+    let early_secs = EARLY_REFUSAL_SECS.min(window_secs / 2.0);
+    let refused_early = inputs
+        .first_refused
+        .is_some_and(|at| secs_since(at) + early_secs >= window_secs);
+    let refused_minutes_needed = REFUSED_MINUTES_FRACTION * window_secs / STATS_BUCKET_SECS;
+    let refused_throughout = whole_window
+        && refused_lately
+        && refused_early
+        && inputs.refused_minutes as f64 >= refused_minutes_needed;
     let raw_rate = completed as f64 / held_secs.max(1.0);
-    let measured = (completed >= params.min_samples.max(1)
-        || (refused_throughout && completed > 0))
-        .then_some(raw_rate);
+    let measured = (refused_throughout && completed > 0).then_some(raw_rate);
 
     let released_in_window = memory
         .last_release_at
@@ -225,9 +264,7 @@ pub fn decide_model_hold(
         Some(rate) => ModelHold::Hold {
             cutoff: release_cutoff(&inputs.backlog, rate, params.safety_margin, now),
         },
-        None if refused_throughout && completed == 0 => {
-            ModelHold::ReleaseAll(TolerationsRelease::NoOwnCapacity)
-        }
+        None if no_own_capacity => ModelHold::ReleaseAll(TolerationsRelease::NoOwnCapacity),
         None => ModelHold::Hold { cutoff: None },
     };
 
@@ -400,7 +437,6 @@ mod tests {
     const PARAMS: HoldParams = HoldParams {
         window_secs: 900.0,
         safety_margin: 0.2,
-        min_samples: 20,
     };
 
     fn now() -> DateTime<Utc> {
@@ -413,8 +449,10 @@ mod tests {
         now() + Duration::seconds(secs)
     }
 
-    /// Counters over the last `held_secs` (`None`: no counters at all), the
-    /// last refusal (if any) in the current minute.
+    /// Counters over the last `held_secs` (`None`: no counters at all). With
+    /// refusals, the model was refused in every minute it was counted: the
+    /// first refusal when it was first counted, the last in the current
+    /// minute.
     fn inputs(
         completed: i64,
         refused: i64,
@@ -426,7 +464,13 @@ mod tests {
             completed,
             refused,
             held_since: held_secs.map(|secs| at(-secs)),
+            first_refused: held_secs.filter(|_| refused > 0).map(|secs| at(-secs)),
             last_refused: (refused > 0).then(|| at(-30)),
+            refused_minutes: if refused > 0 {
+                held_secs.map_or(0, |secs| (secs + 59) / 60)
+            } else {
+                0
+            },
             backlog: backlog.iter().map(|(secs, n)| (at(*secs), *n)).collect(),
         }
     }
@@ -437,7 +481,7 @@ mod tests {
 
     #[test]
     fn an_empty_backlog_has_no_cutoff() {
-        let decision = decide(&inputs(900, 0, Some(900), &[]));
+        let decision = decide(&inputs(900, 5, Some(900), &[]));
         assert_eq!(decision.hold, ModelHold::Hold { cutoff: None });
         assert_eq!(decision.own_rate, 1.0);
         assert_eq!(decision.backlog_requests, 0);
@@ -483,7 +527,7 @@ mod tests {
         old.last_refused = Some(at(-850));
         assert_eq!(decide(&old).hold, ModelHold::Hold { cutoff: None });
 
-        // Nor is a rate under min_samples trusted on that evidence.
+        // Nor is the rate of what did complete trusted on that evidence.
         let mut slow = inputs(5, 1, Some(900), &[(3_600, 5), (86_400, 3_000)]);
         slow.last_refused = Some(at(-850));
         assert_eq!(decide(&slow).hold, ModelHold::Hold { cutoff: None });
@@ -551,8 +595,8 @@ mod tests {
         let early = decide(&inputs(2, 40, Some(60), &backlog));
         assert_eq!(early.hold, ModelHold::Hold { cutoff: None });
 
-        // A whole window held: 15 completed, under min_samples, but refused
-        // throughout, so 15 per 900s is the capacity. The 24h work fits.
+        // A whole window held and refused throughout: however few completed,
+        // 15 per 900s is the capacity. The 24h work fits.
         let settled = decide(&inputs(15, 400, Some(900), &backlog));
         assert_eq!(settled.hold, ModelHold::Hold { cutoff: None });
         assert!((settled.own_rate - 15.0 / 900.0).abs() < 1e-12);
@@ -568,11 +612,81 @@ mod tests {
     }
 
     #[test]
-    fn too_few_samples_without_refusals_leaves_the_floor() {
+    fn without_refusals_only_the_floor_releases() {
         let decision = decide(&inputs(3, 0, Some(900), &[(600, 1_000_000)]));
         assert_eq!(decision.hold, ModelHold::Hold { cutoff: None });
         let decision = decide(&inputs(0, 0, None, &[(600, 1_000_000)]));
         assert_eq!(decision.hold, ModelHold::Hold { cutoff: None });
+    }
+
+    #[test]
+    fn a_quiet_models_demand_is_not_taken_for_its_capacity() {
+        // About 22 completions per 15 minutes on a model with spare capacity:
+        // nothing held is refused, so the rate is the demand. A 10k-request
+        // batch due in 24h would take 10000 / (22/900) s at that rate, far
+        // past its deadline, yet nothing may be released early: the model's
+        // own workers have not been shown to be full.
+        let mut memory = ModelHoldMemory::default();
+        let quiet = inputs(22, 0, Some(900), &[(86_400, 10_000)]);
+        let decision = decide_model_hold(&quiet, PARAMS, now(), &mut memory);
+        assert_eq!(decision.hold, ModelHold::Hold { cutoff: None });
+        assert!(
+            (decision.own_rate - 22.0 / 900.0).abs() < 1e-12,
+            "the raw rate, for metrics"
+        );
+        assert_eq!(
+            memory,
+            ModelHoldMemory::default(),
+            "no clean rate learned from demand"
+        );
+
+        // Well over any sample count: still demand, still no cutoff.
+        assert_eq!(
+            decide(&inputs(
+                2_000,
+                0,
+                Some(900),
+                &[(3_600, 5_000), (86_400, 10_000)]
+            ))
+            .hold,
+            ModelHold::Hold { cutoff: None }
+        );
+
+        // The batch saturates the model a minute ago: refused lately, but the
+        // window's completions are mostly from before, so still no cutoff.
+        let mut onset = inputs(25, 40, Some(900), &[(86_400, 10_000)]);
+        onset.first_refused = Some(at(-60));
+        onset.refused_minutes = 2;
+        assert_eq!(decide(&onset).hold, ModelHold::Hold { cutoff: None });
+
+        // Refused at both ends of the window with a quiet spell between: not
+        // refused throughout either.
+        let mut bursts = inputs(25, 40, Some(900), &[(86_400, 10_000)]);
+        bursts.first_refused = Some(at(-900));
+        bursts.refused_minutes = 4;
+        assert_eq!(decide(&bursts).hold, ModelHold::Hold { cutoff: None });
+        // A minute or two missing at either end, or a few in between, still
+        // is: 12 of the window's 15 minutes, the first within two minutes of
+        // its start.
+        bursts.first_refused = Some(at(-780));
+        bursts.refused_minutes = 12;
+        assert_eq!(
+            decide(&bursts).hold,
+            ModelHold::Hold {
+                cutoff: Some(at(86_400))
+            }
+        );
+        bursts.refused_minutes = 11;
+        assert_eq!(decide(&bursts).hold, ModelHold::Hold { cutoff: None });
+        bursts.refused_minutes = 12;
+        bursts.first_refused = Some(at(-779));
+        assert_eq!(decide(&bursts).hold, ModelHold::Hold { cutoff: None });
+
+        // Once the model's own workers have been full for a whole window, the
+        // rate is their capacity: 900 per 15 minutes clears the 10k in time.
+        let saturated = decide(&inputs(900, 4_000, Some(900), &[(86_400, 10_000)]));
+        assert_eq!(saturated.hold, ModelHold::Hold { cutoff: None });
+        assert_eq!(saturated.own_rate, 1.0);
     }
 
     #[test]
@@ -597,7 +711,7 @@ mod tests {
         // At twice the rate the hour's work fits: no cutoff.
         let decision = decide(&inputs(
             1_800,
-            0,
+            7,
             Some(900),
             &[(1_800, 1_000), (3_599, 3_000), (86_400, 4_000)],
         ));
@@ -615,7 +729,9 @@ mod tests {
                 completed,
                 refused,
                 held_since: Some(now - Duration::seconds(900)),
+                first_refused: (refused > 0).then(|| now - Duration::seconds(900)),
                 last_refused: (refused > 0).then_some(now),
+                refused_minutes: if refused > 0 { 15 } else { 0 },
                 backlog: backlog.iter().map(|(due, n)| (at(*due), *n)).collect(),
             };
             decide_model_hold(&inputs, PARAMS, now, &mut memory)
@@ -653,7 +769,7 @@ mod tests {
         );
 
         // A higher measured rate (more capacity) is still used.
-        let faster = decide_at(180, 2_700, 0);
+        let faster = decide_at(180, 2_700, 5);
         assert_eq!(faster.own_rate, 3.0);
         assert_eq!(faster.hold, ModelHold::Hold { cutoff: None });
     }
@@ -666,15 +782,23 @@ mod tests {
             completed,
             refused,
             held_since: Some(now - Duration::seconds(900)),
+            first_refused: (refused > 0).then(|| now - Duration::seconds(900)),
             last_refused: (refused > 0).then_some(now),
+            refused_minutes: if refused > 0 { 15 } else { 0 },
             backlog: backlog.iter().map(|(due, n)| (at(*due), *n)).collect(),
         };
 
         // No release in the window: the measured rate becomes the clean rate.
         let mut memory = ModelHoldMemory::default();
-        decide_model_hold(&held(now(), 450, 0), PARAMS, now(), &mut memory);
+        decide_model_hold(&held(now(), 450, 5), PARAMS, now(), &mut memory);
         assert_eq!(memory.clean_rate, Some((0.5, now())));
         assert_eq!(memory.last_release_at, None);
+
+        // A clean window whose held work is no longer refused measures no
+        // capacity, so there is no clean rate to remember.
+        let mut unsaturated = memory;
+        decide_model_hold(&held(at(60), 450, 0), PARAMS, at(60), &mut unsaturated);
+        assert_eq!(unsaturated.clean_rate, None);
 
         // A clean rate older than CLEAN_RATE_MAX_WINDOWS windows is not used:
         // the measured, diluted, rate is (erring toward release).

@@ -2692,12 +2692,16 @@ fn default_batch_metadata_fields_dwctl() -> Vec<String> {
 /// - when it is due at or before the latest deadline `d` whose pending work
 ///   cannot finish at the model's own rate: `work_due_by(d) / rate * (1 +
 ///   safety_margin) > d - now`, where the rate is the held completions over
-///   the time the model was held in the last `window_secs` (trusted from
-///   `min_samples` completions, or after a whole window of refusals). While a
-///   release is in the window, each replica keeps using the rate it measured
-///   before the release, so released work running on the same capacity does
-///   not drive further release. Requests sharing a deadline are released
-///   together;
+///   the last `window_secs`. The rate is the model's capacity only while that
+///   capacity is full, so it is used only when the model's held dispatches
+///   were refused throughout the window: from its first two minutes to its
+///   last quarter, and in at least three quarters of its minutes. A model
+///   whose held work is not refused (it has spare capacity, so its rate is
+///   its demand, and nothing is being held back) gets no cutoff however much
+///   work arrives. While a release is in the window, each replica keeps using
+///   the rate it measured before the release, so released work running on
+///   the same capacity does not drive further release. Requests sharing a
+///   deadline are released together;
 /// - when a refusal could no longer be retried before the retry cut-off
 ///   (`stop_before_deadline_ms` before the deadline, or the deadline itself
 ///   when that is unset);
@@ -2745,10 +2749,6 @@ pub struct DispatchHoldConfig {
     /// Margin added to a deadline's projected work, as a fraction in
     /// `[0, 1)`. Default: 0.2.
     pub safety_margin: f64,
-    /// Held completions a model needs in the window before its own rate is
-    /// trusted, unless it was refused throughout a whole window of holding.
-    /// Default: 20.
-    pub min_samples: u64,
     /// Decisions older than this (seconds) release every held request. More
     /// than `refresh_interval_secs`. Default: 300.
     pub stale_after_secs: u64,
@@ -2763,7 +2763,6 @@ impl Default for DispatchHoldConfig {
             refresh_interval_secs: 60,
             window_secs: 900,
             safety_margin: 0.2,
-            min_samples: 20,
             stale_after_secs: 300,
         }
     }
@@ -2832,7 +2831,6 @@ impl DispatchHoldConfig {
             refresh_interval: std::time::Duration::from_secs(self.refresh_interval_secs),
             window: std::time::Duration::from_secs(self.window_secs),
             safety_margin: self.safety_margin,
-            min_samples: self.min_samples,
             stale_after: std::time::Duration::from_secs(self.stale_after_secs),
         })
     }
@@ -6029,7 +6027,6 @@ background_services:
             assert_eq!(hold.refresh_interval, std::time::Duration::from_secs(60));
             assert_eq!(hold.window, std::time::Duration::from_secs(900));
             assert_eq!(hold.safety_margin, 0.2);
-            assert_eq!(hold.min_samples, 20);
             assert_eq!(hold.stale_after, std::time::Duration::from_secs(300));
             assert_eq!(hold.models, ["example/model-a".to_string(), "example/model-b".to_string()].into());
 
