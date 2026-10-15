@@ -3960,6 +3960,12 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
+        // Ensure this week's partition before writing `files`. Creating a partition holds
+        // the week's partition lock while attaching the parent's `files` foreign key, which
+        // waits for open `files` writes; writing `files` first can deadlock with the
+        // daemon extending the partition runway.
+        template_store::ensure_current_week_partition(&mut tx).await?;
+
         // Accumulate metadata as we encounter it
         let mut metadata = FileMetadata::default();
         let mut file_id: Option<Uuid> = None;
@@ -7614,6 +7620,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
 
     /// Insert a batch of templates using PostgreSQL UNNEST for bulk insertion.
     /// This is significantly faster than individual INSERTs for large template counts.
+    /// The caller must have ensured this week's partition in `tx`.
     async fn insert_template_batch(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         file_id: Uuid,
@@ -7644,7 +7651,6 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         let line_numbers: Vec<i32> = templates.iter().map(|(_, line)| *line).collect();
         let body_byte_sizes: Vec<i64> = stored_bodies.iter().map(|b| b.len() as i64).collect();
 
-        template_store::ensure_current_week_partition(tx).await?;
         sqlx::query(
             r#"
             WITH inserted AS (
@@ -10252,6 +10258,89 @@ mod tests {
     // BATCH INSERT STRATEGY TESTS
     // =========================================================================
     // Tests for the batched UNNEST upload mechanism
+
+    #[sqlx::test]
+    async fn create_file_does_not_deadlock_with_partition_creation(pool: sqlx::PgPool) {
+        // The daemon creates this week's template partition while an upload that needs it
+        // is starting: hold the week's partition lock as the creator does, let the upload
+        // queue behind it, then create and attach the partition.
+        let no_partitions: bool =
+            sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM request_template_buckets)")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            no_partitions,
+            "the upload must need to create its partition"
+        );
+        let mut creator = pool.begin().await.unwrap();
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtextextended(
+                 'request_templates_g2.partition:' || current_schema() || ':'
+                     || to_char(date_trunc('week', now() AT TIME ZONE 'UTC')::date, 'YYYYMMDD'),
+                 0))",
+        )
+        .execute(&mut *creator)
+        .await
+        .unwrap();
+
+        let manager = Arc::new(PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        ));
+        let upload = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .create_file(
+                        "upload".to_string(),
+                        None,
+                        vec![RequestTemplateInput {
+                            custom_id: None,
+                            endpoint: "https://api.example.com".to_string(),
+                            method: "POST".to_string(),
+                            path: "/v1/completions".to_string(),
+                            body: "{}".to_string(),
+                            model: "test-model".to_string(),
+                            api_key: "key".to_string(),
+                        }],
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM pg_stat_activity
+                         WHERE datname = current_database()
+                           AND wait_event_type = 'Lock' AND wait_event = 'advisory')",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                if waiting {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("upload never queued behind the partition lock");
+
+        sqlx::query(
+            "SELECT ensure_request_template_partition(
+                 date_trunc('week', now() AT TIME ZONE 'UTC')::date, NULL)",
+        )
+        .execute(&mut *creator)
+        .await
+        .expect("partition creation must not deadlock with the upload");
+        creator.commit().await.unwrap();
+        upload
+            .await
+            .unwrap()
+            .expect("upload must not deadlock with partition creation");
+    }
 
     #[sqlx::test]
     async fn test_batched_insert_small_file(pool: sqlx::PgPool) {

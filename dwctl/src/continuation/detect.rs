@@ -74,7 +74,9 @@ pub fn classify(event: &DeathEvent) -> Verdict {
         // FINISHED generation must never be resumed — a stall or reset while
         // waiting for the usage/[DONE] trailer is a lost trailer, and
         // continuing past a terminal finish_reason would append output after a
-        // valid stop.
+        // valid stop. Behind strict-mode onwards these deaths rarely arrive
+        // here: onwards ends a broken or truncated stream with its own error
+        // envelope (code 502), which classifies as `error_envelope`.
         DeathEvent::TransportError { finished: true } => Verdict::LostTrailer,
         DeathEvent::TransportError { finished: false } => Verdict::Resume("transport_error"),
 
