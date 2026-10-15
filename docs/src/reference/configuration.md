@@ -753,6 +753,19 @@ enable_otel_export: false
 
 Exports traces via OTLP. Configure the exporter endpoint with standard OpenTelemetry environment variables (`OTEL_EXPORTER_OTLP_ENDPOINT`, etc.).
 
+Logs and traces are filtered separately. `RUST_LOG` controls the log output.
+`OTEL_TRACES_FILTER` (a dwctl variable, not an OpenTelemetry standard one)
+uses the same directive syntax and controls what the exporter sends; it
+defaults to `info`, which exports the request, routing and provider spans and
+their info-and-above events but not repository spans or debug lines. `RUST_LOG`
+applies first, so the exporter never sees more than the logs do. For example,
+`RUST_LOG=debug` with the default exporter filter gives verbose logs and
+compact traces; `OTEL_TRACES_FILTER=debug,sqlx=warn` additionally exports
+repository spans without sqlx's per-query statement events.
+
+Exported spans omit the source location (`code.*`), thread and
+`busy_ns`/`idle_ns` attributes.
+
 When request analytics and tracing are enabled, the pair `http_analytics.trace_id`
 and `gateway_span_id` identifies the gateway span for a captured request. Follow
 its descendant `onwards.provider_attempt` spans to the downstream serving spans.

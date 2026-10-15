@@ -116,7 +116,7 @@ impl<'c> CacheTariffs<'c> {
     /// Enable (or re-price) caching for a model: expire the current active version, then
     /// insert a new one from `defaults` + `overrides`. Idempotent in spirit — calling it
     /// again just supersedes the previous version, keeping the old one for audit.
-    #[instrument(skip(self, defaults, overrides), fields(deployed_model_id = %model_id), err)]
+    #[instrument(level = "debug", skip(self, defaults, overrides), fields(deployed_model_id = %model_id), err)]
     pub async fn enable(&mut self, model_id: DeploymentId, defaults: &CachePricingConfig, overrides: CacheTariffOverrides) -> Result<()> {
         // Atomic: expire the active version and insert the new one in one transaction, so a
         // failed insert can't leave the model unintentionally disabled (ledger: never edit a
@@ -160,7 +160,7 @@ impl<'c> CacheTariffs<'c> {
     /// Disable caching for a model: expire its active tariff version (config retained for
     /// audit). Returns true if a version was active. Caching turns off within the
     /// resolver's cache TTL.
-    #[instrument(skip(self), fields(deployed_model_id = %model_id), err)]
+    #[instrument(level = "debug", skip(self), fields(deployed_model_id = %model_id), err)]
     pub async fn disable(&mut self, model_id: DeploymentId) -> Result<bool> {
         // Only expire the currently-effective version (valid_from <= now()), matching the
         // resolver's as-of-now active check — a future-dated version is left intact.
@@ -179,7 +179,7 @@ impl<'c> CacheTariffs<'c> {
 
     /// The tariff version effective *now* (the as-of-now active check the resolver uses),
     /// or `None` if cache pricing is currently off for this model.
-    #[instrument(skip(self), fields(deployed_model_id = %model_id), err)]
+    #[instrument(level = "debug", skip(self), fields(deployed_model_id = %model_id), err)]
     pub async fn get_active(&mut self, model_id: DeploymentId) -> Result<Option<ActiveTariff>> {
         let row = sqlx::query_as!(
             ActiveTariff,
@@ -201,7 +201,7 @@ impl<'c> CacheTariffs<'c> {
 
     /// One organisation's active cache versions on a set of models. Empty for models the
     /// organisation has no override on; callers layer the result over [`Self::get_active_bulk`].
-    #[instrument(skip(self, model_ids), fields(model_count = model_ids.len()), err)]
+    #[instrument(level = "debug", skip(self, model_ids), fields(model_count = model_ids.len()), err)]
     pub async fn get_active_for_account_bulk(
         &mut self,
         model_ids: &[DeploymentId],
@@ -246,7 +246,7 @@ impl<'c> CacheTariffs<'c> {
 
     /// Active tariff versions effective now, keyed by deployment ID. Models without an
     /// active row are omitted from the map.
-    #[instrument(skip(self, model_ids), fields(model_count = model_ids.len()), err)]
+    #[instrument(level = "debug", skip(self, model_ids), fields(model_count = model_ids.len()), err)]
     pub async fn get_active_bulk(&mut self, model_ids: &[DeploymentId]) -> Result<HashMap<DeploymentId, ActiveTariff>> {
         if model_ids.is_empty() {
             return Ok(HashMap::new());

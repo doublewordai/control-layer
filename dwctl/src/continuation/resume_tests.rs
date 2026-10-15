@@ -274,6 +274,13 @@ fn contents(frames: &[Value]) -> String {
     frames.iter().filter_map(|f| f["choices"][0]["delta"]["content"].as_str()).collect()
 }
 
+/// The stream ended with onwards' interruption event rather than quietly.
+fn ends_interrupted(frames: &[Value]) -> bool {
+    frames
+        .last()
+        .is_some_and(|f| f["error"]["code"] == onwards::strict::stream_end::INTERRUPTED_STATUS)
+}
+
 fn usage_frames(frames: &[Value]) -> Vec<&Value> {
     frames.iter().filter(|f| f.get("usage").is_some_and(|u| !u.is_null())).collect()
 }
@@ -760,8 +767,13 @@ async fn a_leg_the_target_refuses_consumes_an_attempt(pool: PgPool) {
     let st = state(pool, &fake, tokenizer.uri(), test_config());
 
     let payloads = collect_payloads(app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap()).await;
-    assert_eq!(contents(&parsed(&payloads)), "partial");
+    let frames = parsed(&payloads);
+    assert_eq!(contents(&frames), "partial");
     assert_eq!(fake.resume_requests().len(), 2, "both attempts were spent on the refusing target");
+    assert!(
+        ends_interrupted(&frames),
+        "a reset that could not be resumed ends with an error event, not a quiet close"
+    );
 }
 
 /// A tokenizer-svc outage costs attempts, not correctness: no leg is dispatched
@@ -904,6 +916,7 @@ async fn a_stream_with_unreconstructable_deltas_is_never_resumed(pool: PgPool) {
         frames[1]["choices"][0]["delta"]["reasoning_content"], "let me think",
         "a disarmed stream is still forwarded byte-for-byte"
     );
+    assert!(ends_interrupted(&frames), "an unsaved reset still ends with an error event");
 }
 
 /// The per-model in-flight cap: during an incident the resume budget is finite,
@@ -924,7 +937,9 @@ async fn a_saturated_model_does_not_stampede_the_continuation_target(pool: PgPoo
 
     let payloads = collect_payloads(app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap()).await;
     assert!(fake.resume_requests().is_empty(), "the cap is enforced before any work is done");
-    assert_eq!(contents(&parsed(&payloads)), "partial");
+    let frames = parsed(&payloads);
+    assert_eq!(contents(&frames), "partial");
+    assert!(ends_interrupted(&frames), "the death surfaces as an error event");
 }
 
 /// Nobody is listening: when the client drops the response, the chain — which

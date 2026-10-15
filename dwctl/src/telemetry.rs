@@ -24,6 +24,21 @@
 //! at the default) per process. Raise the queue for burstier traffic or lower it on
 //! small replicas.
 //!
+//! # What gets exported
+//!
+//! Logs and traces are filtered separately. `RUST_LOG` decides what reaches the
+//! log output, as usual. [`OTEL_TRACES_FILTER`] (our own variable, not an
+//! OpenTelemetry standard one) takes the same directive syntax and decides which
+//! spans and events reach the trace backend; it defaults to
+//! [`DEFAULT_OTEL_TRACES_FILTER`]. `RUST_LOG` still applies first, so the
+//! exporter never sees more than the logs do, but a `debug` log level no longer
+//! exports every repository span and every debug line (including sqlx's
+//! per-query statement events) as part of the trace.
+//!
+//! Spans are exported without the layer's default per-span extras
+//! (`code.*` source location, `thread.*`, `busy_ns`/`idle_ns`); nothing we
+//! query uses them and they were a sizeable share of each span's bytes.
+//!
 //! # Span attributes for customer-facing alerts
 //!
 //! Alert and dashboard queries (for example TraceQL metrics) depend on these
@@ -86,13 +101,22 @@ use onwards::{ErrorOrigin, RequestIdentity, ServedBy};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
 pub use opentelemetry_sdk::trace::SdkTracerProvider;
-use opentelemetry_sdk::trace::{BatchConfig, BatchConfigBuilder, BatchSpanProcessor};
+use opentelemetry_sdk::trace::{BatchConfig, BatchConfigBuilder, BatchSpanProcessor, Tracer};
 use std::collections::HashMap;
-use tracing::info;
+use tracing::{Subscriber, info};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer};
+
+/// Environment variable holding the filter directives for the span exporter.
+/// Same syntax as `RUST_LOG`, applied to the trace backend only.
+pub const OTEL_TRACES_FILTER: &str = "OTEL_TRACES_FILTER";
+
+/// Exporter filter when [`OTEL_TRACES_FILTER`] is unset: request-level spans
+/// and events, no repository spans or debug lines.
+pub const DEFAULT_OTEL_TRACES_FILTER: &str = "info";
 
 use crate::inference::rejections::RejectionCode;
 
@@ -216,14 +240,15 @@ pub fn init_telemetry(enable_otel_export: bool) -> anyhow::Result<Option<SdkTrac
 
     if enable_otel_export {
         let (tracer, provider) = create_otlp_tracer()?;
+        let traces_filter = std::env::var(OTEL_TRACES_FILTER).unwrap_or_else(|_| DEFAULT_OTEL_TRACES_FILTER.to_string());
 
         tracing_subscriber::registry()
             .with(env_filter)
             .with(tracing_subscriber::fmt::layer().compact())
-            .with(tracing_opentelemetry::layer().with_tracer(tracer))
+            .with(otel_layer(tracer, &traces_filter))
             .try_init()?;
 
-        info!("Telemetry initialized with OTLP export enabled");
+        info!(traces_filter, "Telemetry initialized with OTLP export enabled");
         return Ok(Some(provider));
     } else {
         // OTLP export disabled - use only console logging
@@ -238,6 +263,25 @@ pub fn init_telemetry(enable_otel_export: bool) -> anyhow::Result<Option<SdkTrac
     Ok(None)
 }
 
+/// The span export layer: `tracer` behind its own `directives` filter, without
+/// the per-span source location, thread and timing attributes.
+///
+/// A span the filter excludes is invisible to this layer only; the fmt layer
+/// still logs it, and an event inside it (such as the error an `err`
+/// instrumented repository method records) is exported on the nearest
+/// exported ancestor span instead.
+fn otel_layer<S>(tracer: Tracer, directives: &str) -> impl Layer<S>
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+{
+    tracing_opentelemetry::layer()
+        .with_tracer(tracer)
+        .with_location(false)
+        .with_threads(false)
+        .with_tracked_inactivity(false)
+        .with_filter(EnvFilter::new(directives))
+}
+
 /// Create an OpenTelemetry tracer with OTLP exporter
 ///
 /// This respects standard OpenTelemetry environment variables for configuration.
@@ -248,7 +292,7 @@ pub fn init_telemetry(enable_otel_export: bool) -> anyhow::Result<Option<SdkTrac
 /// - OTEL_SERVICE_NAME
 ///
 /// Returns both the tracer and provider. The provider must be retained for shutdown.
-fn create_otlp_tracer() -> anyhow::Result<(opentelemetry_sdk::trace::Tracer, SdkTracerProvider)> {
+fn create_otlp_tracer() -> anyhow::Result<(Tracer, SdkTracerProvider)> {
     // Get service name from env or use default
     let service_name = std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "dwctl".to_string());
 
@@ -316,6 +360,91 @@ fn create_otlp_tracer() -> anyhow::Result<(opentelemetry_sdk::trace::Tracer, Sdk
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentelemetry_sdk::error::OTelSdkResult;
+    use opentelemetry_sdk::trace::{SpanData, SpanExporter};
+    use std::sync::{Arc, Mutex};
+    use tracing::Instrument;
+
+    #[derive(Clone, Debug, Default)]
+    struct Exported(Arc<Mutex<Vec<SpanData>>>);
+
+    impl SpanExporter for Exported {
+        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+            self.0.lock().unwrap().extend(batch);
+            Ok(())
+        }
+    }
+
+    /// A repository method as instrumented after DW-931: a debug span whose
+    /// `err` emits an ERROR event (`error = %e`) when it fails.
+    #[tracing::instrument(level = "debug", err)]
+    async fn repository_method() -> Result<(), &'static str> {
+        Err("connection reset")
+    }
+
+    /// With logs at `debug` and the exporter at `info`, a request span is
+    /// exported without its debug events or debug child spans, the error
+    /// event a failing `err`-instrumented debug method emits lands on the
+    /// request span with its message, and none of the layer's per-span extras
+    /// are attached.
+    #[tokio::test]
+    async fn exporter_filter_is_independent_of_the_log_filter() {
+        let exported = Exported::default();
+        let provider = SdkTracerProvider::builder().with_simple_exporter(exported.clone()).build();
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("debug"))
+            .with(otel_layer(provider.tracer("test"), "info"));
+
+        let _guard = tracing::subscriber::set_default(subscriber);
+        async {
+            tracing::debug!(db.statement = "SELECT 1", "query");
+            tracing::info!("finished");
+            let _ = repository_method().await;
+        }
+        .instrument(tracing::info_span!("request"))
+        .await;
+        drop(_guard);
+        provider.shutdown().unwrap();
+
+        let spans = exported.0.lock().unwrap();
+        let names: Vec<&str> = spans.iter().map(|span| span.name.as_ref()).collect();
+        assert_eq!(names, ["request"]);
+
+        let request = &spans[0];
+        // The layer maps an event carrying `error = %e` to the OTel exception
+        // convention: named `exception`, with the message in `exception.message`.
+        let events: Vec<(&str, Option<String>)> = request
+            .events
+            .iter()
+            .map(|event| {
+                let message = event
+                    .attributes
+                    .iter()
+                    .find(|kv| kv.key.as_str() == "exception.message")
+                    .map(|kv| kv.value.to_string());
+                (event.name.as_ref(), message)
+            })
+            .collect();
+        assert_eq!(
+            events,
+            [("finished", None), ("exception", Some("connection reset".to_string()))],
+            "the repository method's error event must land on the request span: {:?}",
+            request.events
+        );
+
+        let keys: Vec<&str> = request.attributes.iter().map(|kv| kv.key.as_str()).collect();
+        for extra in [
+            "code.file.path",
+            "code.line.number",
+            "code.module.name",
+            "thread.id",
+            "thread.name",
+            "busy_ns",
+            "idle_ns",
+        ] {
+            assert!(!keys.contains(&extra), "{extra} exported: {keys:?}");
+        }
+    }
 
     #[test]
     fn span_account_name_falls_back_and_is_bounded() {

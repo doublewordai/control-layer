@@ -28,6 +28,7 @@ use super::schemas::responses::{
     ResponsesRequest, ResponsesResponse, ResponsesStreamingEvent, generated_response_id,
     normalize_responses_response_value, normalize_responses_streaming_event_value,
 };
+use super::stream_end;
 use crate::AppState;
 use crate::client::HttpClient;
 use crate::errors::OnwardsErrorResponse;
@@ -293,6 +294,7 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
                 trusted,
                 sse_buffer_limit,
                 response_id_override,
+                request.n.unwrap_or(1),
             )
             .await
         } else {
@@ -664,6 +666,7 @@ pub async fn completions_handler<T: HttpClient + Clone + Send + Sync + 'static>(
                 trusted,
                 sse_buffer_limit,
                 response_id_override,
+                request.n.unwrap_or(1),
             )
             .await
         } else {
@@ -895,12 +898,16 @@ async fn sanitize_chat_response(mut response: Response, original_model: String) 
 /// chunk). These are forwarded as clean SSE events — sanitized for untrusted
 /// providers — so that downstream consumers like fusillade can detect them in the
 /// reassembled body rather than seeing a broken stream.
+///
+/// A stream the upstream breaks off or ends early is closed with an error
+/// event; see [`stream_end`].
 async fn sanitize_streaming_chat_response(
     mut response: Response,
     original_model: String,
     trusted: bool,
     sse_buffer_limit: usize,
     response_id_override: Option<String>,
+    expected_choices: u32,
 ) -> Response {
     // Wrap with SseBufferedStream to ensure we receive complete SSE events (delimited by \n\n).
     // Providers may send partial chunks that split JSON across network packets.
@@ -910,135 +917,134 @@ async fn sanitize_streaming_chat_response(
     let buffered_stream = crate::sse::SseBufferedStream::with_limit(body_stream, sse_buffer_limit);
     let stream_fallback_id = generated_chat_completion_id();
 
-    let sanitized_stream = buffered_stream.map(move |chunk_result| {
-        match chunk_result {
-            Ok(chunk) => {
-                let chunk_str = String::from_utf8_lossy(&chunk);
-                let mut sanitized_lines = Vec::new();
+    let sanitized_stream = stream_end::end_explicitly(
+        buffered_stream,
+        stream_end::StreamProgress::new(expected_choices),
+        move |chunk, progress| {
+            let chunk_str = String::from_utf8_lossy(&chunk);
+            let mut sanitized_lines = Vec::new();
 
-                // Process SSE line-by-line for streaming chunks,
-                // preserving empty lines and ignoring comment/event-type lines
-                for line in chunk_str.lines() {
-                    if let Some(data_part) = line.strip_prefix("data: ") {
-                        // This is a data line
+            // Process SSE line-by-line for streaming chunks,
+            // preserving empty lines and ignoring comment/event-type lines
+            for line in chunk_str.lines() {
+                if let Some(data_part) = line.strip_prefix("data: ") {
+                    // This is a data line
 
-                        // Handle [DONE] marker
-                        if data_part.trim() == "[DONE]" {
-                            sanitized_lines.push(line.to_string());
-                            continue;
-                        }
-
-                        // Deserialize the chunk through our strict schema.
-                        // Parse once here: an embedded error envelope and a
-                        // normal chunk are both valid JSON, so this same parse
-                        // feeds the error check below and the typed coercion.
-                        let mut raw_chunk: serde_json::Value = match serde_json::from_str(data_part)
-                        {
-                            Ok(chunk) => chunk,
-                            Err(e) => {
-                                error!(
-                                    error = %e,
-                                    data_len = data_part.len(), // ZDR: length only, never SSE chunk content
-                                    "Failed to parse SSE data line from provider, terminating stream"
-                                );
-                                return Err(std::io::Error::other(
-                                    "Malformed SSE data from provider",
-                                ));
-                            }
-                        };
-
-                        // Provider error envelopes may appear either as the
-                        // entire chunk (`{"error":{...}}`) or alongside
-                        // otherwise valid chunk fields (OpenRouter shape:
-                        // `{"id":...,"choices":[],"error":{...}}`). Detect
-                        // them before strict coercion — the strict
-                        // `ChatCompletionChunk` schema has no `error` field
-                        // and would silently drop it, leaving the
-                        // downstream reassembler with no signal.
-                        if let Some(error_event) = try_format_sse_error(&raw_chunk, trusted) {
-                            error!(
-                                data_len = data_part.len(), // ZDR: length only, never SSE chunk content
-                                "Provider returned error envelope in SSE chunk, forwarding as error event"
-                            );
-                            sanitized_lines.push(error_event);
-                            continue;
-                        }
-
-                        normalize_chat_completion_chunk_value(
-                            &mut raw_chunk,
-                            &original_model,
-                            &stream_fallback_id,
-                        );
-
-                        match serde_json::from_value::<ChatCompletionChunk>(raw_chunk) {
-                            Ok(mut chunk_data) => {
-                                // Rewrite model field
-                                chunk_data.model = original_model.clone();
-                                if let Some(id) = &response_id_override {
-                                    chunk_data.id.clone_from(id);
-                                }
-
-                                // Same reasoning canonicalisation as the
-                                // non-streaming path, applied per delta.
-                                for choice in &mut chunk_data.choices {
-                                    choice.delta.canonicalise_reasoning();
-                                }
-
-                                // Re-serialize
-                                match serde_json::to_string(&chunk_data) {
-                                    Ok(sanitized_json) => {
-                                        sanitized_lines.push(format!("data: {}", sanitized_json));
-                                    }
-                                    Err(e) => {
-                                        error!(error = %e, "Failed to serialize chunk, terminating stream");
-                                        return Err(std::io::Error::other(
-                                            "Failed to serialize chunk",
-                                        ));
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!(
-                                    error = %e,
-                                    data_len = data_part.len(), // ZDR: length only, never SSE chunk content
-                                    "Failed to parse SSE data line from provider, terminating stream"
-                                );
-                                return Err(std::io::Error::other(
-                                    "Malformed SSE data from provider",
-                                ));
-                            }
-                        }
-                    } else if line.is_empty() {
-                        // Preserve empty lines (SSE event delimiters)
-                        sanitized_lines.push(String::new());
+                    // Handle [DONE] marker
+                    if data_part.trim() == "[DONE]" {
+                        progress.record_end();
+                        sanitized_lines.push(line.to_string());
+                        continue;
                     }
-                    // Ignore all other lines (comments, event types, etc.) - don't leak metadata
+
+                    // Deserialize the chunk through our strict schema.
+                    // Parse once here: an embedded error envelope and a
+                    // normal chunk are both valid JSON, so this same parse
+                    // feeds the error check below and the typed coercion.
+                    let mut raw_chunk: serde_json::Value = match serde_json::from_str(data_part) {
+                        Ok(chunk) => chunk,
+                        Err(e) => {
+                            error!(
+                                error = %e,
+                                data_len = data_part.len(), // ZDR: length only, never SSE chunk content
+                                "Failed to parse SSE data line from provider, terminating stream"
+                            );
+                            return Err(std::io::Error::other("Malformed SSE data from provider"));
+                        }
+                    };
+
+                    // Provider error envelopes may appear either as the
+                    // entire chunk (`{"error":{...}}`) or alongside
+                    // otherwise valid chunk fields (OpenRouter shape:
+                    // `{"id":...,"choices":[],"error":{...}}`). Detect
+                    // them before strict coercion — the strict
+                    // `ChatCompletionChunk` schema has no `error` field
+                    // and would silently drop it, leaving the
+                    // downstream reassembler with no signal.
+                    if let Some(error_event) = try_format_sse_error(&raw_chunk, trusted) {
+                        error!(
+                            data_len = data_part.len(), // ZDR: length only, never SSE chunk content
+                            "Provider returned error envelope in SSE chunk, forwarding as error event"
+                        );
+                        progress.record_end();
+                        sanitized_lines.push(error_event);
+                        continue;
+                    }
+
+                    normalize_chat_completion_chunk_value(
+                        &mut raw_chunk,
+                        &original_model,
+                        &stream_fallback_id,
+                    );
+
+                    match serde_json::from_value::<ChatCompletionChunk>(raw_chunk) {
+                        Ok(mut chunk_data) => {
+                            for choice in &chunk_data.choices {
+                                progress
+                                    .record_choice(choice.index, choice.finish_reason.is_some());
+                            }
+                            if chunk_data.usage.is_some() && chunk_data.choices.is_empty() {
+                                progress.record_final_usage();
+                            }
+
+                            // Rewrite model field
+                            chunk_data.model = original_model.clone();
+                            if let Some(id) = &response_id_override {
+                                chunk_data.id.clone_from(id);
+                            }
+
+                            // Same reasoning canonicalisation as the
+                            // non-streaming path, applied per delta.
+                            for choice in &mut chunk_data.choices {
+                                choice.delta.canonicalise_reasoning();
+                            }
+
+                            // Re-serialize
+                            match serde_json::to_string(&chunk_data) {
+                                Ok(sanitized_json) => {
+                                    sanitized_lines.push(format!("data: {}", sanitized_json));
+                                }
+                                Err(e) => {
+                                    error!(error = %e, "Failed to serialize chunk, terminating stream");
+                                    return Err(std::io::Error::other("Failed to serialize chunk"));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!(
+                                error = %e,
+                                data_len = data_part.len(), // ZDR: length only, never SSE chunk content
+                                "Failed to parse SSE data line from provider, terminating stream"
+                            );
+                            return Err(std::io::Error::other("Malformed SSE data from provider"));
+                        }
+                    }
+                } else if line.is_empty() {
+                    // Preserve empty lines (SSE event delimiters)
+                    sanitized_lines.push(String::new());
                 }
-
-                // Reconstruct the chunk with sanitized content
-                // Preserve trailing newlines from original chunk
-                let mut sanitized_chunk = sanitized_lines.join("\n");
-
-                // Count trailing newlines in input and restore them
-                let input_trailing = chunk_str.chars().rev().take_while(|&c| c == '\n').count();
-                let output_trailing = sanitized_chunk
-                    .chars()
-                    .rev()
-                    .take_while(|&c| c == '\n')
-                    .count();
-
-                for _ in output_trailing..input_trailing {
-                    sanitized_chunk.push('\n');
-                }
-
-                Ok::<_, std::io::Error>(axum::body::Bytes::from(sanitized_chunk))
+                // Ignore all other lines (comments, event types, etc.) - don't leak metadata
             }
-            Err(e) => {
-                error!(error = %e, "Stream error");
-                Err(std::io::Error::other(e))
+
+            // Reconstruct the chunk with sanitized content
+            // Preserve trailing newlines from original chunk
+            let mut sanitized_chunk = sanitized_lines.join("\n");
+
+            // Count trailing newlines in input and restore them
+            let input_trailing = chunk_str.chars().rev().take_while(|&c| c == '\n').count();
+            let output_trailing = sanitized_chunk
+                .chars()
+                .rev()
+                .take_while(|&c| c == '\n')
+                .count();
+
+            for _ in output_trailing..input_trailing {
+                sanitized_chunk.push('\n');
             }
-        }
-    });
+
+            Ok::<_, std::io::Error>(axum::body::Bytes::from(sanitized_chunk))
+        },
+    );
 
     *response.body_mut() = Body::from_stream(sanitized_stream);
     // Remove Content-Length header - streaming responses should use chunked encoding
@@ -1130,115 +1136,115 @@ async fn sanitize_streaming_completions_response(
     trusted: bool,
     sse_buffer_limit: usize,
     response_id_override: Option<String>,
+    expected_choices: u32,
 ) -> Response {
     let body_stream =
         http_body_util::BodyExt::into_data_stream(std::mem::take(response.body_mut()));
     let buffered_stream = crate::sse::SseBufferedStream::with_limit(body_stream, sse_buffer_limit);
     let stream_fallback_id = generated_completion_id();
 
-    let sanitized_stream = buffered_stream.map(move |chunk_result| {
-        match chunk_result {
-            Ok(chunk) => {
-                let chunk_str = String::from_utf8_lossy(&chunk);
-                let mut sanitized_lines = Vec::new();
+    let sanitized_stream = stream_end::end_explicitly(
+        buffered_stream,
+        stream_end::StreamProgress::new(expected_choices),
+        move |chunk, progress| {
+            let chunk_str = String::from_utf8_lossy(&chunk);
+            let mut sanitized_lines = Vec::new();
 
-                for line in chunk_str.lines() {
-                    if let Some(data_part) = line.strip_prefix("data: ") {
-                        if data_part.trim() == "[DONE]" {
-                            sanitized_lines.push(line.to_string());
-                            continue;
-                        }
-
-                        let mut raw_chunk: serde_json::Value = match serde_json::from_str(data_part)
-                        {
-                            Ok(chunk) => chunk,
-                            Err(e) => {
-                                error!(
-                                    error = %e,
-                                    data_len = data_part.len(), // ZDR: length only, never SSE chunk content
-                                    "Failed to parse completions chunk, terminating stream"
-                                );
-                                return Err(std::io::Error::other(
-                                    "Malformed SSE data from provider",
-                                ));
-                            }
-                        };
-
-                        // See `sanitize_streaming_chat_response` for the full
-                        // rationale — detecting embedded provider errors
-                        // before strict coercion keeps OpenRouter-shape chunks
-                        // (normal fields + `error`) from getting their error
-                        // silently stripped. Reuses the parse above.
-                        if let Some(error_event) = try_format_sse_error(&raw_chunk, trusted) {
-                            error!(
-                                data_len = data_part.len(), // ZDR: length only, never SSE chunk content
-                                "Provider returned error envelope in SSE chunk, forwarding as error event"
-                            );
-                            sanitized_lines.push(error_event);
-                            continue;
-                        }
-
-                        normalize_completion_chunk_value(
-                            &mut raw_chunk,
-                            &original_model,
-                            &stream_fallback_id,
-                        );
-
-                        match serde_json::from_value::<CompletionChunk>(raw_chunk) {
-                            Ok(mut chunk_data) => {
-                                chunk_data.model = original_model.clone();
-                                if let Some(id) = &response_id_override {
-                                    chunk_data.id.clone_from(id);
-                                }
-                                match serde_json::to_string(&chunk_data) {
-                                    Ok(json) => sanitized_lines.push(format!("data: {json}")),
-                                    Err(e) => {
-                                        error!(error = %e, "Failed to serialize completions chunk, terminating stream");
-                                        return Err(std::io::Error::other(
-                                            "Failed to serialize completions chunk",
-                                        ));
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!(
-                                    error = %e,
-                                    data_len = data_part.len(), // ZDR: length only, never SSE chunk content
-                                    "Failed to parse completions chunk, terminating stream"
-                                );
-                                return Err(std::io::Error::other(
-                                    "Malformed SSE data from provider",
-                                ));
-                            }
-                        }
-                    } else if line.is_empty() {
-                        // Preserve empty lines (SSE event delimiters)
-                        sanitized_lines.push(String::new());
+            for line in chunk_str.lines() {
+                if let Some(data_part) = line.strip_prefix("data: ") {
+                    if data_part.trim() == "[DONE]" {
+                        progress.record_end();
+                        sanitized_lines.push(line.to_string());
+                        continue;
                     }
-                    // Ignore comment lines and other non-data SSE fields
-                }
 
-                // Restore trailing newlines from the original chunk
-                let mut sanitized_chunk = sanitized_lines.join("\n");
-                let input_trailing =
-                    chunk_str.chars().rev().take_while(|&c| c == '\n').count();
-                let output_trailing = sanitized_chunk
-                    .chars()
-                    .rev()
-                    .take_while(|&c| c == '\n')
-                    .count();
-                for _ in output_trailing..input_trailing {
-                    sanitized_chunk.push('\n');
-                }
+                    let mut raw_chunk: serde_json::Value = match serde_json::from_str(data_part) {
+                        Ok(chunk) => chunk,
+                        Err(e) => {
+                            error!(
+                                error = %e,
+                                data_len = data_part.len(), // ZDR: length only, never SSE chunk content
+                                "Failed to parse completions chunk, terminating stream"
+                            );
+                            return Err(std::io::Error::other("Malformed SSE data from provider"));
+                        }
+                    };
 
-                Ok::<_, std::io::Error>(axum::body::Bytes::from(sanitized_chunk))
+                    // See `sanitize_streaming_chat_response` for the full
+                    // rationale — detecting embedded provider errors
+                    // before strict coercion keeps OpenRouter-shape chunks
+                    // (normal fields + `error`) from getting their error
+                    // silently stripped. Reuses the parse above.
+                    if let Some(error_event) = try_format_sse_error(&raw_chunk, trusted) {
+                        error!(
+                            data_len = data_part.len(), // ZDR: length only, never SSE chunk content
+                            "Provider returned error envelope in SSE chunk, forwarding as error event"
+                        );
+                        progress.record_end();
+                        sanitized_lines.push(error_event);
+                        continue;
+                    }
+
+                    normalize_completion_chunk_value(
+                        &mut raw_chunk,
+                        &original_model,
+                        &stream_fallback_id,
+                    );
+
+                    match serde_json::from_value::<CompletionChunk>(raw_chunk) {
+                        Ok(mut chunk_data) => {
+                            for choice in &chunk_data.choices {
+                                progress
+                                    .record_choice(choice.index, choice.finish_reason.is_some());
+                            }
+                            if chunk_data.usage.is_some() && chunk_data.choices.is_empty() {
+                                progress.record_final_usage();
+                            }
+                            chunk_data.model = original_model.clone();
+                            if let Some(id) = &response_id_override {
+                                chunk_data.id.clone_from(id);
+                            }
+                            match serde_json::to_string(&chunk_data) {
+                                Ok(json) => sanitized_lines.push(format!("data: {json}")),
+                                Err(e) => {
+                                    error!(error = %e, "Failed to serialize completions chunk, terminating stream");
+                                    return Err(std::io::Error::other(
+                                        "Failed to serialize completions chunk",
+                                    ));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!(
+                                error = %e,
+                                data_len = data_part.len(), // ZDR: length only, never SSE chunk content
+                                "Failed to parse completions chunk, terminating stream"
+                            );
+                            return Err(std::io::Error::other("Malformed SSE data from provider"));
+                        }
+                    }
+                } else if line.is_empty() {
+                    // Preserve empty lines (SSE event delimiters)
+                    sanitized_lines.push(String::new());
+                }
+                // Ignore comment lines and other non-data SSE fields
             }
-            Err(e) => {
-                error!(error = %e, "Stream error");
-                Err(std::io::Error::other(e))
+
+            // Restore trailing newlines from the original chunk
+            let mut sanitized_chunk = sanitized_lines.join("\n");
+            let input_trailing = chunk_str.chars().rev().take_while(|&c| c == '\n').count();
+            let output_trailing = sanitized_chunk
+                .chars()
+                .rev()
+                .take_while(|&c| c == '\n')
+                .count();
+            for _ in output_trailing..input_trailing {
+                sanitized_chunk.push('\n');
             }
-        }
-    });
+
+            Ok::<_, std::io::Error>(axum::body::Bytes::from(sanitized_chunk))
+        },
+    );
 
     *response.body_mut() = Body::from_stream(sanitized_stream);
     response.headers_mut().remove(header::CONTENT_LENGTH);
@@ -1472,128 +1478,129 @@ async fn sanitize_streaming_responses_response(
         .clone()
         .unwrap_or_else(generated_response_id);
 
-    let sanitized_stream = buffered_stream.map(move |chunk_result| {
-        match chunk_result {
-            Ok(chunk) => {
-                let chunk_str = String::from_utf8_lossy(&chunk);
-                let mut sanitized_lines = Vec::new();
+    let sanitized_stream = stream_end::end_explicitly(
+        buffered_stream,
+        stream_end::StreamProgress::new(1),
+        move |chunk, progress| {
+            let chunk_str = String::from_utf8_lossy(&chunk);
+            let mut sanitized_lines = Vec::new();
 
-                // Process SSE line-by-line for streaming chunks
-                for line in chunk_str.lines() {
-                    if let Some(data_part) = line.strip_prefix("data: ") {
-                        // This is a data line
+            // Process SSE line-by-line for streaming chunks
+            for line in chunk_str.lines() {
+                if let Some(data_part) = line.strip_prefix("data: ") {
+                    // This is a data line
 
-                        // Handle [DONE] marker
-                        if data_part.trim() == "[DONE]" {
-                            sanitized_lines.push(line.to_string());
-                            continue;
-                        }
-
-                        // Parse into JSON first so we can normalize sparse provider
-                        // payloads, then coerce into the typed ResponsesStreamingEvent
-                        // envelope to validate type/sequence_number and rewrite the
-                        // nested response model safely.
-                        let mut raw_event: serde_json::Value = match serde_json::from_str(data_part)
-                        {
-                            Ok(event) => event,
-                            Err(e) => {
-                                error!(
-                                    error = %e,
-                                    data_len = data_part.len(), // ZDR: length only, never SSE chunk content
-                                    "Failed to parse responses SSE data line from provider, terminating stream"
-                                );
-                                return Err(std::io::Error::other(
-                                    "Malformed SSE data from provider",
-                                ));
-                            }
-                        };
-
-                        // See `sanitize_streaming_chat_response` for the full
-                        // rationale — embedded provider error envelopes must
-                        // surface as stand-alone error events so the
-                        // downstream reassembler can reclassify the HTTP
-                        // status, rather than being dropped by the strict
-                        // schema. Reuses the parse above.
-                        if let Some(error_event) = try_format_sse_error(&raw_event, trusted) {
-                            error!(
-                                data_len = data_part.len(), // ZDR: length only, never SSE chunk content
-                                "Provider returned error envelope in SSE chunk, forwarding as error event"
-                            );
-                            sanitized_lines.push(error_event);
-                            continue;
-                        }
-
-                        normalize_responses_streaming_event_value(
-                            &mut raw_event,
-                            &original_model,
-                            &stream_fallback_response_id,
-                        );
-
-                        match serde_json::from_value::<ResponsesStreamingEvent>(raw_event) {
-                            Ok(mut event) => {
-                                // Rewrite model on response-level events, and
-                                // override the ID if a caller-supplied override was set.
-                                if let Some(ref mut response) = event.response {
-                                    response.model = original_model.clone();
-                                    if response_id_override.is_some() {
-                                        response.id = stream_fallback_response_id.clone();
-                                    }
-                                }
-
-                                // Re-serialize
-                                match serde_json::to_string(&event) {
-                                    Ok(sanitized_json) => {
-                                        sanitized_lines.push(format!("data: {}", sanitized_json));
-                                    }
-                                    Err(e) => {
-                                        error!(error = %e, "Failed to serialize responses chunk, terminating stream");
-                                        return Err(std::io::Error::other(
-                                            "Failed to serialize chunk",
-                                        ));
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!(
-                                    error = %e,
-                                    data_len = data_part.len(), // ZDR: length only, never SSE chunk content
-                                    "Failed to parse responses SSE data line from provider, terminating stream"
-                                );
-                                return Err(std::io::Error::other(
-                                    "Malformed SSE data from provider",
-                                ));
-                            }
-                        }
-                    } else if line.is_empty() {
-                        // Preserve empty lines (SSE event delimiters)
-                        sanitized_lines.push(String::new());
+                    // Handle [DONE] marker
+                    if data_part.trim() == "[DONE]" {
+                        progress.record_end();
+                        sanitized_lines.push(line.to_string());
+                        continue;
                     }
-                    // Ignore all other lines (comments, event types, etc.) - don't leak metadata
+
+                    // Parse into JSON first so we can normalize sparse provider
+                    // payloads, then coerce into the typed ResponsesStreamingEvent
+                    // envelope to validate type/sequence_number and rewrite the
+                    // nested response model safely.
+                    let mut raw_event: serde_json::Value = match serde_json::from_str(data_part) {
+                        Ok(event) => event,
+                        Err(e) => {
+                            error!(
+                                error = %e,
+                                data_len = data_part.len(), // ZDR: length only, never SSE chunk content
+                                "Failed to parse responses SSE data line from provider, terminating stream"
+                            );
+                            return Err(std::io::Error::other("Malformed SSE data from provider"));
+                        }
+                    };
+
+                    // See `sanitize_streaming_chat_response` for the full
+                    // rationale — embedded provider error envelopes must
+                    // surface as stand-alone error events so the
+                    // downstream reassembler can reclassify the HTTP
+                    // status, rather than being dropped by the strict
+                    // schema. Reuses the parse above.
+                    if let Some(error_event) = try_format_sse_error(&raw_event, trusted) {
+                        error!(
+                            data_len = data_part.len(), // ZDR: length only, never SSE chunk content
+                            "Provider returned error envelope in SSE chunk, forwarding as error event"
+                        );
+                        progress.record_end();
+                        sanitized_lines.push(error_event);
+                        continue;
+                    }
+
+                    normalize_responses_streaming_event_value(
+                        &mut raw_event,
+                        &original_model,
+                        &stream_fallback_response_id,
+                    );
+
+                    match serde_json::from_value::<ResponsesStreamingEvent>(raw_event) {
+                        Ok(mut event) => {
+                            if matches!(
+                                event.event_type.as_str(),
+                                "response.completed"
+                                    | "response.failed"
+                                    | "response.incomplete"
+                                    | "error"
+                            ) {
+                                progress.record_end();
+                            }
+
+                            // Rewrite model on response-level events, and
+                            // override the ID if a caller-supplied override was set.
+                            if let Some(ref mut response) = event.response {
+                                response.model = original_model.clone();
+                                if response_id_override.is_some() {
+                                    response.id = stream_fallback_response_id.clone();
+                                }
+                            }
+
+                            // Re-serialize
+                            match serde_json::to_string(&event) {
+                                Ok(sanitized_json) => {
+                                    sanitized_lines.push(format!("data: {}", sanitized_json));
+                                }
+                                Err(e) => {
+                                    error!(error = %e, "Failed to serialize responses chunk, terminating stream");
+                                    return Err(std::io::Error::other("Failed to serialize chunk"));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!(
+                                error = %e,
+                                data_len = data_part.len(), // ZDR: length only, never SSE chunk content
+                                "Failed to parse responses SSE data line from provider, terminating stream"
+                            );
+                            return Err(std::io::Error::other("Malformed SSE data from provider"));
+                        }
+                    }
+                } else if line.is_empty() {
+                    // Preserve empty lines (SSE event delimiters)
+                    sanitized_lines.push(String::new());
                 }
-
-                // Reconstruct the chunk with sanitized content
-                let mut sanitized_chunk = sanitized_lines.join("\n");
-
-                // Count trailing newlines in input and restore them
-                let input_trailing = chunk_str.chars().rev().take_while(|&c| c == '\n').count();
-                let output_trailing = sanitized_chunk
-                    .chars()
-                    .rev()
-                    .take_while(|&c| c == '\n')
-                    .count();
-
-                for _ in output_trailing..input_trailing {
-                    sanitized_chunk.push('\n');
-                }
-
-                Ok::<_, std::io::Error>(axum::body::Bytes::from(sanitized_chunk))
+                // Ignore all other lines (comments, event types, etc.) - don't leak metadata
             }
-            Err(e) => {
-                error!(error = %e, "Stream error while sanitizing responses");
-                Err(std::io::Error::other("Stream error"))
+
+            // Reconstruct the chunk with sanitized content
+            let mut sanitized_chunk = sanitized_lines.join("\n");
+
+            // Count trailing newlines in input and restore them
+            let input_trailing = chunk_str.chars().rev().take_while(|&c| c == '\n').count();
+            let output_trailing = sanitized_chunk
+                .chars()
+                .rev()
+                .take_while(|&c| c == '\n')
+                .count();
+
+            for _ in output_trailing..input_trailing {
+                sanitized_chunk.push('\n');
             }
-        }
-    });
+
+            Ok::<_, std::io::Error>(axum::body::Bytes::from(sanitized_chunk))
+        },
+    );
 
     *response.body_mut() = Body::from_stream(sanitized_stream);
     // Remove Content-Length header - streaming responses should use chunked encoding
@@ -3918,7 +3925,10 @@ mod tests {
         assert!(body_str.contains("\"status\":\"completed\""));
         assert!(body_str.contains("\"tool_choice\":\"auto\""));
         assert!(body_str.contains("\"delta\":\"Hello\""));
-        assert!(body_str.contains("[DONE]"));
+        assert!(
+            !body_str.contains("[DONE]"),
+            "nothing is forwarded after response.completed"
+        );
     }
 
     #[tokio::test]
@@ -6972,6 +6982,7 @@ mod tests {
             true,
             crate::sse::DEFAULT_SSE_BUFFER_LIMIT,
             None,
+            1,
         )
         .await;
         // HTTP status stays 200 — error is in the SSE body
@@ -6999,6 +7010,7 @@ mod tests {
             false,
             crate::sse::DEFAULT_SSE_BUFFER_LIMIT,
             None,
+            1,
         )
         .await;
         assert_eq!(result.status(), StatusCode::OK);
@@ -7039,6 +7051,7 @@ mod tests {
             false,
             crate::sse::DEFAULT_SSE_BUFFER_LIMIT,
             None,
+            1,
         )
         .await;
         assert_eq!(result.status(), StatusCode::OK);
@@ -7090,6 +7103,7 @@ mod tests {
             true,
             crate::sse::DEFAULT_SSE_BUFFER_LIMIT,
             None,
+            1,
         )
         .await;
         assert_eq!(result.status(), StatusCode::OK);
@@ -7138,6 +7152,183 @@ mod tests {
         assert_eq!(mask_account_class_status(502), 502);
         assert_eq!(mask_account_class_status(503), 503);
         assert_eq!(mask_account_class_status(504), 504);
+    }
+
+    /// An SSE response whose body yields `events`, then fails with a transport
+    /// error when `fail` is set.
+    fn upstream_sse(events: &[&str], fail: bool) -> Response {
+        let mut items: Vec<Result<Bytes, std::io::Error>> = events
+            .iter()
+            .map(|e| Ok(Bytes::from(format!("data: {e}\n\n"))))
+            .collect();
+        if fail {
+            items.push(Err(std::io::Error::other("connection reset")));
+        }
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(futures_util::stream::iter(items)))
+            .unwrap()
+    }
+
+    /// The body must read to the end without a transport error, and its last
+    /// data line is returned.
+    async fn last_data_line(response: Response) -> String {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("an interrupted stream still ends as a complete body");
+        String::from_utf8_lossy(&body)
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .next_back()
+            .expect("at least one data line")
+            .to_string()
+    }
+
+    fn assert_interrupted(last: &str) {
+        let value: serde_json::Value = serde_json::from_str(last).expect("an error envelope");
+        assert_eq!(value["error"]["code"], stream_end::INTERRUPTED_STATUS);
+        assert_eq!(value["error"]["type"], "api_error");
+    }
+
+    const CHAT_CONTENT: &str = r#"{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"Hel"},"finish_reason":null}]}"#;
+    const CHAT_FINISH: &str = r#"{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#;
+
+    async fn chat(response: Response) -> String {
+        last_data_line(
+            sanitize_streaming_chat_response(
+                response,
+                "test-model".to_string(),
+                true,
+                crate::sse::DEFAULT_SSE_BUFFER_LIMIT,
+                None,
+                1,
+            )
+            .await,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_streaming_chat_transport_error_mid_answer_ends_with_error_event() {
+        assert_interrupted(&chat(upstream_sse(&[CHAT_CONTENT], true)).await);
+    }
+
+    #[tokio::test]
+    async fn test_streaming_chat_early_end_mid_answer_ends_with_error_event() {
+        assert_interrupted(&chat(upstream_sse(&[CHAT_CONTENT], false)).await);
+    }
+
+    #[tokio::test]
+    async fn test_streaming_chat_malformed_event_ends_with_error_event() {
+        assert_interrupted(&chat(upstream_sse(&[CHAT_CONTENT, "{not json"], false)).await);
+    }
+
+    #[tokio::test]
+    async fn test_streaming_chat_lost_trailer_ends_with_done() {
+        assert_eq!(
+            chat(upstream_sse(&[CHAT_CONTENT, CHAT_FINISH], true)).await,
+            "[DONE]"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_chat_complete_stream_is_not_extended() {
+        let response = upstream_sse(&[CHAT_CONTENT, CHAT_FINISH, "[DONE]"], false);
+        let result = sanitize_streaming_chat_response(
+            response,
+            "test-model".to_string(),
+            true,
+            crate::sse::DEFAULT_SSE_BUFFER_LIMIT,
+            None,
+            1,
+        )
+        .await;
+        let body = axum::body::to_bytes(result.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(body.matches("[DONE]").count(), 1);
+        assert!(!body.contains("\"error\""));
+    }
+
+    #[tokio::test]
+    async fn test_streaming_chat_usage_on_a_content_chunk_does_not_finish_the_answer() {
+        // `continuous_usage_stats` puts usage on every content chunk.
+        let content_with_usage = r#"{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"Hel"},"finish_reason":null}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}"#;
+        assert_interrupted(&chat(upstream_sse(&[content_with_usage], true)).await);
+    }
+
+    #[tokio::test]
+    async fn test_streaming_chat_unterminated_last_event_is_kept_apart_from_the_error_event() {
+        let body = format!("data: {CHAT_CONTENT}\n\ndata: {CHAT_CONTENT}");
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(body))
+            .unwrap();
+        let result = sanitize_streaming_chat_response(
+            response,
+            "test-model".to_string(),
+            true,
+            crate::sse::DEFAULT_SSE_BUFFER_LIMIT,
+            None,
+            1,
+        )
+        .await;
+        let body = axum::body::to_bytes(result.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        let events: Vec<&str> = body.split("\n\n").filter(|e| !e.is_empty()).collect();
+        assert_eq!(events.len(), 3, "{body}");
+        for event in &events {
+            let data = event
+                .strip_prefix("data: ")
+                .expect("one data line per event");
+            serde_json::from_str::<serde_json::Value>(data).expect("each event is valid JSON");
+        }
+        assert_interrupted(events[2].strip_prefix("data: ").unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_streaming_chat_embedded_error_is_not_followed_by_another() {
+        let embedded = r#"{"error":{"message":"Internal server error","type":"internal_server_error","code":500}}"#;
+        let last = chat(upstream_sse(&[CHAT_CONTENT, embedded], true)).await;
+        let value: serde_json::Value = serde_json::from_str(&last).unwrap();
+        assert_eq!(
+            value["error"]["code"], 500,
+            "the upstream's own error is the last event"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_completions_early_end_mid_answer_ends_with_error_event() {
+        let content = r#"{"id":"c","object":"text_completion","created":1,"model":"m","choices":[{"index":0,"text":"Hel","finish_reason":null}]}"#;
+        let result = sanitize_streaming_completions_response(
+            upstream_sse(&[content], false),
+            "test-model".to_string(),
+            true,
+            crate::sse::DEFAULT_SSE_BUFFER_LIMIT,
+            None,
+            1,
+        )
+        .await;
+        assert_interrupted(&last_data_line(result).await);
+    }
+
+    #[tokio::test]
+    async fn test_streaming_responses_transport_error_before_completion_ends_with_error_event() {
+        let created = r#"{"type":"response.created","sequence_number":0,"response":{"id":"resp_1","object":"response","created_at":1,"status":"in_progress","model":"m","output":[]}}"#;
+        let result = sanitize_streaming_responses_response(
+            upstream_sse(&[created], true),
+            "test-model".to_string(),
+            true,
+            None,
+            crate::sse::DEFAULT_SSE_BUFFER_LIMIT,
+        )
+        .await;
+        assert_interrupted(&last_data_line(result).await);
     }
 
     /// In-stream errors from untrusted providers must apply the account-class
