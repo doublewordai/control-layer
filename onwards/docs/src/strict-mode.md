@@ -130,13 +130,24 @@ The chunk wrapper is stripped so the emitted SSE data line begins with `{"error"
 
 This applies to both bare error chunks and chunks that carry completion fields alongside the error. Untrusted upstreams additionally have the embedded `error.code` masked (per the table above) and the prose replaced with a generic message; trusted targets forward the envelope verbatim.
 
+## Streams the upstream breaks off
+
+A stream can also stop without any error from the upstream: the connection drops, an event is malformed or exceeds the SSE buffer limit, or the body ends without `[DONE]`. Strict mode never ends such a stream with a transport error or a quiet close. On chat completions, completions and Responses streams it sends one last event and closes the body normally:
+
+```text
+data: {"error":{"message":"The response stream was interrupted before it finished. Retry the request.","type":"api_error","param":null,"code":502}}
+```
+
+Official OpenAI SDKs raise this as an API error, and the batch reassembler reclassifies it as a retryable `502`. If every requested choice (`n`) had already finished, or the usage-only chunk that follows them had arrived, only the trailer was lost, and the stream ends with `data: [DONE]` instead. Usage on a content chunk (`continuous_usage_stats`) doesn't count. The stream ends at its own `[DONE]`, an embedded error event, or a final Responses event; anything the upstream sends after that isn't forwarded.
+
 ## Supported endpoints
 
 Strict mode currently supports:
 
 - `/v1/chat/completions` (streaming and non-streaming) - Full sanitization
+- `/v1/completions` (streaming and non-streaming) - Full sanitization
 - `/v1/embeddings` - Full sanitization
-- `/v1/responses` (Open Responses API, non-streaming) - Full sanitization
+- `/v1/responses` (Open Responses API, streaming and non-streaming) - Full sanitization
 - `/v1/models` - Model listing (no sanitization needed)
 
 All supported endpoints include:

@@ -195,8 +195,18 @@ impl ResponsesStreamReframer {
 
 impl StreamReframer for ResponsesStreamReframer {
     fn push(&mut self, chunk: &Value) -> Vec<u8> {
+        if self.errored {
+            return Vec::new();
+        }
         if self.state.is_none() {
             return self.emit_error("could not initialise Responses stream");
+        }
+        // An upstream error inside the stream (onwards forwards it as a bare
+        // `{"error":{...}}` chunk) is terminal: surface it, and never follow it
+        // with `response.completed`.
+        if let Some(err) = chunk.get("error").filter(|e| e.is_object()) {
+            let message = err.get("message").and_then(Value::as_str).unwrap_or("upstream error");
+            return self.emit_error(message);
         }
         // Backfill fields backends legally omit on chunks before the strict
         // parse (same relaxation as the blocking path); then skip a chunk we
@@ -220,6 +230,9 @@ impl StreamReframer for ResponsesStreamReframer {
     }
 
     fn finish(&mut self) -> Vec<u8> {
+        if self.errored {
+            return Vec::new();
+        }
         match self.state.as_mut() {
             Some(state) => state.finalize().iter().flat_map(|e| e.to_sse().into_bytes()).collect(),
             None => Vec::new(),
@@ -424,6 +437,38 @@ mod tests {
         assert!(
             text.contains(r#""delta":"Hi""#) || text.contains("Hi"),
             "missing text delta in:\n{text}"
+        );
+    }
+
+    /// An upstream error after partial output ends the Responses stream with an
+    /// `error` event, never with `response.completed`, even when the upstream
+    /// follows it with `[DONE]`.
+    #[test]
+    fn embedded_upstream_error_ends_the_stream_with_an_error_event() {
+        let request = Bytes::from(r#"{"model":"m","input":"hi","stream":true}"#);
+        let mut reframer = OpenResponses::new().stream_reframer(&request, None);
+        let content = serde_json::json!({
+            "id": "c1", "object": "chat.completion.chunk", "created": 0, "model": "m",
+            "choices": [{"index": 0, "delta": {"content": "Hel"}}]
+        });
+        let error = serde_json::json!({
+            "error": {"message": "The response stream was interrupted before it finished. Retry the request.", "type": "api_error", "param": null, "code": 502}
+        });
+
+        let mut out = reframer.push(&content);
+        out.extend(reframer.push(&error));
+        out.extend(reframer.push(&content));
+        out.extend(reframer.finish());
+        let text = String::from_utf8(out).unwrap();
+
+        assert!(text.contains("event: response.output_text.delta"), "{text}");
+        assert!(text.contains("event: error"), "{text}");
+        assert!(text.contains("interrupted before it finished"), "{text}");
+        assert!(!text.contains("response.completed"), "{text}");
+        assert_eq!(text.matches("event: error").count(), 1, "{text}");
+        assert!(
+            text.rfind("event: error") > text.rfind("output_text.delta"),
+            "nothing follows the error: {text}"
         );
     }
 

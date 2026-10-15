@@ -21,6 +21,7 @@
 
 pub mod handlers;
 pub mod schemas;
+pub mod stream_end;
 
 use crate::AppState;
 use crate::client::HttpClient;
