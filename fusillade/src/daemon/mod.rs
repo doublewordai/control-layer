@@ -2638,6 +2638,12 @@ where
                         .increment(1.0);
                 }
 
+                // The customer-chosen id is bounded so it cannot bloat spans.
+                let span_custom_id: Option<String> = request
+                    .data
+                    .custom_id
+                    .as_deref()
+                    .map(|id| id.chars().take(128).collect());
                 let process_span = tracing::info_span!(
                     parent: tracing::Span::none(),
                     "fusillade.process_request",
@@ -2648,6 +2654,9 @@ where
                     batch_id = ?batch_id,
                     model = %model,
                     capacity_model = %capacity_model,
+                    doubleword.account_id = %user_id,
+                    completion_window = %completion_window,
+                    custom_id = span_custom_id.as_deref(),
                     outcome = tracing::field::Empty,
                 );
                 let process_ctx = crate::processor::ProcessContext::new(process_span.clone());

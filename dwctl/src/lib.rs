@@ -2610,6 +2610,10 @@ pub async fn build_router(
         crate::inference::body_limit::limit_inference_body,
     ));
 
+    // The root span records a batch request's completion window once the
+    // response names a batch key.
+    let onwards_router = onwards_router.layer(middleware::from_fn(crate::telemetry::carry_batch_completion_window));
+
     // Outermost, so every layer above can count the requests it refuses
     // alongside onwards' own (`onwards_rejections_total`).
     let onwards_router = onwards_router.layer(axum::Extension(crate::inference::rejections::Recorder::new(
@@ -2850,6 +2854,7 @@ pub async fn build_router(
             .on_response(|response: &http::Response<_>, latency: std::time::Duration, span: &tracing::Span| {
                 let status = response.status().as_u16();
                 span.set_attribute("http.response.status_code", i64::from(status));
+                crate::telemetry::record_ai_response_attributes(response, span, status);
                 if status >= 500 {
                     span.set_attribute("otel.status_code", "ERROR");
                     span.set_attribute("error.type", status.to_string());

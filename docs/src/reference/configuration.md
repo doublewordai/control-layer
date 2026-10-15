@@ -772,6 +772,37 @@ its descendant `onwards.provider_attempt` spans to the downstream serving spans.
 The gateway span's `doubleword.request_id` attribute holds the logical request
 UUID for reverse lookup in request records.
 
+#### Customer attributes on spans
+
+Spans carry the account, model and error class so alerts and dashboards can be
+built from traces. Attribute names are a contract. `gen_ai.*`, `http.*` and
+`error.type` follow OpenTelemetry semantic conventions; the rest, including
+`doubleword.*`, `onwards.*`, `batch.*` and the unprefixed batch attributes,
+are our own.
+
+| Span | Attributes |
+|---|---|
+| `request` (root, AI requests) | `doubleword.account_id`, `doubleword.account_name`, `doubleword.api_key_id`, `doubleword.key_purpose`, `gen_ai.request.model`, `doubleword.traffic` (`batch` for a batch key, otherwise `realtime`), `doubleword.batch.completion_window` (batch only), `http.response.status_code`, and for 4xx/5xx `error.type`, plus `doubleword.error.source` (`gateway` or `provider`) and `doubleword.rejection.code` (gateway errors) when onwards or a dwctl inference layer produced or relayed the error |
+| `onwards.request` | `onwards.account`, `onwards.account_name`, `onwards.api_key_id`, `onwards.key_purpose`, `gen_ai.request.model`, `http.response.status_code`, and for gateway rejections `error.type` (the rejection code) and `onwards.rejection.param` (when the error names one) |
+| `fusillade.process_request` | `doubleword.account_id`, `completion_window`, `custom_id` (first 128 characters), `model`, `outcome` |
+| `fusillade.batch_finalized` | `batch_id`, `doubleword.account_id`, `doubleword.account_name`, `gen_ai.request.model` (every model the batch used, joined with `, `, for display), `batch.models` (the same models as a string array, for filtering), `completion_window`, `batch.total_requests`, `batch.completed_requests`, `batch.failed_requests`, `batch.canceled_requests`, `batch.outcome` (`completed`, `partially_completed` or `failed`), `batch.sample_error` (failed batches: `http_<status>`, the failure type such as `timeout`, `canceled` when every request was cancelled, or `unknown` when the failure cannot be classified), `batch.finalized_at` (when the batch finished) |
+
+The account, key and traffic attributes are recorded once the key is
+recognised, whether the request succeeds or onwards, a dwctl inference layer or
+the provider refuses it, so a request with an unknown key has none. On request
+spans, `gen_ai.request.model` is only ever a configured model alias, never
+arbitrary client input. `doubleword.account_name` is the account's display
+name, falling back to its username when it has none or it is blank, and cut to
+128 characters.
+`fusillade.batch_finalized` is a root span emitted once per batch by the batch
+notification poller when it claims the finished batch, so it appears whether
+or not email or webhooks are configured, as long as the poller runs. The span
+starts when the batch is claimed; `batch.finalized_at` records when the batch
+itself finished. Batches cancelled as a whole are not claimed and emit no span.
+Cancelled requests count against the outcome like failed ones: a batch none of
+whose requests completed is `failed`. Filter on one model with
+`{ span.batch.models = "<alias>" }`, which matches any element of the array.
+
 Trace context must be propagated on every required forwarding hop. Propagation
 does not itself enable span export: correlation also depends on the connecting
 spans being sampled, exported, and retained. Stored IDs can therefore refer to

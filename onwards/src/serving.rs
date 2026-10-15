@@ -77,6 +77,9 @@ pub const SUFFIX_SEPARATOR: char = ':';
 /// both keyed by its value.
 pub const ACCOUNT_LABEL: &str = "account";
 pub const ACCOUNT_NAME_LABEL: &str = "account_name";
+/// Key label with the account's display name, for trace attributes. Optional;
+/// [`ACCOUNT_NAME_LABEL`] is used when it is absent.
+pub const ACCOUNT_DISPLAY_NAME_LABEL: &str = "account_display_name";
 
 /// The dispatch mode a request is served under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
