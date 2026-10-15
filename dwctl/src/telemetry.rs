@@ -199,6 +199,7 @@ mod tests {
     use opentelemetry_sdk::error::OTelSdkResult;
     use opentelemetry_sdk::trace::{SpanData, SpanExporter};
     use std::sync::{Arc, Mutex};
+    use tracing::Instrument;
 
     #[derive(Clone, Debug, Default)]
     struct Exported(Arc<Mutex<Vec<SpanData>>>);
@@ -210,27 +211,35 @@ mod tests {
         }
     }
 
+    /// A repository method as instrumented after DW-931: a debug span whose
+    /// `err` emits an ERROR event (`error = %e`) when it fails.
+    #[tracing::instrument(level = "debug", err)]
+    async fn repository_method() -> Result<(), &'static str> {
+        Err("connection reset")
+    }
+
     /// With logs at `debug` and the exporter at `info`, a request span is
     /// exported without its debug events or debug child spans, the error
-    /// recorded inside a debug child lands on the request span, and none of
-    /// the layer's per-span extras are attached.
-    #[test]
-    fn exporter_filter_is_independent_of_the_log_filter() {
+    /// event a failing `err`-instrumented debug method emits lands on the
+    /// request span with its message, and none of the layer's per-span extras
+    /// are attached.
+    #[tokio::test]
+    async fn exporter_filter_is_independent_of_the_log_filter() {
         let exported = Exported::default();
         let provider = SdkTracerProvider::builder().with_simple_exporter(exported.clone()).build();
         let subscriber = tracing_subscriber::registry()
             .with(EnvFilter::new("debug"))
             .with(otel_layer(provider.tracer("test"), "info"));
 
-        tracing::subscriber::with_default(subscriber, || {
-            let request = tracing::info_span!("request");
-            let _request = request.enter();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        async {
             tracing::debug!(db.statement = "SELECT 1", "query");
             tracing::info!("finished");
-            let repository = tracing::debug_span!("repository");
-            let _repository = repository.enter();
-            tracing::error!("failed");
-        });
+            let _ = repository_method().await;
+        }
+        .instrument(tracing::info_span!("request"))
+        .await;
+        drop(_guard);
         provider.shutdown().unwrap();
 
         let spans = exported.0.lock().unwrap();
@@ -238,8 +247,26 @@ mod tests {
         assert_eq!(names, ["request"]);
 
         let request = &spans[0];
-        let events: Vec<&str> = request.events.iter().map(|event| event.name.as_ref()).collect();
-        assert_eq!(events, ["finished", "failed"]);
+        // The layer maps an event carrying `error = %e` to the OTel exception
+        // convention: named `exception`, with the message in `exception.message`.
+        let events: Vec<(&str, Option<String>)> = request
+            .events
+            .iter()
+            .map(|event| {
+                let message = event
+                    .attributes
+                    .iter()
+                    .find(|kv| kv.key.as_str() == "exception.message")
+                    .map(|kv| kv.value.to_string());
+                (event.name.as_ref(), message)
+            })
+            .collect();
+        assert_eq!(
+            events,
+            [("finished", None), ("exception", Some("connection reset".to_string()))],
+            "the repository method's error event must land on the request span: {:?}",
+            request.events
+        );
 
         let keys: Vec<&str> = request.attributes.iter().map(|kv| kv.key.as_str()).collect();
         for extra in [
