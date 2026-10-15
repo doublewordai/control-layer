@@ -2444,6 +2444,67 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_errors_standing_in_for_an_upstream_are_attributed_to_the_provider() {
+        use tower::ServiceExt;
+
+        let origin = |mock: MockHttpClient, targets: target::Targets, model: &'static str| async move {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    json!({"model": model, "messages": [{"role": "user", "content": "Hello"}]})
+                        .to_string(),
+                ))
+                .unwrap();
+            let response = build_router(AppState::with_client(targets, mock))
+                .oneshot(request)
+                .await
+                .unwrap();
+            (
+                response.status().as_u16(),
+                response.extensions().get::<crate::ErrorOrigin>().cloned(),
+            )
+        };
+
+        // An embedded server error, not retried: collapsed to a 503 that
+        // reports the provider's failure.
+        let body = json!({"error": {"code": 500, "message": "upstream failure"}}).to_string();
+        let embedded = MockHttpClient::new(StatusCode::OK, &body);
+        assert_eq!(
+            origin(embedded, embedded_error_targets("gpt-4", 1), "gpt-4").await,
+            (503, Some(crate::ErrorOrigin::Provider))
+        );
+
+        // An embedded capacity refusal: a 529 that is the provider's, too.
+        let body = json!({"error": {"code": 503, "message": "no room"}}).to_string();
+        let embedded = MockHttpClient::new(StatusCode::OK, &body);
+        assert_eq!(
+            origin(embedded, embedded_error_targets("gpt-4", 1), "gpt-4").await,
+            (529, Some(crate::ErrorOrigin::Provider))
+        );
+
+        // Every provider answered with an empty body.
+        let empty = MockHttpClient::new(StatusCode::OK, "");
+        assert_eq!(
+            origin(empty, fallback_targets("gpt-4", 2, vec![502]), "gpt-4").await,
+            (503, Some(crate::ErrorOrigin::Provider))
+        );
+
+        // An unknown model is onwards' own decision.
+        let unused = MockHttpClient::new(StatusCode::OK, "");
+        assert_eq!(
+            origin(unused, embedded_error_targets("gpt-4", 1), "no-such-model").await,
+            (
+                404,
+                Some(crate::ErrorOrigin::Gateway {
+                    code: "model_not_found".to_string()
+                })
+            )
+        );
+    }
+
     /// Upstream overload status (529) that every member of a pool returns.
     fn overloaded_mock() -> MockHttpClient {
         MockHttpClient::new(

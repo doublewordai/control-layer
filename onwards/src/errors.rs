@@ -390,6 +390,13 @@ impl OnwardsErrorResponse {
         }
     }
 
+    /// Marks an error onwards built to stand in for an upstream's response
+    /// (an embedded error, an empty body), so it is attributed to the provider.
+    pub(crate) fn reported_by_upstream(mut self) -> Self {
+        self.from_upstream = true;
+        self
+    }
+
     pub(crate) fn with_identity(mut self, identity: Option<crate::RequestIdentity>) -> Self {
         self.identity = identity;
         self

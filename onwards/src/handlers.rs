@@ -1961,16 +1961,16 @@ pub async fn target_message_handler<T: HttpClient>(
                     let error = if embedded == 429 {
                         OnwardsErrorResponse::upstream_rate_limited(state.upstream_rate_limit_message.as_deref())
                     } else if is_capacity_refusal(embedded) {
-                        OnwardsErrorResponse::overloaded()
+                        OnwardsErrorResponse::overloaded().reported_by_upstream()
                     } else {
-                        OnwardsErrorResponse::service_unavailable()
+                        OnwardsErrorResponse::service_unavailable().reported_by_upstream()
                     };
                     return LoopAction::Continue(Some(error));
                 }
 
                 if is_capacity_refusal(embedded) {
                     record_response_status(529);
-                    return LoopAction::Done(Err(OnwardsErrorResponse::overloaded()));
+                    return LoopAction::Done(Err(OnwardsErrorResponse::overloaded().reported_by_upstream()));
                 }
                 record_response_status(embedded);
                 // Keep upstream details private while preserving rate-limit semantics.
@@ -1982,7 +1982,7 @@ pub async fn target_message_handler<T: HttpClient>(
                 let err = if embedded == 429 {
                     OnwardsErrorResponse::upstream_rate_limited(state.upstream_rate_limit_message.as_deref())
                 } else if embedded >= 500 {
-                    OnwardsErrorResponse::service_unavailable()
+                    OnwardsErrorResponse::service_unavailable().reported_by_upstream()
                 } else {
                     OnwardsErrorResponse::builder()
                         .body(ErrorResponseBody {
@@ -2025,13 +2025,13 @@ pub async fn target_message_handler<T: HttpClient>(
                     tracing::Span::current().record("onwards.fallback", "empty_body");
                     // Retry internally; on exhaustion the loop's final-error handling
                     // surfaces the sanitized 503 carried below.
-                    return LoopAction::Continue(Some(OnwardsErrorResponse::service_unavailable()));
+                    return LoopAction::Continue(Some(OnwardsErrorResponse::service_unavailable().reported_by_upstream()));
                 }
 
                 // Not configured to retry 502s: collapse the anomalous empty 200 to a
                 // generic 503 rather than forwarding a bodyless success to the client.
                 record_response_status(503);
-                return LoopAction::Done(Err(OnwardsErrorResponse::service_unavailable()));
+                return LoopAction::Done(Err(OnwardsErrorResponse::service_unavailable().reported_by_upstream()));
             }
             Scan2xx::Clean => {}
         }
