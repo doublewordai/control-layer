@@ -8,6 +8,9 @@
 //! beneath keys the client chose (with serde_json's `raw_value` feature, an
 //! object keyed `$serde_json::private::RawValue` must hold a string). serde's
 //! message, which can quote the offending value, is reduced to a fixed reason.
+//!
+//! Layers in front of onwards that parse their own request types (dwctl's
+//! protocol translation, for one) use [`locate_declared`] with their own list.
 
 use serde::de::DeserializeOwned;
 use serde_path_to_error::Segment;
@@ -177,7 +180,7 @@ const DECLARED_FIELDS: &[&str] = &[
 
 /// Where and how a body failed to deserialise.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SchemaMismatch {
+pub struct SchemaMismatch {
     /// For example `messages[].tool_calls[].function.arguments`. `None` when
     /// the body itself has the wrong shape.
     pub path: Option<String>,
@@ -185,21 +188,32 @@ pub(crate) struct SchemaMismatch {
     pub reason: &'static str,
 }
 
-/// Finds where `body`, which failed to deserialise as `T` with a data error,
-/// stopped matching. Bodies are parsed a second time only on this path, so
-/// requests that pass pay nothing for it.
+/// Finds where `body`, which failed to deserialise as one of the strict
+/// schemas `T` with a data error, stopped matching.
 pub(crate) fn locate<T: DeserializeOwned>(body: &[u8]) -> Option<SchemaMismatch> {
+    locate_declared::<T>(body, DECLARED_FIELDS)
+}
+
+/// Finds where `body`, which failed to deserialise as `T` with a data error,
+/// stopped matching, keeping only the keys in `declared`: the field names and
+/// renames `T`'s schema declares, sorted (an unsorted list only hides more).
+/// Bodies are parsed a second time only on this path, so requests that pass
+/// pay nothing for it.
+pub fn locate_declared<T: DeserializeOwned>(
+    body: &[u8],
+    declared: &[&str],
+) -> Option<SchemaMismatch> {
     let mut deserializer = serde_json::Deserializer::from_slice(body);
     let error = serde_path_to_error::deserialize::<_, T>(&mut deserializer).err()?;
     let message = error.inner().to_string();
     let reason = reason(&message);
-    let mut path = describe(error.path().iter());
+    let mut path = describe(error.path().iter(), declared);
     // serde reports a missing field at its parent and names it in the message;
     // the name comes from the schema, not the request.
     if reason == "missing_field"
-        && let Some(field) = backquoted(&message).filter(|name| is_declared(name))
+        && let Some(field) = backquoted(&message).filter(|name| is_declared(name, declared))
     {
-        push_key(&mut path, field);
+        push_key(&mut path, field, declared);
     }
     Some(SchemaMismatch {
         path: (!path.is_empty()).then_some(path),
@@ -207,15 +221,15 @@ pub(crate) fn locate<T: DeserializeOwned>(body: &[u8]) -> Option<SchemaMismatch>
     })
 }
 
-fn describe<'a>(segments: impl IntoIterator<Item = &'a Segment>) -> String {
+fn describe<'a>(segments: impl IntoIterator<Item = &'a Segment>, declared: &[&str]) -> String {
     let mut described = String::new();
     for segment in segments {
         let before = described.len();
         match segment {
             Segment::Seq { .. } => described.push_str("[]"),
-            Segment::Map { key } => push_key(&mut described, key),
-            Segment::Enum { variant } => push_key(&mut described, variant),
-            Segment::Unknown => push_key(&mut described, "?"),
+            Segment::Map { key } => push_key(&mut described, key, declared),
+            Segment::Enum { variant } => push_key(&mut described, variant, declared),
+            Segment::Unknown => push_key(&mut described, "?", declared),
         }
         if described.len() > MAX_PATH_LEN {
             described.truncate(before);
@@ -226,19 +240,19 @@ fn describe<'a>(segments: impl IntoIterator<Item = &'a Segment>) -> String {
     described
 }
 
-fn push_key(path: &mut String, key: &str) {
+fn push_key(path: &mut String, key: &str, declared: &[&str]) {
     if !path.is_empty() {
         path.push('.');
     }
-    if key == "?" || is_declared(key) {
+    if key == "?" || is_declared(key, declared) {
         path.push_str(key);
     } else {
         path.push('*');
     }
 }
 
-fn is_declared(key: &str) -> bool {
-    DECLARED_FIELDS.binary_search(&key).is_ok()
+fn is_declared(key: &str, declared: &[&str]) -> bool {
+    declared.binary_search(&key).is_ok()
 }
 
 /// The first `` `name` `` in a serde message.
@@ -355,9 +369,9 @@ mod tests {
     #[test]
     fn keys_the_schemas_do_not_declare_are_hidden() {
         let mut path = String::new();
-        push_key(&mut path, "messages");
-        push_key(&mut path, "client_secret");
-        push_key(&mut path, "Customer Key");
+        push_key(&mut path, "messages", DECLARED_FIELDS);
+        push_key(&mut path, "client_secret", DECLARED_FIELDS);
+        push_key(&mut path, "Customer Key", DECLARED_FIELDS);
         assert_eq!(path, "messages.*.*");
     }
 
@@ -378,7 +392,7 @@ mod tests {
             };
             100
         ];
-        let described = describe(&segments);
+        let described = describe(&segments, DECLARED_FIELDS);
         assert!(described.len() <= MAX_PATH_LEN + 3, "{described}");
         assert!(described.ends_with("messages..."), "{described}");
     }
@@ -391,44 +405,6 @@ mod tests {
             "invalid_type"
         );
     }
-    /// Every field name and serde rename declared outside the tests of a
-    /// schema source file. A line scan rather than a parser: it may find a
-    /// few names that aren't JSON keys, which only widens the list.
-    fn declared_in(source: &str) -> Vec<String> {
-        let source = source.split("#[cfg(test)]").next().unwrap_or(source);
-        let mut names = Vec::new();
-        for line in source.lines().map(str::trim) {
-            for marker in ["rename = \"", "alias = \""] {
-                let mut rest = line;
-                while let Some(start) = rest.find(marker) {
-                    rest = &rest[start + marker.len()..];
-                    if let Some(end) = rest.find('"') {
-                        names.push(rest[..end].to_string());
-                    }
-                }
-            }
-            if line.starts_with("//") || line.starts_with("let ") {
-                continue;
-            }
-            let field = line
-                .strip_prefix("pub(crate) ")
-                .or_else(|| line.strip_prefix("pub "))
-                .unwrap_or(line);
-            let field = field.strip_prefix("r#").unwrap_or(field);
-            let len = field
-                .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
-                .unwrap_or(field.len());
-            let after = field[len..].trim_start();
-            if len > 0
-                && field.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
-                && after.starts_with(':')
-                && !after.starts_with("::")
-            {
-                names.push(field[..len].to_string());
-            }
-        }
-        names
-    }
 
     fn schema_names() -> std::collections::BTreeSet<String> {
         [
@@ -438,7 +414,7 @@ mod tests {
             include_str!("schemas/responses.rs"),
         ]
         .into_iter()
-        .flat_map(declared_in)
+        .flat_map(crate::test_utils::declared_field_names)
         .collect()
     }
 
@@ -451,7 +427,7 @@ mod tests {
     fn declared_fields_cover_the_schemas() {
         let missing: Vec<_> = schema_names()
             .into_iter()
-            .filter(|name| !is_declared(name))
+            .filter(|name| !is_declared(name, DECLARED_FIELDS))
             .collect();
         assert!(missing.is_empty(), "add to DECLARED_FIELDS: {missing:?}");
     }

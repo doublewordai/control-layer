@@ -11,7 +11,7 @@ pub mod streaming;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header, request::Parts};
 use bytes::Bytes;
 
-use super::{ProtocolTranslator, StreamReframer, TranslatedRequest, TranslationError};
+use super::{ProtocolTranslator, StreamReframer, TranslatedRequest, TranslationError, parse_request};
 use model::MessagesRequest;
 use streaming::AnthropicStreamReframer;
 
@@ -40,8 +40,7 @@ impl ProtocolTranslator for AnthropicMessages {
     }
 
     fn translate_request(&self, parts: &Parts, body: Bytes) -> Result<TranslatedRequest, TranslationError> {
-        let req: MessagesRequest =
-            serde_json::from_slice(&body).map_err(|e| TranslationError::BadRequest(format!("invalid Anthropic Messages request: {e}")))?;
+        let req: MessagesRequest = parse_request(&body, DECLARED_FIELDS, "Anthropic Messages")?;
 
         let chat = request::to_chat_completions(req, self.cache_enabled)?;
         let new_body = serde_json::to_vec(&chat).map_err(|e| TranslationError::Internal(e.to_string()))?;
@@ -79,6 +78,66 @@ impl ProtocolTranslator for AnthropicMessages {
         Box::new(AnthropicStreamReframer::new())
     }
 }
+
+/// The field names and renames declared in [`model`], sorted, for locating
+/// where a request stopped matching [`MessagesRequest`] without recording a
+/// key the client chose. A name missing here is recorded as `*`, so the list
+/// can only hide too much; a test keeps it in step with `model.rs`.
+const DECLARED_FIELDS: &[&str] = &[
+    "cache_control",
+    "cache_creation",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "content",
+    "created_at",
+    "data",
+    "description",
+    "display_name",
+    "envelope_type",
+    "ephemeral_1h_input_tokens",
+    "ephemeral_24h_input_tokens",
+    "ephemeral_5m_input_tokens",
+    "error",
+    "error_type",
+    "first_id",
+    "has_more",
+    "id",
+    "input",
+    "input_schema",
+    "input_tokens",
+    "is_error",
+    "last_id",
+    "max_tokens",
+    "media_type",
+    "message",
+    "message_type",
+    "messages",
+    "model",
+    "name",
+    "object_type",
+    "output_config",
+    "output_tokens",
+    "role",
+    "service_tier",
+    "signature",
+    "source",
+    "stop_reason",
+    "stop_sequence",
+    "stop_sequences",
+    "stream",
+    "system",
+    "temperature",
+    "text",
+    "thinking",
+    "tool_choice",
+    "tool_use_id",
+    "tools",
+    "top_k",
+    "top_p",
+    "type",
+    "url",
+    "usage",
+];
 
 /// Rewrite a `.../messages` path to `.../chat/completions`, preserving any
 /// query. The route already matched; this only normalises the path for the
@@ -120,7 +179,57 @@ pub(crate) fn accepts_x_api_key(path: &str, headers: &HeaderMap) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use onwards::strict::schema_mismatch::SchemaMismatch;
     use serde_json::{Value, json};
+
+    fn located(body: &[u8]) -> Option<SchemaMismatch> {
+        let (parts, ()) = axum::http::Request::builder().uri("/v1/messages").body(()).unwrap().into_parts();
+        match AnthropicMessages::new(true).translate_request(&parts, Bytes::copy_from_slice(body)) {
+            Err(TranslationError::SchemaMismatch { mismatch, .. }) => mismatch,
+            Err(other) => panic!("expected a schema mismatch, got {other:?}"),
+            Ok(_) => panic!("the body should not translate"),
+        }
+    }
+
+    #[test]
+    fn a_schema_mismatch_names_the_field_but_not_its_value() {
+        let found = located(br#"{"model":"m","max_tokens":"planted-secret","messages":[]}"#).expect("located");
+        assert_eq!(found.path.as_deref(), Some("max_tokens"));
+        assert_eq!(found.reason, "invalid_type");
+        assert!(!format!("{found:?}").contains("planted"));
+
+        let found = located(br#"{"model":"m","max_tokens":5,"messages":[{"role":"user","content":7}]}"#).expect("located");
+        assert_eq!(found.path.as_deref(), Some("messages[].content"));
+        assert_eq!(found.reason, "no_matching_variant");
+
+        let found = located(br#"{"model":"m","messages":[]}"#).expect("located");
+        assert_eq!(found.path.as_deref(), Some("max_tokens"));
+        assert_eq!(found.reason, "missing_field");
+    }
+
+    #[test]
+    fn a_schema_mismatch_hides_client_keys_in_free_form_values() {
+        // With serde_json's `raw_value` feature this object must hold a string,
+        // so the free-form `tool_choice` fails beneath keys the client chose.
+        let found =
+            located(br#"{"model":"m","max_tokens":5,"messages":[],"tool_choice":{"client_secret":{"$serde_json::private::RawValue":1}}}"#)
+                .expect("located");
+        assert_eq!(found.path.as_deref(), Some("tool_choice.*.*"));
+    }
+
+    #[test]
+    fn declared_fields_are_sorted_and_unique() {
+        assert!(DECLARED_FIELDS.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn declared_fields_cover_the_request_types() {
+        let missing: Vec<_> = onwards::test_utils::declared_field_names(include_str!("model.rs"))
+            .into_iter()
+            .filter(|name| DECLARED_FIELDS.binary_search(&name.as_str()).is_err())
+            .collect();
+        assert!(missing.is_empty(), "add to DECLARED_FIELDS: {missing:?}");
+    }
 
     fn translate(body: Value) -> Value {
         let req: MessagesRequest = serde_json::from_value(body).expect("valid request");

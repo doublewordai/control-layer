@@ -130,8 +130,10 @@ impl RejectionContext {
         self.record_with_reason(status, code, param, None);
     }
 
-    /// Records a refusal, with a fixed `reason` saying how the parameter was wrong.
-    pub(crate) fn record_with_reason(
+    /// Records a refusal, with a fixed `reason` saying how the parameter was
+    /// wrong. Neither may hold request content: both are recorded for every
+    /// caller.
+    pub fn record_with_reason(
         &self,
         status: StatusCode,
         code: &str,

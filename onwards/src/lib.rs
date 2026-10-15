@@ -681,6 +681,47 @@ pub mod test_utils {
     use axum::http::StatusCode;
     use std::sync::{Arc, Mutex};
 
+    /// Every field name and serde rename declared outside the tests of a
+    /// schema source file, for tests that keep a list of declared fields (see
+    /// [`crate::strict::schema_mismatch::locate_declared`]) in step with it. A
+    /// line scan rather than a parser: it may find a few names that aren't
+    /// JSON keys, which only widens the list.
+    pub fn declared_field_names(source: &str) -> Vec<String> {
+        let source = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let mut names = Vec::new();
+        for line in source.lines().map(str::trim) {
+            for marker in ["rename = \"", "alias = \""] {
+                let mut rest = line;
+                while let Some(start) = rest.find(marker) {
+                    rest = &rest[start + marker.len()..];
+                    if let Some(end) = rest.find('"') {
+                        names.push(rest[..end].to_string());
+                    }
+                }
+            }
+            if line.starts_with("//") || line.starts_with("let ") {
+                continue;
+            }
+            let field = line
+                .strip_prefix("pub(crate) ")
+                .or_else(|| line.strip_prefix("pub "))
+                .unwrap_or(line);
+            let field = field.strip_prefix("r#").unwrap_or(field);
+            let len = field
+                .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+                .unwrap_or(field.len());
+            let after = field[len..].trim_start();
+            if len > 0
+                && field.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+                && after.starts_with(':')
+                && !after.starts_with("::")
+            {
+                names.push(field[..len].to_string());
+            }
+        }
+        names
+    }
+
     pub struct MockHttpClient {
         pub requests: Arc<Mutex<Vec<MockRequest>>>,
         response_builder: Arc<dyn Fn() -> axum::response::Response + Send + Sync>,
