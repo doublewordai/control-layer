@@ -106,9 +106,7 @@ impl RejectionContext {
     /// Records the alias `model` selects, with any serving-class suffix
     /// removed, if it is configured.
     pub fn set_model_if_configured(&mut self, targets: &Targets, model: &str) {
-        if let Ok((alias, _)) = serving::split_class_suffix(model)
-            && targets.targets.contains_key(alias)
-        {
+        if let Some(alias) = targets.configured_alias(model) {
             self.set_model(alias);
         }
     }

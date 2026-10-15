@@ -39,6 +39,11 @@ impl Recorder {
     pub fn new(targets: Targets) -> Self {
         Self { targets }
     }
+
+    /// See [`Targets::configured_alias`].
+    pub fn configured_alias<'m>(&self, model: &'m str) -> Option<&'m str> {
+        self.targets.configured_alias(model)
+    }
 }
 
 /// The code a dwctl layer refused a response's request with, and the span it

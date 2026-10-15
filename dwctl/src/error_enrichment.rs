@@ -29,7 +29,7 @@ use crate::{
     db::errors::DbError,
     db::handlers::{Credits, api_keys::ApiKeys},
     errors::Error,
-    inference::rejections::RejectionCode,
+    inference::rejections::{Recorder, RejectionCode},
     types::UserId,
 };
 use axum::{
@@ -87,6 +87,12 @@ pub async fn error_enrichment_middleware(
     };
 
     let model_name = serde_json::from_slice::<ChatRequest>(&bytes).ok().map(|req| req.model);
+    // The model as a span label: only a configured alias, like onwards
+    // records, never arbitrary client input.
+    let span_model = model_name
+        .as_deref()
+        .and_then(|model| parts.extensions.get::<Recorder>()?.configured_alias(model))
+        .map(str::to_string);
 
     // Reconstruct the request with the body
     let reconstructed = Request::from_parts(parts, Body::from(bytes));
@@ -114,7 +120,7 @@ pub async fn error_enrichment_middleware(
         // Onwards never saw these keys (they are excluded from its key set), so
         // its response carries no identity. Attach it here, with the refusal
         // code, so the root request span records who was refused and why.
-        let identity = key_info.as_ref().map(|owner| owner.identity(model_name.clone()));
+        let identity = key_info.as_ref().map(|owner| owner.identity(span_model.clone()));
         let tag = |mut response: Response<Body>, code: &str| {
             if let Some(identity) = identity.clone() {
                 response.extensions_mut().insert(identity);
@@ -486,7 +492,7 @@ async fn get_api_key_user_and_purpose(pool: PgPool, api_key: &str) -> Result<Opt
     let mut conn = pool.acquire().await?;
     let row = sqlx::query!(
         r#"
-        SELECT k.id, k.user_id, k.purpose, COALESCE(u.display_name, u.username) AS account_name
+        SELECT k.id, k.user_id, k.purpose, COALESCE(NULLIF(BTRIM(u.display_name), ''), u.username) AS account_name
         FROM api_keys k
         JOIN users u ON u.id = k.user_id
         WHERE k.secret = $1 AND k.is_deleted = false
@@ -1135,6 +1141,67 @@ mod tests {
         assert_eq!(code, Some("image_token_forbidden"));
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"image token forbidden");
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_error_enrichment_identity_labels_only_configured_models(pool: PgPool) {
+        use crate::inference::rejections::test_support::recorder;
+        use tower::ServiceExt;
+
+        // A blank display name falls back to the username, as key labels do.
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        sqlx::query("UPDATE users SET display_name = '   ' WHERE id = $1")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let api_key = ApiKeys::new(&mut conn)
+            .create(&ApiKeyCreateDBRequest {
+                user_id: user.id,
+                name: "Platform Key".to_string(),
+                description: None,
+                purpose: ApiKeyPurpose::Platform,
+                created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
+            })
+            .await
+            .unwrap();
+
+        let router = axum::Router::new()
+            .route(
+                "/ai/v1/chat/completions",
+                axum::routing::post(|| async { StatusCode::FORBIDDEN.into_response() }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                sqlx_pool_router::DynPools::new(pool.clone()),
+                error_enrichment_middleware,
+            ))
+            .layer(axum::Extension(recorder("gpt-4o")));
+        let identity = |model: &'static str| {
+            let router = router.clone();
+            let secret = api_key.secret.clone();
+            async move {
+                let request = Request::post("/ai/v1/chat/completions")
+                    .header("authorization", format!("Bearer {secret}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"model": "{model}", "messages": []}}"#)))
+                    .unwrap();
+                let response = router.oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                response.extensions().get::<RequestIdentity>().cloned().unwrap()
+            }
+        };
+
+        let known = identity("gpt-4o").await;
+        assert_eq!(known.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(known.account_name.as_deref(), Some(user.username.as_str()));
+        assert_eq!(known.key_purpose.as_deref(), Some("platform"));
+
+        // Client input that names no configured alias is not a span label.
+        assert_eq!(identity("anything-a-client-sends").await.model, None);
     }
 
     /// Integration test: Error enrichment middleware only affects /ai/ paths
