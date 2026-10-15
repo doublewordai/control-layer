@@ -1,5 +1,23 @@
 # Changelog
 
+## [14.2.0](https://github.com/doublewordai/control-layer/compare/v14.1.0...v14.2.0) (2026-10-15)
+
+
+### Features
+
+* **metrics:** the credits metric names the model that served each request ([#1987](https://github.com/doublewordai/control-layer/issues/1987)) ([589a262](https://github.com/doublewordai/control-layer/commit/589a26284dd77d8b00cc9a5ff3f138bd44121ff8))
+* **tracing:** customer attributes on request and batch spans ([#1972](https://github.com/doublewordai/control-layer/issues/1972)) ([60db3ec](https://github.com/doublewordai/control-layer/commit/60db3ec246429061cc153b9b5bfea07abc218ca2))
+
+
+### Bug Fixes
+
+* **fusillade:** stop daemon maintenance from stalling writes to files ([#1986](https://github.com/doublewordai/control-layer/issues/1986)) ([fc5b7f7](https://github.com/doublewordai/control-layer/commit/fc5b7f7f6b3e74c0a208243641307442ae0f9c5a))
+
+
+### Performance Improvements
+
+* **tracing:** filter and slim the spans sent to the trace backend (DW-931) ([#1984](https://github.com/doublewordai/control-layer/issues/1984)) ([4a07bb1](https://github.com/doublewordai/control-layer/commit/4a07bb1199d8aaf25cec7a6c19f3815d63b5a3b7))
+
 ## [14.1.0](https://github.com/doublewordai/control-layer/compare/v14.0.1...v14.1.0) (2026-10-15)
 
 
