@@ -161,7 +161,9 @@ fn batch_outcome(batch: &fusillade::batch::Batch) -> &'static str {
 }
 
 /// The models a claimed batch's requests named. The claim reports them joined
-/// with `", "`.
+/// with `", "`, so an alias that itself contains `", "` comes back split. That
+/// is accepted rather than changing fusillade's public `BatchNotification` or
+/// scanning each batch's requests a second time.
 fn batch_models(notif: &fusillade::batch::BatchNotification) -> Vec<&str> {
     notif.model.split(", ").filter(|model| !model.is_empty()).collect()
 }
