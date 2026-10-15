@@ -772,23 +772,6 @@ its descendant `onwards.provider_attempt` spans to the downstream serving spans.
 The gateway span's `doubleword.request_id` attribute holds the logical request
 UUID for reverse lookup in request records.
 
-#### Span queue sizing
-
-Finished spans wait in a bounded queue before export, and spans arriving while
-it is full are dropped. A large batch dispatches many requests at once, so the
-queue must absorb that burst. The standard `OTEL_BSP_*` variables apply:
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `OTEL_BSP_MAX_QUEUE_SIZE` | `16384` | Spans buffered before dropping. The SDK default is 2048. |
-| `OTEL_BSP_MAX_EXPORT_BATCH_SIZE` | `1024` | Spans per export request (at most the queue size). |
-| `OTEL_BSP_SCHEDULE_DELAY` | `5000` | Milliseconds between exports when a batch is not yet full. |
-| `OTEL_BSP_EXPORT_TIMEOUT` | `30000` | Milliseconds before an export attempt is abandoned. |
-
-Memory is the trade-off: a full queue holds up to `OTEL_BSP_MAX_QUEUE_SIZE`
-finished spans per process, roughly 1-2 KiB each (about 16-32 MiB at the
-default). Raise it for burstier traffic or lower it on small replicas.
-
 #### Customer attributes on spans
 
 Spans carry the account, model and error class so alerts and dashboards can be

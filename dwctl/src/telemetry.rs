@@ -12,18 +12,6 @@
 //! - `OTEL_EXPORTER_OTLP_HEADERS` - Headers as comma-separated key=value pairs. The values can have their spaces encoded URL style - i.e. replace %20 with space.
 //! - `OTEL_SERVICE_NAME` - Service name for resource identification
 //!
-//! The span batch processor honours the standard `OTEL_BSP_*` variables
-//! (`OTEL_BSP_MAX_QUEUE_SIZE`, `OTEL_BSP_MAX_EXPORT_BATCH_SIZE`,
-//! `OTEL_BSP_SCHEDULE_DELAY`, `OTEL_BSP_EXPORT_TIMEOUT`). Spans that arrive while
-//! the queue is full are dropped, so the queue must absorb bursts (a large batch
-//! dispatching tens of thousands of requests at once). The SDK default of 2048
-//! dropped most spans in such bursts; this module defaults to a queue of
-//! [`DEFAULT_BSP_MAX_QUEUE_SIZE`] spans and exports in batches of
-//! [`DEFAULT_BSP_MAX_EXPORT_BATCH_SIZE`]. Memory is the trade-off: a full queue
-//! holds up to that many finished spans (roughly 1-2 KiB each, so about 16-32 MiB
-//! at the default) per process. Raise the queue for burstier traffic or lower it on
-//! small replicas.
-//!
 //! # What gets exported
 //!
 //! Logs and traces are filtered separately. `RUST_LOG` decides what reaches the
@@ -101,7 +89,7 @@ use onwards::{ErrorOrigin, RequestIdentity, ServedBy};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
 pub use opentelemetry_sdk::trace::SdkTracerProvider;
-use opentelemetry_sdk::trace::{BatchConfig, BatchConfigBuilder, BatchSpanProcessor, Tracer};
+use opentelemetry_sdk::trace::Tracer;
 use std::collections::HashMap;
 use tracing::{Subscriber, info};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -119,25 +107,6 @@ pub const OTEL_TRACES_FILTER: &str = "OTEL_TRACES_FILTER";
 pub const DEFAULT_OTEL_TRACES_FILTER: &str = "info";
 
 use crate::inference::rejections::RejectionCode;
-
-/// Default span queue size when `OTEL_BSP_MAX_QUEUE_SIZE` is unset. The SDK
-/// default (2048) dropped most spans in a large batch's dispatch burst.
-pub const DEFAULT_BSP_MAX_QUEUE_SIZE: usize = 16_384;
-/// Default export batch size when `OTEL_BSP_MAX_EXPORT_BATCH_SIZE` is unset.
-pub const DEFAULT_BSP_MAX_EXPORT_BATCH_SIZE: usize = 1_024;
-
-/// Batch processor settings: the SDK's `OTEL_BSP_*` environment handling, with
-/// larger defaults for the queue and export batch size.
-fn batch_config() -> BatchConfig {
-    let mut builder = BatchConfigBuilder::default();
-    if std::env::var_os("OTEL_BSP_MAX_QUEUE_SIZE").is_none() {
-        builder = builder.with_max_queue_size(DEFAULT_BSP_MAX_QUEUE_SIZE);
-    }
-    if std::env::var_os("OTEL_BSP_MAX_EXPORT_BATCH_SIZE").is_none() {
-        builder = builder.with_max_export_batch_size(DEFAULT_BSP_MAX_EXPORT_BATCH_SIZE);
-    }
-    builder.build()
-}
 
 /// Longest account name recorded on a span. Display names are free text, and
 /// the name rides on every authenticated request's spans.
@@ -346,9 +315,8 @@ fn create_otlp_tracer() -> anyhow::Result<(Tracer, SdkTracerProvider)> {
         .with_service_name(service_name.clone())
         .build();
 
-    let batch_processor = BatchSpanProcessor::builder(exporter).with_batch_config(batch_config()).build();
     let tracer_provider = SdkTracerProvider::builder()
-        .with_span_processor(batch_processor)
+        .with_batch_exporter(exporter)
         .with_resource(resource)
         .build();
 
