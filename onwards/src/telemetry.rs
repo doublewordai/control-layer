@@ -9,15 +9,26 @@
 //! - `OTEL_EXPORTER_OTLP_PROTOCOL` — Protocol: `http/protobuf` (default), `http/json`
 //! - `OTEL_EXPORTER_OTLP_HEADERS` — Comma-separated `key=value` pairs (supports `%20` for spaces)
 //! - `OTEL_SERVICE_NAME` — Service name (default: `onwards`)
+//!
+//! `RUST_LOG` filters the log output. `OTEL_TRACES_FILTER` (ours, not an OTel
+//! standard variable; same directive syntax, default `info`) filters what the
+//! exporter sends, so a `debug` log level does not export every debug span and
+//! line. Spans are exported without the layer's per-span source location,
+//! thread and timing attributes, which nothing queries.
 
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
 pub use opentelemetry_sdk::trace::SdkTracerProvider;
+use opentelemetry_sdk::trace::Tracer;
 use std::collections::HashMap;
-use tracing::info;
-use tracing_subscriber::EnvFilter;
+use tracing::{Subscriber, info};
 use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer};
+
+/// Filter directives for the span exporter; `RUST_LOG` syntax, default `info`.
+pub const OTEL_TRACES_FILTER: &str = "OTEL_TRACES_FILTER";
 
 /// Initialize tracing with optional OpenTelemetry OTLP export.
 ///
@@ -32,14 +43,19 @@ pub fn init_telemetry() -> anyhow::Result<Option<SdkTracerProvider>> {
 
     if std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok() {
         let (tracer, provider) = create_otlp_tracer()?;
+        let traces_filter =
+            std::env::var(OTEL_TRACES_FILTER).unwrap_or_else(|_| "info".to_string());
 
         tracing_subscriber::registry()
             .with(env_filter)
             .with(tracing_subscriber::fmt::layer().compact())
-            .with(tracing_opentelemetry::layer().with_tracer(tracer))
+            .with(otel_layer(tracer, &traces_filter))
             .try_init()?;
 
-        info!("Telemetry initialized with OTLP export enabled");
+        info!(
+            traces_filter,
+            "Telemetry initialized with OTLP export enabled"
+        );
         Ok(Some(provider))
     } else {
         tracing_subscriber::registry()
@@ -54,7 +70,22 @@ pub fn init_telemetry() -> anyhow::Result<Option<SdkTracerProvider>> {
     }
 }
 
-fn create_otlp_tracer() -> anyhow::Result<(opentelemetry_sdk::trace::Tracer, SdkTracerProvider)> {
+/// The span export layer behind its own filter, without the per-span source
+/// location, thread and timing attributes. Events inside an excluded span are
+/// exported on the nearest exported ancestor.
+fn otel_layer<S>(tracer: Tracer, directives: &str) -> impl Layer<S>
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+{
+    tracing_opentelemetry::layer()
+        .with_tracer(tracer)
+        .with_location(false)
+        .with_threads(false)
+        .with_tracked_inactivity(false)
+        .with_filter(EnvFilter::new(directives))
+}
+
+fn create_otlp_tracer() -> anyhow::Result<(Tracer, SdkTracerProvider)> {
     let service_name = std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "onwards".to_string());
 
     let base = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")

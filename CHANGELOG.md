@@ -1,5 +1,30 @@
 # Changelog
 
+## [14.1.0](https://github.com/doublewordai/control-layer/compare/v14.0.1...v14.1.0) (2026-10-15)
+
+
+### Features
+
+* correlate requests end to end with x_request_id ([#1970](https://github.com/doublewordai/control-layer/issues/1970)) ([f61e00f](https://github.com/doublewordai/control-layer/commit/f61e00fe5c898b4bf3fda97eef2f34578e059c23))
+* count the inference requests dwctl's own layers refuse (DW-851) ([#1978](https://github.com/doublewordai/control-layer/issues/1978)) ([b822bd0](https://github.com/doublewordai/control-layer/commit/b822bd0bae2731a1db94679479ae86e5b304e6e2))
+* make auto-top-up retry delay configurable ([#1966](https://github.com/doublewordai/control-layer/issues/1966)) ([d1f96b3](https://github.com/doublewordai/control-layer/commit/d1f96b3bb22b2cc978c1b84f3329ed67bbf39e62))
+
+
+### Bug Fixes
+
+* **dashboard:** keep the edit user and organization dialogs within the viewport ([#1975](https://github.com/doublewordai/control-layer/issues/1975)) ([3f0c3cf](https://github.com/doublewordai/control-layer/commit/3f0c3cf13d96b24a6d3d78069e8010ba434beb2d))
+* **dwctl:** map Anthropic thinking types and output_config.effort to reasoning_effort ([#1981](https://github.com/doublewordai/control-layer/issues/1981)) ([87362dd](https://github.com/doublewordai/control-layer/commit/87362dd857fd2ad174cc6070a48f65dd6b650500))
+* end interrupted streams with an error event (DW-851) ([#1979](https://github.com/doublewordai/control-layer/issues/1979)) ([843f421](https://github.com/doublewordai/control-layer/commit/843f421ef04ec8d4ca29c762f01aae9be1dc7206))
+* give every response the gateway id and send streamed usage only on request ([#1973](https://github.com/doublewordai/control-layer/issues/1973)) ([ccb3919](https://github.com/doublewordai/control-layer/commit/ccb3919682884ea2fb963eb48d55b690d6bd6877))
+* **onwards:** give trusted providers' errors the OpenAI envelope ([#1977](https://github.com/doublewordai/control-layer/issues/1977)) ([8d2960e](https://github.com/doublewordai/control-layer/commit/8d2960e1734b6a9efc38f321757811ea64b5171e))
+* remove two lock races behind flaky CI tests ([#1982](https://github.com/doublewordai/control-layer/issues/1982)) ([2163e35](https://github.com/doublewordai/control-layer/commit/2163e3541137332aeb22c167a78355aeb6a53b32))
+
+
+### Tests
+
+* **stripe:** cover the Stripe provider against a mock Stripe API ([#1971](https://github.com/doublewordai/control-layer/issues/1971)) ([cd42cbc](https://github.com/doublewordai/control-layer/commit/cd42cbc420a72ade25c8faa3060272ec7ce8455e))
+* **sync:** keep the reconnect test from killing other tests' listeners ([#1983](https://github.com/doublewordai/control-layer/issues/1983)) ([ad8bd06](https://github.com/doublewordai/control-layer/commit/ad8bd065287dd3f826ec31091816be3c5ad2fc17))
+
 ## [14.0.1](https://github.com/doublewordai/control-layer/compare/v14.0.0...v14.0.1) (2026-10-13)
 
 

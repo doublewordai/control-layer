@@ -111,6 +111,12 @@ fn normalize_auth(headers: &mut HeaderMap) {
     }
 }
 
+/// Whether an Anthropic translator claims this request, so that its
+/// `x-api-key` stands in for a missing `Authorization` (see [`normalize_auth`]).
+pub(crate) fn accepts_x_api_key(path: &str, headers: &HeaderMap) -> bool {
+    AnthropicMessages::new(false).detect(path, headers) || models::AnthropicModels.detect(path, headers)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

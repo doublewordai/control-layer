@@ -22,7 +22,7 @@ impl<'c> Webhooks<'c> {
     }
 
     /// Create a new webhook for a user.
-    #[instrument(skip(self, request), fields(user_id = %abbrev_uuid(&request.user_id)), err)]
+    #[instrument(level = "debug", skip(self, request), fields(user_id = %abbrev_uuid(&request.user_id)), err)]
     pub async fn create(&mut self, request: &WebhookCreateDBRequest) -> Result<Webhook> {
         let event_types_json = request
             .event_types
@@ -50,7 +50,7 @@ impl<'c> Webhooks<'c> {
     }
 
     /// Get a webhook by ID.
-    #[instrument(skip(self), fields(webhook_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(webhook_id = %abbrev_uuid(&id)), err)]
     pub async fn get_by_id(&mut self, id: WebhookId) -> Result<Option<Webhook>> {
         let webhook = sqlx::query_as!(Webhook, r#"SELECT id, user_id, url, secret, enabled, event_types, description, created_at, updated_at, consecutive_failures, disabled_at, scope FROM user_webhooks WHERE id = $1"#, id)
             .fetch_optional(&mut *self.db)
@@ -60,7 +60,7 @@ impl<'c> Webhooks<'c> {
     }
 
     /// List webhooks for a user.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn list_by_user(&mut self, user_id: UserId) -> Result<Vec<Webhook>> {
         let webhooks = sqlx::query_as!(
             Webhook,
@@ -78,7 +78,7 @@ impl<'c> Webhooks<'c> {
     }
 
     /// Update a webhook.
-    #[instrument(skip(self, request), fields(webhook_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self, request), fields(webhook_id = %abbrev_uuid(&id)), err)]
     pub async fn update(&mut self, id: WebhookId, request: &WebhookUpdateDBRequest) -> Result<Option<Webhook>> {
         // Convert event_types Option<Option<Vec>> to Option<Option<Value>> for SQL
         let event_types_json: Option<Option<serde_json::Value>> = request.event_types.as_ref().map(|opt| {
@@ -129,7 +129,7 @@ impl<'c> Webhooks<'c> {
     }
 
     /// Delete a webhook.
-    #[instrument(skip(self), fields(webhook_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(webhook_id = %abbrev_uuid(&id)), err)]
     pub async fn delete(&mut self, id: WebhookId) -> Result<bool> {
         let result = sqlx::query!("DELETE FROM user_webhooks WHERE id = $1", id)
             .execute(&mut *self.db)
@@ -139,7 +139,7 @@ impl<'c> Webhooks<'c> {
     }
 
     /// Rotate a webhook's secret.
-    #[instrument(skip(self, new_secret), fields(webhook_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self, new_secret), fields(webhook_id = %abbrev_uuid(&id)), err)]
     pub async fn rotate_secret(&mut self, id: WebhookId, new_secret: String) -> Result<Option<Webhook>> {
         let webhook = sqlx::query_as!(
             Webhook,
@@ -159,7 +159,7 @@ impl<'c> Webhooks<'c> {
     }
 
     /// Get all enabled webhooks for a set of users, grouped by user ID.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn get_enabled_webhooks_for_users(
         &mut self,
         user_ids: Vec<UserId>,
@@ -190,7 +190,7 @@ impl<'c> Webhooks<'c> {
     /// The `scope = 'platform'` constraint is enforced by a DB trigger at write time,
     /// but the `role = 'PlatformManager'` check at read time handles the demotion case —
     /// if a PM loses their role, their existing platform webhooks stop firing immediately.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn get_enabled_platform_webhooks(&mut self) -> Result<Vec<Webhook>> {
         let webhooks = sqlx::query_as!(
             Webhook,
@@ -214,7 +214,7 @@ impl<'c> Webhooks<'c> {
     ///
     /// Returns `None` if the webhook was deleted (e.g. CASCADE from user or
     /// direct delete while deliveries were in-flight).
-    #[instrument(skip(self), fields(webhook_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(webhook_id = %abbrev_uuid(&id)), err)]
     pub async fn increment_failures(&mut self, id: WebhookId, circuit_breaker_threshold: i32) -> Result<Option<Webhook>> {
         let webhook = sqlx::query_as!(
             Webhook,
@@ -243,7 +243,7 @@ impl<'c> Webhooks<'c> {
     }
 
     /// Reset consecutive failures on successful delivery.
-    #[instrument(skip(self), fields(webhook_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(webhook_id = %abbrev_uuid(&id)), err)]
     pub async fn reset_failures(&mut self, id: WebhookId) -> Result<()> {
         sqlx::query!(
             r#"
@@ -262,7 +262,7 @@ impl<'c> Webhooks<'c> {
     // ===== Delivery methods =====
 
     /// Create a new delivery record.
-    #[instrument(skip(self, request), fields(webhook_id = %abbrev_uuid(&request.webhook_id)), err)]
+    #[instrument(level = "debug", skip(self, request), fields(webhook_id = %abbrev_uuid(&request.webhook_id)), err)]
     pub async fn create_delivery(&mut self, request: &WebhookDeliveryCreateDBRequest) -> Result<WebhookDelivery> {
         let delivery = sqlx::query_as!(
             WebhookDelivery,
@@ -289,7 +289,7 @@ impl<'c> Webhooks<'c> {
     ///
     /// Used by the notification poller for platform events where the LISTEN/NOTIFY
     /// trigger may fire multiple times (e.g., during leadership transitions).
-    #[instrument(skip(self, request), fields(webhook_id = %abbrev_uuid(&request.webhook_id)), err)]
+    #[instrument(level = "debug", skip(self, request), fields(webhook_id = %abbrev_uuid(&request.webhook_id)), err)]
     pub async fn try_create_delivery(&mut self, request: &WebhookDeliveryCreateDBRequest) -> Result<Option<WebhookDelivery>> {
         let delivery = sqlx::query_as!(
             WebhookDelivery,
@@ -329,7 +329,7 @@ impl<'c> Webhooks<'c> {
     /// claimable again after 5 minutes. This also means graceful shutdown
     /// doesn't need to drain in-flight results — unprocessed deliveries
     /// just get re-claimed on the next startup.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn claim_retriable_deliveries(&mut self, limit: i64) -> Result<Vec<ClaimedDelivery>> {
         let deliveries = sqlx::query_as!(
             ClaimedDelivery,
@@ -365,7 +365,7 @@ impl<'c> Webhooks<'c> {
     }
 
     /// Mark a delivery as successful.
-    #[instrument(skip(self), fields(delivery_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(delivery_id = %abbrev_uuid(&id)), err)]
     pub async fn mark_delivered(&mut self, id: DeliveryId, status_code: i32) -> Result<()> {
         sqlx::query!(
             r#"
@@ -387,7 +387,7 @@ impl<'c> Webhooks<'c> {
     }
 
     /// Mark a delivery as failed and schedule retry.
-    #[instrument(skip(self, error), fields(delivery_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self, error), fields(delivery_id = %abbrev_uuid(&id)), err)]
     pub async fn mark_failed(
         &mut self,
         id: DeliveryId,
@@ -433,7 +433,7 @@ impl<'c> Webhooks<'c> {
     }
 
     /// Mark a delivery as exhausted (e.g., webhook was disabled).
-    #[instrument(skip(self), fields(delivery_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(delivery_id = %abbrev_uuid(&id)), err)]
     pub async fn mark_exhausted(&mut self, id: DeliveryId) -> Result<()> {
         sqlx::query!(
             r#"

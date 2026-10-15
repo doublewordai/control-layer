@@ -114,7 +114,7 @@ impl<'c> Credits<'c> {
     /// analytics batcher's flush fold also updates. When calling inside an
     /// enclosing transaction, keep that transaction short and DB-local -
     /// holding it across external I/O would stall flushes for its duration.
-    #[instrument(skip(self, request), fields(user_id = %abbrev_uuid(&request.user_id), transaction_type = ?request.transaction_type, amount = %request.amount), err)]
+    #[instrument(level = "debug", skip(self, request), fields(user_id = %abbrev_uuid(&request.user_id), transaction_type = ?request.transaction_type, amount = %request.amount), err)]
     pub async fn create_transaction(&mut self, request: &CreditTransactionCreateDBRequest) -> Result<CreditTransactionDBResponse> {
         let signed_amount = match request.transaction_type {
             CreditTransactionType::AdminGrant | CreditTransactionType::Purchase => request.amount,
@@ -220,7 +220,7 @@ impl<'c> Credits<'c> {
     /// Served by the partial `idx_credits_transactions_user_purchases` index
     /// (migration 100), so it stays a direct lookup no matter how many `usage`
     /// rows the target has accumulated.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn has_purchased(&mut self, user_id: UserId) -> Result<bool> {
         let purchased = sqlx::query_scalar!(
             r#"
@@ -245,7 +245,7 @@ impl<'c> Credits<'c> {
     ///
     /// `DISTINCT` rather than a count: we only need the boolean, and stopping
     /// at existence keeps this on the partial purchases index.
-    #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
+    #[instrument(level = "debug", skip(self, user_ids), fields(count = user_ids.len()), err)]
     pub async fn has_purchased_bulk(&mut self, user_ids: &[UserId]) -> Result<HashSet<UserId>> {
         if user_ids.is_empty() {
             return Ok(HashSet::new());
@@ -284,7 +284,7 @@ impl<'c> Credits<'c> {
     /// `source_id` unique constraint makes the second insert a no-op). Reuses
     /// `create_transaction`, so the bonus also triggers the balance-restored
     /// notify like any other credit.
-    #[instrument(skip(self), fields(payee = %abbrev_uuid(&payee), match_up_to = %match_up_to), err)]
+    #[instrument(level = "debug", skip(self), fields(payee = %abbrev_uuid(&payee), match_up_to = %match_up_to), err)]
     pub async fn grant_first_payment_match(
         &mut self,
         match_up_to: Decimal,
@@ -394,7 +394,7 @@ impl<'c> Credits<'c> {
     ///
     /// Whether the payee may be verified at all is decided before this is
     /// called: see `claim_verification_instrument`.
-    #[instrument(skip(self), fields(payee = %abbrev_uuid(&payee), amount = %amount), err)]
+    #[instrument(level = "debug", skip(self), fields(payee = %abbrev_uuid(&payee), amount = %amount), err)]
     pub async fn grant_verification_credits(&mut self, amount: Decimal, payee: UserId, setup_source_id: &str) -> Result<()> {
         if amount <= Decimal::ZERO {
             return Ok(());
@@ -472,7 +472,7 @@ impl<'c> Credits<'c> {
     /// writer folds its charges in synchronously, so it is current as of the
     /// last committed write); a missing row can only mean a user that has
     /// never existed, so it reads as zero.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn get_user_balance(&mut self, user_id: UserId) -> Result<Decimal> {
         let balance = sqlx::query_scalar!(r#"SELECT balance FROM user_balance_checkpoints WHERE user_id = $1"#, user_id)
             .fetch_optional(&mut *self.db)
@@ -483,7 +483,7 @@ impl<'c> Credits<'c> {
 
     /// Balance used for admission checks; `None` means this billing account
     /// permits debt. This policy never changes the balance used for accounting.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn get_balance_for_admission(&mut self, user_id: UserId) -> Result<Option<Decimal>> {
         if super::feature_flags::FeatureFlags::new(&mut *self.db)
             .has_feature(user_id, super::feature_flags::FeatureFlag::AllowNegativeBalance)
@@ -495,7 +495,7 @@ impl<'c> Credits<'c> {
     }
 
     /// Get balances for multiple users: point reads of the read model.
-    #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
+    #[instrument(level = "debug", skip(self, user_ids), fields(count = user_ids.len()), err)]
     pub async fn get_users_balances_bulk(&mut self, user_ids: &[UserId]) -> Result<HashMap<UserId, Decimal>> {
         if user_ids.is_empty() {
             return Ok(HashMap::new());
@@ -523,7 +523,7 @@ impl<'c> Credits<'c> {
     }
 
     /// List transactions for a specific user with pagination and optional filters
-    #[instrument(skip(self, filters), fields(user_id = %abbrev_uuid(&user_id), skip = skip, limit = limit), err)]
+    #[instrument(level = "debug", skip(self, filters), fields(user_id = %abbrev_uuid(&user_id), skip = skip, limit = limit), err)]
     pub async fn list_user_transactions(
         &mut self,
         user_id: UserId,
@@ -565,7 +565,7 @@ impl<'c> Credits<'c> {
     }
 
     /// List all transactions across all users (admin view) with optional filters
-    #[instrument(skip(self, filters), fields(skip = skip, limit = limit), err)]
+    #[instrument(level = "debug", skip(self, filters), fields(skip = skip, limit = limit), err)]
     pub async fn list_all_transactions(
         &mut self,
         skip: i64,
@@ -604,7 +604,7 @@ impl<'c> Credits<'c> {
     }
 
     /// Get a single transaction by its ID
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn get_transaction_by_id(&mut self, transaction_id: Uuid) -> Result<Option<CreditTransactionDBResponse>> {
         let transaction = sqlx::query_as!(
             CreditTransaction,
@@ -640,7 +640,7 @@ impl<'c> Credits<'c> {
     }
 
     /// Get the total amount of auto top-up charges for a user in the current calendar month (UTC).
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn get_monthly_auto_topup_spend(&mut self, user_id: UserId) -> Result<rust_decimal::Decimal> {
         let row = sqlx::query!(
             r#"
@@ -661,7 +661,7 @@ impl<'c> Credits<'c> {
     /// Get the total auto top-up spend for multiple users in the current calendar month (UTC).
     /// Returns a map of user_id → total spend. Users with no auto-topup transactions this month
     /// will be absent from the map; callers should treat missing entries as zero.
-    #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
+    #[instrument(level = "debug", skip(self, user_ids), fields(count = user_ids.len()), err)]
     pub async fn get_monthly_auto_topup_spend_bulk(&mut self, user_ids: &[UserId]) -> Result<HashMap<UserId, rust_decimal::Decimal>> {
         if user_ids.is_empty() {
             return Ok(HashMap::new());
@@ -693,7 +693,7 @@ impl<'c> Credits<'c> {
     /// This is used to calculate the balance at a specific point in the transaction history.
     /// Only date filters are applied - search and type filters are excluded since they break
     /// chronological ordering which the frontend relies on for running balance calculation.
-    #[instrument(skip(self, filters), fields(user_id = %abbrev_uuid(&user_id), count = count), err)]
+    #[instrument(level = "debug", skip(self, filters), fields(user_id = %abbrev_uuid(&user_id), count = count), err)]
     pub async fn sum_recent_transactions(&mut self, user_id: UserId, count: i64, filters: &TransactionFilters) -> Result<Decimal> {
         let result = sqlx::query!(
             r#"
@@ -723,7 +723,7 @@ impl<'c> Credits<'c> {
 
     /// Sum the signed amounts of all transactions after a given date for a user.
     /// This is used to calculate the balance at a specific point in time when date filtering.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn sum_transactions_after_date(&mut self, user_id: UserId, after_date: DateTime<Utc>) -> Result<Decimal> {
         let result = sqlx::query!(
             r#"
@@ -745,7 +745,7 @@ impl<'c> Credits<'c> {
 
     /// Sum the signed amounts of all grouped transaction items after a given date for a user.
     /// This operates on the same grouped view as `list_transactions_with_batches`.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn sum_transactions_after_date_grouped(&mut self, user_id: UserId, after_date: DateTime<Utc>) -> Result<Decimal> {
         let result = sqlx::query!(
             r#"
@@ -787,7 +787,7 @@ impl<'c> Credits<'c> {
     /// This is used to calculate the balance at a specific point when batch grouping is enabled.
     /// Only date filters are applied - search and type filters are excluded since they break
     /// chronological ordering which the frontend relies on for running balance calculation.
-    #[instrument(skip(self, filters), fields(user_id = %abbrev_uuid(&user_id), count = count), err)]
+    #[instrument(level = "debug", skip(self, filters), fields(user_id = %abbrev_uuid(&user_id), count = count), err)]
     pub async fn sum_recent_transactions_grouped(&mut self, user_id: UserId, count: i64, filters: &TransactionFilters) -> Result<Decimal> {
         // Sum from the same UNION view used by list_transactions_with_batches
         // All batch aggregates are usage type (negative), non-batched follow normal signing rules
@@ -841,7 +841,7 @@ impl<'c> Credits<'c> {
 
     /// List transactions with batch grouping applied using pre-aggregated batch_aggregates table.
     /// Uses optimized query with pre-limited UNION branches for O(limit) performance.
-    #[instrument(skip(self, filters), fields(user_id = %abbrev_uuid(&user_id), skip = skip, limit = limit), err)]
+    #[instrument(level = "debug", skip(self, filters), fields(user_id = %abbrev_uuid(&user_id), skip = skip, limit = limit), err)]
     pub async fn list_transactions_with_batches(
         &mut self,
         user_id: UserId,
