@@ -1425,6 +1425,61 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_strict_sanitized_errors_keep_the_caller_and_name_the_provider() {
+        use std::collections::HashMap;
+        use tower::ServiceExt;
+
+        let attribution = |mock: MockHttpClient| async move {
+            let targets = fallback_targets("gpt-4", 1, vec![]);
+            targets.key_labels.insert(
+                "sk-acct".to_string(),
+                HashMap::from([(serving::ACCOUNT_LABEL.to_string(), "acct-1".to_string())]),
+            );
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-acct")
+                .body(axum::body::Body::from(
+                    json!({"model": "gpt-4", "messages": [{"role": "user", "content": "Hello"}]})
+                        .to_string(),
+                ))
+                .unwrap();
+            let response = crate::strict::build_strict_router(AppState::with_client(targets, mock))
+                .oneshot(request)
+                .await
+                .unwrap();
+            let account = response
+                .extensions()
+                .get::<crate::RequestIdentity>()
+                .and_then(|identity| identity.account_id.clone());
+            (
+                response.status().as_u16(),
+                account,
+                response.extensions().get::<crate::ErrorOrigin>().cloned(),
+            )
+        };
+        let expected = |status| {
+            (
+                status,
+                Some("acct-1".to_string()),
+                Some(crate::ErrorOrigin::Provider),
+            )
+        };
+
+        // A success body that is not a chat completion becomes a fresh 502.
+        let malformed = MockHttpClient::new(StatusCode::OK, "not a completion");
+        assert_eq!(attribution(malformed).await, expected(502));
+
+        // An untrusted provider's error is replaced by a standard one.
+        let rejected = MockHttpClient::new(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"provider detail"}}"#,
+        );
+        assert_eq!(attribution(rejected).await, expected(400));
+    }
+
     /// Strict-mode `Targets` with one alias backed by a fallback pool of `n`
     /// identical providers (all hit the shared mock client), configured to retry
     /// on the given upstream `on_status` codes.
