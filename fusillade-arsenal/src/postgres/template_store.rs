@@ -285,4 +285,69 @@ mod tests {
         .unwrap();
         assert!(matches);
     }
+
+    /// Extending the runway attaches a partition, which waits for every open
+    /// transaction that has written `files`. It must give up quickly rather
+    /// than queue every new write to `files` behind it until that
+    /// transaction ends.
+    #[sqlx::test]
+    async fn runway_extension_does_not_stall_file_writes_behind_an_open_upload(pool: sqlx::PgPool) {
+        use std::sync::Arc;
+
+        use crate::manager::DaemonStorage;
+        use crate::{PostgresRequestManager, TestDbPools};
+
+        let manager = Arc::new(PostgresRequestManager::new(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Default::default(),
+        ));
+        // An upload keeps its transaction open after writing its files row.
+        let mut upload = pool.begin().await.unwrap();
+        sqlx::query("INSERT INTO files (name) VALUES ('open-upload')")
+            .execute(&mut *upload)
+            .await
+            .unwrap();
+
+        let extension = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.ensure_request_template_partitions(1).await }
+        });
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_locks \
+                     WHERE relation = 'files'::regclass \
+                       AND mode = 'ShareRowExclusiveLock' AND NOT granted)",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                if waiting {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the attach must wait for the open upload");
+
+        // A second upload's write completes while the first is still open.
+        timeout(
+            Duration::from_secs(10),
+            sqlx::query("INSERT INTO files (name) VALUES ('second-upload')").execute(&pool),
+        )
+        .await
+        .expect("file writes must not queue behind the attach until the upload ends")
+        .unwrap();
+        assert!(
+            extension.await.unwrap().is_err(),
+            "the attach gives up while the upload is open"
+        );
+
+        // Once the upload commits, a later tick extends the runway.
+        upload.commit().await.unwrap();
+        let (created, ahead) = manager.ensure_request_template_partitions(1).await.unwrap();
+        assert!(created >= 1);
+        assert_eq!(ahead, 2);
+    }
 }
