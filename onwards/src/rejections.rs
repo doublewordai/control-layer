@@ -12,17 +12,21 @@
 //!   strict-mode refusal made before that span exists needs an embedding
 //!   gateway's request span; the standalone server has none.
 //!
+//! An embedding gateway counts the requests its own layers refuse through the
+//! same [`RejectionContext`], so one series and one set of span attributes
+//! covers every client error the gateway decides on.
+//!
 //! Request values and bodies are never recorded.
 
 use axum::http::{HeaderMap, StatusCode};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
-use crate::{AppState, client::HttpClient, errors::OnwardsErrorResponse, serving};
+use crate::{AppState, client::HttpClient, errors::OnwardsErrorResponse, serving, target::Targets};
 
-/// What is known about a request when onwards refuses it.
+/// What is known about a request when the gateway refuses it.
 #[derive(Debug, Clone)]
-pub(crate) struct RejectionContext {
+pub struct RejectionContext {
     model: Option<String>,
     account: Option<String>,
     api_key_id: Option<Uuid>,
@@ -33,15 +37,28 @@ impl RejectionContext {
     /// The caller and traffic kind, from the request's bearer token and
     /// headers. The model is added once it resolves to a configured alias.
     pub(crate) fn from_request<T: HttpClient>(state: &AppState<T>, headers: &HeaderMap) -> Self {
-        let labels = headers
-            .get("authorization")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .and_then(|token| state.targets.key_labels.get(token));
         let dispatched = state
             .first_token_timeout_exempt_header
             .as_deref()
             .is_some_and(|header| headers.contains_key(header));
+        Self::new(&state.targets, headers, dispatched)
+    }
+
+    /// The caller, from the request's bearer token and `targets`' key labels.
+    /// `dispatched` marks traffic sent by a batch dispatcher rather than a
+    /// client waiting for the answer.
+    pub(crate) fn new(targets: &Targets, headers: &HeaderMap, dispatched: bool) -> Self {
+        let api_key = headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "));
+        Self::for_api_key(targets, api_key, dispatched)
+    }
+
+    /// As [`new`](Self::new), for a gateway that has already resolved the
+    /// request's API key under its own protocol's rules.
+    pub fn for_api_key(targets: &Targets, api_key: Option<&str>, dispatched: bool) -> Self {
+        let labels = api_key.and_then(|key| targets.key_labels.get(key));
         Self {
             model: None,
             account: labels
@@ -62,13 +79,9 @@ impl RejectionContext {
 
     /// Records the alias `model` selects, with any serving-class suffix
     /// removed, if it is configured.
-    pub(crate) fn set_model_if_configured<T: HttpClient>(
-        &mut self,
-        state: &AppState<T>,
-        model: &str,
-    ) {
+    pub fn set_model_if_configured(&mut self, targets: &Targets, model: &str) {
         if let Ok((alias, _)) = serving::split_class_suffix(model)
-            && state.targets.targets.contains_key(alias)
+            && targets.targets.contains_key(alias)
         {
             self.set_model(alias);
         }
@@ -88,7 +101,7 @@ impl RejectionContext {
     }
 
     /// Records a refusal with this status, error code and parameter.
-    pub(crate) fn record(&self, status: StatusCode, code: &str, param: Option<&str>) {
+    pub fn record(&self, status: StatusCode, code: &str, param: Option<&str>) {
         let model = self.model.as_deref().unwrap_or("");
         metrics::counter!(
             "onwards_rejections_total",

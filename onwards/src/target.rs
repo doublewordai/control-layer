@@ -1262,7 +1262,7 @@ pub struct ConfigFile {
 }
 
 /// The live-updating collection of targets.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Targets {
     /// Map of alias names to their named pools (supports load balancing, and
     /// per-request-class pools — see [`TargetPools`])

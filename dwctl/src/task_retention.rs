@@ -76,8 +76,8 @@ async fn purge_expired_batch_on_connection(connection: &mut PgConnection, batch_
 /// One sweep: repeat batches until a batch comes back short, pausing between them.
 ///
 /// Returns the total rows deleted, or `None` when another sweep held the lock. The lock is
-/// session-level on a detached connection that is closed on every exit path, so it can
-/// neither leak back into the pool nor outlive the sweep.
+/// session-level on a detached connection that is unlocked and closed on every exit path,
+/// so it can neither leak back into the pool nor outlive the sweep.
 async fn sweep(pool: &PgPool, config: &TaskRetentionConfig, shutdown: &CancellationToken) -> Result<Option<u64>, sqlx::Error> {
     let mut guard = pool.acquire().await?.detach();
     let locked: bool = match sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
@@ -96,7 +96,13 @@ async fn sweep(pool: &PgPool, config: &TaskRetentionConfig, shutdown: &Cancellat
         return Ok(None);
     }
     let result = sweep_batches(&mut guard, config, shutdown).await;
-    // Closing the session releases the advisory lock whatever happened above.
+    // Unlock explicitly so the lock is free when this returns. Closing the session would
+    // also release it, but only once the backend has exited, after `close` has returned;
+    // the close remains the fallback when the connection is already broken.
+    let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(SWEEP_LOCK_KEY)
+        .execute(&mut guard)
+        .await;
     let _ = guard.close().await;
     result.map(Some)
 }
@@ -363,6 +369,11 @@ mod tests {
         let config = TaskRetentionConfig::default();
         assert_eq!(sweep(&pool, &config, &CancellationToken::new()).await.unwrap(), None);
         assert_eq!(remaining(&pool).await.len(), 1);
+        sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(SWEEP_LOCK_KEY)
+            .execute(&mut holder)
+            .await
+            .unwrap();
         holder.close().await.unwrap();
         // With the lock released the sweep proceeds, and it releases its own lock when
         // done: a second sweep is not refused.
@@ -393,9 +404,10 @@ mod tests {
         })
         .await
         .expect("first batch should finish");
-        // Terminate only this test database's retention lock holder.
+        // Terminate only this test database's retention lock holder, waiting for it to exit
+        // so its lock is released before the final sweep below.
         let terminated: bool = sqlx::query_scalar(
-            "SELECT pg_terminate_backend(pid) FROM pg_locks
+            "SELECT pg_terminate_backend(pid, 10000) FROM pg_locks
              WHERE locktype = 'advisory' AND granted
                AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
                AND classid::bigint = ($1::bigint >> 32) AND objid::bigint = ($1::bigint & 4294967295) AND objsubid = 1",

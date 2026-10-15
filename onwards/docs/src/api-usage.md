@@ -74,3 +74,5 @@ Each rejection also sets these attributes on the current trace span, usually onw
 - `http.response.status_code`: on `onwards.request`.
 
 Request parameter values and request bodies are never recorded. A client error that reports an upstream's response isn't counted.
+
+A gateway that embeds onwards can count the requests its own layers refuse in the same series, with `onwards::rejections::RejectionContext::for_api_key`. dwctl records the refusals of its body limit, inference routing, protocol translation, prompt cache, continuation, request preparation, image normalisation and `/models` list there. A layer that only rewrites a refusal onwards made, such as dwctl's error enrichment, doesn't record it again.
