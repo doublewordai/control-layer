@@ -111,7 +111,7 @@ impl<'c> Repository for ApiKeys<'c> {
     type Id = ApiKeyId;
     type Filter = ApiKeyFilter;
 
-    #[instrument(skip(self, request), fields(name = %request.name), err)]
+    #[instrument(level = "debug", skip(self, request), fields(name = %request.name), err)]
     async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
         // Generate a secure API key
         let secret = generate_api_key();
@@ -147,7 +147,7 @@ impl<'c> Repository for ApiKeys<'c> {
         Ok(ApiKeyDBResponse::from((self.get_api_key_deployments(api_key.id).await?, api_key)))
     }
 
-    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let api_key = sqlx::query_as!(
             ApiKey,
@@ -163,7 +163,7 @@ impl<'c> Repository for ApiKeys<'c> {
         }
     }
 
-    #[instrument(skip(self, ids), fields(count = ids.len()), err)]
+    #[instrument(level = "debug", skip(self, ids), fields(count = ids.len()), err)]
     async fn get_bulk(&mut self, ids: Vec<Self::Id>) -> Result<HashMap<Self::Id, Self::Response>> {
         let api_keys = sqlx::query_as!(
             ApiKey,
@@ -181,7 +181,7 @@ impl<'c> Repository for ApiKeys<'c> {
         Ok(responses)
     }
 
-    #[instrument(skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
+    #[instrument(level = "debug", skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
         let api_keys = sqlx::query_as!(
             ApiKey,
@@ -209,7 +209,7 @@ impl<'c> Repository for ApiKeys<'c> {
         Ok(responses)
     }
 
-    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
     async fn delete(&mut self, id: Self::Id) -> Result<bool> {
         // Soft-deleting a visible key also soft-deletes its cap-scope children
         // (hidden batch keys with parent_api_key_id = id) in the same
@@ -234,7 +234,7 @@ impl<'c> Repository for ApiKeys<'c> {
         Ok(deleted)
     }
 
-    #[instrument(skip(self, request), fields(api_key_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self, request), fields(api_key_id = %abbrev_uuid(&id)), err)]
     async fn update(&mut self, id: Self::Id, request: &Self::UpdateRequest) -> Result<Self::Response> {
         // Atomic update with conditional field updates
         let api_key = sqlx::query_as!(
@@ -268,7 +268,7 @@ impl<'c> ApiKeys<'c> {
     }
 
     /// Count total API keys matching the filter
-    #[instrument(skip(self, filter), err)]
+    #[instrument(level = "debug", skip(self, filter), err)]
     pub async fn count(&mut self, filter: &ApiKeyFilter) -> Result<i64> {
         let count = sqlx::query_scalar!(
             r#"SELECT COUNT(*) FROM api_keys
@@ -293,7 +293,7 @@ impl<'c> ApiKeys<'c> {
     ///
     /// # Returns
     /// Returns Some(user_id) if found, None if the key doesn't exist
-    #[instrument(skip(self, secret), err)]
+    #[instrument(level = "debug", skip(self, secret), err)]
     pub async fn get_user_id_by_secret(&mut self, secret: &str) -> Result<Option<UserId>> {
         let user_id = sqlx::query_scalar!(
             r#"
@@ -322,7 +322,7 @@ impl<'c> ApiKeys<'c> {
     ///
     /// # Returns
     /// Returns the secret of the hidden API key
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn get_or_create_hidden_key(&mut self, user_id: UserId, purpose: ApiKeyPurpose, created_by: UserId) -> Result<String> {
         // Convert purpose enum to string for database
         let purpose_str = match purpose {
@@ -381,7 +381,7 @@ impl<'c> ApiKeys<'c> {
 
     /// Get or create a hidden API key, returning both the secret and the key's UUID.
     /// Used when the caller needs to pass the key ID to fusillade for attribution.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn get_or_create_hidden_key_with_id(
         &mut self,
         user_id: UserId,
@@ -456,7 +456,7 @@ impl<'c> ApiKeys<'c> {
     /// Called eagerly at cap-set time so the child is in onwards' key set
     /// before the first batch/flex request fires (same race-avoidance as
     /// pre-creating shared hidden keys at user creation).
-    #[instrument(skip(self), fields(parent_api_key_id = %abbrev_uuid(&parent_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(parent_api_key_id = %abbrev_uuid(&parent_id)), err)]
     pub async fn get_or_create_child_hidden_key(&mut self, parent_id: ApiKeyId) -> Result<(String, ApiKeyId)> {
         let secret = generate_api_key();
 
@@ -518,7 +518,7 @@ impl<'c> ApiKeys<'c> {
     /// stamps the shared hidden batch key unchanged. Session-authenticated
     /// callers (`authenticating_key_id = None`) always get the shared key —
     /// dashboard flows are deliberately uncapped.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&target_user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&target_user_id)), err)]
     pub async fn resolve_batch_execution_key(
         &mut self,
         target_user_id: UserId,
@@ -557,7 +557,7 @@ impl<'c> ApiKeys<'c> {
     /// child; those are the cap-set path's responsibility (see
     /// `reset_spend_window` / `get_or_create_child_hidden_key` and the
     /// contract on `EnrichedRecord::cap_scope_root` in the batcher).
-    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
     pub async fn update_spend_cap(
         &mut self,
         id: ApiKeyId,
@@ -588,7 +588,7 @@ impl<'c> ApiKeys<'c> {
     /// cap transitions from unset to set (else the scope inherits spend
     /// accumulated before/between caps and can exhaust immediately), on
     /// interval changes, and for the explicit owner "re-arm" action.
-    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&scope_root_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&scope_root_id)), err)]
     pub async fn reset_spend_window(&mut self, scope_root_id: ApiKeyId) -> Result<()> {
         sqlx::query!(
             r#"
@@ -611,7 +611,7 @@ impl<'c> ApiKeys<'c> {
     /// window's counted spend — 0 when the calendar window has rolled but no
     /// request has folded yet, NULL when the key has never folded (uncapped
     /// keys are not folded at all).
-    #[instrument(skip(self, ids), fields(count = ids.len()), err)]
+    #[instrument(level = "debug", skip(self, ids), fields(count = ids.len()), err)]
     pub async fn get_spend_states(&mut self, ids: &[ApiKeyId]) -> Result<HashMap<ApiKeyId, ApiKeySpendState>> {
         if ids.is_empty() {
             return Ok(HashMap::new());
@@ -666,7 +666,7 @@ impl<'c> ApiKeys<'c> {
     /// Note the inverse is the useful property: rotating a VISIBLE key does
     /// NOT stop batches already submitted with it — they execute on the
     /// hidden child. Callers must surface that to users.
-    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
     pub async fn rotate_secret(&mut self, id: ApiKeyId) -> Result<String> {
         let secret = generate_api_key();
         let result = sqlx::query!(
@@ -690,7 +690,7 @@ impl<'c> ApiKeys<'c> {
     /// (see migration 131). Called only by the create handler when a manager
     /// issues a key to a different user — every other insert path leaves the
     /// column at its born-revealed default.
-    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
     pub async fn mark_secret_reveal_pending(&mut self, id: ApiKeyId) -> Result<()> {
         let result = sqlx::query!(
             "UPDATE api_keys SET secret_revealed_at = NULL WHERE id = $1 AND is_deleted = false",
@@ -710,7 +710,7 @@ impl<'c> ApiKeys<'c> {
     /// exactly one caller ever gets the secret; a concurrent second reveal
     /// matches zero rows and returns None (handler surfaces a conflict). The
     /// caller performs holder/authorization checks BEFORE calling this.
-    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
     pub async fn reveal_secret_once(&mut self, id: ApiKeyId) -> Result<Option<String>> {
         let secret = sqlx::query_scalar!(
             r#"
@@ -733,7 +733,7 @@ impl<'c> ApiKeys<'c> {
     /// yanked until the periodic fallback sync (up to ~5 min). Cap-COLUMN
     /// changes don't need it (the api_keys UPDATE trigger covers those).
     /// Transactional: fires only if the surrounding transaction commits.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn notify_spend_cap_rearm(&mut self) -> Result<()> {
         let epoch_micros = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -752,7 +752,7 @@ impl<'c> ApiKeys<'c> {
     /// keys, minus the per-model free-tariff arm. Used by admission checks
     /// (batch creation pre-flight) to reject work that would only fail
     /// request-by-request at the proxy.
-    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&api_key_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&api_key_id)), err)]
     pub async fn is_scope_exhausted(&mut self, api_key_id: ApiKeyId) -> Result<bool> {
         let exhausted = sqlx::query_scalar!(
             r#"
@@ -782,7 +782,7 @@ impl<'c> ApiKeys<'c> {
     /// callers use this to translate a member into the hidden keys their
     /// batches/files are attributed to, and a member's capped-key work is
     /// stamped with the child's id, not the shared key's.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn find_hidden_key_ids(&mut self, user_id: UserId, purpose: ApiKeyPurpose, created_by: UserId) -> Result<Vec<ApiKeyId>> {
         let purpose_str = match purpose {
             ApiKeyPurpose::Platform => "platform",
@@ -813,7 +813,7 @@ impl<'c> ApiKeys<'c> {
     /// Find ALL hidden API key IDs created by a given user across all contexts (personal + orgs).
     /// This is used when a PM filters by member in personal mode — need to find all keys
     /// where `created_by = member_id` regardless of which user_id (org or personal) owns them.
-    #[instrument(skip(self), fields(created_by = %abbrev_uuid(&created_by)), err)]
+    #[instrument(level = "debug", skip(self), fields(created_by = %abbrev_uuid(&created_by)), err)]
     pub async fn find_all_hidden_key_ids_by_creator(&mut self, purpose: ApiKeyPurpose, created_by: UserId) -> Result<Vec<ApiKeyId>> {
         let purpose_str = match purpose {
             ApiKeyPurpose::Platform => "platform",
@@ -841,7 +841,7 @@ impl<'c> ApiKeys<'c> {
 
     /// Bulk lookup the `created_by` user IDs for a set of API key IDs.
     /// Returns a map from api_key_id to the user who created that key.
-    #[instrument(skip(self, key_ids), err)]
+    #[instrument(level = "debug", skip(self, key_ids), err)]
     pub async fn get_creators_by_key_ids(&mut self, key_ids: Vec<ApiKeyId>) -> Result<HashMap<ApiKeyId, UserId>> {
         if key_ids.is_empty() {
             return Ok(HashMap::new());
@@ -862,7 +862,7 @@ impl<'c> ApiKeys<'c> {
     }
 
     /// Get specific deployment IDs that an API key has access to
-    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&api_key_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&api_key_id)), err)]
     async fn get_api_key_deployments(&mut self, api_key_id: ApiKeyId) -> Result<Vec<DeploymentId>> {
         let deployment_ids = sqlx::query_scalar!(
             r#"
@@ -893,7 +893,7 @@ impl<'c> ApiKeys<'c> {
     /// unless their billing account allows negative balances.
     /// General free-model exemptions retain the legacy rule: positive open-ended
     /// general tariffs count as paid, including future and internal-purpose rows.
-    #[instrument(skip(self), fields(deployment_id = %abbrev_uuid(&deployment_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(deployment_id = %abbrev_uuid(&deployment_id)), err)]
     pub async fn get_api_keys_for_deployment_with_sufficient_credit(
         &mut self,
         deployment_id: DeploymentId,
@@ -1084,7 +1084,7 @@ impl<'c> ApiKeys<'c> {
     ///
     /// # Returns
     /// Returns a tuple of (user_id, email, purpose) if found, or None if not found
-    #[instrument(skip(self, secret), err)]
+    #[instrument(level = "debug", skip(self, secret), err)]
     pub async fn get_user_info_by_secret(&mut self, secret: &str) -> Result<Option<(UserId, String, ApiKeyPurpose)>> {
         #[derive(Debug, FromRow)]
         struct UserInfo {
@@ -1131,7 +1131,7 @@ impl<'c> ApiKeys<'c> {
 
     /// Soft-delete all API keys created by a member for an organization.
     /// Returns the number of keys deleted.
-    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), member_id = %abbrev_uuid(&member_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(org_id = %abbrev_uuid(&org_id), member_id = %abbrev_uuid(&member_id)), err)]
     pub async fn soft_delete_member_org_keys(&mut self, org_id: UserId, member_id: UserId) -> Result<u64> {
         let result = sqlx::query!(
             "UPDATE api_keys SET is_deleted = true WHERE user_id = $1 AND created_by = $2 AND is_deleted = false",

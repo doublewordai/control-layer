@@ -1301,7 +1301,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     ///
     /// Returns the number of requests that were unclaimed. Limited by `unclaim_batch_size`
     /// to prevent unbounded database load when many requests become stale simultaneously.
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn unclaim_stale_requests(&self) -> Result<usize> {
         let claim_timeout_ms = self.config.claim_timeout_ms as i64;
         let processing_timeout_ms = self.config.processing_timeout_ms as i64;
@@ -2390,7 +2390,11 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Ok(result)
     }
 
-    #[tracing::instrument(skip(self, available_capacity, user_active_counts), fields(limit))]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, available_capacity, user_active_counts),
+        fields(limit)
+    )]
     async fn claim_batchless_requests(
         &self,
         limit: usize,
@@ -2723,6 +2727,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
     }
 
     #[tracing::instrument(
+        level = "debug",
         skip(self, available_capacity, user_active_counts),
         fields(limit, batch_limit)
     )]
@@ -2766,6 +2771,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
     }
 
     #[tracing::instrument(
+        level = "debug",
         skip(self, available_capacity, user_active_counts),
         fields(limit, batch_limit)
     )]
@@ -3662,7 +3668,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         outcome
     }
 
-    #[tracing::instrument(skip(self, ids), fields(count = ids.len()))]
+    #[tracing::instrument(level = "debug", skip(self, ids), fields(count = ids.len()))]
     async fn get_requests(&self, ids: Vec<RequestId>) -> Result<Vec<Result<AnyRequest>>> {
         let uuid_ids: Vec<Uuid> = ids.iter().map(|id| **id).collect();
 
@@ -3912,7 +3918,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
     // File and Batch Management
     // ===================================================================
 
-    #[tracing::instrument(skip(self, templates), fields(name = %name, template_count = templates.len()))]
+    #[tracing::instrument(level = "debug", skip(self, templates), fields(name = %name, template_count = templates.len()))]
     async fn create_file(
         &self,
         name: String,
@@ -3941,7 +3947,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         }
     }
 
-    #[tracing::instrument(skip(self, stream))]
+    #[tracing::instrument(level = "debug", skip(self, stream))]
     async fn create_file_stream<S: Stream<Item = FileStreamItem> + Send + Unpin>(
         &self,
         mut stream: S,
@@ -4182,7 +4188,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Ok(FileStreamResult::Success(FileId(fid)))
     }
 
-    #[tracing::instrument(skip(self), fields(file_id = %file_id))]
+    #[tracing::instrument(level = "debug", skip(self), fields(file_id = %file_id))]
     async fn get_file(&self, file_id: FileId) -> Result<File> {
         self.retry_db_operation(|| async {
             let mut file = self
@@ -4200,7 +4206,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         .await
     }
 
-    #[tracing::instrument(skip(self), fields(file_id = %file_id))]
+    #[tracing::instrument(level = "debug", skip(self), fields(file_id = %file_id))]
     async fn get_file_from_primary_pool(&self, file_id: FileId) -> Result<File> {
         self.retry_db_operation(|| async {
             let mut file = self
@@ -4229,7 +4235,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Ok(items)
     }
 
-    #[tracing::instrument(skip(self), fields(file_id = %file_id))]
+    #[tracing::instrument(level = "debug", skip(self), fields(file_id = %file_id))]
     async fn get_file_template_stats(
         &self,
         file_id: FileId,
@@ -4263,7 +4269,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             .collect())
     }
 
-    #[tracing::instrument(skip(self), fields(file_id = %file_id, search = ?search))]
+    #[tracing::instrument(level = "debug", skip(self), fields(file_id = %file_id, search = ?search))]
     fn get_file_content_stream(
         &self,
         file_id: FileId,
@@ -4352,7 +4358,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Box::pin(ReceiverStream::new(rx))
     }
 
-    #[tracing::instrument(skip(self, filter), fields(uploaded_by = ?filter.uploaded_by, status = ?filter.status, purpose = ?filter.purpose, after = ?filter.after, limit = ?filter.limit))]
+    #[tracing::instrument(level = "debug", skip(self, filter), fields(uploaded_by = ?filter.uploaded_by, status = ?filter.status, purpose = ?filter.purpose, after = ?filter.after, limit = ?filter.limit))]
     async fn list_files(&self, filter: crate::batch::FileFilter) -> Result<Vec<File>> {
         use sqlx::QueryBuilder;
 
@@ -4576,7 +4582,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Ok(files)
     }
 
-    #[tracing::instrument(skip(self), fields(file_id = %file_id))]
+    #[tracing::instrument(level = "debug", skip(self), fields(file_id = %file_id))]
     async fn delete_file(&self, file_id: FileId) -> Result<()> {
         // Use a transaction to ensure atomicity
         let mut tx = self
@@ -5083,7 +5089,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         }
     }
 
-    #[tracing::instrument(skip(self), fields(created_by = ?filter.created_by, limit = filter.limit))]
+    #[tracing::instrument(level = "debug", skip(self), fields(created_by = ?filter.created_by, limit = filter.limit))]
     async fn list_batches(&self, filter: ListBatchesFilter) -> Result<Vec<Batch>> {
         // Resolve the cursor batch's sort keys with one primary-key lookup. A
         // missing cursor batch falls back to the first page. The priority
@@ -5208,7 +5214,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Ok(rows.into_iter().map(BatchId::from).collect())
     }
 
-    #[tracing::instrument(skip(self), fields(batch_id = %batch_id))]
+    #[tracing::instrument(level = "debug", skip(self), fields(batch_id = %batch_id))]
     async fn cancel_batch(&self, batch_id: BatchId) -> Result<()> {
         let now = Utc::now();
 
@@ -5237,7 +5243,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), fields(batch_id = %batch_id, target_state = target_state.as_str()))]
+    #[tracing::instrument(level = "debug", skip(self), fields(batch_id = %batch_id, target_state = target_state.as_str()))]
     async fn cascade_batch_state_to_requests(
         &self,
         batch_id: BatchId,
@@ -6085,7 +6091,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Ok(count)
     }
 
-    #[tracing::instrument(skip(self), fields(batch_id = %batch_id))]
+    #[tracing::instrument(level = "debug", skip(self), fields(batch_id = %batch_id))]
     async fn get_batch_requests(&self, batch_id: BatchId) -> Result<Vec<AnyRequest>> {
         let rows = sqlx::query!(
             r#"
@@ -6320,7 +6326,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Ok(results)
     }
 
-    #[tracing::instrument(skip(self), fields(batch_id = %batch_id, search = ?search, status = ?status))]
+    #[tracing::instrument(level = "debug", skip(self), fields(batch_id = %batch_id, search = ?search, status = ?status))]
     fn get_batch_results_stream(
         &self,
         batch_id: BatchId,
@@ -6351,7 +6357,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Box::pin(ReceiverStream::new(rx))
     }
 
-    #[tracing::instrument(skip(self, filter))]
+    #[tracing::instrument(level = "debug", skip(self, filter))]
     async fn list_requests(
         &self,
         filter: crate::request::ListRequestsFilter,
@@ -6359,7 +6365,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         retained_response::list_requests(self, filter).await
     }
 
-    #[tracing::instrument(skip(self, request_id))]
+    #[tracing::instrument(level = "debug", skip(self, request_id))]
     async fn get_request_detail(
         &self,
         request_id: crate::request::RequestId,

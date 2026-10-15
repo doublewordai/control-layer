@@ -190,7 +190,7 @@ impl<'c> Repository for Users<'c> {
     type Id = UserId;
     type Filter = UserFilter;
 
-    #[instrument(skip(self, request), fields(username = %request.username), err)]
+    #[instrument(level = "debug", skip(self, request), fields(username = %request.username), err)]
     async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
         // Always generate a new ID for users
         let user_id = Uuid::new_v4();
@@ -246,7 +246,7 @@ impl<'c> Repository for Users<'c> {
         Ok(UserDBResponse::from((roles_to_insert, user)))
     }
 
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&id)), err)]
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let result = sqlx::query!(
             r#"
@@ -340,7 +340,7 @@ impl<'c> Repository for Users<'c> {
         }
     }
 
-    #[instrument(skip(self, ids), fields(count = ids.len()), err)]
+    #[instrument(level = "debug", skip(self, ids), fields(count = ids.len()), err)]
     async fn get_bulk(&mut self, ids: Vec<UserId>) -> Result<std::collections::HashMap<Self::Id, UserDBResponse>> {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -440,7 +440,7 @@ impl<'c> Repository for Users<'c> {
 
         Ok(result)
     }
-    #[instrument(skip(self, filter), fields(limit = filter.limit, skip = filter.skip, search = filter.search), err)]
+    #[instrument(level = "debug", skip(self, filter), fields(limit = filter.limit, skip = filter.skip, search = filter.search), err)]
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
         use sqlx::QueryBuilder;
 
@@ -485,7 +485,7 @@ impl<'c> Repository for Users<'c> {
         Ok(result)
     }
 
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&id)), err)]
     async fn delete(&mut self, id: Self::Id) -> Result<bool> {
         // Soft delete with GDPR-compliant data scrubbing
         // We scrub all personal information but keep the record for referential integrity
@@ -676,7 +676,7 @@ impl<'c> Repository for Users<'c> {
         Ok(result.rows_affected() > 0)
     }
 
-    #[instrument(skip(self, request), fields(user_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self, request), fields(user_id = %abbrev_uuid(&id)), err)]
     async fn update(&mut self, id: Self::Id, request: &Self::UpdateRequest) -> Result<Self::Response> {
         // This update touches multiple tables, so regardless of the connection passed in, we still need a transaction.
 
@@ -805,7 +805,7 @@ impl<'c> Users<'c> {
         Self { db }
     }
 
-    #[instrument(skip(self, filter), fields(search = filter.search), err)]
+    #[instrument(level = "debug", skip(self, filter), fields(search = filter.search), err)]
     pub async fn count(&mut self, filter: &UserFilter) -> Result<i64> {
         use sqlx::QueryBuilder;
 
@@ -830,7 +830,7 @@ impl<'c> Users<'c> {
         Ok(count.0)
     }
 
-    #[instrument(skip(self, email), err)]
+    #[instrument(level = "debug", skip(self, email), err)]
     pub async fn get_user_by_email(&mut self, email: &str) -> Result<Option<UserDBResponse>> {
         let user = sqlx::query_as!(
             User,
@@ -854,7 +854,7 @@ impl<'c> Users<'c> {
         }
     }
 
-    #[instrument(skip(self, external_user_id), err)]
+    #[instrument(level = "debug", skip(self, external_user_id), err)]
     pub async fn get_user_by_external_user_id(&mut self, external_user_id: &str) -> Result<Option<UserDBResponse>> {
         let user = sqlx::query_as!(
             User,
@@ -879,7 +879,7 @@ impl<'c> Users<'c> {
     }
 
     /// Update a user's email address
-    #[instrument(skip(self, email), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self, email), fields(user_id = %abbrev_uuid(&user_id)), err)]
     async fn update_user_email(&mut self, user_id: UserId, email: &str) -> Result<()> {
         sqlx::query!("UPDATE users SET email = $1 WHERE id = $2", email, user_id)
             .execute(&mut *self.db)
@@ -888,7 +888,7 @@ impl<'c> Users<'c> {
     }
 
     /// Update a user's external_user_id
-    #[instrument(skip(self, external_user_id), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self, external_user_id), fields(user_id = %abbrev_uuid(&user_id)), err)]
     async fn update_user_external_id(&mut self, user_id: UserId, external_user_id: &str) -> Result<()> {
         sqlx::query!("UPDATE users SET external_user_id = $1 WHERE id = $2", external_user_id, user_id)
             .execute(&mut *self.db)
@@ -906,7 +906,7 @@ impl<'c> Users<'c> {
     /// Email is required for user creation. Groups are synced if provided (along with provider).
     ///
     /// Returns a tuple of (user, was_created) where was_created is true if a new user was created.
-    #[instrument(skip(self, external_user_id, email, groups_and_provider, default_roles), err)]
+    #[instrument(level = "debug", skip(self, external_user_id, email, groups_and_provider, default_roles), err)]
     pub async fn get_or_create_proxy_header_user(
         &mut self,
         external_user_id: &str,
@@ -1030,7 +1030,7 @@ impl<'c> Users<'c> {
     }
 
     /// Mark that the first-batch welcome email has been sent for a user.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn mark_first_batch_email_sent(&mut self, user_id: UserId) -> Result<()> {
         sqlx::query!("UPDATE users SET first_batch_email_sent = true WHERE id = $1", user_id)
             .execute(&mut *self.db)
@@ -1039,7 +1039,7 @@ impl<'c> Users<'c> {
     }
 
     /// Return all users who have a low-balance threshold configured.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn users_with_low_balance_threshold(&mut self) -> Result<Vec<LowBalanceUser>> {
         let rows = sqlx::query_as!(
             LowBalanceUser,
@@ -1062,7 +1062,7 @@ impl<'c> Users<'c> {
     }
 
     /// Mark that low-balance notifications have been sent for the given users.
-    #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
+    #[instrument(level = "debug", skip(self, user_ids), fields(count = user_ids.len()), err)]
     pub async fn mark_low_balance_notification_sent(&mut self, user_ids: &[UserId]) -> Result<()> {
         sqlx::query!("UPDATE users SET low_balance_notification_sent = true WHERE id = ANY($1)", user_ids)
             .execute(&mut *self.db)
@@ -1071,7 +1071,7 @@ impl<'c> Users<'c> {
     }
 
     /// Clear the low-balance notification flag for users who have recovered.
-    #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
+    #[instrument(level = "debug", skip(self, user_ids), fields(count = user_ids.len()), err)]
     pub async fn clear_low_balance_notification_sent(&mut self, user_ids: &[UserId]) -> Result<()> {
         sqlx::query!(
             "UPDATE users SET low_balance_notification_sent = false WHERE id = ANY($1)",
@@ -1083,7 +1083,7 @@ impl<'c> Users<'c> {
     }
 
     /// Mark that the auto top-up monthly limit notification has been sent for the given users.
-    #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
+    #[instrument(level = "debug", skip(self, user_ids), fields(count = user_ids.len()), err)]
     pub async fn mark_auto_topup_limit_notification_sent(&mut self, user_ids: &[UserId]) -> Result<()> {
         sqlx::query!(
             "UPDATE users SET auto_topup_limit_notification_sent = true WHERE id = ANY($1)",
@@ -1096,7 +1096,7 @@ impl<'c> Users<'c> {
 
     /// Clear the auto top-up monthly limit notification flag.
     /// Called when the user changes their limit or at month rollover.
-    #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
+    #[instrument(level = "debug", skip(self, user_ids), fields(count = user_ids.len()), err)]
     pub async fn clear_auto_topup_limit_notification_sent(&mut self, user_ids: &[UserId]) -> Result<()> {
         sqlx::query!(
             "UPDATE users SET auto_topup_limit_notification_sent = false WHERE id = ANY($1)",
@@ -1109,7 +1109,7 @@ impl<'c> Users<'c> {
 
     /// Clear recovered users and fetch low-balance users in one round-trip.
     /// Uses the cached checkpoint balance — good enough for notification thresholds.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn poll_low_balance_users(&mut self) -> Result<Vec<LowBalanceUser>> {
         let rows = sqlx::query_as!(
             LowBalanceUser,
@@ -1143,7 +1143,7 @@ impl<'c> Users<'c> {
     }
 
     /// Return all users who have auto top-up fully configured (threshold + amount + payment method).
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn users_with_auto_topup_enabled(&mut self) -> Result<Vec<AutoTopupUser>> {
         let rows = sqlx::query_as!(
             AutoTopupUser,
@@ -1176,7 +1176,7 @@ impl<'c> Users<'c> {
     /// Apply a soft auto-top-up decline if the caller's observed failure count
     /// is still current. Returns false when another poller already applied the
     /// same decline transition.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id), expected_failure_count), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id), expected_failure_count), err)]
     pub async fn apply_auto_topup_soft_decline(
         &mut self,
         user_id: UserId,
@@ -1230,7 +1230,7 @@ impl<'c> Users<'c> {
     /// it as a card decline.
     ///
     /// Returns false when another poller already applied the pause.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn pause_auto_topup_after_provider_failure(&mut self, user_id: UserId, retry_delay: Duration) -> Result<bool> {
         let result = sqlx::query(
             r#"
@@ -1254,7 +1254,7 @@ impl<'c> Users<'c> {
     /// Disable auto top-up after a hard card decline.
     ///
     /// Returns false when auto top-up was already disabled by another poller.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn disable_auto_topup_after_hard_decline(&mut self, user_id: UserId) -> Result<bool> {
         let result = sqlx::query!(
             r#"
@@ -1278,7 +1278,7 @@ impl<'c> Users<'c> {
     }
 
     /// Clear decline backoff state after a successful charge.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn reset_auto_topup_failure_state(&mut self, user_id: UserId) -> Result<()> {
         sqlx::query!(
             r#"
@@ -1299,7 +1299,7 @@ impl<'c> Users<'c> {
 
     /// Set the payment provider ID for a user if it's not already set
     /// Returns true if the ID was updated, false if the user already had one or user not found
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn set_payment_provider_id_if_empty(&mut self, user_id: UserId, payment_provider_id: &str) -> Result<bool> {
         let rows_affected = sqlx::query!(
             "UPDATE users SET payment_provider_id = $1 WHERE id = $2 AND payment_provider_id IS NULL",
@@ -1317,7 +1317,7 @@ impl<'c> Users<'c> {
     /// real money has moved (completed checkout, successful auto-topup charge).
     /// The onwards sync uses this flag to pick between the verified and unverified
     /// rate-limit tiers.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn set_verified(&mut self, user_id: UserId) -> Result<bool> {
         let rows_affected = sqlx::query!("UPDATE users SET verified = true WHERE id = $1 AND verified = false", user_id)
             .execute(&mut *self.db)
@@ -1330,7 +1330,7 @@ impl<'c> Users<'c> {
     /// Whether a user (or organization) is verified. A single-row primary-key
     /// lookup used on the submission path to gate the unverified upload-volume
     /// cap. A missing row counts as unverified.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn is_verified(&mut self, user_id: UserId) -> Result<bool> {
         let verified = sqlx::query_scalar!("SELECT verified FROM users WHERE id = $1", user_id)
             .fetch_optional(&mut *self.db)

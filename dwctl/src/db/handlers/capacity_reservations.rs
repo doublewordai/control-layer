@@ -25,7 +25,7 @@ impl<'c> BatchCapacityReservations<'c> {
     /// reservations closes that gap; the worst case is a batch counted twice,
     /// which only errs towards under-acceptance. `released_since` must come
     /// from the same clock as `released_at` (this database's `now()`).
-    #[instrument(skip(self, model_ids), fields(count = model_ids.len()), err)]
+    #[instrument(level = "debug", skip(self, model_ids), fields(count = model_ids.len()), err)]
     pub async fn sum_active_by_model_window(
         &mut self,
         model_ids: &[Uuid],
@@ -57,7 +57,7 @@ impl<'c> BatchCapacityReservations<'c> {
         Ok(rows.into_iter().map(|r| (r.model_id, r.reserved.unwrap_or(0))).collect())
     }
 
-    #[instrument(skip(self, rows), fields(count = rows.len()), err)]
+    #[instrument(level = "debug", skip(self, rows), fields(count = rows.len()), err)]
     pub async fn insert_reservations(&mut self, rows: &[(Uuid, &str, i64, DateTime<Utc>)]) -> Result<Vec<Uuid>> {
         if rows.is_empty() {
             return Ok(vec![]);
@@ -86,7 +86,7 @@ impl<'c> BatchCapacityReservations<'c> {
         Ok(ids)
     }
 
-    #[instrument(skip(self, ids), fields(count = ids.len()), err)]
+    #[instrument(level = "debug", skip(self, ids), fields(count = ids.len()), err)]
     pub async fn release_reservations(&mut self, ids: &[Uuid]) -> Result<()> {
         if ids.is_empty() {
             return Ok(());
