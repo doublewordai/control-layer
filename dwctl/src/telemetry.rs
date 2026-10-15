@@ -77,6 +77,7 @@
 //! export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic%20<token>"
 //! ```
 
+use axum::{extract::Request, middleware::Next, response::Response};
 use onwards::{ErrorOrigin, RequestIdentity, ServedBy};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
@@ -88,6 +89,8 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+
+use crate::inference::rejections::RejectionCode;
 
 /// Default span queue size when `OTEL_BSP_MAX_QUEUE_SIZE` is unset. The SDK
 /// default (2048) dropped most spans in a large batch's dispatch burst.
@@ -108,14 +111,43 @@ fn batch_config() -> BatchConfig {
     builder.build()
 }
 
+/// The completion window the batch daemon stamps on a request it dispatches,
+/// carried onto the response so the root span can record it once the key
+/// behind the request says it is batch traffic.
+#[derive(Clone, Debug)]
+pub struct BatchCompletionWindow(String);
+
+/// Copies `x-fusillade-batch-completion-window` onto the response as a
+/// [`BatchCompletionWindow`].
+pub async fn carry_batch_completion_window(request: Request, next: Next) -> Response {
+    let window = request
+        .headers()
+        .get("x-fusillade-batch-completion-window")
+        .and_then(|value| value.to_str().ok())
+        .map(|window| BatchCompletionWindow(window.to_string()));
+    let mut response = next.run(request).await;
+    if let Some(window) = window {
+        response.extensions_mut().insert(window);
+    }
+    response
+}
+
 /// Records who made an AI request, and where an error came from, on the root
 /// request span. Reads the extensions onwards attaches to its responses, so it
-/// covers successes, gateway refusals and provider errors alike. A request
-/// whose key was not recognised (401) has no identity and records none, and an
-/// error that did not pass through onwards has no source.
+/// covers successes, gateway refusals and provider errors alike, and the code
+/// a dwctl layer refused a request with. A request whose key was not
+/// recognised (401) has no identity and records none, and an error neither
+/// onwards nor a dwctl layer decided on has no source.
 pub fn record_ai_response_attributes<B>(response: &axum::http::Response<B>, span: &tracing::Span, status: u16) {
     let extensions = response.extensions();
     if let Some(identity) = extensions.get::<RequestIdentity>() {
+        // Batch keys are hidden and held only by the batch daemon, so the key,
+        // not a header any caller can send, says whether this is batch traffic.
+        let batch = identity.key_purpose.as_deref() == Some("batch");
+        span.set_attribute("doubleword.traffic", if batch { "batch" } else { "realtime" });
+        if batch && let Some(BatchCompletionWindow(window)) = extensions.get() {
+            span.set_attribute("doubleword.batch.completion_window", window.clone());
+        }
         let attrs = [
             ("doubleword.account_id", identity.account_id.clone()),
             ("doubleword.account_name", identity.account_name.clone()),
@@ -130,13 +162,16 @@ pub fn record_ai_response_attributes<B>(response: &axum::http::Response<B>, span
         }
     }
     if status >= 400 {
-        let (source, code) = match extensions.get::<ErrorOrigin>() {
-            Some(ErrorOrigin::Provider) => ("provider", None),
-            Some(ErrorOrigin::Gateway { code }) => ("gateway", Some(code.clone())),
+        let (source, code) = match (extensions.get::<ErrorOrigin>(), extensions.get::<RejectionCode>()) {
+            (Some(ErrorOrigin::Provider), _) => ("provider", None),
+            (Some(ErrorOrigin::Gateway { code }), _) => ("gateway", Some(code.clone())),
+            // Refused by a dwctl layer, before or instead of onwards.
+            (None, Some(rejection)) => ("gateway", Some(rejection.code().to_string())),
             // An upstream's response passed through unchanged.
-            None if extensions.get::<ServedBy>().is_some() => ("provider", None),
-            // Not produced by onwards (admin API, or refused before it ran).
-            None => return,
+            (None, None) if extensions.get::<ServedBy>().is_some() => ("provider", None),
+            // Not produced by onwards or a dwctl layer (admin API, or refused
+            // before either ran).
+            (None, None) => return,
         };
         span.set_attribute("doubleword.error.source", source);
         if let Some(code) = code.filter(|code| !code.is_empty()) {

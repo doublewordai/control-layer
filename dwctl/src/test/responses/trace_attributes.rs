@@ -132,20 +132,40 @@ async fn customer_attributes_on_request_spans(pool: sqlx::PgPool) {
     assert_eq!(attr(inner, "onwards.key_purpose").as_deref(), Some("realtime"));
     assert_eq!(attr(inner, "http.response.status_code").as_deref(), Some("200"));
 
-    // Dispatched by the batch daemon: traffic is batch, with its window.
-    server
-        .post(path_chat)
-        .add_header("Authorization", &auth)
-        .add_header("x-fusillade-batch-created-at", "2026-01-01T00:00:00Z")
-        .add_header("x-fusillade-batch-completion-window", "24h")
-        .json(&chat)
-        .await
-        .assert_status_ok();
+    // The batch daemon's headers from a realtime key do not make it batch
+    // traffic: any caller can send them.
+    let dispatched = |key: &str| {
+        server
+            .post(path_chat)
+            .add_header("Authorization", format!("Bearer {key}"))
+            .add_header("x-fusillade-batch-created-at", "2026-01-01T00:00:00Z")
+            .add_header("x-fusillade-batch-completion-window", "24h")
+            .json(&chat)
+    };
+    dispatched(&key).await.assert_status_ok();
+    let spans = take(&provider, &exported);
+    let request = root(&spans, path_chat);
+    assert_eq!(attr(request, "doubleword.traffic").as_deref(), Some("realtime"));
+    assert_eq!(attr(request, "doubleword.batch.completion_window"), None);
+
+    // Dispatched by the batch daemon with the account's batch key: traffic is
+    // batch, with its window.
+    let set_purpose = |purpose: &'static str| {
+        sqlx::query("UPDATE api_keys SET purpose = $1 WHERE id = $2")
+            .bind(purpose)
+            .bind(key_id)
+            .execute(&pool)
+    };
+    set_purpose("batch").await.unwrap();
+    bg.sync_onwards_config(&pool).await.unwrap();
+    dispatched(&key).await.assert_status_ok();
     let spans = take(&provider, &exported);
     let request = root(&spans, path_chat);
     assert_eq!(attr(request, "doubleword.traffic").as_deref(), Some("batch"));
     assert_eq!(attr(request, "doubleword.batch.completion_window").as_deref(), Some("24h"));
     assert_eq!(attr(request, "doubleword.account_id"), Some(owner.to_string()));
+    set_purpose("realtime").await.unwrap();
+    bg.sync_onwards_config(&pool).await.unwrap();
 
     // A gateway refusal (unknown model): source and code are recorded next to
     // the account, and onwards' own span keeps its rejection attributes.
@@ -166,6 +186,19 @@ async fn customer_attributes_on_request_spans(pool: sqlx::PgPool) {
     assert_eq!(attr(inner, "onwards.account"), Some(owner.to_string()));
     assert_eq!(attr(inner, "onwards.api_key_id"), Some(key_id.to_string()));
     assert_eq!(attr(inner, "http.response.status_code").as_deref(), Some("404"));
+
+    // A dwctl layer's refusal, before onwards runs, is a gateway decision too.
+    let invalid = server
+        .post(path_chat)
+        .add_header("Authorization", &auth)
+        .content_type("application/json")
+        .text("not json")
+        .await;
+    assert_eq!(invalid.status_code().as_u16(), 400);
+    let spans = take(&provider, &exported);
+    let request = root(&spans, path_chat);
+    assert_eq!(attr(request, "doubleword.error.source").as_deref(), Some("gateway"));
+    assert_eq!(attr(request, "doubleword.rejection.code").as_deref(), Some("invalid_json"));
 
     // A provider-side 4xx: source is provider, with account and model on the
     // same span, and no gateway rejection code.
@@ -203,12 +236,13 @@ async fn customer_attributes_on_request_spans(pool: sqlx::PgPool) {
     assert_eq!(attr(request, "doubleword.error.source").as_deref(), Some("gateway"));
     assert_eq!(attr(request, "doubleword.rejection.code").as_deref(), Some("model_access_denied"));
 
-    // An unknown key is a 401 with no identity.
-    server
+    // A key onwards does not know is refused (403) with no identity.
+    let unknown = server
         .post(path_chat)
         .add_header("Authorization", "Bearer sk-not-a-key")
         .json(&chat)
         .await;
+    assert_eq!(unknown.status_code().as_u16(), 403);
     let spans = take(&provider, &exported);
     let request = root(&spans, path_chat);
     assert_eq!(attr(request, "doubleword.account_id"), None);

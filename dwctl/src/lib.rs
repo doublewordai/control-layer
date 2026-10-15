@@ -2610,6 +2610,10 @@ pub async fn build_router(
         crate::inference::body_limit::limit_inference_body,
     ));
 
+    // The root span records a batch request's completion window once the
+    // response names a batch key.
+    let onwards_router = onwards_router.layer(middleware::from_fn(crate::telemetry::carry_batch_completion_window));
+
     // Outermost, so every layer above can count the requests it refuses
     // alongside onwards' own (`onwards_rejections_total`).
     let onwards_router = onwards_router.layer(axum::Extension(crate::inference::rejections::Recorder::new(
@@ -2844,19 +2848,6 @@ pub async fn build_router(
                 span.set_attribute("http.route", route.unwrap_or_default());
                 span.set_attribute("url.path", path.to_string());
                 span.set_attribute("url.query", request.uri().query().unwrap_or("").to_string());
-                if api_type == "ai_proxy" {
-                    // The batch daemon stamps every request it dispatches with this header.
-                    let dispatched = request.headers().contains_key("x-fusillade-batch-created-at");
-                    span.set_attribute("doubleword.traffic", if dispatched { "batch" } else { "realtime" });
-                    if let Some(window) = request
-                        .headers()
-                        .get("x-fusillade-batch-completion-window")
-                        .and_then(|value| value.to_str().ok())
-                        .filter(|_| dispatched)
-                    {
-                        span.set_attribute("doubleword.batch.completion_window", window.to_string());
-                    }
-                }
                 span
             })
             .on_request(tower_http::trace::DefaultOnRequest::new().level(tracing::Level::TRACE))
