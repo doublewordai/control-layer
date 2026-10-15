@@ -159,6 +159,11 @@ pub struct UsageMetrics {
     /// place per-request routing attribution is knowable. `None` when the
     /// request never reached an upstream (or predates the extension).
     pub served_by: Option<String>,
+    /// The model name onwards sent upstream for the request (the `onwards_model`
+    /// of the onwards `ServedBy` extension): for a composite model, the selected
+    /// component's own model, after any fallback. `None` when no upstream answered
+    /// or the target has no model rewrite.
+    pub served_model: Option<String>,
     /// Cached-prompt count as reported by the UPSTREAM in
     /// `usage.prompt_tokens_details.cached_tokens` (SGLang/vLLM through the dynamo
     /// frontend, OpenAI-compatible providers). Observational only: distinct from
@@ -610,6 +615,10 @@ impl UsageMetrics {
             server_address: config.host.clone(),
             server_port: config.port,
             served_by: response_data.extensions.get::<onwards::ServedBy>().map(|s| s.url.clone()),
+            served_model: response_data
+                .extensions
+                .get::<onwards::ServedBy>()
+                .and_then(|s| s.onwards_model.clone()),
             engine_cached_tokens,
             cache_read_source: extract_cache_read_source(response_data),
             request_params,
@@ -1778,6 +1787,7 @@ mod tests {
             &crate::config::Config::default(),
         );
         assert_eq!(metrics.served_by.as_deref(), Some("https://router.requesty.ai/v1"));
+        assert_eq!(metrics.served_model.as_deref(), Some("policy/glm-5.2"));
 
         // Absent extension → None (request never reached an upstream).
         let response_data_no_ext = ResponseData {
@@ -1799,6 +1809,7 @@ mod tests {
             &crate::config::Config::default(),
         );
         assert_eq!(metrics.served_by, None);
+        assert_eq!(metrics.served_model, None);
     }
 
     #[test]

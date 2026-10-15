@@ -316,6 +316,7 @@ impl RequestHandler for AnalyticsHandler {
                 server_address: metrics.server_address,
                 server_port: metrics.server_port,
                 served_by: metrics.served_by,
+                served_model: metrics.served_model,
                 requested_serving_class: metrics.requested_serving_class,
                 resolved_serving_class: metrics.resolved_serving_class,
                 api_key_id,
