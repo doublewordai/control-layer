@@ -12,8 +12,9 @@
 //! A [`Recorder`] is installed as a request extension around the whole
 //! inference stack. A layer that refuses a request passes its response through
 //! [`refuse`], which records the refusal and tags the response with its
-//! [`RejectionCode`], so the request span reports that code rather than the
-//! bare status. A 4xx a layer only passes on or reshapes (onwards' own, or an
+//! [`RejectionCode`] and, when the key is known, the caller's
+//! [`onwards::RequestIdentity`], so the request span reports that code and the
+//! account rather than the bare status. A 4xx a layer only passes on or reshapes (onwards' own, or an
 //! upstream's) is not recorded again.
 
 use axum::{
@@ -38,6 +39,11 @@ pub struct Recorder {
 impl Recorder {
     pub fn new(targets: Targets) -> Self {
         Self { targets }
+    }
+
+    /// See [`Targets::configured_alias`].
+    pub fn configured_alias<'m>(&self, model: &'m str) -> Option<&'m str> {
+        self.targets.configured_alias(model)
     }
 }
 
@@ -127,6 +133,11 @@ impl Scope {
             }
             context.record(response.status(), code, param);
             recorded_on = tracing::Span::current().id();
+            // Names the caller on the root request span, as onwards' own
+            // refusals do.
+            if let Some(identity) = context.identity() {
+                response.extensions_mut().insert(identity);
+            }
         }
         response.extensions_mut().insert(RejectionCode { code, recorded_on });
         response
@@ -253,8 +264,9 @@ mod tests {
 
     #[test]
     fn counts_configured_models_and_dispatched_traffic() {
-        let (lines, code) = rejections(async {
+        let (lines, (code, identities)) = rejections(async {
             let mut code = None;
+            let mut identities = Vec::new();
             for (model, dispatched) in [("known-model:interactive", false), ("not-configured", true)] {
                 let mut request = Request::post("/chat/completions").header("authorization", "Bearer sk-test");
                 if dispatched {
@@ -263,10 +275,20 @@ mod tests {
                 let body = serde_json::json!({"model": model}).to_string();
                 let response = app().oneshot(request.body(Body::from(body)).unwrap()).await.unwrap();
                 code = response.extensions().get::<RejectionCode>().map(RejectionCode::code);
+                identities.push(response.extensions().get::<onwards::RequestIdentity>().cloned());
             }
-            code
+            (code, identities)
         });
         assert_eq!(code, Some("some_code"), "the response carries its code");
+        let [configured, unconfigured] = identities.try_into().unwrap();
+        let configured = configured.expect("the response names the caller");
+        assert_eq!(configured.account_id.as_deref(), Some("acct-1"));
+        assert_eq!(configured.model.as_deref(), Some("known-model"));
+        assert_eq!(
+            unconfigured.expect("the response names the caller").model,
+            None,
+            "unconfigured models are not labelled"
+        );
         let realtime = lines.iter().find(|line| line.contains("traffic=\"realtime\"")).unwrap();
         assert!(realtime.contains("model=\"known-model\""), "{realtime}");
         assert!(
@@ -289,6 +311,19 @@ mod tests {
                 .unwrap();
         });
         assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    #[test]
+    fn names_no_caller_for_an_unknown_key() {
+        let (_, identity) = rejections(async {
+            let request = Request::post("/chat/completions")
+                .header("authorization", "Bearer sk-unknown")
+                .body(Body::from(r#"{"model": "known-model"}"#))
+                .unwrap();
+            let response = app().oneshot(request).await.unwrap();
+            response.extensions().get::<onwards::RequestIdentity>().cloned()
+        });
+        assert_eq!(identity, None);
     }
 
     #[test]

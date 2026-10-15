@@ -68,6 +68,29 @@ use super::utils::{
     estimate_output_file_size,
 };
 
+/// A bounded, content-free class for a stored failure: `http_<status>` when a
+/// status is known (from the stored response or the serialized
+/// [`FailureReason`]), else the failure's type tag, else `unknown`.
+fn failure_class(response_status: Option<i16>, error: Option<&str>) -> String {
+    if let Some(status) = response_status {
+        return format!("http_{status}");
+    }
+    let Some(reason) = error.and_then(|e| serde_json::from_str::<FailureReason>(e).ok()) else {
+        return "unknown".to_string();
+    };
+    match reason {
+        FailureReason::RetriableHttpStatus { status, .. }
+        | FailureReason::NonRetriableHttpStatus { status, .. } => {
+            format!("http_{status}")
+        }
+        FailureReason::NetworkError { .. } => "network_error".to_string(),
+        FailureReason::Timeout { .. } => "timeout".to_string(),
+        FailureReason::TaskTerminated => "task_terminated".to_string(),
+        FailureReason::RequestBuilderError { .. } => "request_builder_error".to_string(),
+        FailureReason::BatchTerminated => "batch_terminated".to_string(),
+    }
+}
+
 /// Strip fusillade-routing-only fields from a request body before storing it
 /// in the request template store. The daemon sends the stored body verbatim, so this
 /// is the single chokepoint that decides what goes on the wire.
@@ -7618,6 +7641,67 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             .collect())
     }
 
+    /// One failure class per batch, for batches that have at least one failed
+    /// request: `http_<status>` for an HTTP failure, otherwise the failure
+    /// type (`network_error`, `timeout`, ...) or `unknown`. Batches without
+    /// failed requests are absent from the map.
+    ///
+    /// Meant for labelling telemetry about fully failed batches, so only the
+    /// class is derived from the stored failure; error text and response
+    /// bodies, which can echo request content, never leave this function.
+    /// Frozen batches may already have been archived, so the archive is
+    /// consulted when the live table has no failed row.
+    pub async fn failed_batch_sample_classes(
+        &self,
+        batch_ids: &[BatchId],
+    ) -> Result<std::collections::HashMap<BatchId, String>> {
+        if batch_ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let ids: Vec<Uuid> = batch_ids.iter().map(|id| **id).collect();
+        let rows = sqlx::query(
+            r#"
+            SELECT t.id AS batch_id,
+                   COALESCE(l.response_status, a.response_status) AS response_status,
+                   COALESCE(l.error, a.error) AS error
+            FROM batches t
+            LEFT JOIN LATERAL (
+                SELECT true AS found, r.response_status, r.error
+                FROM requests r
+                WHERE r.batch_id = t.id AND r.state = 'failed'
+                LIMIT 1
+            ) l ON true
+            LEFT JOIN LATERAL (
+                SELECT true AS found, x.response_status, x.error
+                FROM batch_requests_archive x
+                WHERE l.found IS NULL
+                  AND x.archive_bucket = t.archive_bucket
+                  AND x.batch_id = t.id
+                  AND x.state = 'failed'
+                LIMIT 1
+            ) a ON true
+            WHERE t.id = ANY($1)
+              AND COALESCE(l.found, a.found, false)
+            "#,
+        )
+        .bind(&ids)
+        .fetch_all(self.read_executor())
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to sample batch failures: {}", e)))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let status = row.get::<Option<i16>, _>("response_status");
+                let error = row.get::<Option<String>, _>("error");
+                (
+                    BatchId(row.get::<Uuid, _>("batch_id")),
+                    failure_class(status, error.as_deref()),
+                )
+            })
+            .collect())
+    }
+
     /// Insert a batch of templates using PostgreSQL UNNEST for bulk insertion.
     /// This is significantly faster than individual INSERTs for large template counts.
     /// The caller must have ensured this week's partition in `tx`.
@@ -14969,6 +15053,86 @@ mod tests {
         let finalized = manager.finalize_cancelled_batches(0.0, 10).await.unwrap();
         assert_eq!(finalized, 0, "zombie must be skipped, not frozen");
         assert!(frozen_at(&pool, batch_id).await.is_none());
+    }
+
+    /// The failure sample classifies a failed request without exposing its
+    /// error text, and leaves out batches whose requests all succeeded.
+    #[sqlx::test]
+    async fn test_failed_batch_sample_classes(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let failed = setup_freeze_test_batch(&manager, "sample-failed", 2).await;
+        let ok = setup_freeze_test_batch(&manager, "sample-ok", 2).await;
+        let reason = serde_json::to_string(&FailureReason::NonRetriableHttpStatus {
+            status: 422,
+            body: "secret detail".to_string(),
+        })
+        .unwrap();
+        sqlx::query!(
+            "UPDATE requests SET state = 'failed', failed_at = NOW(), error = $2 WHERE batch_id = $1",
+            *failed as Uuid,
+            reason
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query!(
+            "UPDATE requests SET state = 'completed', completed_at = NOW(), response_status = 200, response_body = '{}' WHERE batch_id = $1",
+            *ok as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            manager
+                .failed_batch_sample_classes(&[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let samples = manager
+            .failed_batch_sample_classes(&[failed, ok])
+            .await
+            .unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[&failed], "http_422");
+
+        let reason = serde_json::to_string(&FailureReason::Timeout {
+            error: "secret".to_string(),
+        })
+        .unwrap();
+        sqlx::query!(
+            "UPDATE requests SET error = $2 WHERE batch_id = $1",
+            *failed as Uuid,
+            reason
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let samples = manager
+            .failed_batch_sample_classes(&[failed])
+            .await
+            .unwrap();
+        assert_eq!(samples[&failed], "timeout");
+
+        // Once the frozen batch's rows move to the archive, they are sampled
+        // from there.
+        manager.get_batch(failed).await.unwrap(); // freeze-on-read
+        assert_eq!(
+            manager.archive_batch(failed).await.unwrap(),
+            ArchiveOutcome::Archived { rows: 2 }
+        );
+        let (_, _, live, archived) = archive_state(&pool, failed).await;
+        assert_eq!((live, archived), (0, 2));
+        let samples = manager
+            .failed_batch_sample_classes(&[failed, ok])
+            .await
+            .unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[&failed], "timeout");
     }
 
     #[sqlx::test]
