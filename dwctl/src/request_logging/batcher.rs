@@ -111,6 +111,12 @@ pub struct RawAnalyticsRecord {
     /// URL of the upstream that served the request (onwards `ServedBy`
     /// extension) — per-component attribution for composite models.
     pub served_by: Option<String>,
+    /// The model name onwards sent upstream (onwards `ServedBy::onwards_model`),
+    /// so billing can be attributed to the component model that served it.
+    /// Defaulted so outbox rows written before this field existed still
+    /// deserialise after a deploy.
+    #[serde(default)]
+    pub served_model: Option<String>,
     /// Serving class the request asked for / was served under (onwards
     /// `ServingClassOutcome` extension). See `serializers::UsageMetrics`.
     /// Defaulted so outbox rows written before these fields existed still
@@ -1123,6 +1129,7 @@ where
         let mut fusillade_batch_ids: Vec<Option<Uuid>> = Vec::new();
         let mut models: Vec<String> = Vec::new();
         let mut served_bys: Vec<String> = Vec::new();
+        let mut served_models: Vec<String> = Vec::new();
         let mut api_key_ids_credit: Vec<Option<Uuid>> = Vec::new();
         // Service tier, computed in memory from the fusillade metadata, so the
         // transactions list can label each row (realtime / flex / async / batch)
@@ -1190,6 +1197,7 @@ where
             fusillade_batch_ids.push(record.raw.fusillade_batch_id);
             models.push(model);
             served_bys.push(crate::metrics::served_by_host(record.raw.served_by.as_deref()));
+            served_models.push(record.raw.served_model.clone().unwrap_or_default());
             api_key_ids_credit.push(record.api_key_id);
             service_tiers
                 .push(compute_billing_tier(record.raw.fusillade_batch_id, record.raw.batch_completion_window.as_deref()).to_string());
@@ -1203,11 +1211,24 @@ where
 
         let expected_count = user_ids.len() as u64;
 
-        // Build a map from source_id to (index, user_id, amount, model, served_by) for metric recording
-        let source_id_to_record: HashMap<String, (usize, Uuid, Decimal, String, String)> = source_ids
+        // Build a map from source_id to (index, user_id, amount, model, served_by, served_model) for metric recording
+        type CreditMetricRecord = (usize, Uuid, Decimal, String, String, String);
+        let source_id_to_record: HashMap<String, CreditMetricRecord> = source_ids
             .iter()
             .enumerate()
-            .map(|(i, sid)| (sid.clone(), (i, user_ids[i], amounts[i], models[i].clone(), served_bys[i].clone())))
+            .map(|(i, sid)| {
+                (
+                    sid.clone(),
+                    (
+                        i,
+                        user_ids[i],
+                        amounts[i],
+                        models[i].clone(),
+                        served_bys[i].clone(),
+                        served_models[i].clone(),
+                    ),
+                )
+            })
             .collect();
 
         // Batch INSERT, folding into the read model in the same transaction.
@@ -1674,7 +1695,7 @@ where
 
         // Record metrics only for successfully inserted credit transactions
         for row in &inserted_rows {
-            if let Some((_, user_id, amount, model, served_by)) = source_id_to_record.get(&row.source_id) {
+            if let Some((_, user_id, amount, model, served_by, served_model)) = source_id_to_record.get(&row.source_id) {
                 // Nanocredits (1 credit = 1e9). Tariffs price tokens at
                 // DECIMAL(12,8), so a single token can cost 1e-8 credits; nano
                 // is the coarsest power of ten that represents every
@@ -1687,7 +1708,8 @@ where
                     "dwctl_credits_deducted_nanocredits_total",
                     "user_id" => user_id.to_string(),
                     "model" => model.clone(),
-                    "served_by" => served_by.clone()
+                    "served_by" => served_by.clone(),
+                    "served_model" => served_model.clone()
                 )
                 .increment(nanocredits);
             }
@@ -1809,6 +1831,7 @@ mod tests {
         let api_key_id = Uuid::new_v4();
         let record = RawAnalyticsRecord {
             served_by: None,
+            served_model: None,
             requested_serving_class: None,
             resolved_serving_class: None,
             instance_id: Uuid::new_v4(),
@@ -1885,6 +1908,7 @@ mod tests {
     fn cost_record(prompt: i64, completion: i64, read: i64, c5: i64, c1: i64, c24: i64) -> RawAnalyticsRecord {
         RawAnalyticsRecord {
             served_by: None,
+            served_model: None,
             requested_serving_class: None,
             resolved_serving_class: None,
             instance_id: Uuid::new_v4(),
@@ -2180,6 +2204,7 @@ mod integration_tests {
     fn create_raw_record(model: &str, api_key_id: Option<Uuid>, prompt_tokens: i64, completion_tokens: i64) -> RawAnalyticsRecord {
         RawAnalyticsRecord {
             served_by: None,
+            served_model: None,
             requested_serving_class: None,
             resolved_serving_class: None,
             instance_id: Uuid::new_v4(),
@@ -2555,6 +2580,42 @@ mod integration_tests {
         let usage_tx = transactions.iter().find(|tx| tx.transaction_type == CreditTransactionType::Usage);
         assert!(usage_tx.is_some(), "Usage transaction should be created");
         assert_eq!(usage_tx.unwrap().amount, expected_cost);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn credit_metric_names_the_model_that_served_the_request(pool: sqlx::PgPool) {
+        let model_id = create_test_model(&pool, "composite-alias").await;
+        setup_tariff(
+            &pool,
+            model_id,
+            Decimal::from_str("0.00001").unwrap(),
+            Decimal::from_str("0.00003").unwrap(),
+            ApiKeyPurpose::Realtime,
+        )
+        .await;
+        let user_id = setup_user_with_balance(&pool, Decimal::from_str("10.00").unwrap()).await;
+        let api_key = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Realtime).await;
+        let mut record = create_raw_record("composite-alias", Some(api_key), 1000, 500);
+        record.served_by = Some("http://inference.internal:3000/v1".to_string());
+        record.served_model = Some("component-model".to_string());
+
+        // The test macro runs this body on one thread, so a thread-local
+        // recorder sees the deduction.
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        run_batcher_with_records(&pool, vec![record]).await;
+
+        let rendered = handle.render();
+        let line = rendered
+            .lines()
+            .find(|l| l.starts_with("dwctl_credits_deducted_nanocredits_total{"))
+            .expect("the deduction is counted");
+        assert!(line.contains(r#"model="composite-alias""#), "{line}");
+        assert!(line.contains(r#"served_by="inference.internal""#), "{line}");
+        assert!(line.contains(r#"served_model="component-model""#), "{line}");
+        // (1000 * 0.00001) + (500 * 0.00003) = 0.025 credits.
+        assert!(line.ends_with(" 25000000"), "{line}");
     }
 
     #[dwctl_test_macros::test]
