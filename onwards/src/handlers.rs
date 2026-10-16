@@ -830,16 +830,11 @@ pub async fn target_message_handler<T: HttpClient>(
         None
     };
 
-    // Chat parameters not every worker can serve. Each is counted and recorded
-    // on the request span; the configured ones are refused here.
+    // Parameters not every worker can serve. Each is counted and recorded on
+    // the request span; the configured ones are refused here.
     let flagged_params = match body_json.as_ref() {
-        Some(body)
-            if state.targets.strict_mode
-                && canonical_request_path
-                    .trim_end_matches('/')
-                    .ends_with("/chat/completions") =>
-        {
-            crate::unsupported_params::chat_request_params(body)
+        Some(body) if state.targets.strict_mode => {
+            crate::unsupported_params::request_params(&canonical_request_path, body)
         }
         _ => Vec::new(),
     };

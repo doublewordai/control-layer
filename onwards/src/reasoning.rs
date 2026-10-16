@@ -197,7 +197,7 @@ impl fmt::Display for ReasoningError {
 impl std::error::Error for ReasoningError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ApiSurface {
+pub(crate) enum ApiSurface {
     ChatCompletions,
     Responses,
     Completions,
@@ -205,7 +205,7 @@ enum ApiSurface {
 }
 
 impl ApiSurface {
-    fn from_path(path: &str) -> Self {
+    pub(crate) fn from_path(path: &str) -> Self {
         let path = path.trim_end_matches('/');
         if path.ends_with("/chat/completions") {
             Self::ChatCompletions

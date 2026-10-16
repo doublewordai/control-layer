@@ -1445,7 +1445,8 @@ pub struct OnwardsConfig {
     /// breach without cutting it off; once breaches exceed the controller's
     /// target rate, later requests shift to the alternates. Set to 0 to disable.
     pub first_token_timeout_ms: u64,
-    /// Strict-mode chat parameters that get a 400 instead of being forwarded.
+    /// Strict-mode chat and legacy completions parameters that get a 400
+    /// instead of being forwarded.
     /// Every parameter onwards flags as not servable by every worker is counted
     /// (`onwards_unsupported_params_total`) and traced; only the ones listed
     /// here are refused. Names must come from `onwards::unsupported_params::params()`.
