@@ -14,6 +14,7 @@
 //! - Sanitizing error responses to prevent third-party info leakage
 //! - Giving every error the OpenAI envelope, including a trusted provider's
 
+use super::schema_mismatch::{self, SchemaMismatch};
 use super::schemas::chat_completions::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
     generated_chat_completion_id, normalize_chat_completion_chunk_value,
@@ -146,20 +147,27 @@ fn parse_strict_request<T: serde::de::DeserializeOwned, C: HttpClient>(
     body: &[u8],
 ) -> Result<T, Response> {
     serde_json::from_slice::<T>(body).map_err(|e| {
-        let (status, code) = if e.is_data() {
-            (StatusCode::UNPROCESSABLE_ENTITY, "schema_mismatch")
-        } else {
-            (StatusCode::BAD_REQUEST, "invalid_json")
-        };
         let model = extract_model_from_request(headers, body);
-        refused_invalid(
-            state,
-            headers,
-            model.as_deref(),
-            status,
-            code,
-            &format!("Invalid request: {e}"),
-        )
+        let message = format!("Invalid request: {e}");
+        if e.is_data() {
+            refused_mismatch(
+                state,
+                headers,
+                model.as_deref(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                schema_mismatch::locate::<T>(body),
+                &message,
+            )
+        } else {
+            refused_invalid(
+                state,
+                headers,
+                model.as_deref(),
+                StatusCode::BAD_REQUEST,
+                "invalid_json",
+                &message,
+            )
+        }
     })
 }
 
@@ -199,9 +207,48 @@ fn refused_invalid<C: HttpClient>(
     code: &str,
     message: &str,
 ) -> Response {
+    refused(state, headers, model, status, code, None, message)
+}
+
+/// Counts a body that doesn't match the schema, recording where it stopped
+/// matching (never what it contained), and names that place in the response.
+fn refused_mismatch<C: HttpClient>(
+    state: &AppState<C>,
+    headers: &HeaderMap,
+    model: Option<&str>,
+    status: StatusCode,
+    mismatch: Option<SchemaMismatch>,
+    message: &str,
+) -> Response {
+    refused(
+        state,
+        headers,
+        model,
+        status,
+        "schema_mismatch",
+        mismatch.as_ref(),
+        message,
+    )
+}
+
+fn refused<C: HttpClient>(
+    state: &AppState<C>,
+    headers: &HeaderMap,
+    model: Option<&str>,
+    status: StatusCode,
+    code: &str,
+    mismatch: Option<&SchemaMismatch>,
+    message: &str,
+) -> Response {
+    let param = mismatch.and_then(|mismatch| mismatch.path.as_deref());
     let rejection = rejection_context(state, headers, model);
-    rejection.record(status, code, None);
-    let mut response = error_response(status, "invalid_request_error", message);
+    rejection.record_with_reason(
+        status,
+        code,
+        param,
+        mismatch.map(|mismatch| mismatch.reason),
+    );
+    let mut response = error_response_with_param(status, "invalid_request_error", message, param);
     if let Some(identity) = rejection.identity() {
         response.extensions_mut().insert(identity);
     }
@@ -356,21 +403,31 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     *json_request.extensions_mut() = extensions.clone();
     let request: ResponsesRequest = match Json::from_request(json_request, &state).await {
         Ok(Json(r)) => r,
+        // Not logged: the rejection's message can quote the request's values.
         Err(e) => {
-            error!(error = %e, "Failed to parse responses request");
+            let model = extract_model_from_request(&headers, &body_bytes);
+            let message = format!("Invalid request: {e}");
             let code = match e {
-                JsonRejection::JsonDataError(_) => "schema_mismatch",
+                JsonRejection::JsonDataError(_) => {
+                    return refused_mismatch(
+                        &state,
+                        &headers,
+                        model.as_deref(),
+                        StatusCode::BAD_REQUEST,
+                        schema_mismatch::locate::<ResponsesRequest>(&body_bytes),
+                        &message,
+                    );
+                }
                 JsonRejection::MissingJsonContentType(_) => "invalid_content_type",
                 _ => "invalid_json",
             };
-            let model = extract_model_from_request(&headers, &body_bytes);
             return refused_invalid(
                 &state,
                 &headers,
                 model.as_deref(),
                 StatusCode::BAD_REQUEST,
                 code,
-                &format!("Invalid request: {}", e),
+                &message,
             );
         }
     };
@@ -760,11 +817,20 @@ async fn forward_request<T: HttpClient + Clone + Send + Sync + 'static>(
 /// Format matches OpenAI's error structure:
 /// https://platform.openai.com/docs/guides/error-codes
 fn error_response(status: StatusCode, error_type: &str, message: &str) -> Response {
+    error_response_with_param(status, error_type, message, None)
+}
+
+fn error_response_with_param(
+    status: StatusCode,
+    error_type: &str,
+    message: &str,
+    param: Option<&str>,
+) -> Response {
     let body = json!({
         "error": {
             "message": message,
             "type": error_type,
-            "param": null,
+            "param": param,
             "code": null
         }
     });

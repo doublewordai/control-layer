@@ -21,7 +21,7 @@ use axum::{
     http::{HeaderMap, Request, header::AUTHORIZATION, request::Parts},
     response::Response,
 };
-use onwards::{rejections::RejectionContext, target::Targets};
+use onwards::{rejections::RejectionContext, strict::schema_mismatch::SchemaMismatch, target::Targets};
 
 use crate::inference::translation::anthropic;
 
@@ -105,6 +105,19 @@ pub(crate) fn refuse<'a>(
     Scope::of(origin).refuse(response, code, param, model)
 }
 
+/// Records `response` as refused for a body that doesn't match its schema,
+/// with where and how it stopped matching when that is known.
+pub(crate) fn refuse_mismatch<'a>(
+    origin: impl Into<Origin<'a>>,
+    response: Response,
+    mismatch: Option<&SchemaMismatch>,
+    model: Option<&str>,
+) -> Response {
+    let param = mismatch.and_then(|mismatch| mismatch.path.as_deref());
+    let reason = mismatch.map(|mismatch| mismatch.reason);
+    Scope::of(origin).refuse_with_reason(response, "schema_mismatch", param, reason, model)
+}
+
 /// A request's caller, kept for a refusal decided after the request itself has
 /// been handed on.
 pub(crate) struct Scope {
@@ -125,13 +138,24 @@ impl Scope {
         Self { caller }
     }
 
-    pub(crate) fn refuse(self, mut response: Response, code: &'static str, param: Option<&str>, model: Option<&str>) -> Response {
+    pub(crate) fn refuse(self, response: Response, code: &'static str, param: Option<&str>, model: Option<&str>) -> Response {
+        self.refuse_with_reason(response, code, param, None, model)
+    }
+
+    fn refuse_with_reason(
+        self,
+        mut response: Response,
+        code: &'static str,
+        param: Option<&str>,
+        reason: Option<&'static str>,
+        model: Option<&str>,
+    ) -> Response {
         let mut recorded_on = None;
         if let Some((targets, mut context)) = self.caller {
             if let Some(model) = model {
                 context.set_model_if_configured(&targets, model);
             }
-            context.record(response.status(), code, param);
+            context.record_with_reason(response.status(), code, param, reason);
             recorded_on = tracing::Span::current().id();
             // Names the caller on the root request span, as onwards' own
             // refusals do.
@@ -173,17 +197,6 @@ pub(crate) fn model_of(body: &[u8]) -> Option<String> {
         model: Option<String>,
     }
     serde_json::from_slice::<Model>(body).ok()?.model
-}
-
-/// Code for a request body that couldn't be translated: `invalid_json` when it
-/// isn't JSON at all, `schema_mismatch` otherwise. onwards' strict mode counts
-/// its own body errors under the same codes.
-pub(crate) fn body_error_code(body: &[u8]) -> &'static str {
-    if serde_json::from_slice::<serde::de::IgnoredAny>(body).is_ok() {
-        "schema_mismatch"
-    } else {
-        "invalid_json"
-    }
 }
 
 #[cfg(test)]
@@ -361,9 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn classifies_untranslatable_bodies() {
-        assert_eq!(body_error_code(b"{not json"), "invalid_json");
-        assert_eq!(body_error_code(br#"{"input": 1}"#), "schema_mismatch");
+    fn reads_the_model_of_a_body() {
         assert_eq!(model_of(br#"{"model": "m", "x": 1}"#).as_deref(), Some("m"));
         assert_eq!(model_of(b"{not json"), None);
     }

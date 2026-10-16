@@ -61,7 +61,8 @@ impl opentelemetry_sdk::trace::SpanExporter for Exported {
 }
 
 /// The exported request span keeps a dwctl layer's rejection code, and an
-/// Anthropic client's `x-api-key` attributes the refusal to its account.
+/// Anthropic client's `x-api-key` attributes the refusal to its account. A
+/// translation refusal records where the body went wrong, never its content.
 #[dwctl_test_macros::test]
 async fn test_dwctl_layer_rejections_are_traced(pool: PgPool) {
     use opentelemetry::trace::TracerProvider;
@@ -96,7 +97,7 @@ async fn test_dwctl_layer_rejections_are_traced(pool: PgPool) {
     let attr = |span: &SpanData, key: &str| values(span, key).into_iter().next();
     // The exported request span for `path`, with every `error.type` it carries,
     // and the spans with any attribute naming the account.
-    let refused = |path: &str| -> (SpanData, Vec<String>, bool) {
+    let refused = |path: &str| -> (SpanData, Vec<String>, bool, Vec<SpanData>) {
         let exported = std::mem::take(&mut *exporter.0.lock().unwrap());
         let root = exported
             .iter()
@@ -105,7 +106,28 @@ async fn test_dwctl_layer_rejections_are_traced(pool: PgPool) {
             .clone();
         let attributed = exported.iter().any(|span| attr(span, "onwards.account").is_some());
         let error_types = values(&root, "error.type");
-        (root, error_types, attributed)
+        (root, error_types, attributed, exported)
+    };
+    // The first exported value of a rejection attribute.
+    let recorded = |spans: &[SpanData], key: &str| spans.iter().find_map(|span| attr(span, key));
+    // Every exported attribute or event that quotes the planted request content:
+    // strings marked `planted`, and the planted number.
+    const PLANTED_NUMBER: &str = "9182736455";
+    let leaks = |spans: &[SpanData]| -> Vec<String> {
+        spans
+            .iter()
+            .flat_map(|span| {
+                let events = span.events.iter().flat_map(|event| {
+                    std::iter::once(event.name.to_string()).chain(event.attributes.iter().map(|kv| kv.value.to_string()))
+                });
+                span.attributes
+                    .iter()
+                    .map(|kv| kv.value.to_string())
+                    .chain(events)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|value| value.contains("planted") || value.contains(PLANTED_NUMBER))
+            .collect()
     };
     exporter.0.lock().unwrap().clear();
 
@@ -117,25 +139,92 @@ async fn test_dwctl_layer_rejections_are_traced(pool: PgPool) {
         .bytes(vec![b'x'; 4097].into())
         .await;
     response.assert_status(axum::http::StatusCode::PAYLOAD_TOO_LARGE);
-    let (root, error_types, _) = refused("/ai/v1/messages");
+    let (root, error_types, _, _) = refused("/ai/v1/messages");
     assert_eq!(error_types, ["request_too_large"], "one error.type, the rejection code");
     assert_eq!(attr(&root, "http.response.status_code").as_deref(), Some("413"));
     assert!(attr(&root, "onwards.account").is_some(), "x-api-key attributes the account");
     assert!(attr(&root, "onwards.api_key_id").is_some());
 
     // Translation: recorded inside inference routing; the request span reports
-    // the same code.
+    // the same code, and the refusal says where the body stopped matching but
+    // nothing it contained.
+    let response = server
+        .post("/ai/v1/messages")
+        .add_header("x-api-key", &key)
+        .add_header("anthropic-version", "2023-06-01")
+        .json(&serde_json::json!({
+            "model": "gpt-4o", "max_tokens": "planted-value",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"planted-key": "planted-value"}
+        }))
+        .await;
+    response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["type"], "error", "Anthropic's error shape, which has no param");
+    let (_, error_types, attributed, spans) = refused("/ai/v1/messages");
+    assert_eq!(error_types, ["schema_mismatch"], "the request span reports the rejection code");
+    assert!(attributed, "x-api-key attributes the account");
+    assert_eq!(recorded(&spans, "onwards.rejection.param").as_deref(), Some("max_tokens"));
+    assert_eq!(recorded(&spans, "onwards.rejection.reason").as_deref(), Some("invalid_type"));
+    assert_eq!(leaks(&spans), Vec::<String>::new());
+
+    // A free-form value that fails beneath keys the client chose (an object
+    // keyed `$serde_json::private::RawValue` must hold a string) is refused
+    // before translation, as JSON the inference middleware can't read. serde's
+    // message for it quotes the number, so neither it nor the key may reach
+    // the trace, logged events included.
     let response = server
         .post("/ai/v1/messages")
         .add_header("x-api-key", &key)
         .add_header("anthropic-version", "2023-06-01")
         .json(&serde_json::json!({
             "model": "gpt-4o", "max_tokens": 5,
-            "messages": [{"role": "developer", "content": "hi"}]
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": {"planted-key": {"$serde_json::private::RawValue": 9182736455u64}}
         }))
         .await;
     response.assert_status(axum::http::StatusCode::BAD_REQUEST);
-    let (_, error_types, attributed) = refused("/ai/v1/messages");
-    assert_eq!(error_types, ["schema_mismatch"], "the request span reports the rejection code");
-    assert!(attributed, "x-api-key attributes the account");
+    let (_, error_types, _, spans) = refused("/ai/v1/messages");
+    assert_eq!(error_types, ["invalid_json"]);
+    assert!(
+        spans.iter().any(|span| !span.events.is_empty()),
+        "the refusal's log is exported as an event"
+    );
+    assert_eq!(leaks(&spans), Vec::<String>::new());
+
+    // A role the translation doesn't support names the parameter, not the role.
+    let response = server
+        .post("/ai/v1/messages")
+        .add_header("x-api-key", &key)
+        .add_header("anthropic-version", "2023-06-01")
+        .json(&serde_json::json!({
+            "model": "gpt-4o", "max_tokens": 5,
+            "messages": [{"role": "planted-role", "content": "hi"}]
+        }))
+        .await;
+    response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    let (_, error_types, _, spans) = refused("/ai/v1/messages");
+    assert_eq!(error_types, ["invalid_parameter"]);
+    assert_eq!(recorded(&spans, "onwards.rejection.param").as_deref(), Some("messages[].role"));
+    assert_eq!(leaks(&spans), Vec::<String>::new());
+
+    // OpenAI Responses: the error body names the parameter too.
+    let response = server
+        .post("/ai/v1/responses")
+        .add_header("Authorization", &format!("Bearer {key}"))
+        .json(&serde_json::json!({
+            "model": "gpt-4o", "input": "hi",
+            "text": {"format": {"type": "planted-value"}},
+            "metadata": {"planted-key": "planted-value"}
+        }))
+        .await;
+    response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["error"]["param"], "text.format.type");
+    let (_, error_types, attributed, spans) = refused("/ai/v1/responses");
+    assert_eq!(error_types, ["schema_mismatch"]);
+    assert!(attributed, "the bearer key attributes the account");
+    assert_eq!(recorded(&spans, "onwards.rejection.param").as_deref(), Some("text.format.type"));
+    assert_eq!(recorded(&spans, "onwards.rejection.reason").as_deref(), Some("unknown_variant"));
+    assert_eq!(leaks(&spans), Vec::<String>::new());
 }

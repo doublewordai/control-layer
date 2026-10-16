@@ -58,8 +58,10 @@
 //!
 //! `onwards.request` span: `onwards.account`, `onwards.account_name`,
 //! `onwards.api_key_id`, `onwards.key_purpose`, `gen_ai.request.model`,
-//! `http.response.status_code`, plus `error.type` and `onwards.rejection.param`
-//! for gateway rejections.
+//! `http.response.status_code`, plus `error.type`, `onwards.rejection.param`
+//! and, for a body that doesn't match its schema, `onwards.rejection.reason`
+//! for gateway rejections. dwctl's own layers record the same attributes on
+//! the span current when they refuse.
 //!
 //! `fusillade.process_request` span (one per batch request attempt):
 //! `doubleword.account_id`, `completion_window`, `custom_id`, `model`, `outcome`.

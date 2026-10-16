@@ -72,14 +72,18 @@ pub async fn translation_middleware(State(registry): State<TranslationRegistry>,
 
     let translated = match translator.translate_request(&parts, body_bytes) {
         Ok(t) => t,
-        Err(TranslationError::BadRequest(msg)) => {
+        Err(TranslationError::InvalidJson(msg)) => {
             let response = error_response(translator.as_ref(), StatusCode::BAD_REQUEST, &msg);
-            let code = rejections::body_error_code(&original_request);
+            return rejections::refuse(&parts, response, "invalid_json", None, None);
+        }
+        Err(TranslationError::SchemaMismatch { mismatch, message }) => {
+            let param = mismatch.as_ref().and_then(|mismatch| mismatch.path.as_deref());
+            let response = error_response_for_param(translator.as_ref(), StatusCode::BAD_REQUEST, &message, param);
             let model = rejections::model_of(&original_request);
-            return rejections::refuse(&parts, response, code, None, model.as_deref());
+            return rejections::refuse_mismatch(&parts, response, mismatch.as_ref(), model.as_deref());
         }
         Err(TranslationError::InvalidParameter { param, message }) => {
-            let response = error_response(translator.as_ref(), StatusCode::BAD_REQUEST, &message);
+            let response = error_response_for_param(translator.as_ref(), StatusCode::BAD_REQUEST, &message, Some(param));
             let model = rejections::model_of(&original_request);
             return rejections::refuse(&parts, response, "invalid_parameter", Some(param), model.as_deref());
         }
@@ -178,6 +182,12 @@ fn json_response(status: StatusCode, body: Bytes) -> Response {
 /// translator, so a pre-forward failure looks the same as a downstream one.
 fn error_response(translator: &dyn ProtocolTranslator, status: StatusCode, message: &str) -> Response {
     let (status, bytes) = translator.error_from_message(status, message);
+    json_response(status, bytes)
+}
+
+/// As [`error_response`], naming the request field at fault.
+fn error_response_for_param(translator: &dyn ProtocolTranslator, status: StatusCode, message: &str, param: Option<&str>) -> Response {
+    let (status, bytes) = translator.error_for_param(status, message, param);
     json_response(status, bytes)
 }
 
@@ -414,6 +424,7 @@ mod tests {
             let mut statuses = Vec::new();
             for body in [
                 "{not json".to_string(),
+                serde_json::json!({"model": "claude-x", "max_tokens": "lots", "messages": []}).to_string(),
                 message("developer", "hi"),
                 message("user", "broken"),
                 message("user", "hi"),
@@ -432,9 +443,13 @@ mod tests {
             statuses
         });
 
-        assert_eq!(statuses, [400, 400, 422, 400, 400]);
+        assert_eq!(statuses, [400, 400, 400, 422, 400, 400]);
         assert_eq!(lines.len(), 4, "the downstream 400 is not counted: {lines:?}");
         let line = |code: &str| lines.iter().find(|l| l.contains(&format!("code=\"{code}\""))).unwrap();
+        assert!(
+            line("invalid_parameter").ends_with(" 2"),
+            "the role and thinking refusals: {lines:?}"
+        );
         assert!(line("invalid_json").contains("model=\"\""));
         assert!(line("schema_mismatch").contains("model=\"claude-x\""));
         assert!(line("response_translation_failed").contains("status=\"422\""));

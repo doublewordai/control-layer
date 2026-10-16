@@ -7,6 +7,7 @@
 //!   `model` is set only for configured aliases, so the label stays bounded
 //!   whatever a client sends;
 //! - sets `error.type` (the error code), `onwards.rejection.param`,
+//!   `onwards.rejection.reason` (how a body failed the schema),
 //!   `onwards.account` and `onwards.api_key_id` (when the key has them) on the
 //!   current span, and the response status on onwards' request span. A
 //!   strict-mode refusal made before that span exists needs an embedding
@@ -126,6 +127,19 @@ impl RejectionContext {
 
     /// Records a refusal with this status, error code and parameter.
     pub fn record(&self, status: StatusCode, code: &str, param: Option<&str>) {
+        self.record_with_reason(status, code, param, None);
+    }
+
+    /// Records a refusal, with a fixed `reason` saying how the parameter was
+    /// wrong. Neither may hold request content: both are recorded for every
+    /// caller.
+    pub fn record_with_reason(
+        &self,
+        status: StatusCode,
+        code: &str,
+        param: Option<&str>,
+        reason: Option<&'static str>,
+    ) {
         let model = self.identity.model.as_deref().unwrap_or("");
         metrics::counter!(
             "onwards_rejections_total",
@@ -143,6 +157,9 @@ impl RejectionContext {
         span.set_attribute("error.type", code.to_string());
         if let Some(param) = param {
             span.set_attribute("onwards.rejection.param", param.to_string());
+        }
+        if let Some(reason) = reason {
+            span.set_attribute("onwards.rejection.reason", reason);
         }
         self.record_identity();
     }

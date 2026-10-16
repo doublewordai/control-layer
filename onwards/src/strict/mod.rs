@@ -20,6 +20,7 @@
 //! ```
 
 pub mod handlers;
+pub mod schema_mismatch;
 pub mod schemas;
 pub mod stream_end;
 

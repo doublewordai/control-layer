@@ -132,7 +132,14 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     let mut request_value: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
-            tracing::error!(error = %e, "Failed to parse request body in inference middleware");
+            // Only the category: serde's message can quote the body's values.
+            let category = match e.classify() {
+                serde_json::error::Category::Io => "io",
+                serde_json::error::Category::Syntax => "syntax",
+                serde_json::error::Category::Data => "data",
+                serde_json::error::Category::Eof => "eof",
+            };
+            tracing::error!(category, "Failed to parse request body in inference middleware");
             let response = Response::builder().status(StatusCode::BAD_REQUEST).body(Body::empty()).unwrap();
             return rejections::refuse(&parts, response, "invalid_json", None, None);
         }

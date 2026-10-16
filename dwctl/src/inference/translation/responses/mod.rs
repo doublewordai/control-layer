@@ -26,7 +26,7 @@ use onwards::strict::schemas::chat_completions::{
 
 use self::types::ResponsesRequest;
 
-use super::{ProtocolTranslator, StreamReframer, TranslatedRequest, TranslationError};
+use super::{ProtocolTranslator, StreamReframer, TranslatedRequest, TranslationError, parse_request};
 
 /// Translator for the OpenAI Responses API. Pure and stateless; see module docs.
 pub struct OpenResponses;
@@ -54,8 +54,7 @@ impl ProtocolTranslator for OpenResponses {
     }
 
     fn translate_request(&self, parts: &Parts, body: Bytes) -> Result<TranslatedRequest, TranslationError> {
-        let req: ResponsesRequest =
-            serde_json::from_slice(&body).map_err(|e| TranslationError::BadRequest(format!("invalid OpenAI Responses request: {e}")))?;
+        let req: ResponsesRequest = parse_request(&body, DECLARED_FIELDS, "OpenAI Responses")?;
 
         let chat = request::to_chat_request(&req);
         let new_body = serde_json::to_vec(&chat).map_err(|e| TranslationError::Internal(e.to_string()))?;
@@ -110,7 +109,11 @@ impl ProtocolTranslator for OpenResponses {
     }
 
     fn error_from_message(&self, status: StatusCode, message: &str) -> (StatusCode, Bytes) {
-        (status, openai_error(status, message))
+        self.error_for_param(status, message, None)
+    }
+
+    fn error_for_param(&self, status: StatusCode, message: &str, param: Option<&str>) -> (StatusCode, Bytes) {
+        (status, openai_error(status, message, param))
     }
 
     fn stream_reframer(&self, request: &Bytes, response_id: Option<&str>) -> Box<dyn StreamReframer> {
@@ -136,9 +139,102 @@ fn normalize_path(uri: &Uri) -> Result<Uri, TranslationError> {
         .map_err(|e| TranslationError::Internal(format!("failed to build normalised URI: {e}")))
 }
 
-/// Build an OpenAI-shaped error envelope (`{"error": {"message", "type"}}`),
+/// The field names and renames the request types in [`types`] declare,
+/// sorted, for locating where a request stopped matching [`ResponsesRequest`]
+/// without recording a key the client chose. Response-only names are left out:
+/// in a request they are the client's. A name missing here is recorded as `*`;
+/// a test keeps the list equal to the request types' fields.
+const DECLARED_FIELDS: &[&str] = &[
+    "allowed_tools",
+    "annotation_type",
+    "annotations",
+    "arguments",
+    "background",
+    "call_id",
+    "code_interpreter",
+    "computer_use_preview",
+    "container",
+    "content",
+    "content_filter",
+    "custom",
+    "data",
+    "defer_loading",
+    "description",
+    "detail",
+    "display_height",
+    "display_width",
+    "effort",
+    "encrypted_content",
+    "environment",
+    "extra",
+    "file_id",
+    "file_search",
+    "filename",
+    "filters",
+    "format",
+    "function",
+    "headers",
+    "hosted_tool",
+    "id",
+    "image_url",
+    "include",
+    "input",
+    "input_file",
+    "input_image",
+    "input_text",
+    "instructions",
+    "json_object",
+    "json_schema",
+    "logprobs",
+    "max_num_results",
+    "max_output_tokens",
+    "mcp",
+    "message.output_text.logprobs",
+    "metadata",
+    "model",
+    "name",
+    "namespace",
+    "output",
+    "output_text",
+    "parallel_tool_calls",
+    "parameters",
+    "previous_response_id",
+    "reasoning",
+    "reasoning.encrypted_content",
+    "reasoning_text",
+    "refusal",
+    "require_approval",
+    "role",
+    "schema",
+    "search_context_size",
+    "server_label",
+    "server_url",
+    "service_tier",
+    "status",
+    "stop",
+    "store",
+    "stream",
+    "strict",
+    "summary",
+    "summary_text",
+    "temperature",
+    "text",
+    "tool_choice",
+    "tool_type",
+    "tools",
+    "top_logprobs",
+    "top_p",
+    "truncation",
+    "type",
+    "user",
+    "user_location",
+    "vector_store_ids",
+    "web_search_preview",
+];
+
+/// Build an OpenAI-shaped error envelope (`{"error": {"message", "type", "param"}}`),
 /// the same shape the Responses API returns.
-fn openai_error(status: StatusCode, message: &str) -> Bytes {
+fn openai_error(status: StatusCode, message: &str, param: Option<&str>) -> Bytes {
     let err_type = match status.as_u16() {
         400 => "invalid_request_error",
         401 => "authentication_error",
@@ -149,7 +245,7 @@ fn openai_error(status: StatusCode, message: &str) -> Bytes {
         s if s >= 500 => "server_error",
         _ => "invalid_request_error",
     };
-    let body = serde_json::json!({ "error": { "message": message, "type": err_type } });
+    let body = serde_json::json!({ "error": { "message": message, "type": err_type, "param": param } });
     Bytes::from(serde_json::to_vec(&body).unwrap_or_default())
 }
 
@@ -255,7 +351,96 @@ mod tests {
     use axum::body::Body;
     use axum::response::Response;
     use axum::{Router, extract::Request, routing::post};
+    use onwards::strict::schema_mismatch::SchemaMismatch;
     use std::sync::Arc;
+
+    /// How the translator refuses `body`, which must not translate.
+    fn refusal(body: &[u8]) -> TranslationError {
+        let (parts, ()) = axum::http::Request::builder().uri("/v1/responses").body(()).unwrap().into_parts();
+        match OpenResponses::new().translate_request(&parts, Bytes::copy_from_slice(body)) {
+            Ok(_) => panic!("the body should not translate"),
+            Err(e) => e,
+        }
+    }
+
+    fn located(body: &[u8]) -> Option<SchemaMismatch> {
+        match refusal(body) {
+            TranslationError::SchemaMismatch { mismatch, .. } => mismatch,
+            other => panic!("expected a schema mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_schema_mismatch_names_the_field_but_not_its_value() {
+        let found = located(br#"{"model":"m","input":"hi","max_output_tokens":"planted-secret","metadata":{"planted-secret":1}}"#)
+            .expect("located");
+        assert_eq!(found.path.as_deref(), Some("max_output_tokens"));
+        assert_eq!(found.reason, "invalid_type");
+        assert!(!format!("{found:?}").contains("planted"));
+    }
+
+    #[test]
+    fn a_schema_mismatch_hides_client_keys_in_free_form_values() {
+        // With serde_json's `raw_value` feature this object must hold a string,
+        // so the free-form `metadata` fails beneath keys the client chose.
+        let found =
+            located(br#"{"model":"m","input":"hi","metadata":{"client_secret":{"$serde_json::private::RawValue":1}}}"#).expect("located");
+        assert_eq!(found.path.as_deref(), Some("metadata"));
+
+        // Keys named like fields are still the client's inside a free-form value.
+        let found =
+            located(br#"{"model":"m","input":"hi","metadata":{"model":{"input":{"$serde_json::private::RawValue":1}}}}"#).expect("located");
+        assert_eq!(found.path.as_deref(), Some("metadata"));
+    }
+
+    #[test]
+    fn a_malformed_input_item_is_located_at_input() {
+        // `Input` is untagged and `Item` re-parses through a `Value`, so serde
+        // reports these at `input` without the inner path.
+        let found =
+            located(br#"{"model":"m","input":[{"type":"function_call","call_id":5,"name":"f","arguments":"{}"}]}"#).expect("located");
+        assert_eq!(found.path.as_deref(), Some("input"));
+        assert_eq!(found.reason, "no_matching_variant");
+    }
+
+    #[test]
+    fn a_missing_field_is_named() {
+        let found = located(br#"{"input":"hi"}"#).expect("located");
+        assert_eq!(found.path.as_deref(), Some("model"));
+        assert_eq!(found.reason, "missing_field");
+    }
+
+    #[test]
+    fn a_body_that_is_not_json_is_not_a_schema_mismatch() {
+        assert!(matches!(refusal(b"{not json"), TranslationError::InvalidJson(_)));
+    }
+
+    #[test]
+    fn errors_name_the_param() {
+        let (_, body) = OpenResponses::new().error_for_param(StatusCode::BAD_REQUEST, "bad", Some("input"));
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["param"], "input");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        let (_, body) = OpenResponses::new().error_from_message(StatusCode::BAD_REQUEST, "bad");
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["param"], Value::Null);
+    }
+
+    #[test]
+    fn declared_fields_are_sorted_and_unique() {
+        assert!(DECLARED_FIELDS.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn declared_fields_are_the_request_types_fields() {
+        let source = include_str!("types.rs");
+        let start = source.find("/// Request body for POST /v1/responses").expect("request types start");
+        let end = source.find("/// Response from POST /v1/responses").expect("response types start");
+        let declared: std::collections::BTreeSet<String> =
+            onwards::test_utils::declared_field_names(&source[start..end]).into_iter().collect();
+        let listed: std::collections::BTreeSet<String> = DECLARED_FIELDS.iter().map(|name| name.to_string()).collect();
+        assert_eq!(listed, declared, "DECLARED_FIELDS must list exactly the request types' fields");
+    }
 
     #[test]
     fn detect_claims_responses_ignoring_headers() {
