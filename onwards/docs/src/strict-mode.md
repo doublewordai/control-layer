@@ -162,7 +162,7 @@ Requests to unsupported endpoints will return `404 Not Found` when strict mode i
 
 Some chat parameters are engine extensions or options that not every backend behind a model can honour, for example `n` greater than 1, `logprobs`, `guided_json` or `min_tokens`. The full list, with the values that count as absent (such as `n: 1`, `logprobs: false` or `top_logprobs: 0`), is the chat catalog in `onwards::unsupported_params`. `chat_template_kwargs` isn't in it: strict mode refuses that field outright and points to `reasoning_effort` instead.
 
-Legacy completions requests have their own, shorter catalog: `n` and `best_of` greater than 1, `logprobs` and `prompt_logprobs`. On that surface `logprobs` is a count, and any count, including `0`, asks for log probabilities; only a missing or `null` value counts as absent.
+Legacy completions requests have their own, shorter catalog: `n` and `best_of` values other than 1 (normally greater than 1), `logprobs` and `prompt_logprobs`. On that surface `logprobs` is a count, and any count, including `0`, asks for log probabilities; only a missing or `null` value counts as absent.
 
 Strict mode checks every Chat Completions and legacy completions request against its surface's catalog after schema validation (on chat, before reasoning validation):
 
