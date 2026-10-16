@@ -1,5 +1,19 @@
 # Changelog
 
+## [14.3.0](https://github.com/doublewordai/control-layer/compare/v14.2.0...v14.3.0) (2026-10-16)
+
+
+### Features
+
+* **dwctl:** record where a translated body fails its schema, without its content (DW-951) ([#1991](https://github.com/doublewordai/control-layer/issues/1991)) ([53b07dc](https://github.com/doublewordai/control-layer/commit/53b07dc2bf5932cc3c037f803095eb46e90b161f))
+* **onwards:** check legacy completions for unsupported parameters (DW-855) ([#1996](https://github.com/doublewordai/control-layer/issues/1996)) ([500873b](https://github.com/doublewordai/control-layer/commit/500873b76a678ff2d2983d04c5e797121a285111))
+* **onwards:** record where a body fails the strict schema, without its content (DW-951) ([#1990](https://github.com/doublewordai/control-layer/issues/1990)) ([e1cb85a](https://github.com/doublewordai/control-layer/commit/e1cb85a5a525bb360edaf0ab2005fed0db6b680e))
+
+
+### Bug Fixes
+
+* **dwctl:** export the request span as a server span (DW-954) ([#1993](https://github.com/doublewordai/control-layer/issues/1993)) ([57ded54](https://github.com/doublewordai/control-layer/commit/57ded542e15168eb22818bb7e82cbac6e0e4d833))
+
 ## [14.2.0](https://github.com/doublewordai/control-layer/compare/v14.1.0...v14.2.0) (2026-10-15)
 
 
