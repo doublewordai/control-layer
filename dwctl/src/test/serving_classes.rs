@@ -407,3 +407,30 @@ async fn json_key_order_survives_batch_upload(pool: PgPool) {
     content.assert_status_ok();
     assert!(content.text().contains(ORDERED_SCHEMA), "{}", content.text());
 }
+
+/// The inference middleware forwards a daemon loopback request's scheduling
+/// tolerations untouched, whatever put them in the body (the daemon's hold
+/// list or an account preset stamped at upload). The body here is built by
+/// hand, as the daemon would send it; the daemon side is covered in
+/// fusillade's dispatch hold tests, and the realtime client-strip and
+/// account-preset paths in `toleration_presets`.
+#[dwctl_test_macros::test]
+async fn daemon_loopback_forwards_scheduling_tolerations_untouched(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let response = f
+        .server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {}", f.key))
+        .add_header("x-fusillade-request-id", Uuid::new_v4().to_string())
+        .json(&json!({"model":"policy","messages":[{"role":"user","content":"hi"}],
+            "nvext":{"routing_constraints":{"tolerations":[]},"agent_hints":{"priority":-1700000000}}}))
+        .await;
+    response.assert_status_ok();
+    let forwarded = f.last_body().await;
+    assert_eq!(
+        forwarded["nvext"]["routing_constraints"]["tolerations"],
+        json!([]),
+        "a daemon request's tolerations are forwarded untouched"
+    );
+    assert_eq!(forwarded["nvext"]["agent_hints"]["priority"], -1700000000);
+}

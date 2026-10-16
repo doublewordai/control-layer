@@ -178,9 +178,74 @@ pub struct Claimed {
     /// daemon which `(user, window-class, model)` bucket to stamp (the model is
     /// read from the request's `data.model`). `None` for full-capacity claims.
     pub leak: Option<LeakStamp>,
+    /// Whether this dispatch is held or released, as decided by the claim for
+    /// a held model. Nothing is written to the row. `None` when the claim
+    /// made no decision: the model is not held, or the path (single-row
+    /// claims, background) does not decide.
+    pub tolerations: Option<DispatchTolerations>,
 }
 
 impl RequestState for Claimed {}
+
+/// The claim's decision on a held model's request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum DispatchTolerations {
+    /// Hold: send the hold list (unless the body carries its own).
+    Keep,
+    /// Send the stored body as it is, without the hold list: the hold no
+    /// longer limits where the backend schedules the request (constraints
+    /// the body itself carries still apply).
+    Release(TolerationsRelease),
+}
+
+/// Why a held request was released (sent as stored, without the hold list).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum TolerationsRelease {
+    /// Inside the batch-claim deadline ramp.
+    Ramp,
+    /// Already past its deadline (retry grace).
+    PastDeadline,
+    /// Due at or before its model's release cutoff: projected to miss its
+    /// completion window at the rate held dispatches complete.
+    SlaProjection,
+    /// Its model's held dispatches were refused throughout a whole window of
+    /// holding and none completed: there is no capacity the hold allows to
+    /// wait for.
+    NoOwnCapacity,
+    /// The hold decisions are missing or stale (the refresh is failing).
+    Stale,
+    /// Too close to its deadline for a held refusal to be retried before the
+    /// retry cut-off (`stop_before_deadline_ms` before the deadline, or the
+    /// deadline itself when unset): released so a refusal cannot fail it.
+    RetryCutoff,
+}
+
+impl TolerationsRelease {
+    /// Metric label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ramp => "ramp",
+            Self::PastDeadline => "past_deadline",
+            Self::SlaProjection => "sla_projection",
+            Self::NoOwnCapacity => "no_own_capacity",
+            Self::Stale => "stale",
+            Self::RetryCutoff => "retry_cutoff",
+        }
+    }
+
+    /// Parse the claim query's release reason.
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "ramp" => Some(Self::Ramp),
+            "past_deadline" => Some(Self::PastDeadline),
+            "sla_projection" => Some(Self::SlaProjection),
+            "no_own_capacity" => Some(Self::NoOwnCapacity),
+            "stale" => Some(Self::Stale),
+            "retry_cutoff" => Some(Self::RetryCutoff),
+            _ => None,
+        }
+    }
+}
 
 /// Request is currently being processed by a daemon (i.e., HTTP request in flight).
 #[derive(Debug, Clone, Serialize)]

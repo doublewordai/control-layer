@@ -139,6 +139,7 @@ impl Request<Pending> {
                 batch_expires_at: self.state.batch_expires_at, // Carry over batch deadline
                 // This single-row claim path does not run the leaky-bucket gate.
                 leak: None,
+                tolerations: None,
             },
         };
         storage.persist(&request).await?;
@@ -296,7 +297,7 @@ impl Request<Failed> {
         retry_attempt: u32,
         config: RetryConfig,
     ) -> std::result::Result<Request<Pending>, Box<Self>> {
-        self.reschedule_retry(retry_attempt, config, true)
+        self.reschedule_retry(retry_attempt, config, true, false)
     }
 
     /// Reschedule this failure without spending a retry attempt.
@@ -312,7 +313,34 @@ impl Request<Failed> {
         retry_attempt: u32,
         config: RetryConfig,
     ) -> std::result::Result<Request<Pending>, Box<Self>> {
-        self.reschedule_retry(retry_attempt, config, false)
+        self.reschedule_retry(retry_attempt, config, false, false)
+    }
+
+    /// Reschedule a held dispatch the backend refused for capacity (503/529)
+    /// without spending a retry attempt, after the maximum backoff.
+    ///
+    /// A held request carries the daemon's hold list, so the backend refuses
+    /// it while the capacity the list allows is full: that is the hold
+    /// working, not a failed attempt. Charging attempts would let a long hold
+    /// exhaust `max_retries` before the request is released. The attempt count
+    /// does not grow, so the exponential ladder would retry at its first rung
+    /// forever; the maximum backoff is used instead.
+    ///
+    /// Never terminal: a held request is released before it can miss its
+    /// window, so failing it for a refusal the hold caused would be wrong.
+    /// When the maximum backoff would land at or past the retry cut-off
+    /// (`stop_before_deadline_ms` before the deadline, or the deadline itself
+    /// when that is unset), the request is made claimable at once
+    /// instead, and its next claim releases it (the daemon releases held
+    /// requests that close to the cut-off, and the claim releases any past
+    /// the deadline). A released dispatch that fails is retried, or failed,
+    /// exactly as by [`Self::can_retry`].
+    pub fn can_retry_held_refusal(
+        self,
+        retry_attempt: u32,
+        config: RetryConfig,
+    ) -> std::result::Result<Request<Pending>, Box<Self>> {
+        self.reschedule_retry(retry_attempt, config, false, true)
     }
 
     fn reschedule_retry(
@@ -320,9 +348,12 @@ impl Request<Failed> {
         retry_attempt: u32,
         config: RetryConfig,
         spend_attempt: bool,
+        held_refusal: bool,
     ) -> std::result::Result<Request<Pending>, Box<Self>> {
         // Calculate exponential backoff: backoff_ms * (backoff_factor ^ retry_attempt)
-        let backoff_duration = {
+        let backoff_duration = if held_refusal {
+            config.max_backoff_ms
+        } else {
             let exponential = config
                 .backoff_ms
                 .saturating_mul(config.backoff_factor.saturating_pow(retry_attempt));
@@ -330,7 +361,7 @@ impl Request<Failed> {
         };
 
         let now = chrono::Utc::now();
-        let not_before = now + chrono::Duration::milliseconds(backoff_duration as i64);
+        let mut not_before = now + chrono::Duration::milliseconds(backoff_duration as i64);
 
         // Admission-control reschedules do not spend attempts, so they are not
         // bounded by `max_retries`. For requests with a batch deadline the
@@ -367,7 +398,12 @@ impl Request<Failed> {
 
             // Check if the next retry would start before the effective deadline.
             if not_before >= effective_deadline {
-                return Err(Box::new(self));
+                if !held_refusal {
+                    return Err(Box::new(self));
+                }
+                // A held refusal is never terminal: claimable at once, and the
+                // next claim releases it.
+                not_before = now;
             }
         }
 
@@ -710,6 +746,59 @@ mod background_tests {
             "the refusal must not consume a retry attempt"
         );
         assert!(pending.state.not_before.is_some(), "normal backoff applies");
+    }
+
+    #[test]
+    fn held_refusal_reschedules_at_max_backoff_without_spending_an_attempt() {
+        let request = failed_request_with_reason(
+            FailureReason::RetriableHttpStatus {
+                status: 529,
+                body: r#"{"error":{"type":"overloaded_error"}}"#.to_string(),
+            },
+            2,
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        );
+        let before = chrono::Utc::now();
+        let pending = request
+            .can_retry_held_refusal(2, retry_config())
+            .expect("a held refusal is rescheduled past max_retries");
+        assert_eq!(pending.state.retry_attempt, 2, "no attempt spent");
+        let wait = pending.state.not_before.unwrap() - before;
+        assert!(
+            wait >= chrono::Duration::milliseconds(10),
+            "the maximum backoff, not the first rung: {wait}"
+        );
+    }
+
+    #[test]
+    fn a_held_refusal_at_the_retry_cut_off_is_requeued_now_not_failed() {
+        // The cut-off is 1s before the deadline and the backoff 10ms. Inside
+        // the cut-off, or past the deadline, an ordinary 529 fails for good; a
+        // held one is made claimable at once, so its next claim releases it.
+        for deadline_in_ms in [500, 0, -60_000] {
+            let deadline = chrono::Utc::now() + chrono::Duration::milliseconds(deadline_in_ms);
+            let refusal = || {
+                failed_request_with_reason(
+                    FailureReason::RetriableHttpStatus {
+                        status: 529,
+                        body: String::new(),
+                    },
+                    0,
+                    Some(deadline),
+                )
+            };
+            assert!(refusal().can_retry(0, retry_config()).is_err());
+            let before = chrono::Utc::now();
+            let pending = refusal()
+                .can_retry_held_refusal(0, retry_config())
+                .expect("a held refusal is never terminal");
+            let not_before = pending.state.not_before.unwrap();
+            assert!(
+                not_before >= before && not_before <= chrono::Utc::now(),
+                "claimable at once, not after the backoff"
+            );
+            assert_eq!(pending.state.retry_attempt, 0);
+        }
     }
 
     #[test]
