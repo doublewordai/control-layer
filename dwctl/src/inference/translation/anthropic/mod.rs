@@ -79,50 +79,29 @@ impl ProtocolTranslator for AnthropicMessages {
     }
 }
 
-/// The field names and renames declared in [`model`], sorted, for locating
-/// where a request stopped matching [`MessagesRequest`] without recording a
-/// key the client chose. A name missing here is recorded as `*`, so the list
-/// can only hide too much; a test keeps it in step with `model.rs`.
+/// The field names and renames the request types in [`model`] declare,
+/// sorted, for locating where a request stopped matching [`MessagesRequest`]
+/// without recording a key the client chose. Response-only names are left out:
+/// in a request they are the client's. A name missing here is recorded as `*`;
+/// a test keeps the list equal to the request types' fields.
 const DECLARED_FIELDS: &[&str] = &[
     "cache_control",
-    "cache_creation",
-    "cache_creation_input_tokens",
-    "cache_read_input_tokens",
     "content",
-    "created_at",
     "data",
     "description",
-    "display_name",
-    "envelope_type",
-    "ephemeral_1h_input_tokens",
-    "ephemeral_24h_input_tokens",
-    "ephemeral_5m_input_tokens",
-    "error",
-    "error_type",
-    "first_id",
-    "has_more",
     "id",
     "input",
     "input_schema",
-    "input_tokens",
     "is_error",
-    "last_id",
     "max_tokens",
     "media_type",
-    "message",
-    "message_type",
     "messages",
     "model",
     "name",
-    "object_type",
     "output_config",
-    "output_tokens",
     "role",
     "service_tier",
-    "signature",
     "source",
-    "stop_reason",
-    "stop_sequence",
     "stop_sequences",
     "stream",
     "system",
@@ -136,7 +115,6 @@ const DECLARED_FIELDS: &[&str] = &[
     "top_p",
     "type",
     "url",
-    "usage",
 ];
 
 /// Rewrite a `.../messages` path to `.../chat/completions`, preserving any
@@ -230,12 +208,16 @@ mod tests {
     }
 
     #[test]
-    fn declared_fields_cover_the_request_types() {
-        let missing: Vec<_> = onwards::test_utils::declared_field_names(include_str!("model.rs"))
-            .into_iter()
-            .filter(|name| DECLARED_FIELDS.binary_search(&name.as_str()).is_err())
-            .collect();
-        assert!(missing.is_empty(), "add to DECLARED_FIELDS: {missing:?}");
+    fn declared_fields_are_the_request_types_fields() {
+        let source = include_str!("model.rs");
+        let end = source.find("// Response types").expect("response types start");
+        let mut declared: std::collections::BTreeSet<String> =
+            onwards::test_utils::declared_field_names(&source[..end]).into_iter().collect();
+        // Names the line scan can't see: the content-block tag, and fields
+        // declared inline in `ImageSource`'s variants.
+        declared.extend(["type", "media_type", "data", "url"].map(String::from));
+        let listed: std::collections::BTreeSet<String> = DECLARED_FIELDS.iter().map(|name| name.to_string()).collect();
+        assert_eq!(listed, declared, "DECLARED_FIELDS must list exactly the request types' fields");
     }
 
     fn translate(body: Value) -> Value {

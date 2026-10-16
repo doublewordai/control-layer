@@ -139,29 +139,23 @@ fn normalize_path(uri: &Uri) -> Result<Uri, TranslationError> {
         .map_err(|e| TranslationError::Internal(format!("failed to build normalised URI: {e}")))
 }
 
-/// Build an OpenAI-shaped error envelope (`{"error": {"message", "type"}}`),
-/// the same shape the Responses API returns.
-/// The field names and renames declared in [`types`], sorted, for locating
-/// where a request stopped matching [`ResponsesRequest`] without recording a
-/// key the client chose. A name missing here is recorded as `*`, so the list
-/// can only hide too much; a test keeps it in step with `types.rs`.
+/// The field names and renames the request types in [`types`] declare,
+/// sorted, for locating where a request stopped matching [`ResponsesRequest`]
+/// without recording a key the client chose. Response-only names are left out:
+/// in a request they are the client's. A name missing here is recorded as `*`;
+/// a test keeps the list equal to the request types' fields.
 const DECLARED_FIELDS: &[&str] = &[
     "allowed_tools",
     "annotation_type",
     "annotations",
     "arguments",
     "background",
-    "cache_write_tokens",
-    "cached_tokens",
     "call_id",
-    "code",
     "code_interpreter",
-    "completed_at",
     "computer_use_preview",
     "container",
     "content",
     "content_filter",
-    "created_at",
     "custom",
     "data",
     "defer_loading",
@@ -172,69 +166,47 @@ const DECLARED_FIELDS: &[&str] = &[
     "effort",
     "encrypted_content",
     "environment",
-    "error",
-    "error_type",
-    "event_type",
     "extra",
-    "fallback_model",
-    "fallback_response_id",
     "file_id",
     "file_search",
     "filename",
     "filters",
     "format",
-    "frequency_penalty",
     "function",
     "headers",
     "hosted_tool",
     "id",
     "image_url",
     "include",
-    "incomplete_details",
     "input",
     "input_file",
     "input_image",
     "input_text",
-    "input_tokens",
-    "input_tokens_details",
     "instructions",
     "json_object",
     "json_schema",
     "logprobs",
     "max_num_results",
     "max_output_tokens",
-    "max_tool_calls",
     "mcp",
-    "message",
     "message.output_text.logprobs",
     "metadata",
     "model",
     "name",
     "namespace",
-    "object",
     "output",
     "output_text",
-    "output_tokens",
-    "output_tokens_details",
     "parallel_tool_calls",
-    "param",
     "parameters",
-    "presence_penalty",
     "previous_response_id",
-    "prompt_cache_key",
-    "reason",
     "reasoning",
     "reasoning.encrypted_content",
     "reasoning_text",
-    "reasoning_tokens",
     "refusal",
     "require_approval",
-    "response",
     "role",
-    "safety_identifier",
     "schema",
     "search_context_size",
-    "sequence_number",
     "server_label",
     "server_url",
     "service_tier",
@@ -252,16 +224,16 @@ const DECLARED_FIELDS: &[&str] = &[
     "tools",
     "top_logprobs",
     "top_p",
-    "total_tokens",
     "truncation",
     "type",
-    "usage",
     "user",
     "user_location",
     "vector_store_ids",
     "web_search_preview",
 ];
 
+/// Build an OpenAI-shaped error envelope (`{"error": {"message", "type", "param"}}`),
+/// the same shape the Responses API returns.
 fn openai_error(status: StatusCode, message: &str, param: Option<&str>) -> Bytes {
     let err_type = match status.as_u16() {
         400 => "invalid_request_error",
@@ -422,6 +394,16 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_input_item_is_located_at_input() {
+        // `Input` is untagged and `Item` re-parses through a `Value`, so serde
+        // reports these at `input` without the inner path.
+        let found =
+            located(br#"{"model":"m","input":[{"type":"function_call","call_id":5,"name":"f","arguments":"{}"}]}"#).expect("located");
+        assert_eq!(found.path.as_deref(), Some("input"));
+        assert_eq!(found.reason, "no_matching_variant");
+    }
+
+    #[test]
     fn a_missing_field_is_named() {
         let found = located(br#"{"input":"hi"}"#).expect("located");
         assert_eq!(found.path.as_deref(), Some("model"));
@@ -450,12 +432,14 @@ mod tests {
     }
 
     #[test]
-    fn declared_fields_cover_the_request_types() {
-        let missing: Vec<_> = onwards::test_utils::declared_field_names(include_str!("types.rs"))
-            .into_iter()
-            .filter(|name| DECLARED_FIELDS.binary_search(&name.as_str()).is_err())
-            .collect();
-        assert!(missing.is_empty(), "add to DECLARED_FIELDS: {missing:?}");
+    fn declared_fields_are_the_request_types_fields() {
+        let source = include_str!("types.rs");
+        let start = source.find("/// Request body for POST /v1/responses").expect("request types start");
+        let end = source.find("/// Response from POST /v1/responses").expect("response types start");
+        let declared: std::collections::BTreeSet<String> =
+            onwards::test_utils::declared_field_names(&source[start..end]).into_iter().collect();
+        let listed: std::collections::BTreeSet<String> = DECLARED_FIELDS.iter().map(|name| name.to_string()).collect();
+        assert_eq!(listed, declared, "DECLARED_FIELDS must list exactly the request types' fields");
     }
 
     #[test]
