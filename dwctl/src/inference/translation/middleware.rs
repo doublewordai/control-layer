@@ -72,11 +72,9 @@ pub async fn translation_middleware(State(registry): State<TranslationRegistry>,
 
     let translated = match translator.translate_request(&parts, body_bytes) {
         Ok(t) => t,
-        Err(TranslationError::BadRequest(msg)) => {
+        Err(TranslationError::InvalidJson(msg)) => {
             let response = error_response(translator.as_ref(), StatusCode::BAD_REQUEST, &msg);
-            let code = rejections::body_error_code(&original_request);
-            let model = rejections::model_of(&original_request);
-            return rejections::refuse(&parts, response, code, None, model.as_deref());
+            return rejections::refuse(&parts, response, "invalid_json", None, None);
         }
         Err(TranslationError::SchemaMismatch { mismatch, message }) => {
             let param = mismatch.as_ref().and_then(|mismatch| mismatch.path.as_deref());

@@ -199,17 +199,6 @@ pub(crate) fn model_of(body: &[u8]) -> Option<String> {
     serde_json::from_slice::<Model>(body).ok()?.model
 }
 
-/// Code for a request body that couldn't be translated: `invalid_json` when it
-/// isn't JSON at all, `schema_mismatch` otherwise. onwards' strict mode counts
-/// its own body errors under the same codes.
-pub(crate) fn body_error_code(body: &[u8]) -> &'static str {
-    if serde_json::from_slice::<serde::de::IgnoredAny>(body).is_ok() {
-        "schema_mismatch"
-    } else {
-        "invalid_json"
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::future::Future;
@@ -385,9 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn classifies_untranslatable_bodies() {
-        assert_eq!(body_error_code(b"{not json"), "invalid_json");
-        assert_eq!(body_error_code(br#"{"input": 1}"#), "schema_mismatch");
+    fn reads_the_model_of_a_body() {
         assert_eq!(model_of(br#"{"model": "m", "x": 1}"#).as_deref(), Some("m"));
         assert_eq!(model_of(b"{not json"), None);
     }

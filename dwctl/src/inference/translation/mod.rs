@@ -56,9 +56,9 @@ use std::sync::Arc;
 /// Error raised while translating a request or response.
 #[derive(Debug, thiserror::Error)]
 pub enum TranslationError {
-    /// The inbound foreign request was malformed (maps to a 400).
+    /// The inbound foreign request isn't JSON at all (maps to a 400).
     #[error("{0}")]
-    BadRequest(String),
+    InvalidJson(String),
     /// The inbound foreign request is JSON but doesn't match the protocol's
     /// request type (maps to a 400 naming where it stopped matching, when
     /// that could be found).
@@ -86,7 +86,7 @@ pub(crate) fn parse_request<T: DeserializeOwned>(body: &[u8], declared: &[&str],
                 message,
             }
         } else {
-            TranslationError::BadRequest(message)
+            TranslationError::InvalidJson(message)
         }
     })
 }

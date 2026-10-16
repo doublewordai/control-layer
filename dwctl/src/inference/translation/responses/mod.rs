@@ -425,7 +425,7 @@ mod tests {
 
     #[test]
     fn a_body_that_is_not_json_is_not_a_schema_mismatch() {
-        assert!(matches!(refusal(b"{not json"), TranslationError::BadRequest(_)));
+        assert!(matches!(refusal(b"{not json"), TranslationError::InvalidJson(_)));
     }
 
     #[test]
