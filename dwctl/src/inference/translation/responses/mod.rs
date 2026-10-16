@@ -413,7 +413,12 @@ mod tests {
         // so the free-form `metadata` fails beneath keys the client chose.
         let found =
             located(br#"{"model":"m","input":"hi","metadata":{"client_secret":{"$serde_json::private::RawValue":1}}}"#).expect("located");
-        assert_eq!(found.path.as_deref(), Some("metadata.*.*"));
+        assert_eq!(found.path.as_deref(), Some("metadata"));
+
+        // Keys named like fields are still the client's inside a free-form value.
+        let found =
+            located(br#"{"model":"m","input":"hi","metadata":{"model":{"input":{"$serde_json::private::RawValue":1}}}}"#).expect("located");
+        assert_eq!(found.path.as_deref(), Some("metadata"));
     }
 
     #[test]

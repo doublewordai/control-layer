@@ -214,7 +214,14 @@ mod tests {
         let found =
             located(br#"{"model":"m","max_tokens":5,"messages":[],"tool_choice":{"client_secret":{"$serde_json::private::RawValue":1}}}"#)
                 .expect("located");
-        assert_eq!(found.path.as_deref(), Some("tool_choice.*.*"));
+        assert_eq!(found.path.as_deref(), Some("tool_choice"));
+
+        // Keys named like fields are still the client's inside a free-form value.
+        let found = located(
+            br#"{"model":"m","max_tokens":5,"messages":[],"tool_choice":{"model":{"messages":{"$serde_json::private::RawValue":1}}}}"#,
+        )
+        .expect("located");
+        assert_eq!(found.path.as_deref(), Some("tool_choice"));
     }
 
     #[test]
