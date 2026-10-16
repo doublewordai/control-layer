@@ -199,7 +199,7 @@ async fn schema_mismatches_record_where_but_never_what() {
                 "messages": [],
                 "logit_bias": {SECRET: {"$serde_json::private::RawValue": 1}}
             }),
-            "logit_bias.*.*",
+            "logit_bias",
         ),
     ] {
         let (_, spans) = send(path, body).await;

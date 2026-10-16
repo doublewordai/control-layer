@@ -6,12 +6,17 @@
 //! it as a field; anything else becomes `*`. Checking keys against the schemas
 //! rather than their shape matters: a free-form `serde_json::Value` can fail
 //! beneath keys the client chose (with serde_json's `raw_value` feature, an
-//! object keyed `$serde_json::private::RawValue` must hold a string). serde's
-//! message, which can quote the offending value, is reduced to a fixed reason.
+//! object keyed `$serde_json::private::RawValue` must hold a string). Such a
+//! failure is recorded at the top-level field only, since keys inside a
+//! free-form value are the client's even when they match a field name.
+//! serde's message, which can quote the offending value, is reduced to a fixed
+//! reason.
 
 use serde::de::DeserializeOwned;
 use serde_path_to_error::Segment;
 
+/// Prefix of the keys serde_json reserves for `RawValue` and arbitrary-precision numbers.
+const SERDE_JSON_PRIVATE: &str = "$serde_json::private::";
 /// Longest path recorded; anything longer is cut at a segment boundary.
 const MAX_PATH_LEN: usize = 200;
 /// The field names and renames the strict request and response schemas
@@ -193,7 +198,20 @@ pub(crate) fn locate<T: DeserializeOwned>(body: &[u8]) -> Option<SchemaMismatch>
     let error = serde_path_to_error::deserialize::<_, T>(&mut deserializer).err()?;
     let message = error.inner().to_string();
     let reason = reason(&message);
-    let mut path = describe(error.path().iter());
+    let segments: Vec<&Segment> = error.path().iter().collect();
+    // A serde_json private key means the failure is inside a free-form value,
+    // where every key, even one named like a field, is the client's: keep only
+    // the top-level field, which the request type declares.
+    let in_free_form = segments.iter().any(
+        |segment| matches!(segment, Segment::Map { key } if key.starts_with(SERDE_JSON_PRIVATE)),
+    );
+    let mut path =
+        describe(
+            segments
+                .iter()
+                .copied()
+                .take(if in_free_form { 1 } else { usize::MAX }),
+        );
     // serde reports a missing field at its parent and names it in the message;
     // the name comes from the schema, not the request.
     if reason == "missing_field"
@@ -367,7 +385,12 @@ mod tests {
         // string, so the free-form `logit_bias` fails beneath a client key.
         let body = br#"{"model":"m","messages":[],"logit_bias":{"client_secret":{"$serde_json::private::RawValue":1}}}"#;
         let found = locate::<ChatCompletionRequest>(body).expect("the body should not match");
-        assert_eq!(found.path.as_deref(), Some("logit_bias.*.*"));
+        assert_eq!(found.path.as_deref(), Some("logit_bias"));
+
+        // Keys named like fields are still the client's inside a free-form value.
+        let body = br#"{"model":"m","messages":[],"logit_bias":{"model":{"messages":{"$serde_json::private::RawValue":1}}}}"#;
+        let found = locate::<ChatCompletionRequest>(body).expect("the body should not match");
+        assert_eq!(found.path.as_deref(), Some("logit_bias"));
     }
 
     #[test]
