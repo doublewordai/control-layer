@@ -2773,9 +2773,11 @@ pub async fn build_router(
     // Tracing span fields appear on every fmt log line in the request, so only the
     // correlation keys are fields: trace_id, otel.name, x_request_id,
     // edge_request_id and provider_request_id (the request IDs are what
-    // `|= "x_request_id=<id>"` log queries match on). All other attributes are set via
-    // OpenTelemetrySpanExt::set_attribute() so they're exported to the trace backend
-    // but don't clutter log lines.
+    // `|= "x_request_id=<id>"` log queries match on), plus otel.kind, which the
+    // tracing-opentelemetry layer only reads from a field (as a raw attribute it
+    // is ignored and the span exports as `internal`). All other attributes are
+    // set via OpenTelemetrySpanExt::set_attribute() so they're exported to the
+    // trace backend but don't clutter log lines.
     // Reference: https://opentelemetry.io/docs/specs/semconv/http/http-spans/
     let router = router.layer(middleware::from_fn(record_provider_request_id));
     let router = router.layer(middleware::from_fn(inject_trace_id)).layer(
@@ -2805,6 +2807,7 @@ pub async fn build_router(
                     edge_request_id = tracing::field::Empty,
                     provider_request_id = tracing::field::Empty,
                     otel.name = %span_name,
+                    otel.kind = "server",
                 );
 
                 // IDs minted by `assign_request_id`, which runs outside this layer.
@@ -2842,7 +2845,6 @@ pub async fn build_router(
                     let _ = span.set_parent(parent);
                 }
 
-                span.set_attribute("otel.kind", "Server");
                 span.set_attribute("api.type", api_type.to_string());
                 span.set_attribute("http.request.method", request.method().to_string());
                 span.set_attribute("http.route", route.unwrap_or_default());
