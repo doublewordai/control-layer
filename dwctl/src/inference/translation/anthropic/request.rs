@@ -221,7 +221,12 @@ fn convert_message(m: &InputMessage, out: &mut Vec<Value>) -> Result<(), Transla
         // (Claude Code injects harness reminders this way); keep them in place as
         // OpenAI system messages.
         "system" => out.extend(system_to_message(&m.content)),
-        other => return Err(TranslationError::BadRequest(format!("unsupported message role: {other}"))),
+        other => {
+            return Err(TranslationError::InvalidParameter {
+                param: "messages[].role",
+                message: format!("messages[].role: expected one of user, assistant, system, got {other}"),
+            });
+        }
     }
     Ok(())
 }
@@ -690,7 +695,10 @@ mod tests {
         }))
         .unwrap();
         let err = to_chat_completions(req, true).unwrap_err();
-        assert!(matches!(err, TranslationError::BadRequest(m) if m.contains("developer")));
+        assert!(matches!(
+            err,
+            TranslationError::InvalidParameter { param: "messages[].role", message } if message.contains("developer")
+        ));
     }
 
     fn effort_for(extra: Value) -> Result<Option<Value>, TranslationError> {
