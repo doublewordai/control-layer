@@ -129,6 +129,7 @@ async fn schema_errors_are_counted_before_forwarding() {
         .await;
 
     response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(response.json::<Value>()["error"]["param"], "messages");
     assert!(mock.get_requests().is_empty());
     assert_eq!(
         count(&[

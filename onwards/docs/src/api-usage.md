@@ -69,7 +69,8 @@ Every client error that onwards decides on itself, such as an unknown model, a f
 Each rejection also sets these attributes on the current trace span, usually onwards' `onwards.request` span. Strict mode refuses some requests before that span exists (body errors, payload too large, unsupported `/v1/completions` and Responses reasoning fields). Those attributes go on the enclosing span when onwards runs inside a gateway that opens one per request, such as dwctl; the standalone server opens none, so they are only counted there:
 
 - `error.type`: the same code as the metric;
-- `onwards.rejection.param`: the parameter the error names, if any;
+- `onwards.rejection.param`: the parameter the error names, if any. For `schema_mismatch` it is where the body stopped matching, such as `messages[].tool_calls[].function.arguments`: array positions are left out, and so is anything the request contained. The client's error carries the same value in `param`;
+- `onwards.rejection.reason`: for `schema_mismatch`, how the body failed: `invalid_type`, `invalid_value`, `invalid_length`, `unknown_variant`, `unknown_field`, `missing_field`, `duplicate_field`, `no_matching_variant` or `other`;
 - `onwards.account` and `onwards.api_key_id`: from the labels of the key the request presented, when it has them;
 - `http.response.status_code`: on `onwards.request`.
 
