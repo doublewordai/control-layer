@@ -143,6 +143,7 @@ fn install_crypto_provider() {
 pub mod account_limits;
 pub mod api;
 pub mod auth;
+pub mod capacity_reservation_retention;
 pub mod clickhouse;
 pub mod config;
 mod config_watcher;
@@ -4019,6 +4020,19 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         let daemon_shutdown = shutdown_token.clone();
         background_tasks.spawn("prompt-cache-retention", async move {
             prompt_cache::retention::run_prompt_cache_retention_daemon(daemon_pool, daemon_config, daemon_shutdown).await;
+            Ok(())
+        });
+    }
+
+    // Start the capacity-reservation retention daemon: bounded deletion of batch admission
+    // reservations released or expired long ago. Without it the ledger only grows.
+    if config.background_services.capacity_reservation_retention.enabled {
+        // Retention holds a session advisory lock, which requires a direct connection.
+        let daemon_pool = direct_pools.clone();
+        let daemon_config = config.background_services.capacity_reservation_retention.clone();
+        let daemon_shutdown = shutdown_token.clone();
+        background_tasks.spawn("capacity-reservation-retention", async move {
+            capacity_reservation_retention::run_capacity_reservation_retention_daemon(daemon_pool, daemon_config, daemon_shutdown).await;
             Ok(())
         });
     }

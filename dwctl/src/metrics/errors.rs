@@ -34,6 +34,7 @@ pub mod component {
     pub const USAGE_REFRESH: &str = "usage_refresh";
     pub const TASK_RETENTION: &str = "task_retention";
     pub const PROMPT_CACHE_RETENTION: &str = "prompt_cache_retention";
+    pub const CAPACITY_RESERVATION_RETENTION: &str = "capacity_reservation_retention";
     pub const CONTINUATION: &str = "continuation";
     pub const ALLOCATOR_METRICS: &str = "allocator_metrics";
     pub const HEAP_PROFILING: &str = "heap_profiling";

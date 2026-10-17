@@ -509,6 +509,40 @@ re-writing at that moment is skipped. Each batch has a 2-second lock timeout and
 million entries an hour, so an installation with a long existing history clears it over
 several sweeps without a burst of write and vacuum load.
 
+### Capacity Reservation Retention
+
+Deletes batch capacity reservations that can no longer affect admission. `POST /batches`
+writes one short-lived reservation per model and releases it when the submission
+finishes; admission only reads unexpired reservations that are unreleased or were
+released moments ago. Nothing else removes the rest, so without this daemon the
+reservation ledger keeps every reservation ever made.
+
+```yaml
+background_services:
+  capacity_reservation_retention:
+    enabled: true
+    interval_seconds: 3600
+    retention_seconds: 3600
+    batch_size: 10000
+    batch_pause_milliseconds: 250
+    max_rows_per_sweep: 2000000
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | boolean | `true` | Run the retention daemon. |
+| `interval_seconds` | integer | `3600` | Seconds between sweeps. |
+| `retention_seconds` | integer | `3600` | Seconds a reservation is kept after it was released, or, if it was never released, after it expired. Must be at least `batches.reservation_ttl_secs`; a lower value fails configuration loading. |
+| `batch_size` | integer | `10000` | Rows deleted per statement; each batch is its own short transaction. |
+| `batch_pause_milliseconds` | integer | `250` | Pause between batches of one sweep. |
+| `max_rows_per_sweep` | integer | `2000000` | Rows one sweep deletes at most. A larger backlog drains over several sweeps. |
+
+Every instance runs the daemon; an advisory lock collapses concurrent sweeps to one.
+Each batch has a 2-second lock timeout and a 30-second statement timeout. An
+installation that has never run the daemon clears its existing reservations over
+several sweeps (about `existing rows / max_rows_per_sweep`). Deleted space is reused for
+new reservations rather than returned to the operating system.
+
 ### Leader Election
 
 For multi-instance deployments:
