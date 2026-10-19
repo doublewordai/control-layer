@@ -112,10 +112,11 @@ async fn rejected_and_unrouted_responses_carry_id(pool: sqlx::PgPool) {
 }
 
 /// The root request span carries our ID and the sanitised edge ID, both as
-/// log fields and as exported OTel attributes.
+/// log fields and as exported OTel attributes, and is exported as a server
+/// span.
 #[dwctl_test_macros::test]
 async fn root_span_records_request_ids(pool: sqlx::PgPool) {
-    use opentelemetry::trace::TracerProvider;
+    use opentelemetry::trace::{SpanKind, TracerProvider};
     use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
     use tracing_subscriber::layer::SubscriberExt;
 
@@ -165,6 +166,10 @@ async fn root_span_records_request_ids(pool: sqlx::PgPool) {
     let span = root_for("/missing-a");
     assert_eq!(attr(&span, "x_request_id").as_deref(), Some(id.as_str()));
     assert_eq!(attr(&span, "edge_request_id").as_deref(), Some("edge-123"));
+    // The kind must be the span's own kind, not a string attribute the
+    // trace backend ignores (it would then store the span as `internal`).
+    assert_eq!(span.span_kind, SpanKind::Server);
+    assert_eq!(attr(&span, "otel.kind"), None, "otel.kind must not leak as an attribute");
     // Log lines carry the IDs unquoted, so `|= "x_request_id=<id>"` matches.
     let text = logs.text();
     assert!(

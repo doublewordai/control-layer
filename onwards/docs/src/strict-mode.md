@@ -160,17 +160,19 @@ Requests to unsupported endpoints will return `404 Not Found` when strict mode i
 
 ## Parameters not every backend supports
 
-Some chat parameters are engine extensions or options that not every backend behind a model can honour, for example `n` greater than 1, `logprobs`, `guided_json` or `min_tokens`. The full list, with the values that count as absent (such as `n: 1`, `logprobs: false` or `top_logprobs: 0`), is the catalog in `onwards::unsupported_params`. `chat_template_kwargs` isn't in it: strict mode refuses that field outright and points to `reasoning_effort` instead.
+Some chat parameters are engine extensions or options that not every backend behind a model can honour, for example `n` greater than 1, `logprobs`, `guided_json` or `min_tokens`. The full list, with the values that count as absent (such as `n: 1`, `logprobs: false` or `top_logprobs: 0`), is the chat catalog in `onwards::unsupported_params`. `chat_template_kwargs` isn't in it: strict mode refuses that field outright and points to `reasoning_effort` instead.
 
-Strict mode checks every Chat Completions request against that list after schema validation and before reasoning validation:
+Legacy completions requests have their own, shorter catalog: `n` and `best_of` values other than 1 (normally greater than 1), `logprobs` and `prompt_logprobs`. On that surface `logprobs` is a count, and any count, including `0`, asks for log probabilities; only a missing or `null` value counts as absent.
+
+Strict mode checks every Chat Completions and legacy completions request against its surface's catalog after schema validation (on chat, before reasoning validation):
 
 - Each matching parameter increments `onwards_unsupported_params_total{param, model, traffic, action}`. `action` is `logged` or `rejected`. A `logged` request can still be refused by a later check, such as reasoning validation.
 - The `onwards.request` trace span gets `onwards.unsupported_params`, the matching parameter names joined by commas, and `onwards.account` and `onwards.api_key_id` from the labels of the key the request presented, when it has them. Values and request bodies are never recorded.
 - If any parameter is in the gateway's reject list, the whole request gets a `400` with code `unsupported_parameter` naming the rejected parameters, for example ``Unsupported parameter(s): `logprobs` ``, and is not forwarded. A request whose flagged parameters are all outside the reject list is forwarded unchanged.
 
-The check covers Chat Completions requests, including Responses and Messages requests that an edge such as dwctl has translated into Chat Completions before they reach onwards. Native `/v1/responses` requests are forwarded to an upstream that speaks the Responses API itself and aren't checked.
+The check covers Chat Completions requests, including Responses and Messages requests that an edge such as dwctl has translated into Chat Completions before they reach onwards, and legacy `/v1/completions` requests. Native `/v1/responses` requests are forwarded to an upstream that speaks the Responses API itself and aren't checked.
 
-The reject list is empty by default, so the check only observes. Set it with `AppState::with_rejected_params`; in dwctl, use `onwards.rejected_params`. A name outside the catalog is a configuration error.
+The reject list is empty by default, so the check only observes. Set it with `AppState::with_rejected_params`; in dwctl, use `onwards.rejected_params`. The list holds names, so a listed name is refused on every surface whose catalog has it: rejecting `logprobs` refuses `logprobs: true` on chat and any `logprobs` count on legacy completions. A name outside both catalogs is a configuration error.
 
 ## Comparison with response sanitization
 
