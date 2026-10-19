@@ -34,6 +34,12 @@
 //! attributes; `gen_ai.*`, `http.*` and `error.type` follow OpenTelemetry
 //! semantic conventions.
 //!
+//! Span kinds are set with an `otel.kind` *field* on the span (the layer
+//! ignores a raw `otel.kind` attribute and exports the span as `internal`):
+//! the root `request` span is a `server` span and `fusillade.batch_finalized`
+//! a `producer` span, so backends that derive RED metrics from server spans
+//! count every request.
+//!
 //! Root `request` span, for authenticated AI requests (set when the response is
 //! produced; see [`record_ai_response_attributes`]):
 //!

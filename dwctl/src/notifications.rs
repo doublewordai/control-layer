@@ -233,11 +233,13 @@ async fn emit_batch_finalized_spans<P: sqlx_pool_router::PoolProvider>(
         });
         // When the batch finished; the span itself starts when the poller claims it.
         let finalized_at = batch.completed_at.or(batch.failed_at).map(|at| at.to_rfc3339());
-        // A root span: the poller has no request to belong to.
+        // A root span: the poller has no request to belong to. A producer,
+        // because it reports on work it did not serve itself.
         let span = tracing::info_span!(
             parent: None,
             "fusillade.batch_finalized",
             otel.name = "fusillade.batch_finalized",
+            otel.kind = "producer",
             batch_id = %batch.id,
             doubleword.account_id = %batch.created_by,
             doubleword.account_name = account_name.map(String::as_str),
@@ -2403,6 +2405,12 @@ mod tests {
         let spans = exported.0.lock().unwrap();
         let spans: Vec<_> = spans.iter().filter(|s| s.name == "fusillade.batch_finalized").collect();
         assert_eq!(spans.len(), 3, "one span per claimed batch");
+        // The poller produces the span for a batch it did not serve, so the
+        // kind is the span's own kind, never a string attribute.
+        for span in &spans {
+            assert_eq!(span.span_kind, opentelemetry::trace::SpanKind::Producer);
+            assert_eq!(span_attr(span, "otel.kind"), None, "otel.kind must not leak as an attribute");
+        }
         let span_of = |batch_id: fusillade::BatchId| {
             spans
                 .iter()
