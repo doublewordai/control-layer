@@ -530,6 +530,33 @@ impl<'c> Repository for Users<'c> {
             .execute(&mut *tx)
             .await?;
 
+            // Retire the account's active connections through the same path as
+            // an explicit connection deletion. This also marks their sync rows
+            // deleted, preventing queued workers from recreating hidden keys
+            // for the deleted owner. The connection records remain for audit.
+            let connection_ids = sqlx::query_scalar!("SELECT id FROM connections WHERE user_id = $1 AND deleted_at IS NULL", id)
+                .fetch_all(&mut *tx)
+                .await?;
+            for connection_id in connection_ids {
+                crate::db::handlers::connections::Connections::new(&mut tx)
+                    .soft_delete(connection_id)
+                    .await?;
+            }
+
+            // A key owned by this account may also be referenced by a
+            // connection owned elsewhere. Release any such remaining
+            // references before hard-deleting the account's keys.
+            sqlx::query!(
+                r#"
+                UPDATE connections
+                SET api_key_id = NULL
+                WHERE api_key_id IN (SELECT id FROM api_keys WHERE user_id = $1)
+                "#,
+                id
+            )
+            .execute(&mut *tx)
+            .await?;
+
             sqlx::query!(r#"DELETE FROM api_keys WHERE user_id = $1"#, id)
                 .execute(&mut *tx)
                 .await?;
@@ -1456,6 +1483,131 @@ mod tests {
             repo.delete(user.id).await.unwrap()
         };
         assert!(!again);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_soft_deleted_connection_releases_api_key_for_user_deletion(pool: PgPool) {
+        use crate::db::{handlers::connections::Connections, models::api_keys::ApiKeyCreateDBRequest};
+
+        let mut conn = pool.acquire().await.unwrap();
+        let user = create_standard_user(&mut conn, "connection-owner").await;
+        let api_key = ApiKeys::new(&mut conn)
+            .create(&ApiKeyCreateDBRequest {
+                user_id: user.id,
+                name: "connection-key".to_string(),
+                description: None,
+                purpose: ApiKeyPurpose::Batch,
+                created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
+            })
+            .await
+            .unwrap();
+        let connection = Connections::new(&mut conn)
+            .create(user.id, Some(api_key.id), "source", "s3", "connection", b"encrypted-config")
+            .await
+            .unwrap();
+
+        assert!(Connections::new(&mut conn).soft_delete(connection.id).await.unwrap());
+
+        let (deleted_at, connection_api_key_id): (Option<DateTime<Utc>>, Option<Uuid>) =
+            sqlx::query_as("SELECT deleted_at, api_key_id FROM connections WHERE id = $1")
+                .bind(connection.id)
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+        assert!(deleted_at.is_some());
+        assert!(connection_api_key_id.is_none());
+
+        assert!(Users::new(&mut conn).delete(user.id).await.unwrap());
+        let remaining_keys: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE user_id = $1")
+            .bind(user.id)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(remaining_keys, 0);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_delete_user_releases_api_key_from_active_connection(pool: PgPool) {
+        use crate::db::{handlers::connections::Connections, models::api_keys::ApiKeyCreateDBRequest};
+
+        let mut conn = pool.acquire().await.unwrap();
+        let user = create_standard_user(&mut conn, "active-connection-owner").await;
+        let api_key = ApiKeys::new(&mut conn)
+            .create(&ApiKeyCreateDBRequest {
+                user_id: user.id,
+                name: "active-connection-key".to_string(),
+                description: None,
+                purpose: ApiKeyPurpose::Batch,
+                created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
+            })
+            .await
+            .unwrap();
+        let connection = Connections::new(&mut conn)
+            .create(user.id, Some(api_key.id), "source", "s3", "connection", b"encrypted-config")
+            .await
+            .unwrap();
+        let sync_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO sync_operations (connection_id, status, strategy, triggered_by, sync_config)
+            VALUES ($1, 'pending', 'snapshot', $2, '{}')
+            RETURNING id
+            "#,
+        )
+        .bind(connection.id)
+        .bind(user.id)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        let sync_entry_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO sync_entries (sync_id, connection_id, external_key, status)
+            VALUES ($1, $2, 'pending.jsonl', 'pending')
+            RETURNING id
+            "#,
+        )
+        .bind(sync_id)
+        .bind(connection.id)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+
+        assert!(Users::new(&mut conn).delete(user.id).await.unwrap());
+
+        let (connection_api_key_id, deleted_at): (Option<Uuid>, Option<DateTime<Utc>>) =
+            sqlx::query_as("SELECT api_key_id, deleted_at FROM connections WHERE id = $1")
+                .bind(connection.id)
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+        assert!(connection_api_key_id.is_none());
+        assert!(deleted_at.is_some());
+
+        let sync_status: String = sqlx::query_scalar("SELECT status FROM sync_operations WHERE id = $1")
+            .bind(sync_id)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(sync_status, "deleted");
+
+        let entry_status: String = sqlx::query_scalar("SELECT status FROM sync_entries WHERE id = $1")
+            .bind(sync_entry_id)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(entry_status, "deleted");
+
+        let remaining_keys: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE user_id = $1")
+            .bind(user.id)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(remaining_keys, 0);
     }
 
     #[dwctl_test_macros::test]
