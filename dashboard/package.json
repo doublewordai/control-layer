@@ -68,7 +68,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.33.0",
-    "@playwright/test": "1.58.2",
+    "@playwright/test": "1.64.1",
     "@testing-library/jest-dom": "^6.8.0",
     "@testing-library/react": "^16.3.0",
     "@testing-library/user-event": "^14.6.1",
@@ -110,7 +110,7 @@
       "js-yaml": "^4.3.2",
       "@babel/core@<=7.29.0": "^7.29.6",
       "@ungap/structured-clone@<1.3.1": "^1.3.1",
-      "undici": "7.29.1"
+      "undici": "7.30.1"
     },
     "onlyBuiltDependencies": [
       "esbuild",

@@ -48,24 +48,24 @@ tokio = { version = "1.45.1", features = [
 ] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tracing = "0.1.41"
-tracing-opentelemetry = "0.33.0"
+tracing-opentelemetry = "0.34.0"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "registry"] }
-opentelemetry = "0.32.0"
-opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "http-json", "reqwest-blocking-client", "reqwest-rustls"] }
+opentelemetry = "0.33.0"
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "http-json", "reqwest-blocking-client", "reqwest-rustls"] }
 url = { version = "2.5", features = ["serde"] }
 bon = "3.6.5"
 subtle = "2.6.1"
 axum-prometheus = "0.10.0"
 metrics = "0.24"
 governor = "0.10.1"
-rand = "0.9"
+rand = "0.10"
 sha2 = "0.11.0"
 uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 axum-test = "18.0.0"
 futures-util = "0.3"
-rstest = "0.26.1"
+rstest = "0.28.0"
 tower = "0.5"
 wiremock = "0.6"
 reqwest = { version = "0.13", features = ["json", "stream"] }
