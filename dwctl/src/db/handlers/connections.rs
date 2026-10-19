@@ -237,7 +237,12 @@ impl<'c> Connections<'c> {
         .execute(&mut *self.db)
         .await?;
 
-        let result = sqlx::query!("UPDATE connections SET deleted_at = now() WHERE id = $1 AND deleted_at IS NULL", id,)
+        // A deleted connection can no longer run syncs, so it no longer needs
+        // the hidden batch key used for future attribution. Releasing that
+        // reference also lets account deletion remove the owner's API keys
+        // without the retained audit row violating its foreign key.
+        let result = sqlx::query("UPDATE connections SET deleted_at = now(), api_key_id = NULL WHERE id = $1 AND deleted_at IS NULL")
+            .bind(id)
             .execute(&mut *self.db)
             .await?;
 

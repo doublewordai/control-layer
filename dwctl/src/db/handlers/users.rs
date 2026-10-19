@@ -1460,6 +1460,50 @@ mod tests {
 
     #[dwctl_test_macros::test]
     #[test_log::test]
+    async fn test_soft_deleted_connection_releases_api_key_for_user_deletion(pool: PgPool) {
+        use crate::db::{handlers::connections::Connections, models::api_keys::ApiKeyCreateDBRequest};
+
+        let mut conn = pool.acquire().await.unwrap();
+        let user = create_standard_user(&mut conn, "connection-owner").await;
+        let api_key = ApiKeys::new(&mut conn)
+            .create(&ApiKeyCreateDBRequest {
+                user_id: user.id,
+                name: "connection-key".to_string(),
+                description: None,
+                purpose: ApiKeyPurpose::Batch,
+                created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
+            })
+            .await
+            .unwrap();
+        let connection = Connections::new(&mut conn)
+            .create(user.id, Some(api_key.id), "source", "s3", "connection", b"encrypted-config")
+            .await
+            .unwrap();
+
+        assert!(Connections::new(&mut conn).soft_delete(connection.id).await.unwrap());
+
+        let (deleted_at, connection_api_key_id): (Option<DateTime<Utc>>, Option<Uuid>) =
+            sqlx::query_as("SELECT deleted_at, api_key_id FROM connections WHERE id = $1")
+                .bind(connection.id)
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+        assert!(deleted_at.is_some());
+        assert!(connection_api_key_id.is_none());
+
+        assert!(Users::new(&mut conn).delete(user.id).await.unwrap());
+        let remaining_keys: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE user_id = $1")
+            .bind(user.id)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(remaining_keys, 0);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
     async fn test_delete_user_soft_deletes_attributed_keys_preserving_audit_trail(pool: PgPool) {
         use crate::db::{
             handlers::organizations::Organizations,
