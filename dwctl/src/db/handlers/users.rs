@@ -530,6 +530,20 @@ impl<'c> Repository for Users<'c> {
             .execute(&mut *tx)
             .await?;
 
+            // Connections are retained for audit when their owner is deleted,
+            // but their hidden batch keys are not. Release every reference to
+            // a key owned by this account before hard-deleting those keys.
+            sqlx::query!(
+                r#"
+                UPDATE connections
+                SET api_key_id = NULL
+                WHERE api_key_id IN (SELECT id FROM api_keys WHERE user_id = $1)
+                "#,
+                id
+            )
+            .execute(&mut *tx)
+            .await?;
+
             sqlx::query!(r#"DELETE FROM api_keys WHERE user_id = $1"#, id)
                 .execute(&mut *tx)
                 .await?;
@@ -1494,6 +1508,47 @@ mod tests {
         assert!(connection_api_key_id.is_none());
 
         assert!(Users::new(&mut conn).delete(user.id).await.unwrap());
+        let remaining_keys: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE user_id = $1")
+            .bind(user.id)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(remaining_keys, 0);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_delete_user_releases_api_key_from_active_connection(pool: PgPool) {
+        use crate::db::{handlers::connections::Connections, models::api_keys::ApiKeyCreateDBRequest};
+
+        let mut conn = pool.acquire().await.unwrap();
+        let user = create_standard_user(&mut conn, "active-connection-owner").await;
+        let api_key = ApiKeys::new(&mut conn)
+            .create(&ApiKeyCreateDBRequest {
+                user_id: user.id,
+                name: "active-connection-key".to_string(),
+                description: None,
+                purpose: ApiKeyPurpose::Batch,
+                created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
+            })
+            .await
+            .unwrap();
+        let connection = Connections::new(&mut conn)
+            .create(user.id, Some(api_key.id), "source", "s3", "connection", b"encrypted-config")
+            .await
+            .unwrap();
+
+        assert!(Users::new(&mut conn).delete(user.id).await.unwrap());
+
+        let connection_api_key_id: Option<Uuid> = sqlx::query_scalar("SELECT api_key_id FROM connections WHERE id = $1")
+            .bind(connection.id)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert!(connection_api_key_id.is_none());
+
         let remaining_keys: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE user_id = $1")
             .bind(user.id)
             .fetch_one(&mut *conn)
