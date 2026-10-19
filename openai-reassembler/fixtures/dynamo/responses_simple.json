@@ -1,0 +1,370 @@
+{
+  "events": [
+    {
+      "data": {
+        "response": {
+          "background": false,
+          "completed_at": null,
+          "created_at": 1775560916,
+          "error": null,
+          "frequency_penalty": 0.0,
+          "id": "resp_3a213adaeef3422087a7fc23a479f9c7",
+          "incomplete_details": null,
+          "instructions": null,
+          "max_output_tokens": 4096,
+          "max_tool_calls": null,
+          "metadata": {},
+          "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+          "object": "response",
+          "output": [],
+          "parallel_tool_calls": true,
+          "presence_penalty": 0.0,
+          "previous_response_id": null,
+          "prompt_cache_key": null,
+          "reasoning": null,
+          "safety_identifier": null,
+          "service_tier": "auto",
+          "status": "in_progress",
+          "store": false,
+          "temperature": 0.0,
+          "text": {
+            "format": {
+              "type": "text"
+            }
+          },
+          "tool_choice": "auto",
+          "tools": [],
+          "top_logprobs": 0,
+          "top_p": 1.0,
+          "truncation": "disabled",
+          "usage": null
+        },
+        "sequence_number": 0,
+        "type": "response.created"
+      },
+      "event_type": "response.created"
+    },
+    {
+      "data": {
+        "response": {
+          "background": false,
+          "completed_at": null,
+          "created_at": 1775560916,
+          "error": null,
+          "frequency_penalty": 0.0,
+          "id": "resp_3a213adaeef3422087a7fc23a479f9c7",
+          "incomplete_details": null,
+          "instructions": null,
+          "max_output_tokens": 4096,
+          "max_tool_calls": null,
+          "metadata": {},
+          "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+          "object": "response",
+          "output": [],
+          "parallel_tool_calls": true,
+          "presence_penalty": 0.0,
+          "previous_response_id": null,
+          "prompt_cache_key": null,
+          "reasoning": null,
+          "safety_identifier": null,
+          "service_tier": "auto",
+          "status": "in_progress",
+          "store": false,
+          "temperature": 0.0,
+          "text": {
+            "format": {
+              "type": "text"
+            }
+          },
+          "tool_choice": "auto",
+          "tools": [],
+          "top_logprobs": 0,
+          "top_p": 1.0,
+          "truncation": "disabled",
+          "usage": null
+        },
+        "sequence_number": 1,
+        "type": "response.in_progress"
+      },
+      "event_type": "response.in_progress"
+    },
+    {
+      "data": {
+        "item": {
+          "content": [],
+          "id": "msg_f7274d08d7cc499eb3b9c1b3998dc05b",
+          "role": "assistant",
+          "status": "in_progress",
+          "type": "message"
+        },
+        "output_index": 0,
+        "sequence_number": 2,
+        "type": "response.output_item.added"
+      },
+      "event_type": "response.output_item.added"
+    },
+    {
+      "data": {
+        "content_index": 0,
+        "item_id": "msg_f7274d08d7cc499eb3b9c1b3998dc05b",
+        "output_index": 0,
+        "part": {
+          "annotations": [],
+          "logprobs": [],
+          "text": "",
+          "type": "output_text"
+        },
+        "sequence_number": 3,
+        "type": "response.content_part.added"
+      },
+      "event_type": "response.content_part.added"
+    },
+    {
+      "data": {
+        "content_index": 0,
+        "delta": "The",
+        "item_id": "msg_f7274d08d7cc499eb3b9c1b3998dc05b",
+        "logprobs": [],
+        "output_index": 0,
+        "sequence_number": 4,
+        "type": "response.output_text.delta"
+      },
+      "event_type": "response.output_text.delta"
+    },
+    {
+      "data": {
+        "content_index": 0,
+        "delta": " quick",
+        "item_id": "msg_f7274d08d7cc499eb3b9c1b3998dc05b",
+        "logprobs": [],
+        "output_index": 0,
+        "sequence_number": 5,
+        "type": "response.output_text.delta"
+      },
+      "event_type": "response.output_text.delta"
+    },
+    {
+      "data": {
+        "content_index": 0,
+        "delta": " brown",
+        "item_id": "msg_f7274d08d7cc499eb3b9c1b3998dc05b",
+        "logprobs": [],
+        "output_index": 0,
+        "sequence_number": 6,
+        "type": "response.output_text.delta"
+      },
+      "event_type": "response.output_text.delta"
+    },
+    {
+      "data": {
+        "content_index": 0,
+        "delta": " fox",
+        "item_id": "msg_f7274d08d7cc499eb3b9c1b3998dc05b",
+        "logprobs": [],
+        "output_index": 0,
+        "sequence_number": 7,
+        "type": "response.output_text.delta"
+      },
+      "event_type": "response.output_text.delta"
+    },
+    {
+      "data": {
+        "content_index": 0,
+        "delta": ".",
+        "item_id": "msg_f7274d08d7cc499eb3b9c1b3998dc05b",
+        "logprobs": [],
+        "output_index": 0,
+        "sequence_number": 8,
+        "type": "response.output_text.delta"
+      },
+      "event_type": "response.output_text.delta"
+    },
+    {
+      "data": {
+        "content_index": 0,
+        "item_id": "msg_f7274d08d7cc499eb3b9c1b3998dc05b",
+        "logprobs": [],
+        "output_index": 0,
+        "sequence_number": 9,
+        "text": "The quick brown fox.",
+        "type": "response.output_text.done"
+      },
+      "event_type": "response.output_text.done"
+    },
+    {
+      "data": {
+        "content_index": 0,
+        "item_id": "msg_f7274d08d7cc499eb3b9c1b3998dc05b",
+        "output_index": 0,
+        "part": {
+          "annotations": [],
+          "logprobs": [],
+          "text": "The quick brown fox.",
+          "type": "output_text"
+        },
+        "sequence_number": 10,
+        "type": "response.content_part.done"
+      },
+      "event_type": "response.content_part.done"
+    },
+    {
+      "data": {
+        "item": {
+          "content": [
+            {
+              "annotations": [],
+              "logprobs": [],
+              "text": "The quick brown fox.",
+              "type": "output_text"
+            }
+          ],
+          "id": "msg_f7274d08d7cc499eb3b9c1b3998dc05b",
+          "role": "assistant",
+          "status": "completed",
+          "type": "message"
+        },
+        "output_index": 0,
+        "sequence_number": 11,
+        "type": "response.output_item.done"
+      },
+      "event_type": "response.output_item.done"
+    },
+    {
+      "data": {
+        "response": {
+          "background": false,
+          "completed_at": 1775560916,
+          "created_at": 1775560916,
+          "error": null,
+          "frequency_penalty": 0.0,
+          "id": "resp_3a213adaeef3422087a7fc23a479f9c7",
+          "incomplete_details": null,
+          "instructions": null,
+          "max_output_tokens": 4096,
+          "max_tool_calls": null,
+          "metadata": {},
+          "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+          "object": "response",
+          "output": [
+            {
+              "content": [
+                {
+                  "annotations": [],
+                  "logprobs": [],
+                  "text": "The quick brown fox.",
+                  "type": "output_text"
+                }
+              ],
+              "id": "msg_f7274d08d7cc499eb3b9c1b3998dc05b",
+              "role": "assistant",
+              "status": "completed",
+              "type": "message"
+            }
+          ],
+          "parallel_tool_calls": true,
+          "presence_penalty": 0.0,
+          "previous_response_id": null,
+          "prompt_cache_key": null,
+          "reasoning": null,
+          "safety_identifier": null,
+          "service_tier": "auto",
+          "status": "completed",
+          "store": false,
+          "temperature": 0.0,
+          "text": {
+            "format": {
+              "type": "text"
+            }
+          },
+          "tool_choice": "auto",
+          "tools": [],
+          "top_logprobs": 0,
+          "top_p": 1.0,
+          "truncation": "disabled",
+          "usage": {
+            "input_tokens": 17,
+            "input_tokens_details": {
+              "cached_tokens": 0
+            },
+            "output_tokens": 6,
+            "output_tokens_details": {
+              "reasoning_tokens": 0
+            },
+            "total_tokens": 23
+          }
+        },
+        "sequence_number": 12,
+        "type": "response.completed"
+      },
+      "event_type": "response.completed"
+    }
+  ],
+  "expected": {
+    "background": false,
+    "completed_at": 1775560916,
+    "created_at": 1775560916,
+    "error": null,
+    "frequency_penalty": 0.0,
+    "id": "resp_85831751eec4452f8e91093252bec30c",
+    "incomplete_details": null,
+    "instructions": null,
+    "max_output_tokens": 4096,
+    "max_tool_calls": null,
+    "metadata": {},
+    "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+    "nvext": {
+      "timing": {
+        "request_received_ms": 1775560916341,
+        "total_time_ms": 266.328782
+      }
+    },
+    "object": "response",
+    "output": [
+      {
+        "content": [
+          {
+            "annotations": [],
+            "logprobs": null,
+            "text": "The quick brown fox.",
+            "type": "output_text"
+          }
+        ],
+        "id": "msg_2f306bd86e5c489289585bc2bd3ff420",
+        "role": "assistant",
+        "status": "completed",
+        "type": "message"
+      }
+    ],
+    "parallel_tool_calls": true,
+    "presence_penalty": 0.0,
+    "previous_response_id": null,
+    "prompt_cache_key": null,
+    "reasoning": null,
+    "safety_identifier": null,
+    "service_tier": "auto",
+    "status": "completed",
+    "store": false,
+    "temperature": 0.0,
+    "text": {
+      "format": {
+        "type": "text"
+      }
+    },
+    "tool_choice": "auto",
+    "tools": [],
+    "top_logprobs": 0,
+    "top_p": 1.0,
+    "truncation": "disabled",
+    "usage": {
+      "input_tokens": 17,
+      "input_tokens_details": {
+        "cached_tokens": 0
+      },
+      "output_tokens": 6,
+      "output_tokens_details": {
+        "reasoning_tokens": 0
+      },
+      "total_tokens": 23
+    }
+  }
+}

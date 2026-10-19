@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgConnection};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::{instrument, trace};
 use uuid::Uuid;
 
@@ -114,7 +114,7 @@ impl<'c> Credits<'c> {
     /// analytics batcher's flush fold also updates. When calling inside an
     /// enclosing transaction, keep that transaction short and DB-local -
     /// holding it across external I/O would stall flushes for its duration.
-    #[instrument(skip(self, request), fields(user_id = %abbrev_uuid(&request.user_id), transaction_type = ?request.transaction_type, amount = %request.amount), err)]
+    #[instrument(level = "debug", skip(self, request), fields(user_id = %abbrev_uuid(&request.user_id), transaction_type = ?request.transaction_type, amount = %request.amount), err)]
     pub async fn create_transaction(&mut self, request: &CreditTransactionCreateDBRequest) -> Result<CreditTransactionDBResponse> {
         let signed_amount = match request.transaction_type {
             CreditTransactionType::AdminGrant | CreditTransactionType::Purchase => request.amount,
@@ -203,6 +203,68 @@ impl<'c> Credits<'c> {
         })
     }
 
+    /// Has this billing target ever completed a purchase?
+    ///
+    /// The read-side counterpart of [`Self::grant_first_payment_match`]: that
+    /// method decides eligibility from the absence of a prior `purchase` row,
+    /// and this answers the same question for callers that need to know
+    /// *before* any money moves - notably the dashboard's first-deposit-match
+    /// banner, which must not advertise a promotion the ledger will refuse.
+    ///
+    /// Deliberately not `has_payment_provider_id`: a payment-provider customer
+    /// record is created by setup-mode card verification and by
+    /// `POST /auto-topup/enable` (even on the `needs_billing_portal` bail-out),
+    /// so it goes true for accounts that have never bought anything and would
+    /// hide the promotion from people still entitled to it.
+    ///
+    /// Served by the partial `idx_credits_transactions_user_purchases` index
+    /// (migration 100), so it stays a direct lookup no matter how many `usage`
+    /// rows the target has accumulated.
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn has_purchased(&mut self, user_id: UserId) -> Result<bool> {
+        let purchased = sqlx::query_scalar!(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM credits_transactions
+                WHERE user_id = $1 AND transaction_type = 'purchase'
+            ) AS "purchased!"
+            "#,
+            user_id
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+
+        Ok(purchased)
+    }
+
+    /// Which of `user_ids` have ever completed a purchase?
+    ///
+    /// Bulk form of [`Self::has_purchased`], for the list endpoints - one
+    /// query for the page rather than one per row. Returns only the ids that
+    /// have purchased; absent means no purchase, so callers test membership.
+    ///
+    /// `DISTINCT` rather than a count: we only need the boolean, and stopping
+    /// at existence keeps this on the partial purchases index.
+    #[instrument(level = "debug", skip(self, user_ids), fields(count = user_ids.len()), err)]
+    pub async fn has_purchased_bulk(&mut self, user_ids: &[UserId]) -> Result<HashSet<UserId>> {
+        if user_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let rows = sqlx::query_scalar!(
+            r#"
+            SELECT DISTINCT user_id AS "user_id!"
+            FROM credits_transactions
+            WHERE user_id = ANY($1::uuid[]) AND transaction_type = 'purchase'
+            "#,
+            user_ids
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows.into_iter().collect())
+    }
+
     /// Grant a first-payment match bonus to `payee` if eligible.
     ///
     /// The promotion matches a user's first ever payment with bonus credits, up
@@ -222,7 +284,7 @@ impl<'c> Credits<'c> {
     /// `source_id` unique constraint makes the second insert a no-op). Reuses
     /// `create_transaction`, so the bonus also triggers the balance-restored
     /// notify like any other credit.
-    #[instrument(skip(self), fields(payee = %abbrev_uuid(&payee), match_up_to = %match_up_to), err)]
+    #[instrument(level = "debug", skip(self), fields(payee = %abbrev_uuid(&payee), match_up_to = %match_up_to), err)]
     pub async fn grant_first_payment_match(
         &mut self,
         match_up_to: Decimal,
@@ -329,7 +391,10 @@ impl<'c> Credits<'c> {
     ///
     /// Recorded as an `admin_grant` via `create_transaction`, so it fires the
     /// balance-restored notify like any other credit.
-    #[instrument(skip(self), fields(payee = %abbrev_uuid(&payee), amount = %amount), err)]
+    ///
+    /// Whether the payee may be verified at all is decided before this is
+    /// called: see `claim_verification_instrument`.
+    #[instrument(level = "debug", skip(self), fields(payee = %abbrev_uuid(&payee), amount = %amount), err)]
     pub async fn grant_verification_credits(&mut self, amount: Decimal, payee: UserId, setup_source_id: &str) -> Result<()> {
         if amount <= Decimal::ZERO {
             return Ok(());
@@ -351,6 +416,31 @@ impl<'c> Credits<'c> {
             trace!("Payee {} already received verification credits, skipping", payee);
         }
         Ok(())
+    }
+
+    /// Record `payee` as the account verified by a payment instrument and
+    /// return whoever holds it afterwards: `payee` when it was unclaimed or
+    /// already theirs, otherwise the earlier claimant.
+    ///
+    /// `fingerprint` is Stripe's fingerprint of the payment method: the same
+    /// card or bank account yields the same value on every customer. One
+    /// instrument verifies one account. It can still pay for top-ups on any
+    /// account; only verification consults this table. Rows are never
+    /// deleted, so a scrubbed-and-recreated account cannot claim again.
+    /// Two statements rather than one CTE so a concurrent first claim is
+    /// visible to the loser's read.
+    pub async fn claim_verification_instrument(&mut self, fingerprint: &str, payee: UserId) -> Result<UserId> {
+        sqlx::query("INSERT INTO verification_instruments (fingerprint, user_id) VALUES ($1, $2) ON CONFLICT (fingerprint) DO NOTHING")
+            .bind(fingerprint)
+            .bind(payee)
+            .execute(&mut *self.db)
+            .await?;
+
+        let owner: Uuid = sqlx::query_scalar("SELECT user_id FROM verification_instruments WHERE fingerprint = $1")
+            .bind(fingerprint)
+            .fetch_one(&mut *self.db)
+            .await?;
+        Ok(owner)
     }
 
     /// Send a pg_notify so the onwards config sync re-evaluates key
@@ -382,7 +472,7 @@ impl<'c> Credits<'c> {
     /// writer folds its charges in synchronously, so it is current as of the
     /// last committed write); a missing row can only mean a user that has
     /// never existed, so it reads as zero.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn get_user_balance(&mut self, user_id: UserId) -> Result<Decimal> {
         let balance = sqlx::query_scalar!(r#"SELECT balance FROM user_balance_checkpoints WHERE user_id = $1"#, user_id)
             .fetch_optional(&mut *self.db)
@@ -391,8 +481,21 @@ impl<'c> Credits<'c> {
         Ok(balance.unwrap_or(Decimal::ZERO))
     }
 
+    /// Balance used for admission checks; `None` means this billing account
+    /// permits debt. This policy never changes the balance used for accounting.
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn get_balance_for_admission(&mut self, user_id: UserId) -> Result<Option<Decimal>> {
+        if super::feature_flags::FeatureFlags::new(&mut *self.db)
+            .has_feature(user_id, super::feature_flags::FeatureFlag::AllowNegativeBalance)
+            .await?
+        {
+            return Ok(None);
+        }
+        self.get_user_balance(user_id).await.map(Some)
+    }
+
     /// Get balances for multiple users: point reads of the read model.
-    #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
+    #[instrument(level = "debug", skip(self, user_ids), fields(count = user_ids.len()), err)]
     pub async fn get_users_balances_bulk(&mut self, user_ids: &[UserId]) -> Result<HashMap<UserId, Decimal>> {
         if user_ids.is_empty() {
             return Ok(HashMap::new());
@@ -420,7 +523,7 @@ impl<'c> Credits<'c> {
     }
 
     /// List transactions for a specific user with pagination and optional filters
-    #[instrument(skip(self, filters), fields(user_id = %abbrev_uuid(&user_id), skip = skip, limit = limit), err)]
+    #[instrument(level = "debug", skip(self, filters), fields(user_id = %abbrev_uuid(&user_id), skip = skip, limit = limit), err)]
     pub async fn list_user_transactions(
         &mut self,
         user_id: UserId,
@@ -462,7 +565,7 @@ impl<'c> Credits<'c> {
     }
 
     /// List all transactions across all users (admin view) with optional filters
-    #[instrument(skip(self, filters), fields(skip = skip, limit = limit), err)]
+    #[instrument(level = "debug", skip(self, filters), fields(skip = skip, limit = limit), err)]
     pub async fn list_all_transactions(
         &mut self,
         skip: i64,
@@ -501,7 +604,7 @@ impl<'c> Credits<'c> {
     }
 
     /// Get a single transaction by its ID
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn get_transaction_by_id(&mut self, transaction_id: Uuid) -> Result<Option<CreditTransactionDBResponse>> {
         let transaction = sqlx::query_as!(
             CreditTransaction,
@@ -537,7 +640,7 @@ impl<'c> Credits<'c> {
     }
 
     /// Get the total amount of auto top-up charges for a user in the current calendar month (UTC).
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn get_monthly_auto_topup_spend(&mut self, user_id: UserId) -> Result<rust_decimal::Decimal> {
         let row = sqlx::query!(
             r#"
@@ -558,7 +661,7 @@ impl<'c> Credits<'c> {
     /// Get the total auto top-up spend for multiple users in the current calendar month (UTC).
     /// Returns a map of user_id → total spend. Users with no auto-topup transactions this month
     /// will be absent from the map; callers should treat missing entries as zero.
-    #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
+    #[instrument(level = "debug", skip(self, user_ids), fields(count = user_ids.len()), err)]
     pub async fn get_monthly_auto_topup_spend_bulk(&mut self, user_ids: &[UserId]) -> Result<HashMap<UserId, rust_decimal::Decimal>> {
         if user_ids.is_empty() {
             return Ok(HashMap::new());
@@ -590,7 +693,7 @@ impl<'c> Credits<'c> {
     /// This is used to calculate the balance at a specific point in the transaction history.
     /// Only date filters are applied - search and type filters are excluded since they break
     /// chronological ordering which the frontend relies on for running balance calculation.
-    #[instrument(skip(self, filters), fields(user_id = %abbrev_uuid(&user_id), count = count), err)]
+    #[instrument(level = "debug", skip(self, filters), fields(user_id = %abbrev_uuid(&user_id), count = count), err)]
     pub async fn sum_recent_transactions(&mut self, user_id: UserId, count: i64, filters: &TransactionFilters) -> Result<Decimal> {
         let result = sqlx::query!(
             r#"
@@ -620,7 +723,7 @@ impl<'c> Credits<'c> {
 
     /// Sum the signed amounts of all transactions after a given date for a user.
     /// This is used to calculate the balance at a specific point in time when date filtering.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn sum_transactions_after_date(&mut self, user_id: UserId, after_date: DateTime<Utc>) -> Result<Decimal> {
         let result = sqlx::query!(
             r#"
@@ -642,7 +745,7 @@ impl<'c> Credits<'c> {
 
     /// Sum the signed amounts of all grouped transaction items after a given date for a user.
     /// This operates on the same grouped view as `list_transactions_with_batches`.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn sum_transactions_after_date_grouped(&mut self, user_id: UserId, after_date: DateTime<Utc>) -> Result<Decimal> {
         let result = sqlx::query!(
             r#"
@@ -684,7 +787,7 @@ impl<'c> Credits<'c> {
     /// This is used to calculate the balance at a specific point when batch grouping is enabled.
     /// Only date filters are applied - search and type filters are excluded since they break
     /// chronological ordering which the frontend relies on for running balance calculation.
-    #[instrument(skip(self, filters), fields(user_id = %abbrev_uuid(&user_id), count = count), err)]
+    #[instrument(level = "debug", skip(self, filters), fields(user_id = %abbrev_uuid(&user_id), count = count), err)]
     pub async fn sum_recent_transactions_grouped(&mut self, user_id: UserId, count: i64, filters: &TransactionFilters) -> Result<Decimal> {
         // Sum from the same UNION view used by list_transactions_with_batches
         // All batch aggregates are usage type (negative), non-batched follow normal signing rules
@@ -738,7 +841,7 @@ impl<'c> Credits<'c> {
 
     /// List transactions with batch grouping applied using pre-aggregated batch_aggregates table.
     /// Uses optimized query with pre-limited UNION branches for O(limit) performance.
-    #[instrument(skip(self, filters), fields(user_id = %abbrev_uuid(&user_id), skip = skip, limit = limit), err)]
+    #[instrument(level = "debug", skip(self, filters), fields(user_id = %abbrev_uuid(&user_id), skip = skip, limit = limit), err)]
     pub async fn list_transactions_with_batches(
         &mut self,
         user_id: UserId,
@@ -912,7 +1015,43 @@ mod tests {
         user_id
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
+    async fn test_allow_negative_balance_preserves_accounting(pool: PgPool) {
+        let user_id = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        assert_eq!(
+            Credits::new(&mut conn).get_balance_for_admission(user_id).await.unwrap(),
+            Some(Decimal::ZERO)
+        );
+        sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', true) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut credits = Credits::new(&mut conn);
+        credits
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id,
+                transaction_type: CreditTransactionType::Usage,
+                amount: Decimal::from(25),
+                source_id: Uuid::new_v4().to_string(),
+                description: None,
+                fusillade_batch_id: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(credits.get_user_balance(user_id).await.unwrap(), Decimal::from(-25));
+        assert_eq!(credits.get_balance_for_admission(user_id).await.unwrap(), None);
+        sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', false) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(credits.get_balance_for_admission(user_id).await.unwrap(), Some(Decimal::from(-25)));
+    }
+
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_user_balance_zero_for_new_user(pool: PgPool) {
         let user_id = create_test_user(&pool).await;
@@ -931,7 +1070,7 @@ mod tests {
         assert_eq!(row_balance, Decimal::ZERO);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_transaction_admin_grant(pool: PgPool) {
         let user_id = create_test_user(&pool).await;
@@ -957,7 +1096,104 @@ mod tests {
         assert_eq!(balance, Decimal::from_str("100.50").unwrap());
     }
 
-    #[sqlx::test]
+    /// A usage transaction carrying a `fusillade_batch_id` is NOT listed individually —
+    /// the grouped query's non-batch arm filters `WHERE fusillade_batch_id IS NULL`, and
+    /// batched spend reaches the customer only through `batch_aggregates`.
+    ///
+    /// This is a trap for anyone amending billing by hand. A compensating correction for a
+    /// batched request, written with the batch id set and without also folding
+    /// `batch_aggregates.total_amount`, is charged to the customer and appears **nowhere**
+    /// in their transaction history. The internal usage-repair runbook therefore writes
+    /// batch corrections with a NULL batch id so they surface as their own line; this test
+    /// pins the behaviour that advice depends on.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn batched_transaction_is_invisible_without_an_aggregate_row(pool: PgPool) {
+        let user_id = create_test_user(&pool).await;
+        let batch_id = Uuid::new_v4();
+        let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+
+        // A usage row tagged with a batch, but no batch_aggregates row to surface it.
+        sqlx::query!(
+            r#"INSERT INTO credits_transactions
+               (user_id, transaction_type, amount, source_id, description, fusillade_batch_id, service_tier)
+               VALUES ($1, 'usage', $2, $3, 'batched usage', $4, 'batch')"#,
+            user_id,
+            Decimal::from_str("1.25").unwrap(),
+            format!("test-batched-{}", Uuid::new_v4()),
+            batch_id,
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("insert batched usage");
+
+        let mut credits = Credits::new(&mut conn);
+        let listed = credits
+            .list_transactions_with_batches(user_id, 0, 50, &TransactionFilters::default())
+            .await
+            .expect("list transactions");
+
+        assert!(
+            listed.is_empty(),
+            "a batched transaction with no aggregate row must not appear; got {listed:?}"
+        );
+
+        // The ledger row is real - the money is recorded, it simply cannot be seen.
+        let ledger: Decimal = sqlx::query_scalar!(
+            r#"SELECT COALESCE(SUM(CASE WHEN transaction_type IN ('admin_grant','purchase')
+                                        THEN amount ELSE -amount END), 0) AS "total!"
+               FROM credits_transactions WHERE user_id = $1"#,
+            user_id
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("sum ledger");
+        assert_eq!(ledger, Decimal::from_str("-1.25").unwrap(), "the charge is in the ledger");
+
+        // ...and the balance read model has NOT moved, because a raw INSERT never folds it.
+        // That is the second half of the same trap, and why the repair runbook must run the
+        // balance heal after any manual ledger surgery.
+        let mut credits = Credits::new(&mut conn);
+        let balance = credits.get_user_balance(user_id).await.expect("Failed to get balance");
+        assert_eq!(
+            balance,
+            Decimal::ZERO,
+            "a hand-written ledger row does not fold the checkpoint - heal is required"
+        );
+    }
+
+    /// The same correction written WITHOUT a batch id does surface, which is why the
+    /// runbook writes them that way.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn unbatched_correction_surfaces_as_its_own_line(pool: PgPool) {
+        let user_id = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+
+        sqlx::query!(
+            r#"INSERT INTO credits_transactions
+               (user_id, transaction_type, amount, source_id, description, fusillade_batch_id, service_tier)
+               VALUES ($1, 'usage', $2, $3, 'usage correction', NULL, 'batch')"#,
+            user_id,
+            Decimal::from_str("1.25").unwrap(),
+            format!("test-correction-{}", Uuid::new_v4()),
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("insert correction");
+
+        let mut credits = Credits::new(&mut conn);
+        let listed = credits
+            .list_transactions_with_batches(user_id, 0, 50, &TransactionFilters::default())
+            .await
+            .expect("list transactions");
+
+        assert_eq!(listed.len(), 1, "the correction must be visible to the customer");
+        assert_eq!(listed[0].transaction.description.as_deref(), Some("usage correction"));
+        assert_eq!(listed[0].batch_id, None);
+    }
+
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_user_balance_after_transactions(pool: PgPool) {
         let user_id = create_test_user(&pool).await;
@@ -979,7 +1215,7 @@ mod tests {
         assert_eq!(balance, Decimal::from_str("150.0").unwrap());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_user_balance_after_transactions_negative_balance(pool: PgPool) {
         let user_id = create_test_user(&pool).await;
@@ -1009,7 +1245,7 @@ mod tests {
         assert_eq!(balance, Decimal::from_str("-400.0").unwrap());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_transaction_balance_after_multiple_transactions(pool: PgPool) {
         let user_id = create_test_user(&pool).await;
@@ -1075,7 +1311,7 @@ mod tests {
         assert_eq!(balance, Decimal::from_str("120.50").unwrap());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_user_transactions_ordering(pool: PgPool) {
         let user_id = create_test_user(&pool).await;
@@ -1110,7 +1346,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_user_transaction(pool: PgPool) {
         let user_id = create_test_user(&pool).await;
@@ -1161,7 +1397,7 @@ mod tests {
         )
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_user_transactions_pagination(pool: PgPool) {
         let user_id = create_test_user(&pool).await;
@@ -1199,7 +1435,7 @@ mod tests {
         assert_eq!(transactions.len(), 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_user_transactions_filters_by_user(pool: PgPool) {
         let user1_id = create_test_user(&pool).await;
@@ -1246,7 +1482,7 @@ mod tests {
         assert_eq!(transactions.len(), 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_all_transactions(pool: PgPool) {
         let user1_id = create_test_user(&pool).await;
@@ -1284,7 +1520,7 @@ mod tests {
         assert!(transactions.iter().any(|t| t.user_id == user2_id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_all_transactions_pagination(pool: PgPool) {
         let mut conn = pool.acquire().await.expect("Failed to acquire connection");
@@ -1315,7 +1551,7 @@ mod tests {
         assert!(skip_page.len() >= 2);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_transaction_with_all_transaction_types(pool: PgPool) {
         let user_id = create_test_user(&pool).await;
@@ -1372,7 +1608,7 @@ mod tests {
         assert_eq!(balance, Decimal::from_str("100.0").unwrap());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_transaction_rollback_on_error(pool: PgPool) {
         let user_id = create_test_user(&pool).await;
@@ -1409,7 +1645,7 @@ mod tests {
     /// With the checkpoint-based system, we verify that:
     /// 1. All concurrent transactions are created successfully
     /// 2. The final balance is correct after all transactions complete
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_concurrent_transactions_balance_correctness(pool: PgPool) {
         use std::sync::Arc;
@@ -1494,7 +1730,7 @@ mod tests {
     }
 
     /// Test that admin_grant crossing zero upward sends pg_notify
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_balance_restored_notification_on_admin_grant(pool: PgPool) {
         use sqlx::postgres::PgListener;
@@ -1578,7 +1814,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_transaction_large_amounts(pool: PgPool) {
         let user_id = create_test_user(&pool).await;
@@ -1615,7 +1851,7 @@ mod tests {
         assert_eq!(balance, Decimal::from_str("200000000.00").unwrap());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_transaction_preserves_high_precision(pool: PgPool) {
         let user_id = create_test_user(&pool).await;
@@ -1663,7 +1899,7 @@ mod tests {
         assert_eq!(balance, Decimal::from_str("100.123456375").unwrap());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_transactions_with_date_range_filter(pool: PgPool) {
         let user_id = create_test_user(&pool).await;
@@ -1724,7 +1960,7 @@ mod tests {
         assert_eq!(all_txs.len(), 3, "Should return all 3 transactions with no date filter");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_transactions_with_only_start_date(pool: PgPool) {
         let user_id = create_test_user(&pool).await;
@@ -1776,7 +2012,7 @@ mod tests {
         assert_eq!(filtered_txs.len(), 2, "Should return 2 transactions after cutoff");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_transactions_with_only_end_date(pool: PgPool) {
         let user_id = create_test_user(&pool).await;
@@ -1828,7 +2064,7 @@ mod tests {
         assert_eq!(filtered_txs.len(), 2, "Should return 2 transactions before cutoff");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_all_transactions_with_date_filter(pool: PgPool) {
         let user1_id = create_test_user(&pool).await;
@@ -1872,7 +2108,7 @@ mod tests {
         assert_eq!(filtered_txs.len(), 1, "Should have 1 transaction after cutoff");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_transactions_with_batches_date_filter(pool: PgPool) {
         let user_id = create_test_user(&pool).await;
@@ -1932,7 +2168,7 @@ mod tests {
         assert_eq!(filtered_txs.len(), 1, "Should have only non-batch transaction");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_date_filter_handles_empty_results(pool: PgPool) {
         let user_id = create_test_user(&pool).await;
@@ -1963,7 +2199,7 @@ mod tests {
         assert_eq!(filtered_txs.len(), 0, "Should return no transactions outside date range");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_monthly_auto_topup_spend_zero_for_new_user(pool: PgPool) {
         let user_id = create_test_user(&pool).await;
@@ -1974,7 +2210,7 @@ mod tests {
         assert_eq!(spend, Decimal::ZERO, "New user should have zero monthly auto-topup spend");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_monthly_auto_topup_spend_sums_only_auto_topup(pool: PgPool) {
         let user_id = create_test_user(&pool).await;
@@ -2031,7 +2267,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_monthly_auto_topup_spend_excludes_other_users(pool: PgPool) {
         let user_a = create_test_user(&pool).await;
@@ -2107,7 +2343,66 @@ mod tests {
         .expect("query bonus")
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
+    async fn test_has_purchased_is_false_before_any_purchase(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+
+        assert!(!credits.has_purchased(user).await.unwrap());
+
+        insert_purchase(&mut credits, user, "30.0", "sess-1").await;
+
+        assert!(credits.has_purchased(user).await.unwrap());
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_has_purchased_ignores_grants_and_usage(pool: PgPool) {
+        // The regression this guards: signup credits and a verified card both
+        // give an account a balance and a payment-provider record without a
+        // purchase, and the first-payment match is still owed to them.
+        let user = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+
+        for (transaction_type, source_id) in [
+            (CreditTransactionType::AdminGrant, "signup-credits"),
+            (CreditTransactionType::Usage, "some-request"),
+            (CreditTransactionType::AdminRemoval, "clawback"),
+        ] {
+            credits
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: user,
+                    transaction_type,
+                    amount: Decimal::from_str("1.0").unwrap(),
+                    source_id: source_id.to_string(),
+                    description: None,
+                    fusillade_batch_id: None,
+                    api_key_id: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        assert!(!credits.has_purchased(user).await.unwrap());
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_has_purchased_is_scoped_to_the_billing_target(pool: PgPool) {
+        // An org admin paying for their org must not lose their own personal
+        // eligibility, and vice versa - the two are separate billing targets.
+        let payer = create_test_user(&pool).await;
+        let other = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+
+        insert_purchase(&mut credits, payer, "30.0", "sess-1").await;
+
+        assert!(credits.has_purchased(payer).await.unwrap());
+        assert!(!credits.has_purchased(other).await.unwrap());
+    }
+
+    #[dwctl_test_macros::test]
     async fn test_first_payment_match_grants_on_first_purchase(pool: PgPool) {
         let user = create_test_user(&pool).await;
         let mut conn = pool.acquire().await.unwrap();
@@ -2128,7 +2423,7 @@ mod tests {
         assert_eq!(match_bonus_amount(&pool, "sess-1").await, Some(Decimal::from_str("30.0").unwrap()));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_first_payment_match_caps_at_match_up_to(pool: PgPool) {
         let user = create_test_user(&pool).await;
         let mut conn = pool.acquire().await.unwrap();
@@ -2149,7 +2444,7 @@ mod tests {
         assert_eq!(match_bonus_amount(&pool, "sess-1").await, Some(Decimal::from_str("50.0").unwrap()));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_first_payment_match_skips_when_not_first(pool: PgPool) {
         let user = create_test_user(&pool).await;
         let mut conn = pool.acquire().await.unwrap();
@@ -2171,7 +2466,7 @@ mod tests {
         assert_eq!(match_bonus_amount(&pool, "sess-1").await, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_first_payment_match_disabled_when_zero(pool: PgPool) {
         let user = create_test_user(&pool).await;
         let mut conn = pool.acquire().await.unwrap();
@@ -2186,7 +2481,7 @@ mod tests {
         assert_eq!(match_bonus_amount(&pool, "sess-1").await, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_first_payment_match_idempotent(pool: PgPool) {
         let user = create_test_user(&pool).await;
         let mut conn = pool.acquire().await.unwrap();
@@ -2240,7 +2535,7 @@ mod tests {
         .unwrap_or(0)
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_verification_credits_granted_on_first_verification(pool: PgPool) {
         let user = create_test_user(&pool).await;
         let mut conn = pool.acquire().await.unwrap();
@@ -2259,7 +2554,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_verification_credits_disabled_at_zero(pool: PgPool) {
         let user = create_test_user(&pool).await;
         let mut conn = pool.acquire().await.unwrap();
@@ -2272,7 +2567,7 @@ mod tests {
 
     /// The webhook and the front-channel `PATCH /payments/{id}` both fulfil the
     /// same session; the derived source_id must make the second one a no-op.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_verification_credits_idempotent_for_one_session(pool: PgPool) {
         let user = create_test_user(&pool).await;
         let mut conn = pool.acquire().await.unwrap();
@@ -2290,7 +2585,7 @@ mod tests {
 
     /// Verifying a *second* card produces a different session id. Keying the
     /// grant on the payee is what stops it paying out twice.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_verification_credits_granted_only_once_per_user(pool: PgPool) {
         let user = create_test_user(&pool).await;
         let mut conn = pool.acquire().await.unwrap();
@@ -2324,7 +2619,7 @@ mod tests {
     /// front-channel confirmation of another. A read-then-insert guard lets
     /// both observe "no prior grant" and pay out twice; the unique constraint
     /// on a payee-keyed source_id cannot.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_verification_credits_survive_concurrent_sessions(pool: PgPool) {
         let user = create_test_user(&pool).await;
 
@@ -2345,7 +2640,7 @@ mod tests {
         assert_eq!(verification_grant_count(&pool, user).await, 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_verification_credits_are_per_user(pool: PgPool) {
         let first = create_test_user(&pool).await;
         let second = create_test_user(&pool).await;
@@ -2363,5 +2658,109 @@ mod tests {
 
         assert_eq!(verification_grant_count(&pool, first).await, 1);
         assert_eq!(verification_grant_count(&pool, second).await, 1);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_instrument_claim_goes_to_first_account(pool: PgPool) {
+        let first = create_test_user(&pool).await;
+        let second = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+
+        assert_eq!(credits.claim_verification_instrument("fp_shared", first).await.unwrap(), first);
+        assert_eq!(
+            credits.claim_verification_instrument("fp_shared", second).await.unwrap(),
+            first,
+            "a second account presenting the same instrument must see the first claimant"
+        );
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_instrument_claim_is_idempotent_for_the_owner(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+
+        for _ in 0..3 {
+            assert_eq!(credits.claim_verification_instrument("fp_mine", user).await.unwrap(), user);
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_instrument_claim_race_has_one_winner(pool: PgPool) {
+        // Two accounts present the same instrument at the same moment on
+        // separate connections. Exactly one may hold it afterwards, and both
+        // callers must be told who that is.
+        let contenders: Vec<UserId> = vec![
+            create_test_user(&pool).await,
+            create_test_user(&pool).await,
+            create_test_user(&pool).await,
+            create_test_user(&pool).await,
+        ];
+
+        let owners = futures::future::join_all(contenders.iter().map(|&user| {
+            let pool = pool.clone();
+            async move {
+                let mut conn = pool.acquire().await.unwrap();
+                Credits::new(&mut conn).claim_verification_instrument("fp_raced", user).await
+            }
+        }))
+        .await;
+
+        let owners: Vec<UserId> = owners.into_iter().map(|r| r.expect("a losing racer must not error")).collect();
+        let winner = owners[0];
+        assert!(contenders.contains(&winner));
+        assert!(
+            owners.iter().all(|&o| o == winner),
+            "every racer must observe the same owner: {owners:?}"
+        );
+
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM verification_instruments WHERE fingerprint = $1")
+            .bind("fp_raced")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_instrument_claim_rolled_back_frees_the_instrument(pool: PgPool) {
+        // The claim is made inside the transaction that also sets the verified
+        // flag, so a failure after the claim rolls it back and the instrument
+        // is unclaimed again rather than held by an account that was never
+        // verified.
+        let first = create_test_user(&pool).await;
+        let second = create_test_user(&pool).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        assert_eq!(
+            Credits::new(&mut tx)
+                .claim_verification_instrument("fp_abandoned", first)
+                .await
+                .unwrap(),
+            first
+        );
+        tx.rollback().await.unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        assert_eq!(
+            Credits::new(&mut conn)
+                .claim_verification_instrument("fp_abandoned", second)
+                .await
+                .unwrap(),
+            second,
+            "a rolled-back claim must not hold the instrument"
+        );
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_instrument_claims_are_independent(pool: PgPool) {
+        let first = create_test_user(&pool).await;
+        let second = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+
+        assert_eq!(credits.claim_verification_instrument("fp_a", first).await.unwrap(), first);
+        assert_eq!(credits.claim_verification_instrument("fp_b", second).await.unwrap(), second);
     }
 }

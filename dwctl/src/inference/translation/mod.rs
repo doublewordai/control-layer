@@ -1,7 +1,8 @@
 //! Generic edge protocol-translation layer.
 //!
-//! A single Axum middleware (see [`middleware`]) is layered as the OUTERMOST
-//! Tower layer on the onwards router. For each request it asks a registry of
+//! A single Axum middleware (see [`middleware`]) is layered on the onwards
+//! router, inside the inference middleware and the outlet (see the stack comment
+//! in `lib.rs`). For each request it asks a registry of
 //! [`ProtocolTranslator`]s whether any of them claims the request (by route +
 //! headers, cheaply, with no body deserialisation). If one matches, the
 //! middleware:
@@ -26,28 +27,68 @@
 //! request back through the router - a nested router fixes its sub-path at match
 //! time, so a post-match URI change never re-dispatches.
 //!
-//! Anthropic Messages (`/v1/messages`) is the first and currently only
-//! implementation. A stateless OpenAI Responses translator is the planned
-//! second implementation that would later absorb the translation half of the
-//! onwards adapter. Stateful orchestration (tool loops, `previous_response_id`)
-//! is deliberately NOT part of this layer.
+//! Every translator is pure and synchronous - a body-in/body-out conversion with
+//! no I/O and no stored handles. There is deliberately no async hook on the
+//! trait. Anything stateful an API needs lives OUTSIDE this layer, in the
+//! components that own that state:
+//!
+//! - the inference middleware (outer to this one) does control-plane work on the
+//!   raw foreign request: `background` / `service_tier` routing, minting the
+//!   tracking id, and `previous_response_id` hydration for OpenAI Responses,
+//! - the outlet (also outer) persists the produced object, which is what
+//!   `GET /v1/responses/{id}` later reads.
+//!
+//! Keeping the translator pure is what lets it sit inside those layers: the
+//! response it produces is the one the outlet stores, and the id it stamps is
+//! the one the client can retrieve. Multi-step tool-loop orchestration is not
+//! part of this layer either.
 
 pub mod anthropic;
 pub mod middleware;
+pub mod responses;
 
 use axum::http::{HeaderMap, StatusCode, Uri, request::Parts};
 use bytes::Bytes;
+use onwards::strict::schema_mismatch::{SchemaMismatch, locate_declared};
+use serde::de::DeserializeOwned;
 use std::sync::Arc;
 
 /// Error raised while translating a request or response.
 #[derive(Debug, thiserror::Error)]
 pub enum TranslationError {
-    /// The inbound foreign request was malformed (maps to a 400).
+    /// The inbound foreign request isn't JSON at all (maps to a 400).
     #[error("{0}")]
-    BadRequest(String),
+    InvalidJson(String),
+    /// The inbound foreign request is JSON but doesn't match the protocol's
+    /// request type (maps to a 400 naming where it stopped matching, when
+    /// that could be found).
+    #[error("{message}")]
+    SchemaMismatch { mismatch: Option<SchemaMismatch>, message: String },
+    /// A field of the inbound request has a value we can't accept (maps to a
+    /// 400 naming the field).
+    #[error("{message}")]
+    InvalidParameter { param: &'static str, message: String },
     /// Something went wrong on our side translating (maps to a 5xx).
     #[error("{0}")]
     Internal(String),
+}
+
+/// Parses a foreign request body as `T`. A body that is JSON but doesn't match
+/// `T` is a [`TranslationError::SchemaMismatch`] located with `declared`, the
+/// sorted field names `T`'s schema declares; see [`locate_declared`]. The
+/// message, which can quote the body, goes only to the client.
+pub(crate) fn parse_request<T: DeserializeOwned>(body: &[u8], declared: &[&str], protocol: &str) -> Result<T, TranslationError> {
+    serde_json::from_slice(body).map_err(|e| {
+        let message = format!("invalid {protocol} request: {e}");
+        if e.is_data() {
+            TranslationError::SchemaMismatch {
+                mismatch: locate_declared::<T>(body, declared),
+                message,
+            }
+        } else {
+            TranslationError::InvalidJson(message)
+        }
+    })
 }
 
 /// The result of translating a foreign request into canonical Chat Completions.
@@ -71,8 +112,12 @@ pub struct TranslatedRequest {
     pub body: Bytes,
 }
 
-/// A single foreign-protocol translator. Implementations are stateless and
-/// request-scoped; they hold no `ResponseStore` and do no orchestration.
+/// A single foreign-protocol translator. Every translator is pure and stateless:
+/// a synchronous request/response conversion with no I/O and no stored handles.
+/// Stateful work for an API that has a control plane (e.g. OpenAI Responses'
+/// `previous_response_id` hydration, id minting, and persistence) lives OUTSIDE
+/// the translator - in the inference middleware (routing / id / hydration) and
+/// the outlet (persistence) - so the translator stays a pure protocol converter.
 pub trait ProtocolTranslator: Send + Sync {
     /// Stable name for logging/metrics.
     fn name(&self) -> &'static str;
@@ -81,12 +126,32 @@ pub trait ProtocolTranslator: Send + Sync {
     /// deserialise the body, so the fast path for native requests stays fast.
     fn detect(&self, path: &str, headers: &HeaderMap) -> bool;
 
+    /// Whether [`translate_request`](Self::translate_request) deserialises the
+    /// request body. When true the middleware only claims POSTs, so a GET or
+    /// DELETE to the same path falls through to the real routing (and its
+    /// 404/405) instead of being rejected by the body parse.
+    ///
+    /// Defaults to true, since that is the common case. Translators that only
+    /// rewrite headers or the path - `AnthropicModels`, which claims
+    /// `GET /models` purely to normalise auth - must override this to false.
+    fn translates_request_body(&self) -> bool {
+        true
+    }
+
     /// Translate the foreign request into a canonical Chat Completions request.
     fn translate_request(&self, parts: &Parts, body: Bytes) -> Result<TranslatedRequest, TranslationError>;
 
     /// Translate a successful (blocking) Chat Completions response body back
-    /// into the foreign protocol.
-    fn translate_response(&self, body: Bytes) -> Result<Bytes, TranslationError>;
+    /// into the foreign protocol. `request` is the original inbound foreign
+    /// request body, for protocols whose response echoes request fields (e.g.
+    /// OpenAI Responses echoes `model` / `tools` / `instructions`); protocols
+    /// that don't need it (Anthropic) ignore it. `response_id` is the platform's
+    /// tracking id for this request (from `x-fusillade-request-id`, set by the
+    /// inference middleware): protocols whose response carries a retrievable id
+    /// that must match the stored record (OpenAI Responses) stamp it, so a later
+    /// `GET /v1/responses/{id}` resolves; `None` when absent (unit tests, or a
+    /// native path with no tracking row) - the translator then self-generates.
+    fn translate_response(&self, request: &Bytes, response_id: Option<&str>, body: Bytes) -> Result<Bytes, TranslationError>;
 
     /// Translate an error response (any non-2xx) into the foreign error shape.
     fn translate_error(&self, status: StatusCode, body: Bytes) -> (StatusCode, Bytes);
@@ -96,10 +161,20 @@ pub trait ProtocolTranslator: Send + Sync {
     /// there is any downstream body to reshape.
     fn error_from_message(&self, status: StatusCode, message: &str) -> (StatusCode, Bytes);
 
+    /// As [`error_from_message`](Self::error_from_message), naming the request
+    /// field at fault where the protocol's error shape has a place for it.
+    fn error_for_param(&self, status: StatusCode, message: &str, _param: Option<&str>) -> (StatusCode, Bytes) {
+        self.error_from_message(status, message)
+    }
+
     /// Create a fresh, stateful reframer for one streaming (SSE) response. The
     /// middleware feeds it each upstream Chat Completions chunk and forwards the
-    /// foreign-protocol SSE bytes it emits.
-    fn stream_reframer(&self) -> Box<dyn StreamReframer>;
+    /// foreign-protocol SSE bytes it emits. `request` is the original inbound
+    /// foreign request body, for protocols whose streamed response echoes request
+    /// fields (e.g. OpenAI Responses); protocols that don't need it ignore it.
+    /// `response_id` is the platform tracking id (see `translate_response`), which
+    /// a streamed foreign response stamps on its opening event's id.
+    fn stream_reframer(&self, request: &Bytes, response_id: Option<&str>) -> Box<dyn StreamReframer>;
 }
 
 /// Stateful transformer that turns an OpenAI Chat Completions SSE stream into a
@@ -127,15 +202,6 @@ pub struct TranslationRegistry {
     max_body_size: usize,
 }
 
-impl Default for TranslationRegistry {
-    fn default() -> Self {
-        Self {
-            translators: Vec::new(),
-            max_body_size: usize::MAX,
-        }
-    }
-}
-
 impl TranslationRegistry {
     pub fn new(translators: Vec<Arc<dyn ProtocolTranslator>>) -> Self {
         Self {
@@ -157,9 +223,5 @@ impl TranslationRegistry {
     /// Return the first translator that claims this request, if any.
     pub fn detect(&self, path: &str, headers: &HeaderMap) -> Option<Arc<dyn ProtocolTranslator>> {
         self.translators.iter().find(|t| t.detect(path, headers)).cloned()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.translators.is_empty()
     }
 }

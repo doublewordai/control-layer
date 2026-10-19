@@ -45,7 +45,13 @@ export const UpdateModelPricingModal: React.FC<
   >(null);
 
   // Memoize tariffs to avoid creating new array reference on every render
-  const currentTariffs = useMemo(() => model?.tariffs || [], [model?.tariffs]);
+  // Only the model's general prices are edited here. Organisation prices come
+  // from the organisation catalog; sending them back as tariffs would close
+  // them as general rows.
+  const currentTariffs = useMemo(
+    () => (model?.tariffs || []).filter((t) => !t.organization_id),
+    [model?.tariffs],
+  );
 
   // Reset pending changes when modal closes
   useEffect(() => {

@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            created_by AS \"created_by!\",\n            user_id AS \"user_id!\",\n            (purpose = 'batch' AND hidden) AS \"is_daemon_dispatch!\"\n        FROM api_keys\n        WHERE secret = $1 AND is_deleted = FALSE\n        LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "created_by!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "user_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "is_daemon_dispatch!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "6fe8629904a81b14af375d1ecf8d15a550019b8c02b07a6156fffeadf1637c75"
+}

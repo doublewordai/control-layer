@@ -30,6 +30,7 @@
       "created_by_email": "sarah.chen@acme.com",
       "request_source": "api"
     },
+    "model": "Qwen/Qwen3-235B-A22B-Instruct-2507",
     "usage": {
       "input_tokens": 125000,
       "output_tokens": 89000,
@@ -65,7 +66,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440002",
       "created_by_email": "james.wilson@acme.com",
       "request_source": "frontend"
-    }
+    },
+    "model": "zai-org/GLM-4.5"
   },
   {
     "id": "batch-demo-3",
@@ -105,7 +107,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440003",
       "created_by_email": "alex.rodriguez@acme.com",
       "request_source": "api"
-    }
+    },
+    "model": "deepseek-ai/DeepSeek-V3.1"
   },
   {
     "id": "batch-demo-4",
@@ -136,7 +139,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440004",
       "created_by_email": "maria.garcia@partnerco.io",
       "request_source": "api"
-    }
+    },
+    "model": "moonshotai/Kimi-K2-Instruct"
   },
   {
     "id": "batch-demo-5",
@@ -167,7 +171,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440001",
       "created_by_email": "sarah.chen@acme.com",
       "request_source": "frontend"
-    }
+    },
+    "model": "Qwen/Qwen3-235B-A22B-Instruct-2507"
   },
   {
     "id": "batch-demo-6",
@@ -198,7 +203,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440002",
       "created_by_email": "james.wilson@acme.com",
       "request_source": "api"
-    }
+    },
+    "model": "zai-org/GLM-4.5"
   },
   {
     "id": "batch-demo-7",
@@ -229,7 +235,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440003",
       "created_by_email": "alex.rodriguez@acme.com",
       "request_source": "api"
-    }
+    },
+    "model": "deepseek-ai/DeepSeek-V3.1"
   },
   {
     "id": "batch-demo-8",
@@ -260,7 +267,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440004",
       "created_by_email": "maria.garcia@partnerco.io",
       "request_source": "frontend"
-    }
+    },
+    "model": "mixed"
   },
   {
     "id": "batch-demo-9",
@@ -291,7 +299,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440001",
       "created_by_email": "sarah.chen@acme.com",
       "request_source": "api"
-    }
+    },
+    "model": "Qwen/Qwen3-235B-A22B-Instruct-2507"
   },
   {
     "id": "batch-demo-10",
@@ -322,7 +331,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440002",
       "created_by_email": "james.wilson@acme.com",
       "request_source": "api"
-    }
+    },
+    "model": "zai-org/GLM-4.5"
   },
   {
     "id": "batch-demo-11",
@@ -353,7 +363,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440003",
       "created_by_email": "alex.rodriguez@acme.com",
       "request_source": "frontend"
-    }
+    },
+    "model": "deepseek-ai/DeepSeek-V3.1"
   },
   {
     "id": "batch-demo-12",
@@ -415,7 +426,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440001",
       "created_by_email": "sarah.chen@acme.com",
       "request_source": "api"
-    }
+    },
+    "model": "Qwen/Qwen3-235B-A22B-Instruct-2507"
   },
   {
     "id": "batch-demo-14",
@@ -446,7 +458,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440002",
       "created_by_email": "james.wilson@acme.com",
       "request_source": "frontend"
-    }
+    },
+    "model": "zai-org/GLM-4.5"
   },
   {
     "id": "batch-demo-15",
@@ -477,7 +490,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440003",
       "created_by_email": "alex.rodriguez@acme.com",
       "request_source": "api"
-    }
+    },
+    "model": "deepseek-ai/DeepSeek-V3.1"
   },
   {
     "id": "batch-demo-16",
@@ -508,7 +522,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440004",
       "created_by_email": "maria.garcia@partnerco.io",
       "request_source": "api"
-    }
+    },
+    "model": "moonshotai/Kimi-K2-Instruct"
   },
   {
     "id": "batch-demo-17",
@@ -539,7 +554,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440001",
       "created_by_email": "sarah.chen@acme.com",
       "request_source": "frontend"
-    }
+    },
+    "model": "Qwen/Qwen3-235B-A22B-Instruct-2507"
   },
   {
     "id": "batch-demo-18",
@@ -570,7 +586,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440002",
       "created_by_email": "james.wilson@acme.com",
       "request_source": "api"
-    }
+    },
+    "model": "zai-org/GLM-4.5"
   },
   {
     "id": "batch-demo-19",
@@ -601,7 +618,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440003",
       "created_by_email": "alex.rodriguez@acme.com",
       "request_source": "api"
-    }
+    },
+    "model": "deepseek-ai/DeepSeek-V3.1"
   },
   {
     "id": "batch-demo-20",
@@ -632,7 +650,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440004",
       "created_by_email": "maria.garcia@partnerco.io",
       "request_source": "frontend"
-    }
+    },
+    "model": "mixed"
   },
   {
     "id": "batch-demo-21",
@@ -663,7 +682,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440001",
       "created_by_email": "sarah.chen@acme.com",
       "request_source": "api"
-    }
+    },
+    "model": "Qwen/Qwen3-235B-A22B-Instruct-2507"
   },
   {
     "id": "batch-demo-22",
@@ -694,7 +714,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440002",
       "created_by_email": "james.wilson@acme.com",
       "request_source": "api"
-    }
+    },
+    "model": "zai-org/GLM-4.5"
   },
   {
     "id": "batch-demo-23",
@@ -725,7 +746,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440003",
       "created_by_email": "alex.rodriguez@acme.com",
       "request_source": "frontend"
-    }
+    },
+    "model": "deepseek-ai/DeepSeek-V3.1"
   },
   {
     "id": "batch-demo-24",
@@ -787,7 +809,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440001",
       "created_by_email": "sarah.chen@acme.com",
       "request_source": "api"
-    }
+    },
+    "model": "Qwen/Qwen3-235B-A22B-Instruct-2507"
   },
   {
     "id": "batch-demo-26",
@@ -818,7 +841,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440002",
       "created_by_email": "james.wilson@acme.com",
       "request_source": "frontend"
-    }
+    },
+    "model": "zai-org/GLM-4.5"
   },
   {
     "id": "batch-demo-27",
@@ -849,7 +873,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440003",
       "created_by_email": "alex.rodriguez@acme.com",
       "request_source": "api"
-    }
+    },
+    "model": "deepseek-ai/DeepSeek-V3.1"
   },
   {
     "id": "batch-demo-28",
@@ -880,7 +905,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440004",
       "created_by_email": "maria.garcia@partnerco.io",
       "request_source": "api"
-    }
+    },
+    "model": "moonshotai/Kimi-K2-Instruct"
   },
   {
     "id": "batch-demo-29",
@@ -911,7 +937,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440001",
       "created_by_email": "sarah.chen@acme.com",
       "request_source": "frontend"
-    }
+    },
+    "model": "Qwen/Qwen3-235B-A22B-Instruct-2507"
   },
   {
     "id": "batch-demo-30",
@@ -942,7 +969,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440002",
       "created_by_email": "james.wilson@acme.com",
       "request_source": "api"
-    }
+    },
+    "model": "zai-org/GLM-4.5"
   },
   {
     "id": "batch-demo-31",
@@ -973,7 +1001,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440003",
       "created_by_email": "alex.rodriguez@acme.com",
       "request_source": "api"
-    }
+    },
+    "model": "deepseek-ai/DeepSeek-V3.1"
   },
   {
     "id": "batch-demo-32",
@@ -1035,7 +1064,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440001",
       "created_by_email": "sarah.chen@acme.com",
       "request_source": "api"
-    }
+    },
+    "model": "Qwen/Qwen3-235B-A22B-Instruct-2507"
   },
   {
     "id": "batch-demo-34",
@@ -1066,7 +1096,8 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440002",
       "created_by_email": "james.wilson@acme.com",
       "request_source": "api"
-    }
+    },
+    "model": "zai-org/GLM-4.5"
   },
   {
     "id": "batch-demo-35",
@@ -1097,6 +1128,7 @@
       "created_by": "550e8400-e29b-41d4-a716-446655440003",
       "created_by_email": "alex.rodriguez@acme.com",
       "request_source": "frontend"
-    }
+    },
+    "model": "deepseek-ai/DeepSeek-V3.1"
   }
 ]

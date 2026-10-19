@@ -5,6 +5,75 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0](https://github.com/doublewordai/control-layer/compare/onwards-v1.1.0...onwards-v1.2.0) (2026-09-16)
+
+
+### Features
+
+* **onwards:** add default-on AIMD provider share control ([#1793](https://github.com/doublewordai/control-layer/issues/1793)) ([5e848a5](https://github.com/doublewordai/control-layer/commit/5e848a547c8f22218e3fcdd8335b3fcd7a982a1e))
+
+## [1.1.0](https://github.com/doublewordai/control-layer/compare/onwards-v1.0.1...onwards-v1.1.0) (2026-09-16)
+
+
+### Features
+
+* **onwards:** measure first-token latency per provider role ([#1790](https://github.com/doublewordai/control-layer/issues/1790)) ([adc080b](https://github.com/doublewordai/control-layer/commit/adc080b07f6b190876bf75f034297a8a21b4961b))
+
+## [1.0.1](https://github.com/doublewordai/control-layer/compare/onwards-v1.0.0...onwards-v1.0.1) (2026-09-15)
+
+
+### Bug Fixes
+
+* **onwards:** pass provider reasoning fields through non-strict gateways ([#1591](https://github.com/doublewordai/control-layer/issues/1591)) ([81e0d38](https://github.com/doublewordai/control-layer/commit/81e0d38b4ff98f1e1d0eb02ed523c19499a94e18))
+* **onwards:** preserve trusted embedded client error details ([#1714](https://github.com/doublewordai/control-layer/issues/1714)) ([e2bcc8e](https://github.com/doublewordai/control-layer/commit/e2bcc8ee0328994dc52fe4c1bd82488c9e3e077e))
+
+
+### Code Refactoring
+
+* bring response reassembly into the Rust workspace ([#1775](https://github.com/doublewordai/control-layer/issues/1775)) ([d75c262](https://github.com/doublewordai/control-layer/commit/d75c26220fbd2660bf19c3e7df11fec4eceed14a))
+
+## [1.0.0](https://github.com/doublewordai/control-layer/compare/onwards-v0.38.1...onwards-v1.0.0) (2026-09-05)
+
+
+### ⚠ BREAKING CHANGES
+
+* remove tool injection, tool_sources, and the onwards Responses adapter ([#1518](https://github.com/doublewordai/control-layer/issues/1518))
+
+### Features
+
+* enforce scheduled content retention by partition drop ([#1481](https://github.com/doublewordai/control-layer/issues/1481)) ([fc5aeae](https://github.com/doublewordai/control-layer/commit/fc5aeaeac79d2f73d5fd2175f28877cc150216db))
+* midstream retries ([#1453](https://github.com/doublewordai/control-layer/issues/1453)) ([48be316](https://github.com/doublewordai/control-layer/commit/48be3169869cad3344a01b9ee4c3952ca8f597d8))
+* **onwards:** count gateway failures by reason and upstream status ([#1519](https://github.com/doublewordai/control-layer/issues/1519)) ([fce9cbd](https://github.com/doublewordai/control-layer/commit/fce9cbdc88cbdc81a850bd86660743e3e710758c))
+* remove tool injection, tool_sources, and the onwards Responses adapter ([#1518](https://github.com/doublewordai/control-layer/issues/1518)) ([4276d91](https://github.com/doublewordai/control-layer/commit/4276d91a4c320bf884ed3ba88004d1ca9265fe12))
+
+
+### Bug Fixes
+
+* **dwctl:** tolerate backend-omitted fields in Responses translation, stop retry loops on translate failure ([#1544](https://github.com/doublewordai/control-layer/issues/1544)) ([04c07c9](https://github.com/doublewordai/control-layer/commit/04c07c9fad947668b6d0be77a38475528dbdc6de))
+* fold SSE streams incrementally and drop async-openai from dwctl ([#1503](https://github.com/doublewordai/control-layer/issues/1503)) ([2995d73](https://github.com/doublewordai/control-layer/commit/2995d734bd966070ca337e61e50cd2dc7cd5392e))
+* **onwards:** drain active responses during shutdown ([#1586](https://github.com/doublewordai/control-layer/issues/1586)) ([416ef7f](https://github.com/doublewordai/control-layer/commit/416ef7f1b3cf506a6d4bcec658a3e1ea3d3e7402))
+* **onwards:** retry slow empty SSE streams ([#1510](https://github.com/doublewordai/control-layer/issues/1510)) ([4df7a30](https://github.com/doublewordai/control-layer/commit/4df7a30f657dd3f87bfc6cf9c07c0a33180cd3a5))
+
+## [0.38.1](https://github.com/doublewordai/control-layer/compare/onwards-v0.38.0...onwards-v0.38.1) (2026-08-13)
+
+
+### Bug Fixes
+
+* antrhopic billing ([#1470](https://github.com/doublewordai/control-layer/issues/1470)) ([c44b73a](https://github.com/doublewordai/control-layer/commit/c44b73ae4a1223ff0174d0fa117f151699bc6e45))
+* **onwards:** accept JSON-escaped model values in model extraction ([#1484](https://github.com/doublewordai/control-layer/issues/1484)) ([4b20813](https://github.com/doublewordai/control-layer/commit/4b208135a5093c54f8ebc9fc06c0409fe9907cd9))
+
+## [0.38.0](https://github.com/doublewordai/control-layer/compare/onwards-v0.37.1...onwards-v0.38.0) (2026-08-11)
+
+
+### Features
+
+* move the OpenAI Responses API into the dwctl edge (COR-519 + COR-536 + COR-522) ([#1317](https://github.com/doublewordai/control-layer/issues/1317)) ([2061ce0](https://github.com/doublewordai/control-layer/commit/2061ce05c5a0490e74931348da14d5b2d9d0354c))
+
+
+### Bug Fixes
+
+* **inference:** normalize null-like tool call arguments ([#1461](https://github.com/doublewordai/control-layer/issues/1461)) ([5915516](https://github.com/doublewordai/control-layer/commit/591551646f54203c94d5541813499c615eaa8d6d))
+
 ## [0.37.1](https://github.com/doublewordai/control-layer/compare/onwards-v0.37.0...onwards-v0.37.1) (2026-07-30)
 
 

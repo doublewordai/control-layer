@@ -2,17 +2,18 @@
 
 use sqlx_pool_router::PoolProvider;
 
-use crate::api::models::deployments::{ModelFacets, ModelListResponse, TrafficRoutingAction, TrafficRoutingRule};
+use crate::api::models::deployments::{ModelFacets, ModelListResponse, TariffDefinition, TrafficRoutingAction, TrafficRoutingRule};
 use crate::db::models::deployments::{
-    LoadBalancingStrategy, MODEL_CATALOG_METADATA_MAX_BYTES, MODEL_CATALOG_METADATA_MAX_EXTRA_KEYS, ModelCatalogMetadata, TrafficRuleAction,
+    AffinityConfig, AimdConfig, LoadBalancingStrategy, MODEL_CATALOG_METADATA_MAX_BYTES, MODEL_CATALOG_METADATA_MAX_EXTRA_KEYS,
+    ModelCatalogMetadata, TrafficRuleAction,
 };
 use crate::db::models::tariffs::TariffCreateDBRequest;
 use crate::{
     AppState,
     api::models::{
         deployments::{
-            ComponentEndpointSummary, ComponentModelSummary, DeployedModelCreate, DeployedModelResponse, DeployedModelUpdate,
-            GetModelQuery, ListModelsQuery, ModelComponentResponse, enrichment::DeployedModelEnricher,
+            ComponentEndpointSummary, ComponentModelSummary, ComponentPool, ComponentPoolQuery, DeployedModelCreate, DeployedModelResponse,
+            DeployedModelUpdate, GetModelQuery, ListModelsQuery, ModelComponentResponse, enrichment::DeployedModelEnricher,
         },
         users::CurrentUser,
     },
@@ -26,19 +27,87 @@ use crate::{
     },
     errors::{Error, Result},
     reasoning::ReasoningTranslationOverrides,
-    types::{DeploymentId, Resource},
+    types::{DeploymentId, InferenceEndpointId, Resource},
 };
 use axum::{
     extract::{Path, Query, State},
     response::Json,
 };
+use onwards::affinity::AffinityConfig as OnwardsAffinityConfig;
+use onwards::aimd::AimdConfig as OnwardsAimdConfig;
 use sqlx::Acquire;
+
+fn validate_tariff_prices(tariffs: Option<&[TariffDefinition]>) -> Result<()> {
+    for tariff in tariffs.unwrap_or_default() {
+        // Zero is a valid price; negative rates are never customer discounts.
+        if tariff.input_price_per_token < rust_decimal::Decimal::ZERO || tariff.output_price_per_token < rust_decimal::Decimal::ZERO {
+            return Err(Error::BadRequest {
+                message: "Tariff input and output prices must be non-negative".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
 
 fn validate_reasoning_translation_overrides(overrides: Option<&ReasoningTranslationOverrides>) -> Result<()> {
     if let Some(overrides) = overrides {
         overrides.validate().map_err(|error| Error::BadRequest {
             message: error.to_string(),
         })?;
+    }
+    Ok(())
+}
+
+/// Realtime-only failover statuses use the same patterns as `fallback_on_status`:
+/// an exact 4xx/5xx code, a decade (`52` = 520-529) or a class (`5` = 5xx).
+fn validate_realtime_fallback_statuses(statuses: Option<&[i32]>) -> Result<()> {
+    if statuses.is_some_and(|statuses| statuses.iter().any(|status| !matches!(status, 4..=5 | 40..=59 | 400..=599))) {
+        return Err(Error::BadRequest {
+            message: "fallback_realtime_on_status entries must be 4xx/5xx status codes or 4, 5, 40-59 patterns".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_aimd(timeout: Option<i64>, config: Option<&AimdConfig>, composite: bool, priority: bool, fallback: bool) -> Result<()> {
+    if timeout.is_some_and(|ms| !(0..=3_600_000).contains(&ms)) {
+        return Err(Error::BadRequest {
+            message: "first_token_timeout_ms must be between 0 and 3600000".into(),
+        });
+    }
+    if let Some(config) = config {
+        let config: OnwardsAimdConfig = config.clone().into();
+        config.validate().map_err(|message| Error::BadRequest { message: message.into() })?;
+        if !config.enabled {
+            return Ok(());
+        }
+        if !composite || !priority || !fallback {
+            return Err(Error::BadRequest {
+                message: "AIMD requires a priority composite model with fallback enabled".into(),
+            });
+        }
+        if !timeout.is_some_and(|ms| ms == 0 || ms as u64 >= config.latency_budget_ms) {
+            return Err(Error::BadRequest {
+                message: "AIMD requires an explicit first_token_timeout_ms of 0 or at least latency_budget_ms".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_affinity(config: Option<&AffinityConfig>, composite: bool, priority: bool, fallback: bool) -> Result<()> {
+    let Some(config) = config else {
+        return Ok(());
+    };
+    let config: OnwardsAffinityConfig = config.clone().into();
+    if !config.enabled {
+        return Ok(());
+    }
+    config.validate().map_err(|message| Error::BadRequest { message: message.into() })?;
+    if !composite || !priority || !fallback {
+        return Err(Error::BadRequest {
+            message: "conversation affinity requires a priority composite model with fallback enabled".into(),
+        });
     }
     Ok(())
 }
@@ -148,11 +217,29 @@ async fn resolve_traffic_rules(
     Ok(resolved)
 }
 
+/// A completions-pool member must be reachable over HTTP: a continuation leg is
+/// an ordinary `/v1/completions` call to a provider, so the component's model
+/// needs an inference endpoint. (Composite components always do today; the
+/// check keeps that from becoming an assumption.)
+///
+/// Deliberately NOT limited to one member: a completions pool is a failover
+/// list like any other — dynamo first, the validated third-party target behind
+/// it. Pool membership itself is bounded by the column's CHECK constraint.
+fn validate_pool_member(pool: ComponentPool, component_hosted_on: Option<InferenceEndpointId>) -> Result<()> {
+    if pool == ComponentPool::Completions && component_hosted_on.is_none() {
+        return Err(Error::BadRequest {
+            message: "A completions-pool component must be hosted on an inference endpoint".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Convert a DB component response to an API component response
 fn db_component_to_response(c: DeploymentComponentDBResponse) -> ModelComponentResponse {
     ModelComponentResponse {
         weight: c.weight,
         enabled: c.enabled,
+        pool: ComponentPool::from_db(&c.pool),
         sort_order: c.sort_order,
         created_at: c.created_at,
         model: ComponentModelSummary {
@@ -171,7 +258,6 @@ fn db_component_to_response(c: DeploymentComponentDBResponse) -> ModelComponentR
                 name: c.endpoint_name.unwrap_or_default(),
             }),
             trusted: c.model_trusted,
-            open_responses_adapter: c.model_open_responses_adapter,
         },
     }
 }
@@ -197,7 +283,7 @@ fn db_component_to_response(c: DeploymentComponentDBResponse) -> ModelComponentR
         ("inactive" = Option<bool>, Query, description = "Show inactive models when true (admin only)"),
         ("limit" = Option<i64>, Query, description = "Maximum number of items to return (default: 10, max: 100)"),
         ("skip" = Option<i64>, Query, description = "Number of items to skip (default: 0)"),
-        ("search" = Option<String>, Query, description = "Search query to filter models by alias, model_name, or endpoint name (case-insensitive substring match)"),
+        ("search" = Option<String>, Query, description = "Search query to filter models by alias, model name, display name, or endpoint name (case-insensitive substring match)"),
         ("is_composite" = Option<bool>, Query, description = "Filter by composite/virtual model status (true = virtual models only, false = hosted models only)"),
     ),
     responses(
@@ -346,6 +432,10 @@ pub async fn list_deployed_models<P: PoolProvider>(
         filter = filter.with_realtime_availability(available_for_realtime);
     }
 
+    if !can_read_pricing {
+        filter.pricing_account = Some(current_user.active_organization.unwrap_or(current_user.id));
+    }
+
     // Apply sort if specified
     if let Some(sort_field) = query.sort {
         filter = filter.with_sort(sort_field, query.sort_direction);
@@ -399,7 +489,11 @@ pub async fn list_deployed_models<P: PoolProvider>(
         .into_iter()
         .map(|model| {
             let provider_pricing = if can_read_pricing { model.provider_pricing.clone() } else { None };
-            DeployedModelResponse::from(model).with_provider_pricing(provider_pricing)
+            // Serving presets are an operator detail, never a customer one.
+            let serving_classes = can_read_all_models.then(|| model.serving_classes.clone());
+            DeployedModelResponse::from(model)
+                .with_provider_pricing(provider_pricing)
+                .with_serving_classes(serving_classes)
         })
         .collect();
 
@@ -434,7 +528,7 @@ pub async fn list_deployed_models<P: PoolProvider>(
 
     // Use ModelEnricher to add requested data
     let enricher = DeployedModelEnricher {
-        db: state.db.read(),
+        db: &state.db.read(),
         include_groups,
         include_metrics,
         include_status,
@@ -445,6 +539,7 @@ pub async fn list_deployed_models<P: PoolProvider>(
         can_read_rate_limits,
         can_read_users,
         can_read_composite_info: can_read_all_models,
+        pricing_account: Some(current_user.active_organization.unwrap_or(current_user.id)),
     };
 
     let response = enricher.enrich_many(models).await?;
@@ -483,6 +578,27 @@ pub async fn list_deployed_models<P: PoolProvider>(
         limit,
         facets,
     }))
+}
+
+fn validate_realtime_inflight_limit(limit: Option<i32>) -> Result<()> {
+    if limit.is_some_and(|limit| limit < 1) {
+        return Err(Error::BadRequest {
+            message: "realtime_inflight_limit must be at least 1".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// A non-positive `batch_capacity` is stored as either a cap of zero (which
+/// refuses every batch request) or a value onwards would read as uncapped, so
+/// reject it before it reaches the database.
+fn validate_batch_capacity(capacity: Option<i32>) -> Result<()> {
+    if capacity.is_some_and(|capacity| capacity < 1) {
+        return Err(Error::BadRequest {
+            message: "batch_capacity must be at least 1".to_string(),
+        });
+    }
+    Ok(())
 }
 
 #[utoipa::path(
@@ -535,6 +651,15 @@ pub async fn create_deployed_model<P: PoolProvider>(
             message: "Model name and alias must not be empty or whitespace".to_string(),
         });
     }
+
+    validate_tariff_prices(tariffs.as_deref())?;
+
+    // Validate batch capacity if provided (both standard and composite models).
+    let batch_capacity = match &create {
+        DeployedModelCreate::Standard(s) => s.batch_capacity,
+        DeployedModelCreate::Composite(c) => c.batch_capacity,
+    };
+    validate_batch_capacity(batch_capacity)?;
 
     // Validate throughput is positive if provided
     if let Some(t) = throughput
@@ -589,6 +714,28 @@ pub async fn create_deployed_model<P: PoolProvider>(
         DeployedModelCreate::Composite(c) => (c.backoff_initial_ms, c.backoff_max_ms, c.backoff_factor, c.backoff_max_total_ms),
     };
     validate_backoff(Some(b_initial), Some(b_max), Some(b_factor), b_total)?;
+    if let DeployedModelCreate::Composite(c) = &create {
+        validate_realtime_fallback_statuses(Some(&c.fallback_realtime_on_status))?;
+        validate_realtime_inflight_limit(c.realtime_inflight_limit)?;
+    }
+    match &create {
+        DeployedModelCreate::Standard(s) => validate_aimd(s.first_token_timeout_ms, s.aimd.as_ref(), false, false, s.backoff_enabled)?,
+        DeployedModelCreate::Composite(c) => {
+            validate_aimd(
+                c.first_token_timeout_ms,
+                c.aimd.as_ref(),
+                true,
+                c.lb_strategy == LoadBalancingStrategy::Priority,
+                c.fallback_enabled,
+            )?;
+            validate_affinity(
+                c.affinity.as_ref(),
+                true,
+                c.lb_strategy == LoadBalancingStrategy::Priority,
+                c.fallback_enabled,
+            )?;
+        }
+    }
 
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
 
@@ -627,9 +774,37 @@ pub async fn create_deployed_model<P: PoolProvider>(
     }
 
     // Create tariffs if provided
-    if let Some(tariff_defs) = tariffs {
+    if let Some(mut tariff_defs) = tariffs {
+        // Normalize incoming windows before persistence and comparison. Repeating
+        // a padded request is a no-op once stored canonically. Do not trim stored
+        // legacy rows when comparing: replace them so exact-window billing works.
+        for tariff in &mut tariff_defs {
+            if tariff.api_key_purpose == Some(ApiKeyPurpose::Batch) {
+                tariff.completion_window = tariff.completion_window.take().map(|window| window.trim().to_owned());
+            }
+        }
         let mut tariffs_repo = Tariffs::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
         for tariff_def in tariff_defs {
+            if tariff_def
+                .api_key_purpose
+                .as_ref()
+                .is_none_or(|purpose| !purpose.is_customer_billing())
+            {
+                return Err(Error::BadRequest {
+                    message: "Tariffs support only realtime, batch and playground customer inference".to_string(),
+                });
+            }
+            if tariff_def.api_key_purpose == Some(ApiKeyPurpose::Batch) {
+                if tariff_def.completion_window.as_deref().is_none_or(|w| w.trim().is_empty()) {
+                    return Err(Error::BadRequest {
+                        message: "Batch tariffs require a completion window".to_string(),
+                    });
+                }
+            } else if tariff_def.completion_window.is_some() {
+                return Err(Error::BadRequest {
+                    message: "Only batch tariffs may specify a completion window".to_string(),
+                });
+            }
             let tariff_request = TariffCreateDBRequest {
                 deployed_model_id: model.id,
                 name: tariff_def.name,
@@ -638,6 +813,7 @@ pub async fn create_deployed_model<P: PoolProvider>(
                 api_key_purpose: tariff_def.api_key_purpose,
                 completion_window: tariff_def.completion_window,
                 valid_from: None, // Use NOW()
+                user_id: None,
             };
             tariffs_repo.create(&tariff_request).await?;
         }
@@ -688,6 +864,11 @@ pub async fn update_deployed_model<P: PoolProvider>(
 ) -> Result<Json<DeployedModelResponse>> {
     let has_system_access = has_permission(&current_user, resource::Models.into(), operation::SystemAccess.into());
 
+    validate_tariff_prices(update.tariffs.as_deref())?;
+
+    // `Some(None)` clears the cap; only a concrete non-positive value is invalid.
+    validate_batch_capacity(update.batch_capacity.flatten())?;
+
     if let Some(Some(t)) = update.throughput
         && t <= 0.0
     {
@@ -725,7 +906,19 @@ pub async fn update_deployed_model<P: PoolProvider>(
     // We also keep the current row so we can (a) validate the *merged* backoff
     // state — not just the fields in this PATCH — and (b) derive the
     // standard-model fallback invariant below.
-    let (model_alias, is_composite, prev_lb_strategy, cur_initial, cur_max, cur_factor, cur_total) = {
+    let (
+        model_alias,
+        is_composite,
+        prev_lb_strategy,
+        cur_initial,
+        cur_max,
+        cur_factor,
+        cur_total,
+        cur_timeout,
+        cur_aimd,
+        cur_affinity,
+        cur_fallback,
+    ) = {
         let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
         match repo.get_by_id(deployment_id).await {
             Ok(Some(model)) => {
@@ -743,6 +936,10 @@ pub async fn update_deployed_model<P: PoolProvider>(
                     model.backoff_max_ms,
                     model.backoff_factor,
                     model.backoff_max_total_ms,
+                    model.first_token_timeout_ms,
+                    model.aimd,
+                    model.affinity,
+                    model.fallback_enabled,
                 )
             }
             Ok(None) => {
@@ -755,11 +952,33 @@ pub async fn update_deployed_model<P: PoolProvider>(
         }
     };
 
+    validate_realtime_fallback_statuses(update.fallback_realtime_on_status.as_deref())?;
+    validate_aimd(
+        update.first_token_timeout_ms.unwrap_or(cur_timeout),
+        update.aimd.as_ref().map(|v| v.as_ref()).unwrap_or(cur_aimd.as_ref()),
+        is_composite,
+        update.lb_strategy.as_ref().unwrap_or(&prev_lb_strategy) == &LoadBalancingStrategy::Priority,
+        update.fallback_enabled.unwrap_or(cur_fallback),
+    )?;
+    validate_affinity(
+        update.affinity.as_ref().map(|v| v.as_ref()).unwrap_or(cur_affinity.as_ref()),
+        is_composite,
+        update.lb_strategy.as_ref().unwrap_or(&prev_lb_strategy) == &LoadBalancingStrategy::Priority,
+        update.fallback_enabled.unwrap_or(cur_fallback),
+    )?;
+
     if is_composite && update.reasoning_translation_overrides.is_some() {
         return Err(Error::BadRequest {
             message: "reasoning_translation_overrides is only supported for standard models".to_string(),
         });
     }
+
+    if !is_composite && update.realtime_inflight_limit.is_some() {
+        return Err(Error::BadRequest {
+            message: "realtime_inflight_limit is only supported for composite models".to_string(),
+        });
+    }
+    validate_realtime_inflight_limit(update.realtime_inflight_limit)?;
 
     // Validate the backoff state the update would *result in*, merging
     // incoming fields over the stored values. Without merging, a one-sided
@@ -841,7 +1060,29 @@ pub async fn update_deployed_model<P: PoolProvider>(
     }
 
     // Handle tariff replacement if provided
-    if let Some(tariff_defs) = tariffs {
+    if let Some(mut tariff_defs) = tariffs {
+        // Normalize incoming windows before persistence and comparison. Repeating
+        // a padded request is a no-op once stored canonically. Do not trim stored
+        // legacy rows when comparing: replace them so exact-window billing works.
+        for tariff in &mut tariff_defs {
+            if tariff.api_key_purpose == Some(ApiKeyPurpose::Batch) {
+                tariff.completion_window = tariff.completion_window.take().map(|window| window.trim().to_owned());
+            }
+        }
+        let scheduled: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM model_tariffs WHERE deployed_model_id=$1 AND user_id IS NULL AND serving_class IS NULL
+             AND valid_from>NOW() AND (valid_until IS NULL OR valid_until>valid_from))",
+        )
+        .bind(deployment_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| Error::Database(e.into()))?;
+        if scheduled {
+            return Err(Error::BadRequest {
+                message: "This model has scheduled future prices; explicitly cancel or resolve the schedule before replacing tariffs"
+                    .to_string(),
+            });
+        }
         let tariff_conn = tx.acquire().await.map_err(|e| Error::Database(e.into()))?;
         let mut tariffs_repo = Tariffs::new(tariff_conn);
 
@@ -872,11 +1113,31 @@ pub async fn update_deployed_model<P: PoolProvider>(
 
         // Create new or changed tariffs (skip those that already exist unchanged)
         for tariff_def in tariff_defs {
-            // Skip if this tariff already exists with the same values
+            // Preserve unchanged legacy rows when editing model metadata. New or
+            // changed prices must satisfy the current customer-billing contract.
             if current_tariffs.iter().any(|existing| tariff_matches(existing, &tariff_def)) {
                 continue;
             }
-
+            if tariff_def
+                .api_key_purpose
+                .as_ref()
+                .is_none_or(|purpose| !purpose.is_customer_billing())
+            {
+                return Err(Error::BadRequest {
+                    message: "Tariffs support only realtime, batch and playground customer inference".to_string(),
+                });
+            }
+            if tariff_def.api_key_purpose == Some(ApiKeyPurpose::Batch) {
+                if tariff_def.completion_window.as_deref().is_none_or(|w| w.trim().is_empty()) {
+                    return Err(Error::BadRequest {
+                        message: "Batch tariffs require a completion window".to_string(),
+                    });
+                }
+            } else if tariff_def.completion_window.is_some() {
+                return Err(Error::BadRequest {
+                    message: "Only batch tariffs may specify a completion window".to_string(),
+                });
+            }
             let tariff_request = TariffCreateDBRequest {
                 deployed_model_id: deployment_id,
                 name: tariff_def.name,
@@ -885,6 +1146,7 @@ pub async fn update_deployed_model<P: PoolProvider>(
                 api_key_purpose: tariff_def.api_key_purpose,
                 completion_window: tariff_def.completion_window,
                 valid_from: None, // Use NOW()
+                user_id: None,
             };
             tariffs_repo.create(&tariff_request).await?;
         }
@@ -1044,7 +1306,10 @@ pub async fn get_deployed_model<P: PoolProvider>(
     } else {
         None
     };
-    let mut response = DeployedModelResponse::from(model).with_provider_pricing(provider_pricing);
+    let serving_classes = can_read_all_models.then(|| model.serving_classes.clone());
+    let mut response = DeployedModelResponse::from(model)
+        .with_provider_pricing(provider_pricing)
+        .with_serving_classes(serving_classes);
 
     // Fetch and attach traffic rules
     {
@@ -1054,7 +1319,7 @@ pub async fn get_deployed_model<P: PoolProvider>(
 
     // Use ModelEnricher to add related data
     let enricher = DeployedModelEnricher {
-        db: state.db.read(),
+        db: &state.db.read(),
         include_groups,
         include_metrics,
         include_status,
@@ -1065,6 +1330,7 @@ pub async fn get_deployed_model<P: PoolProvider>(
         can_read_rate_limits,
         can_read_users,
         can_read_composite_info: can_read_all_models,
+        pricing_account: Some(current_user.active_organization.unwrap_or(current_user.id)),
     };
 
     response = enricher.enrich_one(response).await?;
@@ -1235,23 +1501,26 @@ pub async fn add_model_component<P: PoolProvider>(
                 message: "Cannot add a composite model as a component".to_string(),
             });
         }
+
+        validate_pool_member(body.pool, component.hosted_on)?;
     }
 
     // Add the component. Its priority position is always assigned by the server
-    // as "one past the current last component" so sort_order stays unique and
-    // dense within the composite — the client-supplied `sort_order` is ignored
+    // as "one past the current last component of that pool" so sort_order stays
+    // unique and dense within the pool — the client-supplied `sort_order` is ignored
     // (reordering is done via PATCH, which moves-and-reindexes). Lock the
     // composite first so concurrent adds can't both read the same MAX and
     // collide on a position.
     let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
     repo.lock_composite(id).await?;
-    let sort_order = repo.next_component_sort_order(id).await?;
+    let sort_order = repo.next_component_sort_order(id, body.pool.as_str()).await?;
     let request = DeploymentComponentCreateDBRequest {
         composite_model_id: id,
         deployed_model_id: component_id,
         weight: body.weight,
         enabled: body.enabled,
         sort_order,
+        pool: body.pool.as_str().to_string(),
     };
 
     let component = repo.add_component(&request).await?;
@@ -1269,6 +1538,7 @@ pub async fn add_model_component<P: PoolProvider>(
     params(
         ("id" = String, Path, description = "The composite model ID", format = "uuid"),
         ("component_id" = String, Path, description = "The deployed model ID of the component", format = "uuid"),
+        ComponentPoolQuery,
     ),
     request_body = ModelComponentUpdate,
     responses(
@@ -1288,6 +1558,7 @@ pub async fn add_model_component<P: PoolProvider>(
 pub async fn update_model_component<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path((id, component_id)): Path<(DeploymentId, DeploymentId)>,
+    Query(query): Query<ComponentPoolQuery>,
     _: RequiresPermission<resource::CompositeModels, operation::UpdateAll>,
     Json(body): Json<ModelComponentUpdate>,
 ) -> Result<Json<ModelComponentResponse>> {
@@ -1300,19 +1571,19 @@ pub async fn update_model_component<P: PoolProvider>(
         });
     }
 
-    // A sort_order change moves the component and renumbers the whole composite,
-    // so run on a transaction to keep that multi-row rewrite atomic.
+    // A sort_order change moves the component and renumbers its pool, so run on
+    // a transaction to keep that multi-row rewrite atomic.
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
     let component = {
         let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
         // Serialize with other component mutations on this composite so the
         // move-and-reindex below isn't interleaved with a concurrent add/reorder.
         repo.lock_composite(id).await?;
-        repo.update_component(id, component_id, body.weight, body.enabled, body.sort_order)
+        repo.update_component(id, component_id, query.pool.as_str(), body.weight, body.enabled, body.sort_order)
             .await?
             .ok_or_else(|| Error::NotFound {
                 resource: "component".to_string(),
-                id: format!("{}/{}", id, component_id),
+                id: format!("{}/{}/{}", id, component_id, query.pool.as_str()),
             })?
     };
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
@@ -1329,6 +1600,7 @@ pub async fn update_model_component<P: PoolProvider>(
     params(
         ("id" = String, Path, description = "The composite model ID", format = "uuid"),
         ("component_id" = String, Path, description = "The deployed model ID of the component to remove", format = "uuid"),
+        ComponentPoolQuery,
     ),
     responses(
         (status = 200, description = "Component removed"),
@@ -1346,6 +1618,7 @@ pub async fn update_model_component<P: PoolProvider>(
 pub async fn remove_model_component<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path((id, component_id)): Path<(DeploymentId, DeploymentId)>,
+    Query(query): Query<ComponentPoolQuery>,
     _: RequiresPermission<resource::CompositeModels, operation::UpdateAll>,
 ) -> Result<Json<String>> {
     // Remove and then compact the remaining components back to a dense 0..n-1
@@ -1357,15 +1630,15 @@ pub async fn remove_model_component<P: PoolProvider>(
         let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
         repo.lock_composite(id).await?;
 
-        let removed = repo.remove_component(id, component_id).await?;
+        let removed = repo.remove_component(id, component_id, query.pool.as_str()).await?;
         if !removed {
             return Err(Error::NotFound {
                 resource: "component".to_string(),
-                id: format!("{}/{}", id, component_id),
+                id: format!("{}/{}/{}", id, component_id, query.pool.as_str()),
             });
         }
 
-        repo.compact_component_sort_order(id).await?;
+        repo.compact_component_sort_order(id, query.pool.as_str()).await?;
     }
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
@@ -1374,6 +1647,7 @@ pub async fn remove_model_component<P: PoolProvider>(
 
 #[cfg(test)]
 mod tests {
+    use rust_decimal::Decimal;
 
     use crate::{
         api::{
@@ -1390,12 +1664,232 @@ mod tests {
     use serde_json::json;
     use sqlx::PgPool;
 
+    #[dwctl_test_macros::test]
+    async fn aimd_api_create_patch_clear_and_validate(pool: PgPool) {
+        let (app, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let headers = add_auth_headers(&user);
+        let config = json!({"latency_budget_ms":100,"breach_rate_target":0.1,"window_samples":20,
+            "min_samples":5,"share_step":0.05,"share_decay":0.5,"share_floor":0.1,"dwell_ms":1000});
+        let response = app
+            .post("/admin/api/v1/models")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"type":"composite","model_name":"aimd-model","lb_strategy":"priority",
+                "fallback_enabled":true,"first_token_timeout_ms":200,"aimd":config}))
+            .await;
+        response.assert_status_ok();
+        let model: DeployedModelResponse = response.json();
+        assert_eq!(model.fallback.as_ref().unwrap().first_token_timeout_ms, Some(200));
+        assert!(model.fallback.unwrap().aimd.is_some());
+        let path = format!("/admin/api/v1/models/{}", model.id);
+        // Malformed overrides are rejected by typed deserialization before persistence.
+        app.patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"first_token_timeout_ms":0,"aimd":{"enabled":true,"latency_budget_ms":null}}))
+            .await
+            .assert_status_unprocessable_entity();
+
+        for patch in [
+            json!({"first_token_timeout_ms":50}),
+            json!({"first_token_timeout_ms":null}),
+            json!({"lb_strategy":"weighted_random"}),
+            json!({"fallback_enabled":false}),
+            json!({"first_token_timeout_ms":-1}),
+        ] {
+            app.patch(&path)
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .json(&patch)
+                .await
+                .assert_status_bad_request();
+        }
+        let response = app
+            .patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"description":"unchanged settings"}))
+            .await;
+        response.assert_status_ok();
+        let model: DeployedModelResponse = response.json();
+        assert!(model.fallback.unwrap().aimd.is_some());
+        app.patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"aimd":null,"first_token_timeout_ms":null,"lb_strategy":"weighted_random"}))
+            .await
+            .assert_status_ok();
+        let response = app
+            .get(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        response.assert_status_ok();
+        let model: DeployedModelResponse = response.json();
+        let fallback = model.fallback.unwrap();
+        assert!(fallback.aimd.is_none());
+        assert!(fallback.first_token_timeout_ms.is_none());
+        // Explicit opt-out survives persistence; null restores inheritance.
+        let response = app
+            .patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"aimd":{"enabled":false}}))
+            .await;
+        response.assert_status_ok();
+        let disabled: DeployedModelResponse = response.json();
+        assert!(!disabled.fallback.unwrap().aimd.unwrap().enabled);
+        app.patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"aimd":null}))
+            .await
+            .assert_status_ok();
+        let mut conn = pool.acquire().await.unwrap();
+        let stored = Deployments::new(&mut conn).get_by_id(model.id).await.unwrap().unwrap();
+        assert!(stored.aimd.is_none());
+        assert!(stored.first_token_timeout_ms.is_none());
+    }
+
+    #[dwctl_test_macros::test]
+    async fn realtime_fallback_statuses_default_patch_and_validate(pool: PgPool) {
+        let (app, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let headers = add_auth_headers(&user);
+        let response = app
+            .post("/admin/api/v1/models")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"type":"composite","model_name":"realtime-fallback-model"}))
+            .await;
+        response.assert_status_ok();
+        let model: DeployedModelResponse = response.json();
+        assert_eq!(model.fallback.unwrap().realtime_on_status, vec![529]);
+        let path = format!("/admin/api/v1/models/{}", model.id);
+
+        for statuses in [json!([200]), json!([600]), json!([-529])] {
+            app.patch(&path)
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .json(&json!({"fallback_realtime_on_status": statuses}))
+                .await
+                .assert_status_bad_request();
+        }
+
+        let response = app
+            .patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"fallback_realtime_on_status": []}))
+            .await;
+        response.assert_status_ok();
+        let model: DeployedModelResponse = response.json();
+        assert!(model.fallback.unwrap().realtime_on_status.is_empty());
+
+        // Omitting the field leaves the stored statuses untouched.
+        app.patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"fallback_realtime_on_status": [529]}))
+            .await
+            .assert_status_ok();
+        let response = app
+            .patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"fallback_on_status": [500]}))
+            .await;
+        response.assert_status_ok();
+        let model: DeployedModelResponse = response.json();
+        assert_eq!(model.fallback.unwrap().realtime_on_status, vec![529]);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn affinity_api_create_patch_clear_and_validate(pool: PgPool) {
+        let (app, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let headers = add_auth_headers(&user);
+        let response = app
+            .post("/admin/api/v1/models")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"type":"composite","model_name":"affinity-model","lb_strategy":"priority",
+                "fallback_enabled":true,"affinity":{"target_conversations":40}}))
+            .await;
+        response.assert_status_ok();
+        let model: DeployedModelResponse = response.json();
+        assert_eq!(model.fallback.as_ref().unwrap().affinity.as_ref().unwrap().target_conversations, 40);
+        let path = format!("/admin/api/v1/models/{}", model.id);
+
+        // Typed deserialization rejects unknown members before persistence.
+        app.patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"affinity":{"target":5}}))
+            .await
+            .assert_status_unprocessable_entity();
+        // Invalid settings, and routing that affinity cannot run on.
+        for patch in [
+            json!({"affinity":{"target_conversations":0}}),
+            json!({"lb_strategy":"weighted_random"}),
+            json!({"fallback_enabled":false}),
+        ] {
+            app.patch(&path)
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .json(&patch)
+                .await
+                .assert_status_bad_request();
+        }
+        let response = app
+            .patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"affinity":{"target_conversations":60,"margin":5}}))
+            .await;
+        response.assert_status_ok();
+        let model: DeployedModelResponse = response.json();
+        let affinity = model.fallback.unwrap().affinity.unwrap();
+        assert_eq!((affinity.target_conversations, affinity.margin), (60, Some(5)));
+        // An unrelated change keeps the setting.
+        let response = app
+            .patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"description":"unchanged routing"}))
+            .await;
+        response.assert_status_ok();
+        let model: DeployedModelResponse = response.json();
+        assert!(model.fallback.unwrap().affinity.is_some());
+        // Null returns the model to per-request selection.
+        app.patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"affinity":null}))
+            .await
+            .assert_status_ok();
+        let mut conn = pool.acquire().await.unwrap();
+        let stored = Deployments::new(&mut conn).get_by_id(model.id).await.unwrap().unwrap();
+        assert!(stored.affinity.is_none());
+        // A weighted composite cannot be created with affinity.
+        app.post("/admin/api/v1/models")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(
+                &json!({"type":"composite","model_name":"weighted-affinity","lb_strategy":"weighted_random",
+                "fallback_enabled":true,"affinity":{"target_conversations":10}}),
+            )
+            .await
+            .assert_status_bad_request();
+    }
+
     /// Helper function to find a model by ID in a paginated response
     fn get_model_by_id(id: DeploymentId, response: &PaginatedResponse<DeployedModelResponse>) -> Option<&DeployedModelResponse> {
         response.data.iter().find(|model| model.id == id)
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_deployments(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1414,7 +1908,7 @@ mod tests {
         assert!(response_body.data.is_empty() || !response_body.data.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn admin_models_include_pricing_exposes_cache_tariffs(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1497,7 +1991,81 @@ mod tests {
         assert!(model.get("cache_pricing").is_none());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
+    async fn customer_model_prices_hide_class_details_but_managers_keep_them(pool: PgPool) {
+        let (app, _services) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let customer = create_test_user(&pool, Role::StandardUser).await;
+        let model = create_test_deployment(&pool, admin.id, "customer-price", "customer-price").await;
+        sqlx::query(
+            "INSERT INTO deployment_groups (deployment_id,group_id,granted_by) VALUES ($1,'00000000-0000-0000-0000-000000000000',$2)",
+        )
+        .bind(model.id)
+        .bind(admin.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (account, class, rate) in [
+            (None, None, 3),
+            (Some(customer.id), None, 2),
+            (Some(customer.id), Some("standard"), 9),
+            (Some(customer.id), Some("interactive"), 0),
+        ] {
+            sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,input_price_per_token,output_price_per_token,api_key_purpose) VALUES ($1,$2,$3,'price',$4,$4,'realtime')").bind(model.id).bind(account).bind(class).bind(rust_decimal::Decimal::from(rate)).execute(&pool).await.unwrap();
+        }
+        for (account, class, rate) in [
+            (None, None, "0.1"),
+            (Some(customer.id), None, "0.2"),
+            (Some(customer.id), Some("interactive"), "0.8"),
+        ] {
+            sqlx::query("INSERT INTO model_cache_tariffs (deployed_model_id,user_id,serving_class,write_multiplier_5m,write_multiplier_1h,write_multiplier_24h,read_multiplier,min_prefix_tokens) VALUES ($1,$2,$3,1,1,1,$4,1)").bind(model.id).bind(account).bind(class).bind(rate.parse::<rust_decimal::Decimal>().unwrap()).execute(&pool).await.unwrap();
+        }
+        for user in [&customer, &admin] {
+            for path in [
+                "/admin/api/v1/models?include=pricing".to_string(),
+                format!("/admin/api/v1/models/{}?include=pricing", model.id),
+            ] {
+                let headers = add_auth_headers(user);
+                let response = app
+                    .get(&path)
+                    .add_header(&headers[0].0, &headers[0].1)
+                    .add_header(&headers[1].0, &headers[1].1)
+                    .await;
+                response.assert_status_ok();
+                let body: serde_json::Value = response.json();
+                let response_model = if let Some(data) = body["data"].as_array() {
+                    data.iter().find(|m| m["id"] == model.id.to_string()).unwrap()
+                } else {
+                    &body
+                };
+                let tariffs = response_model["tariffs"].as_array().unwrap();
+                if user.id == customer.id {
+                    assert_eq!(tariffs.len(), 1);
+                    assert_eq!(
+                        tariffs[0]["input_price_per_token"]
+                            .as_str()
+                            .unwrap()
+                            .parse::<rust_decimal::Decimal>()
+                            .unwrap(),
+                        rust_decimal::Decimal::from(2)
+                    );
+                    assert!(tariffs[0].get("organization_id").is_none());
+                    assert!(tariffs[0].get("serving_class").is_none());
+                    assert!(response_model.get("cache_pricing_by_class").is_none());
+                    assert_eq!(response_model["cache_pricing"]["read_multiplier"], "0.2000");
+                } else {
+                    assert_eq!(tariffs.len(), 4);
+                    assert!(
+                        tariffs
+                            .iter()
+                            .any(|t| t["serving_class"] == "interactive" && t["organization_id"] == customer.id.to_string())
+                    );
+                }
+            }
+        }
+    }
+
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_deployments_with_nonexistent_endpoint(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1513,7 +2081,7 @@ mod tests {
         response.assert_status_not_found();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_model_operations(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1591,7 +2159,7 @@ mod tests {
         response.assert_status_ok(); // Admin can see deleted model with deleted=true
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_composite_model_patch_rejects_reasoning_translation_overrides(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1632,7 +2200,103 @@ mod tests {
         assert_eq!(stored, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_realtime_inflight_limit_below_one_is_rejected(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let auth = add_auth_headers(&user);
+
+        app.post("/admin/api/v1/models")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .json(&json!({ "type": "composite", "model_name": "inflight-zero", "alias": "inflight-zero", "realtime_inflight_limit": 0 }))
+            .await
+            .assert_status_bad_request();
+
+        let response = app
+            .post("/admin/api/v1/models")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .json(&json!({ "type": "composite", "model_name": "inflight-one", "alias": "inflight-one" }))
+            .await;
+        response.assert_status_ok();
+        let created: DeployedModelResponse = response.json();
+        app.patch(&format!("/admin/api/v1/models/{}", created.id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .json(&json!({ "realtime_inflight_limit": 0 }))
+            .await
+            .assert_status_bad_request();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_non_positive_batch_capacity_is_rejected(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let auth = add_auth_headers(&user);
+
+        for invalid in [0, -1] {
+            app.post("/admin/api/v1/models")
+                .add_header(&auth[0].0, &auth[0].1)
+                .add_header(&auth[1].0, &auth[1].1)
+                .json(&json!({ "type": "composite", "model_name": format!("batch-{invalid}"), "alias": format!("batch-{invalid}"), "batch_capacity": invalid }))
+                .await
+                .assert_status_bad_request();
+        }
+
+        let response = app
+            .post("/admin/api/v1/models")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .json(&json!({ "type": "composite", "model_name": "batch-valid", "alias": "batch-valid", "batch_capacity": 5 }))
+            .await;
+        response.assert_status_ok();
+        let created: DeployedModelResponse = response.json();
+
+        for invalid in [0, -1] {
+            app.patch(&format!("/admin/api/v1/models/{}", created.id))
+                .add_header(&auth[0].0, &auth[0].1)
+                .add_header(&auth[1].0, &auth[1].1)
+                .json(&json!({ "batch_capacity": invalid }))
+                .await
+                .assert_status_bad_request();
+        }
+
+        let stored = sqlx::query_scalar::<_, i32>("SELECT batch_capacity FROM deployed_models WHERE id = $1")
+            .bind(created.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, 5, "a rejected update must leave the stored value untouched");
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_standard_model_patch_rejects_realtime_inflight_limit(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let model = create_test_deployment(&pool, user.id, "inflight-standard", "inflight-standard").await;
+
+        let response = app
+            .patch(&format!("/admin/api/v1/models/{}", model.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .json(&json!({ "realtime_inflight_limit": 500 }))
+            .await;
+
+        response.assert_status_bad_request();
+
+        let stored = sqlx::query_scalar::<_, i32>("SELECT realtime_inflight_limit FROM deployed_models WHERE id = $1")
+            .bind(model.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, 14);
+    }
+
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_deployments_with_groups_include(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1702,7 +2366,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_deployments_with_reasoning_capabilities_include(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1765,7 +2429,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_role_based_visibility_for_deleted_models(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1823,7 +2487,7 @@ mod tests {
         // Verify the API behavior is consistent with soft deletion
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_role_based_list_filtering(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1894,7 +2558,7 @@ mod tests {
         assert!(!user_models.data.iter().any(|it| it.id == deployment2.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_role_based_update_access_for_deleted_models(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1940,7 +2604,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_soft_delete_preserves_model_accessibility_for_admin(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2012,7 +2676,258 @@ mod tests {
         assert_eq!(updated_model.alias, "updated-after-deletion");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
+    async fn invalid_tariffs_are_rejected_atomically_on_create_and_update(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let headers = add_auth_headers(&admin);
+        let endpoint = get_test_endpoint_id(&pool).await;
+        let existing = create_test_deployment(&pool, admin.id, "original", "original").await;
+        for (purpose, window) in [
+            (Some("continuation"), None),
+            (Some("platform"), None),
+            (None, None),
+            (Some("realtime"), Some("24h")),
+            (Some("batch"), None),
+            (Some("batch"), Some("   ")),
+        ] {
+            let tariffs = json!([{"name":"invalid", "api_key_purpose":purpose, "completion_window":window,
+                "input_price_per_token":"1", "output_price_per_token":"2"}]);
+            app.post("/admin/api/v1/models")
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .json(&json!({"type":"standard", "model_name":"invalid", "alias":"invalid", "hosted_on":endpoint, "tariffs":tariffs}))
+                .await
+                .assert_status_bad_request();
+            app.patch(&format!("/admin/api/v1/models/{}", existing.id))
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .json(&json!({"alias":"must-rollback", "tariffs":tariffs}))
+                .await
+                .assert_status_bad_request();
+        }
+        let alias: String = sqlx::query_scalar("SELECT alias FROM deployed_models WHERE id=$1")
+            .bind(existing.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(alias, "original");
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM deployed_models WHERE alias='invalid'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM model_tariffs WHERE deployed_model_id=$1")
+            .bind(existing.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn negative_tariff_prices_are_rejected_before_model_or_ledger_changes(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let headers = add_auth_headers(&admin);
+        let endpoint = get_test_endpoint_id(&pool).await;
+        let existing = create_test_deployment(&pool, admin.id, "original", "original").await;
+        let original_tariff: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO model_tariffs(deployed_model_id,name,api_key_purpose,input_price_per_token,output_price_per_token)
+             VALUES ($1,'original','realtime',1,2) RETURNING id",
+        )
+        .bind(existing.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        for (input, output) in [("-1", "2"), ("1", "-0.00000001"), ("-1", "-2")] {
+            // A valid earlier row must not be written before rejecting a later bad rate.
+            let tariffs = json!([
+                {"name":"valid", "api_key_purpose":"playground", "input_price_per_token":"1", "output_price_per_token":"2"},
+                {"name":"invalid", "api_key_purpose":"realtime", "input_price_per_token":input, "output_price_per_token":output}
+            ]);
+            for kind in ["standard", "composite"] {
+                let mut create = json!({"type":kind,"model_name":"invalid-price","alias":"invalid-price","tariffs":tariffs});
+                if kind == "standard" {
+                    create["hosted_on"] = json!(endpoint);
+                }
+                let response = app
+                    .post("/admin/api/v1/models")
+                    .add_header(&headers[0].0, &headers[0].1)
+                    .add_header(&headers[1].0, &headers[1].1)
+                    .json(&create)
+                    .await;
+                response.assert_status_bad_request();
+                assert!(response.text().contains("non-negative"));
+            }
+            let response = app
+                .patch(&format!("/admin/api/v1/models/{}", existing.id))
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .json(&json!({"alias":"must-not-change","tariffs":tariffs}))
+                .await;
+            response.assert_status_bad_request();
+            assert!(response.text().contains("non-negative"));
+
+            let rows: Vec<(uuid::Uuid, Decimal, Decimal, bool)> = sqlx::query_as(
+                "SELECT id,input_price_per_token,output_price_per_token,valid_until IS NULL FROM model_tariffs WHERE deployed_model_id=$1",
+            )
+            .bind(existing.id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(rows, vec![(original_tariff, Decimal::ONE, Decimal::from(2), true)]);
+            let alias: String = sqlx::query_scalar("SELECT alias FROM deployed_models WHERE id=$1")
+                .bind(existing.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(alias, "original");
+        }
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM deployed_models WHERE alias='invalid-price'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn zero_tariff_prices_remain_valid_on_create_and_update(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let headers = add_auth_headers(&admin);
+        let endpoint = get_test_endpoint_id(&pool).await;
+        for (input, output) in [("0", "2"), ("1", "0"), ("0", "0")] {
+            let alias = format!("zero-{input}-{output}");
+            let tariff =
+                json!({"name":"zero", "api_key_purpose":"realtime", "input_price_per_token":input,"output_price_per_token":output});
+            let response = app
+                .post("/admin/api/v1/models")
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .json(&json!({"type":"standard","model_name":alias,"alias":alias,"hosted_on":endpoint,"tariffs":[tariff]}))
+                .await;
+            response.assert_status_ok();
+            let model: DeployedModelResponse = response.json();
+            let original: uuid::Uuid = sqlx::query_scalar("SELECT id FROM model_tariffs WHERE deployed_model_id=$1")
+                .bind(model.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            app.patch(&format!("/admin/api/v1/models/{}", model.id))
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .json(&json!({"description":"zero remains valid","tariffs":[tariff]}))
+                .await
+                .assert_status_ok();
+            let rows: Vec<(uuid::Uuid, Decimal, Decimal)> =
+                sqlx::query_as("SELECT id,input_price_per_token,output_price_per_token FROM model_tariffs WHERE deployed_model_id=$1")
+                    .bind(model.id)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(rows, vec![(original, input.parse().unwrap(), output.parse().unwrap())]);
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn customer_tariff_windows_are_normalized_on_create_and_update(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let headers = add_auth_headers(&admin);
+        let endpoint = get_test_endpoint_id(&pool).await;
+        for (purpose, window, expected_window) in [("realtime", None, None), ("batch", Some(" 24h "), Some("24h"))] {
+            let tariff = json!({"name":"price", "api_key_purpose":purpose, "completion_window":window,
+                "input_price_per_token":"1", "output_price_per_token":"2"});
+            let response = app
+                .post("/admin/api/v1/models")
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .json(&json!({"type":"standard", "model_name":purpose, "alias":purpose, "hosted_on":endpoint, "tariffs":[tariff]}))
+                .await;
+            response.assert_status_ok();
+            let model: DeployedModelResponse = response.json();
+            let original: (uuid::Uuid, Option<String>) =
+                sqlx::query_as("SELECT id,completion_window FROM model_tariffs WHERE deployed_model_id=$1")
+                    .bind(model.id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(original.1.as_deref(), expected_window);
+            // An unchanged padded request must not add a historical version.
+            for output in ["2", "3"] {
+                let mut update = tariff.clone();
+                update["output_price_per_token"] = json!(output);
+                app.patch(&format!("/admin/api/v1/models/{}", model.id))
+                    .add_header(&headers[0].0, &headers[0].1)
+                    .add_header(&headers[1].0, &headers[1].1)
+                    .json(&json!({"tariffs":[update]}))
+                    .await
+                    .assert_status_ok();
+                let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM model_tariffs WHERE deployed_model_id=$1")
+                    .bind(model.id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                assert_eq!(rows, if output == "2" { 1 } else { 2 });
+                let selected: (uuid::Uuid, Option<String>, Decimal) = sqlx::query_as(
+                    "SELECT id,completion_window,output_price_per_token FROM effective_model_tariff($1,$2,$3,$4,'standard',clock_timestamp())")
+                    .bind(model.id).bind(admin.id).bind(purpose).bind(expected_window)
+                    .fetch_one(&pool).await.unwrap();
+                assert_eq!(selected.1.as_deref(), expected_window);
+                assert_eq!(selected.2, output.parse::<Decimal>().unwrap());
+                assert_eq!(selected.0 == original.0, output == "2");
+            }
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    async fn unchanged_legacy_tariff_allows_metadata_edits_but_not_repricing(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let headers = add_auth_headers(&admin);
+        let model = create_test_deployment(&pool, admin.id, "legacy", "legacy").await;
+        let id: uuid::Uuid = sqlx::query_scalar("INSERT INTO model_tariffs (deployed_model_id,name,input_price_per_token,output_price_per_token,valid_from) VALUES ($1,'legacy',1,2,NOW()-INTERVAL '1 day') RETURNING id")
+            .bind(model.id).fetch_one(&pool).await.unwrap();
+        let mut tariff = json!({"name":"legacy","api_key_purpose":null,"input_price_per_token":"1","output_price_per_token":"2"});
+        app.patch(&format!("/admin/api/v1/models/{}", model.id))
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"description":"metadata edit", "tariffs":[tariff]}))
+            .await
+            .assert_status_ok();
+        tariff["output_price_per_token"] = json!("3");
+        app.patch(&format!("/admin/api/v1/models/{}", model.id))
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"description":"must roll back", "tariffs":[tariff]}))
+            .await
+            .assert_status_bad_request();
+        let description: String = sqlx::query_scalar("SELECT description FROM deployed_models WHERE id=$1")
+            .bind(model.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(description, "metadata edit");
+        let rows: Vec<(uuid::Uuid, Decimal)> =
+            sqlx::query_as("SELECT id,output_price_per_token FROM model_tariffs WHERE deployed_model_id=$1 AND valid_until IS NULL")
+                .bind(model.id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, vec![(id, Decimal::from(2))]);
+        let billable: i64 = sqlx::query_scalar("SELECT count(*) FROM effective_model_tariff($1,$2,'realtime',NULL,'standard',NOW())")
+            .bind(model.id)
+            .bind(admin.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(billable, 0, "preserving legacy metadata must not make it billable");
+    }
+
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_deployed_model(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2047,7 +2962,7 @@ mod tests {
         assert_eq!(created_model.created_by, Some(admin_user.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_deployed_model_with_defaults(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2078,7 +2993,7 @@ mod tests {
         assert_eq!(created_model.created_by, Some(admin_user.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_deployed_model_non_admin_forbidden(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2101,7 +3016,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_deployed_model_nonexistent_endpoint(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2123,7 +3038,7 @@ mod tests {
         response.assert_status_not_found();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_include_groups_admin_only(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2194,7 +3109,7 @@ mod tests {
         assert!(test_model.groups.is_none(), "Regular user should NOT see groups included");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_accessible_parameter_filtering(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2287,7 +3202,7 @@ mod tests {
         assert!(get_model_by_id(deployment1.id, &admin_accessible).is_some());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_include_metrics_parameter(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2370,7 +3285,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_sees_all_models_by_default(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2439,7 +3354,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_can_request_accessible_filtering(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2503,7 +3418,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_request_viewer_role_gets_filtered(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2568,7 +3483,7 @@ mod tests {
         assert!(pm_models.data.iter().any(|m| m.id == deployment2.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_can_see_newly_created_models(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2615,7 +3530,7 @@ mod tests {
         assert_eq!(found_model.alias, "Platform Manager New Model");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_standard_user_cannot_see_ungrouped_models(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2656,7 +3571,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_request_viewer_cannot_modify_models(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2703,7 +3618,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_standard_user_cannot_modify_models(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2750,7 +3665,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_multi_role_user_cannot_modify_models_without_platform_manager(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2798,7 +3713,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_plus_standard_user_can_modify_models(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2847,7 +3762,7 @@ mod tests {
         response.assert_status_ok();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_accessibility_filtering_permissions(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2914,7 +3829,7 @@ mod tests {
         assert!(pm_models.data.iter().any(|m| m.id == inaccessible_deployment.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_groups_include_permission_enforcement(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2977,81 +3892,70 @@ mod tests {
         assert!(rv_model.groups.is_none(), "RequestViewer should NOT see groups even when requested");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn test_rate_limits_permission_gating(pool: PgPool) {
+    async fn test_realtime_inflight_limit_permission_gating(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager = create_test_admin_user(&pool, Role::PlatformManager).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
+        let auth = |user| add_auth_headers(user);
 
-        // Create a deployment with rate limits
-        let deployment = create_test_deployment(&pool, platform_manager.id, "rate-limit-test", "rate-limit-alias").await;
-
-        // Set rate limits on the deployment
-        let update = json!({
-            "requests_per_second": 100.0,
-            "burst_size": 200
-        });
+        let manager_auth = auth(&platform_manager);
         let response = app
-            .patch(&format!("/admin/api/v1/models/{}", deployment.id))
-            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
-            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
-            .json(&update)
+            .post("/admin/api/v1/models")
+            .add_header(&manager_auth[0].0, &manager_auth[0].1)
+            .add_header(&manager_auth[1].0, &manager_auth[1].1)
+            .json(&json!({
+                "type": "composite",
+                "model_name": "inflight-composite",
+                "alias": "inflight-composite",
+                "realtime_inflight_limit": 40
+            }))
+            .await;
+        response.assert_status_ok();
+        let created: DeployedModelResponse = response.json();
+        assert_eq!(created.realtime_inflight_limit, Some(40));
+
+        let response = app
+            .patch(&format!("/admin/api/v1/models/{}", created.id))
+            .add_header(&manager_auth[0].0, &manager_auth[0].1)
+            .add_header(&manager_auth[1].0, &manager_auth[1].1)
+            .json(&json!({ "realtime_inflight_limit": 60 }))
             .await;
         response.assert_status_ok();
 
-        // Create a group and add users to it so they can see the deployment
         let mut pool_conn = pool.acquire().await.unwrap();
         let mut group_repo = Groups::new(&mut pool_conn);
-        let group_create = GroupCreateDBRequest {
-            name: "Rate Limit Test Group".to_string(),
-            description: Some("Test group for rate limit permissions".to_string()),
-            created_by: platform_manager.id,
-        };
-        let group = group_repo.create(&group_create).await.unwrap();
+        let group = group_repo
+            .create(&GroupCreateDBRequest {
+                name: "In-flight Limit Test Group".to_string(),
+                description: None,
+                created_by: platform_manager.id,
+            })
+            .await
+            .unwrap();
         group_repo.add_user_to_group(standard_user.id, group.id).await.unwrap();
         group_repo.add_user_to_group(request_viewer.id, group.id).await.unwrap();
         group_repo
-            .add_deployment_to_group(deployment.id, group.id, platform_manager.id)
+            .add_deployment_to_group(created.id, group.id, platform_manager.id)
             .await
             .unwrap();
 
-        // PlatformManager should see rate limits (has ModelRateLimits::ReadAll)
-        let response = app
-            .get(&format!("/admin/api/v1/models/{}", deployment.id))
-            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
-            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
-            .await;
-        response.assert_status_ok();
-        let pm_model: DeployedModelResponse = response.json();
-        assert_eq!(pm_model.requests_per_second, Some(100.0), "PlatformManager should see rate limits");
-        assert_eq!(pm_model.burst_size, Some(200), "PlatformManager should see burst size");
-
-        // StandardUser should NOT see rate limits (masked)
-        let response = app
-            .get(&format!("/admin/api/v1/models/{}", deployment.id))
-            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
-            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
-            .await;
-        response.assert_status_ok();
-        let user_model: DeployedModelResponse = response.json();
-        assert_eq!(user_model.requests_per_second, None, "StandardUser should NOT see rate limits");
-        assert_eq!(user_model.burst_size, None, "StandardUser should NOT see burst size");
-
-        // RequestViewer should NOT see rate limits (masked)
-        let response = app
-            .get(&format!("/admin/api/v1/models/{}", deployment.id))
-            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
-            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
-            .await;
-        response.assert_status_ok();
-        let rv_model: DeployedModelResponse = response.json();
-        assert_eq!(rv_model.requests_per_second, None, "RequestViewer should NOT see rate limits");
-        assert_eq!(rv_model.burst_size, None, "RequestViewer should NOT see burst size");
+        for (user, expected) in [(&platform_manager, Some(60)), (&standard_user, None), (&request_viewer, None)] {
+            let headers = auth(user);
+            let response = app
+                .get(&format!("/admin/api/v1/models/{}", created.id))
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .await;
+            response.assert_status_ok();
+            let model: DeployedModelResponse = response.json();
+            assert_eq!(model.realtime_inflight_limit, expected);
+        }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_metrics_permission_gating(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3115,7 +4019,7 @@ mod tests {
         assert!(rv_model.metrics.is_some(), "RequestViewer should see metrics when requested");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_models_pagination(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3202,7 +4106,7 @@ mod tests {
         assert_eq!(empty_page.data.len(), 0, "Offset beyond available models should return empty array");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_models_with_group_filter(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3298,7 +4202,7 @@ mod tests {
         assert!(all_models.data.len() >= 3, "Empty group list should return all models");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_models_with_available_for_realtime_filter(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3366,7 +4270,7 @@ mod tests {
 
     // ===== Traffic Routing Rules Tests =====
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_model_with_traffic_rules(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3423,7 +4327,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_model_includes_traffic_rules(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3467,7 +4371,7 @@ mod tests {
         ));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_models_includes_traffic_rules(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3507,7 +4411,7 @@ mod tests {
         assert_eq!(rules[0].api_key_purpose, crate::db::models::api_keys::ApiKeyPurpose::Playground);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_model_set_traffic_rules(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3545,7 +4449,7 @@ mod tests {
         assert_eq!(fetched.traffic_routing_rules.unwrap().len(), 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_model_clear_traffic_rules(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3597,7 +4501,7 @@ mod tests {
         assert!(fetched.traffic_routing_rules.is_none());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_model_no_change_to_traffic_rules(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3639,7 +4543,7 @@ mod tests {
         assert_eq!(rules.len(), 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_model_self_redirect_rejected(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3664,7 +4568,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_model_nonexistent_redirect_target(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3689,7 +4593,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_model_empty_redirect_target(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3714,7 +4618,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_redirect_target_cascades(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3762,5 +4666,38 @@ mod tests {
             fetched.traffic_routing_rules.is_none(),
             "traffic rules should be cleared after cascade delete of redirect target"
         );
+    }
+    #[dwctl_test_macros::test]
+    async fn tariff_replacement_rejects_future_schedule_without_partial_updates(pool: PgPool) {
+        let (app, _services) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let model = create_test_deployment(&pool, admin.id, "scheduled", "scheduled").await;
+        sqlx::query("INSERT INTO model_tariffs (deployed_model_id,name,input_price_per_token,output_price_per_token,api_key_purpose,valid_from,valid_until) VALUES ($1,'current',1,1,'realtime',NOW()-INTERVAL '1 day',NOW()+INTERVAL '1 day'),($1,'future',2,2,'realtime',NOW()+INTERVAL '1 day',NULL)").bind(model.id).execute(&pool).await.unwrap();
+        let before: serde_json::Value = sqlx::query_scalar("SELECT jsonb_agg(to_jsonb(t) ORDER BY id) FROM model_tariffs t")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let headers = add_auth_headers(&admin);
+        let path = format!("/admin/api/v1/models/{}", model.id);
+        let response=app.patch(&path).add_header(&headers[0].0,&headers[0].1).add_header(&headers[1].0,&headers[1].1).json(&json!({"description":"rejected-change","tariffs":[{"name":"new","api_key_purpose":"realtime","input_price_per_token":"3","output_price_per_token":"3"}]})).await;
+        response.assert_status_bad_request();
+        assert!(response.text().contains("scheduled future prices"));
+        let after: serde_json::Value = sqlx::query_scalar("SELECT jsonb_agg(to_jsonb(t) ORDER BY id) FROM model_tariffs t")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(before, after);
+        let description: Option<String> = sqlx::query_scalar("SELECT description FROM deployed_models WHERE id=$1")
+            .bind(model.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_ne!(description.as_deref(), Some("rejected-change"));
+        app.patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"description":"metadata-only"}))
+            .await
+            .assert_status_ok();
     }
 }

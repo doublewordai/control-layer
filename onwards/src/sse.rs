@@ -5,38 +5,44 @@
 //! network packets. This buffer accumulates bytes until a complete SSE event
 //! (terminated by `\n\n`) is received before forwarding.
 
-use bytes::{Bytes, BytesMut};
-use futures_util::Stream;
+use std::error::Error;
+use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-/// Maximum buffer size per SSE stream (64KB).
-///
-/// This prevents memory exhaustion from malicious or buggy providers that
-/// send endless data without event delimiters. Typical SSE events are under
-/// 1KB, so 64KB provides ample headroom while capping worst-case memory at
-/// ~64MB for 1000 concurrent streams.
-const MAX_SSE_BUFFER_SIZE: usize = 64 * 1024;
+use bytes::{Bytes, BytesMut};
+use futures_util::Stream;
 
-/// A stream wrapper that buffers SSE events until they are complete.
+/// Default maximum pending bytes of an unfinished SSE event (64 KiB).
 ///
-/// SSE events are delimited by `\n\n`. This wrapper accumulates incoming
-/// bytes and only yields complete events, preventing consumers from
-/// receiving partial JSON data.
+/// Complete events are forwarded before this limit is checked. Increase via
+/// [`SseBufferedStream::with_limit`] for providers with large fragmented events.
+pub const DEFAULT_SSE_BUFFER_LIMIT: usize = 64 * 1024;
+
+/// Buffers SSE events until their `\n\n` delimiter arrives.
 ///
-/// The buffer is capped at [`MAX_SSE_BUFFER_SIZE`] bytes to prevent memory
-/// exhaustion from malicious or buggy upstream providers.
+/// The limit applies only to unfinished data, not the total response or a
+/// transport chunk containing many complete events. Exceeding it yields a body
+/// error and drops the upstream stream; it must never look like a clean EOF.
 pub struct SseBufferedStream<S> {
-    inner: S,
+    inner: Option<S>,
     buffer: BytesMut,
+    limit: usize,
 }
 
 impl<S> SseBufferedStream<S> {
-    /// Wrap an existing stream with SSE buffering.
+    /// Wrap a stream with the default unfinished-event limit.
     pub fn new(inner: S) -> Self {
+        Self::with_limit(inner, DEFAULT_SSE_BUFFER_LIMIT)
+    }
+
+    /// Wrap a stream with a limit on pending bytes of an unfinished event.
+    /// Zero permits no unfinished bytes; it does not disable the limit.
+    pub fn with_limit(inner: S, limit: usize) -> Self {
         Self {
-            inner,
+            inner: Some(inner),
             buffer: BytesMut::new(),
+            limit,
         }
     }
 }
@@ -44,53 +50,60 @@ impl<S> SseBufferedStream<S> {
 impl<S, E> Stream for SseBufferedStream<S>
 where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
+    E: Into<Box<dyn Error + Send + Sync>>,
 {
-    type Item = Result<Bytes, E>;
+    type Item = Result<Bytes, axum::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = &mut *self;
 
         loop {
-            // Check if buffer contains a complete event (ends with \n\n)
+            // Drain complete events before limiting the unfinished remainder.
+            // A network read may coalesce arbitrarily many valid events.
             if let Some(pos) = find_event_boundary(&this.buffer) {
-                // Extract the complete event(s) up to and including the \n\n
                 let complete = this.buffer.split_to(pos + 2);
                 return Poll::Ready(Some(Ok(complete.freeze())));
             }
 
-            // Need more data - poll the inner stream
-            match Pin::new(&mut this.inner).poll_next(cx) {
+            if this.buffer.len() > this.limit {
+                tracing::error!(
+                    buffered_bytes = this.buffer.len(),
+                    limit_bytes = this.limit,
+                    "Unfinished SSE event exceeded buffer limit"
+                );
+                this.buffer = BytesMut::new();
+                this.inner = None;
+                return Poll::Ready(Some(Err(axum::Error::new(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Unfinished SSE event exceeded buffer limit of {} bytes",
+                        this.limit
+                    ),
+                )))));
+            }
+
+            let Some(inner) = this.inner.as_mut() else {
+                return Poll::Ready(None);
+            };
+            match Pin::new(inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
                     this.buffer.extend_from_slice(&chunk);
-
-                    // Check buffer size limit to prevent memory exhaustion
-                    // If exceeded, log error and terminate stream by returning None
-                    if this.buffer.len() > MAX_SSE_BUFFER_SIZE {
-                        tracing::error!(
-                            "SSE buffer exceeded maximum size of {} bytes, terminating stream",
-                            MAX_SSE_BUFFER_SIZE
-                        );
-                        this.buffer.clear();
-                        return Poll::Ready(None);
-                    }
-
-                    // Loop back to check for complete events
                 }
                 Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Some(Err(e)));
+                    this.buffer = BytesMut::new();
+                    this.inner = None;
+                    return Poll::Ready(Some(Err(axum::Error::new(e))));
                 }
                 Poll::Ready(None) => {
-                    // Stream ended - flush any remaining data
+                    this.inner = None;
                     if this.buffer.is_empty() {
                         return Poll::Ready(None);
                     }
-                    // Return whatever is left (may be incomplete, but stream is done)
+                    // Preserve the existing EOF behavior for a partial final event.
                     let remaining = this.buffer.split().freeze();
                     return Poll::Ready(Some(Ok(remaining)));
                 }
-                Poll::Pending => {
-                    return Poll::Pending;
-                }
+                Poll::Pending => return Poll::Pending,
             }
         }
     }
@@ -106,6 +119,8 @@ mod tests {
     use super::*;
     use futures_util::StreamExt;
     use std::convert::Infallible;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Helper to create a stream from chunks
     fn chunks_to_stream(
@@ -253,9 +268,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_buffer_overflow_terminates_stream() {
-        // Create a chunk larger than MAX_SSE_BUFFER_SIZE without \n\n
-        let large_chunk = vec![b'x'; MAX_SSE_BUFFER_SIZE + 1];
+    async fn test_coalesced_events_above_buffer_limit_are_preserved() {
+        let event = b"data: small event\n\n";
+        let chunk = event.repeat(10_000);
+        let stream = SseBufferedStream::new(futures_util::stream::iter([Ok::<_, Infallible>(
+            Bytes::from(chunk.clone()),
+        )]));
+        let results: Vec<_> = stream.collect().await;
+        assert_eq!(results.len(), 10_000);
+        let forwarded: Vec<u8> = results.into_iter().flat_map(|r| r.unwrap()).collect();
+        assert_eq!(forwarded, chunk);
+    }
+
+    #[tokio::test]
+    async fn test_buffer_overflow_returns_error() {
+        // Create a chunk larger than DEFAULT_SSE_BUFFER_LIMIT without \n\n
+        let large_chunk = vec![b'x'; DEFAULT_SSE_BUFFER_LIMIT + 1];
         let chunks: Vec<&[u8]> = vec![&large_chunk];
         let stream = SseBufferedStream::new(futures_util::stream::iter(
             chunks
@@ -264,14 +292,21 @@ mod tests {
         ));
         let results: Vec<_> = stream.collect().await;
 
-        // Stream terminates immediately when buffer exceeded (returns None)
-        assert_eq!(results.len(), 0);
+        // The body must fail explicitly, never report a clean EOF.
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0]
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("buffer limit")
+        );
     }
 
     #[tokio::test]
     async fn test_buffer_at_limit_still_works() {
-        // Create a chunk exactly at MAX_SSE_BUFFER_SIZE with \n\n at the end
-        let mut chunk = vec![b'x'; MAX_SSE_BUFFER_SIZE - 2];
+        // Create a chunk exactly at DEFAULT_SSE_BUFFER_LIMIT with \n\n at the end
+        let mut chunk = vec![b'x'; DEFAULT_SSE_BUFFER_LIMIT - 2];
         chunk.extend_from_slice(b"\n\n");
         let chunks: Vec<&[u8]> = vec![&chunk];
         let stream = SseBufferedStream::new(futures_util::stream::iter(
@@ -283,6 +318,87 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert!(results[0].is_ok());
-        assert_eq!(results[0].as_ref().unwrap().len(), MAX_SSE_BUFFER_SIZE);
+        assert_eq!(results[0].as_ref().unwrap().len(), DEFAULT_SSE_BUFFER_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn test_configured_limit_allows_large_fragmented_tool_event() {
+        let event = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"function\":{{\"arguments\":\"{}\"}}}}]}}}}]}}\n\n",
+            "x".repeat(128 * 1024)
+        );
+        let chunks: Vec<_> = event
+            .as_bytes()
+            .chunks(16 * 1024)
+            .map(|chunk| Ok::<_, Infallible>(Bytes::copy_from_slice(chunk)))
+            .collect();
+        let mut stream =
+            SseBufferedStream::with_limit(futures_util::stream::iter(chunks), 256 * 1024);
+        assert_eq!(
+            stream.next().await.unwrap().unwrap().as_ref(),
+            event.as_bytes()
+        );
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_complete_events_forwarded_before_oversized_remainder_errors() {
+        let mut chunk = b"data: valid\n\n".to_vec();
+        chunk.extend_from_slice(&[b'x'; 33]);
+        let mut stream = SseBufferedStream::with_limit(
+            futures_util::stream::iter([
+                Ok::<_, Infallible>(Bytes::from(chunk)),
+                Ok(Bytes::from_static(b"\n\ndata: must not resume\n\n")),
+            ]),
+            32,
+        );
+        assert_eq!(stream.next().await.unwrap().unwrap(), "data: valid\n\n");
+        assert!(stream.next().await.unwrap().is_err());
+        assert!(stream.next().await.is_none());
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_overflow_drops_upstream_and_errors_http_body() {
+        struct Upstream(Arc<AtomicBool>);
+        impl Stream for Upstream {
+            type Item = Result<Bytes, Infallible>;
+            fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+                Poll::Ready(Some(Ok(Bytes::from_static(b"unterminated"))))
+            }
+        }
+        impl Drop for Upstream {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let stream = SseBufferedStream::with_limit(Upstream(dropped.clone()), 8);
+        let body = axum::body::Body::from_stream(stream);
+        let error = axum::body::to_bytes(body, usize::MAX).await.unwrap_err();
+        assert!(error.to_string().contains("buffer limit"));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_upstream_error_is_preserved_and_terminal() {
+        let mut stream = SseBufferedStream::new(futures_util::stream::iter([
+            Ok(Bytes::from_static(b"data: unfinished")),
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "upstream reset",
+            )),
+            Ok(Bytes::from_static(b"must not resume\n\n")),
+        ]));
+        assert!(
+            stream
+                .next()
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("upstream reset")
+        );
+        assert!(stream.next().await.is_none());
     }
 }

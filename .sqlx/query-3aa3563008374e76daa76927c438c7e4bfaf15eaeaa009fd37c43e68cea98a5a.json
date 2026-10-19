@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE user_balance_checkpoints c\n            SET balance = (\n                SELECT COALESCE(SUM(CASE WHEN transaction_type IN ('admin_grant', 'purchase') THEN amount ELSE -amount END), 0)\n                FROM credits_transactions\n                WHERE user_id = $1\n            )\n            WHERE c.user_id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3aa3563008374e76daa76927c438c7e4bfaf15eaeaa009fd37c43e68cea98a5a"
+}

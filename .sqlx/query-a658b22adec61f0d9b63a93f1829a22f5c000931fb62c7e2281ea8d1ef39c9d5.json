@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO fusillade.request_templates (id, endpoint, method, path, model, api_key, body)\n             VALUES ($1,'http://x','POST','/messages','m','k',$2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a658b22adec61f0d9b63a93f1829a22f5c000931fb62c7e2281ea8d1ef39c9d5"
+}

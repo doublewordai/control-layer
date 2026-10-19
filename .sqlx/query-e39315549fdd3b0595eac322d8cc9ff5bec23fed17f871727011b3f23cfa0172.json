@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT dm.alias, t.input_price_per_token as \"input_price_per_token!\", t.output_price_per_token as \"output_price_per_token!\"\n        FROM deployed_models dm\n        CROSS JOIN LATERAL (\n            SELECT choices.input_price_per_token, choices.output_price_per_token FROM (\n                SELECT user_id, serving_class, input_price_per_token, output_price_per_token\n                FROM effective_model_display_tariff(dm.id, $1, 'realtime', NULL, NOW())\n                UNION SELECT user_id, serving_class, input_price_per_token, output_price_per_token\n                FROM effective_model_tariff(dm.id, $1, 'realtime', NULL, 'standard', NOW())\n            ) choices\n            ORDER BY CASE WHEN choices.user_id = $1 AND choices.serving_class IS NULL THEN 0\n                          WHEN choices.user_id = $1 THEN 1 ELSE 2 END\n            LIMIT 1\n        ) t\n        WHERE dm.alias = ANY($2)\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "input_price_per_token!",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 2,
+        "name": "output_price_per_token!",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "e39315549fdd3b0595eac322d8cc9ff5bec23fed17f871727011b3f23cfa0172"
+}

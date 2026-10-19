@@ -254,6 +254,18 @@ impl PaymentProvider for DummyProvider {
         })
     }
 
+    async fn accrue_invoice_item(
+        &self,
+        _amount_cents: i64,
+        customer_id: &str,
+        _description: &str,
+        idempotency_key: &str,
+    ) -> Result<String> {
+        // Deterministic from the idempotency key, so a retry of the same top-up
+        // returns the same line item, as Stripe's idempotency would.
+        Ok(format!("dummy_ii_{customer_id}_{idempotency_key}"))
+    }
+
     async fn charge_auto_topup(
         &self,
         _amount_cents: i64,
@@ -350,7 +362,7 @@ mod tests {
         assert_eq!(provider.config.amount, Decimal::new(100, 0));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_dummy_full_payment_flow(pool: PgPool) {
         let config = crate::config::DummyConfig {
             amount: Decimal::new(5000, 2), // $50.00
@@ -414,7 +426,7 @@ mod tests {
         assert_eq!(transaction.description, Some("Dummy payment (test)".to_string()));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_dummy_idempotency(pool: PgPool) {
         let config = crate::config::DummyConfig {
             amount: Decimal::new(100, 0),

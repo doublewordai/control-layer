@@ -1,14 +1,15 @@
 //! Database repository for model deployments.
 
 use crate::api::models::deployments::{ModelSortField, SortDirection};
+use crate::db::handlers::model_provisioning::classes::{lock_model_names, validate_model_name};
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::db::{
     errors::{DbError, Result},
     handlers::repository::Repository,
     models::deployments::{
-        DeploymentComponentCreateDBRequest, DeploymentComponentDBResponse, DeploymentCreateDBRequest, DeploymentDBResponse,
-        DeploymentUpdateDBRequest, LoadBalancingStrategy, ModelStatus, ModelType, ProviderPricing, ProviderPricingFields,
-        TrafficRuleAction, TrafficRuleDBRow,
+        AffinityConfig, AimdConfig, DEFAULT_COMPONENT_POOL, DeploymentComponentCreateDBRequest, DeploymentComponentDBResponse,
+        DeploymentCreateDBRequest, DeploymentDBResponse, DeploymentUpdateDBRequest, LoadBalancingStrategy, ModelStatus, ModelType,
+        ProviderPricing, ProviderPricingFields, TrafficRuleAction, TrafficRuleDBRow,
     },
 };
 use crate::reasoning::{ModelReasoningPolicy, resolve_reasoning_translation};
@@ -16,7 +17,8 @@ use crate::types::{DeploymentId, InferenceEndpointId, UserId, abbrev_uuid};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgConnection, Row, query_builder::QueryBuilder};
+use sqlx::types::Json;
+use sqlx::{Connection, FromRow, PgConnection, Row, query_builder::QueryBuilder};
 use std::collections::HashMap;
 use tracing::instrument;
 
@@ -40,12 +42,13 @@ pub struct DeploymentFilter {
     pub accessible_to: Option<UserId>, // None = show all deployments, Some(user_id) = show only deployments accessible to that user
     pub group_ids: Option<Vec<crate::types::GroupId>>, // None = show all, Some(group_ids) = show only models in any of these groups
     pub aliases: Option<Vec<String>>,
-    pub search: Option<String>,                // Case-insensitive substring search on alias and model_name
-    pub is_composite: Option<bool>,            // None = show all, Some(true) = composite only, Some(false) = non-composite only
-    pub provider: Option<String>,              // Filter by metadata provider (case-insensitive exact match)
-    pub model_type: Option<ModelType>,         // Filter by model type column
-    pub capability: Option<String>,            // Filter to models that have this capability
-    pub available_for_realtime: Option<bool>,  // Filter by whether realtime traffic is denied
+    pub search: Option<String>,               // Case-insensitive substring search
+    pub is_composite: Option<bool>,           // None = show all, Some(true) = composite only, Some(false) = non-composite only
+    pub provider: Option<String>,             // Filter by metadata provider (case-insensitive exact match)
+    pub model_type: Option<ModelType>,        // Filter by model type column
+    pub capability: Option<String>,           // Filter to models that have this capability
+    pub available_for_realtime: Option<bool>, // Filter by whether realtime traffic is denied
+    pub pricing_account: Option<UserId>,
     pub sort_field: Option<ModelSortField>,    // Sort field (default: created_at)
     pub sort_direction: Option<SortDirection>, // Sort direction (default depends on field)
 }
@@ -67,8 +70,9 @@ impl DeploymentFilter {
             model_type: None,             // Default: no type filter
             capability: None,             // Default: no capability filter
             available_for_realtime: None, // Default: no realtime availability filter
-            sort_field: None,             // Default: created_at
-            sort_direction: None,         // Default: depends on field
+            pricing_account: None,
+            sort_field: None,     // Default: created_at
+            sort_direction: None, // Default: depends on field
         }
     }
 
@@ -165,9 +169,7 @@ struct DeployedModel {
     pub deleted: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    pub requests_per_second: Option<f32>,
-    pub burst_size: Option<i32>,
-    pub capacity: Option<i32>,
+    pub realtime_inflight_limit: i32,
     pub batch_capacity: Option<i32>,
     pub throughput: Option<f32>,
     // Provider pricing (flexible)
@@ -182,6 +184,7 @@ struct DeployedModel {
     pub fallback_enabled: Option<bool>,
     pub fallback_on_rate_limit: Option<bool>,
     pub fallback_on_status: Option<Vec<i32>>,
+    pub fallback_realtime_on_status: Vec<i32>,
     pub fallback_with_replacement: Option<bool>,
     pub fallback_max_attempts: Option<i32>,
     pub backoff_enabled: bool,
@@ -190,14 +193,19 @@ struct DeployedModel {
     pub backoff_factor: f64,
     pub backoff_jitter: String,
     pub backoff_max_total_ms: Option<i32>,
+    pub first_token_timeout_ms: Option<i64>,
+    pub aimd: Option<Json<AimdConfig>>,
+    pub affinity: Option<Json<AffinityConfig>>,
     pub sanitize_responses: bool,
     pub trusted: bool,
-    pub open_responses_adapter: Option<bool>,
     pub reasoning_translation_overrides: Option<serde_json::Value>,
     // Traffic routing
     pub allowed_batch_completion_windows: Option<Vec<String>>,
     // Catalog metadata
     pub metadata: serde_json::Value,
+    pub provisioning_source: Option<String>,
+    /// Serving classes this model offers, keyed by class name, each a preset of targets.
+    pub serving_classes: serde_json::Value,
 }
 
 pub struct Deployments<'c> {
@@ -236,9 +244,7 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             deleted: m.deleted,
             created_at: m.created_at,
             updated_at: m.updated_at,
-            requests_per_second: m.requests_per_second,
-            burst_size: m.burst_size,
-            capacity: m.capacity,
+            realtime_inflight_limit: m.realtime_inflight_limit,
             batch_capacity: m.batch_capacity,
             throughput: m.throughput,
             provider_pricing,
@@ -248,6 +254,7 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             fallback_enabled: m.fallback_enabled.unwrap_or(true),
             fallback_on_rate_limit: m.fallback_on_rate_limit.unwrap_or(true),
             fallback_on_status: m.fallback_on_status.unwrap_or_else(|| vec![429, 499, 500, 502, 503, 504]),
+            fallback_realtime_on_status: m.fallback_realtime_on_status,
             fallback_with_replacement: m.fallback_with_replacement.unwrap_or(false),
             fallback_max_attempts: m.fallback_max_attempts,
             backoff_enabled: m.backoff_enabled,
@@ -256,9 +263,11 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             backoff_factor: m.backoff_factor,
             backoff_jitter: m.backoff_jitter,
             backoff_max_total_ms: m.backoff_max_total_ms,
+            first_token_timeout_ms: m.first_token_timeout_ms,
+            aimd: m.aimd.map(|v| v.0),
+            affinity: m.affinity.map(|v| v.0),
             sanitize_responses: m.sanitize_responses,
             trusted: m.trusted,
-            open_responses_adapter: m.open_responses_adapter.unwrap_or(true),
             reasoning_translation_overrides: m.reasoning_translation_overrides.and_then(|value| {
                 serde_json::from_value(value)
                     .inspect_err(|error| tracing::warn!(%error, "failed to deserialize reasoning translation overrides"))
@@ -266,6 +275,8 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             }),
             allowed_batch_completion_windows: m.allowed_batch_completion_windows,
             metadata: m.metadata,
+            provisioning_source: m.provisioning_source,
+            serving_classes: m.serving_classes,
         }
     }
 }
@@ -278,8 +289,11 @@ impl<'c> Repository for Deployments<'c> {
     type Id = DeploymentId;
     type Filter = DeploymentFilter;
 
-    #[instrument(skip(self, request), fields(model_name = %request.model_name, alias = %request.alias), err)]
+    #[instrument(level = "debug", skip(self, request), fields(model_name = %request.model_name, alias = %request.alias), err)]
     async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
+        let mut tx = self.db.begin().await?;
+        lock_model_names(&mut tx).await?;
+        validate_model_name(&mut tx, None, request.alias.trim()).await?;
         let created_at = Utc::now();
         let updated_at = created_at;
 
@@ -310,66 +324,89 @@ impl<'c> Repository for Deployments<'c> {
             .transpose()
             .map_err(anyhow::Error::from)?;
 
-        let model = sqlx::query_as!(
-            DeployedModel,
+        let model = sqlx::query_as::<_, DeployedModel>(
             r#"
             INSERT INTO deployed_models (
                 model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, created_at, updated_at,
-                requests_per_second, burst_size, capacity, batch_capacity, throughput,
+                batch_capacity, throughput,
                 downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token,
                 downstream_hourly_rate, downstream_input_token_cost_ratio,
                 is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status,
                 fallback_with_replacement, fallback_max_attempts,
-                sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows,
+                sanitize_responses, trusted, allowed_batch_completion_windows,
                 metadata,
                 backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms,
-                reasoning_translation_overrides
+                reasoning_translation_overrides, first_token_timeout_ms, aimd, fallback_realtime_on_status, affinity
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39)
-            RETURNING *
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, COALESCE($38, '{}'), $39)
+            RETURNING id, model_name, alias, display_name, description,
+                type, capabilities, created_by, hosted_on, status,
+                last_sync, deleted, created_at, updated_at, realtime_inflight_limit,
+                batch_capacity, throughput, downstream_pricing_mode,
+                downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite,
+                lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_realtime_on_status, fallback_with_replacement,
+                fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor,
+                backoff_jitter, backoff_max_total_ms, first_token_timeout_ms, aimd, affinity, sanitize_responses, trusted, reasoning_translation_overrides,
+                allowed_batch_completion_windows, metadata, provisioning_source, serving_classes
             "#,
-            request.model_name.trim(),
-            request.alias.trim(),
-            request.display_name.as_deref(),
-            request.description,
-            model_type_str,
-            request.capabilities.as_ref().map(|caps| caps.as_slice()),
-            request.created_by,
-            request.hosted_on,
-            created_at,
-            updated_at,
-            request.requests_per_second,
-            request.burst_size,
-            request.capacity,
-            request.batch_capacity,
-            request.throughput,
-            pricing_fields.mode,
-            pricing_fields.input_price_per_token,
-            pricing_fields.output_price_per_token,
-            pricing_fields.hourly_rate,
-            pricing_fields.input_token_cost_ratio,
-            request.is_composite,
-            lb_strategy_str,
-            request.fallback_enabled,
-            request.fallback_on_rate_limit,
-            request.fallback_on_status.as_ref().map(|s| s.as_slice()),
-            request.fallback_with_replacement,
-            request.fallback_max_attempts,
-            request.sanitize_responses,
-            request.trusted,
-            Some(request.open_responses_adapter),
-            request.allowed_batch_completion_windows.as_ref().map(|w| w.as_slice()),
-            request.metadata.as_ref().map(|m| serde_json::to_value(m).unwrap_or_else(|_| serde_json::json!({}))).unwrap_or_else(|| serde_json::json!({})) as serde_json::Value,
-            request.backoff_enabled,                  // $33
-            request.backoff_initial_ms,               // $34
-            request.backoff_max_ms,                   // $35
-            request.backoff_factor,                   // $36
-            request.backoff_jitter.as_str(),          // $37
-            request.backoff_max_total_ms,             // $38
-            reasoning_translation_overrides,          // $39
         )
-        .fetch_one(&mut *self.db)
+        .bind(request.model_name.trim())
+        .bind(request.alias.trim())
+        .bind(request.display_name.as_deref())
+        .bind(request.description.as_deref())
+        .bind(model_type_str)
+        .bind(request.capabilities.as_deref())
+        .bind(request.created_by)
+        .bind(request.hosted_on)
+        .bind(created_at)
+        .bind(updated_at)
+        .bind(request.batch_capacity)
+        .bind(request.throughput)
+        .bind(pricing_fields.mode)
+        .bind(pricing_fields.input_price_per_token)
+        .bind(pricing_fields.output_price_per_token)
+        .bind(pricing_fields.hourly_rate)
+        .bind(pricing_fields.input_token_cost_ratio)
+        .bind(request.is_composite)
+        .bind(lb_strategy_str)
+        .bind(request.fallback_enabled)
+        .bind(request.fallback_on_rate_limit)
+        .bind(request.fallback_on_status.as_deref())
+        .bind(request.fallback_with_replacement)
+        .bind(request.fallback_max_attempts)
+        .bind(request.sanitize_responses)
+        .bind(request.trusted)
+        .bind(request.allowed_batch_completion_windows.as_deref())
+        .bind(
+            request
+                .metadata
+                .as_ref()
+                .map(|metadata| serde_json::to_value(metadata).unwrap_or_else(|_| serde_json::json!({})))
+                .unwrap_or_else(|| serde_json::json!({})),
+        )
+        .bind(request.backoff_enabled)
+        .bind(request.backoff_initial_ms)
+        .bind(request.backoff_max_ms)
+        .bind(request.backoff_factor)
+        .bind(request.backoff_jitter.as_str())
+        .bind(request.backoff_max_total_ms)
+        .bind(reasoning_translation_overrides)
+        .bind(request.first_token_timeout_ms)
+        .bind(request.aimd.as_ref().map(Json))
+        .bind(request.fallback_realtime_on_status.as_deref())
+        .bind(request.affinity.as_ref().map(Json))
+        .fetch_one(&mut *tx)
         .await?;
+
+        let mut model = model;
+        if let Some(limit) = request.realtime_inflight_limit {
+            sqlx::query("UPDATE deployed_models SET realtime_inflight_limit = $1 WHERE id = $2")
+                .bind(limit)
+                .bind(model.id)
+                .execute(&mut *tx)
+                .await?;
+            model.realtime_inflight_limit = limit;
+        }
 
         let model_type = model.r#type.as_ref().and_then(|s| match s.as_str() {
             "CHAT" => Some(ModelType::Chat),
@@ -378,16 +415,16 @@ impl<'c> Repository for Deployments<'c> {
             _ => None,
         });
 
+        tx.commit().await?;
         Ok(DeploymentDBResponse::from((model_type, model)))
     }
 
-    #[instrument(skip(self), fields(deployment_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(deployment_id = %abbrev_uuid(&id)), err)]
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
-        let model = sqlx::query_as!(
-            DeployedModel,
-            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows, metadata, reasoning_translation_overrides FROM deployed_models WHERE id = $1",
-            id
+        let model = sqlx::query_as::<_, DeployedModel>(
+            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, realtime_inflight_limit, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_realtime_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, first_token_timeout_ms, aimd, affinity, sanitize_responses, trusted, allowed_batch_completion_windows, metadata, reasoning_translation_overrides, provisioning_source, serving_classes FROM deployed_models WHERE id = $1",
         )
+            .bind(id)
             .fetch_optional(&mut *self.db)
             .await?;
 
@@ -395,6 +432,7 @@ impl<'c> Repository for Deployments<'c> {
             m.r#type.as_ref().and_then(|s| match s.as_str() {
                 "CHAT" => Some(ModelType::Chat),
                 "EMBEDDINGS" => Some(ModelType::Embeddings),
+                "RERANKER" => Some(ModelType::Reranker),
                 _ => None,
             })
         });
@@ -402,17 +440,16 @@ impl<'c> Repository for Deployments<'c> {
         Ok(model.map(|m| DeploymentDBResponse::from((model_type, m))))
     }
 
-    #[instrument(skip(self, ids), fields(count = ids.len()), err)]
+    #[instrument(level = "debug", skip(self, ids), fields(count = ids.len()), err)]
     async fn get_bulk(&mut self, ids: Vec<Self::Id>) -> Result<std::collections::HashMap<Self::Id, DeploymentDBResponse>> {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
 
-        let deployments = sqlx::query_as!(
-            DeployedModel,
-            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows, metadata, reasoning_translation_overrides FROM deployed_models WHERE id = ANY($1)",
-            ids.as_slice()
+        let deployments = sqlx::query_as::<_, DeployedModel>(
+            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, realtime_inflight_limit, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_realtime_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, first_token_timeout_ms, aimd, affinity, sanitize_responses, trusted, allowed_batch_completion_windows, metadata, reasoning_translation_overrides, provisioning_source, serving_classes FROM deployed_models WHERE id = ANY($1)",
         )
+            .bind(ids.as_slice())
             .fetch_all(&mut *self.db)
             .await?;
 
@@ -422,6 +459,7 @@ impl<'c> Repository for Deployments<'c> {
             let model_type = deployment.r#type.as_ref().and_then(|s| match s.as_str() {
                 "CHAT" => Some(ModelType::Chat),
                 "EMBEDDINGS" => Some(ModelType::Embeddings),
+                "RERANKER" => Some(ModelType::Reranker),
                 _ => None,
             });
             result.insert(deployment.id, DeploymentDBResponse::from((model_type, deployment)));
@@ -430,7 +468,7 @@ impl<'c> Repository for Deployments<'c> {
         Ok(result)
     }
 
-    #[instrument(skip(self), fields(deployment_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(deployment_id = %abbrev_uuid(&id)), err)]
     async fn delete(&mut self, id: Self::Id) -> Result<bool> {
         let result = sqlx::query!("DELETE FROM deployed_models WHERE id = $1", id)
             .execute(&mut *self.db)
@@ -439,8 +477,13 @@ impl<'c> Repository for Deployments<'c> {
         Ok(result.rows_affected() > 0)
     }
 
-    #[instrument(skip(self, request), fields(deployment_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self, request), fields(deployment_id = %abbrev_uuid(&id)), err)]
     async fn update(&mut self, id: Self::Id, request: &Self::UpdateRequest) -> Result<Self::Response> {
+        let mut tx = self.db.begin().await?;
+        if let Some(alias) = &request.alias {
+            lock_model_names(&mut tx).await?;
+            validate_model_name(&mut tx, Some(id), alias.trim()).await?;
+        }
         if let Some(model_name) = &request.model_name
             && model_name.trim().is_empty()
         {
@@ -480,16 +523,7 @@ impl<'c> Repository for Deployments<'c> {
             .transpose()
             .map_err(anyhow::Error::from)?;
 
-        // Info logging for rate limiting
-        tracing::info!(
-            "Updating deployment {} - requests_per_second: {:?}, burst_size: {:?}",
-            id,
-            request.requests_per_second,
-            request.burst_size
-        );
-
-        let model = sqlx::query_as!(
-            DeployedModel,
+        let model = sqlx::query_as::<_, DeployedModel>(
             r#"
         UPDATE deployed_models SET
             model_name   = COALESCE($2, model_name),
@@ -518,176 +552,165 @@ impl<'c> Repository for Deployments<'c> {
             END,
             deleted    = COALESCE($13, deleted),
 
-            -- Three-state update for rate limiting
-            requests_per_second = CASE
-                WHEN $14 THEN $15
-                ELSE requests_per_second
-            END,
-            burst_size = CASE
-                WHEN $16 THEN $17
-                ELSE burst_size
-            END,
-
-            -- Three-state update for capacity
-            capacity = CASE
-                WHEN $18 THEN $19
-                ELSE capacity
-            END,
+            realtime_inflight_limit = COALESCE($14, realtime_inflight_limit),
             batch_capacity = CASE
-                WHEN $20 THEN $21
+                WHEN $15 THEN $16
                 ELSE batch_capacity
             END,
 
             -- Three-state update for throughput
             throughput = CASE
-                WHEN $37 THEN $38
+                WHEN $32 THEN $33
                 ELSE throughput
             END,
 
             -- Individual field updates for provider/downstream pricing
             downstream_pricing_mode = CASE
-                WHEN $22 THEN $23
+                WHEN $17 THEN $18
                 ELSE downstream_pricing_mode
             END,
             downstream_input_price_per_token = CASE
-                WHEN $24 THEN $25
+                WHEN $19 THEN $20
                 ELSE downstream_input_price_per_token
             END,
             downstream_output_price_per_token = CASE
-                WHEN $26 THEN $27
+                WHEN $21 THEN $22
                 ELSE downstream_output_price_per_token
             END,
             downstream_hourly_rate = CASE
-                WHEN $28 THEN $29
+                WHEN $23 THEN $24
                 ELSE downstream_hourly_rate
             END,
             downstream_input_token_cost_ratio = CASE
-                WHEN $30 THEN $31
+                WHEN $25 THEN $26
                 ELSE downstream_input_token_cost_ratio
             END,
 
             -- Composite model fields
-            lb_strategy = COALESCE($32, lb_strategy),
-            fallback_enabled = COALESCE($33, fallback_enabled),
-            fallback_on_rate_limit = COALESCE($34, fallback_on_rate_limit),
-            fallback_on_status = COALESCE($35, fallback_on_status),
-            sanitize_responses = COALESCE($36, sanitize_responses),
-            fallback_with_replacement = COALESCE($39, fallback_with_replacement),
+            lb_strategy = COALESCE($27, lb_strategy),
+            fallback_enabled = COALESCE($28, fallback_enabled),
+            fallback_on_rate_limit = COALESCE($29, fallback_on_rate_limit),
+            fallback_on_status = COALESCE($30, fallback_on_status),
+            sanitize_responses = COALESCE($31, sanitize_responses),
+            fallback_with_replacement = COALESCE($34, fallback_with_replacement),
             fallback_max_attempts = CASE
-                WHEN $40 THEN $41
+                WHEN $35 THEN $36
                 ELSE fallback_max_attempts
             END,
-            trusted = COALESCE($42, trusted),
-            open_responses_adapter = COALESCE($43, open_responses_adapter),
+            trusted = COALESCE($37, trusted),
 
             -- Batch completion windows
             allowed_batch_completion_windows = CASE
-                WHEN $44 THEN $45
+                WHEN $38 THEN $39
                 ELSE allowed_batch_completion_windows
             END,
 
             -- Catalog metadata
             metadata = CASE
-                WHEN $46 THEN $47
+                WHEN $40 THEN $41
                 ELSE metadata
             END,
 
-            display_name = COALESCE($48, display_name),
+            display_name = COALESCE($42, display_name),
 
             -- Inter-attempt backoff
-            backoff_enabled = COALESCE($49, backoff_enabled),
-            backoff_initial_ms = COALESCE($50, backoff_initial_ms),
-            backoff_max_ms = COALESCE($51, backoff_max_ms),
-            backoff_factor = COALESCE($52, backoff_factor),
-            backoff_jitter = COALESCE($53, backoff_jitter),
+            backoff_enabled = COALESCE($43, backoff_enabled),
+            backoff_initial_ms = COALESCE($44, backoff_initial_ms),
+            backoff_max_ms = COALESCE($45, backoff_max_ms),
+            backoff_factor = COALESCE($46, backoff_factor),
+            backoff_jitter = COALESCE($47, backoff_jitter),
             backoff_max_total_ms = CASE
-                WHEN $54 THEN $55
+                WHEN $48 THEN $49
                 ELSE backoff_max_total_ms
             END,
 
             reasoning_translation_overrides = CASE
-                WHEN $56 THEN $57
+                WHEN $50 THEN $51
                 ELSE reasoning_translation_overrides
             END,
 
+            first_token_timeout_ms = CASE WHEN $52 THEN $53 ELSE first_token_timeout_ms END,
+            aimd = CASE WHEN $54 THEN $55 ELSE aimd END,
+            fallback_realtime_on_status = COALESCE($56, fallback_realtime_on_status),
+            affinity = CASE WHEN $57 THEN $58 ELSE affinity END,
             updated_at = NOW()
         WHERE id = $1
-        RETURNING *
+        RETURNING id, model_name, alias, display_name, description,
+                type, capabilities, created_by, hosted_on, status,
+                last_sync, deleted, created_at, updated_at, realtime_inflight_limit,
+                batch_capacity, throughput, downstream_pricing_mode,
+                downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite,
+                lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_realtime_on_status, fallback_with_replacement,
+                fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor,
+                backoff_jitter, backoff_max_total_ms, first_token_timeout_ms, aimd, affinity, sanitize_responses, trusted, reasoning_translation_overrides,
+                allowed_batch_completion_windows, metadata, provisioning_source, serving_classes
         "#,
-            id,                                            // $1
-            request.model_name.as_ref().map(|s| s.trim()), // $2
-            request.alias.as_ref().map(|s| s.trim()),      // $3
-            // For description
-            request.description.is_some() as bool,                         // $4
-            request.description.as_ref().and_then(|inner| inner.as_ref()), // $5
-            // For model_type
-            request.model_type.is_some() as bool, // $6
-            model_type_str,                       // $7
-            // For capabilities
-            request.capabilities.is_some() as bool, // $8
-            capabilities_slice,                     // $9
-            status_str.as_deref(),                  // $10
-            // For last_sync
-            request.last_sync.is_some() as bool,                         // $11
-            request.last_sync.as_ref().and_then(|inner| inner.as_ref()), // $12
-            request.deleted,                                             // $13
-            // For rate limiting
-            request.requests_per_second.is_some() as bool,                         // $14
-            request.requests_per_second.as_ref().and_then(|inner| inner.as_ref()), // $15
-            request.burst_size.is_some() as bool,                                  // $16
-            request.burst_size.as_ref().and_then(|inner| inner.as_ref()),          // $17
-            // For capacity
-            request.capacity.is_some() as bool,                               // $18
-            request.capacity.as_ref().and_then(|inner| inner.as_ref()),       // $19
-            request.batch_capacity.is_some() as bool,                         // $20
-            request.batch_capacity.as_ref().and_then(|inner| inner.as_ref()), // $21
-            // For individual provider/downstream pricing fields
-            pricing_params.should_update_mode,   // $22
-            pricing_params.mode.as_deref(),      // $23
-            pricing_params.should_update_input,  // $24
-            pricing_params.input,                // $25
-            pricing_params.should_update_output, // $26
-            pricing_params.output,               // $27
-            pricing_params.should_update_hourly, // $28
-            pricing_params.hourly,               // $29
-            pricing_params.should_update_ratio,  // $30
-            pricing_params.ratio,                // $31
-            // For composite model fields
-            lb_strategy_str,                                                         // $32
-            request.fallback_enabled,                                                // $33
-            request.fallback_on_rate_limit,                                          // $34
-            request.fallback_on_status.as_ref().map(|s| s.as_slice()),               // $35
-            request.sanitize_responses,                                              // $36
-            request.throughput.is_some() as bool,                                    // $37
-            request.throughput.as_ref().and_then(|inner| inner.as_ref()),            // $38
-            request.fallback_with_replacement,                                       // $39
-            request.fallback_max_attempts.is_some() as bool,                         // $40
-            request.fallback_max_attempts.as_ref().and_then(|inner| inner.as_ref()), // $41
-            request.trusted,                                                         // $42
-            request.open_responses_adapter,                                          // $43
-            // Batch completion windows
-            request.allowed_batch_completion_windows.is_some() as bool, // $44
-            request.allowed_batch_completion_windows.as_ref().and_then(|inner| inner.as_deref()) as Option<&[String]>, // $45
-            // Catalog metadata
-            request.metadata.is_some() as bool, // $46
+        )
+        .bind(id)
+        .bind(request.model_name.as_deref().map(str::trim))
+        .bind(request.alias.as_deref().map(str::trim))
+        .bind(request.description.is_some())
+        .bind(request.description.as_ref().and_then(Option::as_deref))
+        .bind(request.model_type.is_some())
+        .bind(model_type_str)
+        .bind(request.capabilities.is_some())
+        .bind(capabilities_slice)
+        .bind(status_str.as_deref())
+        .bind(request.last_sync.is_some())
+        .bind(request.last_sync.as_ref().and_then(Option::as_ref))
+        .bind(request.deleted)
+        .bind(request.realtime_inflight_limit)
+        .bind(request.batch_capacity.is_some())
+        .bind(request.batch_capacity.as_ref().and_then(Option::as_ref))
+        .bind(pricing_params.should_update_mode)
+        .bind(pricing_params.mode.as_deref())
+        .bind(pricing_params.should_update_input)
+        .bind(pricing_params.input)
+        .bind(pricing_params.should_update_output)
+        .bind(pricing_params.output)
+        .bind(pricing_params.should_update_hourly)
+        .bind(pricing_params.hourly)
+        .bind(pricing_params.should_update_ratio)
+        .bind(pricing_params.ratio)
+        .bind(lb_strategy_str)
+        .bind(request.fallback_enabled)
+        .bind(request.fallback_on_rate_limit)
+        .bind(request.fallback_on_status.as_deref())
+        .bind(request.sanitize_responses)
+        .bind(request.throughput.is_some())
+        .bind(request.throughput.as_ref().and_then(Option::as_ref))
+        .bind(request.fallback_with_replacement)
+        .bind(request.fallback_max_attempts.is_some())
+        .bind(request.fallback_max_attempts.as_ref().and_then(Option::as_ref))
+        .bind(request.trusted)
+        .bind(request.allowed_batch_completion_windows.is_some())
+        .bind(request.allowed_batch_completion_windows.as_ref().and_then(Option::as_deref))
+        .bind(request.metadata.is_some())
+        .bind(
             request
                 .metadata
                 .as_ref()
-                .map(|m| serde_json::to_value(m).unwrap_or_else(|_| serde_json::json!({})))
-                .unwrap_or_else(|| serde_json::json!({})) as serde_json::Value, // $47
-            request.display_name.as_deref(),    // $48
-            // Inter-attempt backoff
-            request.backoff_enabled,                                                // $49
-            request.backoff_initial_ms,                                             // $50
-            request.backoff_max_ms,                                                 // $51
-            request.backoff_factor,                                                 // $52
-            request.backoff_jitter.as_deref(),                                      // $53
-            request.backoff_max_total_ms.is_some() as bool,                         // $54
-            request.backoff_max_total_ms.as_ref().and_then(|inner| inner.as_ref()), // $55
-            request.reasoning_translation_overrides.is_some(),                      // $56
-            reasoning_translation_overrides,                                        // $57
+                .map(|metadata| serde_json::to_value(metadata).unwrap_or_else(|_| serde_json::json!({})))
+                .unwrap_or_else(|| serde_json::json!({})),
         )
-        .fetch_one(&mut *self.db)
+        .bind(request.display_name.as_deref())
+        .bind(request.backoff_enabled)
+        .bind(request.backoff_initial_ms)
+        .bind(request.backoff_max_ms)
+        .bind(request.backoff_factor)
+        .bind(request.backoff_jitter.as_deref())
+        .bind(request.backoff_max_total_ms.is_some())
+        .bind(request.backoff_max_total_ms.as_ref().and_then(Option::as_ref))
+        .bind(request.reasoning_translation_overrides.is_some())
+        .bind(reasoning_translation_overrides)
+        .bind(request.first_token_timeout_ms.is_some())
+        .bind(request.first_token_timeout_ms.flatten())
+        .bind(request.aimd.is_some())
+        .bind(request.aimd.as_ref().and_then(Option::as_ref).map(Json))
+        .bind(request.fallback_realtime_on_status.as_deref())
+        .bind(request.affinity.is_some())
+        .bind(request.affinity.as_ref().and_then(Option::as_ref).map(Json))
+        .fetch_one(&mut *tx)
         .await?;
 
         // Convert DB model_type back to enum
@@ -698,14 +721,27 @@ impl<'c> Repository for Deployments<'c> {
             _ => None,
         });
 
+        tx.commit().await?;
         Ok(DeploymentDBResponse::from((model_type, model)))
     }
 
-    #[instrument(skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
+    #[instrument(level = "debug", skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
-        // Use LEFT JOIN with inference_endpoints to enable searching by endpoint name
-        let mut query =
-            QueryBuilder::new("SELECT dm.* FROM deployed_models dm LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id WHERE 1=1");
+        // Explicit results keep prepared statements compatible with additive migrations,
+        // including server statements retained by a transaction pooler across clients.
+        // Use LEFT JOIN with inference_endpoints to enable searching by endpoint name.
+        let mut query = QueryBuilder::new(
+            "SELECT dm.id, dm.model_name, dm.alias, dm.display_name, dm.description,
+                dm.type, dm.capabilities, dm.created_by, dm.hosted_on, dm.status,
+                dm.last_sync, dm.deleted, dm.created_at, dm.updated_at, dm.realtime_inflight_limit,
+                dm.batch_capacity, dm.throughput, dm.downstream_pricing_mode,
+                dm.downstream_input_price_per_token, dm.downstream_output_price_per_token, dm.downstream_hourly_rate, dm.downstream_input_token_cost_ratio, dm.is_composite,
+                dm.lb_strategy, dm.fallback_enabled, dm.fallback_on_rate_limit, dm.fallback_on_status, dm.fallback_realtime_on_status, dm.fallback_with_replacement,
+                dm.fallback_max_attempts, dm.backoff_enabled, dm.backoff_initial_ms, dm.backoff_max_ms, dm.backoff_factor,
+                dm.backoff_jitter, dm.backoff_max_total_ms, dm.first_token_timeout_ms, dm.aimd, dm.affinity, dm.sanitize_responses, dm.trusted, dm.reasoning_translation_overrides,
+                dm.allowed_batch_completion_windows, dm.metadata, dm.provisioning_source, dm.serving_classes
+             FROM deployed_models dm LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id WHERE 1=1",
+        );
 
         Self::apply_filters(&mut query, filter);
 
@@ -717,7 +753,7 @@ impl<'c> Repository for Deployments<'c> {
             Some(ModelSortField::ContextWindow) => ("(dm.metadata->>'context_window')::bigint", "DESC"),
             Some(ModelSortField::Provider) => ("dm.metadata->>'provider'", "ASC"),
             Some(ModelSortField::PriceFrom) => (
-                "(SELECT MIN(mt.input_price_per_token + mt.output_price_per_token) FROM model_tariffs mt WHERE mt.deployed_model_id = dm.id AND mt.valid_until IS NULL AND (mt.input_price_per_token + mt.output_price_per_token) > 0)",
+                "(SELECT MIN(mt.input_price_per_token + mt.output_price_per_token) FROM model_tariffs mt WHERE mt.deployed_model_id = dm.id AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW()) AND mt.user_id IS NULL AND mt.serving_class IS NULL AND (mt.api_key_purpose IS NULL OR mt.api_key_purpose IN ('realtime','batch','playground')))",
                 "ASC",
             ),
             Some(ModelSortField::CreatedAt) | None => ("dm.created_at", "DESC"),
@@ -734,7 +770,16 @@ impl<'c> Repository for Deployments<'c> {
             } else {
                 ""
             };
-        query.push(format!(" ORDER BY {sort_expr} {direction}{nulls_clause} LIMIT "));
+        if matches!(filter.sort_field, Some(ModelSortField::PriceFrom)) && filter.pricing_account.is_some() {
+            query.push(" ORDER BY (WITH selectors AS (SELECT DISTINCT api_key_purpose, completion_window FROM model_tariffs WHERE deployed_model_id = dm.id AND (user_id IS NULL OR user_id = ");
+            query.push_bind(filter.pricing_account);
+            query.push(") AND serving_class IS NULL AND valid_from <= NOW() AND (valid_until IS NULL OR valid_until > NOW()) AND api_key_purpose IN ('realtime','batch','playground')) SELECT MIN(t.input_price_per_token + t.output_price_per_token) FROM selectors s CROSS JOIN LATERAL effective_model_display_tariff(dm.id, ");
+            query.push_bind(filter.pricing_account);
+            query.push(", s.api_key_purpose, s.completion_window, NOW()) t)");
+            query.push(format!(" {direction} NULLS LAST, dm.id LIMIT "));
+        } else {
+            query.push(format!(" ORDER BY {sort_expr} {direction}{nulls_clause} LIMIT "));
+        }
         query.push_bind(filter.limit);
         query.push(" OFFSET ");
         query.push_bind(filter.skip);
@@ -815,6 +860,8 @@ impl<'c> Deployments<'c> {
             query.push_bind(search_pattern.clone());
             query.push(" OR LOWER(dm.model_name) LIKE ");
             query.push_bind(search_pattern.clone());
+            query.push(" OR LOWER(dm.display_name) LIKE ");
+            query.push_bind(search_pattern.clone());
             query.push(" OR LOWER(ie.name) LIKE ");
             query.push_bind(search_pattern);
             query.push(")");
@@ -879,7 +926,7 @@ impl<'c> Deployments<'c> {
         // Build a CTE that selects the filtered model set (ignoring pagination,
         // sort, and search so facets reflect the full universe visible to this user).
         let mut query = QueryBuilder::new(
-            "WITH visible AS (SELECT dm.* FROM deployed_models dm LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id WHERE 1=1",
+            "WITH visible AS (SELECT dm.metadata, dm.capabilities, dm.type FROM deployed_models dm LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id WHERE 1=1",
         );
 
         let facets_filter = DeploymentFilter {
@@ -913,7 +960,7 @@ impl<'c> Deployments<'c> {
 
     /// Check if a user has access to a deployment through group membership
     /// Returns deployment info and system API key if access is granted
-    #[instrument(skip(self), fields(deployment_alias = %deployment_alias, user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(deployment_alias = %deployment_alias, user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn check_user_access(&mut self, deployment_alias: &str, user_id: UserId) -> Result<Option<DeploymentAccessInfo>> {
         let result = sqlx::query_as!(
             DeploymentAccessInfo,
@@ -944,7 +991,7 @@ impl<'c> Deployments<'c> {
     }
 
     /// Count deployments matching the given filter (without pagination)
-    #[instrument(skip(self, filter), err)]
+    #[instrument(level = "debug", skip(self, filter), err)]
     pub async fn count(&mut self, filter: &DeploymentFilter) -> Result<i64> {
         // Use LEFT JOIN with inference_endpoints to enable searching by endpoint name
         let mut query =
@@ -959,14 +1006,14 @@ impl<'c> Deployments<'c> {
     // ===== Composite Model Component Management =====
 
     /// Add a component to a composite model
-    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&request.composite_model_id), deployed_id = %abbrev_uuid(&request.deployed_model_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&request.composite_model_id), deployed_id = %abbrev_uuid(&request.deployed_model_id)), err)]
     pub async fn add_component(&mut self, request: &DeploymentComponentCreateDBRequest) -> Result<DeploymentComponentDBResponse> {
         let result = sqlx::query!(
             r#"
             WITH inserted AS (
-                INSERT INTO deployed_model_components (composite_model_id, deployed_model_id, weight, enabled, sort_order)
-                VALUES ($1, $2, $3, $4, $5)
-                RETURNING id, composite_model_id, deployed_model_id, weight, enabled, sort_order, created_at
+                INSERT INTO deployed_model_components (composite_model_id, deployed_model_id, weight, enabled, sort_order, pool)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING id, composite_model_id, deployed_model_id, weight, enabled, sort_order, pool, created_at
             )
             SELECT
                 inserted.id,
@@ -975,13 +1022,13 @@ impl<'c> Deployments<'c> {
                 inserted.weight,
                 inserted.enabled,
                 inserted.sort_order,
+                inserted.pool,
                 inserted.created_at,
                 dm.alias as model_alias,
                 dm.model_name,
                 dm.description as model_description,
                 dm.type as model_type,
                 dm.trusted as model_trusted,
-                dm.open_responses_adapter as "model_open_responses_adapter?",
                 dm.hosted_on as endpoint_id,
                 e.name as "endpoint_name?"
             FROM inserted
@@ -992,7 +1039,8 @@ impl<'c> Deployments<'c> {
             request.deployed_model_id,
             request.weight,
             request.enabled,
-            request.sort_order
+            request.sort_order,
+            request.pool
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -1004,6 +1052,7 @@ impl<'c> Deployments<'c> {
             weight: result.weight,
             enabled: result.enabled,
             sort_order: result.sort_order,
+            pool: result.pool,
             created_at: result.created_at,
             model_alias: result.model_alias,
             model_name: result.model_name,
@@ -1012,17 +1061,23 @@ impl<'c> Deployments<'c> {
             endpoint_id: result.endpoint_id,
             endpoint_name: result.endpoint_name,
             model_trusted: result.model_trusted,
-            model_open_responses_adapter: result.model_open_responses_adapter.unwrap_or(true),
         })
     }
 
     /// Remove a component from a composite model
-    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), deployed_id = %abbrev_uuid(&deployed_model_id)), err)]
-    pub async fn remove_component(&mut self, composite_model_id: DeploymentId, deployed_model_id: DeploymentId) -> Result<bool> {
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), deployed_id = %abbrev_uuid(&deployed_model_id)), err)]
+    pub async fn remove_component(
+        &mut self,
+        composite_model_id: DeploymentId,
+        deployed_model_id: DeploymentId,
+        pool: &str,
+    ) -> Result<bool> {
         let result = sqlx::query!(
-            "DELETE FROM deployed_model_components WHERE composite_model_id = $1 AND deployed_model_id = $2",
+            "DELETE FROM deployed_model_components
+             WHERE composite_model_id = $1 AND deployed_model_id = $2 AND pool = $3",
             composite_model_id,
-            deployed_model_id
+            deployed_model_id,
+            pool
         )
         .execute(&mut *self.db)
         .await?;
@@ -1031,7 +1086,7 @@ impl<'c> Deployments<'c> {
     }
 
     /// Get all components of a composite model
-    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
     pub async fn get_components(&mut self, composite_model_id: DeploymentId) -> Result<Vec<DeploymentComponentDBResponse>> {
         let results = sqlx::query!(
             r#"
@@ -1042,13 +1097,13 @@ impl<'c> Deployments<'c> {
                 dmc.weight,
                 dmc.enabled,
                 dmc.sort_order,
+                dmc.pool,
                 dmc.created_at,
                 dm.alias as model_alias,
                 dm.model_name,
                 dm.description as model_description,
                 dm.type as model_type,
                 dm.trusted as model_trusted,
-                dm.open_responses_adapter as "model_open_responses_adapter?",
                 dm.hosted_on as endpoint_id,
                 e.name as "endpoint_name?"
             FROM deployed_model_components dmc
@@ -1071,6 +1126,7 @@ impl<'c> Deployments<'c> {
                 weight: r.weight,
                 enabled: r.enabled,
                 sort_order: r.sort_order,
+                pool: r.pool,
                 created_at: r.created_at,
                 model_alias: r.model_alias,
                 model_name: r.model_name,
@@ -1079,13 +1135,12 @@ impl<'c> Deployments<'c> {
                 endpoint_id: r.endpoint_id,
                 endpoint_name: r.endpoint_name,
                 model_trusted: r.model_trusted,
-                model_open_responses_adapter: r.model_open_responses_adapter.unwrap_or(true),
             })
             .collect())
     }
 
     /// Get components for multiple composite models in bulk
-    #[instrument(skip(self, composite_model_ids), fields(count = composite_model_ids.len()), err)]
+    #[instrument(level = "debug", skip(self, composite_model_ids), fields(count = composite_model_ids.len()), err)]
     pub async fn get_components_bulk(
         &mut self,
         composite_model_ids: Vec<DeploymentId>,
@@ -1103,13 +1158,13 @@ impl<'c> Deployments<'c> {
                 dmc.weight,
                 dmc.enabled,
                 dmc.sort_order,
+                dmc.pool,
                 dmc.created_at,
                 dm.alias as model_alias,
                 dm.model_name,
                 dm.description as model_description,
                 dm.type as model_type,
                 dm.trusted as model_trusted,
-                dm.open_responses_adapter as "model_open_responses_adapter?",
                 dm.hosted_on as endpoint_id,
                 e.name as "endpoint_name?"
             FROM deployed_model_components dmc
@@ -1133,6 +1188,7 @@ impl<'c> Deployments<'c> {
                 weight: r.weight,
                 enabled: r.enabled,
                 sort_order: r.sort_order,
+                pool: r.pool,
                 created_at: r.created_at,
                 model_alias: r.model_alias,
                 model_name: r.model_name,
@@ -1141,7 +1197,6 @@ impl<'c> Deployments<'c> {
                 endpoint_id: r.endpoint_id,
                 endpoint_name: r.endpoint_name,
                 model_trusted: r.model_trusted,
-                model_open_responses_adapter: r.model_open_responses_adapter.unwrap_or(true),
             });
         }
 
@@ -1150,15 +1205,19 @@ impl<'c> Deployments<'c> {
 
     /// Set all components of a composite model (replace existing)
     /// Tuple is (deployed_model_id, weight, enabled, sort_order)
-    #[instrument(skip(self, components), fields(composite_id = %abbrev_uuid(&composite_model_id), count = components.len()), err)]
+    #[instrument(level = "debug", skip(self, components), fields(composite_id = %abbrev_uuid(&composite_model_id), count = components.len()), err)]
     pub async fn set_components(
         &mut self,
         composite_model_id: DeploymentId,
         components: Vec<(DeploymentId, i32, bool, i32)>,
     ) -> Result<Vec<DeploymentComponentDBResponse>> {
-        // Delete existing components
+        // Replace the DEFAULT pool only. Bulk replacement predates pools and has
+        // no way to name one; wiping a composite's completions pool as a side
+        // effect of editing its member list would silently disable continuation
+        // for that model. Non-default pools are edited through the components
+        // API, which names the pool.
         sqlx::query!(
-            "DELETE FROM deployed_model_components WHERE composite_model_id = $1",
+            "DELETE FROM deployed_model_components WHERE composite_model_id = $1 AND pool = 'default'",
             composite_model_id
         )
         .execute(&mut *self.db)
@@ -1173,6 +1232,7 @@ impl<'c> Deployments<'c> {
                 weight,
                 enabled,
                 sort_order,
+                pool: DEFAULT_COMPONENT_POOL.to_string(),
             };
             results.push(self.add_component(&request).await?);
         }
@@ -1186,7 +1246,7 @@ impl<'c> Deployments<'c> {
     /// duplicate positions (there is no DB unique constraint on the pair). Must
     /// run inside the same transaction as the mutation it guards. Returns `false`
     /// if the composite does not exist.
-    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
     pub async fn lock_composite(&mut self, composite_model_id: DeploymentId) -> Result<bool> {
         let locked = sqlx::query_scalar!(
             "SELECT id FROM deployed_models WHERE id = $1 AND is_composite = TRUE FOR UPDATE",
@@ -1198,17 +1258,20 @@ impl<'c> Deployments<'c> {
         Ok(locked.is_some())
     }
 
-    /// Renumber a composite's components to a dense 0..n-1 sequence in their
+    /// Renumber one pool's components to a dense 0..n-1 sequence in their
     /// current priority order (sort_order, then weight DESC, then created_at).
     /// Used after a removal so deletions don't leave gaps. Idempotent.
-    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
-    pub async fn compact_component_sort_order(&mut self, composite_model_id: DeploymentId) -> Result<()> {
+    ///
+    /// Ordering is per pool: each pool is its own failover list, so position 0
+    /// means "tried first in this pool", not "tried first in the composite".
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), pool), err)]
+    pub async fn compact_component_sort_order(&mut self, composite_model_id: DeploymentId, pool: &str) -> Result<()> {
         sqlx::query!(
             r#"
             WITH ranked AS (
                 SELECT id, ROW_NUMBER() OVER (ORDER BY sort_order ASC, weight DESC, created_at ASC) - 1 AS new_order
                 FROM deployed_model_components
-                WHERE composite_model_id = $1
+                WHERE composite_model_id = $1 AND pool = $2
             )
             UPDATE deployed_model_components dmc
             SET sort_order = ranked.new_order
@@ -1216,7 +1279,8 @@ impl<'c> Deployments<'c> {
             WHERE dmc.id = ranked.id
               AND dmc.sort_order IS DISTINCT FROM ranked.new_order
             "#,
-            composite_model_id
+            composite_model_id,
+            pool
         )
         .execute(&mut *self.db)
         .await?;
@@ -1225,16 +1289,19 @@ impl<'c> Deployments<'c> {
     }
 
     /// The sort_order to use when appending a new component: one past the
-    /// current maximum within the composite, or 0 if it has no components yet.
+    /// current maximum within the composite's `pool`, or 0 if that pool is
+    /// empty.
     /// Callers serialize via [`Self::lock_composite`] so concurrent appends can't
     /// observe the same maximum. With removals compacting the sequence
     /// ([`Self::compact_component_sort_order`]) there are no gaps, so this is also
     /// the next dense index.
-    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
-    pub async fn next_component_sort_order(&mut self, composite_model_id: DeploymentId) -> Result<i32> {
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), pool), err)]
+    pub async fn next_component_sort_order(&mut self, composite_model_id: DeploymentId, pool: &str) -> Result<i32> {
         let next = sqlx::query_scalar!(
-            "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM deployed_model_components WHERE composite_model_id = $1",
-            composite_model_id
+            "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM deployed_model_components
+             WHERE composite_model_id = $1 AND pool = $2",
+            composite_model_id,
+            pool
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -1242,17 +1309,18 @@ impl<'c> Deployments<'c> {
         Ok(next.unwrap_or(0))
     }
 
-    /// Reassign sort_order across a composite's components by descending weight
-    /// (ties broken by insertion order), producing a dense, unique 0..n-1
-    /// sequence. Used when a composite switches to the `priority` strategy so the
+    /// Reassign sort_order within each of a composite's pools by descending
+    /// weight (ties broken by insertion order), producing a dense, unique
+    /// 0..n-1 sequence per pool. Used when a composite switches to the `priority` strategy so the
     /// previous weighting determines the failover order instead of leaving every
     /// component at the default sort_order = 0.
-    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
     pub async fn renumber_components_by_weight(&mut self, composite_model_id: DeploymentId) -> Result<()> {
         sqlx::query!(
             r#"
             WITH ranked AS (
-                SELECT id, ROW_NUMBER() OVER (ORDER BY weight DESC, created_at ASC) - 1 AS new_order
+                SELECT id,
+                       ROW_NUMBER() OVER (PARTITION BY pool ORDER BY weight DESC, created_at ASC) - 1 AS new_order
                 FROM deployed_model_components
                 WHERE composite_model_id = $1
             )
@@ -1275,19 +1343,21 @@ impl<'c> Deployments<'c> {
     /// is clamped into range. Run inside a transaction so the multi-row rewrite is
     /// atomic. This is what keeps two components from ever sharing a sort_order via
     /// the reorder path.
-    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), deployed_id = %abbrev_uuid(&deployed_model_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), deployed_id = %abbrev_uuid(&deployed_model_id)), err)]
     async fn move_component_to_position(
         &mut self,
         composite_model_id: DeploymentId,
         deployed_model_id: DeploymentId,
+        pool: &str,
         target_position: i32,
     ) -> Result<()> {
-        // Current order (same key the read paths use), as component ids.
+        // Current order within this pool (same key the read paths use).
         let mut ordered: Vec<DeploymentId> = sqlx::query_scalar!(
             "SELECT deployed_model_id FROM deployed_model_components
-             WHERE composite_model_id = $1
+             WHERE composite_model_id = $1 AND pool = $2
              ORDER BY sort_order ASC, weight DESC, created_at ASC",
-            composite_model_id
+            composite_model_id,
+            pool
         )
         .fetch_all(&mut *self.db)
         .await?;
@@ -1302,11 +1372,12 @@ impl<'c> Deployments<'c> {
         // Write back sort_order = index for the whole composite.
         for (idx, id) in ordered.iter().enumerate() {
             sqlx::query!(
-                "UPDATE deployed_model_components SET sort_order = $3
-                 WHERE composite_model_id = $1 AND deployed_model_id = $2
-                   AND sort_order IS DISTINCT FROM $3",
+                "UPDATE deployed_model_components SET sort_order = $4
+                 WHERE composite_model_id = $1 AND deployed_model_id = $2 AND pool = $3
+                   AND sort_order IS DISTINCT FROM $4",
                 composite_model_id,
                 id,
+                pool,
                 idx as i32
             )
             .execute(&mut *self.db)
@@ -1317,11 +1388,12 @@ impl<'c> Deployments<'c> {
     }
 
     /// Fetch a single component (with joined model/endpoint info) by its ids.
-    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), deployed_id = %abbrev_uuid(&deployed_model_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), deployed_id = %abbrev_uuid(&deployed_model_id)), err)]
     pub async fn get_component(
         &mut self,
         composite_model_id: DeploymentId,
         deployed_model_id: DeploymentId,
+        pool: &str,
     ) -> Result<Option<DeploymentComponentDBResponse>> {
         let result = sqlx::query!(
             r#"
@@ -1332,22 +1404,23 @@ impl<'c> Deployments<'c> {
                 dmc.weight,
                 dmc.enabled,
                 dmc.sort_order,
+                dmc.pool,
                 dmc.created_at,
                 dm.alias as model_alias,
                 dm.model_name,
                 dm.description as model_description,
                 dm.type as model_type,
                 dm.trusted as model_trusted,
-                dm.open_responses_adapter as "model_open_responses_adapter?",
                 dm.hosted_on as endpoint_id,
                 e.name as "endpoint_name?"
             FROM deployed_model_components dmc
             JOIN deployed_models dm ON dm.id = dmc.deployed_model_id
             LEFT JOIN inference_endpoints e ON e.id = dm.hosted_on
-            WHERE dmc.composite_model_id = $1 AND dmc.deployed_model_id = $2
+            WHERE dmc.composite_model_id = $1 AND dmc.deployed_model_id = $2 AND dmc.pool = $3
             "#,
             composite_model_id,
-            deployed_model_id
+            deployed_model_id,
+            pool
         )
         .fetch_optional(&mut *self.db)
         .await?;
@@ -1359,6 +1432,7 @@ impl<'c> Deployments<'c> {
             weight: r.weight,
             enabled: r.enabled,
             sort_order: r.sort_order,
+            pool: r.pool,
             created_at: r.created_at,
             model_alias: r.model_alias,
             model_name: r.model_name,
@@ -1367,7 +1441,6 @@ impl<'c> Deployments<'c> {
             endpoint_id: r.endpoint_id,
             endpoint_name: r.endpoint_name,
             model_trusted: r.model_trusted,
-            model_open_responses_adapter: r.model_open_responses_adapter.unwrap_or(true),
         }))
     }
 
@@ -1380,11 +1453,12 @@ impl<'c> Deployments<'c> {
     ///
     /// Must run on a transaction connection: a position change rewrites multiple
     /// rows and the caller commits them together.
-    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), deployed_id = %abbrev_uuid(&deployed_model_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), deployed_id = %abbrev_uuid(&deployed_model_id)), err)]
     pub async fn update_component(
         &mut self,
         composite_model_id: DeploymentId,
         deployed_model_id: DeploymentId,
+        pool: &str,
         weight: Option<i32>,
         enabled: Option<bool>,
         sort_order: Option<i32>,
@@ -1392,12 +1466,13 @@ impl<'c> Deployments<'c> {
         // Apply weight/enabled first; this also tells us whether the component exists.
         let exists = sqlx::query_scalar!(
             "UPDATE deployed_model_components
-             SET weight = COALESCE($3, weight),
-                 enabled = COALESCE($4, enabled)
-             WHERE composite_model_id = $1 AND deployed_model_id = $2
+             SET weight = COALESCE($4, weight),
+                 enabled = COALESCE($5, enabled)
+             WHERE composite_model_id = $1 AND deployed_model_id = $2 AND pool = $3
              RETURNING id",
             composite_model_id,
             deployed_model_id,
+            pool,
             weight,
             enabled
         )
@@ -1408,19 +1483,19 @@ impl<'c> Deployments<'c> {
             return Ok(None);
         }
 
-        // A supplied sort_order is a move-to-position request; reindex the composite.
+        // A supplied sort_order is a move-to-position request; reindex this pool.
         if let Some(target_position) = sort_order {
-            self.move_component_to_position(composite_model_id, deployed_model_id, target_position)
+            self.move_component_to_position(composite_model_id, deployed_model_id, pool, target_position)
                 .await?;
         }
 
-        self.get_component(composite_model_id, deployed_model_id).await
+        self.get_component(composite_model_id, deployed_model_id, pool).await
     }
 
     /// Get throughput values for the given model aliases
     /// Returns a map of alias -> throughput for models that have throughput configured
     /// Get batch-relevant model info (throughput + allowed completion windows) in a single query.
-    #[instrument(skip(self, aliases), fields(count = aliases.len()), err)]
+    #[instrument(level = "debug", skip(self, aliases), fields(count = aliases.len()), err)]
     pub async fn get_batch_model_info(&mut self, aliases: &[String]) -> Result<BatchModelInfo> {
         if aliases.is_empty() {
             return Ok(BatchModelInfo::default());
@@ -1452,7 +1527,7 @@ impl<'c> Deployments<'c> {
 
     /// Load effective reasoning mappings for every configured provider behind
     /// each requested model alias, including disabled components.
-    #[instrument(skip(self, aliases), fields(count = aliases.len()), err)]
+    #[instrument(level = "debug", skip(self, aliases), fields(count = aliases.len()), err)]
     pub async fn get_reasoning_policies(&mut self, aliases: &[String]) -> Result<HashMap<String, ModelReasoningPolicy>> {
         if aliases.is_empty() {
             return Ok(HashMap::new());
@@ -1509,7 +1584,7 @@ impl<'c> Deployments<'c> {
     }
 
     /// Resolve a model alias to its deployment ID. Returns None if not found or deleted.
-    #[instrument(skip(self), fields(alias = %alias), err)]
+    #[instrument(level = "debug", skip(self), fields(alias = %alias), err)]
     pub async fn resolve_alias_to_id(&mut self, alias: &str) -> Result<Option<DeploymentId>> {
         let id = sqlx::query_scalar!(
             r#"
@@ -1524,7 +1599,7 @@ impl<'c> Deployments<'c> {
     }
 
     /// Set traffic routing rules for a model (replace-all pattern).
-    #[instrument(skip(self, rules), fields(deployment_id = %abbrev_uuid(&deployed_model_id), count = rules.len()), err)]
+    #[instrument(level = "debug", skip(self, rules), fields(deployment_id = %abbrev_uuid(&deployed_model_id), count = rules.len()), err)]
     pub async fn set_traffic_rules(&mut self, deployed_model_id: DeploymentId, rules: &[(ApiKeyPurpose, TrafficRuleAction)]) -> Result<()> {
         // Delete existing rules
         sqlx::query!("DELETE FROM model_traffic_rules WHERE deployed_model_id = $1", deployed_model_id)
@@ -1560,7 +1635,7 @@ impl<'c> Deployments<'c> {
     }
 
     /// Get traffic routing rules for a single model.
-    #[instrument(skip(self), fields(deployment_id = %abbrev_uuid(&deployed_model_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(deployment_id = %abbrev_uuid(&deployed_model_id)), err)]
     pub async fn get_traffic_rules(&mut self, deployed_model_id: DeploymentId) -> Result<Vec<TrafficRuleDBRow>> {
         let rows = sqlx::query!(
             r#"
@@ -1592,7 +1667,7 @@ impl<'c> Deployments<'c> {
     }
 
     /// Get traffic routing rules for multiple models in bulk.
-    #[instrument(skip(self, deployment_ids), fields(count = deployment_ids.len()), err)]
+    #[instrument(level = "debug", skip(self, deployment_ids), fields(count = deployment_ids.len()), err)]
     pub async fn get_traffic_rules_bulk(
         &mut self,
         deployment_ids: &[DeploymentId],
@@ -1632,10 +1707,20 @@ impl<'c> Deployments<'c> {
         Ok(map)
     }
 
+    /// Resolve names for an already-authorized model set in one query.
+    pub async fn get_aliases_by_ids(&mut self, ids: &[DeploymentId]) -> Result<std::collections::BTreeMap<DeploymentId, String>> {
+        let rows: Vec<(DeploymentId, String)> =
+            sqlx::query_as("SELECT id, alias FROM deployed_models WHERE id = ANY($1) AND deleted = FALSE")
+                .bind(ids)
+                .fetch_all(&mut *self.db)
+                .await?;
+        Ok(rows.into_iter().collect())
+    }
+
     /// Get model UUIDs keyed by alias for the given aliases.
     /// Aliases are enforced to be unique, so this should be a one to one mapping
     /// Only returns rows where `deleted = false`.
-    #[instrument(skip(self, aliases), fields(count = aliases.len()), err)]
+    #[instrument(level = "debug", skip(self, aliases), fields(count = aliases.len()), err)]
     pub async fn get_model_ids_by_aliases(&mut self, aliases: &[String]) -> Result<std::collections::HashMap<String, uuid::Uuid>> {
         if aliases.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -1694,6 +1779,51 @@ mod tests {
         user_repo.create(&user_create).await.unwrap().into()
     }
 
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn searches_customer_visible_model_fields(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        crate::seed_database(
+            &[crate::config::ModelSource {
+                name: "test".to_string(),
+                url: base_url,
+                api_key: None,
+                sync_interval: std::time::Duration::from_secs(3600),
+                default_models: None,
+            }],
+            &pool,
+        )
+        .await
+        .unwrap();
+
+        let user = create_test_user(&pool).await;
+        let endpoint_id = get_test_endpoint_id(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+        let created = repo
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("Qwen/Qwen3.8-27B-FP8".to_string())
+                    .alias("Qwen/Qwen3.8-27B-FP8".to_string())
+                    .display_name("Qwen3.8 27B".to_string())
+                    .description("Optimized for multilingual retrieval".to_string())
+                    .hosted_on(endpoint_id)
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        for search in ["qwen3.8 27b", "qwen3.8-27b"] {
+            let results = repo
+                .list(&DeploymentFilter::new(0, 10).with_search(search.to_string()))
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].id, created.id);
+        }
+    }
+
     fn reasoning_translation_overrides() -> ReasoningTranslationOverrides {
         ReasoningTranslationOverrides {
             chat_completions: ReasoningSurfaceOverride::Override(ReasoningTranslation {
@@ -1712,7 +1842,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn persists_and_clears_mixed_reasoning_translation_overrides(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -1758,7 +1888,7 @@ mod tests {
         assert_eq!(cleared.reasoning_translation_overrides, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn loads_effective_reasoning_policy_for_standard_model(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -1805,7 +1935,7 @@ mod tests {
         assert_eq!(supported.responses, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_deployed_model(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -1833,7 +1963,7 @@ mod tests {
                     .hosted_on(test_endpoint_id)
                     .model_type(ModelType::Chat)
                     .capabilities(vec!["text-generation".to_string(), "streaming".to_string()])
-                    .capacity(100)
+                    .realtime_inflight_limit(40)
                     .batch_capacity(50)
                     .build();
 
@@ -1849,11 +1979,11 @@ mod tests {
             model.capabilities,
             Some(vec!["text-generation".to_string(), "streaming".to_string()])
         );
-        assert_eq!(model.capacity, Some(100));
+        assert_eq!(model.realtime_inflight_limit, 40);
         assert_eq!(model.batch_capacity, Some(50));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_deployed_model(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -1894,7 +2024,7 @@ mod tests {
         assert_eq!(found_model.alias, "get-test-deployment");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_deployed_model(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -1932,7 +2062,7 @@ mod tests {
                     .description(Some("Updated description".to_string()))
                     .model_type(Some(ModelType::Embeddings))
                     .capabilities(Some(vec!["embeddings".to_string(), "similarity".to_string()]))
-                    .capacity(Some(200))
+                    .realtime_inflight_limit(200)
                     .batch_capacity(Some(75))
                     .build();
 
@@ -1947,11 +2077,11 @@ mod tests {
             updated_model.capabilities,
             Some(vec!["embeddings".to_string(), "similarity".to_string()])
         );
-        assert_eq!(updated_model.capacity, Some(200));
+        assert_eq!(updated_model.realtime_inflight_limit, 200);
         assert_eq!(updated_model.batch_capacity, Some(75));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_deployed_model_with_null_fields(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -1989,11 +2119,11 @@ mod tests {
         assert_eq!(model.created_by, user.id);
         assert_eq!(model.model_type, None);
         assert_eq!(model.capabilities, None);
-        assert_eq!(model.capacity, None);
+        assert_eq!(model.realtime_inflight_limit, 14);
         assert_eq!(model.batch_capacity, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_deployed_model_to_null_fields(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2025,7 +2155,6 @@ mod tests {
                 model_create.hosted_on = Some(test_endpoint_id);
                 model_create.model_type = Some(ModelType::Chat);
                 model_create.capabilities = Some(vec!["test-capability".to_string()]);
-                model_create.capacity = Some(150);
                 model_create.batch_capacity = Some(60);
 
                 created_model = repo.create(&model_create).await.unwrap();
@@ -2034,7 +2163,6 @@ mod tests {
                 let update = DeploymentUpdateDBRequest::builder()
                     .maybe_model_type(Some(None))
                     .maybe_capabilities(Some(None))
-                    .maybe_capacity(Some(None))
                     .maybe_batch_capacity(Some(None))
                     .build();
 
@@ -2044,15 +2172,13 @@ mod tests {
         }
         assert_eq!(created_model.model_type, Some(ModelType::Chat));
         assert_eq!(created_model.capabilities, Some(vec!["test-capability".to_string()]));
-        assert_eq!(created_model.capacity, Some(150));
         assert_eq!(created_model.batch_capacity, Some(60));
         assert_eq!(updated_model.model_type, None);
         assert_eq!(updated_model.capabilities, None);
-        assert_eq!(updated_model.capacity, None);
         assert_eq!(updated_model.batch_capacity, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_deployed_model(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2093,7 +2219,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_deployed_models(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2138,7 +2264,7 @@ mod tests {
         assert!(models[1].model_name == "list-test-model-2");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_with_endpoint_filter(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2174,7 +2300,7 @@ mod tests {
         assert!(models.iter().all(|m| m.hosted_on == Some(endpoint_id)));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_with_status_filter(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2214,7 +2340,7 @@ mod tests {
         assert!(models.iter().all(|m| m.status == ModelStatus::Active));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_with_deleted_filter(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2260,7 +2386,7 @@ mod tests {
         assert!(models.iter().all(|m| !m.deleted));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_with_accessible_to_filter(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2334,7 +2460,7 @@ mod tests {
         assert!(models.iter().any(|m| m.id == deployment2.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_with_combined_filters(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2391,7 +2517,7 @@ mod tests {
         assert!(models.iter().all(|m| m.status == ModelStatus::Active));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_pagination(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2437,7 +2563,7 @@ mod tests {
         assert!(page1_ids.is_disjoint(&page2_ids));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_embeddings_deployment(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2475,7 +2601,7 @@ mod tests {
         assert_eq!(model.capabilities, Some(vec!["embeddings".to_string(), "similarity".to_string()]));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_by_id_with_embeddings_type(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2511,7 +2637,7 @@ mod tests {
         assert_eq!(found_model.model_type, Some(ModelType::Embeddings));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_with_mixed_model_types(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2574,7 +2700,7 @@ mod tests {
         assert_eq!(no_type_result.model_type, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_with_mixed_model_types(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2622,7 +2748,7 @@ mod tests {
         assert_eq!(embeddings_found.model_type, Some(ModelType::Embeddings));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_chat_to_embeddings(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2662,7 +2788,7 @@ mod tests {
         assert_eq!(updated_model.capabilities, Some(vec!["embeddings".to_string()]));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_embeddings_to_chat(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2705,7 +2831,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_empty_ids(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2726,7 +2852,7 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_check_user_access(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2843,7 +2969,7 @@ mod tests {
         assert!(access_result.is_none());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_partial_downstream_per_token_pricing_updates(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2960,7 +3086,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_provider_hourly_pricing_updates(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -3088,7 +3214,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_with_inactive_status_filter(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -3158,7 +3284,7 @@ mod tests {
         assert!(all_models.iter().any(|m| m.id == deployment2.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_with_combined_deleted_and_inactive_filters(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -3208,7 +3334,7 @@ mod tests {
         assert!(models.iter().any(|m| m.id == deployment.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_deployment_alias_conflict(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -3224,7 +3350,9 @@ mod tests {
             auth_header_name: None,
             auth_header_prefix: None,
             reasoning_translation: None,
+            accepts_scheduling_priority: false,
             created_by: user.id,
+            kind: Default::default(),
         };
         let endpoint = endpoints_repo.create(&endpoint_create).await.unwrap();
         let test_endpoint_id = endpoint.id;
@@ -3255,7 +3383,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_deployment_alias_conflict(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -3271,7 +3399,9 @@ mod tests {
             auth_header_name: None,
             auth_header_prefix: None,
             reasoning_translation: None,
+            accepts_scheduling_priority: false,
             created_by: user.id,
+            kind: Default::default(),
         };
         let endpoint = endpoints_repo.create(&endpoint_create).await.unwrap();
         let test_endpoint_id = endpoint.id;
@@ -3305,7 +3435,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_deployment_with_empty_model_name_or_alias(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -3350,7 +3480,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_deployment_with_empty_model_name_or_alias(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -3394,7 +3524,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_with_group_filter(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -3502,7 +3632,7 @@ mod tests {
 
     // ===== Traffic Routing Rules Tests =====
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_resolve_alias_to_id(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -3571,7 +3701,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_set_and_get_traffic_rules(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -3658,7 +3788,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_set_traffic_rules_replaces_existing(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -3741,7 +3871,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_set_traffic_rules_empty_clears(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -3809,7 +3939,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_traffic_rules_empty(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -3855,7 +3985,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_traffic_rules_bulk(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -3953,7 +4083,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_traffic_rules_bulk_empty_ids(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -3973,7 +4103,7 @@ mod tests {
         tx.commit().await.unwrap();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_cascade_delete_source_model(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -4052,7 +4182,7 @@ mod tests {
         assert_eq!(count, 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_cascade_delete_redirect_target(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -4131,7 +4261,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_unique_purpose_per_model(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -4189,7 +4319,7 @@ mod tests {
         assert!(err_str.contains("unique_purpose_per_model") || err_str.contains("duplicate key"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_with_provider_filter(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -4248,7 +4378,7 @@ mod tests {
         assert!(!models.iter().any(|m| m.alias == "provider-filter-anthropic"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_with_model_type_filter(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -4305,7 +4435,7 @@ mod tests {
         assert!(!models.iter().any(|m| m.id == chat_model.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_with_capability_filter(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -4362,7 +4492,7 @@ mod tests {
         assert!(models.iter().any(|m| m.id == text_model.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_with_sort(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -4422,7 +4552,7 @@ mod tests {
         assert!(pos_z < pos_a, "sort-zzz should come before sort-aaa in DESC order");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_facets(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -4486,7 +4616,7 @@ mod tests {
         assert!(model_types.contains(&"EMBEDDINGS".to_string()));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_facets_respect_filters(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -4585,7 +4715,47 @@ mod tests {
         result
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrations = false)]
+    async fn realtime_fallback_backfill_follows_server_error_failover(pool: PgPool) {
+        let migrator = crate::migrator();
+        let (before, backfill): (Vec<_>, Vec<_>) = migrator.iter().partition(|migration| migration.version < 145);
+        for migration in before {
+            sqlx::raw_sql(migration.sql.as_ref()).execute(&pool).await.unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO deployed_models (model_name, alias, created_by, is_composite, fallback_on_status) VALUES
+                ('explicit', 'explicit', '00000000-0000-0000-0000-000000000000', TRUE, '{429,503}'),
+                ('class', 'class', '00000000-0000-0000-0000-000000000000', TRUE, '{5}'),
+                ('inherited', 'inherited', '00000000-0000-0000-0000-000000000000', TRUE, NULL),
+                ('no-5xx', 'no-5xx', '00000000-0000-0000-0000-000000000000', TRUE, '{429,499}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let backfill = backfill.first().expect("realtime fallback migration");
+        assert_eq!(backfill.version, 145);
+        sqlx::raw_sql(backfill.sql.as_ref()).execute(&pool).await.unwrap();
+
+        let statuses: BTreeMap<String, Vec<i32>> =
+            sqlx::query_as::<_, (String, Vec<i32>)>("SELECT alias, fallback_realtime_on_status FROM deployed_models")
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect();
+        let expected: BTreeMap<String, Vec<i32>> = [
+            ("class", vec![529]),
+            ("explicit", vec![529]),
+            ("inherited", vec![529]),
+            ("no-5xx", vec![]),
+        ]
+        .into_iter()
+        .map(|(alias, statuses)| (alias.to_string(), statuses))
+        .collect();
+        assert_eq!(statuses, expected);
+    }
+
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn database_fallback_status_default_remains_historical(pool: PgPool) {
         let column_default: String = sqlx::query_scalar(
@@ -4604,7 +4774,7 @@ mod tests {
         assert_eq!(column_default, "'{429,500,502,503,504}'::integer[]");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn reasoning_policy_includes_every_configured_composite_provider(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -4690,7 +4860,7 @@ mod tests {
         assert_eq!(orders, expected, "sort_order must be a dense, unique 0..n-1 sequence");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_next_sort_order_appends(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -4701,13 +4871,14 @@ mod tests {
             let mut repo = Deployments::new(tx.acquire().await.unwrap());
             for component_id in &components {
                 // Mirror the handler: the server assigns the next position on add.
-                let sort_order = repo.next_component_sort_order(composite).await.unwrap();
+                let sort_order = repo.next_component_sort_order(composite, DEFAULT_COMPONENT_POOL).await.unwrap();
                 repo.add_component(&DeploymentComponentCreateDBRequest {
                     composite_model_id: composite,
                     deployed_model_id: *component_id,
                     weight: 50,
                     enabled: true,
                     sort_order,
+                    pool: DEFAULT_COMPONENT_POOL.to_string(),
                 })
                 .await
                 .unwrap();
@@ -4721,7 +4892,7 @@ mod tests {
         assert_eq!(ordered.iter().map(|(id, _)| *id).collect::<Vec<_>>(), components);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_renumber_by_weight(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -4739,6 +4910,7 @@ mod tests {
                     weight,
                     enabled: true,
                     sort_order: 0,
+                    pool: DEFAULT_COMPONENT_POOL.to_string(),
                 })
                 .await
                 .unwrap();
@@ -4757,7 +4929,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_move_component_reindexes_densely(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -4774,6 +4946,7 @@ mod tests {
                     weight: 50,
                     enabled: true,
                     sort_order: i as i32,
+                    pool: DEFAULT_COMPONENT_POOL.to_string(),
                 })
                 .await
                 .unwrap();
@@ -4786,7 +4959,7 @@ mod tests {
         {
             let mut repo = Deployments::new(tx.acquire().await.unwrap());
             let moved = repo
-                .update_component(composite, components[2], None, None, Some(0))
+                .update_component(composite, components[2], DEFAULT_COMPONENT_POOL, None, None, Some(0))
                 .await
                 .unwrap()
                 .expect("component exists");
@@ -4805,7 +4978,7 @@ mod tests {
         let mut tx = pool.begin().await.unwrap();
         {
             let mut repo = Deployments::new(tx.acquire().await.unwrap());
-            repo.update_component(composite, components[2], None, None, Some(999))
+            repo.update_component(composite, components[2], DEFAULT_COMPONENT_POOL, None, None, Some(999))
                 .await
                 .unwrap()
                 .expect("component exists");
@@ -4821,7 +4994,7 @@ mod tests {
         let mut tx = pool.begin().await.unwrap();
         {
             let mut repo = Deployments::new(tx.acquire().await.unwrap());
-            repo.update_component(composite, components[0], Some(99), None, None)
+            repo.update_component(composite, components[0], DEFAULT_COMPONENT_POOL, Some(99), None, None)
                 .await
                 .unwrap()
                 .expect("component exists");
@@ -4830,7 +5003,7 @@ mod tests {
         assert_eq!(ordered_components(&pool, composite).await, order_before);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_remove_compacts_sort_order(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -4847,6 +5020,7 @@ mod tests {
                     weight: 50,
                     enabled: true,
                     sort_order: i as i32,
+                    pool: DEFAULT_COMPONENT_POOL.to_string(),
                 })
                 .await
                 .unwrap();
@@ -4858,8 +5032,12 @@ mod tests {
         let mut tx = pool.begin().await.unwrap();
         {
             let mut repo = Deployments::new(tx.acquire().await.unwrap());
-            assert!(repo.remove_component(composite, components[1]).await.unwrap());
-            repo.compact_component_sort_order(composite).await.unwrap();
+            assert!(
+                repo.remove_component(composite, components[1], DEFAULT_COMPONENT_POOL)
+                    .await
+                    .unwrap()
+            );
+            repo.compact_component_sort_order(composite, DEFAULT_COMPONENT_POOL).await.unwrap();
         }
         tx.commit().await.unwrap();
 
@@ -4874,7 +5052,7 @@ mod tests {
         let mut tx = pool.begin().await.unwrap();
         let next = {
             let mut repo = Deployments::new(tx.acquire().await.unwrap());
-            repo.next_component_sort_order(composite).await.unwrap()
+            repo.next_component_sort_order(composite, DEFAULT_COMPONENT_POOL).await.unwrap()
         };
         tx.commit().await.unwrap();
         assert_eq!(next, 2);

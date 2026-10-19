@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO deployed_models (id, model_name, alias, created_by, deleted, is_composite)\n             VALUES ($1, $2, $3, $4, false, true)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Varchar",
+        "Varchar",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ed4413f8a8f2049479cba3626004cdfbabfe6da6bc9caf6e42083633296e6d90"
+}

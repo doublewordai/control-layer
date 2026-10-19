@@ -19,11 +19,15 @@
 //! in-memory store is meant for `cargo test` and local `cargo run`
 //! workflows where no bucket is configured.
 use async_trait::async_trait;
+use aws_sdk_s3::config::retry::RetryConfig;
+use aws_sdk_s3::config::timeout::TimeoutConfig;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use metrics::counter;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
+use tracing::debug;
 use url::Url;
 
 use super::token::ImageToken;
@@ -46,13 +50,15 @@ pub enum StoreError {
     Unimplemented,
 }
 
-/// Object-store backend for normalised image bytes. Content-addressed by
-/// SHA-256.
+/// Object-store backend for normalised image bytes, keyed by [`ImageToken`]:
+/// the content SHA-256, plus a per-ingest upload ID when
+/// `image_normalizer.unique_upload_keys` is on.
 #[async_trait]
 pub trait ImageStore: Send + Sync {
-    /// Idempotently store `bytes` under `token`. If the object already
-    /// exists, this is a no-op and returns `Ok(false)`. Otherwise stores
-    /// and returns `Ok(true)`.
+    /// Store `bytes` under `token`. Returns `Ok(true)` if written. Remote
+    /// backends write unconditionally — callers that may reuse an existing
+    /// object check [`exists`](Self::exists) first; [`MemoryStore`] returns
+    /// `Ok(false)` if the token is already present.
     async fn put(&self, token: ImageToken, mime: &str, bytes: Bytes) -> Result<bool, StoreError>;
 
     /// Generate a short-lived signed URL pointing at the bytes for `token`.
@@ -62,8 +68,16 @@ pub trait ImageStore: Send + Sync {
     /// image-view path. Caller is responsible for authorisation.
     async fn read(&self, token: ImageToken) -> Result<(String, Bytes), StoreError>;
 
-    /// True if an object with this token already exists. Cheap check used
-    /// by the ingest path to skip uploads on dedup hits.
+    /// True if an object with this token already exists AND will still be
+    /// there for as long as a signed reference to it can stay in use. Cheap
+    /// check used by the ingest path to skip uploads on dedup hits when
+    /// tokens are content-addressed (`unique_upload_keys` off).
+    ///
+    /// The second half matters for backends with a bucket lifecycle rule:
+    /// an object that exists today but is about to be expired by age must
+    /// report `false`, so the caller re-uploads it and resets its age.
+    /// Otherwise a 24h batch that references it fails part way through
+    /// (see `reuse_max_age` on [`S3CompatStore`]).
     async fn exists(&self, token: ImageToken) -> Result<bool, StoreError>;
 
     /// True if `url` already points at an object in THIS store — i.e. a URL
@@ -108,6 +122,13 @@ impl MemoryStore {
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
+    }
+
+    /// Every stored object's raw bytes, for tests asserting what reached the store.
+    #[cfg(test)]
+    pub fn objects(&self) -> Vec<Bytes> {
+        let map = self.inner.lock().expect("MemoryStore mutex poisoned");
+        map.values().map(|(_, bytes)| bytes.clone()).collect()
     }
 }
 
@@ -236,10 +257,6 @@ impl GcsStore {
 #[async_trait]
 impl ImageStore for GcsStore {
     async fn put(&self, token: ImageToken, mime: &str, bytes: Bytes) -> Result<bool, StoreError> {
-        // Idempotency: short-circuit if the object already exists.
-        if self.exists(token).await? {
-            return Ok(false);
-        }
         let client = self.client().await?;
         let key = Self::key(token);
         client
@@ -316,10 +333,41 @@ impl ImageStore for GcsStore {
 
 // ========================== S3CompatStore =================================
 
+/// Whether an object with the given `Last-Modified` (epoch seconds) is old
+/// enough that a caller should re-upload it rather than reuse it. `None`
+/// for `last_modified_secs` means the backend did not report one, which is
+/// treated as fresh: the alternative is re-uploading on every dedup hit.
+fn stale_for_reuse(last_modified_secs: Option<i64>, now_secs: i64, max_age: Option<Duration>) -> bool {
+    match (last_modified_secs, max_age) {
+        (Some(modified), Some(max_age)) => {
+            // Saturate rather than cast: a configured age beyond i64::MAX would
+            // otherwise wrap negative and mark every object stale.
+            let max_age_secs = i64::try_from(max_age.as_secs()).unwrap_or(i64::MAX);
+            now_secs.saturating_sub(modified) >= max_age_secs
+        }
+        _ => false,
+    }
+}
+
+/// `Last-Modified` from a HeadObject response as epoch seconds, or `None`
+/// when the backend did not report one.
+fn head_last_modified_secs(head: &aws_sdk_s3::operation::head_object::HeadObjectOutput) -> Option<i64> {
+    head.last_modified().map(|t| t.secs())
+}
+
 /// SigV4 presigning has a hard 7-day ceiling. Clamp any requested TTL to
 /// just under it so a misconfigured `dispatch_ttl` can't make presigning
 /// fail at runtime.
 const S3_MAX_PRESIGN: Duration = Duration::from_secs(7 * 24 * 60 * 60 - 60);
+
+/// Attempts per S3 call. Ingest runs inside the upload request, so a failed
+/// call fails the upload; five attempts with the SDK's jittered exponential
+/// backoff (1s base) ride out object-store blips of several seconds.
+const S3_MAX_ATTEMPTS: u32 = 5;
+
+/// Bound on one S3 call including retries, so a sustained outage returns a
+/// 503 instead of holding the upload open.
+const S3_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// S3-compatible object store backend (Cloudflare R2, MinIO, Backblaze B2,
 /// AWS S3) reached via a custom endpoint.
@@ -334,6 +382,11 @@ const S3_MAX_PRESIGN: Duration = Duration::from_secs(7 * 24 * 60 * 60 - 60);
 /// so it is created eagerly in [`S3CompatStore::new`].
 pub struct S3CompatStore {
     bucket: String,
+    /// Objects at least this old are reported as absent by [`exists`] so the
+    /// ingest path re-uploads them, resetting their age under the bucket's
+    /// lifecycle rule. `None` disables the check. See
+    /// `BackendConfig::S3Compatible::reuse_max_age_secs` for why.
+    reuse_max_age: Option<Duration>,
     /// The configured endpoint (e.g. `https://<acct>.r2.cloudflarestorage.com`),
     /// trailing slash trimmed. Parsed in [`owns_url`] to match the host of our
     /// own presigned URLs — exactly for path-style, or as `{bucket}.{host}` for
@@ -360,12 +413,22 @@ impl S3CompatStore {
             .endpoint_url(endpoint.clone())
             .force_path_style(force_path_style)
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .retry_config(RetryConfig::standard().with_max_attempts(S3_MAX_ATTEMPTS))
+            .timeout_config(TimeoutConfig::builder().operation_timeout(S3_OPERATION_TIMEOUT).build())
             .build();
         Self {
             bucket: bucket.into(),
+            reuse_max_age: None,
             endpoint: endpoint.trim_end_matches('/').to_string(),
             client: aws_sdk_s3::Client::from_conf(s3_config),
         }
+    }
+
+    /// Treat objects at least `max_age` old as absent in [`exists`], so
+    /// they are re-uploaded before the bucket lifecycle rule expires them.
+    pub fn with_reuse_max_age(mut self, max_age: Option<Duration>) -> Self {
+        self.reuse_max_age = max_age;
+        self
     }
 
     /// Object key shape for a given token. Mirrors [`GcsStore::key`] so the
@@ -379,10 +442,6 @@ impl S3CompatStore {
 #[async_trait]
 impl ImageStore for S3CompatStore {
     async fn put(&self, token: ImageToken, mime: &str, bytes: Bytes) -> Result<bool, StoreError> {
-        // Idempotency: short-circuit if the object already exists.
-        if self.exists(token).await? {
-            return Ok(false);
-        }
         let key = Self::key(token);
         self.client
             .put_object()
@@ -442,7 +501,21 @@ impl ImageStore for S3CompatStore {
         // up so a misconfiguration can't be misread as a missing object
         // (which would otherwise trigger a needless re-upload).
         match self.client.head_object().bucket(&self.bucket).key(&key).send().await {
-            Ok(_) => Ok(true),
+            Ok(head) => {
+                // An object the lifecycle rule is about to expire is as good
+                // as absent: report it so, and the caller re-uploads, which
+                // resets the object's age. HeadObject already carries
+                // Last-Modified, so this costs no extra request.
+                let last_modified_secs = head_last_modified_secs(&head);
+                if stale_for_reuse(last_modified_secs, Utc::now().timestamp(), self.reuse_max_age) {
+                    // Counted so the refresh rate is visible in Grafana; a
+                    // debug line is easy to lose at production log volume.
+                    counter!("dwctl_image_normalizer_refresh_total").increment(1);
+                    debug!(key, ?last_modified_secs, "image object older than reuse_max_age; re-uploading");
+                    return Ok(false);
+                }
+                Ok(true)
+            }
             Err(e) => {
                 let svc = e.into_service_error();
                 if svc.is_not_found() {
@@ -488,7 +561,7 @@ mod tests {
     use super::*;
 
     fn tok(b: u8) -> ImageToken {
-        ImageToken([b; 32])
+        ImageToken([b; 32], None)
     }
 
     #[tokio::test]
@@ -548,9 +621,57 @@ mod tests {
     }
 
     #[test]
+    fn stale_for_reuse_only_when_older_than_max_age() {
+        let day = 24 * 60 * 60;
+        let now = 1_790_000_000;
+        let five_days = Some(Duration::from_secs(5 * day as u64));
+        // Disabled: never stale.
+        assert!(!stale_for_reuse(Some(now - 100 * day), now, None));
+        // No Last-Modified reported: treat as fresh rather than re-upload every hit.
+        assert!(!stale_for_reuse(None, now, five_days));
+        // Younger than the threshold: reuse.
+        assert!(!stale_for_reuse(Some(now - 4 * day), now, five_days));
+        // At or past it: re-upload. The 2026-09-24 case was an object uploaded
+        // 14 days before a 24h batch referenced it.
+        assert!(stale_for_reuse(Some(now - 5 * day), now, five_days));
+        assert!(stale_for_reuse(Some(now - 14 * day), now, five_days));
+        // A clock skewed into the future never counts as stale.
+        assert!(!stale_for_reuse(Some(now + day), now, five_days));
+        // An absurd max_age saturates instead of wrapping negative, which
+        // would have marked every object stale.
+        assert!(!stale_for_reuse(Some(now - 100 * day), now, Some(Duration::from_secs(u64::MAX))));
+    }
+
+    #[test]
+    fn head_last_modified_maps_to_epoch_seconds() {
+        use aws_sdk_s3::operation::head_object::HeadObjectOutput;
+        use aws_sdk_s3::primitives::DateTime;
+
+        let with = HeadObjectOutput::builder()
+            .last_modified(DateTime::from_secs(1_790_000_000))
+            .build();
+        assert_eq!(head_last_modified_secs(&with), Some(1_790_000_000));
+
+        let without = HeadObjectOutput::builder().build();
+        assert_eq!(head_last_modified_secs(&without), None);
+    }
+
+    #[test]
     fn s3_key_uses_two_level_prefix() {
         let key = S3CompatStore::key(tok(0xab));
         assert!(key.starts_with("images/ab/ab/abab"));
+    }
+
+    #[test]
+    fn copies_of_the_same_image_get_distinct_keys_under_its_prefix() {
+        let a = ImageToken::new_unique([0xab; 32]);
+        let b = ImageToken::new_unique([0xab; 32]);
+        let (ka, kb) = (S3CompatStore::key(a), S3CompatStore::key(b));
+        assert_ne!(ka, kb);
+        assert!(ka.starts_with(&format!("images/ab/ab/{}.", hex::encode([0xab; 32]))));
+        assert_eq!(GcsStore::key(a), ka);
+        // Content-addressed tokens keep resolving to the content-hash-only key.
+        assert_eq!(S3CompatStore::key(tok(0xab)), format!("images/ab/ab/{}", hex::encode([0xab; 32])));
     }
 
     #[test]

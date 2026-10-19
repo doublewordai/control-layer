@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO deployed_model_components (composite_model_id, deployed_model_id, weight, enabled, sort_order, pool)\n         SELECT composite_model_id, deployed_model_id, weight, enabled, 0, 'completions'\n         FROM deployed_model_components\n         WHERE deployed_model_id = '40000000-0000-0000-0000-000000000006'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "0289488ce9be5a7466c6b8c055f649bf52eaae9caef54aac0bdea2fadb58750a"
+}

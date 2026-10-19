@@ -7,6 +7,7 @@
 - [Quickstart](quickstart.md)
 - [Configuration](configuration.md)
 - [Command Line Options](cli.md)
+- [Graceful Shutdown](shutdown.md)
 - [API Usage](api-usage.md)
 
 # Features
@@ -23,3 +24,4 @@
 # Development
 
 - [Contributing](contributing.md)
+- [Load-Aware Failover (design)](load-aware-failover.md)

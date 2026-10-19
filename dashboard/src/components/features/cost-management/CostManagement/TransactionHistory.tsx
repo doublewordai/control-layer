@@ -321,7 +321,7 @@ export function TransactionHistory({
                   onClick={addFundsConfig.onGiftFunds}
                 >
                   <Plus className="w-4 h-4 mr-2" />
-                  Gift Funds
+                  Gift/Remove Funds
                 </Button>
               )}
               {addFundsConfig.type === "purchase-only" && (
@@ -358,7 +358,7 @@ export function TransactionHistory({
                     <DropdownMenuContent align="end">
                       {addFundsConfig.onGiftFunds && (
                         <DropdownMenuItem onClick={addFundsConfig.onGiftFunds}>
-                          Gift Funds
+                          Gift/Remove Funds
                         </DropdownMenuItem>
                       )}
                       {addFundsConfig.onBillingPortal && (

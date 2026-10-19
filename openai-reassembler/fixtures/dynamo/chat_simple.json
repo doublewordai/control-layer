@@ -1,0 +1,186 @@
+{
+  "chunks": [
+    {
+      "choices": [
+        {
+          "delta": {
+            "content": "The",
+            "function_call": null,
+            "reasoning_content": null,
+            "refusal": null,
+            "role": "assistant",
+            "tool_calls": null
+          },
+          "index": 0
+        }
+      ],
+      "created": 1775560913,
+      "id": "chatcmpl-ca4ff23b-cab7-4ef2-82fb-84e3c6d3b1a9",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "chat.completion.chunk",
+      "service_tier": null,
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "delta": {
+            "content": " quick",
+            "function_call": null,
+            "reasoning_content": null,
+            "refusal": null,
+            "role": "assistant",
+            "tool_calls": null
+          },
+          "index": 0
+        }
+      ],
+      "created": 1775560913,
+      "id": "chatcmpl-ca4ff23b-cab7-4ef2-82fb-84e3c6d3b1a9",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "chat.completion.chunk",
+      "service_tier": null,
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "delta": {
+            "content": " brown",
+            "function_call": null,
+            "reasoning_content": null,
+            "refusal": null,
+            "role": "assistant",
+            "tool_calls": null
+          },
+          "index": 0
+        }
+      ],
+      "created": 1775560913,
+      "id": "chatcmpl-ca4ff23b-cab7-4ef2-82fb-84e3c6d3b1a9",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "chat.completion.chunk",
+      "service_tier": null,
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "delta": {
+            "content": " fox",
+            "function_call": null,
+            "reasoning_content": null,
+            "refusal": null,
+            "role": "assistant",
+            "tool_calls": null
+          },
+          "index": 0
+        }
+      ],
+      "created": 1775560913,
+      "id": "chatcmpl-ca4ff23b-cab7-4ef2-82fb-84e3c6d3b1a9",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "chat.completion.chunk",
+      "service_tier": null,
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "delta": {
+            "content": ".",
+            "function_call": null,
+            "reasoning_content": null,
+            "refusal": null,
+            "role": "assistant",
+            "tool_calls": null
+          },
+          "index": 0
+        }
+      ],
+      "created": 1775560913,
+      "id": "chatcmpl-ca4ff23b-cab7-4ef2-82fb-84e3c6d3b1a9",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "chat.completion.chunk",
+      "service_tier": null,
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "delta": {
+            "content": null,
+            "function_call": null,
+            "reasoning_content": null,
+            "refusal": null,
+            "role": "assistant",
+            "tool_calls": null
+          },
+          "finish_reason": "stop",
+          "index": 0
+        }
+      ],
+      "created": 1775560913,
+      "id": "chatcmpl-ca4ff23b-cab7-4ef2-82fb-84e3c6d3b1a9",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "nvext": {
+        "timing": {
+          "request_received_ms": 1775560913898,
+          "total_time_ms": 608.7418700000001
+        }
+      },
+      "object": "chat.completion.chunk",
+      "service_tier": null,
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [],
+      "created": 1775560913,
+      "id": "chatcmpl-ca4ff23b-cab7-4ef2-82fb-84e3c6d3b1a9",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "chat.completion.chunk",
+      "service_tier": null,
+      "system_fingerprint": null,
+      "usage": {
+        "completion_tokens": 6,
+        "prompt_tokens": 17,
+        "total_tokens": 23
+      }
+    },
+    "[DONE]"
+  ],
+  "expected": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "content": "The quick brown fox.",
+          "reasoning_content": null,
+          "role": "assistant"
+        }
+      }
+    ],
+    "created": 1775560913,
+    "id": "chatcmpl-c53d4856-f716-42dd-9e1a-53d16a7f8a98",
+    "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+    "nvext": {
+      "timing": {
+        "request_received_ms": 1775560913282,
+        "total_time_ms": 607.9004110000001
+      }
+    },
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 6,
+      "prompt_tokens": 17,
+      "total_tokens": 23
+    }
+  }
+}

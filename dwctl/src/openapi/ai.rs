@@ -332,7 +332,7 @@ Errors follow the OpenAI format with `error.message`, `error.type`, and `error.c
 ```json
 {
   \"error\": {
-    \"message\": \"Invalid API key\",
+    \"message\": \"Invalid API key. API keys are region-bound: if you expected this key to work, check that your base URL matches the region the key was created in. See https://docs.doubleword.ai/inference-api/regional-endpoints\",
     \"type\": \"authentication_error\",
     \"code\": \"invalid_api_key\"
   }

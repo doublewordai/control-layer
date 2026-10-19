@@ -32,34 +32,54 @@ pub const ZDR_MARKER_KEY: &str = "zdr";
 pub const ZDR_MARKER_HEADER: &str = "x-fusillade-batch-zdr";
 
 /// Whether a request's key opts into ZDR. Decided once, at submit, from the
-/// per-key policy map ([`crate::sync::zdr_keys`]); dispatch and retrieve instead
+/// per-key policy map ([`crate::sync::key_policy`]); dispatch and retrieve instead
 /// key off the body sentinel. A key absent from the map (deleted/invalid, which
 /// auth rejects anyway) reads as non-ZDR, and a `None` key never opts in.
 ///
 /// This answers per-key policy only. Callers that must encrypt (the flex path)
 /// additionally require a configured keystore.
-pub fn is_zdr_request(zdr_cache: &crate::sync::zdr_keys::ZdrKeyCache, api_key: Option<&str>) -> bool {
+pub fn is_zdr_request(zdr_cache: &crate::sync::key_policy::KeyPolicyCache, api_key: Option<&str>) -> bool {
     api_key.is_some_and(|key| zdr_cache.is_zdr(key))
+}
+
+/// The two per-request keys of a ZDR flex request. Generated before anything
+/// about the request is stored, so the request key can seal the request's
+/// images ([`crate::image_normalizer::ImageNormalizer::ingest_sealed`]) before
+/// the body itself is encrypted by [`prepare_flex_submit`].
+pub struct FlexKeys {
+    /// Encrypts the request body and the request's images. Shredded when the
+    /// terminal response is stored, which makes the images unreadable too.
+    pub request: [u8; 32],
+    /// Encrypts the response body. Shredded on retrieval.
+    pub response: [u8; 32],
+}
+
+impl FlexKeys {
+    pub fn generate() -> Self {
+        Self {
+            request: keystore::generate_key(),
+            response: keystore::generate_key(),
+        }
+    }
 }
 
 /// Prepare a ZDR flex request for storage: strip the control fields fusillade's
 /// sanitiser would have removed (it cannot run on ciphertext), encrypt the body
-/// with a fresh request key, and store both per-request keys. Returns the
+/// with the request key, and store both per-request keys. Returns the
 /// sentinel-prefixed ciphertext to store as the request body.
 pub async fn prepare_flex_submit(
     keystore: &crate::keystore::Keystore,
     request_id: &Uuid,
+    keys: &FlexKeys,
     request_value: &mut serde_json::Value,
 ) -> Result<String, KeystoreError> {
     if let Some(obj) = request_value.as_object_mut() {
-        obj.remove("service_tier");
-        obj.remove("background");
+        obj.shift_remove("service_tier");
+        obj.shift_remove("background");
     }
-    let request_key = keystore::generate_key();
-    let response_key = keystore::generate_key();
-    let body = encrypt_body(&request_key, &request_value.to_string())?;
-    keystore.put(&key_id(request_id, KeyKind::Request), &request_key, None).await?;
-    keystore.put(&key_id(request_id, KeyKind::Response), &response_key, None).await?;
+    let body = encrypt_body(&keys.request, &request_value.to_string())?;
+    keystore.put(&key_id(request_id, KeyKind::Request), &keys.request, None).await?;
+    keystore.put(&key_id(request_id, KeyKind::Response), &keys.response, None).await?;
     Ok(body)
 }
 
@@ -253,7 +273,7 @@ mod tests {
 
     #[test]
     fn is_zdr_request_reads_the_key_map() {
-        let cache = crate::sync::zdr_keys::ZdrKeyCache::from_pairs([("sk-on".to_string(), true), ("sk-off".to_string(), false)]);
+        let cache = crate::sync::key_policy::KeyPolicyCache::from_pairs([("sk-on".to_string(), true), ("sk-off".to_string(), false)]);
         assert!(is_zdr_request(&cache, Some("sk-on")));
         assert!(!is_zdr_request(&cache, Some("sk-off")));
         // Absent key (deleted/invalid, auth-rejected) reads as non-ZDR.

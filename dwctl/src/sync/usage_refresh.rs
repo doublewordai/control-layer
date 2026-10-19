@@ -15,7 +15,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use sqlx::PgPool;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, instrument};
@@ -30,7 +29,13 @@ use crate::metrics::errors::component::USAGE_REFRESH;
 /// refresh, then waits `min_interval` before it can run again (bounding the refresh rate
 /// and coalescing bursts of nudges).
 #[instrument(skip_all)]
-pub async fn run_usage_refresh_daemon(pool: PgPool, config: UsageRefreshConfig, notify: Arc<Notify>, shutdown: CancellationToken) {
+pub async fn run_usage_refresh_daemon(
+    pools: impl sqlx_pool_router::PoolProvider,
+    config: UsageRefreshConfig,
+    notify: Arc<Notify>,
+    shutdown: CancellationToken,
+) {
+    let pools = sqlx_pool_router::DynPools::new(pools);
     let min_interval = Duration::from_millis(config.min_interval_milliseconds);
 
     // Fallback tick is optional (0 disables it). Skip missed ticks so a stall doesn't
@@ -58,7 +63,7 @@ pub async fn run_usage_refresh_daemon(pool: PgPool, config: UsageRefreshConfig, 
             _ = async { match fallback.as_mut() { Some(t) => { t.tick().await; }, None => std::future::pending().await } } => {}
         }
 
-        if let Err(e) = refresh_user_model_usage_daily(&pool).await {
+        if let Err(e) = refresh_user_model_usage_daily(&pools.write()).await {
             crate::background_error!(USAGE_REFRESH, "refresh", Error, error = %e, "Failed to refresh user_model_usage_daily");
         }
 

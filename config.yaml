@@ -18,6 +18,27 @@ dashboard_url: "http://localhost:5173"
 # Email address where support requests are sent
 # support_email: "support@doubleword.ai"
 
+# Schema migrations
+#
+# `dwctl migrate` applies every pending migration (main, fusillade, underway,
+# and outlet when request logging is enabled) and exits; it repairs
+# interrupted concurrent index builds first and verifies the result. Run it
+# from a pre-rollout Job with the release image, or by hand against a local
+# database.
+#
+# `migrations.mode` decides what the serving process does at startup:
+#   run   - apply pending migrations before serving (default; local
+#           development and single-instance installs)
+#   check - never execute DDL. Verify the database carries every migration
+#           this binary ships with matching checksums and refuse to start
+#           otherwise. A database that is AHEAD of the binary is accepted, so
+#           replicas of the previous release keep serving while the next
+#           release's migrations are applied before its rollout.
+# Deployments that run the migration Job set `check` on the application pods
+# (DWCTL_MIGRATIONS__MODE=check).
+migrations:
+  mode: run
+
 # Database configuration
 database:
   # Configure connectivity to an external postgres database here
@@ -30,6 +51,25 @@ database:
   #   DATABASE_REPLICA_URL=postgres://postgres:password@replica:5432/dwctl (recommended)
   #   DWCTL_DATABASE_REPLICA_URL=postgres://postgres:password@replica:5432/dwctl (single underscore)
   # Note: DWCTL_DATABASE__REPLICA_URL (double underscore) won't work due to config structure
+
+  # Optional: transaction-pooled endpoint for query traffic. The direct URL above
+  # still serves migrations, LISTEN subscriptions, and leader election.
+  # pooled_url: postgres://postgres:password@pooler:6432/dwctl
+  # Also accepts DATABASE_POOLED_URL or DWCTL_DATABASE_POOLED_URL independently
+  # of DATABASE_URL. Without a pooled endpoint, pool settings are unchanged.
+  # direct_pool:
+  #   max_connections: 8
+  #   min_connections: 0
+  #
+  # Schema components default to pooled_schema_mode: role_default. Give each
+  # component a login whose persistent search_path selects its schema, using
+  # both url (direct migrations/session work) and pooled_url (query traffic).
+  # The direct schema URL must reach the same live database as main; startup
+  # verifies this before creating the schema or running component migrations.
+  # Recycle existing pooler backends after changing role defaults.
+  # Fusillade can instead share the main credentials with explicit
+  # pooled_schema_mode: transaction, which selects the schema in each query
+  # transaction. Outlet supports only role_default.
 
   # Main database pool settings for primary (and replica if not specified separately)
   # pool:
@@ -64,6 +104,18 @@ database:
   # fusillade:
   #   mode: schema
   #   name: fusillade
+  #   # Scoped identity: use the same role for migrations, queries and maintenance.
+  #   # url: postgres://fusillade:password@localhost:5432/dwctl
+  #   # pooled_url: postgres://fusillade:password@pooler:6432/dwctl
+  #   # pooled_schema_mode: role_default # default; verify primary and replica
+  #   # replica_url: postgres://fusillade:password@replica-pooler:6432/dwctl
+  #   # An explicit url never inherits the main replica: reads fall back to this
+  #   # primary unless replica_url is set. With a main pooler, an explicit url
+  #   # also requires an explicit pooled_url to avoid changing query credentials.
+  #   # Shared main login compatibility: omit url and use
+  #   # pooled_schema_mode: transaction (Fusillade only).
+  #   # direct_pool:
+  #   #   max_connections: 2
   #   pool:
   #     max_connections: 20
   #     min_connections: 2
@@ -74,6 +126,9 @@ database:
   # Alternative: use a dedicated database for fusillade
   # fusillade:
   #   mode: dedicated
+  #   # pooled_url: postgres://postgres:password@pooler:6432/component_database
+  #   # direct_pool:
+  #   #   max_connections: 2
   #   url: postgres://postgres:password@localhost:5432/fusillade
   #   replica_url: postgres://postgres:password@replica:5432/fusillade
   #   pool:
@@ -87,6 +142,10 @@ database:
   # outlet:
   #   mode: schema
   #   name: outlet
+  #   # url: postgres://outlet_pool:password@localhost:5432/dwctl
+  #   # pooled_schema_mode: role_default
+  #   # pooled_url: postgres://outlet_pool:password@pooler:6432/dwctl
+  #   # replica_url: postgres://outlet_pool:password@replica-pooler:6432/dwctl
   #   pool:
   #     max_connections: 5
   #   # Optional: separate replica pool settings (defaults to pool settings)
@@ -96,6 +155,9 @@ database:
   # Alternative: use a dedicated database for outlet
   # outlet:
   #   mode: dedicated
+  #   # pooled_url: postgres://postgres:password@pooler:6432/component_database
+  #   # direct_pool:
+  #   #   max_connections: 2
   #   url: postgres://postgres:password@localhost:5432/outlet
   #   pool:
   #     max_connections: 5
@@ -182,6 +244,20 @@ auth:
     # auto_create_users: Automatically create users on first login
     auto_create_users: true
 
+  # Extra email domains to treat as personal, on top of the built-in list.
+  #
+  # A personal domain can't be claimed by a workspace and is never used to route
+  # a signup to one. The built-in list covers the major free-mail providers and
+  # consumer ISPs, but it can only ever be a snapshot: a provider it misses gets
+  # claimed by whoever signs up first, and everyone who signs up at that provider
+  # afterwards is routed into that stranger's workspace. Add a domain here to
+  # close that immediately — it also retires any existing claim, since the claim
+  # is only consulted after this check.
+  #
+  # personal_email_domains:
+  #   - "example-isp.net"
+  personal_email_domains: []
+
   # Default roles assigned to newly created non-admin users
   # Applies to both native user registration and proxy header auto-creation
   # StandardUser role is always guaranteed to be present even if not specified
@@ -219,18 +295,6 @@ auth:
       # content_security_policy_report_only: ""        # roll a CSP out in report-only first
       # strict_transport_security: "max-age=31536000; includeSubDomains"  # usually set on whatever terminates TLS instead
 
-  # Default per-API-key rate limits, applied based on the owning user's
-  # `verified` flag (set true after a successful Stripe payment or auto-topup
-  # charge). Only used when the api_key has no explicit per-key override.
-  # Omit a tier (or the whole `rate_limits` block) to leave that tier
-  # unlimited.
-  #
-  # Both tiers are intentionally left unset: unverified users get full
-  # platform throughput — throttling it feels slow/unreliable — and are instead
-  # bounded by an upload-*volume* cap until they verify. See
-  # `batches.unverified_requests_per_completion_hour` below.
-  rate_limits: {}
-
 # Email configuration for password resets and notifications
 email:
   # Email transport - either 'file' (for development) or 'smtp' (for production)
@@ -267,10 +331,66 @@ credits:
   # target, and idempotent across the webhook/front-channel race.
   # Example: 25 gives a newly verified user 25 credits.
   verification_credits: 0
+  # Delay after a transient provider failure or first soft card decline before
+  # another automatic charge is eligible. Keep the 24h production default;
+  # staging can shorten this to exercise the complete decline lifecycle.
+  auto_topup_retry_delay: 24h
 
 # Optional feature toggles
 enable_metrics: true # Enable Prometheus metrics endpoint
 enable_request_logging: true # Enable request/response logging to database
+
+# Opt-in heap profile listener (GET /debug/pprof/heap, gzip pprof). Profiles exist
+# only if the process also starts with jemalloc sampling on, e.g.
+# _RJEM_MALLOC_CONF=prof:true,prof_active:true,lg_prof_sample:19.
+# The listener is unauthenticated: keep it on loopback (use port-forwarding) or,
+# for an in-cluster scraper, bind 0.0.0.0 behind a NetworkPolicy.
+# See docs/memory-observability.md. DWCTL_HEAP_PROFILING__ENABLED=true etc.
+heap_profiling:
+  enabled: false # Default: false
+  bind_address: "127.0.0.1:6060" # Default: 127.0.0.1:6060
+  dump_timeout: 30s # Default: 30s
+
+# Scheduling toleration presets.
+#
+# An operator can pin an account (a user or an organization) to one of these
+# presets through the admin API / dashboard. Every inference request from a
+# pinned account then carries the preset's toleration list at
+# `nvext.routing_constraints.tolerations` before it reaches the inference
+# backend, for realtime, flex and batch traffic alike, so a backend that
+# honours tolerations keeps the account's work on the capacity you intend.
+#
+# Pinning restricts where an account's requests can be placed, and can make
+# scheduling harder for accounts sharing the same capacity, depending on how
+# the backend treats tolerations. Pin as few accounts as possible and only
+# when a customer requires it.
+#
+# This is a distinct setting from `self_hosted_only` (the account's
+# `users.self_hosted_only` / `organizations.self_hosted_only` flag): that flag
+# is the *gateway's* provider-fallback control and decides whether onwards may
+# route a request to a third-party (`external`) provider at all. These presets
+# say nothing about which provider is chosen; they only constrain where the
+# chosen backend may place an accepted request.
+#
+# `tolerations` uses the same shape as the request field: a list of
+# Kubernetes-style entries, each `{key, operator?, value?, effect?}` where
+# `operator` is `Equal` (the default, needs a `value`) or `Exists`, and
+# `effect` is `NoSchedule` (the default) or `PreferNoSchedule`. An empty list
+# asks the backend to keep the account off any tainted capacity. Wording here
+# is deliberately backend-agnostic.
+#
+# An account stores only the preset's `id` (`users.toleration_preset`). An id
+# the config no longer defines is a misconfiguration: the request path logs it
+# and fails closed by applying the empty (most restrictive) list.
+scheduling:
+  toleration_presets:
+    - id: "no-overflow"
+      label: "No overflow capacity"
+      description: >-
+        Never placed on capacity the backend marks with any taint, such as
+        overflow capacity; requests may be refused when dedicated capacity is
+        full.
+      tolerations: []
 # Note: Environment variables can override top level setting, as long as they're supplied with the DWCTL_ prefix:
 # DWCTL_PORT=8080
 #
@@ -401,9 +521,30 @@ batches:
 #   requests:
 #     # Maximum body size per individual request (bytes). Applies to requests
 #     # in batch JSONL files and to realtime request bodies on /ai/v1/*.
+#     # Inference bodies are bounded before parsing or request logging;
+#     # oversized bodies return HTTP 413. Multipart uploads use max_file_size.
 #     # Set to 0 for unlimited (not recommended for production)
 #     # Default: 10MB (10485760)
+#     # Changing this limit requires a restart to rebuild all routing layers.
 #     max_body_size: 10485760
+#   realtime_inflight:
+#     # Refuse realtime requests over each account's in-flight limit (default: false)
+#     enforce: true
+#     # Redis that holds the realtime in-flight counts every replica shares.
+#     # Unset or unreachable: each replica counts only its own requests.
+#     redis_url: rediss://:password@limits-redis.example:6379
+#   batch_inflight:
+#     # Refuse batch requests over each virtual model's batch_capacity
+#     # (default: false). Off: every batch request is admitted and no shared
+#     # count is touched. Reuses the realtime_inflight.redis_url above; batch
+#     # and realtime counts use separate key spaces.
+#     enforce: true
+#     # Global batch in-flight cap for virtual models that do not set their own
+#     # positive batch_capacity (default: 200). Does not change fusillade's
+#     # per-daemon starting concurrency, which keeps using
+#     # background_services.batch_daemon.default_model_concurrency. Set to 0 or
+#     # null for no default. Raise it per model where batch runs higher.
+#     default_capacity: 200
 
 # External data source connections (S3, etc.)
 # Allows users to connect external storage and sync files for batch processing.
@@ -436,11 +577,41 @@ openapi:
 # Onwards AI proxy configuration
 # Controls behavior of the onwards routing layer for AI proxy requests
 onwards:
+  # Maximum pending bytes of an unfinished SSE event; complete events are forwarded first.
+  # Increase for providers with large tool-call events. This is not a response-length limit.
+  # Exceeding it fails the response body stream. Zero permits no unfinished bytes.
+  # Set via environment: DWCTL_ONWARDS__SSE_BUFFER_LIMIT=1048576
+  sse_buffer_limit: 65536
   # Enable strict mode with schema validation and typed handlers.
   # When false (default), all requests are passed through transparently.
   # When true, only known OpenAI API paths are accepted and validated.
   # Set via environment: DWCTL_ONWARDS__STRICT_MODE=true
   strict_mode: false
+  # Public message for upstream 429 responses, including exhausted retries.
+  # Local request and concurrency limits keep their existing messages.
+  # Set via environment: DWCTL_ONWARDS__UPSTREAM_RATE_LIMIT_MESSAGE
+  upstream_rate_limit_message: "This is a shared best-effort endpoint, rate limited under load – retry with backoff. For production workloads that aren't latency-sensitive, try our async or batch tiers (https://docs.doubleword.ai/inference-api/batch-inference); for a dedicated real-time endpoint with SLAs, higher rate limits, and volume pricing, contact support@doubleword.ai."
+  # Failover deadline (ms) for the first token of a realtime streamed response.
+  # While a model still has another provider to fail over to, an attempt that
+  # hasn't started streaming within this window is abandoned and the next
+  # provider tried. The final attempt is never cut off, and fusillade daemon
+  # traffic (batch, flex, background) is exempt. Set to 0 to disable.
+  # AIMD records a first token later than its separate 10-second latency budget as
+  # a breach without cutting the attempt off; once breaches exceed its target rate,
+  # later requests shift to the alternates.
+  # Set via environment: DWCTL_ONWARDS__FIRST_TOKEN_TIMEOUT_MS=20000
+  first_token_timeout_ms: 20000
+  # Models may override the deadline via first_token_timeout_ms in the model API.
+  # Priority composites with fallback enabled use AIMD by default in strict mode.
+  # Override through the model API's aimd object, or set aimd.enabled=false to opt out.
+  # See onwards/docs/src/load-aware-failover.md for coverage and tuning.
+  # Strict-mode chat and legacy completions parameters refused with a 400
+  # instead of forwarded.
+  # Onwards counts and traces every parameter not every worker can serve
+  # (onwards_unsupported_params_total); only the ones listed here are refused.
+  # Names come from onwards::unsupported_params::params(), e.g. [n, logprobs].
+  # Set via environment: DWCTL_ONWARDS__REJECTED_PARAMS='[n,logprobs]'
+  rejected_params: []
 
 # Cached-input pricing (the dwctl-owned cache layer)
 cache:
@@ -492,9 +663,96 @@ cache:
   #   default_read_multiplier: 0.1
   #   default_min_prefix_tokens: 1024
 
+# Mid-stream continuation (the resume layer): when a streaming generation dies
+# mid-output, rebuild the prompt + partial output as token-ids (tokenizer-svc
+# /v1/render) and resume it as a /v1/completions request through the model's
+# completions pool, splicing the result into the client's still-open stream with
+# merged billing. Per-model activation is DATA, not config: a model rescues only
+# when its composite carries a completions pool with an enabled member.
+# ClickHouse warehouse connection (unused in local dev). Required by prefix_chain.
+# clickhouse:
+#   endpoint_url: "https://<service>.<region>.aws.clickhouse.cloud:8443"
+#   database: "clay"
+#   user: "dwctl"
+#   password: ""
+
+# Prefix-chain capture: per chat-completions request, keyed hashes of the prompt's
+# content blocks plus per-block token counts, written to ClickHouse. No content.
+prefix_chain:
+  enabled: false
+  models: null # null: every model; a non-empty list: exactly those aliases
+  hmac_key: "" # 32 bytes, hex; from a secret as DWCTL_PREFIX_CHAIN__HMAC_KEY
+
+continuation:
+  # Global kill switch. When false (default), the layer is not added to the
+  # stack and the request path is byte-identical to a build without it.
+  # Set via environment: DWCTL_CONTINUATION__ENABLED=true
+  enabled: false
+  # Base URL of the tokenizer-svc used to render resume prefixes. Unset
+  # (default) falls back to cache.tokenizer_url — the same service serves both
+  # layers; set only to split them.
+  # Set via environment: DWCTL_CONTINUATION__TOKENIZER_URL=http://tokenizer-svc:8088
+  # tokenizer_url: http://localhost:8088
+  # Per-origin eligibility gates (derived from the API key's purpose, the same
+  # signal analytics uses for request_origin). Permanent config, not rollout
+  # scaffolding: resume economics differ per origin (paying a provider again vs
+  # a plain retry behind fusillade's masking).
+  origins:
+    # Set via environment: DWCTL_CONTINUATION__ORIGINS__REALTIME=true
+    realtime: true
+    # Set via environment: DWCTL_CONTINUATION__ORIGINS__BATCH=true
+    batch: false
+    # Set via environment: DWCTL_CONTINUATION__ORIGINS__PLAYGROUND=true
+    playground: false
+  # Maximum resume legs for one logical stream (a leg that itself dies re-enters
+  # the chain). Exhausted -> the ORIGINAL death surfaces, exactly as unresumed.
+  # Set via environment: DWCTL_CONTINUATION__MAX_ATTEMPTS=2
+  max_attempts: 2
+  # Seconds per resume attempt (render + continuation-target time-to-first-byte).
+  # Crossed -> that leg is abandoned; attempts exhausted -> the original death
+  # surfaces. Cold provider prefill dominates on long prompts.
+  # Set via environment: DWCTL_CONTINUATION__RESUME_DEADLINE_SECS=20
+  resume_deadline_secs: 20
+  # Inter-frame silence after which an armed stream is declared stalled and
+  # rescued. Rescue CANCELS the original leg, so this must never undercut the
+  # platform's own liveness judgment (fusillade allows 600s between SSE events
+  # in prod): a preempted-but-progressing stream must be left alone. 540 sits
+  # just inside fusillade's 600s so batch-origin stalls remain rescuable before
+  # the daemon aborts. Arms only after the first generated text.
+  # Set via environment: DWCTL_CONTINUATION__STALL_TIMEOUT_SECS=540
+  stall_timeout_secs: 540
+  # Cap applied separately to each retained allocation per armed stream (the
+  # request body, and the accumulated generation) - worst case ~2x this value.
+  # Exceeded -> the stream is marked non-resumable (outcome cap_exceeded) and
+  # the buffer dropped; the stream itself is unaffected.
+  # Set via environment: DWCTL_CONTINUATION__MAX_BUFFER_BYTES=2097152
+  max_buffer_bytes: 2097152
+  # Dynamo scheduler priority on resume legs. Realtime runs 0, batch negative —
+  # positive puts resumes ahead of new work, deliberately: a resume finishes a
+  # stream already accepted, on a seam budget. Onwards strips the field for
+  # pool members that would reject it (third-party providers).
+  # Set via environment: DWCTL_CONTINUATION__PRIORITY=100
+  priority: 100
+  # Per-model cap on concurrently in-flight resume legs — bounds the stampede a
+  # flapping model can send at its continuation provider during an incident.
+  # Set via environment: DWCTL_CONTINUATION__MAX_INFLIGHT_PER_MODEL=8
+  max_inflight_per_model: 8
+  # Reconstructor per model alias, for models whose reasoning/tool-call streams
+  # have a byte-exactness verdict from the fidelity harness ("dsv4" = the
+  # DeepSeek-V4/DSML family). Absent from the map -> plain-content only;
+  # reasoning/tool streams disarm safely instead of resuming.
+  # Set via environment: DWCTL_CONTINUATION__MODEL_RECONSTRUCTORS='{"deepseek-ai/DeepSeek-V4-Flash":"dsv4"}'
+  model_reconstructors: {}
+
 # Background services configuration
 # Controls which background services run on this instance
 background_services:
+  # jemalloc statistics sampler (Linux) for the dwctl_jemalloc_* gauges. Runs off
+  # the request path when enable_metrics is true. See docs/memory-observability.md.
+  allocator_metrics:
+    enabled: true # Default: true
+    sample_interval: 15s # Default: 15s (minimum 1s)
+
   # Onwards config sync - syncs database changes to the AI proxy routing layer
   # Disabling this will prevent the AI proxy from receiving config updates
   onwards_sync:
@@ -503,6 +761,18 @@ background_services:
     # changes in real time; this fallback only guards against dropped notifications. Each tick
     # triggers a full routing-table reload (heavy DB egress), so keep it in minutes, not seconds.
     # Default: 300000 (5 min). Set to 0 to disable (not recommended).
+    fallback_interval_milliseconds: 300000
+
+  # Per-key account policy sync - keeps the in-memory map of each API key's owning
+  # account policy (zero data retention, disabled modalities) fresh after startup.
+  # Independent of onwards_sync: the realtime modality gate enforces from this map.
+  # The map is always loaded once at startup; with this off, policy changes only
+  # reach an instance when it restarts.
+  key_policy_sync:
+    enabled: true # Default: true
+    # Periodic full reload (milliseconds). One small join; NOTIFY carries real
+    # changes, so this only guards against a missed notification.
+    # Default: 300000 (5 min). Set to 0 to disable.
     fallback_interval_milliseconds: 300000
 
   # Usage-refresh daemon - incrementally folds new http_analytics rows into the
@@ -542,14 +812,36 @@ background_services:
     default_model_concurrency: 10 # Default concurrent requests per model
     claim_interval_ms: 1000 # Milliseconds to sleep between claim iterations
 
+    # Adaptive per-model concurrency. Discovers the sustainable in-flight count
+    # from downstream 529s instead of running flat out at a static number.
+    #
+    # default_model_concurrency and per-model batch_capacity become the value
+    # each model STARTS at; the controller owns the number from there and can go
+    # above it. Turning this off puts every model back on its configured value,
+    # so the flag is safe to flip either way. Set max_total_in_flight first - it
+    # is what bounds this instance's memory once per-model values stop capping.
+    #
+    # adaptive_concurrency: false
+    # adaptive_growth_factor: 1.5    # Multiplier applied each time a limit goes up
+    # adaptive_cut_factor: 0.8       # Multiplier applied on downstream 529
+    # max_total_in_flight: 0         # Hard cap on this instance's total in-flight
+    #                                # requests across all models; 0 disables
+
     # Split claim daemons (fusillade >= 20): batched and batchless (flex) rows
     # are claimed by independent loops. All optional:
     # batch_claim_size: 0            # Max rows per batch-claim iteration; 0 = inherit claim_batch_size
     # batch_claim_batch_size: 4      # Max batches selected per model per iteration (spill-over pool)
     # batch_claim_interval_ms: 0     # Batch-claim loop cadence; 0 = inherit claim_interval_ms
-    # batch_claim_require_live: false # Require an explicit `live` model_filters event to batch-claim;
+    # batch_claim_require_live: false # Require `live` for full-rate batch claims outside the deadline ramp;
     #                                 # false treats no-event models (external providers) as live
-    # claim_ramp_exponent: 0.56      # Deadline-ramp curve: not-live batches become claimable within
+    # Batches on unavailable models get one immediate claim,
+    # then one per interval, per user/model/window. Positive whole seconds only.
+    # False restores the batch live gate; deadline-ramp claims still proceed.
+    # Async/flex keeps its window-based rate (24min default tier, 60s flex).
+    leak_enabled: true
+    leak_interval_seconds: 60
+    model_leak_interval_seconds: {} # Exact model aliases; e.g. {"some-large-model": 10}
+    # claim_ramp_exponent: 0.56      # Deadline-ramp curve: not-live work bypasses the leak interval within
     #                                 # window_minutes^exponent minutes of deadline (~59m/24h, ~10m/1h)
     # background_concurrency_limit: 0 # Per-model foreground in-flight threshold below which
     #                                 # background workers may send; background work does not
@@ -581,6 +873,60 @@ background_services:
     claim_timeout_ms: 60000 # Max time in "claimed" state before auto-unclaim (1 minute)
     processing_timeout_ms: 600000 # Max time in "processing" state before auto-unclaim (10 minutes)
     pending_request_counts_timeout_ms: 60000 # Statement timeout for pending request count queries (1 minute)
+
+    # Retained-response lifecycle. No retention period is implied by the
+    # application defaults, and movement and retirement remain off unless
+    # explicitly enabled. Only terminal batchless response tiers are accepted
+    # for scheduled lifecycle management in this release; file and file-backed
+    # batch policies fail startup validation. Every configured tier also needs
+    # an explicit positive max_late_writer_seconds fence.
+    # retention:
+    #   batchless_seconds_by_service_tier:
+    #     flex: <seconds>
+    #   max_late_writer_seconds: <seconds>
+    # batchless_archive_sweep_enabled: false
+    # batchless_archive_backfill_enabled: false
+    # batchless_archive_groups_per_tick: <positive bound>
+    # batchless_archive_bytes_per_tick: <positive bound>
+    # batchless_archive_backfill_concurrency: 1  # Graphs the backfill moves at once per tick; the
+    #                                            # one-off drain lever (sweep stays sequential). Needs
+    #                                            # this many spare fusillade write connections.
+    # retained_response_partitions_days_ahead: <positive runway>
+    # With retention configured for "priority", terminal realtime responses
+    # are written directly into these partitions. Missing/unavailable partitions
+    # fall back to live storage for later archival; monitor
+    # fusillade_realtime_retained_fallback_total (normally zero) alongside
+    # fusillade_realtime_retained_total.
+    # Daily partition retirement irreversibly drops whole expired
+    # retained-response partitions. It is independently disabled and needs a
+    # session-capable direct primary connection: in schema mode the primary
+    # connection is reused, while a dedicated fusillade database requires the
+    # explicit direct (non-pooled) endpoint below. Keep the endpoint
+    # configured until every journaled retirement has completed, even if the
+    # enable flag is turned back off.
+    # retained_response_retirement_enabled: false
+    # Weekly batch-archive retirement irreversibly drops whole expired
+    # archive partitions once every batch in the week is past the
+    # finalization-anchored retention period below. Batch metadata rows are
+    # stamped retention-expired, never deleted. Requires the same
+    # session-capable maintenance endpoint as response retirement.
+    # batch_archive_retirement_enabled: false
+    # batch_archive_retention_days: <positive days>
+    # DEPRECATED and ignored: request templates are always written to the
+    # weekly generation-2 partitions now that the generation-1 heap has been
+    # retired. The key still parses so existing values files keep loading,
+    # but it logs a warning at startup. Remove it.
+    # template_generation_writes_enabled: false
+    # File-content expiry + weekly template partition retirement. Tombstones
+    # aged input-file metadata (rows survive) once every referencing batch's
+    # content is expired, then drops whole template weeks that no live file
+    # references. Requires the same session-capable maintenance endpoint.
+    # template_retirement_enabled: false
+    # template_retention_days: <positive days>
+    # Schema mode reuses the main direct credentials automatically. Override for
+    # dedicated databases or a different Fusillade query role. Use that role on
+    # the DIRECT host; startup attests database, role, schema, and ownership.
+    # retained_response_partition_maintenance_url: postgres://postgres:password@direct:5432/dwctl
 
     # Batch archive (fusillade phase 3): moves frozen terminal batches' rows
     # from fusillade.requests into the partitioned batch_requests_archive.
@@ -619,9 +965,10 @@ background_services:
     #     escalation_threshold_seconds: 900  # Default: 900 (15 minutes before expiry)
 
     # Endpoints that should use SSE streaming for usage tracking.
-    # Batch requests to these paths are sent with X-Fusillade-Stream: true,
-    # causing the upstream proxy to inject stream: true and stream_options.include_usage.
-    # The streamed response is reassembled into non-streaming JSON before storage.
+    # Batch requests to these paths have stream: true and stream_options.include_usage
+    # injected on the way out, and the streamed response is reassembled into
+    # non-streaming JSON before it is stored or returned. Only batch traffic is
+    # affected; a client request to the same path is left as the client sent it.
     streamable_endpoints:
       - /v1/chat/completions
       - /v1/completions
@@ -696,6 +1043,20 @@ image_normalizer:
     # endpoint_url: https://<account_id>.r2.cloudflarestorage.com
     # region: auto            # R2 uses "auto"; AWS S3 uses e.g. us-east-1
     # force_path_style: true  # required by most S3-compatible endpoints
+    # reuse_max_age_secs: 432000   # 5 days. Objects are deduplicated by
+    #                               # content hash, and the R2 lifecycle deletes
+    #                               # them 14 days after upload regardless of use.
+    #                               # A batch reference can be dispatched up to
+    #                               # 24h + the 7-day retry buffer after ingest,
+    #                               # so a dedup hit older than this is re-uploaded
+    #                               # rather than left to expire mid-batch.
+    #                               # 0 disables. Ignored when
+    #                               # unique_upload_keys is on.
+  # Store each ingest under its own object key (dw-img://{sha256}.{upload_id})
+  # instead of reusing one object per content hash. Enable only once every
+  # replica runs a version that reads upload-ID tokens; disable before
+  # rolling back past it.
+  unique_upload_keys: false
   fetcher:
     max_bytes: 20971520        # 20 MiB
     timeout_secs: 30

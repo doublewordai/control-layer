@@ -34,6 +34,13 @@ just test ts
 just test docker --build
 ```
 
+## Database migrations
+
+Read [Database migrations with rolling deployments](docs/schema-safe-migrations.md)
+before changing table columns or query projections. Transaction-pooled prepared
+statements can outlive application pods, so test compatibility with existing
+clients as well as a freshly started application.
+
 ## Developing
 
 ### 1. Install Prerequisites

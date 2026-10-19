@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT (SELECT is_deleted FROM users WHERE id = $1) as \"org_deleted!\",\n                      (SELECT count(*) FROM api_keys WHERE user_id = $1 AND is_deleted = false) as \"key_live!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "org_deleted!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 1,
+        "name": "key_live!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "a1cd5cdd84910298ea9dc1129c9174fcd5d284409e0b70443f3b80e63c1b71d4"
+}

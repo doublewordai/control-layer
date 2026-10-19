@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit,\n                   auto_topup_soft_failure_count, auto_topup_retry_after\n            FROM users WHERE id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "auto_topup_amount",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 1,
+        "name": "auto_topup_threshold",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 2,
+        "name": "auto_topup_monthly_limit",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 3,
+        "name": "auto_topup_soft_failure_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "auto_topup_retry_after",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "d47fa96207115a6b06c8bc00a2241eb41f1e265cb191f23f7c24aa7e28dce338"
+}

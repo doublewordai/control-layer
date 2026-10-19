@@ -1,0 +1,7 @@
+{
+  "error": {
+    "type": "invalid_request_error",
+    "code": "idempotency_key_in_use",
+    "message": "There is currently another in-flight request using this Idempotency-Key."
+  }
+}

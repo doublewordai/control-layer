@@ -125,9 +125,9 @@ pub async fn register<P: PoolProvider>(
         .map_err(|e| Error::Internal {
             operation: format!("spawn password hashing task: {e}"),
         })??;
-    // Generate a random display name if not provided
+    // Default the display name to the email prefix when not provided
     let display_name = if request.display_name.is_none() {
-        Some(crate::auth::utils::generate_random_display_name())
+        Some(crate::auth::utils::default_display_name(&request.email))
     } else {
         request.display_name
     };
@@ -515,6 +515,10 @@ pub async fn confirm_password_reset<P: PoolProvider>(
         auto_topup_threshold: None,
         auto_topup_monthly_limit: None,
         zero_data_retention: None,
+        default_serving_class: None,
+        self_hosted_only: None,
+        granted_serving_classes: Default::default(),
+        toleration_preset: Default::default(),
     };
 
     let mut tx = state.db.write().begin().await.unwrap();
@@ -652,6 +656,10 @@ pub async fn change_password<P: PoolProvider>(
         auto_topup_threshold: None,
         auto_topup_monthly_limit: None,
         zero_data_retention: None,
+        default_serving_class: None,
+        self_hosted_only: None,
+        granted_serving_classes: Default::default(),
+        toleration_preset: Default::default(),
     };
 
     user_repo.update(current_user.id, &update_request).await?;
@@ -807,8 +815,6 @@ pub async fn cli_callback<P: PoolProvider>(
             name: format!("DW CLI inference ({})", timestamp),
             description: Some("Created by dw login".to_string()),
             purpose: ApiKeyPurpose::Realtime,
-            requests_per_second: None,
-            burst_size: None,
             created_by: user_id,
             spend_limit: None,
             spend_limit_interval: None,
@@ -824,8 +830,6 @@ pub async fn cli_callback<P: PoolProvider>(
             name: format!("DW CLI platform ({})", timestamp),
             description: Some("Created by dw login".to_string()),
             purpose: ApiKeyPurpose::Platform,
-            requests_per_second: None,
-            burst_size: None,
             created_by: user_id,
             spend_limit: None,
             spend_limit_interval: None,
@@ -930,7 +934,7 @@ mod tests {
     use axum_test::TestServer;
     use sqlx::PgPool;
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_register_success(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -961,7 +965,7 @@ mod tests {
         assert_eq!(body.message, "Registration successful");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_register_disabled(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = false;
@@ -985,7 +989,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_password_validation(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -1010,7 +1014,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_register_with_initial_credits(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -1066,7 +1070,7 @@ mod tests {
         assert_eq!(balance, rust_decimal::Decimal::new(10000, 2));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_register_without_initial_credits_when_zero(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -1108,7 +1112,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_register_auto_generates_display_name(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -1136,21 +1140,11 @@ mod tests {
         let body: AuthResponse = response.json();
         assert_eq!(body.user.email, "autogen@example.com");
 
-        // Verify display name was auto-generated
-        assert!(body.user.display_name.is_some(), "Display name should be auto-generated");
-        let display_name = body.user.display_name.unwrap();
-
-        // Verify format: "{adjective} {noun} {4-digit number}"
-        let parts: Vec<&str> = display_name.split_whitespace().collect();
-        assert_eq!(parts.len(), 3, "Display name should have 3 parts, got: {}", display_name);
-        assert!(
-            parts[2].len() == 4 && parts[2].parse::<u32>().is_ok(),
-            "Third part should be a 4-digit number, got: {}",
-            parts[2]
-        );
+        // Verify display name defaulted to the email prefix
+        assert_eq!(body.user.display_name.as_deref(), Some("autogen"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_registration_info_enabled(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -1171,7 +1165,7 @@ mod tests {
         assert_eq!(body.message, "Registration is enabled");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_registration_info_disabled_native_auth(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = false;
@@ -1192,7 +1186,7 @@ mod tests {
         assert_eq!(body.message, "Registration is disabled");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_registration_info_disabled_allow_registration(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -1213,7 +1207,7 @@ mod tests {
         assert_eq!(body.message, "Registration is disabled");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_login_info_enabled(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -1233,7 +1227,7 @@ mod tests {
         assert_eq!(body.message, "Native login is enabled");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_login_info_disabled(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = false;
@@ -1253,7 +1247,7 @@ mod tests {
         assert_eq!(body.message, "Native login is disabled");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_login_success(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -1308,7 +1302,7 @@ mod tests {
         assert_eq!(body.message, "Login successful");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_login_disabled(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = false;
@@ -1330,7 +1324,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_login_invalid_email(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -1352,7 +1346,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::UNAUTHORIZED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_login_invalid_password(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -1402,7 +1396,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::UNAUTHORIZED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_login_user_without_password(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -1443,7 +1437,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::UNAUTHORIZED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_logout(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool, config).await;
@@ -1467,7 +1461,7 @@ mod tests {
         assert_eq!(body.message, "Logout successful");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_register_duplicate_email(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -1522,7 +1516,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_register_password_too_long(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -1548,7 +1542,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_register_registration_disabled(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -1573,7 +1567,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_request_password_reset_disabled(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = false;
@@ -1594,7 +1588,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_request_password_reset_nonexistent_user(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -1619,7 +1613,7 @@ mod tests {
         assert!(body.message.contains("If an account with that email exists"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_request_password_reset_sso_user(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -1663,7 +1657,7 @@ mod tests {
         assert!(body.message.contains("If an account with that email exists"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_confirm_password_reset_disabled(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = false;
@@ -1693,7 +1687,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_confirm_password_reset_invalid_token(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -1723,7 +1717,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_confirm_password_reset_password_too_short(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -1754,7 +1748,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_confirm_password_reset_password_too_long(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -1785,7 +1779,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_password_reset_full_flow(pool: PgPool) {
         use crate::test::utils::create_test_config;
 
@@ -1943,7 +1937,7 @@ mod tests {
         std::fs::remove_file(email_file.path()).ok();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_change_password_success_full(pool: PgPool) {
         use crate::test::utils::create_test_config;
 
@@ -2024,7 +2018,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::OK);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_change_password_wrong_current(pool: PgPool) {
         use crate::test::utils::create_test_config;
 
@@ -2083,7 +2077,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::UNAUTHORIZED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_change_password_sso_user_cannot_change(pool: PgPool) {
         use crate::test::utils::create_test_config;
 
@@ -2133,7 +2127,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_change_password_too_short(pool: PgPool) {
         use crate::test::utils::create_test_config;
 
@@ -2193,7 +2187,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_change_password_too_long(pool: PgPool) {
         use crate::test::utils::create_test_config;
 
@@ -2253,7 +2247,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_change_password_when_disabled(pool: PgPool) {
         use crate::test::utils::create_test_config;
 
@@ -2312,7 +2306,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_register_with_configured_default_roles(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -2348,7 +2342,7 @@ mod tests {
         assert!(body.user.roles.contains(&Role::RequestViewer));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_register_standard_user_role_always_present(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -2382,7 +2376,7 @@ mod tests {
         assert!(body.user.roles.contains(&Role::RequestViewer));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_session_cookie_includes_domain_when_configured(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -2412,7 +2406,7 @@ mod tests {
         assert!(cookie.contains("Domain=.example.com"), "cookie should include Domain: {cookie}");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_session_cookie_omits_domain_when_not_configured(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -2482,7 +2476,7 @@ mod tests {
             .collect()
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_cli_login_personal_success(pool: PgPool) {
         let (server, _bg) = crate::test::utils::create_test_app(pool.clone(), false).await;
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
@@ -2526,7 +2520,7 @@ mod tests {
         assert_eq!(response.headers().get("referrer-policy").unwrap(), "no-referrer");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_cli_login_org_success(pool: PgPool) {
         let (server, _bg) = crate::test::utils::create_test_app(pool.clone(), false).await;
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
@@ -2551,7 +2545,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_cli_callback_unknown_org(pool: PgPool) {
         let (server, _bg) = crate::test::utils::create_test_app(pool.clone(), false).await;
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
@@ -2575,7 +2569,7 @@ mod tests {
         assert_eq!(key_count, 0, "no CLI keys should be created when org lookup fails");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_cli_callback_rejects_api_key_auth(pool: PgPool) {
         let (server, _bg) = crate::test::utils::create_test_app(pool.clone(), false).await;
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
@@ -2588,8 +2582,6 @@ mod tests {
                 name: "test-key".to_string(),
                 description: None,
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -2606,7 +2598,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::UNAUTHORIZED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_cli_callback_rejects_invalid_port(pool: PgPool) {
         let (server, _bg) = crate::test::utils::create_test_app(pool.clone(), false).await;
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;

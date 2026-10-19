@@ -31,6 +31,10 @@ export function extractErrorMessage(request: {
       const reason = JSON.parse(request.error);
       const inner = fromBody(reason?.details?.body);
       if (inner) return inner;
+      if (reason?.details) {
+        const status = reason.details.status;
+        return typeof status === "number" ? `Request failed (${status})` : "Request failed";
+      }
     } catch {
       // Not JSON - fall through.
     }

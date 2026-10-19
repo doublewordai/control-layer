@@ -43,7 +43,7 @@ impl ProbeManager {
             r#"
             INSERT INTO probes (name, deployment_id, interval_seconds, active, http_method, request_path, request_body)
             VALUES ($1, $2, $3, true, $4, $5, $6)
-            RETURNING *
+            RETURNING id, name, deployment_id, interval_seconds, active, http_method, request_path, request_body, created_at, updated_at
             "#,
         )
         .bind(&probe.name)
@@ -63,7 +63,7 @@ impl ProbeManager {
     pub async fn get_probe(pool: &PgPool, id: Uuid) -> Result<Probe, AppError> {
         let probe = sqlx::query_as::<_, Probe>(
             r#"
-            SELECT * FROM probes WHERE id = $1
+            SELECT id, name, deployment_id, interval_seconds, active, http_method, request_path, request_body, created_at, updated_at FROM probes WHERE id = $1
             "#,
         )
         .bind(id)
@@ -82,7 +82,7 @@ impl ProbeManager {
     pub async fn list_probes(pool: &PgPool) -> Result<Vec<Probe>, AppError> {
         let probes = sqlx::query_as::<_, Probe>(
             r#"
-            SELECT * FROM probes ORDER BY created_at DESC
+            SELECT id, name, deployment_id, interval_seconds, active, http_method, request_path, request_body, created_at, updated_at FROM probes ORDER BY created_at DESC
             "#,
         )
         .fetch_all(pool)
@@ -96,7 +96,7 @@ impl ProbeManager {
     pub async fn list_active_probes(pool: &PgPool) -> Result<Vec<Probe>, AppError> {
         let probes = sqlx::query_as::<_, Probe>(
             r#"
-            SELECT * FROM probes WHERE active = true ORDER BY created_at DESC
+            SELECT id, name, deployment_id, interval_seconds, active, http_method, request_path, request_body, created_at, updated_at FROM probes WHERE active = true ORDER BY created_at DESC
             "#,
         )
         .fetch_all(pool)
@@ -230,7 +230,7 @@ impl ProbeManager {
     pub async fn activate_probe(pool: &PgPool, id: Uuid) -> Result<Probe, AppError> {
         let probe = sqlx::query_as::<_, Probe>(
             r#"
-            UPDATE probes SET active = true WHERE id = $1 RETURNING *
+            UPDATE probes SET active = true WHERE id = $1 RETURNING id, name, deployment_id, interval_seconds, active, http_method, request_path, request_body, created_at, updated_at
             "#,
         )
         .bind(id)
@@ -245,7 +245,7 @@ impl ProbeManager {
     pub async fn deactivate_probe(pool: &PgPool, id: Uuid) -> Result<Probe, AppError> {
         let probe = sqlx::query_as::<_, Probe>(
             r#"
-            UPDATE probes SET active = false WHERE id = $1 RETURNING *
+            UPDATE probes SET active = false WHERE id = $1 RETURNING id, name, deployment_id, interval_seconds, active, http_method, request_path, request_body, created_at, updated_at
             "#,
         )
         .bind(id)
@@ -266,7 +266,7 @@ impl ProbeManager {
                 request_path = COALESCE($4, request_path),
                 request_body = COALESCE($5, request_body)
             WHERE id = $1
-            RETURNING *
+            RETURNING id, name, deployment_id, interval_seconds, active, http_method, request_path, request_body, created_at, updated_at
             "#,
         )
         .bind(id)
@@ -454,7 +454,7 @@ impl ProbeManager {
             INSERT INTO probe_results
             (probe_id, success, response_time_ms, status_code, error_message, response_data, metadata)
             VALUES ($1, $2, $3, $4, $5, $6, $7)
-            RETURNING *
+            RETURNING id, probe_id, executed_at, success, response_time_ms, status_code, error_message, response_data, metadata
             "#,
         )
         .bind(execution.probe_id)
@@ -481,7 +481,7 @@ impl ProbeManager {
     ) -> Result<Vec<ProbeResult>, AppError> {
         let mut query = String::from(
             r#"
-            SELECT * FROM probe_results
+            SELECT id, probe_id, executed_at, success, response_time_ms, status_code, error_message, response_data, metadata FROM probe_results
             WHERE probe_id = $1
             "#,
         );
@@ -725,7 +725,7 @@ mod tests {
         .unwrap()
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_create_and_get_probe(pool: PgPool) {
         let deployment_id = setup_test_deployment(&pool).await;
 
@@ -751,7 +751,7 @@ mod tests {
         assert_eq!(fetched.name, created.name);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_list_probes(pool: PgPool) {
         // Create separate deployment for each probe
         for i in 0..3 {
@@ -775,7 +775,7 @@ mod tests {
         assert_eq!(probes.len(), 3);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_list_active_probes(pool: PgPool) {
         // Create separate deployments for each probe
         let deployment_id1 = setup_test_deployment(&pool).await;
@@ -818,7 +818,7 @@ mod tests {
         assert_eq!(active[0].id, probe1.id);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_activate_deactivate_probe(pool: PgPool) {
         let deployment_id = setup_test_deployment(&pool).await;
 
@@ -847,7 +847,7 @@ mod tests {
         assert!(activated.active);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_update_probe(pool: PgPool) {
         let deployment_id = setup_test_deployment(&pool).await;
 
@@ -896,7 +896,7 @@ mod tests {
         assert_eq!(unchanged.interval_seconds, 120);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_delete_probe(pool: PgPool) {
         let deployment_id = setup_test_deployment(&pool).await;
 
@@ -921,7 +921,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_deployment_statuses(pool: PgPool) {
         let deployment_id = setup_test_deployment(&pool).await;
 
@@ -948,7 +948,7 @@ mod tests {
         assert_eq!(*interval, Some(60));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_statistics_empty(pool: PgPool) {
         let deployment_id = setup_test_deployment(&pool).await;
 
@@ -974,7 +974,7 @@ mod tests {
         assert_eq!(stats.success_rate, 0.0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_probe_results_empty(pool: PgPool) {
         let deployment_id = setup_test_deployment(&pool).await;
 
@@ -996,7 +996,7 @@ mod tests {
         assert_eq!(results.len(), 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_probe_notify_trigger(pool: PgPool) {
         use sqlx::postgres::PgListener;
         use tokio::time::{Duration, timeout};

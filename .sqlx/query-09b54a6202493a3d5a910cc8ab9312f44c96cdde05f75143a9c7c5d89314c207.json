@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT api_key_id, total_spend, window_spend FROM api_key_spend_checkpoints",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "api_key_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "total_spend",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 2,
+        "name": "window_spend",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "09b54a6202493a3d5a910cc8ab9312f44c96cdde05f75143a9c7c5d89314c207"
+}

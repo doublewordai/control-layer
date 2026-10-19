@@ -3,14 +3,22 @@
 //! This module defines the request and response structures used by the proxy's
 //! API endpoints, particularly the `/v1/models` endpoint which lists available
 //! targets as OpenAI-compatible models.
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 /// Requests to the /v1/{*} endpoints get forwarded onto OpenAI compatible targets.
 /// The target is chosen based on the model specified in the request body.
+///
+/// `Cow` rather than `&str`: a borrowed `&str` cannot represent a JSON string
+/// containing escape sequences (e.g. the RFC 8259 solidus escape `\/` that PHP's
+/// `json_encode` emits by default), so deserialization would reject those
+/// requests outright. `Cow` stays zero-copy for unescaped strings and allocates
+/// only when unescaping is required.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ExtractedModel<'a> {
     #[serde(borrow)]
-    pub(crate) model: &'a str,
+    pub(crate) model: Cow<'a, str>,
 }
 
 /// The returned models from the /v1/models endpoint.

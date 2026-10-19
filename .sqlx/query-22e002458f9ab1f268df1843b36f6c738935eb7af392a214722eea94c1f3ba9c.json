@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT EXISTS (\n                SELECT 1 FROM credits_transactions\n                WHERE user_id = $1 AND transaction_type = 'purchase'\n            ) AS \"purchased!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "purchased!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "22e002458f9ab1f268df1843b36f6c738935eb7af392a214722eea94c1f3ba9c"
+}

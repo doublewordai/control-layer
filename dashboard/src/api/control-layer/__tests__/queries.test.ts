@@ -257,6 +257,19 @@ describe("dwctlApi.users", () => {
   });
 });
 
+describe("dwctlApi.models.overlays", () => {
+  it("handles model overlays in demo mode", async () => {
+    const models = await dwctlApi.models.list();
+    await expect(dwctlApi.models.overlays.list(models.data[0].id)).resolves.toEqual([]);
+  });
+
+  it("rejects an unknown demo model", async () => {
+    await expect(dwctlApi.models.overlays.list("missing-model")).rejects.toThrow(
+      "Failed to fetch model overlays: 404",
+    );
+  });
+});
+
 describe("dwctlApi.models", () => {
   describe("list", () => {
     it("should fetch all models", async () => {
@@ -736,6 +749,21 @@ describe("dwctlApi.cost", () => {
       expect(result).toHaveProperty("id");
       expect(result.user_id).toBe(userId);
       expect(result.amount).toBe(amount);
+    });
+
+    it("should remove funds when transaction_type is admin_removal", async () => {
+      const userId = "550e8400-e29b-41d4-a716-446655440001";
+
+      const result = await dwctlApi.cost.addFunds({
+        user_id: userId,
+        source_id: `550e8400-e29b-41d4-a716-446655440001_${Date.now()}`,
+        amount: 25,
+        transaction_type: "admin_removal",
+      });
+
+      expect(result.user_id).toBe(userId);
+      expect(result.amount).toBe(25);
+      expect(result.transaction_type).toBe("admin_removal");
     });
 
     it("should throw error for invalid user", async () => {

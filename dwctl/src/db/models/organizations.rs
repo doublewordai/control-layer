@@ -33,6 +33,17 @@ pub struct OrganizationUpdateDBRequest {
     pub low_balance_threshold: Option<Option<f32>>,
     /// Account-wide zero-data-retention flag. `None` = don't change.
     pub zero_data_retention: Option<bool>,
+    /// Account setting: default serving class. `None` = don't change,
+    /// `Some(None)` = clear, `Some(Some(class))` = set.
+    pub default_serving_class: Option<Option<String>>,
+    /// Account setting: never fall over to an external provider. `None` = don't change.
+    pub self_hosted_only: Option<bool>,
+    /// Account setting: elevated serving classes held. `None` = don't change.
+    pub granted_serving_classes: Option<Vec<String>>,
+    /// Account setting: the scheduling-toleration preset id pinned to this
+    /// organization's requests. `None` = don't change, `Some(None)` = clear
+    /// (back to the "Default" setting), `Some(Some(id))` = set the preset.
+    pub toleration_preset: Option<Option<String>>,
 }
 
 /// Database response for an organization membership

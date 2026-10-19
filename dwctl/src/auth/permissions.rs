@@ -155,14 +155,6 @@ pub mod resource {
         }
     }
 
-    #[derive(Default)]
-    pub struct ToolSources;
-
-    impl From<ToolSources> for Resource {
-        fn from(_: ToolSources) -> Resource {
-            Resource::ToolSources
-        }
-    }
     impl From<Connections> for Resource {
         fn from(_: Connections) -> Resource {
             Resource::Connections
@@ -888,7 +880,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_is_org_member_returns_true_for_owner(pool: PgPool) {
         let alice = create_db_user(&pool, "alice", "alice@example.com").await;
@@ -917,7 +909,7 @@ mod tests {
         assert!(result, "Owner should be recognized as org member");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_is_org_member_returns_true_for_member(pool: PgPool) {
         let alice = create_db_user(&pool, "alice", "alice@example.com").await;
@@ -948,7 +940,7 @@ mod tests {
         assert!(result, "Member should be recognized as org member");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_is_org_member_returns_true_for_admin(pool: PgPool) {
         let alice = create_db_user(&pool, "alice", "alice@example.com").await;
@@ -979,7 +971,7 @@ mod tests {
         assert!(result, "Admin should be recognized as org member");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_is_org_member_returns_false_for_non_member(pool: PgPool) {
         let alice = create_db_user(&pool, "alice", "alice@example.com").await;
@@ -1009,7 +1001,7 @@ mod tests {
         assert!(!result, "Non-member should not be recognized as org member");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_can_manage_org_resource_owner_and_admin_only(pool: PgPool) {
         let alice = create_db_user(&pool, "alice", "alice@example.com").await;

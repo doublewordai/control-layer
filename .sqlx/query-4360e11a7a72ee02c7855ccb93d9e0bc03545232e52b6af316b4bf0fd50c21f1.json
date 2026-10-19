@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM deployed_model_components\n             WHERE composite_model_id = $1 AND deployed_model_id = $2 AND pool = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4360e11a7a72ee02c7855ccb93d9e0bc03545232e52b6af316b4bf0fd50c21f1"
+}

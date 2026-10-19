@@ -7,8 +7,8 @@ use crate::api::models::cache_pricing::CachePricingResponse;
 use crate::api::models::groups::GroupResponse;
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::db::models::deployments::{
-    BackoffConfig, DeploymentDBResponse, FallbackConfig, JitterStrategy, LoadBalancingStrategy, ModelCatalogMetadata, ModelType,
-    ProviderPricing, ProviderPricingUpdate, TrafficRuleDBRow,
+    AffinityConfig, AimdConfig, BackoffConfig, DeploymentDBResponse, FallbackConfig, JitterStrategy, LoadBalancingStrategy,
+    ModelCatalogMetadata, ModelType, ProviderPricing, ProviderPricingUpdate, TrafficRuleDBRow,
 };
 use crate::reasoning::{ReasoningTranslationOverrides, SupportedReasoningEfforts};
 use crate::types::{DeploymentId, InferenceEndpointId, UserId};
@@ -159,7 +159,7 @@ pub struct TariffDefinition {
     /// Output price per token (sent/returned as string to preserve precision)
     #[schema(value_type = String)]
     pub output_price_per_token: rust_decimal::Decimal,
-    /// Optional API key purpose this tariff applies to (realtime, batch, playground)
+    /// Required for new prices: realtime, batch or playground. Missing/null is rejected.
     pub api_key_purpose: Option<crate::db::models::api_keys::ApiKeyPurpose>,
     /// Optional completion window (priority) for batch tariffs (e.g., "24h", "1h")
     /// Required when api_key_purpose is Batch to support multiple pricing tiers per priority
@@ -218,13 +218,7 @@ pub struct StandardModelCreate {
     pub model_type: Option<ModelType>,
     /// Optional array of model capabilities
     pub capabilities: Option<Vec<String>>,
-    /// Global per-model rate limit: requests per second (null = no limit)
-    pub requests_per_second: Option<f32>,
-    /// Global per-model rate limit: maximum burst size (null = no limit)
-    pub burst_size: Option<i32>,
-    /// Maximum number of concurrent requests allowed for this model (null = no limit)
-    pub capacity: Option<i32>,
-    /// Maximum number of concurrent batch requests allowed for this model (null = defaults to capacity or no limit)
+    /// Maximum number of concurrent batch requests allowed for this model (null = the batch daemon default)
     pub batch_capacity: Option<i32>,
     /// Throughput in requests/second for batch capacity calculations (null = use config default)
     pub throughput: Option<f32>,
@@ -238,9 +232,6 @@ pub struct StandardModelCreate {
     /// Whether to mark provider as trusted in strict mode (defaults to false, used when strict_mode=true)
     #[serde(default)]
     pub trusted: Option<bool>,
-    /// Whether to enable the open_responses adapter that converts /v1/responses to /v1/chat/completions (defaults to true)
-    #[serde(default)]
-    pub open_responses_adapter: Option<bool>,
     /// Per-surface overrides for the endpoint's provider reasoning translations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_translation_overrides: Option<ReasoningTranslationOverrides>,
@@ -260,6 +251,13 @@ pub struct StandardModelCreate {
     pub backoff_jitter: JitterStrategy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backoff_max_total_ms: Option<i32>,
+    /// Stream first-frame deadline; null inherits the global default, 0 disables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_token_timeout_ms: Option<i64>,
+    /// Priority-only share controller overrides; absent/null inherits defaults.
+    /// Set enabled=false to disable. Explicit enabled overrides require a compatible deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aimd: Option<AimdConfig>,
     /// Traffic routing rules evaluated against API key labels.
     /// Each rule matches on key labels (e.g., purpose) and either denies or redirects traffic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -288,13 +286,8 @@ pub struct CompositeModelCreate {
     pub model_type: Option<ModelType>,
     /// Optional array of model capabilities
     pub capabilities: Option<Vec<String>>,
-    /// Global per-model rate limit: requests per second (null = no limit)
-    pub requests_per_second: Option<f32>,
-    /// Global per-model rate limit: maximum burst size (null = no limit)
-    pub burst_size: Option<i32>,
-    /// Maximum number of concurrent requests allowed for this model (null = no limit)
-    pub capacity: Option<i32>,
-    /// Maximum number of concurrent batch requests allowed for this model (null = defaults to capacity or no limit)
+    pub realtime_inflight_limit: Option<i32>,
+    /// Maximum number of concurrent batch requests allowed for this model (null = the batch daemon default)
     pub batch_capacity: Option<i32>,
     /// Throughput in requests/second for batch capacity calculations (null = use config default)
     pub throughput: Option<f32>,
@@ -314,6 +307,11 @@ pub struct CompositeModelCreate {
     /// which defaults to true.
     #[serde(default = "default_fallback_statuses")]
     pub fallback_on_status: Vec<i32>,
+    /// Extra HTTP status codes that trigger fallback for realtime traffic only
+    /// (defaults to [529], so realtime requests reroute when a provider sheds
+    /// load). Batch, flex and background requests run their own retries.
+    #[serde(default = "default_realtime_fallback_statuses")]
+    pub fallback_realtime_on_status: Vec<i32>,
     /// Sample with replacement during weighted random failover (defaults to false)
     #[serde(default)]
     pub fallback_with_replacement: bool,
@@ -341,15 +339,23 @@ pub struct CompositeModelCreate {
     /// (null = no budget cap).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backoff_max_total_ms: Option<i32>,
+    /// Stream first-frame deadline; null inherits the global default, 0 disables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_token_timeout_ms: Option<i64>,
+    /// Priority-only share controller overrides; absent/null inherits defaults.
+    /// Set enabled=false to disable. Explicit enabled overrides require a compatible deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aimd: Option<AimdConfig>,
+    /// Priority-only conversation affinity; absent/null keeps per-request selection.
+    /// Set `target_conversations` to what the preferred provider can serve concurrently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affinity: Option<AffinityConfig>,
     /// Whether to sanitize/filter sensitive data from model responses (defaults to false, used when strict_mode=false)
     #[serde(default)]
     pub sanitize_responses: bool,
     /// Whether to mark provider as trusted in strict mode (defaults to false, used when strict_mode=true)
     #[serde(default)]
     pub trusted: Option<bool>,
-    /// Whether to enable the open_responses adapter that converts /v1/responses to /v1/chat/completions (defaults to true)
-    #[serde(default)]
-    pub open_responses_adapter: Option<bool>,
     /// Traffic routing rules evaluated against API key labels.
     /// Each rule matches on key labels (e.g., purpose) and either denies or redirects traffic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -369,6 +375,10 @@ fn default_true() -> bool {
 
 fn default_fallback_statuses() -> Vec<i32> {
     vec![499, 500, 502, 503, 504]
+}
+
+fn default_realtime_fallback_statuses() -> Vec<i32> {
+    vec![529]
 }
 
 fn default_backoff_initial_ms() -> i32 {
@@ -392,15 +402,8 @@ pub struct DeployedModelUpdate {
     pub description: Option<Option<String>>,
     pub model_type: Option<Option<ModelType>>,
     pub capabilities: Option<Option<Vec<String>>>,
-    /// Global per-model rate limit: requests per second (null = no change, Some(None) = remove limit)
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
-    pub requests_per_second: Option<Option<f32>>,
-    /// Global per-model rate limit: maximum burst size (null = no change, Some(None) = remove limit)
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
-    pub burst_size: Option<Option<i32>>,
-    /// Maximum concurrent requests (null = no change, Some(None) = remove limit, Some(Some(n)) = set limit)
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
-    pub capacity: Option<Option<i32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realtime_inflight_limit: Option<i32>,
     /// Maximum concurrent batch requests (null = no change, Some(None) = remove limit, Some(Some(n)) = set limit)
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub batch_capacity: Option<Option<i32>>,
@@ -426,6 +429,9 @@ pub struct DeployedModelUpdate {
     /// HTTP status codes that trigger fallback (null = no change)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_on_status: Option<Vec<i32>>,
+    /// Extra HTTP status codes that trigger fallback for realtime traffic only (null = no change)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_realtime_on_status: Option<Vec<i32>>,
     /// Sample with replacement during weighted random failover (null = no change)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_with_replacement: Option<bool>,
@@ -451,15 +457,23 @@ pub struct DeployedModelUpdate {
     /// (null = no change, Some(None) = clear cap, Some(Some(n)) = set).
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub backoff_max_total_ms: Option<Option<i32>>,
+    /// Omitted = unchanged; null = inherit proxy default; 0 = disable deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub first_token_timeout_ms: Option<Option<i64>>,
+    /// Omitted = unchanged; null = inherit defaults; object = replace overrides.
+    /// Use {"enabled":false} to disable.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub aimd: Option<Option<AimdConfig>>,
+    /// Omitted = unchanged; null = per-request selection; object = replace the
+    /// affinity configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub affinity: Option<Option<AffinityConfig>>,
     /// Whether to sanitize/filter sensitive data from model responses (null = no change, used when strict_mode=false)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sanitize_responses: Option<bool>,
     /// Whether to mark provider as trusted in strict mode (null = no change, used when strict_mode=true)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted: Option<bool>,
-    /// Whether to enable the open_responses adapter (null = no change)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub open_responses_adapter: Option<bool>,
     /// Reasoning translation overrides (omitted = unchanged, null = inherit both endpoint defaults).
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub reasoning_translation_overrides: Option<Option<ReasoningTranslationOverrides>>,
@@ -516,16 +530,9 @@ pub struct DeployedModelResponse {
     pub hosted_on: Option<InferenceEndpointId>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    /// Global per-model rate limit: requests per second (null = no limit)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub requests_per_second: Option<f32>,
-    /// Global per-model rate limit: maximum burst size (null = no limit)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub burst_size: Option<i32>,
-    /// Maximum number of concurrent requests allowed for this model (null = no limit)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub capacity: Option<i32>,
-    /// Maximum number of concurrent batch requests allowed for this model (null = defaults to capacity or no limit)
+    pub realtime_inflight_limit: Option<i32>,
+    /// Maximum number of concurrent batch requests allowed for this model (null = the batch daemon default)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_capacity: Option<i32>,
     /// Throughput in requests/second for batch capacity calculations (null = use config default)
@@ -549,6 +556,9 @@ pub struct DeployedModelResponse {
     /// Active customer prompt-cache pricing (only included when include=pricing)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_pricing: Option<CachePricingResponse>,
+    /// Class-specific cache prices; omitted classes inherit cache_pricing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_pricing_by_class: Option<std::collections::BTreeMap<String, CachePricingResponse>>,
     /// Inference endpoint information (only included if requested)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<super::inference_endpoints::InferenceEndpointResponse>,
@@ -575,9 +585,6 @@ pub struct DeployedModelResponse {
     /// Whether to mark provider as trusted in strict mode (used when strict_mode=true)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trusted: Option<bool>,
-    /// Whether the open_responses adapter is enabled (converts /v1/responses to /v1/chat/completions)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub open_responses_adapter: Option<bool>,
     /// Provider reasoning translation overrides. Omitted for composite models.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_translation_overrides: Option<ReasoningTranslationOverrides>,
@@ -593,6 +600,16 @@ pub struct DeployedModelResponse {
     /// Catalog metadata for display purposes
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ModelCatalogMetadata>,
+    /// Declarative source reapplied during startup. Absent for manually managed models.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provisioning_source: Option<String>,
+    /// Serving classes this model offers, keyed by class name (`interactive`,
+    /// `throughput`, optionally `standard`), each a preset of targets
+    /// `{ttft_ms, itl_ms, priority}`. Empty object = standard only. Declared
+    /// in the model catalog. An internal, platform-manager detail: only
+    /// included for callers with `Models::ReadAll`, never shown to customers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serving_classes: Option<serde_json::Value>,
 }
 
 impl From<DeploymentDBResponse> for DeployedModelResponse {
@@ -613,10 +630,14 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             enabled: db.fallback_enabled,
             on_rate_limit: db.fallback_on_rate_limit,
             on_status: db.fallback_on_status,
+            realtime_on_status: db.fallback_realtime_on_status,
             with_replacement: db.fallback_with_replacement,
             max_attempts: db.fallback_max_attempts,
             backoff,
             max_total_backoff_ms: db.backoff_max_total_ms,
+            first_token_timeout_ms: db.first_token_timeout_ms,
+            aimd: db.aimd,
+            affinity: db.affinity,
         });
 
         Self {
@@ -631,18 +652,17 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             hosted_on: db.hosted_on,
             created_at: db.created_at,
             updated_at: db.updated_at,
-            requests_per_second: db.requests_per_second,
-            burst_size: db.burst_size,
-            capacity: db.capacity,
+            realtime_inflight_limit: db.is_composite.then_some(db.realtime_inflight_limit),
             batch_capacity: db.batch_capacity,
             throughput: db.throughput,
             groups: None,           // By default, relationships are not included
             metrics: None,          // By default, metrics are not included
             status: None,           // By default, probe status is not included
             provider_pricing: None, // By default, provider pricing is not included
-            cache_pricing: None,    // By default, cache pricing is not included
-            endpoint: None,         // By default, endpoint is not included
-            tariffs: None,          // By default, tariffs are not included
+            cache_pricing_by_class: None,
+            cache_pricing: None, // By default, cache pricing is not included
+            endpoint: None,      // By default, endpoint is not included
+            tariffs: None,       // By default, tariffs are not included
             // Composite model fields
             is_composite: Some(db.is_composite),
             lb_strategy: if db.is_composite { Some(db.lb_strategy) } else { None },
@@ -650,7 +670,6 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             components: None, // By default, components are not included
             sanitize_responses: Some(db.sanitize_responses),
             trusted: Some(db.trusted),
-            open_responses_adapter: Some(db.open_responses_adapter),
             reasoning_translation_overrides: if db.is_composite {
                 None
             } else {
@@ -663,6 +682,9 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
                 .inspect_err(|e| tracing::warn!(error = %e, "failed to deserialize model metadata"))
                 .ok()
                 .filter(|m| *m != ModelCatalogMetadata::default()),
+            provisioning_source: db.provisioning_source,
+            // Attached by the handler for platform managers only.
+            serving_classes: None,
         }
     }
 }
@@ -692,6 +714,12 @@ impl DeployedModelResponse {
         self
     }
 
+    /// Include the model's serving-class presets (platform managers only).
+    pub fn with_serving_classes(mut self, serving_classes: Option<serde_json::Value>) -> Self {
+        self.serving_classes = serving_classes;
+        self
+    }
+
     /// Create a response with cache pricing included.
     pub fn with_cache_pricing(mut self, cache_pricing: CachePricingResponse) -> Self {
         self.cache_pricing = Some(cache_pricing);
@@ -706,14 +734,12 @@ impl DeployedModelResponse {
 
     /// Mask rate limiting information (sets to None for users without permission)
     pub fn mask_rate_limiting(mut self) -> Self {
-        self.requests_per_second = None;
-        self.burst_size = None;
+        self.realtime_inflight_limit = None;
         self
     }
 
     /// Mask capacity information (sets to None for users without permission)
     pub fn mask_capacity(mut self) -> Self {
-        self.capacity = None;
         self.batch_capacity = None;
         self.throughput = None;
         self
@@ -738,7 +764,6 @@ impl DeployedModelResponse {
     pub fn mask_response_config(mut self) -> Self {
         self.sanitize_responses = None;
         self.trusted = None;
-        self.open_responses_adapter = None;
         self.reasoning_translation_overrides = None;
         self
     }
@@ -838,6 +863,57 @@ impl DeployedModelResponse {
 
 // ===== Composite Model Component Types =====
 
+/// Which of a composite's named pools a membership belongs to.
+///
+/// A composite is a set of named pools, and onwards resolves `request class ->
+/// pool` before it selects a provider. `Default` is the pool that serves every
+/// class without a pool of its own — exactly the single member list that
+/// existed before pools — so an unqualified component is unchanged.
+///
+/// The same hosted model may be a member of more than one pool (dynamo at
+/// position 0 of both), with independent ordering in each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ComponentPool {
+    /// Serves every request class that has no pool of its own. The default, so
+    /// adding a component never silently creates a continuation target.
+    #[default]
+    Default,
+    /// Serves `/v1/completions` — token-id continuation resume legs and
+    /// ordinary completions traffic alike. Members here are validated
+    /// continuation targets; "never serves chat" is structural, because they
+    /// are simply not members of the default pool.
+    Completions,
+}
+
+impl ComponentPool {
+    /// The stored/wire value, bounded by the column's CHECK constraint.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ComponentPool::Default => "default",
+            ComponentPool::Completions => "completions",
+        }
+    }
+
+    /// Parse a stored value, falling back to the column default for anything
+    /// unrecognised (a row can only hold what the CHECK constraint allows).
+    pub fn from_db(value: &str) -> Self {
+        match value {
+            "completions" => ComponentPool::Completions,
+            _ => ComponentPool::Default,
+        }
+    }
+}
+
+/// Which pool a component request addresses. Omitted ⇒ `default`, so every
+/// existing caller keeps addressing the pool it always did.
+#[derive(Debug, Clone, Copy, Default, Deserialize, IntoParams)]
+pub struct ComponentPoolQuery {
+    /// The pool this component belongs to. Defaults to `default`.
+    #[serde(default)]
+    pub pool: ComponentPool,
+}
+
 /// Request to add a component to a composite model
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ModelComponentCreate {
@@ -852,6 +928,10 @@ pub struct ModelComponentCreate {
     /// PATCH endpoint's `sort_order` to reorder. Retained for API compatibility.
     #[serde(default)]
     pub sort_order: i32,
+    /// Which of the composite's pools to add this member to. Defaults to
+    /// `default`.
+    #[serde(default)]
+    pub pool: ComponentPool,
 }
 
 fn default_weight() -> i32 {
@@ -874,6 +954,9 @@ pub struct ModelComponentUpdate {
     /// dense, unique 0..n-1 sequence — two components can never share a position.
     /// Out-of-range values are clamped. Omit to leave the order unchanged.
     pub sort_order: Option<i32>,
+    // A component's pool is not updatable: it is part of which membership this
+    // is (the request addresses it with `?pool=`), not a property of one. Move
+    // a member between pools by removing it from one and adding it to the other.
 }
 
 /// Summary of a model used as a component in a composite model
@@ -894,8 +977,6 @@ pub struct ComponentModelSummary {
     pub endpoint: Option<ComponentEndpointSummary>,
     /// Whether to mark provider as trusted in strict mode
     pub trusted: bool,
-    /// Whether the open_responses adapter is enabled
-    pub open_responses_adapter: bool,
 }
 
 /// Summary of an endpoint hosting a component model
@@ -915,6 +996,8 @@ pub struct ModelComponentResponse {
     pub weight: i32,
     /// Whether this component is enabled
     pub enabled: bool,
+    /// Which of the composite's pools this membership belongs to
+    pub pool: ComponentPool,
     /// Sort order for priority-based routing (lower = higher priority)
     pub sort_order: i32,
     /// When this component was added

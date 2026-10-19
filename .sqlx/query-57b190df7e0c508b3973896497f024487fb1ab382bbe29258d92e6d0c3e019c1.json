@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT total_spend AS \"total_spend!\", window_spend AS \"window_spend!\",\n                      window_started_at AS \"window_started_at!\"\n               FROM api_key_spend_checkpoints WHERE api_key_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "total_spend!",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 1,
+        "name": "window_spend!",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 2,
+        "name": "window_started_at!",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "57b190df7e0c508b3973896497f024487fb1ab382bbe29258d92e6d0c3e019c1"
+}

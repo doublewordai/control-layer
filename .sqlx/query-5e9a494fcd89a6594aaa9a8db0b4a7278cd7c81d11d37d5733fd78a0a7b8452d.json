@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE deployed_model_components SET pool = 'completions', sort_order = 1\n         WHERE deployed_model_id = '40000000-0000-0000-0000-000000000005'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "5e9a494fcd89a6594aaa9a8db0b4a7278cd7c81d11d37d5733fd78a0a7b8452d"
+}

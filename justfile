@@ -13,9 +13,12 @@ get-admin-email:
 # - macOS or Linux
 # - Homebrew (recommended for tool installation)
 #
-# First-time setup:
-#   brew install docker hurl postgresql
-#   just setup
+# First-time setup (cargo comes from rustup, not Homebrew):
+#   brew install hurl postgresql pnpm
+#   brew install --cask docker
+#   cargo install cargo-nextest --locked
+#   cargo install sqlx-cli --version '^0.8' --no-default-features --features native-tls,postgres --locked
+#   just check
 check:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -26,7 +29,7 @@ check:
     missing_tools=()
 
     # Required tools
-    required_tools=("docker" "hurl" "psql" "createdb" "cargo" "pnpm")
+    required_tools=("docker" "hurl" "psql" "createdb" "cargo" "pnpm" "sqlx")
     for tool in "${required_tools[@]}"; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             missing_tools+=("$tool")
@@ -36,6 +39,10 @@ check:
     # Check docker compose (subcommand, not separate binary)
     if ! docker compose version >/dev/null 2>&1; then
         missing_tools+=("docker compose-plugin")
+    fi
+
+    if ! cargo nextest --version >/dev/null 2>&1; then
+        missing_tools+=("cargo-nextest (cargo install cargo-nextest --locked)")
     fi
 
     # Report missing tools
@@ -146,6 +153,31 @@ db-setup:
         exit 1
     fi
 
+    echo "Running underway migrations..."
+    # The underway crate (a dependency) ships its own SQLx migrations that
+    # create the underway schema (underway.task, underway.task_attempt, etc.).
+    # These are applied at runtime by underway::run_migrations, but are not
+    # part of dwctl's migration set. They are needed at compile time for
+    # SQLx query verification when DATABASE_URL is set (e.g. when exported in
+    # the shell, as CLAUDE.md suggests). Without them, cargo clippy
+    # --all-features fails with "relation \"underway.task\" does not exist".
+    UNDERWAY_DIR=$(find "${CARGO_HOME:-$HOME/.cargo}/registry/src" \
+        -path "*/underway-*/migrations" -type d 2>/dev/null | head -1)
+    if [ -n "$UNDERWAY_DIR" ] && [ -d "$UNDERWAY_DIR" ]; then
+        PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d dwctl \
+            -c "CREATE SCHEMA IF NOT EXISTS underway" >/dev/null
+        UNDERWAY_DATABASE_URL="postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl?options=-c%20search_path%3Dunderway"
+        if DATABASE_URL="$UNDERWAY_DATABASE_URL" sqlx migrate run --source "$UNDERWAY_DIR"; then
+            echo "  ✅ underway migrations complete"
+        else
+            echo "  ❌ underway migrations failed"
+            exit 1
+        fi
+    else
+        echo "  ⚠️ underway crate not found in cargo registry, skipping"
+        echo "     Run 'cargo fetch' first, or these will be applied at runtime"
+    fi
+
     echo ""
     echo "✅ Database setup complete!"
     echo ""
@@ -153,26 +185,88 @@ db-setup:
     echo "  dwctl:     postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl?options=-c%20search_path%3Dpublic%2Cfusillade"
     echo "  fusillade: postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/fusillade"
 
-# Start the full development stack with hot reload
+# Run dwctl from source: 'just dev-native'
+#
+# The inner loop for Rust work. Compiles dwctl on the host and runs it against
+# the Postgres that 'just db-start' provides, so a change is a cargo rebuild.
+# This is also the only mode SQLx's compile-time query verification is set up for.
+# It reads the DATABASE_URL that 'just db-setup' writes into .env.
+#
+# Both cookie overrides below are necessary for local work. config.yaml
+# ships cookie_secure: true and cookie_same_site: "strict", are for
+# production, but impossible on http://localhost.
+#
+# Extra arguments are passed to cargo, e.g. 'just dev-native --release'.
+#
+# Examples:
+#   just dev-native                              # Debug build, native auth on localhost
+#   just dev-native --release                    # Optimised build
+#   RUST_LOG=info,dwctl=debug,sqlx=debug just dev-native   # Log every SQL statement and its timing
+
+# Build and run dwctl on the host, against 'just db-start' Postgres
+dev-native *args="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    DB_HOST="${DB_HOST:-localhost}"
+    DB_PORT="${DB_PORT:-5432}"
+
+    if ! command -v pg_isready >/dev/null 2>&1; then
+        echo "❌ pg_isready not found - install the PostgreSQL client tools"
+        exit 1
+    fi
+
+    if ! pg_isready -h "$DB_HOST" -p "$DB_PORT" >/dev/null 2>&1; then
+        echo "❌ No PostgreSQL on $DB_HOST:$DB_PORT"
+        echo ""
+        echo "   Start it and create the databases:"
+        echo ""
+        echo "     just db-start && just db-setup"
+        echo ""
+        exit 1
+    fi
+
+    # db-setup writes this; without it SQLx has no DATABASE_URL to verify
+    # queries against and the build fails with errors that point at the SQL
+    # rather than at the missing file.
+    if [ ! -f dwctl/.env ]; then
+        echo "❌ dwctl/.env is missing - SQLx needs it to verify queries at compile time"
+        echo ""
+        echo "     just db-setup"
+        echo ""
+        exit 1
+    fi
+
+    echo "▸ PostgreSQL up on $DB_HOST:$DB_PORT"
+    echo "▸ Native auth relaxed for http://localhost (Secure off, SameSite=lax)"
+    echo ""
+
+    DWCTL_AUTH__NATIVE__SESSION__COOKIE_SECURE=false \
+    DWCTL_AUTH__NATIVE__SESSION__COOKIE_SAME_SITE=lax \
+    cargo run {{args}}
+
+# Start the containerised development stack: 'just dev'
 #
 # Uses docker-compose.yml (base) + docker-compose.override.yml (dev overrides):
 # - docker-compose.yml: Production-ready service definitions
-# - docker-compose.override.yml: Development-specific settings (ports, volumes, hot reload)
+# - docker-compose.override.yml: Development-specific settings (ports, volumes)
 #
 # Services running in development mode:
-# - control-layer: Rust API server (port 3001) - hot reloads via volume mounts
+# - control-layer: published dwctl image (port 3001) - NOT built from source
 # - control-layer-frontend: React dev server (port 5173) - Vite HMR enabled
-# - postgres: Database (port 5432) - exposed for direct access
+# - postgres: Database (port 5433 on the host) - exposed for direct access
 #
-# The --watch flag enables hot reload. File changes trigger container rebuilds.
+# The --watch flag rebuilds the frontend container on dependency changes.
+# Editing Rust here does nothing: dwctl is an image. Use 'just dev-native'
+# when the change lives in Rust.
 #
-# Access the app at: https://localhost
 # Direct API access: http://localhost:3001
-# Database: postgres://control_layer:control_layer_password@localhost:5432/control_layer
-#
+# Database: postgres://control_layer:control_layer_password@localhost:5433/control_layer
 #
 # Examples:
 #   just dev                    # Standard development stack
+
+# Containerised stack: dwctl image + dashboard dev server + Postgres
 dev *args="":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -218,7 +312,7 @@ down *args="":
     docker compose down {{args}}
 
 
-# Run tests: 'just test' or 'just test [docker|rust|ts]'
+# Run tests: 'just test' or 'just test [docker|rust|ts|memory]'
 #
 # Test targets available:
 #
@@ -242,12 +336,28 @@ down *args="":
 # - Runs TypeScript compiler checks and ESLint
 # - Executes Vitest unit tests for React components
 #
+# memory: Heap budgets for requests in flight (dwctl/tests/memory_budget)
+# - Requires PostgreSQL database (run 'just db-setup' first)
+# - Prints the heap each request holds; also part of 'just test rust'
+#
 # Examples:
 #   just test                    # Test against running services
 #   just test docker             # Full docker integration test
 #   just test rust               # Backend unit tests
 #   just test ts                 # Frontend tests
+#   just test memory             # Request memory budgets
+[positional-arguments]
 test target="" *args="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target="$1"
+    shift
+    if [[ "$target" == rust ]]; then
+        exec ./scripts/test-rust.sh "$@"
+    fi
+    exec just _test-other "$target" "$@"
+
+_test-other target="" *args="":
     #!/usr/bin/env bash
     set -euo pipefail
     # Check if target is actually a flag (starts with --)
@@ -419,7 +529,10 @@ test target="" *args="":
                 fi
             else
                 echo "🚀 [$(date '+%H:%M:%S')] Starting docker services..."
-                docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --wait
+                if ! docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --wait; then
+                    docker compose -f docker-compose.yml -f docker-compose.test.yml logs --no-color --tail=100
+                    exit 1
+                fi
                 
                 echo "⏳ Waiting for control-layer service to be ready..."
                 MAX_WAIT=60  # 1 minute max wait for pre-built images
@@ -469,30 +582,6 @@ test target="" *args="":
             echo "   • Cleanup: $((END_TIME - TESTS_DONE_TIME))s"
             echo "   • Total:   $((END_TIME - START_TIME))s"
             ;;
-        rust)
-            echo "Running Rust tests..."
-            if [[ "{{args}}" == *"--watch"* ]]; then
-                if ! command -v cargo-watch >/dev/null 2>&1; then
-                    echo "❌ Error: cargo-watch not found. Install with:"
-                    echo "  cargo install cargo-watch"
-                    exit 1
-                fi
-                # Remove --watch from args and pass remaining to cargo test
-                remaining_args=$(echo "{{args}}" | sed 's/--watch//g' | xargs)
-                cargo watch -x "test --workspace --all-features $remaining_args"
-            elif [[ "{{args}}" == *"--coverage"* ]]; then
-                if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
-                    echo "❌ Error: cargo-llvm-cov not found. Install with:"
-                    echo "  cargo install cargo-llvm-cov"
-                    echo "  # or"
-                    echo "  cargo binstall cargo-llvm-cov"
-                    exit 1
-                fi
-                cargo llvm-cov --workspace --all-features --fail-under-lines 60 --lcov --output-path lcov.info
-            else
-                cargo test --workspace --all-features {{args}}
-            fi
-            ;;
         ts)
             echo "Running TypeScript tests..."
             cd dashboard
@@ -507,8 +596,12 @@ test target="" *args="":
                 pnpm test -- --run {{args}}
             fi
             ;;
+        memory)
+            echo "Running memory budget tests..."
+            cargo test --package dwctl --test memory_budget {{args}} -- --nocapture
+            ;;
         *)
-            echo "Usage: just test [docker|rust|ts]"
+            echo "Usage: just test [docker|rust|ts|memory]"
             exit 1
             ;;
     esac
@@ -557,14 +650,17 @@ lint target *args="":
                 --package dwctl \
                 --package fusillade \
                 --package fusillade-core \
-                --package fusillade-arsenal
+                --package fusillade-arsenal \
+                --package openai-reassembler \
+                --package dwctl-test-macros
             echo "Running cargo clippy..."
             cargo clippy \
                 --package dwctl \
                 --package fusillade \
                 --package fusillade-core \
                 --package fusillade-arsenal \
-                --package onwards-fusillade \
+                --package openai-reassembler \
+                --package dwctl-test-macros \
                 --all-features \
                 --no-deps \
                 {{args}}
@@ -574,8 +670,12 @@ lint target *args="":
                 fusillade/src \
                 fusillade-core/src \
                 fusillade-arsenal/src
+            echo "Checking stable SQL result projections..."
+            python3 -B scripts/tests/schema_migrations/test_projection_guard.py
+            python3 -B scripts/check_query_projections.py
             echo "Checking SQLx prepared queries..."
             cargo sqlx prepare --check --workspace
+            python3 -B scripts/tests/test_rust_runner.py
             echo "Checking local Rust workspace topology..."
             bash .github/scripts/test-local-rust-workspace.sh
             .github/scripts/test-fusillade-migration-checksums.py
@@ -625,7 +725,8 @@ fmt target *args="":
                 --package fusillade \
                 --package fusillade-core \
                 --package fusillade-arsenal \
-                --package onwards-fusillade \
+                --package openai-reassembler \
+                --package dwctl-test-macros \
                 {{args}}
             ;;
         *)
@@ -868,12 +969,18 @@ db-start:
         # 57 in 7 seconds. Raising the ceiling means you no longer have to think about it.
         # Create volume if it doesn't exist
         docker volume create test-postgres-data >/dev/null 2>&1 || true
+        # PGDATA is set explicitly, and the volume is mounted at exactly that
+        # path. Postgres 18 moved its default PGDATA to a versioned directory,
+        # so mounting the parent instead lets two majors write side by side in
+        # one volume: switching version silently yields an empty database
+        # rather than an error.
         docker run --name test-postgres \
           -e POSTGRES_PASSWORD=password \
           -e POSTGRES_HOST_AUTH_METHOD=trust \
+          -e PGDATA=/var/lib/postgresql/data \
           -p 5432:5432 \
-          -v test-postgres-data:/var/lib/postgresql/ \
-          -d postgres:latest \
+          -v test-postgres-data:/var/lib/postgresql/data \
+          -d postgres:17 \
           postgres -c max_connections=400 \
           -c fsync=off \
           -c full_page_writes=off \
@@ -888,15 +995,32 @@ db-start:
     fi
 
     echo "Waiting for postgres to be ready..."
-    sleep 3
 
-    # Verify it's up
-    if pg_isready -h localhost -p 5432 >/dev/null 2>&1; then
-        echo "✅ PostgreSQL is ready on localhost:5432"
-    else
-        echo "❌ PostgreSQL not responding"
-        exit 1
-    fi
+    for _ in $(seq 30); do
+        if pg_isready -h localhost -p 5432 >/dev/null 2>&1; then
+            echo "✅ PostgreSQL is ready on localhost:5432"
+            exit 0
+        fi
+
+        # Usually a volume left over from a different PostgreSQL major: the
+        # server refuses the data directory and the container exits.
+        if ! docker ps --format '{{{{.Names}}' | grep -q "^test-postgres$"; then
+            echo "❌ test-postgres exited during startup"
+            echo ""
+            echo "   If the pinned PostgreSQL version changed, recreate the"
+            echo "   volume - it holds local test data only:"
+            echo ""
+            echo "     just db-stop --remove && just db-start && just db-setup"
+            echo ""
+            docker logs --tail 15 test-postgres 2>&1 || true
+            exit 1
+        fi
+
+        sleep 1
+    done
+
+    echo "❌ PostgreSQL not responding after 30s - check 'docker logs test-postgres'"
+    exit 1
 
 # Stop Docker PostgreSQL container
 #
@@ -933,6 +1057,43 @@ db-stop *args="":
     else
         echo "ℹ️  test-postgres container does not exist"
     fi
+
+# Drop databases left behind by template-backed dwctl tests
+#
+# Lists, and with --yes drops, retained failed-test clones (dwctl_test_*),
+# interrupted template builds (dwctl_build_*) and cached templates
+# (dwctl_template_*, rebuilt on demand). Stop test runs in ALL worktrees using
+# this server first: a running test's database would be dropped from under it.
+#
+# Examples:
+#   just db-prune-tests        # List what would be dropped
+#   just db-prune-tests --yes  # Drop them
+db-prune-tests *args="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    DB_HOST="${DB_HOST:-localhost}"
+    DB_PORT="${DB_PORT:-5432}"
+    DB_USER="${DB_USER:-postgres}"
+    export PGPASSWORD="${DB_PASS:-password}"
+    psql_args=(-X -q -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d postgres)
+    pattern='^dwctl_(template|test|build)_[0-9a-f]{32}$'
+
+    names=$(psql "${psql_args[@]}" -tAc "SELECT datname FROM pg_database WHERE datname ~ '$pattern' ORDER BY datname")
+    if [ -z "$names" ]; then
+        echo "✅ No test databases to prune"
+        exit 0
+    fi
+    psql "${psql_args[@]}" -c "SELECT count(*) AS databases, pg_size_pretty(sum(pg_database_size(oid))) AS size
+        FROM pg_database WHERE datname ~ '$pattern'"
+    if [[ "{{args}}" != *"--yes"* ]]; then
+        echo "Re-run with --yes to drop them, after stopping test runs in all worktrees using this server."
+        exit 0
+    fi
+    for name in $names; do
+        psql "${psql_args[@]}" -c "DROP DATABASE IF EXISTS $name WITH (FORCE)"
+    done
+    echo "✅ Dropped $(echo "$names" | wc -l | tr -d ' ') test databases"
 
 # Start a local Redis for the ZDR keystore (append-only on, named volume for
 # durability). Mirrors the prod keystore shape (single instance, AOF). Point

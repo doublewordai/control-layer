@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO batch_aggregates (\n                fusillade_batch_id, user_id, total_amount, transaction_count, max_seq, service_tier,\n                total_requests, total_prompt_tokens, total_completion_tokens, total_reasoning_tokens,\n                total_tokens, sum_duration_ms, count_duration_ms, sum_ttfb_ms, count_ttfb_ms,\n                total_list_cost\n            )\n            VALUES ($1, $2, 0.0199, 1000, 1, 'batch', 1000, 1433730, 50000, 0, 1483730, 500000, 1000, 0, 0, 0.0422)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e508bdbd8f10b6a3020628f10f4c2cb9ed931b74f7caf494e1207c43cb952bbf"
+}

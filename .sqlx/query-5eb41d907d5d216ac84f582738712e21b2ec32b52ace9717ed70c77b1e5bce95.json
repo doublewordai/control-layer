@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT DISTINCT sha256\n        FROM image_access\n        WHERE sha256 = ANY($1)\n          AND (user_id = $2 OR organization_id = $3)\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "sha256",
+        "type_info": "Bytea"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "ByteaArray",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "5eb41d907d5d216ac84f582738712e21b2ec32b52ace9717ed70c77b1e5bce95"
+}

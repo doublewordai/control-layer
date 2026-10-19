@@ -88,10 +88,13 @@ struct BillingTarget {
     id: crate::types::UserId,
     payment_provider_id: Option<String>,
     email: String,
+    /// Billed by emailed invoice rather than an immediate card charge.
+    invoicing_enabled: bool,
     /// Name to put on the payment-provider customer. Set for organizations
     /// (a real, user-provided org name), but `None` for individuals: their
-    /// display_name is only ever a randomly generated placeholder, never the
-    /// real IdP name, so we don't want it on Stripe customers / receipts.
+    /// display_name is only ever a placeholder derived from the email prefix,
+    /// never the real IdP name, so we don't want it on Stripe customers /
+    /// receipts.
     display_name: Option<String>,
 }
 
@@ -121,15 +124,30 @@ async fn resolve_billing_target(user: &CurrentUser, conn: &mut sqlx::PgConnectio
             id: org.id,
             payment_provider_id: org.payment_provider_id,
             email: org.email,
+            invoicing_enabled: org.invoicing_enabled,
             display_name: org.display_name,
         })
     } else {
+        // Read off the row rather than `CurrentUser`: the auth extractor doesn't
+        // carry this flag, and threading it through all nine of its construction
+        // sites isn't worth it for one boolean on the payment path.
+        let invoicing_enabled = sqlx::query_scalar!("SELECT invoicing_enabled FROM users WHERE id = $1", user.id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to read invoicing flag: {:?}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .unwrap_or(false);
+
         Ok(BillingTarget {
             id: user.id,
             payment_provider_id: user.payment_provider_id.clone(),
             email: user.email.clone(),
+            invoicing_enabled,
             // Intentionally omitted: an individual's display_name is a
-            // generated placeholder, not their real name (see BillingTarget).
+            // placeholder derived from the email prefix, not their real name
+            // (see BillingTarget).
             display_name: None,
         })
     }
@@ -213,6 +231,25 @@ pub async fn create_payment<P: PoolProvider>(
     })?;
     let target = resolve_billing_target(&user, &mut conn).await?;
     drop(conn);
+
+    // Invoice-billed accounts don't buy credits by card. Sending them to
+    // Checkout would either fail (they may have no card at all) or take a
+    // payment for credits Stripe is also going to invoice them for at the end
+    // of the period - billing them twice for the same top-up.
+    //
+    // Their balance is maintained by auto top-up, which accrues onto the next
+    // invoice (see `process_auto_topups`), so there is nothing for this
+    // endpoint to do.
+    if target.invoicing_enabled {
+        tracing::info!(target_id = %target.id, "Refused card checkout for an invoice-billed account");
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "message": "This account is billed by invoice. Credits are added automatically and charged to your monthly invoice."
+            })),
+        )
+            .into_response());
+    }
 
     let payer = payment_providers::CheckoutPayer {
         id: target.id,
@@ -329,6 +366,7 @@ pub async fn create_payment_setup<P: PoolProvider>(State(state): State<AppState<
     responses(
         (status = 200, description = "Payment processed successfully"),
         (status = 402, description = "Payment not completed yet"),
+        (status = 409, description = "The payment method saved by this verification session has already verified another account; the account is not verified. Verify with a different card or add credit."),
         (status = 400, description = "Invalid payment ID or missing data"),
         (status = 501, description = "Payment provider not configured"),
     ),
@@ -361,7 +399,7 @@ pub async fn process_payment<P: PoolProvider>(
     };
 
     // Process the payment session using the provider trait
-    match provider.process_payment_session(state.db.write(), &id, &config.credits).await {
+    match provider.process_payment_session(&state.db.write(), &id, &config.credits).await {
         Ok(()) => Ok(Json(json!({
             "message": "Payment processed successfully"
         }))
@@ -381,6 +419,13 @@ pub async fn process_payment<P: PoolProvider>(
                 }))
                 .into_response())
             }
+            payment_providers::PaymentError::InstrumentAlreadyUsed => Ok((
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "message": "Sorry, this payment method has already been used for verification. Please top up your account or verify with a new payment method."
+                })),
+            )
+                .into_response()),
             _ => {
                 // Map the provider error to its real status. InvalidData / NoCustomerId are
                 // client 400s; hardcoding 500 here pages on a client's bad/expired session id.
@@ -452,13 +497,47 @@ pub async fn webhook_handler<P: PoolProvider>(
     tracing::trace!("Received webhook event: {}", event.event_type);
 
     // Process the webhook event
-    match provider.process_webhook_event(state.db.write(), &event, &config.credits).await {
+    match provider.process_webhook_event(&state.db.write(), &event, &config.credits).await {
         Ok(()) => {
             tracing::trace!("Successfully processed webhook event: {}", event.event_type);
             StatusCode::OK
         }
         Err(payment_providers::PaymentError::AlreadyProcessed) => {
             tracing::trace!("Webhook event already processed (idempotent): {}", event.event_type);
+            StatusCode::OK
+        }
+        Err(payment_providers::PaymentError::UnknownReference(reference)) => {
+            // Routine in a multi-region deployment, not a fault: one Stripe
+            // account serves both regional planes, and Stripe fans every
+            // account-level event out to every configured endpoint, so each
+            // plane sees the other's sessions.
+            //
+            // Acked explicitly here rather than by the catch-all below, and
+            // deliberately NOT via the shared StatusCode mapping, which returns
+            // 404 for the front-channel caller. Retrying cannot make a user
+            // this plane does not own appear, so the webhook must tell Stripe
+            // to stop.
+            //
+            // warn rather than error because it is expected, and rather than
+            // info because a genuinely orphaned *local* session is
+            // indistinguishable from here and must stay visible. The volume is
+            // the other region's payment count — events, not requests — so this
+            // stays quiet. `client_reference_id` is structured for alerting if
+            // orphans ever need chasing.
+            tracing::warn!(
+                event_type = %event.event_type,
+                client_reference_id = %reference,
+                "Ignoring payment webhook for a user unknown to this plane (expected for another region's events)"
+            );
+            StatusCode::OK
+        }
+        Err(payment_providers::PaymentError::InstrumentAlreadyUsed) => {
+            // Expected outcome, not a fault: the front-channel caller was told
+            // (409). Nothing to retry, so ack it.
+            tracing::warn!(
+                event_type = %event.event_type,
+                "Setup session's payment method has already verified another account; acked"
+            );
             StatusCode::OK
         }
         Err(payment_providers::PaymentError::Database(_)) => {
@@ -691,7 +770,7 @@ pub async fn process_auto_topup<P: PoolProvider>(
         }
     };
 
-    let setup_result = match provider.process_auto_topup_session(state.db.write(), &id).await {
+    let setup_result = match provider.process_auto_topup_session(&state.db.write(), &id).await {
         Ok(result) => result,
         Err(e) => match e {
             payment_providers::PaymentError::PaymentNotCompleted => {
@@ -746,6 +825,10 @@ pub async fn process_auto_topup<P: PoolProvider>(
         auto_topup_threshold: Some(Some(body.threshold)),
         auto_topup_monthly_limit: Some(body.monthly_limit),
         zero_data_retention: None,
+        default_serving_class: None,
+        self_hosted_only: None,
+        granted_serving_classes: Default::default(),
+        toleration_preset: Default::default(),
     };
 
     let mut conn = state.db.write().acquire().await.map_err(|e| {
@@ -918,6 +1001,10 @@ pub async fn enable_auto_topup<P: PoolProvider>(
                 auto_topup_threshold: Some(Some(body.threshold)),
                 auto_topup_monthly_limit: Some(body.monthly_limit),
                 zero_data_retention: None,
+                default_serving_class: None,
+                self_hosted_only: None,
+                granted_serving_classes: Default::default(),
+                toleration_preset: Default::default(),
             };
 
             Users::new(&mut conn).update(target.id, &update).await.map_err(|e| {
@@ -993,6 +1080,10 @@ pub async fn disable_auto_topup<P: PoolProvider>(State(state): State<AppState<P>
         auto_topup_threshold: Some(None),
         auto_topup_monthly_limit: Some(None),
         zero_data_retention: None,
+        default_serving_class: None,
+        self_hosted_only: None,
+        granted_serving_classes: Default::default(),
+        toleration_preset: Default::default(),
     };
 
     Users::new(&mut conn).update(target.id, &update).await.map_err(|e| match e {
@@ -1017,7 +1108,7 @@ mod tests {
     use rust_decimal::Decimal;
     use sqlx::PgPool;
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_dummy_payment_flow(pool: PgPool) {
         // Setup config with dummy payment provider
         let mut config = create_test_config();
@@ -1124,7 +1215,7 @@ mod tests {
         assert_eq!(count.count.unwrap(), 1, "Should only have one transaction (idempotent)");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_payment_no_provider_configured(pool: PgPool) {
         // Setup config WITHOUT payment provider
         let config = create_test_config();
@@ -1149,7 +1240,7 @@ mod tests {
         assert!(error_response["message"].as_str().unwrap().contains("unavailable"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_payment_with_creditee_id(pool: PgPool) {
         // Test that creditee_id query parameter works
         let mut config = create_test_config();
@@ -1198,7 +1289,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_billing_portal_success(pool: PgPool) {
         // Setup config with dummy provider
         let mut config = create_test_config();
@@ -1248,7 +1339,7 @@ mod tests {
         assert!(url.contains(&format!("customer_id=cus_test_{}", user.id)));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_billing_portal_no_customer_id(pool: PgPool) {
         // Setup config with dummy provider
         let mut config = create_test_config();
@@ -1282,7 +1373,7 @@ mod tests {
         response.assert_status(StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_billing_portal_no_provider_configured(pool: PgPool) {
         // Setup config WITHOUT payment provider
         let config = create_test_config();
@@ -1323,7 +1414,7 @@ mod tests {
         response.assert_status(StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_auto_topup_checkout_success(pool: PgPool) {
         let mut config = create_test_config();
         config.payment = Some(PaymentConfig::Dummy(DummyConfig {
@@ -1361,7 +1452,7 @@ mod tests {
         assert!(url.contains("autoTopup=true"), "URL should contain autoTopup param");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_auto_topup_checkout_no_provider(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -1384,7 +1475,7 @@ mod tests {
         response.assert_status(StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topup_success(pool: PgPool) {
         let mut config = create_test_config();
         config.payment = Some(PaymentConfig::Dummy(DummyConfig {
@@ -1456,7 +1547,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topup_invalid_params(pool: PgPool) {
         let mut config = create_test_config();
         config.payment = Some(PaymentConfig::Dummy(DummyConfig {
@@ -1495,7 +1586,7 @@ mod tests {
         response.assert_status(StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_enable_auto_topup_with_payment_method(pool: PgPool) {
         let mut config = create_test_config();
         config.payment = Some(PaymentConfig::Dummy(DummyConfig {
@@ -1562,7 +1653,7 @@ mod tests {
         assert_eq!(row.auto_topup_retry_after, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_enable_auto_topup_no_customer(pool: PgPool) {
         let mut config = create_test_config();
         config.payment = Some(PaymentConfig::Dummy(DummyConfig {
@@ -1602,7 +1693,7 @@ mod tests {
         assert!(row.payment_provider_id.is_some(), "Customer ID should be saved");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_enable_auto_topup_in_org_context(pool: PgPool) {
         let mut config = create_test_config();
         config.payment = Some(PaymentConfig::Dummy(DummyConfig {
@@ -1662,7 +1753,7 @@ mod tests {
         assert_eq!(user_row.auto_topup_threshold, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_disable_auto_topup(pool: PgPool) {
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), create_test_config()).await;
 
@@ -1706,7 +1797,7 @@ mod tests {
         assert_eq!(row.auto_topup_monthly_limit, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_disable_auto_topup_in_org_context(pool: PgPool) {
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), create_test_config()).await;
 
@@ -1775,7 +1866,43 @@ mod tests {
         query_pairs.get("session_id").expect("session_id in return URL").to_string()
     }
 
-    #[sqlx::test]
+    /// An invoice-billed account must not be able to run a card checkout: they
+    /// may have no card at all, and taking the payment would bill them twice
+    /// for credits their monthly invoice already covers.
+    #[dwctl_test_macros::test]
+    async fn test_create_payment_refuses_invoice_billed_accounts(pool: PgPool) {
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), setup_flow_config(Decimal::ZERO)).await;
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let auth_headers = crate::test::utils::add_auth_headers(&user);
+
+        let app = Router::new().route("/payments", post(create_payment)).with_state(state);
+        let server = TestServer::new(app).unwrap();
+
+        // Card-billed by default: checkout is offered as usual.
+        let mut request = server.post("/payments");
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        request.await.assert_status(StatusCode::OK);
+
+        sqlx::query!("UPDATE users SET invoicing_enabled = true WHERE id = $1", user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut request = server.post("/payments");
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
+        response.assert_status(StatusCode::CONFLICT);
+        assert!(
+            response.text().contains("billed by invoice"),
+            "the refusal should explain why, not just fail"
+        );
+    }
+
+    #[dwctl_test_macros::test]
     async fn test_payment_setup_returns_checkout_url(pool: PgPool) {
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), setup_flow_config(Decimal::ZERO)).await;
         let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
@@ -1800,7 +1927,7 @@ mod tests {
         assert!(url.contains("session_id="), "URL should carry the session id back");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_payment_setup_no_provider(pool: PgPool) {
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), create_test_config()).await;
         let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
@@ -1819,7 +1946,7 @@ mod tests {
     /// The whole onboarding round trip: create the setup session, come back
     /// through the same `PATCH /payments/{id}` a top-up uses, and end up
     /// verified with signup credits but *no* purchase on the ledger.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_payment_setup_verifies_user_and_grants_signup_credits(pool: PgPool) {
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), setup_flow_config(Decimal::new(25, 0))).await;
         let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
@@ -1884,7 +2011,7 @@ mod tests {
 
     /// The SPA's front-channel PATCH races the provider webhook; both call the
     /// same code path, so replaying it must not pay out twice.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_payment_setup_processing_is_idempotent(pool: PgPool) {
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), setup_flow_config(Decimal::new(25, 0))).await;
         let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
@@ -1922,7 +2049,7 @@ mod tests {
         assert_eq!(count, Some(1), "replaying the return must not double-grant");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_payment_setup_without_verification_credits_still_verifies(pool: PgPool) {
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), setup_flow_config(Decimal::ZERO)).await;
         let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;

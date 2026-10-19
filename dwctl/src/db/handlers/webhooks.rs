@@ -22,7 +22,7 @@ impl<'c> Webhooks<'c> {
     }
 
     /// Create a new webhook for a user.
-    #[instrument(skip(self, request), fields(user_id = %abbrev_uuid(&request.user_id)), err)]
+    #[instrument(level = "debug", skip(self, request), fields(user_id = %abbrev_uuid(&request.user_id)), err)]
     pub async fn create(&mut self, request: &WebhookCreateDBRequest) -> Result<Webhook> {
         let event_types_json = request
             .event_types
@@ -34,7 +34,7 @@ impl<'c> Webhooks<'c> {
             r#"
             INSERT INTO user_webhooks (user_id, url, secret, event_types, description, scope)
             VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING *
+            RETURNING id, user_id, url, secret, enabled, event_types, description, created_at, updated_at, consecutive_failures, disabled_at, scope
             "#,
             request.user_id,
             request.url,
@@ -50,9 +50,9 @@ impl<'c> Webhooks<'c> {
     }
 
     /// Get a webhook by ID.
-    #[instrument(skip(self), fields(webhook_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(webhook_id = %abbrev_uuid(&id)), err)]
     pub async fn get_by_id(&mut self, id: WebhookId) -> Result<Option<Webhook>> {
-        let webhook = sqlx::query_as!(Webhook, r#"SELECT * FROM user_webhooks WHERE id = $1"#, id)
+        let webhook = sqlx::query_as!(Webhook, r#"SELECT id, user_id, url, secret, enabled, event_types, description, created_at, updated_at, consecutive_failures, disabled_at, scope FROM user_webhooks WHERE id = $1"#, id)
             .fetch_optional(&mut *self.db)
             .await?;
 
@@ -60,12 +60,12 @@ impl<'c> Webhooks<'c> {
     }
 
     /// List webhooks for a user.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn list_by_user(&mut self, user_id: UserId) -> Result<Vec<Webhook>> {
         let webhooks = sqlx::query_as!(
             Webhook,
             r#"
-            SELECT * FROM user_webhooks
+            SELECT id, user_id, url, secret, enabled, event_types, description, created_at, updated_at, consecutive_failures, disabled_at, scope FROM user_webhooks
             WHERE user_id = $1
             ORDER BY created_at DESC
             "#,
@@ -78,7 +78,7 @@ impl<'c> Webhooks<'c> {
     }
 
     /// Update a webhook.
-    #[instrument(skip(self, request), fields(webhook_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self, request), fields(webhook_id = %abbrev_uuid(&id)), err)]
     pub async fn update(&mut self, id: WebhookId, request: &WebhookUpdateDBRequest) -> Result<Option<Webhook>> {
         // Convert event_types Option<Option<Vec>> to Option<Option<Value>> for SQL
         let event_types_json: Option<Option<serde_json::Value>> = request.event_types.as_ref().map(|opt| {
@@ -112,7 +112,7 @@ impl<'c> Webhooks<'c> {
                     ELSE consecutive_failures
                 END
             WHERE id = $1
-            RETURNING *
+            RETURNING id, user_id, url, secret, enabled, event_types, description, created_at, updated_at, consecutive_failures, disabled_at, scope
             "#,
             id,
             request.url,
@@ -129,7 +129,7 @@ impl<'c> Webhooks<'c> {
     }
 
     /// Delete a webhook.
-    #[instrument(skip(self), fields(webhook_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(webhook_id = %abbrev_uuid(&id)), err)]
     pub async fn delete(&mut self, id: WebhookId) -> Result<bool> {
         let result = sqlx::query!("DELETE FROM user_webhooks WHERE id = $1", id)
             .execute(&mut *self.db)
@@ -139,7 +139,7 @@ impl<'c> Webhooks<'c> {
     }
 
     /// Rotate a webhook's secret.
-    #[instrument(skip(self, new_secret), fields(webhook_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self, new_secret), fields(webhook_id = %abbrev_uuid(&id)), err)]
     pub async fn rotate_secret(&mut self, id: WebhookId, new_secret: String) -> Result<Option<Webhook>> {
         let webhook = sqlx::query_as!(
             Webhook,
@@ -147,7 +147,7 @@ impl<'c> Webhooks<'c> {
             UPDATE user_webhooks
             SET secret = $2
             WHERE id = $1
-            RETURNING *
+            RETURNING id, user_id, url, secret, enabled, event_types, description, created_at, updated_at, consecutive_failures, disabled_at, scope
             "#,
             id,
             new_secret,
@@ -159,7 +159,7 @@ impl<'c> Webhooks<'c> {
     }
 
     /// Get all enabled webhooks for a set of users, grouped by user ID.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn get_enabled_webhooks_for_users(
         &mut self,
         user_ids: Vec<UserId>,
@@ -167,7 +167,7 @@ impl<'c> Webhooks<'c> {
         let webhooks = sqlx::query_as!(
             Webhook,
             r#"
-            SELECT * FROM user_webhooks
+            SELECT id, user_id, url, secret, enabled, event_types, description, created_at, updated_at, consecutive_failures, disabled_at, scope FROM user_webhooks
             WHERE user_id = ANY($1)
               AND enabled = true
               AND disabled_at IS NULL
@@ -190,12 +190,12 @@ impl<'c> Webhooks<'c> {
     /// The `scope = 'platform'` constraint is enforced by a DB trigger at write time,
     /// but the `role = 'PlatformManager'` check at read time handles the demotion case —
     /// if a PM loses their role, their existing platform webhooks stop firing immediately.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn get_enabled_platform_webhooks(&mut self) -> Result<Vec<Webhook>> {
         let webhooks = sqlx::query_as!(
             Webhook,
             r#"
-            SELECT w.*
+            SELECT w.id, w.user_id, w.url, w.secret, w.enabled, w.event_types, w.description, w.created_at, w.updated_at, w.consecutive_failures, w.disabled_at, w.scope
             FROM user_webhooks w
             INNER JOIN user_roles ur ON ur.user_id = w.user_id
             WHERE w.enabled = true
@@ -214,7 +214,7 @@ impl<'c> Webhooks<'c> {
     ///
     /// Returns `None` if the webhook was deleted (e.g. CASCADE from user or
     /// direct delete while deliveries were in-flight).
-    #[instrument(skip(self), fields(webhook_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(webhook_id = %abbrev_uuid(&id)), err)]
     pub async fn increment_failures(&mut self, id: WebhookId, circuit_breaker_threshold: i32) -> Result<Option<Webhook>> {
         let webhook = sqlx::query_as!(
             Webhook,
@@ -231,7 +231,7 @@ impl<'c> Webhooks<'c> {
                     ELSE disabled_at
                 END
             WHERE id = $1
-            RETURNING *
+            RETURNING id, user_id, url, secret, enabled, event_types, description, created_at, updated_at, consecutive_failures, disabled_at, scope
             "#,
             id,
             circuit_breaker_threshold,
@@ -243,7 +243,7 @@ impl<'c> Webhooks<'c> {
     }
 
     /// Reset consecutive failures on successful delivery.
-    #[instrument(skip(self), fields(webhook_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(webhook_id = %abbrev_uuid(&id)), err)]
     pub async fn reset_failures(&mut self, id: WebhookId) -> Result<()> {
         sqlx::query!(
             r#"
@@ -262,14 +262,14 @@ impl<'c> Webhooks<'c> {
     // ===== Delivery methods =====
 
     /// Create a new delivery record.
-    #[instrument(skip(self, request), fields(webhook_id = %abbrev_uuid(&request.webhook_id)), err)]
+    #[instrument(level = "debug", skip(self, request), fields(webhook_id = %abbrev_uuid(&request.webhook_id)), err)]
     pub async fn create_delivery(&mut self, request: &WebhookDeliveryCreateDBRequest) -> Result<WebhookDelivery> {
         let delivery = sqlx::query_as!(
             WebhookDelivery,
             r#"
             INSERT INTO webhook_deliveries (webhook_id, event_id, event_type, payload, resource_id, next_attempt_at)
             VALUES ($1, $2, $3, $4, $5, COALESCE($6, now()))
-            RETURNING *
+            RETURNING id, webhook_id, event_id, event_type, payload, status, attempt_count, next_attempt_at, resource_id, last_status_code, last_error, created_at, updated_at
             "#,
             request.webhook_id,
             request.event_id,
@@ -289,7 +289,7 @@ impl<'c> Webhooks<'c> {
     ///
     /// Used by the notification poller for platform events where the LISTEN/NOTIFY
     /// trigger may fire multiple times (e.g., during leadership transitions).
-    #[instrument(skip(self, request), fields(webhook_id = %abbrev_uuid(&request.webhook_id)), err)]
+    #[instrument(level = "debug", skip(self, request), fields(webhook_id = %abbrev_uuid(&request.webhook_id)), err)]
     pub async fn try_create_delivery(&mut self, request: &WebhookDeliveryCreateDBRequest) -> Result<Option<WebhookDelivery>> {
         let delivery = sqlx::query_as!(
             WebhookDelivery,
@@ -298,7 +298,7 @@ impl<'c> Webhooks<'c> {
             VALUES ($1, $2, $3, $4, $5, COALESCE($6, now()))
             ON CONFLICT (webhook_id, event_type, resource_id) WHERE resource_id IS NOT NULL
             DO NOTHING
-            RETURNING *
+            RETURNING id, webhook_id, event_id, event_type, payload, status, attempt_count, next_attempt_at, resource_id, last_status_code, last_error, created_at, updated_at
             "#,
             request.webhook_id,
             request.event_id,
@@ -329,7 +329,7 @@ impl<'c> Webhooks<'c> {
     /// claimable again after 5 minutes. This also means graceful shutdown
     /// doesn't need to drain in-flight results — unprocessed deliveries
     /// just get re-claimed on the next startup.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn claim_retriable_deliveries(&mut self, limit: i64) -> Result<Vec<ClaimedDelivery>> {
         let deliveries = sqlx::query_as!(
             ClaimedDelivery,
@@ -347,9 +347,9 @@ impl<'c> Webhooks<'c> {
                 SET next_attempt_at = now() + interval '5 minutes'
                 FROM claimed
                 WHERE wd.id = claimed.id
-                RETURNING wd.*
+                RETURNING wd.id, wd.webhook_id, wd.event_id, wd.event_type, wd.payload, wd.status, wd.attempt_count, wd.next_attempt_at, wd.resource_id, wd.last_status_code, wd.last_error, wd.created_at, wd.updated_at
             )
-            SELECT u.*,
+            SELECT u.id, u.webhook_id, u.event_id, u.event_type, u.payload, u.status, u.attempt_count, u.next_attempt_at, u.resource_id, u.last_status_code, u.last_error, u.created_at, u.updated_at,
                    w.url AS webhook_url,
                    w.secret AS webhook_secret,
                    w.enabled AS webhook_enabled
@@ -365,7 +365,7 @@ impl<'c> Webhooks<'c> {
     }
 
     /// Mark a delivery as successful.
-    #[instrument(skip(self), fields(delivery_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(delivery_id = %abbrev_uuid(&id)), err)]
     pub async fn mark_delivered(&mut self, id: DeliveryId, status_code: i32) -> Result<()> {
         sqlx::query!(
             r#"
@@ -387,7 +387,7 @@ impl<'c> Webhooks<'c> {
     }
 
     /// Mark a delivery as failed and schedule retry.
-    #[instrument(skip(self, error), fields(delivery_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self, error), fields(delivery_id = %abbrev_uuid(&id)), err)]
     pub async fn mark_failed(
         &mut self,
         id: DeliveryId,
@@ -433,7 +433,7 @@ impl<'c> Webhooks<'c> {
     }
 
     /// Mark a delivery as exhausted (e.g., webhook was disabled).
-    #[instrument(skip(self), fields(delivery_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(delivery_id = %abbrev_uuid(&id)), err)]
     pub async fn mark_exhausted(&mut self, id: DeliveryId) -> Result<()> {
         sqlx::query!(
             r#"
@@ -518,13 +518,13 @@ mod tests {
     /// Read back a delivery row to verify state after mutations.
     async fn get_delivery(pool: &PgPool, id: DeliveryId) -> WebhookDelivery {
         let mut conn = pool.acquire().await.unwrap();
-        sqlx::query_as!(WebhookDelivery, "SELECT * FROM webhook_deliveries WHERE id = $1", id)
+        sqlx::query_as!(WebhookDelivery, "SELECT id, webhook_id, event_id, event_type, payload, status, attempt_count, next_attempt_at, resource_id, last_status_code, last_error, created_at, updated_at FROM webhook_deliveries WHERE id = $1", id)
             .fetch_one(&mut *conn)
             .await
             .unwrap()
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_claim_picks_up_due_deliveries(pool: PgPool) {
         let (webhook, _) = create_test_webhook(&pool).await;
         let delivery = create_test_delivery(&pool, webhook.id, None).await;
@@ -538,7 +538,7 @@ mod tests {
         assert_eq!(claimed[0].id, delivery.id);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_claim_skips_future_deliveries(pool: PgPool) {
         let (webhook, _) = create_test_webhook(&pool).await;
 
@@ -553,7 +553,7 @@ mod tests {
         assert_eq!(claimed.len(), 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_claim_bumps_next_attempt_at(pool: PgPool) {
         let (webhook, _) = create_test_webhook(&pool).await;
         create_test_delivery(&pool, webhook.id, None).await;
@@ -572,7 +572,7 @@ mod tests {
         assert_eq!(claimed_again.len(), 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_claim_skips_delivered(pool: PgPool) {
         let (webhook, _) = create_test_webhook(&pool).await;
         let delivery = create_test_delivery(&pool, webhook.id, None).await;
@@ -587,7 +587,7 @@ mod tests {
         assert_eq!(claimed.len(), 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_claim_skips_exhausted(pool: PgPool) {
         let (webhook, _) = create_test_webhook(&pool).await;
         let delivery = create_test_delivery(&pool, webhook.id, None).await;
@@ -600,7 +600,7 @@ mod tests {
         assert_eq!(claimed.len(), 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_mark_failed_sets_retry_schedule(pool: PgPool) {
         let (webhook, _) = create_test_webhook(&pool).await;
         let delivery = create_test_delivery(&pool, webhook.id, None).await;
@@ -625,7 +625,7 @@ mod tests {
         assert!((280..=320).contains(&delay), "expected ~300s delay, got {}s", delay);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_mark_failed_exhausts_at_max_retries(pool: PgPool) {
         let (webhook, _) = create_test_webhook(&pool).await;
         let delivery = create_test_delivery(&pool, webhook.id, None).await;
@@ -640,7 +640,7 @@ mod tests {
         assert_eq!(d.attempt_count, 7);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_mark_failed_respects_custom_max_retries(pool: PgPool) {
         let (webhook, _) = create_test_webhook(&pool).await;
         let delivery = create_test_delivery(&pool, webhook.id, None).await;
@@ -655,7 +655,7 @@ mod tests {
         assert_eq!(d.attempt_count, 3);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_full_retry_lifecycle(pool: PgPool) {
         let (webhook, _) = create_test_webhook(&pool).await;
         let delivery = create_test_delivery(&pool, webhook.id, None).await;
@@ -702,7 +702,7 @@ mod tests {
         assert_eq!(claimed.len(), 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_successful_delivery_resets_failures(pool: PgPool) {
         let (webhook, _) = create_test_webhook(&pool).await;
         let delivery = create_test_delivery(&pool, webhook.id, None).await;
@@ -732,7 +732,7 @@ mod tests {
         assert_eq!(claimed.len(), 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_mark_exhausted_is_terminal(pool: PgPool) {
         let (webhook, _) = create_test_webhook(&pool).await;
         let delivery = create_test_delivery(&pool, webhook.id, None).await;

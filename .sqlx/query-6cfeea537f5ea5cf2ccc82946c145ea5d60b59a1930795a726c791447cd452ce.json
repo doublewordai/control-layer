@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO inference_endpoints (id, name, url, api_key, created_by)\n        VALUES ($1, $2, 'http://localhost:8080', NULL, $3)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Varchar",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6cfeea537f5ea5cf2ccc82946c145ea5d60b59a1930795a726c791447cd452ce"
+}

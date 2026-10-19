@@ -35,7 +35,6 @@ use std::time::Duration;
 
 use chrono::Utc;
 use metrics::counter;
-use sqlx::PgPool;
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -76,7 +75,8 @@ struct WebhookSendResult {
 // --- Dispatcher ---
 
 pub struct WebhookDispatcher {
-    pool: PgPool,
+    /// Live provider (not a pinned pool): survives runtime pool swaps.
+    pool: sqlx_pool_router::DynPools,
     send_tx: mpsc::Sender<WebhookSendRequest>,
     result_rx: mpsc::Receiver<WebhookSendResult>,
     retry_schedule: Vec<i64>,
@@ -86,7 +86,8 @@ pub struct WebhookDispatcher {
 
 impl WebhookDispatcher {
     /// Create a new dispatcher and spawn the background sender task.
-    pub fn spawn(pool: PgPool, config: &WebhookConfig, shutdown: CancellationToken) -> Self {
+    pub fn spawn(pool: impl sqlx_pool_router::PoolProvider, config: &WebhookConfig, shutdown: CancellationToken) -> Self {
+        let pool = sqlx_pool_router::DynPools::new(pool);
         let (send_tx, send_rx) = mpsc::channel::<WebhookSendRequest>(config.channel_capacity);
         let (result_tx, result_rx) = mpsc::channel(config.channel_capacity);
 
@@ -116,7 +117,7 @@ impl WebhookDispatcher {
 
     /// Claim deliveries that are due, sign them, and push to the sender channel.
     async fn claim_and_send(&self) {
-        let mut conn = match self.pool.acquire().await {
+        let mut conn = match self.pool.write().acquire().await {
             Ok(c) => c,
             Err(e) => {
                 crate::background_error!(WEBHOOK_DISPATCH, "db_acquire", Warning, error = %e, "Failed to acquire connection for retry claims");
@@ -220,7 +221,7 @@ impl WebhookDispatcher {
 
     /// Drain completed send results and update DB status.
     async fn drain_results(&mut self) {
-        let mut conn = match self.pool.acquire().await {
+        let mut conn = match self.pool.write().acquire().await {
             Ok(c) => c,
             Err(e) => {
                 crate::background_error!(WEBHOOK_DISPATCH, "db_acquire", Warning, error = %e, "Failed to acquire connection for result drain");

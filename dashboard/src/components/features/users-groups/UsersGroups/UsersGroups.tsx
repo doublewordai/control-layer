@@ -9,6 +9,7 @@ import {
   useDeleteGroup,
   useOrganizations,
   useDeleteOrganization,
+  useConfig,
   type Group as BackendGroup,
 } from "../../../../api/control-layer";
 import type { Organization } from "../../../../api/control-layer/types";
@@ -171,6 +172,7 @@ const UsersGroups: React.FC = () => {
   // Authorization
   const { hasPermission } = useAuthorization();
   const isPlatformManager = hasPermission("users-groups");
+  const { data: config } = useConfig();
 
   const handleSelectGroup = (groupId: string) => {
     setSelectedGroups((prev) => {
@@ -267,6 +269,7 @@ const UsersGroups: React.FC = () => {
     },
     groups: groups,
     showTransactions: true,
+    tolerationPresets: config?.scheduling_toleration_presets,
   });
 
   // Column configuration for organizations DataTable
@@ -278,8 +281,9 @@ const UsersGroups: React.FC = () => {
         onDelete: (org) => setDeletingOrg(org),
         onManageBilling: (org) => navigate(`/cost-management?user=${org.id}`),
         canDelete: isPlatformManager,
+        tolerationPresets: config?.scheduling_toleration_presets,
       }),
-    [navigate, isPlatformManager],
+    [navigate, isPlatformManager, config?.scheduling_toleration_presets],
   );
 
   const handleDeleteOrg = async () => {
@@ -749,8 +753,13 @@ const UsersGroups: React.FC = () => {
             avatar: activeUser.avatar,
             roles: activeUser.roles,
             zero_data_retention: activeUser.zero_data_retention,
+            granted_serving_classes: activeUser.granted_serving_classes,
+            default_serving_class: activeUser.default_serving_class,
+            self_hosted_only: activeUser.self_hosted_only,
+            toleration_preset: activeUser.toleration_preset,
           }}
           canEditZdr={isPlatformManager}
+          canEditServing={isPlatformManager}
         />
       )}
       {activeGroup && (
@@ -782,6 +791,7 @@ const UsersGroups: React.FC = () => {
         onClose={() => setEditingOrg(null)}
         organization={editingOrg}
         canEditZdr={isPlatformManager}
+        canEditServing={isPlatformManager}
       />
       <Dialog
         open={!!deletingOrg}

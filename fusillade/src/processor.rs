@@ -86,7 +86,32 @@ where
         storage: &S,
         should_retry: ShouldRetry,
         cancellation: CancellationFuture,
+        ctx: ProcessContext,
     ) -> Result<RequestCompletionResult>;
+}
+
+/// What the daemon hands a processor alongside each claimed request.
+///
+/// Only the daemon can build one, from the `fusillade.process_request` span
+/// that declares the fields recorded here. A processor therefore cannot be
+/// called with a span that would silently drop them.
+#[derive(Debug)]
+pub struct ProcessContext {
+    span: tracing::Span,
+}
+
+impl ProcessContext {
+    /// `span` must declare every field recorded through this context.
+    pub(crate) fn new(span: tracing::Span) -> Self {
+        Self { span }
+    }
+
+    /// Records the server's `X-Request-ID` on `fusillade.process_request`, so
+    /// the attempt's outcome log lines carry it.
+    pub fn record_x_request_id(&self, id: &str) {
+        self.span
+            .record("x_request_id", tracing::field::display(id));
+    }
 }
 
 /// Default processor that preserves today's daemon behavior exactly.
@@ -118,17 +143,28 @@ where
         storage: &S,
         should_retry: ShouldRetry,
         cancellation: CancellationFuture,
+        ctx: ProcessContext,
     ) -> Result<RequestCompletionResult> {
         let request_id = request.data.id;
         let daemon_id = request.state.daemon_id;
         let retry_attempt = request.state.retry_attempt;
-
         // Span 1: claimed -> processing (HTTP request kicked off)
         let processing = async {
             tracing::debug!("Sending batch request to inference endpoint");
             let request_data = request.data.clone();
             let api_key = request_data.api_key.clone();
-            let response_fut = async move { http.execute(&request_data, &api_key).await };
+            // The server mints its own request ID, so it is only known once the
+            // response arrives; record it on the process span so the outcome
+            // log lines carry it.
+            let response_fut = async move {
+                let result = http.execute(&request_data, &api_key).await;
+                if let Ok(response) = &result
+                    && let Some(id) = &response.x_request_id
+                {
+                    ctx.record_x_request_id(id);
+                }
+                result
+            };
             request.process(storage, response_fut).await
         }
         .instrument(tracing::info_span!(

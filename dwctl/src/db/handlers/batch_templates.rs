@@ -32,7 +32,7 @@ impl<'c> BatchTemplates<'c> {
         let rows = sqlx::query(
             r#"
             SELECT model, COUNT(*) AS request_count
-            FROM request_templates
+            FROM request_templates_all
             WHERE file_id = $1
             GROUP BY model
             "#,
@@ -56,7 +56,7 @@ impl<'c> BatchTemplates<'c> {
             sqlx::query_as::<_, BatchTemplateReasoningRequest>(
                 r#"
                 SELECT custom_id, path, body, model, line_number
-                FROM request_templates
+                FROM request_templates_all
                 WHERE file_id = $1
                 ORDER BY line_number ASC, id ASC
                 "#,

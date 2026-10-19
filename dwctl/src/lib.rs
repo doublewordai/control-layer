@@ -140,11 +140,14 @@ fn install_crypto_provider() {
     rustls::crypto::aws_lc_rs::default_provider().install_default().ok();
 }
 
+pub mod account_limits;
 pub mod api;
 pub mod auth;
+pub mod clickhouse;
 pub mod config;
 mod config_watcher;
 pub mod connections;
+pub mod continuation;
 mod crypto;
 pub mod db;
 mod email;
@@ -157,16 +160,29 @@ pub mod keystore;
 mod leader_election;
 pub mod limits;
 mod metrics;
+/// jemalloc statistics (re-exported for the memory validation harness).
+pub use metrics::allocator as allocator_metrics;
+pub mod migrations;
+pub mod modalities;
+pub mod model_provisioning;
 mod notifications;
 mod openapi;
+pub mod org_overlays;
 mod payment_providers;
+pub mod prefix_chain;
+pub mod pricing;
 mod probes;
+pub mod profiling;
 pub mod prompt_cache;
+pub mod realtime_inflight;
 pub mod reasoning;
+mod recompute;
 mod request_logging;
 pub mod sample_files;
+pub mod scheduling;
 mod static_assets;
 mod sync;
+pub mod task_retention;
 pub mod tasks;
 pub mod telemetry;
 mod types;
@@ -191,6 +207,7 @@ use crate::{
 };
 use sqlx_pool_router::{DbPools, PoolProvider};
 
+use crate::db::errors::initialize_database_error_metrics;
 use anyhow::Context;
 use auth::middleware::admin_ai_proxy_middleware;
 use axum::extract::{DefaultBodyLimit, Request, State};
@@ -199,12 +216,15 @@ use axum::response::Response;
 use axum::{
     Router, ServiceExt, http, middleware,
     routing::{delete, get, patch, post, put},
+    serve::ListenerExt,
 };
 use axum_prometheus::PrometheusMetricLayerBuilder;
 use bon::Builder;
 pub use config::Config;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
+use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry::trace::TraceContextExt;
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use outlet::{MultiHandler, RequestLoggerConfig, RequestLoggerLayer};
 use outlet_postgres::PostgresHandler;
 use request_logging::{AiResponse, ParsedAIRequest};
@@ -300,11 +320,6 @@ where
     /// Response store for Open Responses API lifecycle tracking.
     /// Reads/writes to fusillade's requests table.
     pub response_store: Arc<crate::inference::store::FusilladeResponseStore<P>>,
-    /// Multi-step response_steps storage. Optional so deployments that
-    /// don't use the multi-step Open Responses path can omit the
-    /// wiring; the GET /v1/responses/{id} handler degrades to 404 in
-    /// that case rather than panicking.
-    pub response_step_manager: Option<Arc<fusillade_arsenal::PostgresResponseStepManager<P>>>,
     /// Singleton image normaliser used by the realtime middleware, the
     /// batch ingest path, the dispatcher's JIT-signing step, and the
     /// dashboard `/images/:sha256` endpoint. Built once at startup so
@@ -313,6 +328,15 @@ where
     /// Encrypted key custody, built from `config.keystore`. `None` means it is
     /// not configured (ZDR flex disabled).
     pub keystore: Option<crate::keystore::Keystore>,
+    /// Per-key account policy map (ZDR, disabled modalities, toleration
+    /// preset), kept fresh by [`crate::sync::key_policy`]. The batch ingest
+    /// path reads an account's resolved tolerations from here (its hidden batch
+    /// key belongs to that account) so batch matches realtime.
+    pub key_policy_cache: crate::sync::key_policy::KeyPolicyCache,
+    /// The live onwards targets, which dwctl's own inference rejections are
+    /// labelled from (see [`crate::inference::rejections`]). `None` labels them
+    /// with neither model nor account.
+    pub onwards_targets: Option<onwards::target::Targets>,
 }
 
 impl<P> AppState<P>
@@ -352,6 +376,12 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
             // classify, tokenizer-svc call, commit, and index lookup (cache read).
             const CACHE_LATENCY_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
 
+            // Render-drift histogram buckets, in TOKENS (signed: render_total − engine
+            // prompt_tokens). Edges double as alert thresholds: the share of requests
+            // with |drift| beyond ±5/±20/±50/±100/±500 is exact at these edges, so
+            // Grafana alert rules can be tuned across them without a code release.
+            const RENDER_DRIFT_TOKEN_BUCKETS: &[f64] = &[-500.0, -100.0, -50.0, -20.0, -5.0, 0.0, 5.0, 20.0, 50.0, 100.0, 500.0];
+
             // Custom histogram buckets for fusillade retry attempts (0-10 retries)
             const RETRY_ATTEMPTS_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
 
@@ -361,7 +391,15 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
             // compliance ratios are only exact at a bucket edge.
             const SUBMISSION_LATENCY_BUCKETS: &[f64] = &[1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 900.0, 1800.0, 3600.0];
 
-            PrometheusBuilder::new()
+            // Heap profile dump duration (1ms to 30s, the default dump timeout).
+            const HEAP_PROFILE_DUMP_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0];
+
+            let handle = PrometheusBuilder::new()
+                .set_buckets_for_metric(
+                    Matcher::Full("dwctl_heap_profile_dump_duration_seconds".to_string()),
+                    HEAP_PROFILE_DUMP_BUCKETS,
+                )
+                .expect("Failed to set custom buckets for dwctl_heap_profile_dump_duration_seconds")
                 .set_buckets_for_metric(Matcher::Full("dwctl_analytics_lag_seconds".to_string()), ANALYTICS_LAG_BUCKETS)
                 .expect("Failed to set custom buckets for dwctl_analytics_lag_seconds")
                 .set_buckets_for_metric(Matcher::Full("dwctl_cache_sync_lag_seconds".to_string()), CACHE_SYNC_LAG_BUCKETS)
@@ -387,6 +425,11 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
                 )
                 .expect("Failed to set custom buckets for dwctl_cache_lookup_duration_seconds")
                 .set_buckets_for_metric(
+                    Matcher::Full("dwctl_cache_render_drift_tokens".to_string()),
+                    RENDER_DRIFT_TOKEN_BUCKETS,
+                )
+                .expect("Failed to set custom buckets for dwctl_cache_render_drift_tokens")
+                .set_buckets_for_metric(
                     Matcher::Full("fusillade_retry_attempts_on_success".to_string()),
                     RETRY_ATTEMPTS_BUCKETS,
                 )
@@ -401,8 +444,18 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
                     SUBMISSION_LATENCY_BUCKETS,
                 )
                 .expect("Failed to set custom buckets for fusillade_request_pickup_delay_seconds")
+                // Without buckets the first-token latency renders as a per-process
+                // summary, whose quantiles cannot be aggregated across replicas.
+                .set_buckets_for_metric(
+                    Matcher::Full("onwards_first_token_seconds".to_string()),
+                    onwards::FIRST_TOKEN_SECONDS_BUCKETS,
+                )
+                .expect("Failed to set custom buckets for onwards_first_token_seconds")
                 .install_recorder()
-                .expect("Failed to install Prometheus recorder")
+                .expect("Failed to install Prometheus recorder");
+            initialize_database_error_metrics();
+            crate::metrics::describe_cache_info_metrics();
+            handle
         })
         .clone()
 }
@@ -573,16 +626,12 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
                             description: None,
                             model_type: None,
                             capabilities: None,
-                            requests_per_second: None,
-                            burst_size: None,
-                            capacity: None,
                             batch_capacity: None,
                             throughput: None,
                             tariffs: None,
                             provider_pricing: None,
                             sanitize_responses: None,
                             trusted: None,
-                            open_responses_adapter: None,
                             reasoning_translation_overrides: None,
                             backoff_enabled: false,
                             backoff_initial_ms: 100,
@@ -590,6 +639,8 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
                             backoff_factor: 2.0,
                             backoff_jitter: Default::default(),
                             backoff_max_total_ms: None,
+                            first_token_timeout_ms: None,
+                            aimd: None,
                             traffic_routing_rules: None,
                             allowed_batch_completion_windows: None,
                             metadata: None,
@@ -638,32 +689,711 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
     Ok(())
 }
 
-/// Setup database connections, run migrations, and initialize data
-/// Returns: (embedded_db, main_pools, fusillade_pools, outlet_pools)
+/// Build a pool with a schema-specific `search_path`.
+///
+/// Reuses the connection options of the parent (main) pool. The search_path is
+/// set at the connection level (via `PgConnectOptions::options`) rather than
+/// with an `after_connect` hook, so it cannot be unset and works with replicas.
+/// Eager connection (`connect_with`) so `min_connections` is honoured at boot.
+pub(crate) async fn create_schema_pool(
+    schema: &str,
+    opts: sqlx::postgres::PgConnectOptions,
+    settings: &config::PoolSettings,
+) -> Result<sqlx::PgPool, sqlx::Error> {
+    info!("Setting search_path={} via connection options for schema pool", schema);
+    let opts_with_schema = opts.options([("search_path".to_string(), schema.to_string())]);
+    db::pool_options(settings).connect_with(opts_with_schema).await
+}
+
+pub(crate) fn connect_options(url: &str, slow_threshold: std::time::Duration) -> anyhow::Result<PgConnectOptions> {
+    Ok(PgConnectOptions::from_str(url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold))
+}
+
+/// A schema-mode component behind a pooler relies on the server-side default
+/// `search_path` (see `setup_component_pools`). Fail at boot, with the exact
+/// statement to run, rather than at the first bare-table query.
+async fn verify_schema_on_default_search_path(component_name: &str, schema: &str, pooled: &DbPools) -> anyhow::Result<()> {
+    for pool in [pooled.write(), pooled.read()] {
+        let mut transaction = pool.begin().await?;
+        let (current_schema, search_path): (Option<String>, String) =
+            sqlx::query_as("SELECT current_schema(), current_setting('search_path')")
+                .fetch_one(&mut *transaction)
+                .await?;
+        // A leftover session SET must not make a shared login appear correctly
+        // configured. DEFAULT uses the backend's startup default; LOCAL and
+        // rollback preserve its state and are safe through transaction poolers.
+        sqlx::query("SET LOCAL search_path TO DEFAULT").execute(&mut *transaction).await?;
+        let default_schema: Option<String> = sqlx::query_scalar("SELECT current_schema()").fetch_one(&mut *transaction).await?;
+        transaction.rollback().await?;
+        anyhow::ensure!(
+            current_schema.as_deref() == Some(schema) && default_schema.as_deref() == Some(schema),
+            "{component_name}: pooled endpoint current_schema() is {current_schema:?}, default schema is {default_schema:?}, expected `{schema}` \
+             (search_path: {search_path}). Configure database.{component_name}.pooled_url and, if needed, \
+             replica_url using a component role with ALTER ROLE <component_role> IN DATABASE <db> \
+             SET search_path TO \"{schema}\". Recycle existing pooler backends after changing role defaults."
+        );
+    }
+    Ok(())
+}
+
+/// Prove that an explicit schema endpoint reaches the same live database before
+/// creating schemas or migrating. Names, catalog OIDs and system identifiers can
+/// survive cloning; contention on a fresh database-scoped lock cannot. Both locks
+/// are transaction scoped so errors and cancellation cannot leak session locks.
+pub(crate) async fn verify_same_live_database(component_name: &str, main: &PgPool, component: &PgPool) -> anyhow::Result<()> {
+    let challenge = Uuid::new_v4().as_u128() as i64;
+    let mut main_transaction = main.begin().await?;
+    let held: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+        .bind(challenge)
+        .fetch_one(&mut *main_transaction)
+        .await?;
+    anyhow::ensure!(held, "{component_name}: could not acquire live database identity challenge");
+    let mut component_transaction = component.begin().await?;
+    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+        .bind(challenge)
+        .fetch_one(&mut *component_transaction)
+        .await?;
+    component_transaction.rollback().await?;
+    main_transaction.rollback().await?;
+    anyhow::ensure!(
+        !acquired,
+        "{component_name}: schema url must connect to the same live database as main"
+    );
+    Ok(())
+}
+
+/// Validate schema access without changing a pooled backend's session defaults.
+async fn verify_schema_in_transaction(schema: &str, pooled: &DbPools) -> anyhow::Result<()> {
+    for pool in [pooled.write(), pooled.read()] {
+        let mut transaction = pool.begin().await?;
+        sqlx::query(&format!("SET LOCAL search_path TO \"{}\"", schema.replace('"', "\"\"")))
+            .execute(&mut *transaction)
+            .await?;
+        let current: Option<String> = sqlx::query_scalar("SELECT current_schema()").fetch_one(&mut *transaction).await?;
+        anyhow::ensure!(
+            current.as_deref() == Some(schema),
+            "pooled endpoint cannot access schema `{schema}`"
+        );
+        transaction.rollback().await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod pooled_schema_tests {
+    use std::io::{Result as IoResult, Write};
+    use std::sync::Mutex;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn startup_does_not_log_schema_credentials() {
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> IoResult<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> IoResult<()> {
+                Ok(())
+            }
+        }
+        let captured = Capture(Default::default());
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let config = Config {
+            database: serde_json::from_value(serde_json::json!({
+                "type": "external", "url": "invalid", "fusillade": {
+                    "mode": "schema", "name": "fusillade",
+                    "url": "postgres://fusillade:scoped_password_sentinel@localhost/db"
+                }
+            }))
+            .unwrap(),
+            ..Config::default()
+        };
+        assert!(Application::new_with_pool_and_config_path(config, None, None, None).await.is_err());
+        let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("Starting control layer"), "startup logging must be captured");
+        assert!(
+            !logs.contains("scoped_password_sentinel"),
+            "startup must not log schema credentials"
+        );
+    }
+
+    /// `migrations.mode: check` must not create a missing component schema.
+    #[sqlx::test(migrations = false)]
+    async fn check_mode_reports_a_missing_schema_instead_of_creating_it(pool: PgPool) {
+        let component = serde_json::from_value(serde_json::json!({"mode": "schema", "name": "fusillade_missing"})).unwrap();
+        let main = db::PoolPair::unsplit(DbPools::new(pool.clone()));
+        let err = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1), false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not exist"), "{err}");
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'fusillade_missing')")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(!exists, "check mode executed DDL");
+        setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1), true)
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn pooled_fusillade_defaults_to_role_schema_validation(pool: PgPool) {
+        let mut endpoint = pool.connect_options().to_url_lossy();
+        endpoint.set_query(None);
+        let component = serde_json::from_value(serde_json::json!({
+            "mode": "schema", "name": "fusillade", "pooled_url": endpoint.as_str(),
+            "pool": {"max_connections": 2, "min_connections": 0}
+        }))
+        .unwrap();
+        let main = db::PoolPair::unsplit(DbPools::new(pool));
+        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1), true).await;
+        assert!(
+            result.is_err(),
+            "role_default must reject a shared login whose default schema is public"
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn scoped_schema_rejects_inherited_pooled_identity(pool: PgPool) {
+        let component = serde_json::from_value(serde_json::json!({
+            "mode": "schema", "name": "fusillade", "url": pool.connect_options().to_url_lossy().as_str(),
+            "pooled_schema_mode": "transaction"
+        }))
+        .unwrap();
+        let main = db::PoolPair {
+            direct: DbPools::new(pool.clone()),
+            pooled: DbPools::new(
+                sqlx::postgres::PgPoolOptions::new()
+                    .connect_with(pool.connect_options().as_ref().clone())
+                    .await
+                    .unwrap(),
+            ),
+        };
+        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1), true).await;
+        assert!(
+            result.is_err(),
+            "explicit direct credentials must not inherit main pooled credentials"
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn scoped_schema_rejects_outlet_transaction_mode(pool: PgPool) {
+        let component = serde_json::from_value(serde_json::json!({
+            "mode": "schema", "name": "outlet", "pooled_schema_mode": "transaction"
+        }))
+        .unwrap();
+        let main = db::PoolPair::unsplit(DbPools::new(pool));
+        assert!(
+            setup_component_pools("outlet", &component, &main, std::time::Duration::from_secs(1), true)
+                .await
+                .is_err()
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn scoped_schema_rejects_other_database_before_creating_schema(pool: PgPool) {
+        let other = sqlx::postgres::PgPoolOptions::new()
+            .connect_with(pool.connect_options().as_ref().clone().database("postgres"))
+            .await
+            .unwrap();
+        let schema = format!("scoped_proof_{}", Uuid::new_v4().simple());
+        let component = serde_json::from_value(serde_json::json!({
+            "mode": "schema", "name": schema, "url": other.connect_options().to_url_lossy().as_str()
+        }))
+        .unwrap();
+        let main = db::PoolPair::unsplit(DbPools::new(pool.clone()));
+        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1), true).await;
+        // Clean up even on a failed assertion against the old implementation.
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)")
+            .bind(&schema)
+            .fetch_one(&other)
+            .await
+            .unwrap();
+        assert!(!exists);
+        assert!(result.is_err(), "schema mode must reject a different live database");
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn scoped_schema_uses_explicit_direct_identity_without_main_replica(pool: PgPool) {
+        let role = format!("scoped_{}", Uuid::new_v4().simple());
+        pool.execute(format!("CREATE ROLE {role} LOGIN PASSWORD 'scoped_test_password'").as_str())
+            .await
+            .unwrap();
+        pool.execute(format!("CREATE SCHEMA fusillade AUTHORIZATION {role}").as_str())
+            .await
+            .unwrap();
+        let endpoint = pool
+            .connect_options()
+            .as_ref()
+            .clone()
+            .username(&role)
+            .password("scoped_test_password")
+            .to_url_lossy();
+        // A main replica configured with another identity must not be inherited.
+        let main = db::PoolPair::unsplit(DbPools::with_replica(pool.clone(), pool.clone()));
+        let component = serde_json::from_value(serde_json::json!({
+            "mode": "schema", "name": "fusillade", "url": endpoint.as_str()
+        }))
+        .unwrap();
+        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1), true).await;
+        let (identity, has_replica) = match result {
+            Ok(pair) => {
+                let identity: String = sqlx::query_scalar("SELECT current_user")
+                    .fetch_one(pair.direct.write())
+                    .await
+                    .unwrap();
+                let has_replica = pair.pooled.has_replica();
+                pair.direct.write().close().await;
+                (identity, has_replica)
+            }
+            Err(error) => panic!("explicit direct identity setup failed: {error}"),
+        };
+        pool.execute("DROP SCHEMA fusillade CASCADE").await.unwrap();
+        pool.execute(format!("DROP ROLE {role}").as_str()).await.unwrap();
+        assert_eq!(identity, role);
+        assert!(!has_replica);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn pooled_role_default_rejects_contaminated_session(pool: PgPool) {
+        pool.execute("CREATE SCHEMA fusillade").await.unwrap();
+        let mut endpoint = pool.connect_options().to_url_lossy();
+        endpoint.set_query(None);
+        let single = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(endpoint.as_str())
+            .await
+            .unwrap();
+        single.execute("SET search_path TO fusillade").await.unwrap();
+        assert!(
+            verify_schema_on_default_search_path("fusillade", "fusillade", &DbPools::new(single))
+                .await
+                .is_err(),
+            "a session override must not be mistaken for a persistent role default"
+        );
+    }
+
+    // This test exercises initial component migrations and ledger separation.
+    #[sqlx::test]
+    async fn pooled_component_endpoint_preserves_retained_response_lifecycle(pool: PgPool) {
+        use fusillade_arsenal::manager::{RetainedResponseArchiveCutoffs, RetentionPolicy};
+        use fusillade_arsenal::request::{PersistCompletedRealtimeInput, RequestId};
+        use fusillade_arsenal::{DaemonStorage, Storage};
+        // The shared role retains its public default on the pooled endpoint.
+        let mut endpoint = pool.connect_options().to_url_lossy();
+        endpoint.set_query(None);
+        let component: config::ComponentDb = serde_json::from_value(serde_json::json!({
+            "mode": "schema", "name": "fusillade", "pooled_schema_mode": "transaction", "pooled_url": endpoint.as_str(),
+            "pool": {"max_connections": 2, "min_connections": 0}
+        }))
+        .unwrap();
+        let main = db::PoolPair::unsplit(DbPools::new(pool.clone()));
+        let pair = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1), true)
+            .await
+            .unwrap();
+        assert!(
+            pair.is_split(),
+            "an explicit component endpoint must be used even without a main pooler"
+        );
+        fusillade_arsenal::migrator().run(&*pair.direct.write()).await.unwrap();
+        // Each migrator must retain its own ledger.
+        migrator().run(&pool).await.unwrap();
+        // This operator-built index is deliberately not installed by migrations.
+        sqlx::query(
+            r#"
+            CREATE INDEX idx_requests_batchless_retention_due ON requests (
+                service_tier,
+                (CASE state WHEN 'completed' THEN completed_at
+                            WHEN 'failed' THEN failed_at
+                            WHEN 'canceled' THEN canceled_at END), id
+            ) WHERE batch_id IS NULL AND state IN ('completed', 'failed', 'canceled')
+        "#,
+        )
+        .execute(pair.direct.write())
+        .await
+        .unwrap();
+        let manager =
+            fusillade_arsenal::PostgresRequestManager::new(pair.pooled.clone(), Default::default()).with_query_schema("fusillade");
+        assert!(manager.retained_response_archive_index_ready().await.unwrap());
+        let now = chrono::Utc::now();
+        let request_id = Uuid::new_v4();
+        manager
+            .persist_completed_realtime_batch(&[PersistCompletedRealtimeInput {
+                request_id,
+                response_body: r#"{"output":"retained"}"#.into(),
+                status_code: 200,
+                request_body: r#"{"model":"test"}"#.into(),
+                model: "test".into(),
+                endpoint: "https://example.invalid".into(),
+                method: "POST".into(),
+                path: "/v1/responses".into(),
+                api_key: "test-key".into(),
+                created_by: "test-owner".into(),
+                started_at: now - chrono::Duration::hours(2),
+                completed_at: now - chrono::Duration::hours(1),
+            }])
+            .await
+            .unwrap();
+        let policy = RetentionPolicy {
+            batchless_seconds_by_service_tier: [("priority".into(), 604_800)].into(),
+            max_late_writer_seconds: Some(3600),
+            ..Default::default()
+        };
+        manager.ensure_retained_response_partitions(&policy, 1).await.unwrap();
+        let cutoff = now - chrono::Duration::minutes(30);
+        let outcome = manager
+            .archive_terminal_batchless_responses(
+                &policy,
+                &RetainedResponseArchiveCutoffs::new(now, cutoff, cutoff).unwrap(),
+                1,
+                i64::MAX,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.groups_archived, 1);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM fusillade.requests")
+                .fetch_one(pair.pooled.write())
+                .await
+                .unwrap(),
+            0
+        );
+        let retained = manager.get_request_detail(RequestId(request_id)).await.unwrap();
+        assert_eq!(retained.id, request_id);
+        assert_eq!(retained.created_by, "test-owner");
+        assert_eq!(retained.response_body.as_deref(), Some(r#"{"output":"retained"}"#));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn pooled_outlet_rejects_wrong_replica_default(pool: PgPool) {
+        pool.execute("CREATE SCHEMA outlet").await.unwrap();
+        let primary = create_schema_pool("outlet", pool.connect_options().as_ref().clone(), &config::PoolSettings::default())
+            .await
+            .unwrap();
+        let replica = create_schema_pool(
+            "public,outlet",
+            pool.connect_options().as_ref().clone(),
+            &config::PoolSettings::default(),
+        )
+        .await
+        .unwrap();
+        let pools = DbPools::with_replica(primary, replica);
+        assert!(verify_schema_on_default_search_path("outlet", "outlet", &pools).await.is_err());
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn pooled_outlet_rejects_visible_but_noncurrent_schema(pool: PgPool) {
+        pool.execute("CREATE SCHEMA outlet").await.unwrap();
+        let pooled = sqlx::postgres::PgPoolOptions::new()
+            .connect_with(pool.connect_options().as_ref().clone().options([("search_path", "public,outlet")]))
+            .await
+            .unwrap();
+        assert!(
+            verify_schema_on_default_search_path("outlet", "outlet", &DbPools::new(pooled))
+                .await
+                .is_err()
+        );
+    }
+}
+
+/// Pooled/direct pools for a component database (fusillade, outlet).
+///
+/// Schema mode uses its explicit direct URL or the main direct endpoint for
+/// migrations, with a pinned search_path. Pooled queries default to a verified
+/// role schema; Fusillade also supports explicit transaction mode. Dedicated mode has its
+/// own `url` and optional `pooled_url`. Without a pooled endpoint, the pair is
+/// unsplit and sized by `pool`, preserving the existing connection behavior.
+///
+/// `create_schema` is false in `migrations.mode: check`, where startup must not
+/// execute DDL: a missing component schema is reported instead of created.
+async fn setup_component_pools(
+    component_name: &str,
+    component: &config::ComponentDb,
+    main: &db::PoolPair,
+    slow_threshold: std::time::Duration,
+    create_schema: bool,
+) -> anyhow::Result<db::PoolPair> {
+    component
+        .validate_schema_pooling(component_name, main.is_split())
+        .map_err(anyhow::Error::msg)?;
+    let replica_settings = component.replica_pool_settings();
+    match component {
+        config::ComponentDb::Schema {
+            name,
+            url,
+            pooled_schema_mode,
+            pool,
+            direct_pool,
+            pooled_url,
+            replica_url,
+            ..
+        } => {
+            let split = main.is_split() || pooled_url.is_some();
+            let direct = create_schema_pool(
+                name,
+                match url {
+                    Some(url) => connect_options(url, slow_threshold)?,
+                    None => main.direct.write().connect_options().as_ref().clone(),
+                },
+                if split { direct_pool } else { pool },
+            )
+            .await?;
+            if url.is_some() {
+                verify_same_live_database(component_name, &main.direct.write(), &direct).await?;
+            }
+            // Even CREATE SCHEMA IF NOT EXISTS requires database-wide CREATE.
+            // A scoped owner can migrate its existing schema without that grant.
+            let schema_exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)")
+                .bind(name)
+                .fetch_one(&direct)
+                .await?;
+            if !schema_exists && !create_schema {
+                anyhow::bail!("{component_name}: schema `{name}` does not exist and migrations.mode is `check`; run `dwctl migrate` first");
+            }
+            if !schema_exists {
+                direct
+                    .execute(&*format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", name.replace('"', "\"\"")))
+                    .await?;
+            }
+            let replica_options = match replica_url {
+                Some(url) => Some(connect_options(url, slow_threshold)?),
+                None if url.is_none() && main.pooled.has_replica() => Some(main.pooled.read().connect_options().as_ref().clone()),
+                None => None,
+            };
+            if split {
+                // Transaction poolers cannot preserve a session SET search_path.
+                // Explicit Fusillade transaction mode selects its schema locally;
+                // role-default mode requires a matching server-side default. Never
+                // add startup options to a pooled endpoint.
+                let options = match pooled_url {
+                    Some(url) => connect_options(url, slow_threshold)?,
+                    None => main.pooled.write().connect_options().as_ref().clone(),
+                };
+                let primary = db::pool_options(pool).connect_with(options).await?;
+                let pooled = match replica_options {
+                    Some(options) => DbPools::with_replica(primary, db::pool_options(replica_settings).connect_with(options).await?),
+                    None => DbPools::new(primary),
+                };
+                if *pooled_schema_mode == config::PooledSchemaMode::Transaction {
+                    verify_schema_in_transaction(name, &pooled).await?;
+                } else {
+                    verify_schema_on_default_search_path(component_name, name, &pooled).await?;
+                }
+                Ok(db::PoolPair {
+                    pooled,
+                    direct: DbPools::new(direct),
+                })
+            } else {
+                let pools = match replica_options {
+                    Some(options) => DbPools::with_replica(direct, create_schema_pool(name, options, replica_settings).await?),
+                    None => DbPools::new(direct),
+                };
+                Ok(db::PoolPair::unsplit(pools))
+            }
+        }
+        config::ComponentDb::Dedicated {
+            url,
+            replica_url,
+            pooled_url,
+            pool,
+            direct_pool,
+            ..
+        } => {
+            info!("Using dedicated database for {component_name}");
+            let direct_settings = if pooled_url.is_some() { direct_pool } else { pool };
+            let direct = db::pool_options(direct_settings)
+                .connect_with(connect_options(url, slow_threshold)?)
+                .await?;
+            let replica = match replica_url {
+                Some(replica_url) => {
+                    info!("Setting up {component_name} read replica");
+                    Some(
+                        db::pool_options(replica_settings)
+                            .connect_with(connect_options(replica_url, slow_threshold)?)
+                            .await?,
+                    )
+                }
+                None => None,
+            };
+            let with_replica = |primary: sqlx::PgPool, replica: Option<sqlx::PgPool>| match replica {
+                Some(replica) => DbPools::with_replica(primary, replica),
+                None => DbPools::new(primary),
+            };
+            Ok(match pooled_url {
+                Some(pooled_url) => {
+                    info!("Using pooled endpoint for {component_name} query traffic");
+                    let pooled = db::pool_options(pool)
+                        .connect_with(connect_options(pooled_url, slow_threshold)?)
+                        .await?;
+                    db::PoolPair {
+                        pooled: with_replica(pooled, replica),
+                        direct: DbPools::new(direct),
+                    }
+                }
+                None => db::PoolPair::unsplit(with_replica(direct, replica)),
+            })
+        }
+    }
+}
+
+/// Setup database connections, run migrations, and initialize data.
+///
+/// Returns the embedded database handle (if any), every database as a
+/// [`db::PoolPair`], and the retained-response partition-maintenance session
+/// pool when this process must run that recovery (always a direct session).
+///
+/// Every database comes back as a [`db::PoolPair`]: `pooled` carries all query
+/// traffic (through the transaction-pooling endpoint when `pooled_url` is
+/// configured) and `direct` the session-scoped work — LISTEN connections, the
+/// leader-election lock, migrations. With no `pooled_url` the two are the same
+/// pool, sized by `pool`, which is the pre-pooling behaviour byte for byte.
 ///
 /// If `pool` is provided, it will be used directly instead of creating a new connection.
 /// This is useful for tests where sqlx::test provides a pool.
+#[derive(Debug, Clone, Copy)]
+struct RetainedResponseMaintenanceState {
+    unfinished_retirements: i64,
+    identity_mismatch: bool,
+    retired_routes_exist: bool,
+}
+
+fn partition_maintenance_required(daemon: &config::DaemonConfig, state: RetainedResponseMaintenanceState) -> anyhow::Result<bool> {
+    if state.identity_mismatch {
+        // Corruption of the durable lifecycle identity is global: no instance
+        // may start against it, whether or not it runs the daemon.
+        anyhow::bail!("retained-response retirement recovery identity is inconsistent");
+    }
+    if matches!(daemon.enabled, config::DaemonEnabled::Never) {
+        // This instance never runs the archive daemon, so it owns no
+        // maintenance session: in a split topology the daemon pods share this
+        // environment and are the ones that recover journals and clean routes.
+        // Say so loudly when durable work is pending, so a single-instance
+        // deployment that disabled its daemon cannot strand a retirement
+        // silently.
+        if state.unfinished_retirements > 0 || state.retired_routes_exist {
+            tracing::warn!(
+                unfinished_retirements = state.unfinished_retirements,
+                retired_routes_exist = state.retired_routes_exist,
+                "retained-response maintenance work is pending but the batch daemon never runs on this instance; \
+                 another instance must run it"
+            );
+        }
+        return Ok(false);
+    }
+    if state.retired_routes_exist && daemon.retention.max_late_writer_seconds.is_none() {
+        anyhow::bail!("retired response route cleanup requires an explicit late-writer fence period");
+    }
+    if state.retired_routes_exist && (daemon.purge_interval_ms == 0 || daemon.purge_batch_size < 1) {
+        anyhow::bail!("retired response route cleanup requires an enabled positive bounded cleanup configuration");
+    }
+    Ok(daemon.retained_response_retirement_enabled
+        || daemon.batch_archive_retirement_enabled
+        || daemon.template_retirement_enabled
+        || state.unfinished_retirements > 0)
+}
+
+#[cfg(test)]
+mod retained_response_maintenance_preflight_tests {
+    use super::*;
+
+    fn state(unfinished_retirements: i64, identity_mismatch: bool, retired_routes_exist: bool) -> RetainedResponseMaintenanceState {
+        RetainedResponseMaintenanceState {
+            unfinished_retirements,
+            identity_mismatch,
+            retired_routes_exist,
+        }
+    }
+
+    #[test]
+    fn an_instance_that_never_runs_the_daemon_owns_no_maintenance() {
+        // Split topology: the API pods carry the daemon pods' retention
+        // configuration and must start without a maintenance session, even
+        // while durable work is pending — the daemon pods own its recovery.
+        let mut daemon = config::DaemonConfig::default();
+        daemon.enabled = config::DaemonEnabled::Never;
+        daemon.retained_response_retirement_enabled = true;
+        daemon.batch_archive_retirement_enabled = true;
+        assert!(!partition_maintenance_required(&daemon, state(1, false, true)).unwrap());
+        // Corrupted lifecycle identity still stops every instance.
+        assert!(partition_maintenance_required(&daemon, state(0, true, false)).is_err());
+    }
+
+    #[test]
+    fn an_enabled_daemon_owns_maintenance_when_retirement_or_recovery_is_pending() {
+        let mut daemon = config::DaemonConfig::default();
+        daemon.enabled = config::DaemonEnabled::Always;
+        assert!(!partition_maintenance_required(&daemon, state(0, false, false)).unwrap());
+        assert!(partition_maintenance_required(&daemon, state(1, false, false)).unwrap());
+        daemon.retained_response_retirement_enabled = true;
+        assert!(partition_maintenance_required(&daemon, state(0, false, false)).unwrap());
+    }
+
+    #[test]
+    fn orphan_lifecycle_identity_always_fails_startup() {
+        let daemon = config::DaemonConfig::default();
+        let error = partition_maintenance_required(&daemon, state(0, true, false)).expect_err("orphan retiring state is not recoverable");
+        assert!(error.to_string().contains("identity is inconsistent"));
+    }
+
+    #[test]
+    fn retired_route_backlog_requires_fence_and_positive_bounded_cleanup() {
+        let mut daemon = config::DaemonConfig::default();
+        assert!(
+            partition_maintenance_required(&daemon, state(0, false, true))
+                .unwrap_err()
+                .to_string()
+                .contains("fence period")
+        );
+
+        daemon.retention.max_late_writer_seconds = Some(600);
+        daemon.purge_interval_ms = 0;
+        assert!(
+            partition_maintenance_required(&daemon, state(0, false, true))
+                .unwrap_err()
+                .to_string()
+                .contains("positive bounded cleanup")
+        );
+        daemon.purge_interval_ms = 1;
+        daemon.purge_batch_size = 0;
+        assert!(
+            partition_maintenance_required(&daemon, state(0, false, true))
+                .unwrap_err()
+                .to_string()
+                .contains("positive bounded cleanup")
+        );
+        daemon.purge_batch_size = 1;
+        assert!(!partition_maintenance_required(&daemon, state(0, false, true)).unwrap());
+    }
+}
+
 async fn setup_database(
     config: &Config,
     pool: Option<PgPool>,
-) -> anyhow::Result<(Option<db::embedded::EmbeddedDatabase>, DbPools, DbPools, Option<DbPools>)> {
+) -> anyhow::Result<(Option<db::embedded::EmbeddedDatabase>, db::DatabasePools, Option<PgPool>)> {
     let slow_threshold = std::time::Duration::from_millis(config.slow_statement_threshold_ms);
 
-    // If a pool is provided (e.g., from tests), create a TestDbPools which will create a read-only replica
-    let (embedded_db, pool, test_replica_pool) = if let Some(existing_pool) = pool {
+    let (embedded_db, main) = if let Some(existing_pool) = pool {
         info!("Using provided database pool with TestDbPools for read/write separation");
-
-        // Create TestDbPools which creates a read-only replica for testing
+        // TestDbPools adds a read-only replica so tests catch writes routed through `.read()`.
         let test_pools = sqlx_pool_router::TestDbPools::new(existing_pool.clone())
             .await
             .expect("Failed to create TestDbPools");
-
-        // Extract the write and read pools to create a DbPools with proper read/write separation
-        let replica_pool = test_pools.read().clone();
-        (None, existing_pool, Some(replica_pool))
+        let replica_pool = test_pools.read().into_inner();
+        migrations::at_startup(config.migrations.mode, &migrations::Target::main(), &existing_pool).await?;
+        (None, db::PoolPair::unsplit(DbPools::with_replica(existing_pool, replica_pool)))
     } else {
         // Database connection - handle both embedded and external
-        let (_embedded_db, database_url) = match &config.database {
+        let (embedded_db, database_url) = match &config.database {
             config::DatabaseConfig::Embedded { .. } => {
                 let persistent = config.database.embedded_persistent();
                 info!("Starting with embedded database (persistent: {})", persistent);
@@ -691,250 +1421,160 @@ async fn setup_database(
             }
         };
 
-        let main_settings = config.database.main_pool_settings();
-        let connect_opts = PgConnectOptions::from_str(&database_url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(main_settings.max_connections)
-            .min_connections(main_settings.min_connections)
-            .acquire_timeout(std::time::Duration::from_secs(main_settings.acquire_timeout_secs))
-            .idle_timeout(if main_settings.idle_timeout_secs > 0 {
-                Some(std::time::Duration::from_secs(main_settings.idle_timeout_secs))
-            } else {
-                None
-            })
-            .max_lifetime(if main_settings.max_lifetime_secs > 0 {
-                Some(std::time::Duration::from_secs(main_settings.max_lifetime_secs))
-            } else {
-                None
-            })
-            .connect_with(connect_opts)
+        let pooled_url = config.database.external_pooled_url();
+        // Direct connections: real backends. Sized small (`direct_pool`) when a
+        // pooler carries the query traffic, by `pool` otherwise.
+        let direct_settings = if pooled_url.is_some() {
+            config.database.direct_pool_settings()
+        } else {
+            config.database.main_pool_settings()
+        };
+        let direct = db::pool_options(direct_settings)
+            .connect_with(connect_options(&database_url, slow_threshold)?)
             .await?;
-        (_embedded_db, pool, None)
+
+        // Migrations take a session-level advisory lock: always a direct
+        // connection. `migrations.mode` decides whether this process applies
+        // them or only verifies the schema is compatible.
+        migrations::at_startup(config.migrations.mode, &migrations::Target::main(), &direct).await?;
+
+        let replica = match config.database.external_replica_url() {
+            Some(replica_url) => {
+                info!("Setting up read replica pool");
+                Some(
+                    db::pool_options(config.database.main_replica_pool_settings())
+                        .connect_with(connect_options(replica_url, slow_threshold)?)
+                        .await?,
+                )
+            }
+            None => None,
+        };
+        let with_replica = |primary: sqlx::PgPool, replica: Option<sqlx::PgPool>| match replica {
+            Some(replica) => DbPools::with_replica(primary, replica),
+            None => DbPools::new(primary),
+        };
+        let main = match pooled_url {
+            Some(pooled_url) => {
+                info!("Using pooled endpoint for main database query traffic");
+                let pooled = db::pool_options(config.database.main_pool_settings())
+                    .connect_with(connect_options(pooled_url, slow_threshold)?)
+                    .await?;
+                db::PoolPair {
+                    pooled: with_replica(pooled, replica),
+                    direct: DbPools::new(direct),
+                }
+            }
+            None => db::PoolPair::unsplit(with_replica(direct, replica)),
+        };
+        (embedded_db, main)
     };
 
-    migrator().run(&pool).await?;
-
-    // Create replica pool if configured (or use test replica if in test mode)
-    let db_pools = if let Some(test_replica) = test_replica_pool {
-        info!("Using test replica pool with read-only enforcement");
-        DbPools::with_replica(pool, test_replica)
-    } else if let Some(replica_url) = config.database.external_replica_url() {
-        info!("Setting up read replica pool");
-        let replica_settings = config.database.main_replica_pool_settings();
-        let replica_opts = PgConnectOptions::from_str(replica_url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
-        let replica_pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(replica_settings.max_connections)
-            .min_connections(replica_settings.min_connections)
-            .acquire_timeout(std::time::Duration::from_secs(replica_settings.acquire_timeout_secs))
-            .idle_timeout(if replica_settings.idle_timeout_secs > 0 {
-                Some(std::time::Duration::from_secs(replica_settings.idle_timeout_secs))
-            } else {
-                None
-            })
-            .max_lifetime(if replica_settings.max_lifetime_secs > 0 {
-                Some(std::time::Duration::from_secs(replica_settings.max_lifetime_secs))
-            } else {
-                None
-            })
-            .connect_with(replica_opts)
-            .await?;
-        DbPools::with_replica(pool, replica_pool)
-    } else {
-        DbPools::new(pool)
-    };
-
-    // Get connection options from the main pool to create schema-based child pools
-    let main_connect_opts = db_pools.connect_options().as_ref().clone();
-
-    // Helper to create a pool with schema-specific search_path
-    // Reuses connection URLs from main pool (both primary and replica if configured)
-    // Sets search_path at the connection level (via PgConnectOptions) rather than using
-    // after_connect hooks, ensuring it cannot be unset and works reliably with replicas
-    // Uses eager connection (connect_with) to respect min_connections at startup
-    async fn create_schema_pool(
-        schema: String,
-        opts: sqlx::postgres::PgConnectOptions,
-        settings: &config::PoolSettings,
-    ) -> Result<sqlx::PgPool, sqlx::Error> {
-        // Set search_path directly in connection options so PostgreSQL enforces it
-        // This is more reliable than after_connect hooks, especially with replicas
-        // The options() method formats as: "-c key=value"
-        let search_path_key = "search_path".to_string();
-        let search_path_value = schema.clone();
-        info!("Setting search_path={} via connection options for schema pool", schema);
-        let opts_with_schema = opts.options([(search_path_key, search_path_value)]);
-
-        sqlx::postgres::PgPoolOptions::new()
-            .max_connections(settings.max_connections)
-            .min_connections(settings.min_connections)
-            .acquire_timeout(std::time::Duration::from_secs(settings.acquire_timeout_secs))
-            .idle_timeout(if settings.idle_timeout_secs > 0 {
-                Some(std::time::Duration::from_secs(settings.idle_timeout_secs))
-            } else {
-                None
-            })
-            .max_lifetime(if settings.max_lifetime_secs > 0 {
-                Some(std::time::Duration::from_secs(settings.max_lifetime_secs))
-            } else {
-                None
-            })
-            .connect_with(opts_with_schema)
-            .await
+    if main.is_split() {
+        // Steady-state session consumers on the main direct pool: the onwards
+        // config, webhook-event and ZDR key-sync listeners, the probe-changes
+        // listener on the leader, and the leader-election lock — five — plus
+        // migrations at boot. Observed on a Neon branch: a direct pool of 4
+        // times out setting up the webhook listener.
+        const MIN_DIRECT_FOR_SESSION_WORK: u32 = 6;
+        let direct_max = main.direct.write().options().get_max_connections();
+        if direct_max < MIN_DIRECT_FOR_SESSION_WORK {
+            warn!(
+                direct_max,
+                minimum = MIN_DIRECT_FOR_SESSION_WORK,
+                "database.direct_pool.max_connections is below the number of session-scoped consumers \
+                 (LISTEN loops + leader lock); listeners will fail to acquire a connection"
+            );
+        }
     }
 
-    // Setup fusillade batch processing pool
+    // Fusillade batch processing pools
     info!("Setting up fusillade batch processing pool");
-    let fusillade_pools = match config.database.fusillade() {
-        config::ComponentDb::Schema {
-            name, pool: pool_settings, ..
-        } => {
-            // Create primary pool using main's connection, with schema-specific search_path
-            let primary = create_schema_pool(name.clone(), main_connect_opts.clone(), pool_settings).await?;
-            primary.execute(&*format!("CREATE SCHEMA IF NOT EXISTS {name}")).await?;
+    let fusillade = setup_component_pools(
+        "fusillade",
+        config.database.fusillade(),
+        &main,
+        slow_threshold,
+        config.migrations.mode == config::MigrationsMode::Run,
+    )
+    .await?;
+    // sqlx's migrator holds a session advisory lock: direct connections.
+    migrations::at_startup(config.migrations.mode, &migrations::Target::fusillade(), &fusillade.direct.write()).await?;
 
-            // Create replica pool if main has one configured (inherits main's replica connection)
-            if db_pools.has_replica() {
-                info!("Setting up fusillade read replica (schema mode)");
-                let replica_opts = db_pools.read().connect_options().as_ref().clone();
-                let replica_pool_settings = config.database.fusillade().replica_pool_settings();
-                let replica = create_schema_pool(name.clone(), replica_opts, replica_pool_settings).await?;
-                DbPools::with_replica(primary, replica)
-            } else {
-                DbPools::new(primary)
-            }
-        }
-        config::ComponentDb::Dedicated {
-            url,
-            replica_url,
-            pool: pool_settings,
-            ..
-        } => {
-            info!("Using dedicated database for fusillade");
-            let connect_opts = PgConnectOptions::from_str(url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
-            let primary = sqlx::postgres::PgPoolOptions::new()
-                .max_connections(pool_settings.max_connections)
-                .min_connections(pool_settings.min_connections)
-                .acquire_timeout(std::time::Duration::from_secs(pool_settings.acquire_timeout_secs))
-                .idle_timeout(if pool_settings.idle_timeout_secs > 0 {
-                    Some(std::time::Duration::from_secs(pool_settings.idle_timeout_secs))
-                } else {
-                    None
-                })
-                .max_lifetime(if pool_settings.max_lifetime_secs > 0 {
-                    Some(std::time::Duration::from_secs(pool_settings.max_lifetime_secs))
-                } else {
-                    None
-                })
-                .connect_with(connect_opts)
-                .await?;
-
-            if let Some(replica_url) = replica_url {
-                info!("Setting up fusillade read replica");
-                let replica_pool_settings = config.database.fusillade().replica_pool_settings();
-                let replica_opts = PgConnectOptions::from_str(replica_url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
-                let replica = sqlx::postgres::PgPoolOptions::new()
-                    .max_connections(replica_pool_settings.max_connections)
-                    .min_connections(replica_pool_settings.min_connections)
-                    .acquire_timeout(std::time::Duration::from_secs(replica_pool_settings.acquire_timeout_secs))
-                    .idle_timeout(if replica_pool_settings.idle_timeout_secs > 0 {
-                        Some(std::time::Duration::from_secs(replica_pool_settings.idle_timeout_secs))
+    // Every batch-capable process performs the content-free preflight, even
+    // when its daemon is disabled. That makes disabling the last archive
+    // owner fail closed while durable retirement or route cleanup remains.
+    // Request-only processes intentionally ignore shared owner configuration.
+    let daemon = &config.background_services.batch_daemon;
+    let batch_capable = !matches!(daemon.mode, config::DaemonMode::RequestOnly);
+    let partition_maintenance_pool = if batch_capable {
+        let (unfinished_retirements, identity_mismatch, retired_routes_exist): (i64, bool, bool) =
+            sqlx::query_as(include_str!("retention_preflight.sql"))
+                .fetch_one(fusillade.direct.write())
+                .await
+                .map_err(|error| anyhow::anyhow!("failed to inspect retained-response retirement recovery state: {error}"))?;
+        let required = partition_maintenance_required(
+            daemon,
+            RetainedResponseMaintenanceState {
+                unfinished_retirements,
+                identity_mismatch,
+                retired_routes_exist,
+            },
+        )?;
+        if required {
+            let connect_options = match config.database.fusillade() {
+                config::ComponentDb::Schema { name, .. } => {
+                    if let Some(url) = daemon.retained_response_partition_maintenance_url.as_ref() {
+                        PgConnectOptions::from_str(url.expose())?.options([("search_path", name.as_str())])
                     } else {
-                        None
-                    })
-                    .max_lifetime(if replica_pool_settings.max_lifetime_secs > 0 {
-                        Some(std::time::Duration::from_secs(replica_pool_settings.max_lifetime_secs))
-                    } else {
-                        None
-                    })
-                    .connect_with(replica_opts)
-                    .await?;
-                DbPools::with_replica(primary, replica)
-            } else {
-                DbPools::new(primary)
+                        // Schema mode: use the component's DIRECT pool options —
+                        // a real session (never the pooled endpoint), carrying
+                        // the component search_path startup option.
+                        fusillade.direct.write().connect_options().as_ref().clone()
+                    }
+                }
+                config::ComponentDb::Dedicated { .. } => {
+                    let url = daemon.retained_response_partition_maintenance_url.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("retained-response recovery on a dedicated database requires an explicit direct session endpoint")
+                    })?;
+                    PgConnectOptions::from_str(url.expose())?
+                }
             }
+            .log_slow_statements(log::LevelFilter::Warn, slow_threshold);
+            Some(
+                sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(1)
+                    .min_connections(0)
+                    .acquire_timeout(std::time::Duration::from_secs(30))
+                    .idle_timeout(Some(std::time::Duration::from_secs(600)))
+                    .max_lifetime(Some(std::time::Duration::from_secs(1_800)))
+                    .connect_with(connect_options)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("failed to connect retained-response partition maintenance session"))?,
+            )
+        } else {
+            None
         }
+    } else {
+        None
     };
-    fusillade_arsenal::migrator().run(&*fusillade_pools).await?;
 
-    // Run underway migrations (background task queue)
-    underway::run_migrations(&*db_pools).await?;
+    // Underway migrations (background task queue) — one transaction, but keep
+    // them on the direct connection like every other migration.
+    migrations::underway_at_startup(config.migrations.mode, &main.direct.write()).await?;
 
-    // Setup outlet schema and pool if request logging is enabled
-    let outlet_pools = if config.enable_request_logging {
+    // Outlet request-logging pools, if enabled
+    let outlet = if config.enable_request_logging {
         info!("Setting up outlet request logging pool (logging enabled)");
-        let pools = match config.database.outlet() {
-            config::ComponentDb::Schema {
-                name, pool: pool_settings, ..
-            } => {
-                // Create primary pool using main's connection, with schema-specific search_path
-                let primary = create_schema_pool(name.clone(), main_connect_opts.clone(), pool_settings).await?;
-                primary.execute(&*format!("CREATE SCHEMA IF NOT EXISTS {name}")).await?;
-
-                // Create replica pool if main has one configured (inherits main's replica connection)
-                if db_pools.has_replica() {
-                    info!("Setting up outlet read replica (schema mode)");
-                    let replica_opts = db_pools.read().connect_options().as_ref().clone();
-                    let replica_pool_settings = config.database.outlet().replica_pool_settings();
-                    let replica = create_schema_pool(name.clone(), replica_opts, replica_pool_settings).await?;
-                    DbPools::with_replica(primary, replica)
-                } else {
-                    DbPools::new(primary)
-                }
-            }
-            config::ComponentDb::Dedicated {
-                url,
-                replica_url,
-                pool: pool_settings,
-                ..
-            } => {
-                info!("Using dedicated database for outlet");
-                let connect_opts = PgConnectOptions::from_str(url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
-                let primary = sqlx::postgres::PgPoolOptions::new()
-                    .max_connections(pool_settings.max_connections)
-                    .min_connections(pool_settings.min_connections)
-                    .acquire_timeout(std::time::Duration::from_secs(pool_settings.acquire_timeout_secs))
-                    .idle_timeout(if pool_settings.idle_timeout_secs > 0 {
-                        Some(std::time::Duration::from_secs(pool_settings.idle_timeout_secs))
-                    } else {
-                        None
-                    })
-                    .max_lifetime(if pool_settings.max_lifetime_secs > 0 {
-                        Some(std::time::Duration::from_secs(pool_settings.max_lifetime_secs))
-                    } else {
-                        None
-                    })
-                    .connect_with(connect_opts)
-                    .await?;
-
-                if let Some(replica_url) = replica_url {
-                    info!("Setting up outlet read replica");
-                    let replica_pool_settings = config.database.outlet().replica_pool_settings();
-                    let replica_opts = PgConnectOptions::from_str(replica_url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
-                    let replica = sqlx::postgres::PgPoolOptions::new()
-                        .max_connections(replica_pool_settings.max_connections)
-                        .min_connections(replica_pool_settings.min_connections)
-                        .acquire_timeout(std::time::Duration::from_secs(replica_pool_settings.acquire_timeout_secs))
-                        .idle_timeout(if replica_pool_settings.idle_timeout_secs > 0 {
-                            Some(std::time::Duration::from_secs(replica_pool_settings.idle_timeout_secs))
-                        } else {
-                            None
-                        })
-                        .max_lifetime(if replica_pool_settings.max_lifetime_secs > 0 {
-                            Some(std::time::Duration::from_secs(replica_pool_settings.max_lifetime_secs))
-                        } else {
-                            None
-                        })
-                        .connect_with(replica_opts)
-                        .await?;
-                    DbPools::with_replica(primary, replica)
-                } else {
-                    DbPools::new(primary)
-                }
-            }
-        };
-        outlet_postgres::migrator().run(&*pools).await?;
-
-        Some(pools)
+        let outlet = setup_component_pools(
+            "outlet",
+            config.database.outlet(),
+            &main,
+            slow_threshold,
+            config.migrations.mode == config::MigrationsMode::Run,
+        )
+        .await?;
+        migrations::at_startup(config.migrations.mode, &migrations::Target::outlet(), &outlet.direct.write()).await?;
+        Some(outlet)
     } else {
         info!("Skipping outlet pool setup (logging disabled)");
         None
@@ -946,21 +1586,58 @@ async fn setup_database(
         iterations: config.auth.native.password.argon2_iterations,
         parallelism: config.auth.native.password.argon2_parallelism,
     };
-    create_initial_admin_user(&config.admin_email, config.admin_password.as_deref(), argon2_params, &db_pools)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to create initial admin user: {}", e))?;
+    create_initial_admin_user(
+        &config.admin_email,
+        config.admin_password.as_deref(),
+        argon2_params,
+        &main.pooled.write(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to create initial admin user: {}", e))?;
+
+    // Provision the global continuation key (hidden, SYSTEM-owned — system
+    // ownership is what admits it to every model's onwards keyset regardless of
+    // group gating or pricing) so it exists and has synced into the onwards key
+    // cache before the first resume attempt.
+    if config.continuation.enabled {
+        continuation::provision_global_key(&main.pooled.write())
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to provision continuation key: {}", e))?;
+    }
 
     // Seed database with initial configuration (only runs once)
-    seed_database(&config.model_sources, &db_pools).await?;
+    seed_database(&config.model_sources, &main.pooled.write()).await?;
 
-    Ok((embedded_db, db_pools, fusillade_pools, outlet_pools))
+    if config.model_provisioning.enabled {
+        // Every catalog is parsed and validated before any is applied, so
+        // a malformed overlay file fails startup without a half-applied model
+        // catalog. Overlays and account limits reference the model catalog's
+        // aliases, so they are applied after it.
+        let catalog = model_provisioning::Catalog::load(&config.model_provisioning.directory)?;
+        let overlays = org_overlays::OrgCatalog::load(&config.model_provisioning.org_overlays_directory)?;
+        let account_limits = account_limits::AccountLimitsCatalog::load(&config.model_provisioning.account_limits_directory)?;
+        model_provisioning::apply(&main.pooled.write(), &catalog).await?;
+        org_overlays::apply(&main.pooled.write(), &overlays).await?;
+        account_limits::apply(&main.pooled.write(), &account_limits).await?;
+    }
+
+    Ok((
+        embedded_db,
+        db::DatabasePools { main, fusillade, outlet },
+        partition_maintenance_pool,
+    ))
 }
 
 /// Build the base CORS layer (methods, headers, max-age, exposed headers) from
 /// configuration. Origin/credential handling differs by mode — see [`apply_cors`].
 fn create_cors_layer(cors: &CorsConfig) -> anyhow::Result<CorsLayer> {
     // Parse exposed headers as HeaderName
-    let exposed: Vec<http::HeaderName> = cors.exposed_headers.iter().filter_map(|h| h.parse().ok()).collect();
+    let mut exposed: Vec<http::HeaderName> = cors.exposed_headers.iter().filter_map(|h| h.parse().ok()).collect();
+    // Always let browsers read the request ID so users can quote it in support requests.
+    let request_id_header = http::HeaderName::from_static(REQUEST_ID_HEADER);
+    if !exposed.contains(&request_id_header) {
+        exposed.push(request_id_header);
+    }
 
     let mut cors_layer = CorsLayer::new()
         .allow_methods([
@@ -1123,7 +1800,7 @@ fn security_header_pairs(cfg: &crate::config::SecurityHeadersConfig) -> anyhow::
 ///
 /// - `state`: Mutable application state (metrics recorder may be initialized here)
 /// - `onwards_router`: Pre-configured router for AI request proxying
-/// - `analytics_sender`: Optional sender for analytics records (from background services)
+/// - `analytics_writer`: Optional durable outbox writer (from background services)
 /// - `metrics_recorder`: Optional GenAI metrics recorder (created before background services)
 ///
 /// # Returns
@@ -1135,14 +1812,16 @@ fn security_header_pairs(cfg: &crate::config::SecurityHeadersConfig) -> anyhow::
 /// Returns an error if CORS configuration is invalid, a configured security
 /// response header has an invalid value, or metrics initialization fails.
 #[instrument(skip_all)]
+#[allow(clippy::too_many_arguments)]
 pub async fn build_router(
     state: &mut AppState,
     onwards_router: Router,
-    analytics_sender: Option<request_logging::batcher::AnalyticsSender>,
+    analytics_writer: Option<request_logging::batcher::AnalyticsOutboxWriter>,
     requests_writer_sender: Option<crate::inference::engine::writer::RequestsWriterSender>,
     metrics_recorder: Option<GenAiMetrics>,
     strict_mode: bool,
     inference_middleware_state: Option<crate::inference::middleware::InferenceMiddlewareState>,
+    prefix_chain: Option<Arc<crate::prefix_chain::PrefixChainRecorder>>,
 ) -> anyhow::Result<Router> {
     let config = state.current_config();
 
@@ -1157,21 +1836,25 @@ pub async fn build_router(
     let request_logging_enabled = state.outlet_db.is_some() && config.enable_request_logging;
     let analytics_enabled = config.enable_analytics;
 
-    let outlet_layer = if request_logging_enabled || analytics_enabled {
+    let outlet_layer = if request_logging_enabled || analytics_enabled || prefix_chain.is_some() {
         // Store the metrics recorder in state (created earlier in Application::new)
         state.metrics_recorder = metrics_recorder;
 
         // Build handler chain based on config
         let mut multi_handler = MultiHandler::new();
+        // One instance id for every handler that writes `(instance_id, correlation_id)`, so
+        // their rows join.
+        let instance_id = uuid::Uuid::new_v4();
 
         // Add PostgresHandler for request logging if enabled
         if request_logging_enabled {
             let outlet_pool = state.outlet_db.as_ref().expect("outlet_db checked above");
-            let postgres_handler = PostgresHandler::<DbPools, ParsedAIRequest, AiResponse>::from_pool_provider(outlet_pool.clone())
-                .await
-                .expect("Failed to create PostgresHandler for request logging")
-                .with_request_serializer(parse_ai_request)
-                .with_response_serializer(parse_ai_response);
+            let postgres_handler =
+                PostgresHandler::<sqlx::PgPool, ParsedAIRequest, AiResponse>::from_pool_provider(outlet_pool.write().into_inner())
+                    .await
+                    .expect("Failed to create PostgresHandler for request logging")
+                    .with_request_serializer(parse_ai_request)
+                    .with_response_serializer(parse_ai_response);
             // TRANSITIONAL (dwctl ZDR): guard the analytics logger so plaintext
             // ZDR bodies (decrypted for the upstream call, captured on the
             // loopback) never land in http_requests / http_responses. The marker
@@ -1182,9 +1865,21 @@ pub async fn build_router(
 
         // Add AnalyticsHandler for analytics/billing if enabled
         // The batcher is spawned in setup_background_services and managed by BackgroundServices
-        if let Some(sender) = analytics_sender {
-            let analytics_handler = request_logging::AnalyticsHandler::new(sender, uuid::Uuid::new_v4(), config.as_ref().clone());
+        if let Some(writer) = analytics_writer {
+            // Billing reads usage from the single `parse_ai_response -> AiResponse`
+            // parse (the same value request logging stores), via `TokenMetrics::from`.
+            // The outlet sits outer to translation, so it captures the foreign
+            // response body; `AiResponse` covers each protocol's own shape.
+            let analytics_handler = request_logging::AnalyticsHandler::new(writer, instance_id, config.as_ref().clone());
             multi_handler = multi_handler.with(analytics_handler);
+        }
+
+        if let Some(recorder) = prefix_chain {
+            multi_handler = multi_handler.with(crate::prefix_chain::PrefixChainHandler::new(
+                recorder,
+                instance_id,
+                config.as_ref().clone(),
+            ));
         }
 
         // Add FusilladeOutletHandler so completed responses get written to
@@ -1256,6 +1951,10 @@ pub async fn build_router(
             post(api::handlers::api_keys::rotate_user_api_key),
         )
         .route(
+            "/users/{user_id}/api-keys/{id}/reveal",
+            post(api::handlers::api_keys::reveal_user_api_key),
+        )
+        .route(
             "/users/{user_id}/api-keys/{id}",
             delete(api::handlers::api_keys::delete_user_api_key),
         )
@@ -1321,6 +2020,11 @@ pub async fn build_router(
         .route("/models/{id}", get(api::handlers::deployments::get_deployed_model))
         .route("/models/{id}", patch(api::handlers::deployments::update_deployed_model))
         .route("/models/{id}", delete(api::handlers::deployments::delete_deployed_model))
+        .route("/models/{id}/overlays", get(api::handlers::serving::list_model_overlays))
+        .route(
+            "/models/{id}/realtime-inflight-limits",
+            get(api::handlers::realtime_inflight_limits::list_realtime_inflight_limits),
+        )
         .route("/models/{id}/cache-pricing", get(api::handlers::cache_pricing::get_cache_pricing))
         .route(
             "/models/{id}/cache-pricing",
@@ -1402,6 +2106,7 @@ pub async fn build_router(
         .route("/organizations/{id}", get(api::handlers::organizations::get_organization))
         .route("/organizations/{id}", patch(api::handlers::organizations::update_organization))
         .route("/organizations/{id}", delete(api::handlers::organizations::delete_organization))
+        .route("/organizations/{id}/serving", get(api::handlers::serving::get_organization_serving))
         // Organization membership
         .route("/organizations/{id}/members", get(api::handlers::organizations::list_members))
         .route("/organizations/{id}/members", post(api::handlers::organizations::add_member))
@@ -1439,6 +2144,18 @@ pub async fn build_router(
             "/organizations/{id}/join-requests/{request_id}/decline",
             post(api::handlers::organizations::decline_join_request),
         )
+        // Accept/decline by id, for an invitee who reached the invitation
+        // through onboarding rather than the emailed link. Authorized on the
+        // caller's own address matching the one invited — not on membership,
+        // which the only eligible caller does not have yet.
+        .route(
+            "/organizations/{id}/invites/{invite_id}/accept",
+            post(api::handlers::organizations::accept_invite_by_id),
+        )
+        .route(
+            "/organizations/{id}/invites/{invite_id}/decline",
+            post(api::handlers::organizations::decline_invite_by_id),
+        )
         .route(
             "/organizations/invites/{token}",
             get(api::handlers::organizations::get_invite_details),
@@ -1463,6 +2180,25 @@ pub async fn build_router(
             "/users/{user_id}/organizations",
             get(api::handlers::organizations::list_user_organizations),
         )
+        // A user's own outstanding join requests. Sits on the user rather than
+        // the organization because the requester isn't a member yet, so the
+        // organization-scoped queue below is closed to them.
+        .route(
+            "/users/{user_id}/join-requests",
+            get(api::handlers::organizations::list_user_join_requests),
+        )
+        // Filing one is a POST the user makes, never something signup does for
+        // them. Same path because it is the same resource from the same side.
+        .route(
+            "/users/{user_id}/join-requests",
+            post(api::handlers::organizations::create_user_join_request),
+        )
+        // The single read onboarding makes to decide which screen a new user
+        // sees: invited, domain-matched, or neither.
+        .route(
+            "/users/{user_id}/onboarding-context",
+            get(api::handlers::organizations::get_onboarding_context),
+        )
         // Organization session context (validates membership, client stores org ID for X-Organization-Id header)
         .route("/session/organization", post(api::handlers::organizations::set_active_organization))
         // Support requests
@@ -1480,6 +2216,10 @@ pub async fn build_router(
         .route("/requests/aggregate", get(api::handlers::requests::aggregate_requests))
         .route("/requests/aggregate-by-user", get(api::handlers::requests::aggregate_by_user))
         .route("/usage", get(api::handlers::requests::get_usage))
+        // Dry-run recompute of recorded usage. Read-only by construction — it is handed the
+        // read pool and has no write handle; corrections are applied by a documented human
+        // procedure, not by this endpoint.
+        .route("/usage-recompute", get(api::handlers::recompute::recompute_usage))
         // Probes management
         .route("/probes", get(api::handlers::probes::list_probes))
         .route("/probes", post(api::handlers::probes::create_probe))
@@ -1494,38 +2234,6 @@ pub async fn build_router(
         .route("/probes/{id}/statistics", get(api::handlers::probes::get_statistics))
         // Queue monitoring
         .route("/monitoring/demand", get(api::handlers::queue::get_demand))
-        // Tool sources CRUD
-        .route("/tool-sources", get(api::handlers::tool_sources::list_tool_sources))
-        .route("/tool-sources", post(api::handlers::tool_sources::create_tool_source))
-        .route("/tool-sources/{id}", get(api::handlers::tool_sources::get_tool_source))
-        .route("/tool-sources/{id}", patch(api::handlers::tool_sources::update_tool_source))
-        .route("/tool-sources/{id}", delete(api::handlers::tool_sources::delete_tool_source))
-        // Tool sources ↔ deployment attachment
-        .route(
-            "/deployments/{id}/tool-sources",
-            get(api::handlers::tool_sources::list_deployment_tool_sources),
-        )
-        .route(
-            "/deployments/{id}/tool-sources/{source_id}",
-            axum::routing::put(api::handlers::tool_sources::attach_tool_source_to_deployment),
-        )
-        .route(
-            "/deployments/{id}/tool-sources/{source_id}",
-            delete(api::handlers::tool_sources::detach_tool_source_from_deployment),
-        )
-        // Tool sources ↔ group attachment
-        .route(
-            "/groups/{id}/tool-sources",
-            get(api::handlers::tool_sources::list_group_tool_sources),
-        )
-        .route(
-            "/groups/{id}/tool-sources/{source_id}",
-            axum::routing::put(api::handlers::tool_sources::attach_tool_source_to_group),
-        )
-        .route(
-            "/groups/{id}/tool-sources/{source_id}",
-            delete(api::handlers::tool_sources::detach_tool_source_from_group),
-        )
         // Connections (external data sources)
         .route("/connections", post(api::handlers::connections::create_connection))
         .route("/connections", get(api::handlers::connections::list_connections))
@@ -1620,13 +2328,21 @@ pub async fn build_router(
     // wrapper: on a request it runs first; on the response it runs last. The stack below,
     // outermost → innermost (i.e. reverse of the code order), is:
     //
-    //   translation  →  responses_mw  →  outlet (logging/billing)
-    //                →  cache  →  error_enrichment  →  image_normalizer
-    //                →  tool_injection  →  models_route  →  onwards
+    //   inference_mw  →  outlet (logging/billing)  →  translation
+    //                →  cache  →  continuation  →  error_enrichment  →  image_normalizer
+    //                →  models_route  →  onwards
     //
     // Why this order:
+    //   • inference_mw outermost: it must see the RAW foreign request (e.g. `/responses`
+    //     with `background`/`service_tier`) to route the Responses control plane, mint the
+    //     tracking id, and hydrate `previous_response_id` before translation flattens the
+    //     request to Chat Completions.
+    //   • translation inner to outlet: on the response path (inner runs first) it reframes
+    //     chat → Responses BEFORE outlet captures it, so the persisted row — which
+    //     `GET /v1/responses/{id}` reads — is a Responses object. Everything inner to
+    //     translation only ever sees Chat Completions.
     //   • outlet outermost (of the body editors): it logs the request **as the customer
-    //     sent it** (cache_control markers intact, original image URLs, pre tool-injection)
+    //     sent it** (cache_control markers intact, original image URLs)
     //     and captures the response **after** cache injection, so billing sees cache_* usage.
     //   • cache inner to outlet, but OUTER to the body-mutating layers: it must hash the
     //     ORIGINAL request body. The image normaliser rewrites image URLs to per-request
@@ -1634,9 +2350,8 @@ pub async fn build_router(
     //     after it would make every image request a unique key → zero cache hits. Sitting
     //     before the reject-capable layers also means a request they 4xx (unfetchable/
     //     forbidden image) never gets a committed write — the success gate vetoes it.
-    //   • image_normalizer before tool_injection: it fetches/sanitises external image URLs
-    //     (and can reject the request) before tools are spliced in.
-    //   • tool_injection innermost: the body onwards forwards upstream is fully resolved.
+    //   • image_normalizer innermost: it fetches/sanitises external image URLs (and can
+    //     reject the request), so the body onwards forwards upstream is fully resolved.
     //
     // Each block below adds one layer; the inline notes cover that layer's specifics.
 
@@ -1649,19 +2364,27 @@ pub async fn build_router(
         .route("/models", get(api::handlers::ai_models::list_ai_models))
         .fallback_service(onwards_router);
 
-    // Apply tool injection middleware to the onwards router so that per-request tool
-    // schemas are resolved and injected into the request body before onwards processes it.
-    let tool_injection_state = crate::inference::tools::ToolInjectionState {
-        db: state.db.write().clone(),
+    // Last-mile request-body prep and the matching response-side stream reassembly,
+    // applied innermost so it runs right before onwards (inner to cache, which must
+    // hash the original body). Does the id-scrub and the streaming usage-flag
+    // injection that onwards / the BodyTransformFn hook used to do, so onwards can
+    // forward the body untouched.
+    //
+    // Innermost is load-bearing for the response half: request logging is applied
+    // outer to this, so reassembling here means it sees one complete body rather
+    // than every SSE frame retained for the life of the request.
+    let onwards_router = {
+        let daemon = &state.current_config().background_services.batch_daemon;
+        let outbound_config = crate::inference::outbound_request::OutboundConfig {
+            timeouts: crate::inference::outbound_request::StreamTimeouts::from_daemon_config(daemon),
+        };
+        onwards_router.layer(middleware::from_fn_with_state(
+            outbound_config,
+            crate::inference::outbound_request::outbound_request_middleware,
+        ))
     };
-    let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
-        tool_injection_state,
-        crate::inference::tools::tool_injection_middleware,
-    ));
 
-    // Apply the image-input normaliser middleware. This runs BEFORE
-    // tool_injection in request flow (i.e. as an outer Tower layer added
-    // after the inner one). For each `/chat/completions` and `/responses`
+    // Apply the image-input normaliser middleware. For each `/chat/completions` and `/responses`
     // request, it walks the body for HTTP(S) `image_url` values, fetches +
     // stores them via `image_normalizer`, and substitutes signed URLs into
     // the body before the request reaches onwards.
@@ -1670,11 +2393,25 @@ pub async fn build_router(
         // Re-use the AppState-bound singleton built once at startup.
         let normalizer = state.image_normalizer.clone();
         let realtime_ttl = cfg.image_normalizer.signing.realtime_ttl();
+        // Tokens arriving on a daemon loopback (flex enqueue / file ingest
+        // store them) are signed with the dispatch TTL: long enough to outlive
+        // one full processing attempt. Client-presented tokens are authorised
+        // the same way and use the realtime TTL.
+        let processing_timeout = std::time::Duration::from_millis(cfg.background_services.batch_daemon.processing_timeout_ms);
+        let token_ttl = cfg.image_normalizer.signing.dispatch_ttl(processing_timeout);
         let image_normalizer_state = crate::inference::image_normalizer_middleware::ImageNormalizerMiddlewareState {
             enabled: cfg.image_normalizer.enabled,
             normalizer,
             realtime_ttl,
-            pool: Some(state.db.write().clone()),
+            token_ttl,
+            pool: Some(sqlx_pool_router::DynPools::new(state.db.clone())),
+            keystore: state.keystore.clone(),
+            // Same policy map the inference middleware decides ZDR from, so a
+            // realtime ZDR caller's images are inlined rather than stored.
+            key_policy_cache: inference_middleware_state
+                .as_ref()
+                .map(|s| s.key_policy_cache.clone())
+                .unwrap_or_else(crate::sync::key_policy::KeyPolicyCache::empty),
         };
         onwards_router.layer(middleware::from_fn_with_state(
             image_normalizer_state,
@@ -1684,20 +2421,80 @@ pub async fn build_router(
 
     // Apply error enrichment middleware to onwards router (before outlet logging)
     let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
-        state.db.write().clone(),
+        sqlx_pool_router::DynPools::new(state.db.clone()),
         error_enrichment::error_enrichment_middleware,
     ));
 
+    // Apply the mid-stream continuation (resume) layer. It sits between the cache
+    // layer and error enrichment for two reasons: outlet and the cache see ONE
+    // logical stream with the single merged usage frame it emits (no analytics or
+    // cache surgery), and — the load-bearing one — the router it resumes INTO is
+    // the clone taken right here, so a resume leg re-enters BELOW outlet and the
+    // cache and produces no second analytics row, billing record or classify.
+    // Added only when enabled; otherwise the stack is byte-identical to today.
+    let onwards_router = {
+        let cfg = state.current_config();
+        if cfg.continuation.enabled {
+            // The resume target: everything inner to this layer (error
+            // enrichment → image normaliser → tool injection → onwards).
+            // `with_state` here is the same binding the outer `nest` applies to
+            // this router — it only erases the state type so the clone is a
+            // ready-to-call service, it does not change routing.
+            let resume_target = onwards_router.clone().with_state(state.clone());
+            let body_limit = match cfg.limits.requests.max_body_size {
+                0 => usize::MAX,
+                n => usize::try_from(n).unwrap_or(usize::MAX),
+            };
+            match crate::continuation::ContinuationState::build(
+                &cfg.continuation,
+                &cfg.cache.tokenizer_url,
+                sqlx_pool_router::DynPools::new(state.db.clone()),
+                resume_target,
+                body_limit,
+                cfg.onwards.sse_buffer_limit,
+            )
+            .await
+            {
+                Ok(continuation_state) => {
+                    tracing::info!("Mid-stream continuation enabled - wiring resume layer into onwards stack");
+                    crate::continuation::metrics::record_layer_wired(true);
+                    onwards_router.layer(middleware::from_fn_with_state(
+                        continuation_state,
+                        crate::continuation::continuation_middleware,
+                    ))
+                }
+                Err(e) => {
+                    // A missing continuation key must not take the gateway down:
+                    // without the layer, streams die exactly as they do today.
+                    // The gauge + background error are the ONLY signals that a
+                    // deployment which asked for continuation is serving without
+                    // it — no request ever fails because of this.
+                    crate::background_error!(
+                        crate::metrics::errors::component::CONTINUATION,
+                        "state_build",
+                        Error,
+                        error = %e,
+                        "Failed to build continuation state - resume layer NOT wired"
+                    );
+                    crate::continuation::metrics::record_layer_wired(false);
+                    onwards_router
+                }
+            }
+        } else {
+            onwards_router
+        }
+    };
+
     // Apply the cached-input pricing layer (dwctl-owned). Placed inner
     // to outlet so the billing/analytics capture sees the injected `cache_*` usage
-    // fields, but OUTER to the body-mutating layers (image normaliser, tool
-    // injection) so the classifier hashes the original user body — stable across
+    // fields, but OUTER to the body-mutating layer (image normaliser) so the
+    // classifier hashes the original user body — stable across
     // requests, which per-request signed image URLs would otherwise break. Added
     // only when enabled; otherwise the stack is byte-identical to today.
     let onwards_router = {
         let cfg = state.current_config();
         if cfg.cache.enabled {
-            let pool = state.db.write().clone();
+            let pool = sqlx_pool_router::DynPools::new(state.db.clone());
             let classifier = crate::prompt_cache::Classifier::new(
                 crate::prompt_cache::PrincipalResolver::new(pool.clone()),
                 crate::prompt_cache::ModelConfigResolver::new(pool.clone()),
@@ -1708,6 +2505,7 @@ pub async fn build_router(
                     cfg.cache.telemetry_blocks.strip_from_prompt,
                     &cfg.cache.telemetry_blocks.prefixes,
                 ),
+                cfg.cache.render_counting,
             );
             // Bound the cache layer's body buffer by the same limit onwards uses (0 =
             // unlimited), so it's never more restrictive than the entry point.
@@ -1721,7 +2519,8 @@ pub async fn build_router(
                     classifier,
                     body_limit,
                     std::time::Duration::from_secs(cfg.cache.classify_deadline_secs),
-                ),
+                )
+                .with_sse_buffer_limit(cfg.onwards.sse_buffer_limit),
                 crate::prompt_cache::cache_middleware,
             ))
         } else {
@@ -1729,32 +2528,22 @@ pub async fn build_router(
         }
     };
 
-    // Apply request logging layer only to onwards router
-    let onwards_router = if let Some(outlet_layer) = outlet_layer.clone() {
-        onwards_router.layer(outlet_layer)
-    } else {
-        onwards_router
-    };
-
-    // Apply inference middleware to create pending fusillade rows for inference requests.
-    // This runs BEFORE outlet (outer layer executes first), so the X-Onwards-Response-Id
-    // header is set before outlet captures the request and passes it to FusilladeOutletHandler.
-    let onwards_router = if let Some(rms) = inference_middleware_state {
-        onwards_router.layer(middleware::from_fn_with_state(
-            rms,
-            crate::inference::middleware::inference_middleware,
-        ))
-    } else {
-        onwards_router
-    };
-
-    // Apply the generic edge protocol-translation middleware as the OUTERMOST
-    // layer on the onwards router. On the request path it runs first, so any
-    // foreign-protocol request (today: Anthropic `/v1/messages` and `/v1/models`)
-    // is translated before model discovery, image_normalizer, tool_injection,
-    // and onwards see it. On the response path it runs last, so only the final
-    // client bytes are reframed back into the foreign protocol. Native OpenAI
-    // requests match no translator and pass through untouched.
+    // Apply the edge protocol-translation middleware. Placement is deliberate: it
+    // sits INNER to the outlet and the inference middleware, but OUTER to cache /
+    // image-normalisation / tool-injection / onwards.
+    //
+    // Why here rather than outermost:
+    //   - inference_mw (outer) must see the RAW foreign request. The Responses API
+    //     carries control-plane fields (`background`, `service_tier`) and a stored-
+    //     object lifecycle that inference_mw routes on `/responses`; translating
+    //     first would rewrite `/responses` -> `/chat/completions` and hide them.
+    //   - outlet (outer) must capture the TRANSLATED response, because the row it
+    //     writes is what `GET /v1/responses/{id}` reads back. On the response path
+    //     inner layers run first, so translation reframes chat -> Responses before
+    //     outlet persists it (matching the old onwards-side placement).
+    //   - cache / image_normalizer / onwards (inner) still only
+    //     ever see Chat Completions.
+    // Native OpenAI requests match no translator and pass through untouched.
     let onwards_router = {
         // Bound the body the translation middleware buffers by the same cap as the
         // rest of the inference path (limits.requests.max_body_size, 0 = unlimited).
@@ -1769,6 +2558,17 @@ pub async fn build_router(
                 config.cache.enabled,
             )),
             std::sync::Arc::new(crate::inference::translation::anthropic::models::AnthropicModels),
+            // Edge Responses translation. A pure Responses<->Chat converter; the
+            // Responses control plane (id minting, previous_response_id hydration,
+            // background routing) lives in the outer inference middleware, and
+            // persistence lives in the outlet just above. Registered in BOTH strict
+            // and non-strict mode, exactly like the Anthropic translators above.
+            // Downstream, strict mode dispatches the normalised `/chat/completions`
+            // body via onwards' `/responses` route, and non-strict forwards it by
+            // the normalised path through onwards' catch-all (the same mechanism the
+            // `/messages` translation already relies on). dwctl owns Responses in
+            // both modes so id stamping, GET retrieval and hydration work uniformly.
+            std::sync::Arc::new(crate::inference::translation::responses::OpenResponses::new()),
         ];
         let translation_registry =
             crate::inference::translation::TranslationRegistry::new(translators).with_max_body_size(translation_body_limit);
@@ -1777,6 +2577,48 @@ pub async fn build_router(
             crate::inference::translation::middleware::translation_middleware,
         ))
     };
+
+    // Apply request logging (outlet). OUTER to translation, so on the response path
+    // it captures the translated Responses object (the row `GET /v1/responses/{id}`
+    // reads); INNER to inference_mw, so the correlation headers it relies on
+    // (`x-onwards-response-id` / `x-fusillade-request-id`) are already set.
+    let onwards_router = if let Some(outlet_layer) = outlet_layer.clone() {
+        onwards_router.layer(outlet_layer)
+    } else {
+        onwards_router
+    };
+
+    // Apply inference routing outside the other processing layers. It sees the raw
+    // foreign request (before translation), so it can read Responses-only fields
+    // (`background`, `service_tier`), mint the response/tracking id, run
+    // previous_response_id hydration, and set the correlation headers before
+    // anything downstream runs.
+    let onwards_router = if let Some(rms) = inference_middleware_state {
+        onwards_router.layer(middleware::from_fn_with_state(
+            rms,
+            crate::inference::middleware::inference_middleware,
+        ))
+    } else {
+        onwards_router
+    };
+
+    // Bound the raw body before inference routing parses it or outlet captures
+    // it. Inner limits are too late to prevent allocation amplification. Keep
+    // this on the onwards router so files/batches retain their separate limits.
+    let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
+        state.limiters.inference_body_size,
+        crate::inference::body_limit::limit_inference_body,
+    ));
+
+    // The root span records a batch request's completion window once the
+    // response names a batch key.
+    let onwards_router = onwards_router.layer(middleware::from_fn(crate::telemetry::carry_batch_completion_window));
+
+    // Outermost, so every layer above can count the requests it refuses
+    // alongside onwards' own (`onwards_rejections_total`).
+    let onwards_router = onwards_router.layer(axum::Extension(crate::inference::rejections::Recorder::new(
+        state.onwards_targets.clone().unwrap_or_default(),
+    )));
 
     // Build the app with admin API and onwards proxy nested. serve the (restricted) openai spec.
     // Strict mode requires different nesting:
@@ -1889,6 +2731,8 @@ pub async fn build_router(
                 .0
         };
 
+        crate::metrics::error_series::register_documented_routes();
+
         // Get the GenAI registry from the metrics recorder (already initialized earlier)
         let gen_ai_registry = if let Some(ref recorder) = state.metrics_recorder {
             recorder.registry().clone()
@@ -1921,14 +2765,21 @@ pub async fn build_router(
                     axum_metrics
                 }),
             )
-            .layer(prometheus_layer);
+            .layer(prometheus_layer)
+            .layer(middleware::from_fn(crate::metrics::error_series::register_error_series));
     }
 
     // Add tracing layer with OTel-compatible span names and HTTP semantic conventions.
-    // Only trace_id and otel.name are tracing span fields (visible in fmt log output).
-    // All other attributes are set via OpenTelemetrySpanExt::set_attribute() so they're
-    // exported to the trace backend but don't clutter log lines.
+    // Tracing span fields appear on every fmt log line in the request, so only the
+    // correlation keys are fields: trace_id, otel.name, x_request_id,
+    // edge_request_id and provider_request_id (the request IDs are what
+    // `|= "x_request_id=<id>"` log queries match on), plus otel.kind, which the
+    // tracing-opentelemetry layer only reads from a field (as a raw attribute it
+    // is ignored and the span exports as `internal`). All other attributes are
+    // set via OpenTelemetrySpanExt::set_attribute() so they're exported to the
+    // trace backend but don't clutter log lines.
     // Reference: https://opentelemetry.io/docs/specs/semconv/http/http-spans/
+    let router = router.layer(middleware::from_fn(record_provider_request_id));
     let router = router.layer(middleware::from_fn(inject_trace_id)).layer(
         TraceLayer::new_for_http()
             .make_span_with(|request: &http::Request<_>| {
@@ -1952,8 +2803,24 @@ pub async fn build_router(
                 let span = tracing::info_span!(
                     "request",
                     trace_id = tracing::field::Empty,
+                    x_request_id = tracing::field::Empty,
+                    edge_request_id = tracing::field::Empty,
+                    provider_request_id = tracing::field::Empty,
                     otel.name = %span_name,
+                    otel.kind = "server",
                 );
+
+                // IDs minted by `assign_request_id`, which runs outside this layer.
+                // Declared span fields are exported as OTel attributes by the
+                // tracing-opentelemetry layer, so no separate set_attribute is needed.
+                // Recorded with `display` so log lines read `x_request_id=<id>`
+                // unquoted, matching `trace_id` and the line filters we document.
+                if let Some(ids) = request.extensions().get::<RequestIds>() {
+                    span.record("x_request_id", tracing::field::display(&ids.x_request_id));
+                    if let Some(edge) = &ids.edge_request_id {
+                        span.record("edge_request_id", tracing::field::display(edge));
+                    }
+                }
 
                 // W3C Trace Context propagation (https://www.w3.org/TR/trace-context/)
                 //
@@ -1973,30 +2840,11 @@ pub async fn build_router(
                 // If parsing fails at any point we silently fall through and the
                 // span starts a fresh trace — this is fine for requests that don't
                 // carry trace context (e.g. direct API calls from users).
-                if let Some(traceparent) = request.headers().get("traceparent")
-                    && let Ok(tp) = traceparent.to_str()
-                {
-                    let parts: Vec<&str> = tp.split('-').collect();
-                    if parts.len() == 4
-                        && let (Ok(trace_id), Ok(span_id)) = (
-                            opentelemetry::trace::TraceId::from_hex(parts[1]),
-                            opentelemetry::trace::SpanId::from_hex(parts[2]),
-                        )
-                    {
-                        let flags = u8::from_str_radix(parts[3], 16).unwrap_or(1);
-                        let parent_ctx = opentelemetry::trace::SpanContext::new(
-                            trace_id,
-                            span_id,
-                            opentelemetry::trace::TraceFlags::new(flags),
-                            true, // remote: this span context came from another process
-                            opentelemetry::trace::TraceState::default(),
-                        );
-                        let parent = opentelemetry::Context::new().with_remote_span_context(parent_ctx);
-                        let _ = span.set_parent(parent);
-                    }
+                let parent = TraceContextPropagator::new().extract(&onwards::HeaderExtractor(request.headers()));
+                if parent.span().span_context().is_valid() {
+                    let _ = span.set_parent(parent);
                 }
 
-                span.set_attribute("otel.kind", "Server");
                 span.set_attribute("api.type", api_type.to_string());
                 span.set_attribute("http.request.method", request.method().to_string());
                 span.set_attribute("http.route", route.unwrap_or_default());
@@ -2008,11 +2856,19 @@ pub async fn build_router(
             .on_response(|response: &http::Response<_>, latency: std::time::Duration, span: &tracing::Span| {
                 let status = response.status().as_u16();
                 span.set_attribute("http.response.status_code", i64::from(status));
+                crate::telemetry::record_ai_response_attributes(response, span, status);
                 if status >= 500 {
                     span.set_attribute("otel.status_code", "ERROR");
                     span.set_attribute("error.type", status.to_string());
                 } else if status >= 400 {
-                    span.set_attribute("error.type", status.to_string());
+                    // A dwctl layer that refused the request reports its
+                    // rejection code instead of the bare status, and has
+                    // already set it when it recorded on this span.
+                    match response.extensions().get::<crate::inference::rejections::RejectionCode>() {
+                        Some(rejection) if rejection.recorded_on(span) => {}
+                        Some(rejection) => span.set_attribute("error.type", rejection.code()),
+                        None => span.set_attribute("error.type", status.to_string()),
+                    }
                 }
                 tracing::info!(
                     http.response.status_code = status,
@@ -2036,15 +2892,85 @@ pub async fn build_router(
     Ok(router)
 }
 
+/// Header carrying the request ID, both on responses and towards providers.
+const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// Longest foreign `X-Request-ID` we keep (`edge_request_id`, `provider_request_id`).
+const MAX_INBOUND_REQUEST_ID_LEN: usize = 128;
+
+/// Request IDs attached to the request extensions by [`assign_request_id`].
+#[derive(Debug, Clone)]
+struct RequestIds {
+    /// Freshly minted UUIDv7; the only ID we log as `x_request_id`.
+    x_request_id: String,
+    /// Sanitised inbound `X-Request-ID` (e.g. set by an ingress), kept for correlation only.
+    edge_request_id: Option<String>,
+}
+
+/// Keep a request ID we did not mint (from the edge or a provider) only if it
+/// is short, visible ASCII.
+fn sanitise_inbound_request_id(value: &http::HeaderValue) -> Option<String> {
+    let s = value.to_str().ok()?;
+    (!s.is_empty() && s.len() <= MAX_INBOUND_REQUEST_ID_LEN && s.bytes().all(|b| b.is_ascii_graphic())).then(|| s.to_owned())
+}
+
+/// Middleware that mints a unique request ID for every request.
+///
+/// An inbound `X-Request-ID` is never trusted as our ID (clients and ingresses
+/// can set it, so it is not guaranteed unique). It is preserved as
+/// `edge_request_id` and overwritten with our own value, so that onwards
+/// forwards our ID to providers. The ID is echoed on every response.
+///
+/// Applied outside every other layer, including the admin AI proxy
+/// middleware, by [`Application::serve_with_listener`] and the test server.
+async fn assign_request_id(mut request: axum::extract::Request, next: middleware::Next) -> axum::response::Response {
+    let x_request_id = Uuid::now_v7().to_string();
+    let edge_request_id = request.headers().get(REQUEST_ID_HEADER).and_then(sanitise_inbound_request_id);
+    let value = http::HeaderValue::from_str(&x_request_id).expect("UUID is a valid header value");
+    request.headers_mut().insert(REQUEST_ID_HEADER, value.clone());
+    request.extensions_mut().insert(RequestIds {
+        x_request_id,
+        edge_request_id,
+    });
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(REQUEST_ID_HEADER, value);
+    response
+}
+
 /// Middleware that records the OpenTelemetry trace ID on the current span,
 /// making it visible in fmt log output for Loki → Tempo correlation.
-async fn inject_trace_id(request: axum::extract::Request, next: middleware::Next) -> axum::response::Response {
+///
+/// With a valid local OTel context, the request span has already adopted the
+/// inbound W3C headers as its remote parent, so they are stripped: everything
+/// below (embedded onwards included) must nest under that span rather than
+/// re-extract the caller's parent, and onwards injects its own outbound context
+/// per provider attempt. Without a local OTel context the headers are left in
+/// place so dwctl remains a transparent hop for the caller's trace.
+async fn inject_trace_id(mut request: axum::extract::Request, next: middleware::Next) -> axum::response::Response {
     let span = tracing::Span::current();
     let sc = span.context().span().span_context().clone();
     if sc.is_valid() {
         span.record("trace_id", tracing::field::display(sc.trace_id()));
+        request.headers_mut().remove("traceparent");
+        request.headers_mut().remove("tracestate");
     }
     next.run(request).await
+}
+
+/// Records a provider's own `X-Request-ID`, which onwards passes through on
+/// proxied responses, as `provider_request_id` on the request span.
+///
+/// `assign_request_id` replaces the response header with our ID on the way
+/// out, so this is the only place the provider's value is kept. It is
+/// recorded even when the provider echoes back the ID we sent, so queries can
+/// rely on the field being present whenever the provider returned one.
+async fn record_provider_request_id(request: axum::extract::Request, next: middleware::Next) -> axum::response::Response {
+    let span = tracing::Span::current();
+    let response = next.run(request).await;
+    if let Some(provider) = response.headers().get(REQUEST_ID_HEADER).and_then(sanitise_inbound_request_id) {
+        span.record("provider_request_id", tracing::field::display(provider));
+    }
+    response
 }
 
 /// Container for background services and their lifecycle management.
@@ -2063,11 +2989,6 @@ async fn inject_trace_id(request: axum::extract::Request, next: middleware::Next
 /// the shutdown token, signaling all tasks to stop.
 pub struct BackgroundServices {
     request_manager: Arc<fusillade_arsenal::PostgresRequestManager<DbPools>>,
-    /// Step storage for multi-step responses, sharing the same fusillade
-    /// pool as the request manager. Constructed in
-    /// `setup_background_services` so the manager's processor (which
-    /// dwctl wires later in `Application::new_with_pool`) can use it.
-    step_manager: Arc<fusillade_arsenal::PostgresResponseStepManager<DbPools>>,
     /// The onwards-instance daemon id registered in the `daemons` table
     /// for realtime / inline-loop attribution. The graceful-shutdown
     /// drain (`shutdown()`) marks this row Dead and releases any
@@ -2075,21 +2996,24 @@ pub struct BackgroundServices {
     /// them up immediately rather than waiting for stale-daemon
     /// detection (~30s).
     onwards_daemon_id: Option<Uuid>,
-    /// Fusillade write pool retained for the SIGTERM drain queries.
-    fusillade_write_pool: Option<sqlx::PgPool>,
+    /// Fusillade pools retained for the SIGTERM drain queries (a live
+    /// provider, so it follows runtime pool swaps).
+    fusillade_write_pool: Option<sqlx_pool_router::DynPools>,
     task_runner: Arc<tasks::TaskRunner>,
     is_leader: bool,
     onwards_targets: onwards::target::Targets,
     /// Per-key ZDR policy map, initial-loaded and then refreshed by
-    /// [`crate::sync::zdr_keys`]. Handed to `AppState` so `is_zdr_request`
+    /// [`crate::sync::key_policy`]. Handed to `AppState` so `is_zdr_request`
     /// reads it on the request hot path.
-    zdr_key_cache: crate::sync::zdr_keys::ZdrKeyCache,
+    key_policy_cache: crate::sync::key_policy::KeyPolicyCache,
     #[cfg_attr(not(test), allow(dead_code))]
     onwards_sender: Option<tokio::sync::watch::Sender<onwards::target::Targets>>,
     #[allow(dead_code)] // Used in sync_onwards_config method
     strict_mode: bool,
-    /// Sender for analytics records (if analytics is enabled)
-    analytics_sender: Option<request_logging::batcher::AnalyticsSender>,
+    /// Durable analytics outbox writer (if analytics is enabled)
+    analytics_writer: Option<request_logging::batcher::AnalyticsOutboxWriter>,
+    /// Prefix-chain recorder (workload profiling), when `prefix_chain.enabled`.
+    prefix_chain: Option<Arc<crate::prefix_chain::PrefixChainRecorder>>,
     /// Sender for completed-response records consumed by the in-process
     /// `RequestsWriter` (replaces the underway response jobs). Always set
     /// once `setup_background_services` runs; `None` only in test harnesses
@@ -2290,16 +3214,94 @@ impl BackgroundServices {
 
         // Use the same load function as the automatic sync
         // Note: escalation_models is empty for tests - individual tests can set up their own
-        let new_targets =
-            crate::sync::onwards_config::load_targets_from_db(pool, &[], self.strict_mode, &crate::config::RateLimitTiersConfig::default())
-                .await?;
+        let new_targets = crate::sync::onwards_config::load_targets_from_db(pool, &[], self.strict_mode).await?;
+
+        // Snapshot the routing table this update should produce, before the
+        // config is handed to the channel.
+        //
+        // `send` only queues the config for `Targets::receive_updates`, which
+        // applies it on its own task, so returning as soon as it succeeds does
+        // not mean the proxy can serve the new config yet. A test that goes
+        // straight from here to a proxied request can beat the apply and get a
+        // 403 for an API key that is already committed to the database.
+        //
+        // The alias set and each pool's authorised keys are compared by
+        // identity, not by count: a pool can carry the right number of keys and
+        // still not the one under test, which produces exactly the same 403 as
+        // a pool with no keys at all.
+        let expected: Vec<(String, Option<onwards::auth::KeySet>)> = new_targets
+            .targets
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().default_pool().keys().cloned()))
+            .collect();
+
+        // Kept so the update can be re-asserted below. `Targets` is a handle of
+        // `Arc` maps and `receive_updates` only reads from the value it is
+        // given, so re-sending this clone is safe.
+        let desired = new_targets.clone();
 
         // Send through the watch channel (same as automatic sync)
         sender
             .send(new_targets)
             .map_err(|_| anyhow::anyhow!("Failed to send targets update"))?;
 
-        Ok(())
+        // `onwards_targets` shares its maps with the router's `AppState`, so
+        // polling it observes exactly what a proxied request would resolve
+        // against. Reaching this point means the sender exists, which in turn
+        // means `receive_updates` was wired for this app, so an update that
+        // never lands is a real failure rather than a disabled-sync no-op.
+        //
+        // Note this cannot detect an update that changes nothing structural
+        // (e.g. only an endpoint URL) - such an update matches immediately and
+        // returns without waiting, exactly as before.
+        //
+        // Waiting for the state to appear once is not enough. The config
+        // listener shares this watch channel, and a reload it started before
+        // the test's own write can finish afterwards and apply that older
+        // snapshot over this one - dropping the key again in the window between
+        // this function returning and the test issuing its request. So the
+        // state has to hold for a settle window, and any regression re-asserts
+        // the desired config rather than waiting for the listener's periodic
+        // sync to come back around.
+        const SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+        const REASSERT_EVERY: std::time::Duration = std::time::Duration::from_millis(200);
+        // Comfortably inside SETTLE, so the settle window is still sampled many
+        // times, without waking the scheduler thousands of times per call.
+        const POLL_EVERY: std::time::Duration = std::time::Duration::from_millis(10);
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        let mut stable_since: Option<std::time::Instant> = None;
+        let mut last_reassert = std::time::Instant::now();
+
+        loop {
+            let live = &self.onwards_targets.targets;
+            let applied = live.len() == expected.len()
+                && expected
+                    .iter()
+                    .all(|(alias, keys)| live.get(alias).is_some_and(|pool| pool.default_pool().keys() == keys.as_ref()));
+
+            let now = std::time::Instant::now();
+            if applied {
+                if now.duration_since(*stable_since.get_or_insert(now)) >= SETTLE {
+                    return Ok(());
+                }
+            } else {
+                stable_since = None;
+                if now.duration_since(last_reassert) >= REASSERT_EVERY {
+                    sender
+                        .send(desired.clone())
+                        .map_err(|_| anyhow::anyhow!("Failed to re-send targets update"))?;
+                    last_reassert = now;
+                }
+            }
+
+            if now >= deadline {
+                anyhow::bail!("onwards did not apply the config update within {:?}", TIMEOUT);
+            }
+
+            tokio::time::sleep(POLL_EVERY).await;
+        }
     }
 
     /// Manually refresh the per-key ZDR cache from the database (for testing).
@@ -2308,8 +3310,8 @@ impl BackgroundServices {
     /// letting a test flip an account to ZDR mid-run without spawning the
     /// LISTEN/NOTIFY loop.
     #[cfg(test)]
-    pub async fn sync_zdr_keys(&self, pool: &sqlx::PgPool) -> anyhow::Result<()> {
-        crate::sync::zdr_keys::refresh(pool, &self.zdr_key_cache).await?;
+    pub async fn sync_key_policy(&self, pool: &sqlx::PgPool) -> anyhow::Result<()> {
+        crate::sync::key_policy::refresh(pool, &self.key_policy_cache).await?;
         Ok(())
     }
 }
@@ -2318,6 +3320,130 @@ impl BackgroundServices {
 struct BackgroundTaskBuilder {
     tasks: tokio::task::JoinSet<anyhow::Result<()>>,
     names: std::collections::HashMap<tokio::task::Id, &'static str>,
+}
+
+const FUSILLADE_LEADERSHIP_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn stop_leader_fusillade_daemon(
+    leadership_shutdown: &tokio::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
+    daemon_handle: &tokio::sync::Mutex<Option<tokio::task::JoinHandle<fusillade::Result<()>>>>,
+    grace: std::time::Duration,
+) {
+    // Take both values out of their mutexes before awaiting. Cancellation is
+    // cooperative: Fusillade drains its destructive maintenance workers, so
+    // leadership loss must not abort the outer daemon task first.
+    let token = leadership_shutdown.lock().await.take();
+    if let Some(token) = token {
+        token.cancel();
+    }
+    let Some(mut handle) = daemon_handle.lock().await.take() else {
+        return;
+    };
+
+    match tokio::time::timeout(grace, &mut handle).await {
+        Ok(Ok(Ok(()))) => {
+            tracing::info!("Fusillade daemon stopped cooperatively after leadership loss");
+        }
+        Ok(Ok(Err(error))) => {
+            crate::background_error!(
+                crate::metrics::errors::component::LEADER_ELECTION,
+                "daemon_stop_failed",
+                Error,
+                error = %error,
+                "Fusillade daemon failed while stopping after leadership loss"
+            );
+        }
+        Ok(Err(error)) => {
+            crate::background_error!(
+                crate::metrics::errors::component::LEADER_ELECTION,
+                "daemon_stop_panicked",
+                Error,
+                error = %error,
+                "Fusillade daemon task panicked while stopping after leadership loss"
+            );
+        }
+        Err(_) => {
+            // Maintenance workers were not drained cooperatively: a
+            // destructive phase may have been cut mid-flight (journaled, so
+            // recoverable, but worth paging on).
+            crate::background_error!(
+                crate::metrics::errors::component::LEADER_ELECTION,
+                "daemon_stop_timeout",
+                Critical,
+                grace_seconds = grace.as_secs_f64(),
+                "Fusillade daemon exceeded the cooperative leadership-loss shutdown grace; aborting"
+            );
+            handle.abort();
+            if let Err(error) = handle.await
+                && !error.is_cancelled()
+            {
+                crate::background_error!(
+                    crate::metrics::errors::component::LEADER_ELECTION,
+                    "daemon_stop_abort_failed",
+                    Error,
+                    error = %error,
+                    "Fusillade daemon task failed after leadership-loss abort"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod leadership_shutdown_tests {
+    use super::stop_leader_fusillade_daemon;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn leadership_loss_cancels_and_awaits_daemon_without_holding_mutex() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let token_slot = tokio::sync::Mutex::new(Some(token.clone()));
+        let handle_slot = Arc::new(tokio::sync::Mutex::new(None));
+        let observed_unlocked = Arc::new(AtomicBool::new(false));
+
+        let handle_slot_for_task = handle_slot.clone();
+        let observed_unlocked_for_task = observed_unlocked.clone();
+        let handle = tokio::spawn(async move {
+            token.cancelled().await;
+            observed_unlocked_for_task.store(handle_slot_for_task.try_lock().is_ok(), Ordering::SeqCst);
+            Ok(())
+        });
+        *handle_slot.lock().await = Some(handle);
+
+        stop_leader_fusillade_daemon(&token_slot, handle_slot.as_ref(), Duration::from_secs(1)).await;
+
+        assert!(observed_unlocked.load(Ordering::SeqCst));
+        assert!(token_slot.lock().await.is_none());
+        assert!(handle_slot.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn leadership_loss_aborts_and_awaits_after_explicit_grace() {
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let token_slot = tokio::sync::Mutex::new(Some(tokio_util::sync::CancellationToken::new()));
+        let handle_slot = tokio::sync::Mutex::new(None);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(dropped.clone());
+        let handle = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<fusillade::Result<()>>().await
+        });
+        *handle_slot.lock().await = Some(handle);
+        tokio::task::yield_now().await;
+
+        stop_leader_fusillade_daemon(&token_slot, &handle_slot, Duration::from_millis(1)).await;
+
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(handle_slot.lock().await.is_none());
+    }
 }
 
 impl BackgroundTaskBuilder {
@@ -2346,70 +3472,26 @@ impl BackgroundTaskBuilder {
     }
 }
 
-/// Setup background services (probe scheduler, batch daemon, leader election, onwards integration)
-/// Wire the fusillade request manager, step manager, and (optionally)
-/// the multi-step [`DwctlRequestProcessor`] into the daemon and start
-/// the background-services stack.
-///
-/// The caller owns construction of `request_manager`, `step_manager`,
-/// and `multi_step_processor` — and must build them in that order —
-/// because the multi-step processor depends on a `FusilladeResponseStore`,
-/// which itself depends on the request manager and step manager. That
-/// ordering is enforced at the type level (you cannot construct the
-/// processor without first constructing the others), which is why we
-/// take them as parameters rather than constructing them here: it
-/// guarantees that `set_processor` runs *before* any daemon spawn
-/// inside this function, including the leader-election callback's
-/// daemon spawn.
-///
-/// Pre-PR #1064 this function used to construct the request manager
-/// itself and spawn the daemon *before* the caller had a chance to
-/// build and wire the multi-step processor — which meant fusillade's
-/// `OnceLock`-snapshot in `PostgresRequestManager::run` captured a
-/// `None` processor and the daemon fell back to `DefaultRequestProcessor`
-/// for every `/v1/responses + service_tier=flex` claim, looping the
-/// request body back to ourselves and producing the
-/// `{"choices":[],"usage":null}` terminal failure observed in prod.
-///
-/// `multi_step_processor` is `Option<...>` so the test path can pass
-/// `None` to avoid forming the `request_manager → processor → response_store
-/// → request_manager` Arc cycle that blocks `sqlx::test`'s `DROP DATABASE`
-/// cleanup (the cycle's only effect in production — where the app lives
-/// forever — is benign).
+/// Setup background services (probe scheduler, batch daemon, leader election,
+/// onwards integration). The caller owns construction of `request_manager`
+/// and passes it in, so it exists before any daemon spawn inside this
+/// function.
 pub(crate) struct BackgroundServicesInput {
-    /// Fusillade's durable DB store. The caller builds this so the
-    /// multi-step processor can share the same storage instance as the
-    /// daemon runtime.
+    /// Fusillade's durable DB store, shared with the daemon runtime.
     pub request_manager: Arc<fusillade_arsenal::PostgresRequestManager<DbPools>>,
     /// Fusillade's scheduling daemon. Owns HTTP dispatch and runtime
     /// lifecycle; durable data operations live on `request_manager`.
     pub postgres_daemon: Arc<fusillade::PostgresDaemon<DbPools, fusillade::ReqwestHttpClient>>,
-    /// Fusillade's response-step manager. Shares the same fusillade
-    /// pool as the request manager.
-    pub step_manager: Arc<fusillade_arsenal::PostgresResponseStepManager<DbPools>>,
-    /// Multi-step processor to inject onto the request manager. `None`
-    /// in tests to avoid forming the `request_manager → processor →
-    /// response_store → request_manager` Arc cycle that blocks
-    /// `sqlx::test`'s `DROP DATABASE` cleanup.
-    pub multi_step_processor: Option<
-        Arc<
-            dyn fusillade::RequestProcessor<fusillade_arsenal::PostgresRequestManager<DbPools>, fusillade::ReqwestHttpClient> + Send + Sync,
-        >,
-    >,
     /// Shared map between the fusillade daemon's concurrency control
     /// and the onwards config-sync writer. Built once by the caller and
     /// passed in by-clone here.
     pub model_capacity_limits: Arc<dashmap::DashMap<String, usize>>,
     /// dwctl primary pool (used for probe scheduler, notification
     /// poller, and the inference middleware setup).
-    pub pool: PgPool,
-    /// Fusillade pool wrapper; kept around inside this function only
-    /// to clone the write pool for the metrics sampler — fusillade's
-    /// daemon already owns its own clone via `request_manager`.
-    pub fusillade_pools: DbPools,
-    /// Outlet (request-logging) pool. Optional because outlet is
-    /// optional.
-    pub outlet_pool: Option<PgPool>,
+    /// Every database as a pooled/direct pair. Query consumers get the
+    /// pooled side; listeners, leader election and the underway worker the
+    /// direct side.
+    pub pools: db::DatabasePools,
     pub config: Config,
     pub shared_config: SharedConfig,
     pub shutdown_token: tokio_util::sync::CancellationToken,
@@ -2422,12 +3504,8 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
     let BackgroundServicesInput {
         request_manager,
         postgres_daemon,
-        step_manager,
-        multi_step_processor,
         model_capacity_limits,
-        pool,
-        fusillade_pools,
-        outlet_pool,
+        pools,
         config,
         shared_config,
         shutdown_token,
@@ -2435,15 +3513,15 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         keystore,
     } = input;
 
-    // Wire the multi-step processor onto the daemon *before*
-    // any daemon spawn below — this is the whole reason `setup_background_services`
-    // accepts these as parameters rather than constructing them itself.
-    // See the function-level doc comment.
-    if let Some(processor) = multi_step_processor
-        && let Err(e) = postgres_daemon.set_processor(processor)
-    {
-        tracing::warn!(error = e, "Multi-step processor was already set; skipping");
-    }
+    let db_pools = pools.main.pooled.clone();
+    let fusillade_pools = pools.fusillade.pooled.clone();
+    let outlet_pools = pools.outlet.clone();
+    // Live providers for every long-lived consumer below: `dyn_pools` for
+    // query traffic (the pooled endpoint when configured), `direct_pools` for
+    // session-scoped work — LISTEN connections and the leader-election lock —
+    // which a transaction-mode pooler cannot carry.
+    let dyn_pools = sqlx_pool_router::DynPools::new(db_pools.clone());
+    let direct_pools = sqlx_pool_router::DynPools::new(pools.main.direct.clone());
 
     // `keystore` comes from the caller (built once and shared). Install the
     // TRANSITIONAL ZDR response transformer on the daemon before it
@@ -2476,12 +3554,13 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
             .collect();
 
         let (onwards_config_sync, initial_targets, onwards_stream) = sync::onwards_config::OnwardsConfigSync::new_with_daemon_limits(
-            pool.clone(),
+            dyn_pools.clone(),
+            direct_pools.clone(),
             Some(model_capacity_limits.clone()),
             config.background_services.batch_daemon.default_model_concurrency,
+            config.limits.batch_inflight.default_capacity,
             escalation_models,
             config.onwards.strict_mode,
-            config.auth.rate_limits.clone(),
         )
         .await?;
 
@@ -2522,38 +3601,43 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
             auth: None,
             strict_mode: false,
             http_pool: None,
+            accounts: Default::default(),
         };
         (onwards::target::Targets::from_config(empty_config)?, None)
     };
 
-    // Per-key ZDR policy map: an initial synchronous load ALWAYS runs, so the
-    // map is never empty under live traffic (an empty map reads every key as
-    // non-ZDR and would silently leak a ZDR account's body). Only the
-    // LISTEN/NOTIFY refresh loop is gated on onwards config sync, with which it
-    // shares the `auth_config_changed` channel; with sync disabled the map is
-    // still correct at startup, it just does not pick up later policy changes.
-    let zdr_key_cache = crate::sync::zdr_keys::initial_cache(&pool).await?;
-    if config.background_services.onwards_sync.enabled {
-        let zdr_pool = pool.clone();
-        let zdr_cache = zdr_key_cache.clone();
-        let zdr_shutdown = shutdown_token.clone();
-        let zdr_fallback = config.background_services.onwards_sync.fallback_interval_milliseconds;
-        background_tasks.spawn("zdr-key-sync", async move {
-            crate::sync::zdr_keys::run(zdr_pool, zdr_cache, zdr_fallback, zdr_shutdown)
+    // Per-key account policy map (ZDR flag, disabled modalities, toleration
+    // preset): an initial synchronous load ALWAYS runs, so the map is never
+    // empty under live traffic (an empty map reads every key as non-ZDR and
+    // would silently leak a ZDR account's body). The LISTEN/NOTIFY refresh loop
+    // has its own switch, independent of onwards routing sync: the realtime
+    // modality gate enforces from this map, so it must keep refreshing even
+    // where routing sync is off. The map also carries the config's resolved
+    // toleration presets, so a stored preset id resolves on the hot path.
+    let key_policy_cache =
+        crate::sync::key_policy::initial_cache(&db_pools.write(), crate::scheduling::TolerationPresets::new(&config.scheduling)).await?;
+    if config.background_services.key_policy_sync.enabled {
+        let policy_pool = dyn_pools.clone();
+        let policy_listener_pool = direct_pools.clone();
+        let policy_cache = key_policy_cache.clone();
+        let policy_shutdown = shutdown_token.clone();
+        let policy_fallback = config.background_services.key_policy_sync.fallback_interval_milliseconds;
+        background_tasks.spawn("key-policy-sync", async move {
+            crate::sync::key_policy::run(policy_pool, policy_listener_pool, policy_cache, policy_fallback, policy_shutdown)
                 .await
-                .context("ZDR key sync failed")
+                .context("key policy sync failed")
         });
     }
 
     // Leader election lock ID: 0x44574354_50524F42 (DWCT_PROB in hex for "dwctl probes")
     const LEADER_LOCK_ID: i64 = 0x4457_4354_5052_4F42_i64;
 
-    let probe_scheduler = probes::ProbeScheduler::new(pool.clone(), config.clone());
+    let probe_scheduler = probes::ProbeScheduler::new(dyn_pools.clone(), config.clone()).with_listener_pool(direct_pools.clone());
 
     // Caller owns `request_manager` / `step_manager` construction —
-    // see the function-level doc. We still need a pool clone here for
-    // the metrics sampler; `fusillade_pools` is otherwise unused.
-    let fusillade_pool_for_metrics = fusillade_pools.write().clone();
+    // see the function-level doc. `fusillade_pools` is only sampled by the
+    // metrics sampler here, through a live provider so pool swaps show up.
+    let fusillade_pools_for_metrics = sqlx_pool_router::DynPools::new(fusillade_pools.clone());
     drop(fusillade_pools);
 
     let is_leader: bool;
@@ -2617,7 +3701,8 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         {
             let daemon_config = config.clone();
             let daemon_request_manager = request_manager.clone();
-            let daemon_pool = pool.clone();
+            let daemon_pool = dyn_pools.clone();
+            let daemon_listener_pool = direct_pools.clone();
             let daemon_shutdown = shutdown_token.clone();
             background_tasks.spawn("batch-completion", async move {
                 notifications::run_notification_poller(
@@ -2625,6 +3710,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
                     daemon_config,
                     daemon_request_manager,
                     daemon_pool,
+                    daemon_listener_pool,
                     daemon_shutdown,
                 )
                 .await;
@@ -2663,7 +3749,12 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         let is_leader_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Spawn leader election background task
-        let leader_election_pool = pool.clone();
+        // Deliberately a pinned pool, NOT the live provider: leader election
+        // holds one session-pinned connection for the advisory lock, and
+        // swapping the pool underneath it would drop the lock.
+        let leader_election_pool = pools.main.direct.write().into_inner();
+        let leader_election_pools_gain = dyn_pools.clone();
+        let leader_election_listener_pools_gain = direct_pools.clone();
         let leader_election_scheduler_gain = probe_scheduler.clone();
         let leader_election_scheduler_lose = probe_scheduler.clone();
         let leader_election_request_manager_gain = request_manager.clone();
@@ -2691,8 +3782,10 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
                 leader_election_flag,
                 LEADER_LOCK_ID,
                 leader_election_shutdown,
-                move |pool, config| {
+                move |_pool, config| {
                     // This closure is run when a replica becomes the leader
+                    let gain_pools = leader_election_pools_gain.clone();
+                    let gain_listener_pools = leader_election_listener_pools_gain.clone();
                     let scheduler = leader_election_scheduler_gain.clone();
                     let request_manager = leader_election_request_manager_gain.clone();
                     let postgres_daemon = leader_election_postgres_daemon_gain.clone();
@@ -2756,7 +3849,8 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
                                     daemon_config.background_services.notifications.clone(),
                                     daemon_config,
                                     notification_request_manager,
-                                    pool,
+                                    gain_pools,
+                                    gain_listener_pools,
                                     daemon_session_token,
                                 )
                                 .await;
@@ -2773,10 +3867,12 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
                     let daemon_handle = daemon_handle_lose.clone();
                     let leadership_shutdown = leadership_shutdown_lose.clone();
                     async move {
-                        // Cancel the leadership session token first, which will stop all background tasks gracefully
-                        if let Some(token) = leadership_shutdown.lock().await.take() {
-                            token.cancel();
-                        }
+                        stop_leader_fusillade_daemon(
+                            leadership_shutdown.as_ref(),
+                            daemon_handle.as_ref(),
+                            FUSILLADE_LEADERSHIP_SHUTDOWN_GRACE,
+                        )
+                        .await;
 
                         // Now stop all schedulers if probe scheduler was enabled
                         if config.background_services.probe_scheduler.enabled {
@@ -2784,12 +3880,6 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
                                 .stop_all()
                                 .await
                                 .map_err(|e| anyhow::anyhow!("Failed to stop probe scheduler: {}", e))?;
-                        }
-
-                        // Stop the fusillade daemon
-                        if let Some(handle) = daemon_handle.lock().await.take() {
-                            handle.abort();
-                            tracing::info!("Fusillade batch daemon stopped (lost leadership)");
                         }
 
                         Ok(())
@@ -2819,31 +3909,50 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         } else {
             None
         })
-        .connect_with(pool.connect_options().as_ref().clone())
+        .connect_with(pools.main.direct.write().connect_options().as_ref().clone())
         .await?;
 
     // Start pool metrics sampler if metrics are enabled
     if config.enable_metrics {
-        let mut pools = vec![
+        let mut labeled = vec![
             db::LabeledPool {
                 name: "main",
-                pool: pool.clone(),
+                pool: dyn_pools.clone(),
             },
             db::LabeledPool {
                 name: "fusillade",
-                pool: fusillade_pool_for_metrics,
+                pool: fusillade_pools_for_metrics,
             },
             db::LabeledPool {
                 name: "main_underway",
-                pool: underway_pool.clone(),
+                pool: sqlx_pool_router::DynPools::new(underway_pool.clone()),
             },
         ];
-        if let Some(outlet) = outlet_pool {
-            pools.push(db::LabeledPool {
-                name: "outlet",
-                pool: outlet,
+        if pools.main.is_split() {
+            labeled.push(db::LabeledPool {
+                name: "main_direct",
+                pool: direct_pools.clone(),
             });
         }
+        if pools.fusillade.is_split() {
+            labeled.push(db::LabeledPool {
+                name: "fusillade_direct",
+                pool: sqlx_pool_router::DynPools::new(pools.fusillade.direct.clone()),
+            });
+        }
+        if let Some(outlet) = outlet_pools.as_ref() {
+            labeled.push(db::LabeledPool {
+                name: "outlet",
+                pool: sqlx_pool_router::DynPools::new(outlet.pooled.clone()),
+            });
+            if outlet.is_split() {
+                labeled.push(db::LabeledPool {
+                    name: "outlet_direct",
+                    pool: sqlx_pool_router::DynPools::new(outlet.direct.clone()),
+                });
+            }
+        }
+        let pools = labeled;
         let metrics_shutdown = shutdown_token.clone();
         let metrics_config = db::PoolMetricsConfig {
             sample_interval: config.background_services.pool_metrics.sample_interval,
@@ -2853,12 +3962,32 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         });
     }
 
+    // jemalloc statistics gauges (Linux only; the sampler idles elsewhere).
+    if config.enable_metrics && config.background_services.allocator_metrics.enabled {
+        let allocator_config = config.background_services.allocator_metrics.clone();
+        let allocator_shutdown = shutdown_token.clone();
+        background_tasks.spawn("allocator-metrics-sampler", async move {
+            metrics::allocator::run_allocator_metrics_sampler(allocator_config, allocator_shutdown).await
+        });
+    }
+
+    // Opt-in heap profile listener. Serving is separate from sampling, which
+    // only happens when the process started with jemalloc `prof:true`.
+    profiling::log_heap_profiling_status();
+    if config.heap_profiling.enabled {
+        let profiling_config = config.heap_profiling.clone();
+        let profiling_shutdown = shutdown_token.clone();
+        background_tasks.spawn("heap-profiling-server", async move {
+            profiling::run_heap_profiling_server(profiling_config, profiling_shutdown).await
+        });
+    }
+
     // Start the usage-refresh daemon: incrementally folds new http_analytics rows into
     // user_model_usage_daily. The analytics batcher (below) nudges it after every flush;
     // this shares an in-process Notify with it rather than round-tripping through Postgres.
     let usage_refresh_notify = std::sync::Arc::new(tokio::sync::Notify::new());
     if config.enable_analytics && config.background_services.usage_refresh.enabled {
-        let daemon_pool = pool.clone();
+        let daemon_pool = dyn_pools.clone();
         let daemon_config = config.background_services.usage_refresh.clone();
         let daemon_notify = usage_refresh_notify.clone();
         let daemon_shutdown = shutdown_token.clone();
@@ -2868,9 +3997,35 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         });
     }
 
+    // Start the task-retention daemon: bounded, oldest-first deletion of expired
+    // Underway tasks. Without it the task table only ever grows.
+    if config.background_services.task_retention.enabled {
+        // Retention holds a session advisory lock, which requires a direct connection.
+        let daemon_pool = direct_pools.clone();
+        let daemon_config = config.background_services.task_retention.clone();
+        let daemon_shutdown = shutdown_token.clone();
+        background_tasks.spawn("task-retention", async move {
+            task_retention::run_task_retention_daemon(daemon_pool, daemon_config, daemon_shutdown).await;
+            Ok(())
+        });
+    }
+
+    // Start the prompt-cache retention daemon: bounded, oldest-first deletion of entries
+    // that expired more than the recompute grace ago. Without it the table only grows.
+    if config.background_services.prompt_cache_retention.enabled {
+        // Retention holds a session advisory lock, which requires a direct connection.
+        let daemon_pool = direct_pools.clone();
+        let daemon_config = config.background_services.prompt_cache_retention.clone();
+        let daemon_shutdown = shutdown_token.clone();
+        background_tasks.spawn("prompt-cache-retention", async move {
+            prompt_cache::retention::run_prompt_cache_retention_daemon(daemon_pool, daemon_config, daemon_shutdown).await;
+            Ok(())
+        });
+    }
+
     // Start analytics batcher if enabled
-    let analytics_sender = if config.enable_analytics {
-        let (batcher, sender) = request_logging::AnalyticsBatcher::new(pool.clone(), config.clone(), metrics_recorder);
+    let analytics_writer = if config.enable_analytics {
+        let (batcher, writer) = request_logging::AnalyticsBatcher::new(dyn_pools.clone(), config.clone(), metrics_recorder);
         let batcher = batcher.with_usage_refresh_notify(usage_refresh_notify.clone());
 
         let batcher_shutdown = shutdown_token.clone();
@@ -2879,7 +4034,43 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
             Ok(())
         });
 
-        Some(sender)
+        Some(writer)
+    } else {
+        None
+    };
+
+    // Prefix-chain capture: a ClickHouse sink task plus the recorder the analytics
+    // handler calls. Config validation already guaranteed the clickhouse section, the
+    // tokenizer URL and the key are present when this is enabled.
+    let prefix_chain = if config.prefix_chain.enabled {
+        let ch_config = config
+            .clickhouse
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("prefix_chain.enabled requires a clickhouse section"))?;
+        let client = crate::clickhouse::ClickHouseClient::from_config(ch_config)?;
+        let (sink_handle, sink) =
+            crate::clickhouse::ClickHouseSink::<crate::prefix_chain::PromptChainRow>::new(client, crate::prefix_chain::sink_options())?;
+        let sink_shutdown = shutdown_token.clone();
+        background_tasks.spawn("prefix-chain-sink", async move {
+            sink.run(sink_shutdown).await;
+            Ok(())
+        });
+        let key = config.prefix_chain.key_bytes().map_err(|e| anyhow::anyhow!("prefix_chain: {e}"))?;
+        let recorder = crate::prefix_chain::PrefixChainRecorder::new(
+            key,
+            crate::prefix_chain::ModelFilter::from_config(&config.prefix_chain.models),
+            crate::prompt_cache::TierPolicy::from_config(&config.cache.enabled_ttls, &config.cache.default_ttl),
+            crate::prompt_cache::TelemetryPolicy::from_config(
+                config.cache.telemetry_blocks.strip_from_prompt,
+                &config.cache.telemetry_blocks.prefixes,
+            ),
+            crate::prompt_cache::TokenizerClient::new(config.cache.tokenizer_url.clone()),
+            // Long-lived: hold the live provider (pooled endpoint), never a pinned pool.
+            crate::prompt_cache::PrincipalResolver::new(dyn_pools.clone()),
+            sink_handle,
+        );
+        info!(models = ?config.prefix_chain.models, "Prefix-chain capture enabled");
+        Some(Arc::new(recorder))
     } else {
         None
     };
@@ -2915,7 +4106,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
 
     let task_state = tasks::TaskState {
         request_manager: request_manager.clone(),
-        dwctl_pool: pool.clone(),
+        dwctl_pool: dyn_pools.clone(),
         config: shared_config.clone(),
         encryption_key: encryption_key.clone(),
         ingest_file_job: Arc::new(std::sync::OnceLock::new()),
@@ -2936,14 +4127,14 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
 
     Ok(BackgroundServices {
         request_manager,
-        step_manager,
         task_runner,
         is_leader,
         onwards_targets: initial_targets,
-        zdr_key_cache,
+        key_policy_cache,
         onwards_sender,
         strict_mode: config.onwards.strict_mode,
-        analytics_sender,
+        analytics_writer,
+        prefix_chain,
         requests_writer_sender,
         background_tasks,
         task_names,
@@ -2978,9 +4169,7 @@ pub struct Application {
     router: Router,
     app_state: AppState,
     config: Config,
-    db_pools: DbPools,
-    _fusillade_pools: DbPools,
-    _outlet_pools: Option<DbPools>,
+    pools: db::DatabasePools,
     _embedded_db: Option<db::embedded::EmbeddedDatabase>,
     _tracer_provider: Option<telemetry::SdkTracerProvider>,
     bg_services: BackgroundServices,
@@ -3021,10 +4210,16 @@ impl Application {
         pool: Option<PgPool>,
         tracer_provider: Option<telemetry::SdkTracerProvider>,
     ) -> anyhow::Result<Self> {
-        debug!("Starting control layer with configuration: {:#?}", config);
+        debug!("Starting control layer");
 
         // Setup database connections, run migrations, and initialize data
-        let (_embedded_db, db_pools, fusillade_pools, outlet_pools) = setup_database(&config, pool).await?;
+        let (_embedded_db, pools, partition_maintenance_pool) = setup_database(&config, pool).await?;
+        // Query traffic goes through the pooled side; session-scoped work
+        // (listeners, leader election) is wired to the direct side inside
+        // `setup_background_services`.
+        let db_pools = pools.main.pooled.clone();
+        let fusillade_pools = pools.fusillade.pooled.clone();
+        let outlet_pools = pools.outlet.as_ref().map(|p| p.pooled.clone());
 
         // Install Prometheus recorder BEFORE background services start
         // This ensures metrics set during background service initialization are captured
@@ -3049,19 +4244,18 @@ impl Application {
         // which requires direct database connection to primary (not through PgBouncer transaction pooling)
         let shared_config = SharedConfig::new(config.clone());
 
-        // Build the fusillade request manager, step manager, response
-        // store, and multi-step processor *before* spawning any daemons.
-        // Order is enforced at the type level (processor depends on
-        // response_store depends on (request_manager, step_manager)),
-        // so by the time we hand all four to `setup_background_services`,
-        // it can safely call `request_manager.set_processor(...)` before
-        // any daemon spawn. Fusillade's daemon snapshots the processor
-        // via `OnceLock::get()` at `run()` time, so anything spawned
-        // afterward (synchronous fusillade daemon AND the leader-gained
-        // closure) sees the multi-step processor — that's what fixes
-        // the `/v1/responses + service_tier=flex` regression where the
-        // daemon kept using `DefaultRequestProcessor` and looped the
-        // request body back to ourselves.
+        // Build the fusillade request manager, step manager, and response
+        // store before spawning any daemons.
+        //
+        // The daemon runs fusillade's `DefaultRequestProcessor`: every flex
+        // and background claim is dispatched as an HTTP call back through the
+        // loopback (`loopback_base_url`, `.../ai`), so it re-enters the full
+        // dwctl stack and edge translation converts `/responses` to Chat
+        // Completions on the way in and back to a Responses object on the way
+        // out. There is no dwctl-side request processor: the server-side
+        // multi-step tool loop was retired in COR-536, and with it the
+        // `DwctlRequestProcessor` that used to intercept `/v1/responses`
+        // claims and run that loop in-process instead of looping back.
         //
         // Shared `model_capacity_limits` map: the fusillade daemon's
         // per-model concurrency controller reads it; the onwards
@@ -3074,22 +4268,62 @@ impl Application {
             .background_services
             .batch_daemon
             .to_fusillade_config_with_limits(Some(model_capacity_limits.clone()));
+        let retention_maintenance_config = config.background_services.batch_daemon.to_fusillade_retention_maintenance_config();
 
-        let request_manager = Arc::new(
-            fusillade_arsenal::PostgresRequestManager::new(
-                fusillade_pools.clone(),
-                fusillade_arsenal::PostgresStorageConfig::from(&fusillade_daemon_config),
-            )
-            .with_download_buffer_size(config.batches.files.download_buffer_size)
-            .with_batch_insert_strategy(fusillade_arsenal::BatchInsertStrategy::Batched {
-                batch_size: config.batches.files.batch_insert_size,
-            }),
+        if let Some(value) = config.background_services.batch_daemon.template_generation_writes_enabled {
+            tracing::warn!(
+                template_generation_writes_enabled = value,
+                "batch_daemon.template_generation_writes_enabled is deprecated and ignored: \
+                 the weekly generation-2 template store is the only write path. Remove the key."
+            );
+        }
+        let mut request_manager = fusillade_arsenal::PostgresRequestManager::new(
+            fusillade_pools.clone(),
+            fusillade_arsenal::PostgresStorageConfig::from(&fusillade_daemon_config),
+        )
+        .with_maintenance_query_timeout(std::time::Duration::from_millis(fusillade_daemon_config.claim_query_timeout_ms))
+        .with_retained_response_fence_seconds(config.background_services.batch_daemon.retention.max_late_writer_seconds)
+        .with_realtime_retention_seconds(
+            config
+                .background_services
+                .batch_daemon
+                .retention
+                .batchless_seconds_by_service_tier
+                .get("priority")
+                .copied(),
+        )
+        .with_retained_response_retention_bounds_seconds(
+            config
+                .background_services
+                .batch_daemon
+                .retention
+                .batchless_retention_bounds_seconds(),
+        )
+        .with_download_buffer_size(config.batches.files.download_buffer_size)
+        .with_batch_insert_strategy(fusillade_arsenal::BatchInsertStrategy::Batched {
+            batch_size: config.batches.files.batch_insert_size,
+        });
+        if pools.fusillade.is_split()
+            && let config::ComponentDb::Schema {
+                name,
+                pooled_schema_mode: config::PooledSchemaMode::Transaction,
+                ..
+            } = config.database.fusillade()
+        {
+            request_manager = request_manager.with_query_schema(name.clone());
+        }
+        if let Some(partition_maintenance_pool) = partition_maintenance_pool {
+            request_manager = request_manager
+                .with_partition_maintenance_pool(partition_maintenance_pool)?
+                .attest_partition_maintenance_pool()
+                .await?;
+        }
+        let request_manager = Arc::new(request_manager);
+        let postgres_daemon = Arc::new(
+            fusillade::PostgresDaemon::from_store(request_manager.clone(), fusillade_daemon_config.clone())
+                .with_retention_maintenance(retention_maintenance_config)
+                .with_leak_config(config.background_services.batch_daemon.leak.clone()),
         );
-        let postgres_daemon = Arc::new(fusillade::PostgresDaemon::from_store(
-            request_manager.clone(),
-            fusillade_daemon_config.clone(),
-        ));
-        let step_manager = Arc::new(fusillade_arsenal::PostgresResponseStepManager::new(fusillade_pools.clone()));
         // Build the ZDR keystore once and share it across the response store, the
         // daemon processor, and background services (which install the response
         // transformer). A misconfiguration is fatal.
@@ -3097,11 +4331,8 @@ impl Application {
             Some(c) => Some(crate::keystore::Keystore::from_config(c).map_err(|e| anyhow::anyhow!("failed to initialise keystore: {e}"))?),
             None => None,
         };
-        let response_store = Arc::new(
-            crate::inference::store::FusilladeResponseStore::new(request_manager.clone())
-                .with_step_manager(step_manager.clone())
-                .with_keystore(keystore.clone()),
-        );
+        let response_store =
+            Arc::new(crate::inference::store::FusilladeResponseStore::new(request_manager.clone()).with_keystore(keystore.clone()));
 
         // Build the image normaliser ONCE — fail loud at startup if
         // `image_normalizer.enabled = true` but no backend is configured.
@@ -3112,87 +4343,28 @@ impl Application {
         let image_normalizer =
             crate::image_normalizer::from_config(&config.image_normalizer).map_err(|e| anyhow::anyhow!("image normaliser config: {e}"))?;
 
-        // Build the multi-step processor's dependencies. These also end
-        // up wired into the inference middleware state below; cloning
-        // them is cheap (Arc + reqwest::Client share their internal
-        // connection pool / TLS root-cert cache across clones).
-        let multi_step_reqwest_client = reqwest::Client::new();
-        let multi_step_tool_executor_pool = Arc::new(db_pools.write().clone());
-        let multi_step_tool_executor = Arc::new(crate::inference::tools::HttpToolExecutor::new(
-            multi_step_reqwest_client.clone(),
-            Some(multi_step_tool_executor_pool.clone()),
-        ));
-        // Same `ReqwestHttpClient` shape the batch daemon uses internally,
-        // so per-step model fires inherit fusillade's header stamping
-        // (`X-Fusillade-Request-Id` for analytics correlation) and
-        // streamable-endpoint dispatch. Timeouts and the streamable list
-        // come from the same config knobs the daemon respects, so warm
-        // path and daemon path use identical streaming semantics.
-        let multi_step_http_client: Arc<fusillade::ReqwestHttpClient> = Arc::new(fusillade::ReqwestHttpClient::new(
-            std::time::Duration::from_millis(fusillade_daemon_config.first_chunk_timeout_ms),
-            std::time::Duration::from_millis(fusillade_daemon_config.chunk_timeout_ms),
-            std::time::Duration::from_millis(fusillade_daemon_config.body_timeout_ms),
-            fusillade_daemon_config.streamable_endpoints.clone(),
-        ));
-        let multi_step_loop_config = onwards_fusillade::LoopConfig {
-            max_response_step_depth: config.responses.max_response_step_depth,
-            max_response_iterations: config.responses.max_response_iterations,
-        };
-
-        // Build the processor itself only outside test mode: the
-        // `request_manager → processor.OnceLock → response_store →
-        // request_manager` Arc cycle is harmless in production (the app
-        // lives forever) but in `#[sqlx::test]` it keeps each test's
-        // pool clones alive past test teardown, blocking sqlx's
-        // `DROP DATABASE` cleanup. Tests run with `DefaultRequestProcessor`
-        // — their multi-step coverage lives in dedicated
-        // `test/multi_step_*` modules that bypass the daemon path
-        // anyway.
-        let multi_step_processor_for_setup = if cfg!(test) {
-            None
-        } else {
-            let tool_resolver: Arc<dyn crate::inference::engine::processor::DaemonToolResolver> =
-                Arc::new(crate::inference::engine::processor::DbToolResolver {
-                    pool: (*db_pools).write().clone(),
-                });
-            // Derive dispatch TTL from the batch daemon's processing timeout so
-            // the signed URL is always valid for at least one full dispatch
-            // attempt — never the cause of a batch failure on its own.
-            let processing_timeout = std::time::Duration::from_millis(config.background_services.batch_daemon.processing_timeout_ms);
-            let dispatch_ttl = config.image_normalizer.signing.dispatch_ttl(processing_timeout);
-            let mut processor_builder = crate::inference::engine::processor::DwctlRequestProcessor::new(
-                response_store.clone(),
-                multi_step_tool_executor.clone(),
-                multi_step_http_client.clone(),
-                multi_step_loop_config,
-            )
-            .with_tool_resolver(tool_resolver);
-            if config.image_normalizer.enabled {
-                // Re-use the AppState-bound singleton built above; no second
-                // GCS client / ADC signer init.
-                processor_builder = processor_builder.with_image_normalizer(image_normalizer.clone(), dispatch_ttl);
+        // Pre-dispatch preparation for daemon-claimed requests. MUST be installed
+        // before `setup_background_services` spawns the daemon, or claims can be
+        // dispatched without it. Two steps that cannot happen on the loopback:
+        //   - ZDR decrypt: the stored body is `dwzdr1:` ciphertext, so it is not
+        //     parseable JSON and every edge layer chokes before it could act.
+        //   (`dw-img://` image tokens are deliberately NOT signed here: the loopback's
+        //   image-normaliser layer signs them below the prompt-cache layer, so the
+        //   cache keys on the stable token rather than a per-attempt signed URL.)
+        {
+            let dispatch_processor = crate::inference::engine::dispatch_processor::DispatchProcessor::new()
+                .with_keystore(keystore.clone())
+                .with_streamable_endpoints(config.background_services.batch_daemon.streamable_endpoints.clone());
+            if let Err(e) = postgres_daemon.set_processor(Arc::new(dispatch_processor)) {
+                tracing::warn!(error = e, "Dispatch processor was already set; skipping");
             }
-            processor_builder = processor_builder.with_keystore(keystore.clone());
-            let processor = Arc::new(processor_builder);
-            Some(
-                processor
-                    as Arc<
-                        dyn fusillade::RequestProcessor<fusillade_arsenal::PostgresRequestManager<DbPools>, fusillade::ReqwestHttpClient>
-                            + Send
-                            + Sync,
-                    >,
-            )
-        };
+        }
 
         let mut bg_services = setup_background_services(BackgroundServicesInput {
             request_manager: request_manager.clone(),
             postgres_daemon: postgres_daemon.clone(),
-            step_manager: step_manager.clone(),
-            multi_step_processor: multi_step_processor_for_setup,
             model_capacity_limits,
-            pool: (*db_pools).clone(),
-            fusillade_pools: fusillade_pools.clone(),
-            outlet_pool: outlet_pools.as_ref().map(|p| (**p).clone()),
+            pools: pools.clone(),
             config: config.clone(),
             shared_config: shared_config.clone(),
             shutdown_token: shutdown_token.clone(),
@@ -3201,35 +4373,9 @@ impl Application {
         })
         .await?;
 
-        // Enforce `stream_options.include_usage` for streaming chat completions.
-        //
-        // For streaming requests, upstream providers only report token usage in the final
-        // SSE chunk when `stream_options: { include_usage: true }` is set. Without it,
-        // the response contains no usage data and the request logs record 0 tokens — meaning
-        // the request can't be billed. The dashboard sets this automatically, but direct API
-        // callers may not.
-        //
-        // This applies to /chat/completions and the legacy /completions endpoint (both
-        // support `stream_options`). The Responses API (/responses) always includes usage
-        // in its response object regardless of streaming, so no transform is needed there.
-        // Embeddings don't support streaming.
-        let body_transform: onwards::BodyTransformFn = Arc::new(request_logging::stream_usage::stream_usage_transform);
-
-        // Create the HTTP tool executor used by the single-step
-        // (non-multi-step) realtime tool-injection path. Re-uses the
-        // same reqwest::Client and dwctl pool clones the multi-step
-        // executor (built earlier, before `setup_background_services`)
-        // does — cloning a reqwest::Client shares its connection pool /
-        // TLS root cert cache, and the PgPool clone shares the
-        // underlying connection pool. Building separate
-        // clients/pools would double TLS init cost per test and add
-        // unnecessary parallelism pressure.
-        let tool_executor =
-            crate::inference::tools::HttpToolExecutor::new(multi_step_reqwest_client.clone(), Some(multi_step_tool_executor_pool.clone()));
-
         // Register onwards as a fusillade daemon so realtime requests get a valid daemon_id.
         let onwards_daemon_id = uuid::Uuid::new_v4();
-        let fusillade_write_pool = bg_services.request_manager.pool().clone();
+        let fusillade_write_pool = sqlx_pool_router::DynPools::new(pools.fusillade.direct.clone());
         let daemon_insert_result = sqlx::query(
             "INSERT INTO daemons (id, hostname, pid, version, config_snapshot, status, started_at, last_heartbeat)
              VALUES ($1, $2, $3, $4, $5, 'running', NOW(), NOW())",
@@ -3299,13 +4445,10 @@ impl Application {
             });
         } // daemon_registered
 
-        // `response_store`, `multi_step_tool_executor`,
-        // `multi_step_http_client`, `multi_step_loop_config` and the
-        // multi-step processor were built upfront before
-        // `setup_background_services` — `set_processor` ran inside
-        // setup, before any daemon spawn (synchronous fusillade daemon
-        // OR the leader-gained closure). All daemons see the
-        // multi-step processor at claim time.
+        // `response_store` was built upfront (above) so AppState can share it
+        // between the GET `/responses/{id}` handler and `previous_response_id`
+        // hydration. No request processor is installed on the daemon; see the
+        // `DefaultRequestProcessor` note above.
 
         // Inference middleware state. Non-background realtime no longer
         // does any DB work up front; the completion path goes through
@@ -3322,20 +4465,18 @@ impl Application {
                 };
                 format!("http://{addr}/ai")
             },
-            dwctl_pool: (*db_pools).write().clone(),
+            dwctl_pool: sqlx_pool_router::DynPools::new(db_pools.clone()),
             response_store: response_store.clone(),
-            multi_step_tool_executor,
-            multi_step_http_client,
-            loop_config: multi_step_loop_config,
             image_normalizer: image_normalizer.clone(),
             image_normalizer_enabled: config.image_normalizer.enabled,
             unverified_requests_per_completion_hour: config.batches.unverified_requests_per_completion_hour,
             flex_completion_window: config.batches.async_requests.completion_window.clone(),
             keystore: bg_services.keystore.clone(),
-            zdr_key_cache: bg_services.zdr_key_cache.clone(),
+            key_policy_cache: bg_services.key_policy_cache.clone(),
+            sse_buffer_limit: config.onwards.sse_buffer_limit,
         };
 
-        // Build onwards router from targets with body transform, response sanitization, and tool executor.
+        // Build onwards router from targets with body transform + response sanitization.
         // Realtime request bodies share the same configurable cap as batch
         // file requests (limits.requests.max_body_size, 0 = unlimited);
         // without an explicit limit onwards' strict mode would fall back to
@@ -3347,13 +4488,47 @@ impl Application {
         // onwards stays cache-agnostic: cached-input pricing now lives entirely in
         // the dwctl cache tower layer (wired in `build_router`, gated on `cache.enabled`).
         // No classifier is injected here.
-        let onwards_app_state = onwards::AppState::with_transform(bg_services.onwards_targets.clone(), body_transform)
+        // Request-body edits (id-scrub, streaming usage flags) now live in dwctl's own
+        // `outbound_request` middleware, so onwards needs no BodyTransformFn.
+        // One Redis connection for both in-flight limiters. The realtime
+        // per-account limit and the global batch cap share it; each has its own
+        // scope and switch. With no Redis URL it is `None` and both fall back to
+        // counting within this replica.
+        let limits_redis =
+            crate::realtime_inflight::RealtimeInflightLimiter::shared_redis(config.limits.realtime_inflight.redis_url.as_deref())?;
+        let mut onwards_app_state = onwards::AppState::new(bg_services.onwards_targets.clone())
             .with_response_transform(onwards::create_openai_sanitizer())
-            .with_streaming_header("x-fusillade-stream")
+            .with_upstream_rate_limit_message(config.onwards.upstream_rate_limit_message.clone())
             .with_response_id_header("x-fusillade-request-id")
-            .with_tool_executor(Arc::new(tool_executor))
-            .with_response_store(response_store.clone() as Arc<dyn onwards::ResponseStore>)
-            .with_body_limit(onwards_body_limit);
+            .with_body_limit(onwards_body_limit)
+            .with_sse_buffer_limit(config.onwards.sse_buffer_limit)
+            // The fusillade daemon stamps every request it dispatches (file
+            // batches, flex, background) with its batch metadata headers, and
+            // `created_at` is always among them, even for batchless rows.
+            // Realtime traffic never carries it (the realtime path only adds
+            // `x-fusillade-request-id`), so it exempts exactly the daemon
+            // traffic, which tolerates latency and runs its own retries.
+            .with_first_token_timeout_exempt_header(crate::inference::rejections::DISPATCHED_HEADER)
+            .with_inflight_limiter(Arc::new(crate::realtime_inflight::RealtimeInflightLimiter::from_parts(
+                "realtime",
+                config.limits.realtime_inflight.enforce,
+                limits_redis.clone(),
+            )))
+            // The batch cap shares the realtime Redis but has its own switch and
+            // reserved count scope. Off, the handler never consults this
+            // limiter, so no shared count is touched.
+            .with_batch_inflight_limiter(Arc::new(crate::realtime_inflight::RealtimeInflightLimiter::from_parts(
+                "batch",
+                true,
+                limits_redis,
+            )))
+            .with_batch_inflight_enforce(config.limits.batch_inflight.enforce)
+            .with_rejected_params(&config.onwards.rejected_params)
+            .map_err(|error| anyhow::anyhow!("onwards.rejected_params: {error}"))?;
+        if config.onwards.first_token_timeout_ms > 0 {
+            onwards_app_state =
+                onwards_app_state.with_first_token_timeout(std::time::Duration::from_millis(config.onwards.first_token_timeout_ms));
+        }
 
         let onwards_router = if bg_services.onwards_targets.strict_mode {
             tracing::info!("Strict mode enabled - using typed request validation");
@@ -3374,28 +4549,35 @@ impl Application {
             .task_runner(bg_services.task_runner.clone())
             .maybe_outlet_db(outlet_pools.clone())
             .limiters(limiters)
+            .key_policy_cache(bg_services.key_policy_cache.clone())
             .maybe_connections_encryption_key(bg_services.connections_encryption_key.clone())
             .maybe_keystore(bg_services.keystore.clone())
             .response_store(response_store)
-            .response_step_manager(bg_services.step_manager.clone())
             .image_normalizer(image_normalizer)
+            .onwards_targets(bg_services.onwards_targets.clone())
             .build();
 
         if let Some(config_path) = config_path {
             bg_services.spawn(
                 "config-watcher",
-                config_watcher::watch_config_file(config_path, shared_config, bg_services.shutdown_token()),
+                config_watcher::watch_config_file(
+                    config_path,
+                    shared_config,
+                    bg_services.key_policy_cache.clone(),
+                    bg_services.shutdown_token(),
+                ),
             );
         }
 
         let router = build_router(
             &mut app_state,
             onwards_router,
-            bg_services.analytics_sender.clone(),
+            bg_services.analytics_writer.clone(),
             bg_services.requests_writer_sender.clone(),
             metrics_recorder,
             bg_services.onwards_targets.strict_mode,
             Some(inference_middleware_state),
+            bg_services.prefix_chain.clone(),
         )
         .await?;
 
@@ -3403,9 +4585,7 @@ impl Application {
             router,
             app_state,
             config,
-            db_pools,
-            _fusillade_pools: fusillade_pools,
-            _outlet_pools: outlet_pools,
+            pools,
             _embedded_db,
             _tracer_provider: tracer_provider,
             bg_services,
@@ -3419,26 +4599,39 @@ impl Application {
     pub fn into_test_server(self) -> (axum_test::TestServer, BackgroundServices) {
         // Apply middleware before path matching for tests
         let middleware = middleware::from_fn_with_state(self.app_state, admin_ai_proxy_middleware);
-        let service = middleware.layer(self.router).into_make_service();
+        let service = middleware::from_fn(assign_request_id)
+            .layer(middleware.layer(self.router))
+            .into_make_service();
         let server = axum_test::TestServer::new(service).expect("Failed to create test server");
         (server, self.bg_services)
     }
 
-    /// Start serving the application
-    pub async fn serve<F>(mut self, shutdown: F) -> anyhow::Result<()>
+    /// Start serving the application on the configured host and port
+    pub async fn serve<F>(self, shutdown: F) -> anyhow::Result<()>
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        let bind_addr = self.config.bind_address();
-        let listener = TcpListener::bind(&bind_addr).await?;
+        let listener = TcpListener::bind(self.config.bind_address()).await?;
+        self.serve_with_listener(listener, shutdown).await
+    }
+
+    /// Start serving the application on an already-bound listener. The
+    /// listener's port should match `config.port`, which the application uses
+    /// to call itself.
+    pub async fn serve_with_listener<F>(mut self, listener: TcpListener, shutdown: F) -> anyhow::Result<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
         info!(
             "Control layer listening on http://{}, available at http://localhost:{}",
-            bind_addr, self.config.port
+            listener.local_addr()?,
+            self.config.port
         );
 
-        // Apply middleware before path matching
+        // Apply middleware before path matching. The request ID is outermost so
+        // that responses from the admin AI proxy middleware carry it too.
         let middleware = middleware::from_fn_with_state(self.app_state, admin_ai_proxy_middleware);
-        let service = middleware.layer(self.router);
+        let service = middleware::from_fn(assign_request_id).layer(middleware.layer(self.router));
 
         // Cancel shutdown token when SIGTERM arrives, BEFORE axum starts waiting
         // for in-flight connections to close. This lets background services (e.g.,
@@ -3449,6 +4642,14 @@ impl Application {
             shutdown.await;
             shutdown_token.cancel();
         };
+
+        // Streamed responses are many small writes; send each one immediately
+        // rather than waiting for the client to acknowledge the previous one.
+        let listener = listener.tap_io(|tcp| {
+            if let Err(err) = tcp.set_nodelay(true) {
+                warn!(%err, "failed to set TCP_NODELAY on an accepted connection");
+            }
+        });
 
         // Race the server against background task failures (fail-fast)
         let server_error: Option<anyhow::Error> = tokio::select! {
@@ -3470,7 +4671,15 @@ impl Application {
 
         // Close database connections
         info!("Closing database connections...");
-        self.db_pools.close().await;
+        for pair in [Some(&self.pools.main), Some(&self.pools.fusillade), self.pools.outlet.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            pair.pooled.close().await;
+            if pair.is_split() {
+                pair.direct.close().await;
+            }
+        }
 
         // Flush pending spans without shutting down the processor.
         // We intentionally use force_flush() instead of shutdown() because the

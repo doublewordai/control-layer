@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO batch_aggregates (\n                fusillade_batch_id, user_id, total_amount, transaction_count, max_seq, service_tier, total_requests,\n                total_prompt_tokens, total_completion_tokens, total_reasoning_tokens, total_tokens,\n                sum_duration_ms, count_duration_ms, sum_ttfb_ms, count_ttfb_ms, total_list_cost\n            )\n            VALUES ($1, $2, $3, 1, 1, 'batch', 1, $4, $5, $6, $7, $8, 1, $9, $10, $3)\n            ON CONFLICT (fusillade_batch_id) DO UPDATE SET\n                total_amount = batch_aggregates.total_amount + EXCLUDED.total_amount,\n                transaction_count = batch_aggregates.transaction_count + EXCLUDED.transaction_count,\n                total_requests = batch_aggregates.total_requests + EXCLUDED.total_requests,\n                total_prompt_tokens = batch_aggregates.total_prompt_tokens + EXCLUDED.total_prompt_tokens,\n                total_completion_tokens = batch_aggregates.total_completion_tokens + EXCLUDED.total_completion_tokens,\n                total_reasoning_tokens = batch_aggregates.total_reasoning_tokens + EXCLUDED.total_reasoning_tokens,\n                total_tokens = batch_aggregates.total_tokens + EXCLUDED.total_tokens,\n                sum_duration_ms = batch_aggregates.sum_duration_ms + EXCLUDED.sum_duration_ms,\n                count_duration_ms = batch_aggregates.count_duration_ms + EXCLUDED.count_duration_ms,\n                sum_ttfb_ms = batch_aggregates.sum_ttfb_ms + EXCLUDED.sum_ttfb_ms,\n                count_ttfb_ms = batch_aggregates.count_ttfb_ms + EXCLUDED.count_ttfb_ms,\n                total_list_cost = batch_aggregates.total_list_cost + EXCLUDED.total_list_cost\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Numeric",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "892e7e8a438c98f5ce1fb0f5f9c379a70c1c3275cd9cd60f23d2b5dc799b11cc"
+}

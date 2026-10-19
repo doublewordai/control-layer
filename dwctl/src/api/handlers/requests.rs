@@ -86,7 +86,7 @@ pub async fn list_requests<P: PoolProvider>(
     };
 
     // Query the http_analytics table - use read replica for analytics
-    let entries = list_http_analytics(state.db.read(), skip, limit, query.order_desc.unwrap_or(true), filter).await?;
+    let entries = list_http_analytics(&state.db.read(), skip, limit, query.order_desc.unwrap_or(true), filter).await?;
 
     Ok(Json(ListAnalyticsResponse { entries }))
 }
@@ -118,7 +118,7 @@ pub async fn aggregate_requests<P: PoolProvider>(
     let model_filter = query.model.as_deref();
 
     // Get aggregated analytics data from http_analytics table - use read replica for analytics
-    let response = get_requests_aggregate(state.db.read(), time_range_start, time_range_end, model_filter).await?;
+    let response = get_requests_aggregate(&state.db.read(), time_range_start, time_range_end, model_filter).await?;
 
     Ok(Json(response))
 }
@@ -164,7 +164,7 @@ pub async fn aggregate_by_user<P: PoolProvider>(
     let start_date = query.start_date.unwrap_or_else(|| end_date - Duration::hours(24));
 
     // Get usage data from http_analytics table - use read replica for analytics
-    let usage_data = get_model_user_usage(state.db.read(), &model_alias, start_date, end_date).await?;
+    let usage_data = get_model_user_usage(&state.db.read(), &model_alias, start_date, end_date).await?;
 
     Ok(Json(usage_data))
 }
@@ -218,6 +218,9 @@ pub async fn get_usage<P: PoolProvider>(
     // Resolve the target user *before* building the cache key — different
     // targets must never share a cache entry.
     let target_user_id = resolve_usage_target(&state, &current_user, query.user_id).await?;
+    // Usage is attributed to the billed account (API key user_id), not the key's
+    // human creator. A member drill-down reads that member's personal usage;
+    // substituting the viewer's active organisation would quote another account.
 
     // Build cache key: truncate dates to midnight UTC so preset windows always hit cache.
     // Skip cache for ranges under 30 days — the data moves too fast to cache usefully.
@@ -242,16 +245,16 @@ pub async fn get_usage<P: PoolProvider>(
 
     // Two paths: all-time uses fast pre-aggregated tables, date-filtered
     // queries http_analytics directly (bounded by covering index).
-    let (batch_count, by_model, tariffs) = if has_dates {
+    let (batch_count, by_model) = if has_dates {
         let end_date = query.end_date.unwrap_or_else(Utc::now);
         let start = query.start_date.unwrap_or_else(|| end_date - Duration::days(180));
         let max_start = end_date - Duration::days(180);
         let start_date = if start < max_start { max_start } else { start };
 
+        let db = state.db.read();
         tokio::try_join!(
-            get_user_batch_count_for_range(state.db.read(), target_user_id, start_date, end_date),
-            get_user_model_breakdown_for_range(state.db.read(), target_user_id, start_date, end_date),
-            get_realtime_tariffs(state.db.read()),
+            get_user_batch_count_for_range(&db, target_user_id, start_date, end_date),
+            get_user_model_breakdown_for_range(&db, target_user_id, start_date, end_date),
         )?
     } else {
         // All-time usage combines two pre-aggregated tables:
@@ -279,15 +282,18 @@ pub async fn get_usage<P: PoolProvider>(
         // synchronous fold, and only when the caller explicitly asks via
         // ?refresh=true (otherwise the usage-refresh daemon keeps it current).
         if refresh {
-            refresh_user_model_usage_daily(state.db.write()).await?;
+            refresh_user_model_usage_daily(&state.db.write()).await?;
         }
-        let (batch_stats, by_model, tariffs) = tokio::try_join!(
-            get_user_batch_counts(state.db.read(), target_user_id),
-            get_user_model_breakdown(state.db.read(), target_user_id),
-            get_realtime_tariffs(state.db.read()),
+        let db = state.db.read();
+        let (batch_stats, by_model) = tokio::try_join!(
+            get_user_batch_counts(&db, target_user_id),
+            get_user_model_breakdown(&db, target_user_id),
         )?;
-        (batch_stats.0, by_model, tariffs)
+        (batch_stats.0, by_model)
     };
+
+    let aliases: Vec<String> = by_model.iter().map(|entry| entry.model.clone()).collect();
+    let tariffs = get_realtime_tariffs(&state.db.read(), target_user_id, &aliases).await?;
 
     let total_cost = by_model
         .iter()
@@ -454,7 +460,7 @@ mod tests {
         .expect("Failed to insert test analytics data");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_requests_unauthorized(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -470,7 +476,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::FORBIDDEN);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_requests_success_empty(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -487,7 +493,7 @@ mod tests {
         assert!(list_response.entries.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_requests_with_data(pool: PgPool) {
         // Insert test data
@@ -540,7 +546,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_requests_with_model_filter(pool: PgPool) {
         // Insert test data for multiple models
@@ -601,7 +607,7 @@ mod tests {
         assert!(list_response.entries.iter().all(|e| e.model.as_deref() == Some("gpt-4")));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_requests_with_batch_filter(pool: PgPool) {
         use uuid::Uuid;
@@ -680,7 +686,7 @@ mod tests {
         assert!(list_response.entries.iter().all(|e| e.fusillade_batch_id == Some(batch_id)));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_aggregate_requests_success(pool: PgPool) {
         // Insert analytics data to test aggregate functionality
@@ -714,7 +720,7 @@ mod tests {
         assert!(aggregate_response.model.is_none()); // No model filter applied
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_aggregate_requests_with_model_filter(pool: PgPool) {
         // Insert analytics data for multiple models
@@ -761,7 +767,7 @@ mod tests {
         assert_eq!(aggregate_response.model, Some("gpt-4".to_string()));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_aggregate_requests_unauthorized(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -791,7 +797,7 @@ mod tests {
         assert!(query.fusillade_batch_id.is_none());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_standard_user_cannot_access_requests(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -816,7 +822,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_request_viewer_can_access_monitoring_data(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -843,7 +849,7 @@ mod tests {
         let _aggregate_response: RequestsAggregateResponse = response.json();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_cannot_access_raw_requests(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -915,7 +921,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_usage_defaults_to_active_organization(pool: PgPool) {
         // Org-context callers should see the org's aggregate by default,
@@ -947,7 +953,7 @@ mod tests {
         assert_eq!(body.total_output_tokens, 500);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_usage_user_id_filter_to_self(pool: PgPool) {
         // Callers can always pass their own id to override the org-default
@@ -975,7 +981,7 @@ mod tests {
         assert_eq!(body.total_output_tokens, 50);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_usage_admin_can_filter_to_member(pool: PgPool) {
         // Org admins / owners can drill into a specific member's id.
@@ -1003,7 +1009,7 @@ mod tests {
         assert_eq!(body.total_output_tokens, 25);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_usage_non_admin_cannot_filter_to_other_member(pool: PgPool) {
         // Regular members can't see another member's usage even within the
@@ -1029,7 +1035,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::FORBIDDEN);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_usage_personal_context_other_user_id_forbidden(pool: PgPool) {
         // Personal-context callers (no `active_organization`) shouldn't be
@@ -1050,7 +1056,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::FORBIDDEN);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_requests_query_parameters(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1132,7 +1138,7 @@ mod tests {
     /// run against the test pool. Two analytics rows are seeded — one for the
     /// PM, one for the org — and the test asserts the response only contains
     /// the model attributed to the active context.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_usage_pm_in_org_context_scopes_to_org(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;

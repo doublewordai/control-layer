@@ -15,6 +15,7 @@ use crate::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{Connection, FromRow, PgConnection};
+use std::time::Duration;
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -70,6 +71,8 @@ pub struct AutoTopupUser {
     pub auto_topup_limit_notification_sent: bool,
     /// Consecutive soft card declines since the last successful auto top-up.
     pub auto_topup_soft_failure_count: i32,
+    /// Bill this top-up onto the account's next invoice instead of charging a card.
+    pub invoicing_enabled: bool,
 }
 
 /// User with a low-balance threshold configured.
@@ -116,6 +119,27 @@ struct User {
     pub user_type: String,
     pub verified: bool,
     pub zero_data_retention: bool,
+    pub invoicing_enabled: bool,
+    /// Account setting: elevated serving classes held (migration 149).
+    pub granted_serving_classes: Vec<String>,
+    /// Account setting: default serving class (migration 149).
+    pub default_serving_class: Option<String>,
+    /// Account setting: never fall over to an external provider (migration 149).
+    pub self_hosted_only: bool,
+    /// Account setting: the scheduling-toleration preset id pinned to this
+    /// account, or NULL for the "Default" setting.
+    pub toleration_preset: Option<String>,
+    /// Organizations only: admit signups from the claimed domain without
+    /// review.
+    ///
+    /// Included in the explicit projections used by insert/update queries. **Do not read it from here** — the hand-built
+    /// `User` literals in this file leave it `false` regardless of the stored
+    /// value, because their queries don't project it. It is deliberately not
+    /// carried on `UserDBResponse` either: both real readers hold an
+    /// organization id and go through `Organizations::auto_join_enabled`,
+    /// which is always accurate.
+    #[allow(dead_code)]
+    pub auto_join_enabled: bool,
 }
 
 pub struct Users<'c> {
@@ -149,6 +173,11 @@ impl From<(Vec<Role>, User)> for UserDBResponse {
             user_type: user.user_type,
             verified: user.verified,
             zero_data_retention: user.zero_data_retention,
+            invoicing_enabled: user.invoicing_enabled,
+            granted_serving_classes: user.granted_serving_classes,
+            default_serving_class: user.default_serving_class,
+            self_hosted_only: user.self_hosted_only,
+            toleration_preset: user.toleration_preset,
         }
     }
 }
@@ -161,7 +190,7 @@ impl<'c> Repository for Users<'c> {
     type Id = UserId;
     type Filter = UserFilter;
 
-    #[instrument(skip(self, request), fields(username = %request.username), err)]
+    #[instrument(level = "debug", skip(self, request), fields(username = %request.username), err)]
     async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
         // Always generate a new ID for users
         let user_id = Uuid::new_v4();
@@ -173,7 +202,7 @@ impl<'c> Repository for Users<'c> {
             r#"
             INSERT INTO users (id, username, email, display_name, avatar_url, auth_source, is_admin, password_hash, external_user_id)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            RETURNING *
+            RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at, last_login, is_admin, password_hash, external_user_id, payment_provider_id, is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent, low_balance_notification_sent, low_balance_threshold, user_type, auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, auto_topup_limit_notification_sent, verified, zero_data_retention, auto_topup_soft_failure_count, auto_topup_retry_after, invoicing_enabled, auto_join_enabled, granted_serving_classes, default_serving_class, self_hosted_only, toleration_preset
             "#,
             user_id,
             request.username,
@@ -217,7 +246,7 @@ impl<'c> Repository for Users<'c> {
         Ok(UserDBResponse::from((roles_to_insert, user)))
     }
 
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&id)), err)]
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let result = sqlx::query!(
             r#"
@@ -247,12 +276,17 @@ impl<'c> Repository for Users<'c> {
                 u.auto_topup_limit_notification_sent,
                 u.user_type,
                 u.verified,
+                u.invoicing_enabled,
                 u.zero_data_retention,
+                u.granted_serving_classes,
+                u.default_serving_class,
+                u.self_hosted_only,
+                u.toleration_preset,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = $1 AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.auto_topup_limit_notification_sent, u.user_type, u.verified, u.zero_data_retention
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.auto_topup_limit_notification_sent, u.user_type, u.verified, u.invoicing_enabled, u.zero_data_retention, u.granted_serving_classes, u.default_serving_class, u.self_hosted_only, u.toleration_preset
             "#,
             id
         )
@@ -288,7 +322,14 @@ impl<'c> Repository for Users<'c> {
                 auto_topup_retry_after: None,
                 user_type: row.user_type,
                 verified: row.verified,
+                invoicing_enabled: row.invoicing_enabled,
                 zero_data_retention: row.zero_data_retention,
+                granted_serving_classes: row.granted_serving_classes,
+                default_serving_class: row.default_serving_class,
+                self_hosted_only: row.self_hosted_only,
+                toleration_preset: row.toleration_preset,
+                // Not projected by this query; never read from `User`. See the field doc.
+                auto_join_enabled: false,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -299,7 +340,7 @@ impl<'c> Repository for Users<'c> {
         }
     }
 
-    #[instrument(skip(self, ids), fields(count = ids.len()), err)]
+    #[instrument(level = "debug", skip(self, ids), fields(count = ids.len()), err)]
     async fn get_bulk(&mut self, ids: Vec<UserId>) -> Result<std::collections::HashMap<Self::Id, UserDBResponse>> {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -334,12 +375,17 @@ impl<'c> Repository for Users<'c> {
                 u.auto_topup_limit_notification_sent,
                 u.user_type,
                 u.verified,
+                u.invoicing_enabled,
                 u.zero_data_retention,
+                u.granted_serving_classes,
+                u.default_serving_class,
+                u.self_hosted_only,
+                u.toleration_preset,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = ANY($1) AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.auto_topup_limit_notification_sent, u.user_type, u.verified, u.zero_data_retention
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.auto_topup_limit_notification_sent, u.user_type, u.verified, u.invoicing_enabled, u.zero_data_retention, u.granted_serving_classes, u.default_serving_class, u.self_hosted_only, u.toleration_preset
             "#,
             ids.as_slice()
         )
@@ -377,7 +423,14 @@ impl<'c> Repository for Users<'c> {
                 auto_topup_retry_after: None,
                 user_type: row.user_type,
                 verified: row.verified,
+                invoicing_enabled: row.invoicing_enabled,
                 zero_data_retention: row.zero_data_retention,
+                granted_serving_classes: row.granted_serving_classes,
+                default_serving_class: row.default_serving_class,
+                self_hosted_only: row.self_hosted_only,
+                toleration_preset: row.toleration_preset,
+                // Not projected by this query; never read from `User`. See the field doc.
+                auto_join_enabled: false,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -387,12 +440,12 @@ impl<'c> Repository for Users<'c> {
 
         Ok(result)
     }
-    #[instrument(skip(self, filter), fields(limit = filter.limit, skip = filter.skip, search = filter.search), err)]
+    #[instrument(level = "debug", skip(self, filter), fields(limit = filter.limit, skip = filter.skip, search = filter.search), err)]
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
         use sqlx::QueryBuilder;
 
         let mut query = QueryBuilder::new(
-            "SELECT * FROM users WHERE id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false AND user_type = ",
+            "SELECT id, username, email, display_name, avatar_url, auth_source, created_at, updated_at, last_login, is_admin, password_hash, external_user_id, payment_provider_id, is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent, low_balance_notification_sent, low_balance_threshold, user_type, auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, auto_topup_limit_notification_sent, verified, zero_data_retention, auto_topup_soft_failure_count, auto_topup_retry_after, invoicing_enabled, auto_join_enabled, granted_serving_classes, default_serving_class, self_hosted_only, toleration_preset FROM users WHERE id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false AND user_type = ",
         );
         query.push_bind(filter.user_type.clone());
 
@@ -432,14 +485,14 @@ impl<'c> Repository for Users<'c> {
         Ok(result)
     }
 
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&id)), err)]
     async fn delete(&mut self, id: Self::Id) -> Result<bool> {
         // Soft delete with GDPR-compliant data scrubbing
         // We scrub all personal information but keep the record for referential integrity
         let scrubbed_email = format!("deleted-{}@deleted.local", id);
         let scrubbed_username = format!("deleted-{}", id);
 
-        // Scrub the user row and hard-delete their API keys atomically so a
+        // Scrub the user row and revoke their API keys atomically so a
         // "deleted" account can never keep authenticating.
         let mut tx = self.db.begin().await?;
 
@@ -466,12 +519,154 @@ impl<'c> Repository for Users<'c> {
         .await?;
 
         // Only when we actually transitioned the user to deleted (idempotent on
-        // repeat calls). Hard-delete keys owned by the user (user_id) — these
-        // authenticate as them. Keys they merely created for others (created_by)
-        // belong to those users and are left alone. The api_keys DELETE trigger
-        // emits NOTIFY, so the onwards proxy drops them from its cache at once.
+        // repeat calls). Preserve keys attributed to them in another account
+        // for audit attribution, using the same soft deletion as org departure.
+        // Both UPDATE and DELETE triggers notify the onwards cache to revoke access.
         if result.rows_affected() > 0 {
+            sqlx::query!(
+                "UPDATE api_keys SET is_deleted = true WHERE created_by = $1 AND user_id != $1 AND is_deleted = false",
+                id
+            )
+            .execute(&mut *tx)
+            .await?;
+
             sqlx::query!(r#"DELETE FROM api_keys WHERE user_id = $1"#, id)
+                .execute(&mut *tx)
+                .await?;
+
+            // Hand over every workspace this user owned, or close it.
+            //
+            // Deleting a user used to scrub the row and walk away from their
+            // `user_organizations` rows, which left the workspace live, still
+            // claiming its email domain, and with nobody able to administer it:
+            // colleagues signing up were pointed at a workspace whose join
+            // requests no one could approve. `remove_member` has a last-owner
+            // guard for exactly this reason; account deletion walked straight
+            // past it.
+            //
+            // Succession order is the longest-standing live member who is
+            // closest to already holding the role: another owner (a no-op
+            // re-assert), then the earliest admin, then the earliest ordinary
+            // member. Only active memberships of live users count - a pending
+            // invitation is not somebody who can take over a workspace.
+            for org_id in sqlx::query_scalar!(
+                r#"SELECT organization_id FROM user_organizations WHERE user_id = $1 AND role = 'owner' AND status = 'active'"#,
+                id
+            )
+            .fetch_all(&mut *tx)
+            .await?
+            {
+                let successor = sqlx::query_scalar!(
+                    r#"
+                    SELECT uo.user_id
+                    FROM user_organizations uo
+                    JOIN users u ON u.id = uo.user_id
+                    WHERE uo.organization_id = $1
+                      AND uo.user_id <> $2
+                      AND uo.status = 'active'
+                      AND u.is_deleted = false
+                    ORDER BY CASE uo.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, uo.created_at ASC, uo.user_id ASC
+                    LIMIT 1
+                    "#,
+                    org_id,
+                    id
+                )
+                .fetch_optional(&mut *tx)
+                .await?;
+
+                match successor {
+                    Some(successor_id) => {
+                        sqlx::query!(
+                            r#"UPDATE user_organizations SET role = 'owner' WHERE organization_id = $1 AND user_id = $2 AND status = 'active'"#,
+                            org_id,
+                            successor_id
+                        )
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                    None => {
+                        // Nobody left to hand it to, so the workspace goes the
+                        // same way the account does: scrubbed, flagged deleted,
+                        // and its keys revoked so nothing keeps authenticating
+                        // as it.
+                        //
+                        // Soft-deleted, not hard-deleted. `connections.api_key_id`
+                        // references `api_keys(id)` with NO ACTION, so removing a
+                        // key a connection still points at raises a foreign-key
+                        // violation and takes the whole account deletion down with
+                        // it. The `api_keys_notify_update` trigger fires the same
+                        // config-change NOTIFY as the delete trigger, so the proxy
+                        // still drops the key from its cache immediately - the
+                        // hard delete was buying nothing here that the soft one
+                        // does not.
+                        sqlx::query!(
+                            r#"
+                            UPDATE users
+                            SET email = $1, username = $2, display_name = NULL, avatar_url = NULL,
+                                is_deleted = true, updated_at = NOW()
+                            WHERE id = $3 AND user_type = 'organization' AND is_deleted = false
+                            "#,
+                            format!("deleted-{org_id}@deleted.local"),
+                            format!("deleted-{org_id}"),
+                            org_id
+                        )
+                        .execute(&mut *tx)
+                        .await?;
+                        sqlx::query!(
+                            r#"UPDATE api_keys SET is_deleted = true WHERE user_id = $1 AND is_deleted = false"#,
+                            org_id
+                        )
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                }
+            }
+
+            // Revoke the org-scoped keys this user holds, before the
+            // memberships that identify them are dropped.
+            //
+            // The hard delete above only catches keys the user *owns*
+            // (`user_id = id`). A key issued to them inside a workspace is
+            // owned by the workspace and merely attributed to them
+            // (`user_id = organization_id`, `created_by = id`), so it survives
+            // - and API-key auth checks only `api_keys.is_deleted`, never
+            // whether the creator still exists. Without this, deleting an
+            // account leaves it able to keep authenticating into workspaces
+            // that outlived it. Same treatment the member-removal and leave
+            // paths already apply via `soft_delete_member_org_keys`.
+            //
+            // Attribution, not authorship: `created_by` on an org key is the
+            // member it belongs to (`api_keys.rs` sets it from `member_id`),
+            // so this does not touch keys this user issued to other people. It
+            // does take an org-wide key they created without naming a member,
+            // which is attributed to them - the same consequence
+            // `soft_delete_member_org_keys` already has when an org removes
+            // somebody. Logged because, unlike a removal, an account deletion
+            // is invisible to the workspace on the other end of it.
+            let revoked = sqlx::query!(
+                r#"
+                UPDATE api_keys SET is_deleted = true
+                WHERE created_by = $1
+                  AND is_deleted = false
+                  AND user_id IN (SELECT organization_id FROM user_organizations WHERE user_id = $1)
+                "#,
+                id
+            )
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if revoked > 0 {
+                tracing::info!(
+                    user_id = %abbrev_uuid(&id),
+                    revoked,
+                    "Revoked organization API keys held by a deleted user"
+                );
+            }
+
+            // The departing user is not a member of anything any more. Left
+            // behind, these rows are what made the workspaces above look owned
+            // by somebody who no longer exists.
+            sqlx::query!(r#"DELETE FROM user_organizations WHERE user_id = $1"#, id)
                 .execute(&mut *tx)
                 .await?;
         }
@@ -481,7 +676,7 @@ impl<'c> Repository for Users<'c> {
         Ok(result.rows_affected() > 0)
     }
 
-    #[instrument(skip(self, request), fields(user_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self, request), fields(user_id = %abbrev_uuid(&id)), err)]
     async fn update(&mut self, id: Self::Id, request: &Self::UpdateRequest) -> Result<Self::Response> {
         // This update touches multiple tables, so regardless of the connection passed in, we still need a transaction.
 
@@ -531,9 +726,19 @@ impl<'c> Repository for Users<'c> {
                     ELSE auto_topup_retry_after
                 END,
                 zero_data_retention = COALESCE($14, zero_data_retention),
+                default_serving_class = CASE
+                    WHEN $15::boolean THEN $16
+                    ELSE default_serving_class
+                END,
+                self_hosted_only = COALESCE($17, self_hosted_only),
+                granted_serving_classes = COALESCE($18, granted_serving_classes),
+                toleration_preset = CASE
+                    WHEN $19::boolean THEN $20
+                    ELSE toleration_preset
+                END,
                 updated_at = NOW()
             WHERE id = $1
-            RETURNING *
+            RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at, last_login, is_admin, password_hash, external_user_id, payment_provider_id, is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent, low_balance_notification_sent, low_balance_threshold, user_type, auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, auto_topup_limit_notification_sent, verified, zero_data_retention, auto_topup_soft_failure_count, auto_topup_retry_after, invoicing_enabled, auto_join_enabled, granted_serving_classes, default_serving_class, self_hosted_only, toleration_preset
             "#,
                 id,
                 request.display_name,
@@ -549,6 +754,12 @@ impl<'c> Repository for Users<'c> {
                 request.auto_topup_monthly_limit.is_some() as bool,
                 request.auto_topup_monthly_limit.flatten(),
                 request.zero_data_retention,
+                request.default_serving_class.is_some(),
+                request.default_serving_class.clone().flatten(),
+                request.self_hosted_only,
+                request.granted_serving_classes.as_deref(),
+                request.toleration_preset.is_some() as bool,
+                request.toleration_preset.clone().flatten(),
             )
             .fetch_optional(&mut *tx)
             .await?
@@ -594,7 +805,7 @@ impl<'c> Users<'c> {
         Self { db }
     }
 
-    #[instrument(skip(self, filter), fields(search = filter.search), err)]
+    #[instrument(level = "debug", skip(self, filter), fields(search = filter.search), err)]
     pub async fn count(&mut self, filter: &UserFilter) -> Result<i64> {
         use sqlx::QueryBuilder;
 
@@ -619,11 +830,11 @@ impl<'c> Users<'c> {
         Ok(count.0)
     }
 
-    #[instrument(skip(self, email), err)]
+    #[instrument(level = "debug", skip(self, email), err)]
     pub async fn get_user_by_email(&mut self, email: &str) -> Result<Option<UserDBResponse>> {
         let user = sqlx::query_as!(
             User,
-            "SELECT * FROM users WHERE email = $1 AND id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false AND user_type = 'individual'",
+            "SELECT id, username, email, display_name, avatar_url, auth_source, created_at, updated_at, last_login, is_admin, password_hash, external_user_id, payment_provider_id, is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent, low_balance_notification_sent, low_balance_threshold, user_type, auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, auto_topup_limit_notification_sent, verified, zero_data_retention, auto_topup_soft_failure_count, auto_topup_retry_after, invoicing_enabled, auto_join_enabled, granted_serving_classes, default_serving_class, self_hosted_only, toleration_preset FROM users WHERE email = $1 AND id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false AND user_type = 'individual'",
             email
         )
         .fetch_optional(&mut *self.db)
@@ -643,11 +854,11 @@ impl<'c> Users<'c> {
         }
     }
 
-    #[instrument(skip(self, external_user_id), err)]
+    #[instrument(level = "debug", skip(self, external_user_id), err)]
     pub async fn get_user_by_external_user_id(&mut self, external_user_id: &str) -> Result<Option<UserDBResponse>> {
         let user = sqlx::query_as!(
             User,
-            "SELECT * FROM users WHERE external_user_id = $1 AND id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false",
+            "SELECT id, username, email, display_name, avatar_url, auth_source, created_at, updated_at, last_login, is_admin, password_hash, external_user_id, payment_provider_id, is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent, low_balance_notification_sent, low_balance_threshold, user_type, auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, auto_topup_limit_notification_sent, verified, zero_data_retention, auto_topup_soft_failure_count, auto_topup_retry_after, invoicing_enabled, auto_join_enabled, granted_serving_classes, default_serving_class, self_hosted_only, toleration_preset FROM users WHERE external_user_id = $1 AND id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false",
             external_user_id
         )
         .fetch_optional(&mut *self.db)
@@ -668,7 +879,7 @@ impl<'c> Users<'c> {
     }
 
     /// Update a user's email address
-    #[instrument(skip(self, email), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self, email), fields(user_id = %abbrev_uuid(&user_id)), err)]
     async fn update_user_email(&mut self, user_id: UserId, email: &str) -> Result<()> {
         sqlx::query!("UPDATE users SET email = $1 WHERE id = $2", email, user_id)
             .execute(&mut *self.db)
@@ -677,7 +888,7 @@ impl<'c> Users<'c> {
     }
 
     /// Update a user's external_user_id
-    #[instrument(skip(self, external_user_id), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self, external_user_id), fields(user_id = %abbrev_uuid(&user_id)), err)]
     async fn update_user_external_id(&mut self, user_id: UserId, external_user_id: &str) -> Result<()> {
         sqlx::query!("UPDATE users SET external_user_id = $1 WHERE id = $2", external_user_id, user_id)
             .execute(&mut *self.db)
@@ -695,7 +906,7 @@ impl<'c> Users<'c> {
     /// Email is required for user creation. Groups are synced if provided (along with provider).
     ///
     /// Returns a tuple of (user, was_created) where was_created is true if a new user was created.
-    #[instrument(skip(self, external_user_id, email, groups_and_provider, default_roles), err)]
+    #[instrument(level = "debug", skip(self, external_user_id, email, groups_and_provider, default_roles), err)]
     pub async fn get_or_create_proxy_header_user(
         &mut self,
         external_user_id: &str,
@@ -780,8 +991,8 @@ impl<'c> Users<'c> {
                 external_user_id,
                 email
             );
-            let display_name = crate::auth::utils::generate_random_display_name();
-            tracing::debug!("Generated display name: {}", display_name);
+            let display_name = crate::auth::utils::default_display_name(email);
+            tracing::trace!("Defaulted display name to email prefix");
 
             let create_request = UserCreateDBRequest {
                 username: external_user_id.to_string(),
@@ -819,7 +1030,7 @@ impl<'c> Users<'c> {
     }
 
     /// Mark that the first-batch welcome email has been sent for a user.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn mark_first_batch_email_sent(&mut self, user_id: UserId) -> Result<()> {
         sqlx::query!("UPDATE users SET first_batch_email_sent = true WHERE id = $1", user_id)
             .execute(&mut *self.db)
@@ -828,7 +1039,7 @@ impl<'c> Users<'c> {
     }
 
     /// Return all users who have a low-balance threshold configured.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn users_with_low_balance_threshold(&mut self) -> Result<Vec<LowBalanceUser>> {
         let rows = sqlx::query_as!(
             LowBalanceUser,
@@ -851,7 +1062,7 @@ impl<'c> Users<'c> {
     }
 
     /// Mark that low-balance notifications have been sent for the given users.
-    #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
+    #[instrument(level = "debug", skip(self, user_ids), fields(count = user_ids.len()), err)]
     pub async fn mark_low_balance_notification_sent(&mut self, user_ids: &[UserId]) -> Result<()> {
         sqlx::query!("UPDATE users SET low_balance_notification_sent = true WHERE id = ANY($1)", user_ids)
             .execute(&mut *self.db)
@@ -860,7 +1071,7 @@ impl<'c> Users<'c> {
     }
 
     /// Clear the low-balance notification flag for users who have recovered.
-    #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
+    #[instrument(level = "debug", skip(self, user_ids), fields(count = user_ids.len()), err)]
     pub async fn clear_low_balance_notification_sent(&mut self, user_ids: &[UserId]) -> Result<()> {
         sqlx::query!(
             "UPDATE users SET low_balance_notification_sent = false WHERE id = ANY($1)",
@@ -872,7 +1083,7 @@ impl<'c> Users<'c> {
     }
 
     /// Mark that the auto top-up monthly limit notification has been sent for the given users.
-    #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
+    #[instrument(level = "debug", skip(self, user_ids), fields(count = user_ids.len()), err)]
     pub async fn mark_auto_topup_limit_notification_sent(&mut self, user_ids: &[UserId]) -> Result<()> {
         sqlx::query!(
             "UPDATE users SET auto_topup_limit_notification_sent = true WHERE id = ANY($1)",
@@ -885,7 +1096,7 @@ impl<'c> Users<'c> {
 
     /// Clear the auto top-up monthly limit notification flag.
     /// Called when the user changes their limit or at month rollover.
-    #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
+    #[instrument(level = "debug", skip(self, user_ids), fields(count = user_ids.len()), err)]
     pub async fn clear_auto_topup_limit_notification_sent(&mut self, user_ids: &[UserId]) -> Result<()> {
         sqlx::query!(
             "UPDATE users SET auto_topup_limit_notification_sent = false WHERE id = ANY($1)",
@@ -898,7 +1109,7 @@ impl<'c> Users<'c> {
 
     /// Clear recovered users and fetch low-balance users in one round-trip.
     /// Uses the cached checkpoint balance — good enough for notification thresholds.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn poll_low_balance_users(&mut self) -> Result<Vec<LowBalanceUser>> {
         let rows = sqlx::query_as!(
             LowBalanceUser,
@@ -932,7 +1143,7 @@ impl<'c> Users<'c> {
     }
 
     /// Return all users who have auto top-up fully configured (threshold + amount + payment method).
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn users_with_auto_topup_enabled(&mut self) -> Result<Vec<AutoTopupUser>> {
         let rows = sqlx::query_as!(
             AutoTopupUser,
@@ -944,7 +1155,8 @@ impl<'c> Users<'c> {
                    c.balance as "checkpoint_balance?",
                    u.auto_topup_monthly_limit::decimal(20, 9) as "auto_topup_monthly_limit?",
                    u.auto_topup_limit_notification_sent,
-                   u.auto_topup_soft_failure_count
+                   u.auto_topup_soft_failure_count,
+                   u.invoicing_enabled
             FROM users u
             LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id
             WHERE u.id != '00000000-0000-0000-0000-000000000000'
@@ -964,23 +1176,29 @@ impl<'c> Users<'c> {
     /// Apply a soft auto-top-up decline if the caller's observed failure count
     /// is still current. Returns false when another poller already applied the
     /// same decline transition.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id), expected_failure_count), err)]
-    pub async fn apply_auto_topup_soft_decline(&mut self, user_id: UserId, expected_failure_count: i32) -> Result<bool> {
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id), expected_failure_count), err)]
+    pub async fn apply_auto_topup_soft_decline(
+        &mut self,
+        user_id: UserId,
+        expected_failure_count: i32,
+        retry_delay: Duration,
+    ) -> Result<bool> {
         let result = if expected_failure_count == 0 {
-            sqlx::query!(
+            sqlx::query(
                 r#"
                 UPDATE users
                 SET auto_topup_soft_failure_count = 1,
-                    auto_topup_retry_after = NOW() + INTERVAL '24 hours',
+                    auto_topup_retry_after = NOW() + make_interval(secs => $3),
                     updated_at = NOW()
                 WHERE id = $1
                   AND auto_topup_soft_failure_count = $2
                   AND auto_topup_amount IS NOT NULL
                   AND auto_topup_threshold IS NOT NULL
                 "#,
-                user_id,
-                expected_failure_count,
             )
+            .bind(user_id)
+            .bind(expected_failure_count)
+            .bind(retry_delay.as_secs_f64())
             .execute(&mut *self.db)
             .await?
         } else {
@@ -1012,20 +1230,21 @@ impl<'c> Users<'c> {
     /// it as a card decline.
     ///
     /// Returns false when another poller already applied the pause.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
-    pub async fn pause_auto_topup_after_provider_failure(&mut self, user_id: UserId) -> Result<bool> {
-        let result = sqlx::query!(
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn pause_auto_topup_after_provider_failure(&mut self, user_id: UserId, retry_delay: Duration) -> Result<bool> {
+        let result = sqlx::query(
             r#"
             UPDATE users
-            SET auto_topup_retry_after = NOW() + INTERVAL '24 hours',
+            SET auto_topup_retry_after = NOW() + make_interval(secs => $2),
                 updated_at = NOW()
             WHERE id = $1
               AND auto_topup_amount IS NOT NULL
               AND auto_topup_threshold IS NOT NULL
               AND (auto_topup_retry_after IS NULL OR auto_topup_retry_after <= NOW())
             "#,
-            user_id,
         )
+        .bind(user_id)
+        .bind(retry_delay.as_secs_f64())
         .execute(&mut *self.db)
         .await?;
 
@@ -1035,7 +1254,7 @@ impl<'c> Users<'c> {
     /// Disable auto top-up after a hard card decline.
     ///
     /// Returns false when auto top-up was already disabled by another poller.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn disable_auto_topup_after_hard_decline(&mut self, user_id: UserId) -> Result<bool> {
         let result = sqlx::query!(
             r#"
@@ -1059,7 +1278,7 @@ impl<'c> Users<'c> {
     }
 
     /// Clear decline backoff state after a successful charge.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn reset_auto_topup_failure_state(&mut self, user_id: UserId) -> Result<()> {
         sqlx::query!(
             r#"
@@ -1080,7 +1299,7 @@ impl<'c> Users<'c> {
 
     /// Set the payment provider ID for a user if it's not already set
     /// Returns true if the ID was updated, false if the user already had one or user not found
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn set_payment_provider_id_if_empty(&mut self, user_id: UserId, payment_provider_id: &str) -> Result<bool> {
         let rows_affected = sqlx::query!(
             "UPDATE users SET payment_provider_id = $1 WHERE id = $2 AND payment_provider_id IS NULL",
@@ -1098,7 +1317,7 @@ impl<'c> Users<'c> {
     /// real money has moved (completed checkout, successful auto-topup charge).
     /// The onwards sync uses this flag to pick between the verified and unverified
     /// rate-limit tiers.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn set_verified(&mut self, user_id: UserId) -> Result<bool> {
         let rows_affected = sqlx::query!("UPDATE users SET verified = true WHERE id = $1 AND verified = false", user_id)
             .execute(&mut *self.db)
@@ -1111,7 +1330,7 @@ impl<'c> Users<'c> {
     /// Whether a user (or organization) is verified. A single-row primary-key
     /// lookup used on the submission path to gate the unverified upload-volume
     /// cap. A missing row counts as unverified.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn is_verified(&mut self, user_id: UserId) -> Result<bool> {
         let verified = sqlx::query_scalar!("SELECT verified FROM users WHERE id = $1", user_id)
             .fetch_optional(&mut *self.db)
@@ -1133,7 +1352,20 @@ mod tests {
     use sqlx::PgPool;
     use std::str::FromStr;
 
-    #[sqlx::test]
+    async fn create_standard_user(conn: &mut PgConnection, username: &str) -> UserDBResponse {
+        Users::new(conn)
+            .create(&UserCreateDBRequest::from(UserCreate {
+                username: username.to_string(),
+                email: format!("{username}@example.com"),
+                display_name: None,
+                avatar_url: None,
+                roles: vec![Role::StandardUser],
+            }))
+            .await
+            .unwrap()
+    }
+
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_user(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
@@ -1157,7 +1389,7 @@ mod tests {
         assert_eq!(user.roles, vec![Role::StandardUser]);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_user_hard_deletes_api_keys(pool: PgPool) {
         use crate::db::models::api_keys::ApiKeyCreateDBRequest;
@@ -1183,8 +1415,6 @@ mod tests {
                 name: "doomed-key".to_string(),
                 description: None,
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -1228,7 +1458,88 @@ mod tests {
         assert!(!again);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_delete_user_soft_deletes_attributed_keys_preserving_audit_trail(pool: PgPool) {
+        use crate::db::{
+            handlers::organizations::Organizations,
+            models::{api_keys::ApiKeyCreateDBRequest, organizations::OrganizationCreateDBRequest},
+        };
+
+        let mut conn = pool.acquire().await.unwrap();
+        let deleted_user = create_standard_user(&mut conn, "deleted-key-holder").await;
+        let retained_user = create_standard_user(&mut conn, "retained-key-holder").await;
+        let key_owner = Organizations::new(&mut conn)
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "shared-key-owner".to_string(),
+                    email: "org@example.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: retained_user.id,
+                },
+                &[Role::StandardUser],
+            )
+            .await
+            .unwrap();
+
+        let (deleted_user_key, retained_user_key) = {
+            let mut keys = ApiKeys::new(&mut conn);
+            let deleted_user_key = keys
+                .create(&ApiKeyCreateDBRequest {
+                    user_id: key_owner.id,
+                    name: "deleted-user-key".to_string(),
+                    description: None,
+                    purpose: ApiKeyPurpose::Realtime,
+                    created_by: deleted_user.id,
+                    spend_limit: None,
+                    spend_limit_interval: None,
+                })
+                .await
+                .unwrap();
+            let retained_user_key = keys
+                .create(&ApiKeyCreateDBRequest {
+                    user_id: key_owner.id,
+                    name: "retained-user-key".to_string(),
+                    description: None,
+                    purpose: ApiKeyPurpose::Realtime,
+                    created_by: retained_user.id,
+                    spend_limit: None,
+                    spend_limit_interval: None,
+                })
+                .await
+                .unwrap();
+            (deleted_user_key, retained_user_key)
+        };
+
+        assert!(Users::new(&mut conn).delete(deleted_user.id).await.unwrap());
+
+        let audit_record: (UserId, UserId, bool) = sqlx::query_as("SELECT user_id, created_by, is_deleted FROM api_keys WHERE id = $1")
+            .bind(deleted_user_key.id)
+            .fetch_one(&pool)
+            .await
+            .expect("revoked keys must remain available for audit attribution");
+        assert_eq!(audit_record, (key_owner.id, deleted_user.id, true));
+        assert!(
+            ApiKeys::new(&mut conn)
+                .get_user_id_by_secret(&deleted_user_key.secret)
+                .await
+                .unwrap()
+                .is_none(),
+            "the deleted user's attributed key must no longer authenticate"
+        );
+        let retained_key_is_active: bool = sqlx::query_scalar!(
+            "SELECT EXISTS(SELECT 1 FROM api_keys WHERE id = $1 AND is_deleted = false) as \"exists!\"",
+            retained_user_key.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert!(retained_key_is_active, "keys attributed to other users must remain active");
+    }
+
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_user_by_email(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
@@ -1253,7 +1564,7 @@ mod tests {
         assert_eq!(found_user.roles, vec![Role::StandardUser]);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_system_user(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
@@ -1264,7 +1575,7 @@ mod tests {
         assert!(admin_user.is_admin);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_user_roles_always_includes_standard_user(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
@@ -1296,6 +1607,10 @@ mod tests {
             auto_topup_threshold: None,
             auto_topup_monthly_limit: None,
             zero_data_retention: None,
+            default_serving_class: None,
+            self_hosted_only: None,
+            granted_serving_classes: Default::default(),
+            toleration_preset: Default::default(),
         };
 
         let updated_user = repo.update(created_user.id, &update_request).await.unwrap();
@@ -1318,6 +1633,10 @@ mod tests {
             auto_topup_threshold: None,
             auto_topup_monthly_limit: None,
             zero_data_retention: None,
+            default_serving_class: None,
+            self_hosted_only: None,
+            granted_serving_classes: Default::default(),
+            toleration_preset: Default::default(),
         };
 
         let updated_user = repo.update(created_user.id, &update_request).await.unwrap();
@@ -1354,6 +1673,10 @@ mod tests {
                 auto_topup_threshold: None,
                 auto_topup_monthly_limit: None,
                 zero_data_retention: None,
+                default_serving_class: None,
+                self_hosted_only: None,
+                granted_serving_classes: Default::default(),
+                toleration_preset: Default::default(),
             };
             repo.update(user.id, &update).await.unwrap();
         }
@@ -1371,7 +1694,7 @@ mod tests {
         user.id
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_users_with_threshold_skips_users_without_threshold(pool: PgPool) {
         create_user_with_balance(&pool, "1.00", None).await;
@@ -1382,7 +1705,7 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_users_with_threshold_returns_user_with_checkpoint(pool: PgPool) {
         let user_id = create_user_with_balance(&pool, "1.50", Some(2.0)).await;
@@ -1397,7 +1720,7 @@ mod tests {
         assert_eq!(result[0].checkpoint_balance, Some(Decimal::from_str("1.50").unwrap()));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_users_with_threshold_returns_user_without_credits(pool: PgPool) {
         // Create user with threshold but no credits: the read model is total,
@@ -1412,7 +1735,7 @@ mod tests {
         assert_eq!(result[0].checkpoint_balance, Some(Decimal::ZERO));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_mark_and_clear_low_balance_notification(pool: PgPool) {
         let user_id = create_user_with_balance(&pool, "1.00", Some(2.0)).await;
@@ -1443,7 +1766,7 @@ mod tests {
         assert_eq!(low.len(), 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_poll_low_balance_clears_flag_after_topup(pool: PgPool) {
         let user_id = create_user_with_balance(&pool, "1.00", Some(2.0)).await;
@@ -1475,7 +1798,7 @@ mod tests {
         assert!(!user.low_balance_notification_sent);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_poll_low_balance_full_cycle(pool: PgPool) {
         // 1. Create user with $100, threshold $2
@@ -1552,7 +1875,7 @@ mod tests {
         assert_eq!(low[0].id, user_id);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_poll_low_balance_negative_balance(pool: PgPool) {
         // User with negative balance should still be returned
@@ -1580,7 +1903,7 @@ mod tests {
         assert_eq!(low[0].id, user_id);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_low_balance_threshold_resets_flag(pool: PgPool) {
         let user_id = create_user_with_balance(&pool, "1.00", Some(2.0)).await;
@@ -1603,6 +1926,10 @@ mod tests {
             auto_topup_threshold: None,
             auto_topup_monthly_limit: None,
             zero_data_retention: None,
+            default_serving_class: None,
+            self_hosted_only: None,
+            granted_serving_classes: Default::default(),
+            toleration_preset: Default::default(),
         };
         let updated = users.update(user_id, &update).await.unwrap();
         assert!(!updated.low_balance_notification_sent);
@@ -1613,7 +1940,7 @@ mod tests {
         assert!(!result[0].low_balance_notification_sent);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_users_with_auto_topup_enabled(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
 
@@ -1653,7 +1980,7 @@ mod tests {
         assert_eq!(result[0].payment_provider_id, "cus_test_456");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_set_verified_flips_flag_idempotently(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
 
@@ -1689,7 +2016,7 @@ mod tests {
         assert!(!changed_again, "second call should be a no-op since user is already verified");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_users_with_auto_topup_enabled_excludes_incomplete(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
 
@@ -1723,8 +2050,8 @@ mod tests {
         assert!(result.is_empty(), "Should not include user with missing payment_provider_id");
     }
 
-    #[sqlx::test]
-    async fn test_auto_topup_decline_first_soft_failure_pauses_for_24_hours(pool: PgPool) {
+    #[dwctl_test_macros::test]
+    async fn test_auto_topup_decline_first_soft_failure_uses_configured_delay(pool: PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         sqlx::query!(
             r#"
@@ -1742,7 +2069,11 @@ mod tests {
 
         let started_at = Utc::now();
         let mut conn = pool.acquire().await.unwrap();
-        let applied = Users::new(&mut conn).apply_auto_topup_soft_decline(user.id, 0).await.unwrap();
+        let retry_delay = Duration::from_secs(90);
+        let applied = Users::new(&mut conn)
+            .apply_auto_topup_soft_decline(user.id, 0, retry_delay)
+            .await
+            .unwrap();
 
         assert!(applied);
         let row = sqlx::query!(
@@ -1762,14 +2093,55 @@ mod tests {
         assert_eq!(row.auto_topup_threshold, Some(10.0));
         assert_eq!(row.auto_topup_soft_failure_count, 1);
         let retry_after = row.auto_topup_retry_after.unwrap();
-        assert!(retry_after >= started_at + chrono::Duration::hours(23) + chrono::Duration::minutes(59));
-        assert!(retry_after <= Utc::now() + chrono::Duration::hours(24) + chrono::Duration::minutes(1));
+        assert!(retry_after >= started_at + chrono::Duration::seconds(89));
+        assert!(retry_after <= Utc::now() + chrono::Duration::seconds(91));
 
         let candidates = Users::new(&mut conn).users_with_auto_topup_enabled().await.unwrap();
         assert!(candidates.iter().all(|candidate| candidate.id != user.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
+    async fn test_auto_topup_provider_failure_uses_configured_delay(pool: PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        sqlx::query!(
+            r#"
+            UPDATE users
+            SET auto_topup_amount = 25.0,
+                auto_topup_threshold = 10.0,
+                payment_provider_id = 'cus_provider_failure'
+            WHERE id = $1
+            "#,
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let started_at = Utc::now();
+        let mut conn = pool.acquire().await.unwrap();
+        let applied = Users::new(&mut conn)
+            .pause_auto_topup_after_provider_failure(user.id, Duration::from_secs(45))
+            .await
+            .unwrap();
+
+        assert!(applied);
+        let retry_after = sqlx::query_scalar!("SELECT auto_topup_retry_after FROM users WHERE id = $1", user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(retry_after >= started_at + chrono::Duration::seconds(44));
+        assert!(retry_after <= Utc::now() + chrono::Duration::seconds(46));
+        assert!(
+            !Users::new(&mut conn)
+                .pause_auto_topup_after_provider_failure(user.id, Duration::from_secs(45))
+                .await
+                .unwrap(),
+            "a duplicate provider failure must not extend the active pause"
+        );
+    }
+
+    #[dwctl_test_macros::test]
     async fn test_auto_topup_decline_second_soft_failure_disables_with_compare_and_set(pool: PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         sqlx::query!(
@@ -1790,9 +2162,17 @@ mod tests {
         .unwrap();
 
         let mut conn = pool.acquire().await.unwrap();
-        assert!(Users::new(&mut conn).apply_auto_topup_soft_decline(user.id, 1).await.unwrap());
         assert!(
-            !Users::new(&mut conn).apply_auto_topup_soft_decline(user.id, 1).await.unwrap(),
+            Users::new(&mut conn)
+                .apply_auto_topup_soft_decline(user.id, 1, Duration::from_secs(60))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !Users::new(&mut conn)
+                .apply_auto_topup_soft_decline(user.id, 1, Duration::from_secs(60))
+                .await
+                .unwrap(),
             "a stale duplicate transition must not apply twice"
         );
 
@@ -1817,7 +2197,7 @@ mod tests {
         assert_eq!(row.auto_topup_retry_after, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_auto_topup_decline_hard_failure_disables_immediately(pool: PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         sqlx::query!(
@@ -1851,7 +2231,7 @@ mod tests {
         assert_eq!(row.auto_topup_monthly_limit, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_auto_topup_decline_reset_clears_failure_state(pool: PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         sqlx::query!(
@@ -1881,7 +2261,7 @@ mod tests {
         assert_eq!(row.auto_topup_retry_after, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_users_excludes_organizations(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
@@ -1919,7 +2299,7 @@ mod tests {
         assert!(!users.iter().any(|u| u.username == "acme-org"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_count_users_excludes_organizations(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();

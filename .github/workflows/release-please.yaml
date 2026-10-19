@@ -43,7 +43,7 @@ jobs:
           ref: ${{ matrix.pr.headBranchName }}
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
 
       - name: Synchronize release dependencies and lockfile
         run: |

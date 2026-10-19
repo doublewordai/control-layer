@@ -1,0 +1,83 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH selectors AS (\n                SELECT DISTINCT deployed_model_id, api_key_purpose, completion_window\n                FROM model_tariffs\n                WHERE deployed_model_id = ANY($1) AND (user_id IS NULL OR user_id = $2)\n                  AND serving_class IS NULL\n                  AND valid_from <= NOW() AND (valid_until IS NULL OR valid_until > NOW())\n                  AND api_key_purpose IN ('realtime','batch','playground')\n            )\n            SELECT DISTINCT t.id as \"id!\", t.deployed_model_id as \"deployed_model_id!\", t.name as \"name!\",\n                   t.input_price_per_token as \"input_price_per_token!\", t.output_price_per_token as \"output_price_per_token!\",\n                   t.valid_from as \"valid_from!\", t.valid_until, t.api_key_purpose as \"api_key_purpose: _\",\n                   t.completion_window, t.user_id, t.serving_class\n            FROM selectors s\n            CROSS JOIN LATERAL effective_model_display_tariff(s.deployed_model_id, $2,\n                s.api_key_purpose, s.completion_window, NOW()) t\n            ORDER BY \"deployed_model_id!\", \"api_key_purpose: _\", t.completion_window",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "deployed_model_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "name!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "input_price_per_token!",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 4,
+        "name": "output_price_per_token!",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 5,
+        "name": "valid_from!",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "valid_until",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "api_key_purpose: _",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 8,
+        "name": "completion_window",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 9,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 10,
+        "name": "serving_class",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "6ff696d44edaeb3c4acf3d154870ee1156d2a07e6d482151a513603c903d1507"
+}

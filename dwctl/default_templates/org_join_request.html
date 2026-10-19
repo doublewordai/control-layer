@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family: system-ui, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; color: #333;">
+    <h2>{{ requester_name }} has asked to join {{ org_name }}</h2>
+    <p>Hello,</p>
+    <p><strong>{{ requester_name }}</strong> ({{ requester_email }}) signed up with an email address at your workspace's domain and has asked to join <strong>{{ org_name }}</strong>. They cannot see anything in the workspace until an owner or admin approves them.</p>
+    <p style="margin: 30px 0;">
+        <a href="{{ requests_link }}" style="background-color: #333; color: #fff; padding: 12px 24px; text-decoration: none; border-radius: 4px;">Review request</a>
+    </p>
+    <p style="font-size: 13px; color: #666; word-break: break-all;">{{ requests_link }}</p>
+    <p style="font-size: 13px; color: #888;">You are receiving this because you are an owner or admin of {{ org_name }}. Requests do not expire; if you take no action, they simply stay pending.</p>
+</body>
+</html>

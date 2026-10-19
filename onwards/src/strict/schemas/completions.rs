@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use super::chat_completions::{StopSequence, Usage};
+use super::chat_completions::{StopSequence, StreamOptions, Usage};
 use super::utils::ensure_field;
 
 pub(crate) fn generated_completion_id() -> String {
@@ -183,6 +183,34 @@ pub struct CompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<i64>,
 
+    // ── Mid-stream continuation knobs ─────────────────────────────────────
+    // The resume path replays an exact token-id prefix and needs generation
+    // control the base OpenAI schema lacks. Supported by the token-id-capable
+    // engines we resume on (dynamo/sglang-family, Fireworks, Novita); the
+    // strict router previously DROPPED these on re-serialization, silently
+    // breaking resume semantics.
+    /// Continue past the model's EOS token (resume must not stop where the
+    /// failed leg's sampling would have).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ignore_eos: Option<bool>,
+
+    /// Minimum tokens to generate before stop conditions apply.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_tokens: Option<u32>,
+
+    /// Stop on exact token ids (token-space equivalent of `stop`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_token_ids: Option<Vec<u32>>,
+
+    /// Keep special tokens in the output text (resume splicing needs the raw
+    /// emission, not a cleaned rendering).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_special_tokens: Option<bool>,
+
+    /// Include the matched stop string in the returned text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_stop_str_in_output: Option<bool>,
+
     /// Captured only to return a useful compatibility error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<serde_json::Value>,
@@ -198,6 +226,23 @@ pub struct CompletionRequest {
     /// Captured only to return a useful compatibility error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_token_budget: Option<serde_json::Value>,
+
+    /// Ask the engine for a terminal usage frame on a streamed response. Passes
+    /// through for every caller — a stream that does not report its own usage
+    /// cannot be billed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
+
+    /// Scheduling priority. **Privileged**: the dynamo scheduler orders its
+    /// queue by this field. Modelled here so validation ACCEPTS it (this
+    /// schema is strict; an unmodelled field would fail requests that
+    /// legitimately carry it). Enforcement is not this layer's job: onwards
+    /// forwards the original bytes, and dwctl's inference middleware strips
+    /// `priority` from every external request — fusillade daemon requests
+    /// bypass that middleware (keeping batch's deadline priority) and
+    /// continuation resume legs enter the stack below it (keeping theirs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i64>,
 
     /// Captured only to return a useful compatibility error.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -328,5 +373,59 @@ mod tests {
         assert_eq!(req.echo, Some(true));
         assert_eq!(req.best_of, Some(3));
         assert_eq!(req.seed, Some(42));
+    }
+}
+
+#[cfg(test)]
+mod continuation_knob_tests {
+    use super::*;
+
+    /// The resume path depends on these fields surviving the strict router's
+    /// parse -> re-serialize cycle; they were previously silently dropped.
+    #[test]
+    fn continuation_knobs_round_trip() {
+        let body = serde_json::json!({
+            "model": "m",
+            "prompt": [1, 2, 3],
+            "max_tokens": 50,
+            "ignore_eos": true,
+            "min_tokens": 5,
+            "stop_token_ids": [7, 9],
+            "skip_special_tokens": false,
+            "include_stop_str_in_output": true,
+        });
+        let req: CompletionRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(req.ignore_eos, Some(true));
+        assert_eq!(req.min_tokens, Some(5));
+        assert_eq!(req.stop_token_ids, Some(vec![7, 9]));
+        assert_eq!(req.skip_special_tokens, Some(false));
+        assert_eq!(req.include_stop_str_in_output, Some(true));
+
+        let out = serde_json::to_value(&req).unwrap();
+        assert_eq!(out["ignore_eos"], true);
+        assert_eq!(out["min_tokens"], 5);
+        assert_eq!(out["stop_token_ids"], serde_json::json!([7, 9]));
+        assert_eq!(out["skip_special_tokens"], false);
+        assert_eq!(out["include_stop_str_in_output"], true);
+        // Token-id prompt form intact.
+        assert!(matches!(req.prompt, Some(CompletionPrompt::Tokens(_))));
+    }
+
+    /// Absent knobs must not appear in the forwarded body (engines treat
+    /// presence as intent).
+    #[test]
+    fn continuation_knobs_absent_by_default() {
+        let req: CompletionRequest =
+            serde_json::from_value(serde_json::json!({"model": "m", "prompt": "x"})).unwrap();
+        let out = serde_json::to_value(&req).unwrap();
+        for k in [
+            "ignore_eos",
+            "min_tokens",
+            "stop_token_ids",
+            "skip_special_tokens",
+            "include_stop_str_in_output",
+        ] {
+            assert!(out.get(k).is_none(), "{k} should be omitted when unset");
+        }
     }
 }

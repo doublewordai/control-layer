@@ -107,16 +107,17 @@ DELETE http://localhost:3001/admin/api/v1/groups/{{test_group_id}}
 dwctl_session: {{admin_jwt}}
 HTTP 204
 
-# Restore user to original default roles (StandardUser + BatchAPIUser)
+# Restore user to the configured default roles
 # This ensures subsequent tests that use user_jwt have the expected permissions
 PATCH http://localhost:3001/admin/api/v1/users/{{test_user_id}}
 [Cookies]
 dwctl_session: {{admin_jwt}}
 {
-  "roles": ["StandardUser", "BatchAPIUser"]
+  "roles": ["StandardUser", "BatchAPIUser", "BackgroundInferenceUser"]
 }
 HTTP 200
 [Asserts]
 jsonpath "$.roles" contains "StandardUser"
 jsonpath "$.roles" contains "BatchAPIUser"
-jsonpath "$.roles" count == 2
+jsonpath "$.roles" contains "BackgroundInferenceUser"
+jsonpath "$.roles" count == 3

@@ -6,7 +6,7 @@ import {
   Copy,
   Loader2,
   Check,
-  ChevronDown,
+  Eye,
   Info,
   RefreshCw,
 } from "lucide-react";
@@ -28,6 +28,7 @@ import {
 } from "./spendCap";
 import {
   useUser,
+  useRevealApiKey,
   useRotateApiKey,
   useOrganizationMembers,
 } from "../../../../api/control-layer/hooks";
@@ -52,16 +53,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "../../../ui/select";
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from "../../../ui/collapsible";
-import {
-  HoverCard,
-  HoverCardContent,
-  HoverCardTrigger,
-} from "../../../ui/hover-card";
 import { Tabs, TabsList, TabsTrigger } from "../../../ui/tabs";
 import { useServerPagination } from "@/hooks/useServerPagination";
 import { useOrganizationContext } from "@/contexts";
@@ -84,10 +75,6 @@ export const ApiKeys: React.FC = () => {
   const [newKeyDescription, setNewKeyDescription] = useState("");
   const [newKeyPurpose, setNewKeyPurpose] = useState<ApiKeyPurpose>("realtime");
   const [newKeyAssignee, setNewKeyAssignee] = useState<string>("self");
-  const [newKeyRequestsPerSecond, setNewKeyRequestsPerSecond] = useState<
-    number | ""
-  >("");
-  const [newKeyBurstSize, setNewKeyBurstSize] = useState<number | "">("");
   const [newKeyCapAmount, setNewKeyCapAmount] = useState("");
   const [newKeyCapInterval, setNewKeyCapInterval] = useState<
     SpendLimitInterval | "none"
@@ -106,17 +93,26 @@ export const ApiKeys: React.FC = () => {
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [selectedKeys, setSelectedKeys] = useState<any[]>([]);
   const [showBulkDeleteModal, setShowBulkDeleteModal] = useState(false);
-  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [showBulkRotateModal, setShowBulkRotateModal] = useState(false);
+  const [bulkRotating, setBulkRotating] = useState(false);
+  // One-time display of the replacement secrets from a bulk rotation.
+  const [bulkRotatedKeys, setBulkRotatedKeys] = useState<
+    { id: string; name: string; key: string }[] | null
+  >(null);
   const [rotateModal, setRotateModal] = useState<ApiKey | null>(null);
+  const [revealModal, setRevealModal] = useState<ApiKey | null>(null);
+  // One-time secret display, shared by rotation and the one-off reveal —
+  // `mode` only varies the dialog copy.
   const [rotatedKey, setRotatedKey] = useState<{
     name: string;
     key: string;
+    mode: "rotate" | "reveal";
   } | null>(null);
   // Manager-only view scoping (org context): tab + per-member filter,
   // applied client-side since the API already returns all org keys to
   // managers.
-  const [keyScope, setKeyScope] = useState<"all" | "mine">("all");
-  const [memberFilter, setMemberFilter] = useState<string>("all");
+  const [keyScope, setKeyScopeState] = useState<"all" | "mine">("all");
+  const [memberFilter, setMemberFilterState] = useState<string>("all");
 
   // Check if user is a platform manager
   const isPlatformManager = user?.roles?.includes("PlatformManager") || false;
@@ -132,12 +128,23 @@ export const ApiKeys: React.FC = () => {
   const showScopingControls =
     isOrgContext && (isOrgManager || isPlatformManager);
   const pagination = useServerPagination();
+  // Scoping is applied SERVER-side (?created_by): pagination and total_count
+  // then cover the filtered set, so "all of member X's keys" really is all
+  // of them — nothing hiding on other pages during an admin cleanup.
+  const createdByFilter = showScopingControls
+    ? keyScope === "mine"
+      ? user?.id
+      : memberFilter !== "all"
+        ? memberFilter
+        : undefined
+    : undefined;
   const {
     data: apiKeysData,
     isLoading,
     error,
   } = useApiKeys(targetUserId, {
     ...pagination.queryParams,
+    created_by: createdByFilter,
   });
 
   const apiKeys = apiKeysData?.data || [];
@@ -155,17 +162,23 @@ export const ApiKeys: React.FC = () => {
     return `${createdBy.slice(0, 8)}…`;
   };
 
-  const displayedKeys = showScopingControls
-    ? apiKeys.filter((key) => {
-        if (keyScope === "mine") return key.created_by === user?.id;
-        return memberFilter === "all" || key.created_by === memberFilter;
-      })
-    : apiKeys;
 
   const createApiKeyMutation = useCreateApiKey();
   const deleteApiKeyMutation = useDeleteApiKey();
   const updateApiKeyMutation = useUpdateApiKey();
   const rotateApiKeyMutation = useRotateApiKey();
+  const revealApiKeyMutation = useRevealApiKey();
+
+  // Changing scope re-slices the server-side list — snap back to page 1 so
+  // the new filter isn't viewed from a stale offset.
+  const setKeyScope = (scope: "all" | "mine") => {
+    setKeyScopeState(scope);
+    pagination.handleReset();
+  };
+  const setMemberFilter = (member: string) => {
+    setMemberFilterState(member);
+    pagination.handleReset();
+  };
 
   const resetCreateForm = () => {
     setShowCreateForm(false);
@@ -173,12 +186,9 @@ export const ApiKeys: React.FC = () => {
     setNewKeyDescription("");
     setNewKeyPurpose("realtime");
     setNewKeyAssignee("self");
-    setNewKeyRequestsPerSecond("");
-    setNewKeyBurstSize("");
     setNewKeyCapAmount("");
     setNewKeyCapInterval("none");
     setNewKeyResponse(null);
-    setAdvancedOpen(false);
   };
 
   const handleCreateApiKey = async (e: React.FormEvent) => {
@@ -202,11 +212,6 @@ export const ApiKeys: React.FC = () => {
         description: newKeyDescription.trim() || undefined,
         purpose: newKeyPurpose,
         member_id: assignedMemberId,
-        requests_per_second:
-          newKeyRequestsPerSecond === ""
-            ? null
-            : Number(newKeyRequestsPerSecond),
-        burst_size: newKeyBurstSize === "" ? null : Number(newKeyBurstSize),
         spend_limit: newKeyCapAmount.trim() === "" ? null : newKeyCapAmount.trim(),
         spend_limit_interval:
           newKeyCapAmount.trim() === "" || newKeyCapInterval === "none"
@@ -301,6 +306,31 @@ export const ApiKeys: React.FC = () => {
     }
   };
 
+  const handleBulkRotate = async () => {
+    setBulkRotating(true);
+    const rotated: { id: string; name: string; key: string }[] = [];
+    const failed: string[] = [];
+    for (const key of selectedKeys) {
+      try {
+        const { key: secret } = await rotateApiKeyMutation.mutateAsync({
+          keyId: key.id,
+          userId: targetUserId,
+        });
+        rotated.push({ id: key.id, name: key.name, key: secret });
+      } catch (e) {
+        console.error("Failed to rotate API key:", e);
+        failed.push(key.name);
+      }
+    }
+    setBulkRotating(false);
+    setShowBulkRotateModal(false);
+    setSelectedKeys([]);
+    if (failed.length > 0) {
+      toast.error(`Rotated ${rotated.length}, failed for: ${failed.join(", ")}`);
+    }
+    if (rotated.length > 0) setBulkRotatedKeys(rotated);
+  };
+
   const copyToClipboard = async (text: string) => {
     try {
       await navigator.clipboard.writeText(text);
@@ -325,11 +355,26 @@ export const ApiKeys: React.FC = () => {
         userId: targetUserId,
       });
       // One-time secret display, same pattern as creation.
-      setRotatedKey({ name: rotateModal.name, key });
+      setRotatedKey({ name: rotateModal.name, key, mode: "rotate" });
       setRotateModal(null);
     } catch (e) {
       console.error("Failed to rotate API key:", e);
       toast.error((e as Error)?.message ?? "Failed to rotate API key");
+    }
+  };
+
+  const handleRevealKey = async () => {
+    if (!revealModal) return;
+    try {
+      const { key } = await revealApiKeyMutation.mutateAsync({
+        keyId: revealModal.id,
+        userId: targetUserId,
+      });
+      setRotatedKey({ name: revealModal.name, key, mode: "reveal" });
+      setRevealModal(null);
+    } catch (e) {
+      console.error("Failed to reveal API key:", e);
+      toast.error((e as Error)?.message ?? "Failed to reveal API key");
     }
   };
 
@@ -348,12 +393,22 @@ export const ApiKeys: React.FC = () => {
     canManageKey(apiKey) ||
     (!!apiKey.created_by && apiKey.created_by === user?.id);
 
+  // The one-off reveal is HOLDER-only (matching the server): an issued key
+  // the holder hasn't opened yet. Until they do, Reveal replaces Rotate for
+  // them; issuers/admins always see plain Rotate.
+  const canRevealKey = (apiKey: ApiKey) =>
+    !!apiKey.created_by &&
+    apiKey.created_by === user?.id &&
+    apiKey.secret_revealed_at == null;
+
   const columns = createColumns({
     onDelete: handleDeleteFromTable,
     onEdit: openEditModal,
     onRotate: setRotateModal,
+    onReveal: setRevealModal,
     canManage: canManageKey,
     canRotate: canRotateKey,
+    canReveal: canRevealKey,
     isPlatformManager,
     // Assignee is a manager's concept: members' views are isolated to their
     // own keys, so the column would only ever echo their own name.
@@ -441,7 +496,10 @@ export const ApiKeys: React.FC = () => {
         </div>
       )}
 
-      {showScopingControls && apiKeys.length > 0 && (
+      {/* Keep the scoping controls mounted whenever a filter is active —
+          a member with zero keys must leave the admin a way to back out,
+          not dump them on the unscoped empty state. */}
+      {showScopingControls && (apiKeys.length > 0 || createdByFilter != null) && (
         <div className="mb-4 flex flex-wrap items-center gap-3">
           <Tabs
             value={keyScope}
@@ -461,7 +519,9 @@ export const ApiKeys: React.FC = () => {
                 <SelectItem value="all">All members</SelectItem>
                 {orgMembers.map((member) => (
                   <SelectItem key={member.user!.id} value={member.user!.id}>
-                    {memberLabel(member.user!)}
+                    {/* Emails, not display names/usernames — matching the
+                        assign dropdown; nobody remembers usernames. */}
+                    {member.user!.email}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -470,10 +530,32 @@ export const ApiKeys: React.FC = () => {
         </div>
       )}
 
-      {apiKeys.length > 0 ? (
+      {apiKeys.length === 0 && createdByFilter != null ? (
+        <div
+          className="text-center py-12"
+          role="status"
+          aria-label="No keys for this filter"
+        >
+          <div className="p-4 bg-doubleword-neutral-100 rounded-full w-16 h-16 mx-auto mb-4 flex items-center justify-center">
+            <Key className="w-8 h-8 text-doubleword-neutral-600" />
+          </div>
+          <h3
+            className="text-lg font-medium text-doubleword-neutral-900 mb-2"
+            role="heading"
+            aria-level={3}
+          >
+            No keys match this filter
+          </h3>
+          <p className="text-doubleword-neutral-600">
+            {keyScope === "mine"
+              ? "You don't hold any keys in this organization yet."
+              : "The selected member holds no API keys in this organization. Try another member or switch back to all members."}
+          </p>
+        </div>
+      ) : apiKeys.length > 0 ? (
         <DataTable
           columns={columns}
-          data={displayedKeys}
+          data={apiKeys}
           searchPlaceholder="Search API keys..."
           searchColumn="name"
           onSelectionChange={setSelectedKeys}
@@ -486,6 +568,14 @@ export const ApiKeys: React.FC = () => {
                 </span>
               </div>
               <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setShowBulkRotateModal(true)}
+                  className="flex items-center gap-1 px-3 py-1.5 bg-white border border-blue-300 text-blue-900 text-sm rounded-md hover:bg-blue-100 transition-colors"
+                  aria-label={`Rotate ${selectedKeys.length} selected API key${selectedKeys.length !== 1 ? "s" : ""}`}
+                >
+                  <RefreshCw className="w-4 h-4" />
+                  Rotate Selected
+                </button>
                 <button
                   onClick={() => setShowBulkDeleteModal(true)}
                   className="flex items-center gap-1 px-3 py-1.5 bg-red-600 text-white text-sm rounded-md hover:bg-red-700 transition-colors"
@@ -688,9 +778,9 @@ export const ApiKeys: React.FC = () => {
                       </SelectContent>
                     </Select>
                     <p className="text-xs text-doubleword-neutral-500">
-                      The key appears in the assigned member's view, and they
-                      can rotate it from their API Keys page to get a secret
-                      of their own.
+                      The key appears in the assigned member's view. You'll
+                      still see the secret once on creation, and the member
+                      can separately reveal it once from their API Keys page.
                     </p>
                   </div>
                 )}
@@ -795,121 +885,6 @@ export const ApiKeys: React.FC = () => {
                   </p>
                 </div>
 
-                {/* Advanced Settings (Rate Limiting, PM-only) - Collapsible */}
-                {isPlatformManager && (
-                  <Collapsible
-                    open={advancedOpen}
-                    onOpenChange={setAdvancedOpen}
-                  >
-                    <CollapsibleTrigger asChild>
-                      <button
-                        type="button"
-                        className="flex items-center gap-2 w-full text-sm font-medium text-gray-700 hover:text-gray-900 transition-colors group"
-                      >
-                        <ChevronDown
-                          className={`h-4 w-4 text-gray-400 transition-transform duration-200 ${
-                            advancedOpen ? "transform rotate-180" : ""
-                          }`}
-                        />
-                        <span>Advanced Settings</span>
-                        <div className="flex-1 h-px bg-gray-200 group-hover:bg-gray-300 transition-colors" />
-                      </button>
-                    </CollapsibleTrigger>
-                    <CollapsibleContent className="space-y-3 pt-4">
-                      {/* Rate Limiting */}
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                        <div className="space-y-2">
-                          <div className="flex items-center gap-1">
-                            <Label htmlFor="requestsPerSecond">
-                              Requests/Second
-                            </Label>
-                            <HoverCard openDelay={200} closeDelay={100}>
-                              <HoverCardTrigger asChild>
-                                <button
-                                  type="button"
-                                  className="text-gray-400 hover:text-gray-600 transition-colors"
-                                  onFocus={(e) => e.preventDefault()}
-                                  tabIndex={-1}
-                                >
-                                  <Info className="h-4 w-4" />
-                                  <span className="sr-only">
-                                    Requests per second information
-                                  </span>
-                                </button>
-                              </HoverCardTrigger>
-                              <HoverCardContent className="w-80" sideOffset={5}>
-                                <p className="text-sm text-muted-foreground">
-                                  Maximum number of requests allowed per second
-                                  for this API key. Leave blank for no limit.
-                                </p>
-                              </HoverCardContent>
-                            </HoverCard>
-                          </div>
-                          <Input
-                            id="requestsPerSecond"
-                            type="number"
-                            min="1"
-                            max="10000"
-                            step="1"
-                            value={newKeyRequestsPerSecond}
-                            onChange={(e) =>
-                              setNewKeyRequestsPerSecond(
-                                e.target.value === ""
-                                  ? ""
-                                  : Number(e.target.value),
-                              )
-                            }
-                            placeholder="None"
-                          />
-                        </div>
-
-                        <div className="space-y-2">
-                          <div className="flex items-center gap-1">
-                            <Label htmlFor="burstSize">Burst Size</Label>
-                            <HoverCard openDelay={200} closeDelay={100}>
-                              <HoverCardTrigger asChild>
-                                <button
-                                  type="button"
-                                  className="text-gray-400 hover:text-gray-600 transition-colors"
-                                  onFocus={(e) => e.preventDefault()}
-                                  tabIndex={-1}
-                                >
-                                  <Info className="h-4 w-4" />
-                                  <span className="sr-only">
-                                    Burst size information
-                                  </span>
-                                </button>
-                              </HoverCardTrigger>
-                              <HoverCardContent className="w-80" sideOffset={5}>
-                                <p className="text-sm text-muted-foreground">
-                                  Maximum burst capacity for rate limiting. This
-                                  allows temporary spikes above the per-second
-                                  rate. Leave blank for no limit.
-                                </p>
-                              </HoverCardContent>
-                            </HoverCard>
-                          </div>
-                          <Input
-                            id="burstSize"
-                            type="number"
-                            min="1"
-                            max="50000"
-                            step="1"
-                            value={newKeyBurstSize}
-                            onChange={(e) =>
-                              setNewKeyBurstSize(
-                                e.target.value === ""
-                                  ? ""
-                                  : Number(e.target.value),
-                              )
-                            }
-                            placeholder="None"
-                          />
-                        </div>
-                      </div>
-                    </CollapsibleContent>
-                  </Collapsible>
-                )}
               </form>
 
               <DialogFooter>
@@ -1102,6 +1077,66 @@ export const ApiKeys: React.FC = () => {
       </Dialog>
 
 
+      {/* Reveal Confirmation Modal — the reveal is one-off, so make the
+          user own the click before consuming it */}
+      <Dialog
+        open={!!revealModal}
+        onOpenChange={(open) => {
+          if (!open) setRevealModal(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 bg-doubleword-neutral-100 rounded-full flex items-center justify-center">
+                <Eye className="w-5 h-5 text-doubleword-neutral-700" />
+              </div>
+              <div>
+                <DialogTitle>Reveal API Key</DialogTitle>
+                <DialogDescription>
+                  View the secret for <strong>{revealModal?.name}</strong>
+                </DialogDescription>
+              </div>
+            </div>
+          </DialogHeader>
+
+          <div className="space-y-4 py-2">
+            <p className="text-sm text-gray-700">
+              This key was issued to you by an organization admin. You can
+              view its secret exactly once — after that, rotating the key is
+              the only way to get a fresh secret.
+            </p>
+            <div className="p-3 bg-yellow-50 border border-yellow-200 rounded-lg">
+              <p className="text-sm text-yellow-800">
+                <strong>Note:</strong> have somewhere safe ready to store the
+                secret before revealing it. It won't be shown again.
+              </p>
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setRevealModal(null)}
+              disabled={revealApiKeyMutation.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              onClick={handleRevealKey}
+              disabled={revealApiKeyMutation.isPending}
+            >
+              {revealApiKeyMutation.isPending && (
+                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+              )}
+              Reveal Key
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* Rotate Confirmation Modal */}
       <Dialog
         open={!!rotateModal}
@@ -1172,10 +1207,23 @@ export const ApiKeys: React.FC = () => {
       >
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>API Key Rotated</DialogTitle>
+            <DialogTitle>
+              {rotatedKey?.mode === "reveal"
+                ? "API Key Revealed"
+                : "API Key Rotated"}
+            </DialogTitle>
             <DialogDescription>
-              <strong>{rotatedKey?.name}</strong> has a new secret. The old
-              secret no longer works for new requests.
+              {rotatedKey?.mode === "reveal" ? (
+                <>
+                  This is the secret for <strong>{rotatedKey?.name}</strong>.
+                  It won't be shown again.
+                </>
+              ) : (
+                <>
+                  <strong>{rotatedKey?.name}</strong> has a new secret. The
+                  old secret no longer works for new requests.
+                </>
+              )}
             </DialogDescription>
           </DialogHeader>
 
@@ -1193,7 +1241,9 @@ export const ApiKeys: React.FC = () => {
             </div>
 
             <div className="space-y-2">
-              <Label>New API Key</Label>
+              <Label>
+                {rotatedKey?.mode === "reveal" ? "API Key" : "New API Key"}
+              </Label>
               <div className="flex items-center gap-2">
                 <div className="flex-1 overflow-hidden rounded border bg-gray-50">
                   <code className="block text-xs font-mono px-3 py-2 overflow-x-auto whitespace-nowrap">
@@ -1310,6 +1360,161 @@ export const ApiKeys: React.FC = () => {
                   {selectedKeys.length !== 1 ? "s" : ""}
                 </>
               )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Bulk Rotate Confirmation Modal */}
+      <Dialog open={showBulkRotateModal} onOpenChange={setShowBulkRotateModal}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 bg-doubleword-neutral-100 rounded-full flex items-center justify-center">
+                <RefreshCw className="w-5 h-5 text-doubleword-neutral-700" />
+              </div>
+              <div>
+                <DialogTitle>Rotate API Keys</DialogTitle>
+                <DialogDescription>
+                  Generate new secrets for {selectedKeys.length} key
+                  {selectedKeys.length !== 1 ? "s" : ""}
+                </DialogDescription>
+              </div>
+            </div>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            <p className="text-sm text-gray-700">
+              Each key's current secret stops working immediately and a new
+              one is generated. Usage limits and usage history are
+              unaffected. The new secrets are shown once afterwards.
+            </p>
+            <div className="bg-gray-50 rounded-lg p-3 max-h-32 overflow-y-auto">
+              <p className="text-sm font-medium text-gray-600 mb-2">
+                Keys to be rotated:
+              </p>
+              <ul className="text-sm text-gray-700 space-y-1">
+                {selectedKeys.map((key) => (
+                  <li key={key.id}>{key.name}</li>
+                ))}
+              </ul>
+            </div>
+            <div className="p-3 bg-yellow-50 border border-yellow-200 rounded-lg">
+              <p className="text-sm text-yellow-800">
+                <strong>Note:</strong> batches already submitted with these
+                keys will keep running. If a key was compromised, cancel any
+                in-flight batches separately.
+              </p>
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setShowBulkRotateModal(false)}
+              disabled={bulkRotating}
+            >
+              Cancel
+            </Button>
+            <Button type="button" onClick={handleBulkRotate} disabled={bulkRotating}>
+              {bulkRotating ? (
+                <>
+                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                  Rotating...
+                </>
+              ) : (
+                <>
+                  <RefreshCw className="w-4 h-4 mr-2" />
+                  Rotate {selectedKeys.length} Key
+                  {selectedKeys.length !== 1 ? "s" : ""}
+                </>
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Bulk Rotated Secrets Modal — one-time display, same pattern as
+          single rotation but listing every replacement secret */}
+      <Dialog
+        open={!!bulkRotatedKeys}
+        onOpenChange={(open) => {
+          if (!open) setBulkRotatedKeys(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>API Keys Rotated</DialogTitle>
+            <DialogDescription>
+              {bulkRotatedKeys?.length} key
+              {bulkRotatedKeys?.length !== 1 ? "s" : ""} rotated. The old
+              secrets no longer work for new requests.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            <div
+              className="p-3 bg-green-50 border border-green-200 rounded-lg"
+              role="alert"
+            >
+              <div className="flex items-center gap-2">
+                <Key className="w-4 h-4 text-green-600" />
+                <p className="text-sm text-green-800 font-medium">
+                  Save these keys now - they won't be shown again
+                </p>
+              </div>
+            </div>
+
+            <div className="space-y-3 max-h-64 overflow-y-auto">
+              {(bulkRotatedKeys ?? []).map((entry) => (
+                <div key={entry.id} className="space-y-1">
+                  <Label>{entry.name}</Label>
+                  <div className="flex items-center gap-2">
+                    <div className="flex-1 overflow-hidden rounded border bg-gray-50">
+                      <code className="block text-xs font-mono px-3 py-2 overflow-x-auto whitespace-nowrap">
+                        {entry.key}
+                      </code>
+                    </div>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon"
+                      onClick={() => copyToClipboard(entry.key)}
+                      aria-label={
+                        copiedKey === entry.key
+                          ? `Copied secret for ${entry.name}`
+                          : `Copy secret for ${entry.name}`
+                      }
+                    >
+                      {copiedKey === entry.key ? (
+                        <Check className="w-4 h-4" />
+                      ) : (
+                        <Copy className="w-4 h-4" />
+                      )}
+                    </Button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() =>
+                copyToClipboard(
+                  (bulkRotatedKeys ?? [])
+                    .map((entry) => `${entry.name}: ${entry.key}`)
+                    .join("\n"),
+                )
+              }
+            >
+              Copy all
+            </Button>
+            <Button type="button" onClick={() => setBulkRotatedKeys(null)}>
+              I've saved them
             </Button>
           </DialogFooter>
         </DialogContent>

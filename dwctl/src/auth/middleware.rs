@@ -37,15 +37,11 @@ pub(crate) async fn admin_ai_proxy<P: sqlx_pool_router::PoolProvider + Clone>(
     // Reconstruct request for further processing
     request = Request::from_parts(parts, body);
 
-    // Extract the request body to parse the model
-    let body_bytes = match axum::body::to_bytes(std::mem::take(request.body_mut()), usize::MAX).await {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            return Err(Error::BadRequest {
-                message: "Failed to read request body".to_string(),
-            });
-        }
-    };
+    // This parser runs before URI rewriting reaches the inference router, so
+    // it must enforce the same limit before buffering or extracting the model.
+    let max_bytes = state.limiters.inference_body_size;
+    let body = std::mem::take(request.body_mut());
+    let body_bytes = crate::inference::body_limit::read_inference_body(request.headers(), body, max_bytes).await?;
 
     // Extract the model name from the request using the shared function
     let model_name = onwards::extract_model_from_request(request.headers(), &body_bytes).ok_or(Error::BadRequest {
@@ -97,7 +93,6 @@ pub(crate) async fn admin_ai_proxy<P: sqlx_pool_router::PoolProvider + Clone>(
     *request.body_mut() = Body::from(body_bytes);
 
     trace!("Rewritten request URI: {}", request.uri());
-    trace!("Request headers: {:?}", request.headers());
     // Continue with the modified request
     Ok(request)
 }
@@ -109,7 +104,12 @@ pub async fn admin_ai_proxy_middleware<P: sqlx_pool_router::PoolProvider + Clone
     request: Request,
     next: Next,
 ) -> Result<Response, Error> {
-    let request = admin_ai_proxy(state, request).await?;
+    let path = request.uri().path().to_owned();
+    let request = match admin_ai_proxy(state, request).await {
+        Ok(request) => request,
+        Err(Error::PayloadTooLarge { message }) => return Ok(crate::inference::body_limit::oversized_body(message, &path)),
+        Err(error) => return Err(error),
+    };
     Ok(next.run(request).await)
 }
 
@@ -134,7 +134,51 @@ mod tests {
         test::utils::{create_test_config, create_test_user},
     };
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
+    async fn test_playground_body_limit_precedes_model_parsing(pool: PgPool) {
+        let mut config = create_test_config();
+        config.limits.requests.max_body_size = 4;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config.clone()).await;
+        // Reloads must not raise this guard above the downstream startup caps.
+        config.limits.requests.max_body_size = 100;
+        state.config.store(config);
+        for length in [None, Some("5")] {
+            let mut request = axum::http::Request::post("/admin/api/v1/ai/v1/chat/completions")
+                .header("x-doubleword-user", user.external_user_id.as_ref().unwrap_or(&user.username))
+                .header("x-doubleword-email", &user.email);
+            if let Some(length) = length {
+                request = request.header("content-length", length);
+            }
+            let error = admin_ai_proxy(state.clone(), request.body("xxxxx".into()).unwrap())
+                .await
+                .unwrap_err();
+            assert!(matches!(error, crate::errors::Error::PayloadTooLarge { .. }));
+        }
+
+        let router = axum::Router::new()
+            .fallback(|| async { "unexpected success" })
+            .layer(axum::middleware::from_fn_with_state(state, super::admin_ai_proxy_middleware));
+        let server = axum_test::TestServer::new(router).unwrap();
+        for endpoint in ["chat/completions", "messages"] {
+            let response = server
+                .post(&format!("/admin/api/v1/ai/v1/{endpoint}"))
+                .add_header("x-doubleword-user", user.external_user_id.as_ref().unwrap_or(&user.username))
+                .add_header("x-doubleword-email", &user.email)
+                .bytes("xxxxx".into())
+                .await;
+            response.assert_status(axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+            let body: serde_json::Value = response.json();
+            assert_eq!(body["error"]["type"], "request_too_large");
+            if endpoint == "messages" {
+                assert_eq!(body["type"], "error");
+            } else {
+                assert_eq!(body["error"]["code"], "request_too_large");
+            }
+        }
+    }
+
+    #[dwctl_test_macros::test]
     async fn test_user_no_access_auth_error(pool: PgPool) {
         let config = create_test_config();
         let mut inference_conn = pool.acquire().await.unwrap();
@@ -150,7 +194,9 @@ mod tests {
                 auth_header_name: None,
                 auth_header_prefix: None,
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: user.id,
+                kind: Default::default(),
             })
             .await
             .expect("Failed to create test inference endpoint");
@@ -190,7 +236,7 @@ mod tests {
         assert!(request.headers().get("authorization").is_some());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_user_access_no_auth_error(pool: PgPool) {
         let config = create_test_config();
         let user = create_test_user(&pool, Role::StandardUser).await;
@@ -206,7 +252,9 @@ mod tests {
                 auth_header_name: None,
                 auth_header_prefix: None,
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: user.id,
+                kind: Default::default(),
             })
             .await
             .expect("Failed to create test inference endpoint");
@@ -269,7 +317,7 @@ mod tests {
         assert!(request.headers().get("authorization").is_some());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_header_must_be_supplied(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -288,7 +336,7 @@ mod tests {
         assert_eq!(err.status_code().as_u16(), 401);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_unknown_user_no_access(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -310,7 +358,7 @@ mod tests {
         assert!(request.headers().get("authorization").is_some());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_unknown_model_not_found(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -335,7 +383,7 @@ mod tests {
         assert!(request.headers().get("authorization").is_some());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_ignored_paths(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -358,7 +406,7 @@ mod tests {
         assert_eq!(err.uri().path(), "/nonsense/admin/api/v1/ai/v1/chat/completions");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_user_access_through_everyone_group(pool: PgPool) {
         let config = create_test_config();
         let user = create_test_user(&pool, Role::StandardUser).await;
@@ -374,7 +422,9 @@ mod tests {
                 auth_header_name: None,
                 auth_header_prefix: None,
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: user.id,
+                kind: Default::default(),
             })
             .await
             .expect("Failed to create test inference endpoint");
@@ -425,7 +475,7 @@ mod tests {
         assert!(request.headers().get("authorization").is_some());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_jwt_session_authentication(pool: PgPool) {
         let mut config = create_test_config();
         // Enable native auth for JWT tests
@@ -443,7 +493,9 @@ mod tests {
                 auth_header_name: None,
                 auth_header_prefix: None,
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: user.id,
+                kind: Default::default(),
             })
             .await
             .expect("Failed to create test inference endpoint");
@@ -513,9 +565,10 @@ mod tests {
             limiters: state.limiters,
             connections_encryption_key: None,
             response_store: state.response_store,
-            response_step_manager: state.response_step_manager,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
+            key_policy_cache: state.key_policy_cache.clone(),
+            onwards_targets: None,
         };
 
         let request = axum::http::Request::builder()
@@ -536,7 +589,7 @@ mod tests {
         assert!(request.headers().get("authorization").is_some());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_auth_method_priority_jwt_over_header(pool: PgPool) {
         let mut config = create_test_config();
         // Enable native auth for JWT priority tests
@@ -556,7 +609,9 @@ mod tests {
                 auth_header_name: None,
                 auth_header_prefix: None,
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: jwt_user.id,
+                kind: Default::default(),
             })
             .await
             .expect("Failed to create test inference endpoint");
@@ -627,9 +682,10 @@ mod tests {
             limiters: state.limiters,
             connections_encryption_key: None,
             response_store: state.response_store,
-            response_step_manager: state.response_step_manager,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
+            key_policy_cache: state.key_policy_cache.clone(),
+            onwards_targets: None,
         };
 
         let header_external_user_id = header_user.external_user_id.as_ref().unwrap_or(&header_user.username);
@@ -654,7 +710,7 @@ mod tests {
         assert!(request.headers().get("authorization").is_some());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_disabled_auth_methods(pool: PgPool) {
         let mut config = create_test_config();
         // Disable native auth but keep proxy header enabled
@@ -673,7 +729,9 @@ mod tests {
                 auth_header_name: None,
                 auth_header_prefix: None,
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: user.id,
+                kind: Default::default(),
             })
             .await
             .expect("Failed to create test inference endpoint");
@@ -743,9 +801,10 @@ mod tests {
             limiters: state.limiters,
             connections_encryption_key: None,
             response_store: state.response_store,
-            response_step_manager: state.response_step_manager,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
+            key_policy_cache: state.key_policy_cache.clone(),
+            onwards_targets: None,
         };
 
         // Request with JWT cookie - should be ignored since native auth is disabled
@@ -770,7 +829,7 @@ mod tests {
         assert!(request.headers().get("authorization").is_some());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_auto_user_creation_via_current_user(pool: PgPool) {
         let config = create_test_config();
         // Config should have auto_create_users = true by default in test config
@@ -788,7 +847,9 @@ mod tests {
                 auth_header_name: None,
                 auth_header_prefix: None,
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: Uuid::nil(), // Use nil for system creation
+                kind: Default::default(),
             })
             .await
             .expect("Failed to create test inference endpoint");
@@ -852,7 +913,7 @@ mod tests {
         assert_eq!(db_user.auth_source, "proxy-header");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_invalid_jwt_fallback_to_header(pool: PgPool) {
         let mut config = create_test_config();
         // Enable native auth for JWT fallback tests
@@ -872,7 +933,9 @@ mod tests {
                 auth_header_name: None,
                 auth_header_prefix: None,
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: user.id,
+                kind: Default::default(),
             })
             .await
             .expect("Failed to create test inference endpoint");
@@ -926,9 +989,10 @@ mod tests {
             limiters: state.limiters,
             connections_encryption_key: None,
             response_store: state.response_store,
-            response_step_manager: state.response_step_manager,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
+            key_policy_cache: state.key_policy_cache.clone(),
+            onwards_targets: None,
         };
 
         let external_user_id = user.external_user_id.as_ref().unwrap_or(&user.username);
@@ -954,7 +1018,7 @@ mod tests {
         assert!(request.headers().get("authorization").is_some());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_invalid_api_key_with_valid_jwt(pool: PgPool) {
         let mut config = create_test_config();
         // Enable native auth for JWT tests
@@ -972,7 +1036,9 @@ mod tests {
                 auth_header_name: None,
                 auth_header_prefix: None,
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: user.id,
+                kind: Default::default(),
             })
             .await
             .expect("Failed to create test inference endpoint");
@@ -1042,9 +1108,10 @@ mod tests {
             limiters: state.limiters,
             connections_encryption_key: None,
             response_store: state.response_store,
-            response_step_manager: state.response_step_manager,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
+            key_policy_cache: state.key_policy_cache.clone(),
+            onwards_targets: None,
         };
 
         let request = axum::http::Request::builder()

@@ -13,7 +13,7 @@ pub struct Config {
     #[arg(short = 'p', long, default_value_t = 3000)]
     pub port: u16,
 
-    /// The port on which the metrics server will listen.
+    /// The port for metrics and the /healthz and /readyz probes.
     #[arg(long, default_value_t = 9090)]
     pub metrics_port: u16,
 
@@ -32,6 +32,19 @@ pub struct Config {
     /// The prefix to use for metrics.
     #[arg(long, default_value = "onwards")]
     pub metrics_prefix: String,
+
+    /// Maximum pending bytes of an unfinished SSE event (complete events are forwarded first).
+    #[arg(long, env = "ONWARDS_SSE_BUFFER_LIMIT", default_value_t = crate::sse::DEFAULT_SSE_BUFFER_LIMIT)]
+    pub sse_buffer_limit: usize,
+
+    /// Seconds to continue serving after readiness fails, before closing admission.
+    #[arg(long, env = "ONWARDS_SHUTDOWN_DELAY_SECS", default_value_t = 5)]
+    pub shutdown_delay_secs: u64,
+
+    /// Maximum seconds to drain accepted requests after closing admission.
+    #[arg(long, env = "ONWARDS_SHUTDOWN_TIMEOUT_SECS", default_value_t = 300,
+          value_parser = clap::value_parser!(u64).range(1..))]
+    pub shutdown_timeout_secs: u64,
 }
 
 impl Config {

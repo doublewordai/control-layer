@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                            WITH prev AS (\n                                SELECT id, state AS old_state, batch_id\n                                FROM requests WHERE id = $1\n                                FOR UPDATE\n                            ),\n                            upd AS (\n                                UPDATE requests r SET\n                                    state = 'failed',\n                                    retry_attempt = $2,\n                                    error = $3,\n                                    failed_at = $4,\n                                    response_size = $5,\n                                    routed_model = $6,\n                                    canceled_at = NULL\n                                FROM prev\n                                WHERE r.id = prev.id\n                                  AND (\n                                      ($7::timestamptz IS NOT NULL\n                                       AND r.state IN ('claimed', 'processing', 'canceled')\n                                       AND r.claimed_at = $7)\n                                      OR\n                                      ($7::timestamptz IS NULL\n                                       AND r.state NOT IN ('completed', 'failed'))\n                                  )\n                                RETURNING prev.old_state, prev.batch_id\n                            ),\n                            counter_fix AS (\n                                UPDATE batches b SET\n                                    canceled_requests = b.canceled_requests - 1,\n                                    failed_requests = b.failed_requests + 1\n                                FROM upd\n                                WHERE upd.old_state = 'canceled'\n                                  AND b.id = upd.batch_id\n                                  AND b.counts_frozen_at IS NOT NULL\n                            )\n                            SELECT old_state AS \"old_state!\" FROM upd\n                            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "old_state!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Text",
+        "Timestamptz",
+        "Int8",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "19e83aec7f5325a7d20de48f31f59748afc3fa6a03621511ff684db100dc400b"
+}

@@ -25,6 +25,11 @@ pub struct ModelTariff {
     /// Required for batch tariffs to allow multiple pricing tiers per priority
     /// Not applicable for realtime/playground tariffs
     pub completion_window: Option<String>,
+    /// Organisation this tariff belongs to; `None` = the model's general price.
+    /// Billing prefers the caller's organisation rows over the general rows.
+    pub user_id: Option<Uuid>,
+    /// Resolved serving class; None applies to every class.
+    pub serving_class: Option<String>,
 }
 
 /// Request to create a new tariff
@@ -41,6 +46,9 @@ pub struct TariffCreateDBRequest {
     pub completion_window: Option<String>,
     /// Optional valid_from timestamp (defaults to NOW())
     pub valid_from: Option<DateTime<Utc>>,
+    /// Organisation this tariff belongs to; `None` = general price.
+    #[serde(default)]
+    pub user_id: Option<Uuid>,
 }
 
 /// Response from database after creating or updating a tariff

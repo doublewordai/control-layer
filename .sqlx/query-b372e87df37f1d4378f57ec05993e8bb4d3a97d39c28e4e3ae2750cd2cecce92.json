@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE users\n            SET payment_provider_id = $1,\n                auto_topup_soft_failure_count = 1,\n                auto_topup_retry_after = NOW() + INTERVAL '24 hours'\n            WHERE id = $2\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b372e87df37f1d4378f57ec05993e8bb4d3a97d39c28e4e3ae2750cd2cecce92"
+}

@@ -38,79 +38,46 @@ use axum::extract::DefaultBodyLimit;
 use axum::http::HeaderMap;
 use axum::routing::{any, get};
 use axum_prometheus::{
-    GenericMetricLayer, Handle, PrometheusMetricLayerBuilder,
-    metrics_exporter_prometheus::PrometheusHandle,
+    AXUM_HTTP_REQUESTS_DURATION_SECONDS, GenericMetricLayer, Handle,
+    PREFIXED_HTTP_REQUESTS_DURATION_SECONDS, PrometheusMetricLayerBuilder,
+    metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle},
+    utils::SECONDS_DURATION_BUCKETS,
 };
 use std::borrow::Cow;
 use std::sync::Arc;
 use tracing::{info, instrument};
 
+pub mod affinity;
+pub mod aimd;
 pub mod auth;
 pub mod client;
 pub mod config;
 pub mod errors;
 pub mod handlers;
+pub mod inflight;
 pub mod load_balancer;
 pub mod models;
 pub mod reasoning;
+pub mod rejections;
 pub mod response_id;
 pub mod response_sanitizer;
+pub mod serving;
 pub mod sse;
 pub mod strict;
 pub mod target;
 pub mod telemetry;
-pub mod traits;
+pub mod unsupported_params;
 
 use client::{HttpClient, HyperClient};
-pub use handlers::ServedBy;
+pub use errors::ErrorOrigin;
+pub use handlers::{AuthenticatedApiKeyId, HeaderExtractor, ServedBy};
 use handlers::{models as models_handler, target_message_handler};
 use models::ExtractedModel;
-pub use traits::{
-    NoOpResponseStore, NoOpToolExecutor, RequestContext, ResponseStore, StoreError, ToolError,
-    ToolExecutor, ToolKind, ToolSchema,
+pub use rejections::RequestIdentity;
+pub use serving::{
+    AccountServing, ProviderKind, RequestedServingClass, ServingClass, ServingClassOutcome,
+    ServingOverlay, ServingPresets, ServingTargets,
 };
-
-/// Type alias for body transformation function
-///
-/// Takes (path, headers, body_bytes) and returns transformed body_bytes or None if no transformation.
-/// This allows you to modify request bodies before they are forwarded to upstream services.
-///
-/// # Arguments
-///
-/// * `&str` - The request path (e.g., "/v1/chat/completions")
-/// * `&HeaderMap` - HTTP headers from the incoming request
-/// * `&[u8]` - The request body as raw bytes
-///
-/// # Returns
-///
-/// * `Some(Bytes)` - Transformed request body to forward
-/// * `None` - Use original request body unchanged
-///
-/// # Examples
-///
-/// ```
-/// use onwards::BodyTransformFn;
-/// use axum::http::HeaderMap;
-/// use std::sync::Arc;
-/// use serde_json::{json, Value};
-///
-/// // Transform function that adds stream_options to OpenAI streaming requests
-/// let transform: BodyTransformFn = Arc::new(|path, _headers, body_bytes| {
-///     if path == "/v1/chat/completions" {
-///         if let Ok(mut json_body) = serde_json::from_slice::<Value>(body_bytes) {
-///             if json_body.get("stream") == Some(&json!(true)) {
-///                 json_body["stream_options"] = json!({"include_usage": true});
-///                 if let Ok(transformed) = serde_json::to_vec(&json_body) {
-///                     return Some(axum::body::Bytes::from(transformed));
-///                 }
-///             }
-///         }
-///     }
-///     None // No transformation
-/// });
-/// ```
-pub type BodyTransformFn =
-    Arc<dyn Fn(&str, &HeaderMap, &[u8]) -> Option<axum::body::Bytes> + Send + Sync>;
 
 /// Type alias for response transformation function
 ///
@@ -158,7 +125,6 @@ pub type ResponseTransformFn = Arc<
 /// This struct holds all the state needed to run the proxy server. It contains:
 /// - An HTTP client for making upstream requests
 /// - The collection of configured targets (destinations)
-/// - An optional body transformation function
 /// - An optional response transformation function
 ///
 /// # Examples
@@ -175,51 +141,49 @@ pub type ResponseTransformFn = Arc<
 /// # Ok(())
 /// # }
 /// ```
-///
-/// With request transformation:
-/// ```no_run
-/// use onwards::{AppState, BodyTransformFn, config::Config, target::Targets};
-/// use std::sync::Arc;
-/// use clap::Parser;
-///
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let config = Config::parse();
-/// let targets = Targets::from_config_file(&config.targets).await?;
-///
-/// let transform: BodyTransformFn = Arc::new(|path, _headers, body| {
-///     // Custom transformation logic
-///     None
-/// });
-///
-/// let app_state = AppState::with_transform(targets, transform);
-/// # Ok(())
-/// # }
-/// ```
 #[derive(Clone)]
 pub struct AppState<T: HttpClient> {
     pub http_client: T,
     pub targets: target::Targets,
-    pub body_transform_fn: Option<BodyTransformFn>,
     pub response_transform_fn: Option<ResponseTransformFn>,
-    /// Header name that signals the request should be treated as streaming.
-    /// When set, the responses adapter checks this header to decide whether to
-    /// use the streaming path before forwarding (since the body transform runs
-    /// too late for that decision). Defaults to `None` (header check disabled).
-    pub streaming_header: Option<String>,
-    /// Header name whose value overrides the generated `id` in Responses API
-    /// responses. When set, the handler reads this header from the incoming
-    /// request and uses its value (prefixed with `resp_` if not already) as the
-    /// response object's `id` field. This lets callers (e.g. dwctl, fusillade)
-    /// correlate responses with pre-created tracking records without needing to
-    /// patch the response body after the fact.
+    /// Optional public message for upstream 429 responses; local limits are unaffected.
+    pub upstream_rate_limit_message: Option<String>,
+    /// Header name whose value overrides the upstream's `id` in Responses,
+    /// chat completions and legacy completions responses. When set, the handler
+    /// reads this header from the incoming request and uses its value (prefixed
+    /// with `resp_` if not already) as the response object's `id` field, and in
+    /// strict mode as the `id` of every streamed chunk. This lets callers (e.g.
+    /// dwctl, fusillade) correlate responses with pre-created tracking records
+    /// without needing to patch the response body after the fact.
     pub response_id_header: Option<String>,
-    pub tool_executor: Arc<dyn ToolExecutor>,
-    pub response_store: Arc<dyn ResponseStore>,
     /// Maximum request body size in bytes, enforced by both routers. Without
     /// this, the strict router's `Json` extractors fall back to Axum's 2 MB
     /// `DefaultBodyLimit`, which rejects large (e.g. long-context or base64
     /// image) payloads with a 413. Defaults to [`DEFAULT_BODY_LIMIT`].
     pub body_limit: usize,
+    /// Maximum buffered bytes of an unfinished SSE event. Complete events are forwarded first.
+    pub sse_buffer_limit: usize,
+    /// Proxy-wide default for
+    /// [`FallbackConfig::first_token_timeout_ms`](target::FallbackConfig::first_token_timeout_ms),
+    /// applied to every pool with fallback enabled that doesn't set its own.
+    /// `None` (default) leaves the timeout off unless a pool opts in.
+    pub first_token_timeout: Option<std::time::Duration>,
+    /// Request header whose presence exempts a request from the first-token
+    /// failover timeout — e.g. a marker a batch dispatcher stamps on traffic
+    /// that tolerates latency and runs its own retry policy.
+    pub first_token_timeout_exempt_header: Option<String>,
+    /// Parameters from [`unsupported_params::params`] that get a 400 instead of
+    /// being forwarded. Every other flagged parameter is only counted and traced.
+    pub rejected_params: Vec<&'static str>,
+    pub inflight_limiter: Arc<dyn inflight::InflightLimiter>,
+    /// Enforces the per-model batch in-flight cap. Off, dispatched batch
+    /// requests are never refused and the batch limiter is never consulted, so
+    /// no shared count is touched.
+    pub batch_inflight_enforce: bool,
+    /// Counts batch in-flight requests. Kept separate from `inflight_limiter`
+    /// because the two have independent switches and count scopes: realtime
+    /// counts per account, batch counts one global scope per alias.
+    pub batch_inflight_limiter: Arc<dyn inflight::InflightLimiter>,
 }
 
 /// Default maximum request body size (32 MB).
@@ -235,18 +199,25 @@ impl<T: HttpClient> std::fmt::Debug for AppState<T> {
             .field("http_client", &self.http_client)
             .field("targets", &self.targets)
             .field(
-                "body_transform_fn",
-                &self.body_transform_fn.as_ref().map(|_| "<function>"),
-            )
-            .field(
                 "response_transform_fn",
                 &self.response_transform_fn.as_ref().map(|_| "<function>"),
             )
-            .field("streaming_header", &self.streaming_header)
+            .field(
+                "upstream_rate_limit_message",
+                &self.upstream_rate_limit_message,
+            )
             .field("response_id_header", &self.response_id_header)
-            .field("tool_executor", &"<dyn ToolExecutor>")
-            .field("response_store", &"<dyn ResponseStore>")
             .field("body_limit", &self.body_limit)
+            .field("sse_buffer_limit", &self.sse_buffer_limit)
+            .field("first_token_timeout", &self.first_token_timeout)
+            .field(
+                "first_token_timeout_exempt_header",
+                &self.first_token_timeout_exempt_header,
+            )
+            .field("rejected_params", &self.rejected_params)
+            .field("inflight_limiter", &self.inflight_limiter)
+            .field("batch_inflight_enforce", &self.batch_inflight_enforce)
+            .field("batch_inflight_limiter", &self.batch_inflight_limiter)
             .finish()
     }
 }
@@ -264,35 +235,17 @@ impl AppState<HyperClient> {
         Self {
             http_client,
             targets,
-            body_transform_fn: None,
             response_transform_fn: None,
-            streaming_header: None,
+            upstream_rate_limit_message: None,
             response_id_header: None,
-            tool_executor: Arc::new(NoOpToolExecutor),
-            response_store: Arc::new(NoOpResponseStore),
             body_limit: DEFAULT_BODY_LIMIT,
-        }
-    }
-
-    /// Create a new AppState with the default Hyper client and a body transformation function
-    pub fn with_transform(targets: target::Targets, body_transform_fn: BodyTransformFn) -> Self {
-        let (max_idle, timeout) = targets
-            .http_pool_config
-            .as_ref()
-            .map(|p| (p.max_idle_per_host, p.idle_timeout_secs))
-            .unwrap_or((100, 90));
-
-        let http_client = client::create_hyper_client(max_idle, timeout);
-        Self {
-            http_client,
-            targets,
-            body_transform_fn: Some(body_transform_fn),
-            response_transform_fn: None,
-            streaming_header: None,
-            response_id_header: None,
-            tool_executor: Arc::new(NoOpToolExecutor),
-            response_store: Arc::new(NoOpResponseStore),
-            body_limit: DEFAULT_BODY_LIMIT,
+            sse_buffer_limit: sse::DEFAULT_SSE_BUFFER_LIMIT,
+            first_token_timeout: None,
+            first_token_timeout_exempt_header: None,
+            rejected_params: Vec::new(),
+            inflight_limiter: Arc::new(inflight::LocalInflightLimiter::default()),
+            batch_inflight_enforce: false,
+            batch_inflight_limiter: Arc::new(inflight::LocalInflightLimiter::default()),
         }
     }
 }
@@ -303,45 +256,104 @@ impl<T: HttpClient> AppState<T> {
         Self {
             http_client,
             targets,
-            body_transform_fn: None,
             response_transform_fn: None,
-            streaming_header: None,
+            upstream_rate_limit_message: None,
             response_id_header: None,
-            tool_executor: Arc::new(NoOpToolExecutor),
-            response_store: Arc::new(NoOpResponseStore),
             body_limit: DEFAULT_BODY_LIMIT,
+            sse_buffer_limit: sse::DEFAULT_SSE_BUFFER_LIMIT,
+            first_token_timeout: None,
+            first_token_timeout_exempt_header: None,
+            rejected_params: Vec::new(),
+            inflight_limiter: Arc::new(inflight::LocalInflightLimiter::default()),
+            batch_inflight_enforce: false,
+            batch_inflight_limiter: Arc::new(inflight::LocalInflightLimiter::default()),
         }
     }
 
-    /// Create a new AppState with a custom HTTP client and body transformation function
-    pub fn with_client_and_transform(
-        targets: target::Targets,
-        http_client: T,
-        body_transform_fn: BodyTransformFn,
-    ) -> Self {
-        Self {
-            http_client,
-            targets,
-            body_transform_fn: Some(body_transform_fn),
-            response_transform_fn: None,
-            streaming_header: None,
-            response_id_header: None,
-            tool_executor: Arc::new(NoOpToolExecutor),
-            response_store: Arc::new(NoOpResponseStore),
-            body_limit: DEFAULT_BODY_LIMIT,
-        }
-    }
-
-    /// Set the header name that signals a request should use the streaming path.
-    /// Used by the responses adapter to decide streaming vs non-streaming before forwarding.
-    pub fn with_streaming_header(mut self, header: impl Into<String>) -> Self {
-        self.streaming_header = Some(header.into());
+    /// Customize upstream rate-limit errors without exposing provider error bodies.
+    pub fn with_upstream_rate_limit_message(mut self, message: impl Into<String>) -> Self {
+        self.upstream_rate_limit_message = Some(message.into());
         self
     }
 
-    /// Set the header name whose value overrides the Responses API `id` field.
+    /// Set the header name whose value overrides the response `id` field.
     pub fn with_response_id_header(mut self, header: impl Into<String>) -> Self {
         self.response_id_header = Some(header.into());
+        self
+    }
+
+    /// Set the proxy-wide first-token failover timeout (builder pattern). A
+    /// pool's own `fallback.first_token_timeout_ms` takes precedence.
+    pub fn with_first_token_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.first_token_timeout = Some(timeout);
+        self
+    }
+
+    /// Set the header whose presence exempts a request from the first-token
+    /// failover timeout (builder pattern).
+    pub fn with_first_token_timeout_exempt_header(mut self, header: impl Into<String>) -> Self {
+        self.first_token_timeout_exempt_header = Some(header.into());
+        self
+    }
+
+    /// Set the parameters that are rejected with a 400 instead of being
+    /// forwarded (builder pattern). Names outside
+    /// [`unsupported_params::params`] are an error, so a typo in configuration
+    /// can't silently disable a rejection.
+    pub fn with_rejected_params<I, S>(mut self, params: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut rejected = Vec::new();
+        for name in params {
+            let name = name.as_ref();
+            let param = unsupported_params::known_param(name)
+                .ok_or_else(|| format!("unknown parameter in the reject list: {name}"))?;
+            if !rejected.contains(&param) {
+                rejected.push(param);
+            }
+        }
+        self.rejected_params = rejected;
+        Ok(self)
+    }
+
+    pub fn with_inflight_limiter(mut self, limiter: Arc<dyn inflight::InflightLimiter>) -> Self {
+        self.inflight_limiter = limiter;
+        self
+    }
+
+    /// Plug in a shared counter for the per-model batch in-flight cap.
+    ///
+    /// Enforcement also requires [`AppState::with_batch_inflight_enforce`]. The
+    /// standalone `onwards` binary never calls either builder, so the cap is
+    /// inert there; only embedding processes (such as the control layer) enable
+    /// it.
+    pub fn with_batch_inflight_limiter(
+        mut self,
+        limiter: Arc<dyn inflight::InflightLimiter>,
+    ) -> Self {
+        self.batch_inflight_limiter = limiter;
+        self
+    }
+
+    /// Switch enforcement of the per-model batch in-flight cap on or off.
+    ///
+    /// Batch requests are recognised by the header set with
+    /// [`AppState::with_first_token_timeout_exempt_header`], which the batch
+    /// dispatcher stamps on every request it sends. Without that header
+    /// configured no request counts as batch, so the cap never applies; enabling
+    /// enforcement without it logs a warning. The standalone `onwards` binary
+    /// never enables this, so the cap is inert there; see
+    /// [`AppState::with_batch_inflight_limiter`].
+    pub fn with_batch_inflight_enforce(mut self, enforce: bool) -> Self {
+        if enforce && self.first_token_timeout_exempt_header.is_none() {
+            tracing::warn!(
+                "batch in-flight cap enforcement is on, but no batch marker header is configured \
+                 (with_first_token_timeout_exempt_header); no request will be counted as batch"
+            );
+        }
+        self.batch_inflight_enforce = enforce;
         self
     }
 
@@ -351,15 +363,10 @@ impl<T: HttpClient> AppState<T> {
         self
     }
 
-    /// Set the tool executor for server-side tool handling (builder pattern)
-    pub fn with_tool_executor(mut self, executor: Arc<dyn ToolExecutor>) -> Self {
-        self.tool_executor = executor;
-        self
-    }
-
-    /// Set the response store for stateful conversations (builder pattern)
-    pub fn with_response_store(mut self, store: Arc<dyn ResponseStore>) -> Self {
-        self.response_store = store;
+    /// Set the maximum unfinished SSE event size in bytes.
+    /// This is neither a total response limit nor a limit on coalesced complete events.
+    pub fn with_sse_buffer_limit(mut self, limit: usize) -> Self {
+        self.sse_buffer_limit = limit;
         self
     }
 
@@ -427,7 +434,7 @@ pub fn extract_model_from_request(headers: &HeaderMap, body_bytes: &[u8]) -> Opt
         }
         None => {
             let extracted: ExtractedModel = serde_json::from_slice(body_bytes).ok()?;
-            Some(extracted.model.to_string())
+            Some(extracted.model.into_owned())
         }
     }
 }
@@ -554,6 +561,16 @@ pub fn build_metrics_router(handle: PrometheusHandle) -> Router {
     )
 }
 
+/// Histogram buckets for `onwards_first_token_seconds`, in seconds.
+///
+/// 10 is an exact edge because it is the default first-token deadline and AIMD
+/// latency budget: the share of first tokens beyond it is only exact at a
+/// bucket edge. Exported so embedders installing their own recorder can use
+/// the same buckets.
+pub const FIRST_TOKEN_SECONDS_BUCKETS: &[f64] = &[
+    0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 7.5, 10.0, 15.0, 20.0, 30.0, 60.0, 120.0,
+];
+
 type MetricsLayerAndHandle = (
     GenericMetricLayer<'static, PrometheusHandle, Handle>,
     PrometheusHandle,
@@ -623,7 +640,38 @@ pub fn build_metrics_layer_and_handle(
         .with_prefix(prefix)
         .enable_response_body_size(true)
         .with_endpoint_label_type(axum_prometheus::EndpointLabel::Exact)
-        .with_default_metrics()
+        // Same as `with_default_metrics`, plus real histogram buckets for the
+        // first-token latency: without them it renders as a per-process
+        // summary, whose quantiles cannot be aggregated across replicas.
+        .with_metrics_from_fn(|| {
+            let recorder = PrometheusBuilder::new()
+                .set_buckets_for_metric(
+                    Matcher::Full(
+                        PREFIXED_HTTP_REQUESTS_DURATION_SECONDS
+                            .get()
+                            .map_or(AXUM_HTTP_REQUESTS_DURATION_SECONDS, |s| s.as_str())
+                            .to_string(),
+                    ),
+                    SECONDS_DURATION_BUCKETS,
+                )
+                .expect("valid HTTP duration buckets")
+                .set_buckets_for_metric(
+                    Matcher::Full("onwards_first_token_seconds".to_string()),
+                    FIRST_TOKEN_SECONDS_BUCKETS,
+                )
+                .expect("valid first-token buckets")
+                .build_recorder();
+            let handle = recorder.handle();
+            let upkeep = handle.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    upkeep.run_upkeep();
+                }
+            });
+            metrics::set_global_recorder(recorder).expect("Failed to set global recorder");
+            handle
+        })
         .build_pair()
 }
 
@@ -632,6 +680,47 @@ pub mod test_utils {
     use async_trait::async_trait;
     use axum::http::StatusCode;
     use std::sync::{Arc, Mutex};
+
+    /// Every field name and serde rename declared outside the tests of a
+    /// schema source file, for tests that keep a list of declared fields (see
+    /// [`crate::strict::schema_mismatch::locate_declared`]) in step with it. A
+    /// line scan rather than a parser: it may find a few names that aren't
+    /// JSON keys, which only widens the list.
+    pub fn declared_field_names(source: &str) -> Vec<String> {
+        let source = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let mut names = Vec::new();
+        for line in source.lines().map(str::trim) {
+            for marker in ["rename = \"", "alias = \""] {
+                let mut rest = line;
+                while let Some(start) = rest.find(marker) {
+                    rest = &rest[start + marker.len()..];
+                    if let Some(end) = rest.find('"') {
+                        names.push(rest[..end].to_string());
+                    }
+                }
+            }
+            if line.starts_with("//") || line.starts_with("let ") {
+                continue;
+            }
+            let field = line
+                .strip_prefix("pub(crate) ")
+                .or_else(|| line.strip_prefix("pub "))
+                .unwrap_or(line);
+            let field = field.strip_prefix("r#").unwrap_or(field);
+            let len = field
+                .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+                .unwrap_or(field.len());
+            let after = field[len..].trim_start();
+            if len > 0
+                && field.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+                && after.starts_with(':')
+                && !after.starts_with("::")
+            {
+                names.push(field[..len].to_string());
+            }
+        }
+        names
+    }
 
     pub struct MockHttpClient {
         pub requests: Arc<Mutex<Vec<MockRequest>>>,
@@ -709,6 +798,73 @@ pub mod test_utils {
                             .into_iter()
                             .map(|chunk| Ok::<_, std::io::Error>(chunk.into_bytes())),
                     );
+
+                    axum::response::Response::builder()
+                        .status(status)
+                        .header("content-type", "text/event-stream")
+                        .header("cache-control", "no-cache")
+                        .header("connection", "keep-alive")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }),
+            }
+        }
+
+        pub fn new_delayed_streaming_sequence(
+            status: StatusCode,
+            responses: Vec<(std::time::Duration, Vec<String>)>,
+        ) -> Self {
+            let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            Self {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                custom_headers: Arc::new(Mutex::new(Vec::new())),
+                response_builder: Arc::new(move || {
+                    use axum::body::Body;
+
+                    let idx = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let (delay, chunks) = responses.get(idx).cloned().unwrap_or_default();
+
+                    let stream = async_stream::stream! {
+                        tokio::time::sleep(delay).await;
+                        for chunk in chunks {
+                            yield Ok::<_, std::io::Error>(chunk.into_bytes());
+                        }
+                    };
+
+                    axum::response::Response::builder()
+                        .status(status)
+                        .header("content-type", "text/event-stream")
+                        .header("cache-control", "no-cache")
+                        .header("connection", "keep-alive")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }),
+            }
+        }
+
+        /// Like [`Self::new_delayed_streaming_sequence`], but each chunk carries
+        /// its own delay (slept before it is sent), so a stream can emit
+        /// keep-alive frames and then stall before its first real token.
+        pub fn new_timed_streaming_sequence(
+            status: StatusCode,
+            responses: Vec<Vec<(std::time::Duration, String)>>,
+        ) -> Self {
+            let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            Self {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                custom_headers: Arc::new(Mutex::new(Vec::new())),
+                response_builder: Arc::new(move || {
+                    use axum::body::Body;
+
+                    let idx = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let chunks = responses.get(idx).cloned().unwrap_or_default();
+
+                    let stream = async_stream::stream! {
+                        for (delay, chunk) in chunks {
+                            tokio::time::sleep(delay).await;
+                            yield Ok::<_, std::io::Error>(chunk.into_bytes());
+                        }
+                    };
 
                     axum::response::Response::builder()
                         .status(status)
@@ -924,8 +1080,38 @@ mod tests {
     use test_utils::MockHttpClient;
 
     /// Helper to create a single-provider pool from a target
-    fn pool(target: Target) -> ProviderPool {
+    fn pool(target: Target) -> target::TargetPools {
         target.into_pool()
+    }
+
+    /// RFC 8259 permits escaping any character in a JSON string, including the
+    /// solidus (`\/`) that PHP's `json_encode` escapes by default. Extraction
+    /// must decode escapes rather than reject strings containing them.
+    #[test]
+    fn test_extract_model_decodes_json_escapes() {
+        let headers = HeaderMap::new();
+        for body in [
+            br#"{"model":"zai-org/GLM-5.2-FP8","messages":[]}"#.as_slice(),
+            br#"{"model":"zai-org\/GLM-5.2-FP8","messages":[]}"#.as_slice(),
+            br#"{"model":"zai-org\u002FGLM-5.2-FP8","messages":[]}"#.as_slice(),
+        ] {
+            assert_eq!(
+                extract_model_from_request(&headers, body).as_deref(),
+                Some("zai-org/GLM-5.2-FP8"),
+                "body: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_model_decodes_escaped_backslash() {
+        let headers = HeaderMap::new();
+        let body = br#"{"model":"weird\\model","messages":[]}"#;
+        assert_eq!(
+            extract_model_from_request(&headers, body).as_deref(),
+            Some(r"weird\model")
+        );
     }
 
     #[tokio::test]
@@ -936,6 +1122,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
         };
@@ -973,6 +1160,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
         };
@@ -1029,6 +1217,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
         };
@@ -1090,23 +1279,36 @@ mod tests {
     /// exactly why the extension (not a header) carries this.
     #[tokio::test]
     async fn test_served_by_extension_set_on_success() {
+        use crate::auth::ConstantTimeString;
+        use std::collections::{HashMap, HashSet};
         use tower::ServiceExt;
 
+        let api_key_id = uuid::Uuid::new_v4();
+        let api_key = "test-api-key";
+        let mut keys = HashSet::new();
+        keys.insert(ConstantTimeString::from(api_key.to_string()));
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "gpt-4".to_string(),
             pool(
                 target::Target::builder()
                     .url("https://api.openai.com".parse().unwrap())
+                    .keys(keys)
                     .onwards_model("gpt-4-upstream".to_string())
                     .build(),
             ),
+        );
+        let key_labels = Arc::new(DashMap::new());
+        key_labels.insert(
+            api_key.to_string(),
+            HashMap::from([("api_key_id".to_string(), api_key_id.to_string())]),
         );
         let targets = target::Targets {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
+            key_labels,
+            accounts: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
         };
@@ -1121,6 +1323,7 @@ mod tests {
             .method("POST")
             .uri("/v1/chat/completions")
             .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {api_key}"))
             .body(axum::body::Body::from(
                 json!({
                     "model": "gpt-4",
@@ -1138,14 +1341,271 @@ mod tests {
             .expect("success response must carry ServedBy");
         assert_eq!(served_by.url, "https://api.openai.com/");
         assert_eq!(served_by.onwards_model.as_deref(), Some("gpt-4-upstream"));
+        assert_eq!(
+            response.extensions().get::<crate::AuthenticatedApiKeyId>(),
+            Some(&crate::AuthenticatedApiKeyId(api_key_id))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_authenticated_api_key_id_survives_models_and_strict_error() {
+        use crate::auth::ConstantTimeString;
+        use crate::target::{RateLimitExceeded, RateLimiter};
+        use std::collections::{HashMap, HashSet};
+        use tower::ServiceExt;
+
+        #[derive(Debug)]
+        struct BlockingRateLimiter;
+
+        impl RateLimiter for BlockingRateLimiter {
+            fn check(&self) -> Result<(), RateLimitExceeded> {
+                Err(RateLimitExceeded)
+            }
+        }
+
+        let api_key_id = uuid::Uuid::new_v4();
+        let api_key = "test-api-key";
+        let mut keys = HashSet::new();
+        keys.insert(ConstantTimeString::from(api_key.to_string()));
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "gpt-4".to_string(),
+            pool(
+                target::Target::builder()
+                    .url("https://api.openai.com".parse().unwrap())
+                    .keys(keys.clone())
+                    .build(),
+            ),
+        );
+        targets_map.insert(
+            "blocked-model".to_string(),
+            pool(
+                target::Target::builder()
+                    .url("https://api.openai.com".parse().unwrap())
+                    .keys(keys)
+                    .limiter(Arc::new(BlockingRateLimiter) as Arc<dyn RateLimiter>)
+                    .build(),
+            ),
+        );
+        let key_labels = Arc::new(DashMap::new());
+        key_labels.insert(
+            api_key.to_string(),
+            HashMap::from([("api_key_id".to_string(), api_key_id.to_string())]),
+        );
+        let targets = target::Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels,
+            accounts: Default::default(),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+        let mock_client = MockHttpClient::new(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"provider detail"}}"#,
+        );
+        let router = build_router(AppState::with_client(targets, mock_client));
+
+        let models_request = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .header("authorization", format!("Bearer {api_key}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let models_response = router.clone().oneshot(models_request).await.unwrap();
+        assert_eq!(
+            models_response
+                .extensions()
+                .get::<crate::AuthenticatedApiKeyId>(),
+            Some(&crate::AuthenticatedApiKeyId(api_key_id))
+        );
+
+        let chat_request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {api_key}"))
+            .body(axum::body::Body::from(
+                json!({
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let chat_response = router.clone().oneshot(chat_request).await.unwrap();
+        assert_eq!(chat_response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            chat_response
+                .extensions()
+                .get::<crate::AuthenticatedApiKeyId>(),
+            Some(&crate::AuthenticatedApiKeyId(api_key_id))
+        );
+
+        let rejected_request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {api_key}"))
+            .body(axum::body::Body::from(
+                json!({
+                    "model": "blocked-model",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let rejected_response = router.oneshot(rejected_request).await.unwrap();
+        assert_eq!(rejected_response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            rejected_response
+                .extensions()
+                .get::<crate::AuthenticatedApiKeyId>(),
+            Some(&crate::AuthenticatedApiKeyId(api_key_id))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_strict_refusals_before_forwarding_keep_the_caller_and_code() {
+        use std::collections::HashMap;
+        use tower::ServiceExt;
+
+        let refusal = |body: String, body_limit: usize| async move {
+            let targets = fallback_targets("gpt-4", 1, vec![]);
+            targets.key_labels.insert(
+                "sk-acct".to_string(),
+                HashMap::from([(serving::ACCOUNT_LABEL.to_string(), "acct-1".to_string())]),
+            );
+            let state = AppState::with_client(targets, MockHttpClient::new(StatusCode::OK, "{}"))
+                .with_body_limit(body_limit);
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-acct")
+                .body(axum::body::Body::from(body))
+                .unwrap();
+            let response = crate::strict::build_strict_router(state)
+                .oneshot(request)
+                .await
+                .unwrap();
+            let account = response
+                .extensions()
+                .get::<crate::RequestIdentity>()
+                .and_then(|identity| identity.account_id.clone());
+            (
+                response.status().as_u16(),
+                account,
+                response.extensions().get::<crate::ErrorOrigin>().cloned(),
+            )
+        };
+        let expected = |status, code: &str| {
+            (
+                status,
+                Some("acct-1".to_string()),
+                Some(crate::ErrorOrigin::Gateway {
+                    code: code.to_string(),
+                }),
+            )
+        };
+
+        // Valid JSON in the wrong shape.
+        let wrong_shape = json!({"model": "gpt-4", "messages": "hello"}).to_string();
+        assert_eq!(
+            refusal(wrong_shape, 1024).await,
+            expected(422, "schema_mismatch")
+        );
+        assert_eq!(
+            refusal("{not json".to_string(), 1024).await,
+            expected(400, "invalid_json")
+        );
+        let chat = json!({"model": "gpt-4", "messages": [{"role": "user", "content": "Hello"}]});
+        assert_eq!(
+            refusal(chat.to_string(), 8).await,
+            expected(413, "payload_too_large")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_strict_sanitized_errors_keep_the_caller_and_name_the_provider() {
+        use std::collections::HashMap;
+        use tower::ServiceExt;
+
+        let attribution = |mock: MockHttpClient| async move {
+            let targets = fallback_targets("gpt-4", 1, vec![]);
+            targets.key_labels.insert(
+                "sk-acct".to_string(),
+                HashMap::from([(serving::ACCOUNT_LABEL.to_string(), "acct-1".to_string())]),
+            );
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-acct")
+                .body(axum::body::Body::from(
+                    json!({"model": "gpt-4", "messages": [{"role": "user", "content": "Hello"}]})
+                        .to_string(),
+                ))
+                .unwrap();
+            let response = crate::strict::build_strict_router(AppState::with_client(targets, mock))
+                .oneshot(request)
+                .await
+                .unwrap();
+            let account = response
+                .extensions()
+                .get::<crate::RequestIdentity>()
+                .and_then(|identity| identity.account_id.clone());
+            (
+                response.status().as_u16(),
+                account,
+                response.extensions().get::<crate::ErrorOrigin>().cloned(),
+            )
+        };
+        let expected = |status| {
+            (
+                status,
+                Some("acct-1".to_string()),
+                Some(crate::ErrorOrigin::Provider),
+            )
+        };
+
+        // A success body that is not a chat completion becomes a fresh 502.
+        let malformed = MockHttpClient::new(StatusCode::OK, "not a completion");
+        assert_eq!(attribution(malformed).await, expected(502));
+
+        // An untrusted provider's error is replaced by a standard one.
+        let rejected = MockHttpClient::new(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"provider detail"}}"#,
+        );
+        assert_eq!(attribution(rejected).await, expected(400));
     }
 
     /// Strict-mode `Targets` with one alias backed by a fallback pool of `n`
     /// identical providers (all hit the shared mock client), configured to retry
     /// on the given upstream `on_status` codes.
     fn fallback_targets(alias: &str, n: usize, on_status: Vec<u16>) -> target::Targets {
+        fallback_targets_with(
+            alias,
+            n,
+            target::FallbackConfig {
+                enabled: true,
+                on_status,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// `n` priority-ordered providers (`p0`, `p1`, …) under an explicit
+    /// fallback config.
+    fn fallback_targets_with(
+        alias: &str,
+        n: usize,
+        fallback: target::FallbackConfig,
+    ) -> target::Targets {
         use crate::load_balancer::{Provider, ProviderPool};
-        use crate::target::{FallbackConfig, LoadBalanceStrategy, Target};
+        use crate::target::{LoadBalanceStrategy, Target};
 
         let providers = (0..n)
             .map(|i| {
@@ -1156,28 +1616,24 @@ mod tests {
                 Provider::new(t, 1)
             })
             .collect();
-        let fallback = Some(FallbackConfig {
-            enabled: true,
-            on_status,
-            ..Default::default()
-        });
         let pool = ProviderPool::with_config(
             providers,
             None,
             None,
             None,
-            fallback,
+            Some(fallback),
             LoadBalanceStrategy::Priority,
             false,
             Vec::new(),
         );
         let targets_map = Arc::new(DashMap::new());
-        targets_map.insert(alias.to_string(), pool);
+        targets_map.insert(alias.to_string(), pool.into());
         target::Targets {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         }
@@ -1188,14 +1644,371 @@ mod tests {
         fallback_targets(alias, n, vec![429])
     }
 
+    /// A composite whose COMPLETIONS pool has one member per entry of
+    /// `accepts_priority` (Priority order, embedded-429 retry) alongside a
+    /// single-member default pool. Mirrors the continuation-pool shape; each
+    /// member's `accepts_scheduling_priority` capability is given explicitly.
+    fn completions_pool_targets(alias: &str, accepts_priority: &[bool]) -> target::Targets {
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::{FallbackConfig, LoadBalanceStrategy, Target, TargetPools};
+
+        let make_pool = |members: Vec<(String, bool)>| {
+            let providers = members
+                .into_iter()
+                .map(|(u, accepts)| {
+                    let t = Target::builder()
+                        .url(u.parse().unwrap())
+                        .request_timeout_secs(5)
+                        .accepts_scheduling_priority(accepts)
+                        .build();
+                    Provider::new(t, 1)
+                })
+                .collect();
+            ProviderPool::with_config(
+                providers,
+                None,
+                None,
+                None,
+                Some(FallbackConfig {
+                    enabled: true,
+                    on_status: vec![429],
+                    ..Default::default()
+                }),
+                LoadBalanceStrategy::Priority,
+                false,
+                Vec::new(),
+            )
+        };
+        let default_pool = make_pool(vec![("https://chat.example.com/".to_string(), false)]);
+        let completions_pool = make_pool(
+            accepts_priority
+                .iter()
+                .enumerate()
+                .map(|(i, accepts)| (format!("https://c{i}.example.com/"), *accepts))
+                .collect(),
+        );
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("completions".to_string(), completions_pool);
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            alias.to_string(),
+            TargetPools::with_pools(default_pool, extra),
+        );
+        target::Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        }
+    }
+
+    /// The dynamo scheduler's `priority` field reaches a non-default pool
+    /// member iff that member's serving stack accepts it
+    /// (`accepts_scheduling_priority`), regardless of position. Third-party
+    /// completions targets reject unknown fields outright (Fireworks: "Extra
+    /// inputs are not permitted, field: 'priority'"): keyed on position, the
+    /// cl-1453 canary 400'd on every fallback leg, and later — with the dynamo
+    /// member disabled — on every PRIMARY leg too.
+    #[tokio::test]
+    async fn completions_member_sees_priority_iff_it_accepts_it() {
+        let error_frame =
+            "data: {\"error\":{\"code\":429,\"message\":\"Provider returned error\"}}\n\n"
+                .to_string();
+        let mock = MockHttpClient::new_streaming_sequence(
+            StatusCode::OK,
+            vec![
+                vec![error_frame],                  // primary: embedded 429 → fallback
+                vec![OK_CONTENT_FRAME.to_string()], // fallback member serves
+            ],
+        );
+        // dynamo (accepts) first, third party (does not) second: the wave-1 shape.
+        let app_state = AppState::with_client(
+            completions_pool_targets("gpt-4", &[true, false]),
+            mock.clone(),
+        );
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/completions")
+            .json(&json!({
+                "model": "gpt-4", "prompt": [1, 2, 3], "stream": true, "priority": 100,
+                "nvext": {"agent_hints": {"priority": 100}}
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        let requests = mock.get_requests();
+        assert_eq!(requests.len(), 2, "primary fails, fallback serves");
+        let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(
+            first["nvext"]["agent_hints"]["priority"], 100,
+            "a member that accepts scheduling fields receives the nvext carrier"
+        );
+        assert_eq!(first["priority"], 100, "and the legacy top-level field");
+        assert!(
+            second.get("priority").is_none() && second.get("nvext").is_none(),
+            "a member that does not accept them must see neither carrier"
+        );
+        assert_eq!(
+            second["prompt"],
+            json!([1, 2, 3]),
+            "the rest of the body is untouched"
+        );
+    }
+
+    /// The incident shape: the dynamo member is disabled/removed and a third
+    /// party sits at index 0. Position must not decide — the field is stripped
+    /// for the first attempt too, or every resume leg 400s exactly when the
+    /// feature is needed most.
+    #[tokio::test]
+    async fn a_non_accepting_primary_never_sees_priority_either() {
+        let mock =
+            MockHttpClient::new_streaming(StatusCode::OK, vec![OK_CONTENT_FRAME.to_string()]);
+        let app_state =
+            AppState::with_client(completions_pool_targets("gpt-4", &[false]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/completions")
+            .json(&json!({
+                "model": "gpt-4", "prompt": [1, 2, 3], "stream": true,
+                "nvext": {"agent_hints": {"priority": 100}}
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        let requests = mock.get_requests();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(
+            body.get("nvext").is_none(),
+            "index 0 is not 'dynamo'; a non-accepting primary is stripped too"
+        );
+        assert_eq!(body["prompt"], json!([1, 2, 3]));
+    }
+
+    /// Control: default-pool fallbacks keep `priority` on every attempt —
+    /// batch/flex deadline priorities must keep reaching dynamo exactly as
+    /// today, whichever member serves.
+    #[tokio::test]
+    async fn default_pool_fallback_keeps_priority_on_every_attempt() {
+        let error_frame =
+            "data: {\"error\":{\"code\":429,\"message\":\"Provider returned error\"}}\n\n"
+                .to_string();
+        let mock = MockHttpClient::new_streaming_sequence(
+            StatusCode::OK,
+            vec![vec![error_frame], vec![OK_CONTENT_FRAME.to_string()]],
+        );
+        let app_state = AppState::with_client(embedded_error_targets("gpt-4", 2), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4", "stream": true, "priority": -1754812800,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        let requests = mock.get_requests();
+        assert_eq!(requests.len(), 2);
+        for (i, req) in requests.iter().enumerate() {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            assert_eq!(
+                body["priority"], -1754812800i64,
+                "attempt {i}: default-pool members all receive the deadline priority"
+            );
+        }
+    }
+
     // Some upstreams return HTTP 200 and put the real error in the body. These
     // tests exercise the embedded-error detection + retry in target_message_handler.
 
     #[tokio::test]
-    async fn test_streaming_embedded_error_retries_then_exhausts_to_503() {
+    async fn test_embedded_error_preserves_only_trusted_client_details() {
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::LoadBalanceStrategy;
+
+        // A per-provider override must win over pool trust in both directions.
+        for (provider_trust, pool_trust, preserve) in [
+            (Some(true), false, true),
+            (Some(false), true, false),
+            (None, true, true),
+            (None, false, false),
+        ] {
+            for streaming in [false, true] {
+                let body = r#"{"error":{"code":400,"message":"image_url.detail must be auto, low or high","type":"invalid_image_error","param":"image_url.detail","metadata":{"private":"not part of the public error"}}}"#;
+                let mock = if streaming {
+                    MockHttpClient::new_streaming(
+                        StatusCode::OK,
+                        vec![": keep-alive\n\n".to_string(), format!("data:{body}\n\n")],
+                    )
+                } else {
+                    MockHttpClient::new(StatusCode::OK, body)
+                };
+                let target = Target::builder()
+                    .url("https://provider.example.com/".parse().unwrap())
+                    .maybe_trusted(provider_trust)
+                    .build();
+                let provider_pool = ProviderPool::with_config(
+                    vec![Provider::new(target, 1)],
+                    None,
+                    None,
+                    None,
+                    None,
+                    LoadBalanceStrategy::Priority,
+                    pool_trust,
+                    Vec::new(),
+                );
+                let targets = embedded_error_targets("gpt-4", 1);
+                targets
+                    .targets
+                    .insert("gpt-4".to_string(), provider_pool.into());
+                let server =
+                    TestServer::new(build_router(AppState::with_client(targets, mock.clone())))
+                        .unwrap();
+                let response = server
+                    .post("/v1/chat/completions")
+                    .json(&json!({
+                        "model":"gpt-4", "stream":streaming,
+                        "messages":[{"role":"user","content":"hello"}]
+                    }))
+                    .await;
+                assert_eq!(response.status_code(), 400);
+                let error = response.json::<serde_json::Value>();
+                if preserve {
+                    assert_eq!(
+                        error["error"]["message"],
+                        "image_url.detail must be auto, low or high"
+                    );
+                    assert_eq!(error["error"]["param"], "image_url.detail");
+                    assert_eq!(error["error"]["code"], "400");
+                    assert_eq!(error["error"]["type"], "invalid_image_error");
+                } else {
+                    assert_eq!(
+                        error["error"]["message"],
+                        "The upstream provider rejected the request."
+                    );
+                    assert!(error["error"]["param"].is_null());
+                    assert_eq!(error["error"]["type"], "invalid_request_error");
+                }
+                assert!(error["error"].get("metadata").is_none());
+                assert_eq!(mock.get_requests().len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_upstream_rate_limit_preserves_status_and_custom_message() {
+        for strict in [false, true] {
+            for embedded in [false, true] {
+                for streaming in [false, true] {
+                    for retry in [false, true] {
+                        let body = r#"{"error":{"code":429,"message":"private upstream details"}}"#;
+                        let status = if embedded {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::TOO_MANY_REQUESTS
+                        };
+                        let mock = if streaming {
+                            MockHttpClient::new_streaming(status, vec![format!("data: {body}\n\n")])
+                        } else {
+                            MockHttpClient::new(status, body)
+                        };
+                        let targets =
+                            fallback_targets("gpt-4", 2, if retry { vec![429] } else { vec![] });
+                        let state = AppState::with_client(targets, mock.clone())
+                            .with_upstream_rate_limit_message(
+                                "Contact support for a dedicated deployment.",
+                            );
+                        let router = if strict {
+                            crate::strict::build_strict_router(state)
+                        } else {
+                            build_router(state)
+                        };
+                        let server = TestServer::new(router).unwrap();
+                        let response = server
+                            .post(if strict {
+                                "/chat/completions"
+                            } else {
+                                "/v1/chat/completions"
+                            })
+                            .json(&json!({
+                                "model": "gpt-4", "stream": streaming,
+                                "messages": [{"role": "user", "content": "Hello"}]
+                            }))
+                            .await;
+                        assert_eq!(
+                            response.status_code(),
+                            429,
+                            "strict={strict}, embedded={embedded}, streaming={streaming}, retry={retry}"
+                        );
+                        let error = response.json::<serde_json::Value>();
+                        assert_eq!(error["error"]["type"], "rate_limit_error");
+                        assert_eq!(error["error"]["code"], "upstream_rate_limit");
+                        assert_eq!(
+                            error["error"]["message"],
+                            "Contact support for a dedicated deployment."
+                        );
+                        assert!(!response.text().contains("private upstream details"));
+                        assert_eq!(mock.get_requests().len(), if retry { 2 } else { 1 });
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trusted_embedded_error_keeps_server_and_rate_limit_details_private() {
+        for code in [429, 500, 501, 503] {
+            for streaming in [false, true] {
+                let body =
+                    json!({"error":{"code":code,"message":"private upstream failure"}}).to_string();
+                let mock = if streaming {
+                    MockHttpClient::new_streaming(StatusCode::OK, vec![format!("data: {body}\n\n")])
+                } else {
+                    MockHttpClient::new(StatusCode::OK, &body)
+                };
+                let targets = embedded_error_targets("gpt-4", 1);
+                targets.targets.insert(
+                    "gpt-4".to_string(),
+                    pool(
+                        Target::builder()
+                            .url("https://provider.example.com/".parse().unwrap())
+                            .trusted(true)
+                            .build(),
+                    ),
+                );
+                let server =
+                    TestServer::new(build_router(AppState::with_client(targets, mock))).unwrap();
+                let response = server
+                    .post("/v1/chat/completions")
+                    .json(&json!({
+                        "model":"gpt-4", "stream":streaming,
+                        "messages":[{"role":"user","content":"hello"}]
+                    }))
+                    .await;
+                let expected = match code {
+                    429 => 429,
+                    // A provider with no room is a capacity refusal.
+                    503 => 529,
+                    _ => 503,
+                };
+                assert_eq!(response.status_code(), expected);
+                assert!(!response.text().contains("private upstream failure"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_streaming_embedded_error_retries_then_exhausts_to_429() {
         // 200 stream whose first frame is a `429` error envelope. onwards must
-        // retry across providers and, when exhausted, return a sanitized 503 —
-        // never the upstream 429.
+        // retry across providers and, when exhausted, return a sanitized 429.
         let error_frame =
             "data: {\"error\":{\"code\":429,\"message\":\"Provider returned error\"}}\n\n"
                 .to_string();
@@ -1213,8 +2026,8 @@ mod tests {
 
         assert_eq!(
             response.status_code(),
-            503,
-            "exhausted retries must surface a sanitized 503, not the upstream 429"
+            429,
+            "exhausted retries must preserve the upstream 429"
         );
         assert_eq!(
             mock.get_requests().len(),
@@ -1260,8 +2073,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unary_embedded_error_collapses_to_503() {
-        // The same envelope on a non-streaming 200 body collapses to a 503.
+    async fn test_unary_embedded_rate_limit_preserves_429() {
+        // The same envelope on a non-streaming 200 body surfaces as a 429.
         let body = r#"{"error":{"code":429,"message":"Provider returned error"}}"#;
         let mock = MockHttpClient::new(StatusCode::OK, body);
         let app_state = AppState::with_client(embedded_error_targets("gpt-4", 2), mock.clone());
@@ -1275,7 +2088,7 @@ mod tests {
             }))
             .await;
 
-        assert_eq!(response.status_code(), 503);
+        assert_eq!(response.status_code(), 429);
         assert_eq!(
             mock.get_requests().len(),
             2,
@@ -1286,7 +2099,7 @@ mod tests {
     #[tokio::test]
     async fn test_streaming_keepalive_before_error_is_still_detected() {
         // A keep-alive comment precedes the error frame; the peek must skip it
-        // and still detect the 429, retry, and exhaust to 503.
+        // and still detect the 429, retry, and exhaust to 429.
         let keepalive = ": keep-alive\n\n".to_string();
         let error_frame =
             "data: {\"error\":{\"code\":429,\"message\":\"Provider returned error\"}}\n\n"
@@ -1305,7 +2118,7 @@ mod tests {
 
         assert_eq!(
             response.status_code(),
-            503,
+            429,
             "an error after a keep-alive frame must still be detected"
         );
         assert_eq!(mock.get_requests().len(), 2);
@@ -1352,6 +2165,389 @@ mod tests {
             mock.get_requests().len(),
             2,
             "empty stream must trigger a retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_slow_streaming_empty_body_retries_then_succeeds() {
+        // Regression for a stream that stays idle past the SSE peek budget, then
+        // closes without any frames. It is still a terminal empty response and
+        // must not be forwarded as a bodyless 200.
+        let mock = MockHttpClient::new_delayed_streaming_sequence(
+            StatusCode::OK,
+            vec![
+                (std::time::Duration::from_millis(20), vec![]),
+                (
+                    std::time::Duration::ZERO,
+                    vec![OK_CONTENT_FRAME.to_string()],
+                ),
+            ],
+        );
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 2, vec![502]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4", "stream": true,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200, "the retry's success is served");
+        assert!(
+            response.text().contains("hi"),
+            "client receives the healthy provider's content"
+        );
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "slow empty stream must trigger a retry"
+        );
+    }
+
+    /// Two priority providers (`p0`, `p1`) with a 100ms first-token failover
+    /// default. `max_attempts` is unset, so attempt 1 is armed and attempt 2 —
+    /// the last — is not.
+    fn first_token_app(mock: MockHttpClient) -> AppState<MockHttpClient> {
+        AppState::with_client(fallback_targets("gpt-4", 2, vec![502]), mock)
+            .with_first_token_timeout(std::time::Duration::from_millis(100))
+    }
+
+    fn chat_request(stream: bool) -> serde_json::Value {
+        json!({
+            "model": "gpt-4", "stream": stream,
+            "messages": [{"role": "user", "content": "Hello"}]
+        })
+    }
+
+    /// A stream that is 200 OK immediately but produces its content only after
+    /// `delay` — the shape of a provider that accepts a request and stalls.
+    fn slow_stream(delay: std::time::Duration) -> (std::time::Duration, Vec<String>) {
+        (delay, vec![OK_CONTENT_FRAME.to_string()])
+    }
+
+    #[tokio::test]
+    async fn test_first_token_timeout_fails_over_stalled_stream() {
+        // Provider 0 sends headers and then nothing; provider 1 is healthy. The
+        // stall must be abandoned at the deadline, not forwarded to the client.
+        let mock = MockHttpClient::new_delayed_streaming_sequence(
+            StatusCode::OK,
+            vec![
+                slow_stream(std::time::Duration::from_secs(30)),
+                slow_stream(std::time::Duration::ZERO),
+            ],
+        );
+        let server = TestServer::new(build_router(first_token_app(mock.clone()))).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&chat_request(true))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        assert!(
+            response.text().contains("hi"),
+            "served by the healthy provider"
+        );
+        let requests = mock.get_requests();
+        assert_eq!(requests.len(), 2, "the stalled stream must fail over");
+        assert!(
+            requests[1].uri.starts_with("https://p1.example.com/"),
+            "failover goes to the next provider, got {}",
+            requests[1].uri
+        );
+    }
+
+    #[tokio::test]
+    async fn test_first_token_timeout_ignores_keep_alive_comments() {
+        // A stalled provider may keep the connection warm with SSE comments.
+        // Those are not a first token, so they must not defuse the deadline.
+        let keep_alive = |ms: u64| {
+            (
+                std::time::Duration::from_millis(ms),
+                ": keep-alive\n\n".to_string(),
+            )
+        };
+        let mock = MockHttpClient::new_timed_streaming_sequence(
+            StatusCode::OK,
+            vec![
+                vec![
+                    keep_alive(0),
+                    keep_alive(20),
+                    keep_alive(20),
+                    keep_alive(20),
+                    keep_alive(20),
+                    (
+                        std::time::Duration::from_secs(30),
+                        OK_CONTENT_FRAME.to_string(),
+                    ),
+                ],
+                vec![(std::time::Duration::ZERO, OK_CONTENT_FRAME.to_string())],
+            ],
+        );
+        let server = TestServer::new(build_router(first_token_app(mock.clone()))).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&chat_request(true))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        assert!(response.text().contains("hi"));
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "keep-alive comments alone must not count as a first token"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_first_token_timeout_spares_the_final_attempt() {
+        // Both providers are slower than the deadline. The first is abandoned,
+        // but the last attempt is left to finish: failover may reroute a slow
+        // request, never fail one that would otherwise have succeeded.
+        let slow = slow_stream(std::time::Duration::from_millis(300));
+        let mock = MockHttpClient::new_delayed_streaming_sequence(
+            StatusCode::OK,
+            vec![slow.clone(), slow],
+        );
+        let server = TestServer::new(build_router(first_token_app(mock.clone()))).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&chat_request(true))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        assert!(
+            response.text().contains("hi"),
+            "the final attempt is served"
+        );
+        assert_eq!(mock.get_requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_first_token_timeout_exempt_header_opts_out() {
+        let mock = MockHttpClient::new_delayed_streaming_sequence(
+            StatusCode::OK,
+            vec![slow_stream(std::time::Duration::from_millis(300))],
+        );
+        let app = first_token_app(mock.clone())
+            .with_first_token_timeout_exempt_header("x-fusillade-batch-created-at");
+        let server = TestServer::new(build_router(app)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .add_header("x-fusillade-batch-created-at", "2026-09-15T00:00:00Z")
+            .json(&chat_request(true))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        assert!(response.text().contains("hi"));
+        assert_eq!(
+            mock.get_requests().len(),
+            1,
+            "a request carrying the exempt header is never failed over on time"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_first_token_timeout_leaves_non_streaming_alone() {
+        // Unary headers only arrive with the whole completion, so a slow
+        // non-streaming request must not be failed over.
+        let mock = MockHttpClient::new_delayed_streaming_sequence(
+            StatusCode::OK,
+            vec![slow_stream(std::time::Duration::from_millis(300))],
+        );
+        let server = TestServer::new(build_router(first_token_app(mock.clone()))).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&chat_request(false))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(mock.get_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_done_sentinel_is_not_a_first_token_but_is_not_empty() {
+        // `[DONE]` is a data frame carrying no token. It must not count as a
+        // first token — and it must not be mistaken for an empty body either,
+        // since `saw_data` is what suppresses the retryable `EmptyBody` verdict.
+        // So: one attempt, forwarded to the client, no failover.
+        let mock =
+            MockHttpClient::new_streaming(StatusCode::OK, vec!["data: [DONE]\n\n".to_string()]);
+        let server = TestServer::new(build_router(first_token_app(mock.clone()))).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&chat_request(true))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(
+            mock.get_requests().len(),
+            1,
+            "a [DONE]-only stream is not empty, so it must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_first_token_timeout_needs_a_different_provider() {
+        // A single-provider pool with a retry budget has attempts left but no
+        // other provider: re-running a slow prefill on the same backend would
+        // only waste it, so the deadline stays disarmed.
+        let mock = MockHttpClient::new_delayed_streaming_sequence(
+            StatusCode::OK,
+            vec![slow_stream(std::time::Duration::from_millis(300))],
+        );
+        let targets = fallback_targets_with(
+            "gpt-4",
+            1,
+            target::FallbackConfig {
+                enabled: true,
+                on_status: vec![502],
+                max_attempts: Some(3),
+                ..Default::default()
+            },
+        );
+        let app = AppState::with_client(targets, mock.clone())
+            .with_first_token_timeout(std::time::Duration::from_millis(100));
+        let server = TestServer::new(build_router(app)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&chat_request(true))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(mock.get_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_pool_first_token_timeout_overrides_default() {
+        let stalled_then_healthy = || {
+            MockHttpClient::new_delayed_streaming_sequence(
+                StatusCode::OK,
+                vec![
+                    slow_stream(std::time::Duration::from_millis(300)),
+                    slow_stream(std::time::Duration::ZERO),
+                ],
+            )
+        };
+        let pool_timeout = |ms: u64| {
+            fallback_targets_with(
+                "gpt-4",
+                2,
+                target::FallbackConfig {
+                    enabled: true,
+                    on_status: vec![502],
+                    first_token_timeout_ms: Some(ms),
+                    aimd: None,
+                    ..Default::default()
+                },
+            )
+        };
+
+        // A pool's own timeout arms failover with no proxy-wide default...
+        let mock = stalled_then_healthy();
+        let server = TestServer::new(build_router(AppState::with_client(
+            pool_timeout(100),
+            mock.clone(),
+        )))
+        .unwrap();
+        server
+            .post("/v1/chat/completions")
+            .json(&chat_request(true))
+            .await
+            .assert_status_ok();
+        assert_eq!(mock.get_requests().len(), 2, "pool timeout arms failover");
+
+        // ...and `0` disarms it despite one.
+        let mock = stalled_then_healthy();
+        let app = AppState::with_client(pool_timeout(0), mock.clone())
+            .with_first_token_timeout(std::time::Duration::from_millis(100));
+        let server = TestServer::new(build_router(app)).unwrap();
+        server
+            .post("/v1/chat/completions")
+            .json(&chat_request(true))
+            .await
+            .assert_status_ok();
+        assert_eq!(mock.get_requests().len(), 1, "pool timeout of 0 disarms it");
+    }
+
+    #[tokio::test]
+    async fn test_slow_streaming_content_is_not_retried() {
+        // A valid stream may be slow to first token. Once it produces data, the
+        // original stream must be forwarded intact without duplicate work.
+        let mock = MockHttpClient::new_delayed_streaming_sequence(
+            StatusCode::OK,
+            vec![(
+                std::time::Duration::from_millis(20),
+                vec![OK_CONTENT_FRAME.to_string()],
+            )],
+        );
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 2, vec![502]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4", "stream": true,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        assert!(
+            response.text().contains("hi"),
+            "client receives the slow provider's content"
+        );
+        assert_eq!(
+            mock.get_requests().len(),
+            1,
+            "slow content must not trigger a retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_idle_stream_after_decisive_wait_is_forwarded_not_retried() {
+        // If an upstream opens an SSE response and then stays idle past both the
+        // initial peek and bounded decisive wait, the handler must not withhold
+        // response headers indefinitely. The still-open stream is forwarded and
+        // any later content is delivered from the original provider.
+        let mock = MockHttpClient::new_delayed_streaming_sequence(
+            StatusCode::OK,
+            vec![(
+                std::time::Duration::from_millis(75),
+                vec![OK_CONTENT_FRAME.to_string()],
+            )],
+        );
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 2, vec![502]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4", "stream": true,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        assert!(
+            response.text().contains("hi"),
+            "client receives the original provider's delayed content"
+        );
+        assert_eq!(
+            mock.get_requests().len(),
+            1,
+            "idle-but-open stream must not retry before a terminal empty is observed"
         );
     }
 
@@ -1403,6 +2599,218 @@ mod tests {
             2,
             "empty unary body must trigger a retry"
         );
+    }
+
+    #[tokio::test]
+    async fn test_errors_standing_in_for_an_upstream_are_attributed_to_the_provider() {
+        use tower::ServiceExt;
+
+        let origin = |mock: MockHttpClient, targets: target::Targets, model: &'static str| async move {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    json!({"model": model, "messages": [{"role": "user", "content": "Hello"}]})
+                        .to_string(),
+                ))
+                .unwrap();
+            let response = build_router(AppState::with_client(targets, mock))
+                .oneshot(request)
+                .await
+                .unwrap();
+            (
+                response.status().as_u16(),
+                response.extensions().get::<crate::ErrorOrigin>().cloned(),
+            )
+        };
+
+        // An embedded server error, not retried: collapsed to a 503 that
+        // reports the provider's failure.
+        let body = json!({"error": {"code": 500, "message": "upstream failure"}}).to_string();
+        let embedded = MockHttpClient::new(StatusCode::OK, &body);
+        assert_eq!(
+            origin(embedded, embedded_error_targets("gpt-4", 1), "gpt-4").await,
+            (503, Some(crate::ErrorOrigin::Provider))
+        );
+
+        // An embedded capacity refusal: a 529 that is the provider's, too.
+        let body = json!({"error": {"code": 503, "message": "no room"}}).to_string();
+        let embedded = MockHttpClient::new(StatusCode::OK, &body);
+        assert_eq!(
+            origin(embedded, embedded_error_targets("gpt-4", 1), "gpt-4").await,
+            (529, Some(crate::ErrorOrigin::Provider))
+        );
+
+        // Every provider answered with an empty body.
+        let empty = MockHttpClient::new(StatusCode::OK, "");
+        assert_eq!(
+            origin(empty, fallback_targets("gpt-4", 2, vec![502]), "gpt-4").await,
+            (503, Some(crate::ErrorOrigin::Provider))
+        );
+
+        // An unknown model is onwards' own decision.
+        let unused = MockHttpClient::new(StatusCode::OK, "");
+        assert_eq!(
+            origin(unused, embedded_error_targets("gpt-4", 1), "no-such-model").await,
+            (
+                404,
+                Some(crate::ErrorOrigin::Gateway {
+                    code: "model_not_found".to_string()
+                })
+            )
+        );
+    }
+
+    /// Upstream overload status (529) that every member of a pool returns.
+    fn overloaded_mock() -> MockHttpClient {
+        MockHttpClient::new(
+            StatusCode::from_u16(529).unwrap(),
+            r#"{"error":{"message":"overloaded"}}"#,
+        )
+    }
+
+    fn retrying_fallback(on_status: Vec<u16>, max_attempts: usize) -> target::FallbackConfig {
+        target::FallbackConfig {
+            enabled: true,
+            on_status,
+            max_attempts: Some(max_attempts),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_overloaded_members_are_asked_once_and_caller_gets_529() {
+        // Every member is full. A budget of six attempts must not be spent
+        // re-asking members that have just refused: each is asked once, and
+        // the caller is told the model is at capacity rather than handed a 502.
+        let mock = overloaded_mock();
+        let app_state = AppState::with_client(
+            fallback_targets_with("gpt-4", 2, retrying_fallback(vec![529], 6)),
+            mock.clone(),
+        );
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 529);
+        assert_eq!(response.header("retry-after"), "1");
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["error"]["code"], "overloaded");
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "each overloaded member is asked once"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_single_overloaded_member_is_not_reasked() {
+        let mock = overloaded_mock();
+        let app_state = AppState::with_client(
+            fallback_targets_with("gpt-4", 1, retrying_fallback(vec![529], 3)),
+            mock.clone(),
+        );
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 529);
+        assert_eq!(mock.get_requests().len(), 1);
+    }
+
+    async fn chat(app_state: AppState<MockHttpClient>) -> axum_test::TestResponse {
+        TestServer::new(build_router(app_state))
+            .unwrap()
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_members_answering_503_are_asked_once_and_caller_gets_529() {
+        // A provider that is up but has no worker free answers 503: the same
+        // refusal as a 529, so it too sits out the rest of the request.
+        let mock = MockHttpClient::new(StatusCode::SERVICE_UNAVAILABLE, "{}");
+        let response = chat(AppState::with_client(
+            fallback_targets_with("gpt-4", 2, retrying_fallback(vec![503], 6)),
+            mock.clone(),
+        ))
+        .await;
+
+        assert_eq!(response.status_code(), 529);
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["error"]["code"], "overloaded");
+        assert_eq!(mock.get_requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_capacity_refusal_without_failover_reaches_caller_as_529() {
+        let mock = MockHttpClient::new(StatusCode::SERVICE_UNAVAILABLE, "{}");
+        let response = chat(AppState::with_client(
+            fallback_targets("gpt-4", 1, vec![]),
+            mock.clone(),
+        ))
+        .await;
+
+        assert_eq!(response.status_code(), 529);
+        assert_eq!(response.header("retry-after"), "1");
+    }
+
+    #[tokio::test]
+    async fn test_model_with_no_provider_answers_529_no_capacity() {
+        // Nothing is serving the model: a capacity refusal with a longer wait,
+        // since a provider has to be placed and start first.
+        let mock = MockHttpClient::new(StatusCode::OK, "{}");
+        let response = chat(AppState::with_client(
+            fallback_targets_with("gpt-4", 0, retrying_fallback(vec![529], 1)),
+            mock.clone(),
+        ))
+        .await;
+
+        assert_eq!(response.status_code(), 529);
+        assert_eq!(response.header("retry-after"), "30");
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["error"]["code"], "no_capacity");
+        assert!(mock.get_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_non_overload_failures_still_spend_the_retry_budget() {
+        // Only an overload refusal takes a member out of the request; a member
+        // that failed for another reason is retried in later passes as before.
+        let mock = MockHttpClient::new(StatusCode::INTERNAL_SERVER_ERROR, "{}");
+        let app_state = AppState::with_client(
+            fallback_targets_with("gpt-4", 1, retrying_fallback(vec![500], 3)),
+            mock.clone(),
+        );
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 502);
+        assert_eq!(mock.get_requests().len(), 3);
     }
 
     #[tokio::test]
@@ -1492,6 +2900,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
         };
@@ -1565,6 +2974,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_rewritten_body_keeps_key_order() {
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "test-model".to_string(),
+            pool(
+                Target::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .onwards_model("upstream-model".to_string())
+                    .build(),
+            ),
+        );
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
+            strict_mode: false,
+            http_pool_config: None,
+        };
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"choices": []}"#);
+        let app_state = AppState::with_client(targets, mock_client.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let schema = r#"{"type":"object","properties":{"reasoning":{"type":"string"},"answer":{"type":"string"}},"required":["reasoning","answer"],"additionalProperties":false}"#;
+        let body = format!(
+            r#"{{"model":"test-model","messages":[{{"role":"user","content":"Hello!"}}],"response_format":{{"type":"json_schema","json_schema":{{"name":"answer","strict":true,"schema":{schema}}}}},"temperature":0.7}}"#
+        );
+        let response = server
+            .post("/v1/chat/completions")
+            .content_type("application/json")
+            .bytes(body.clone().into())
+            .await;
+        assert_eq!(response.status_code(), 200);
+
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1);
+        let forwarded = String::from_utf8(requests[0].body.clone()).unwrap();
+        assert_eq!(
+            forwarded,
+            body.replace(r#""model":"test-model""#, r#""model":"upstream-model""#)
+        );
+    }
+
+    #[tokio::test]
     async fn test_model_override_header_takes_precedence() {
         // Create two targets
         let targets_map = Arc::new(DashMap::new());
@@ -1592,6 +3046,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
         };
@@ -1667,6 +3122,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
         };
@@ -1765,6 +3221,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
         };
@@ -1874,6 +3331,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
         };
@@ -1937,6 +3395,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
         };
@@ -2020,6 +3479,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
         };
@@ -2078,7 +3538,7 @@ mod tests {
             .build();
         targets_map.insert(
             "limited-model".to_string(),
-            ProviderPool::new(vec![Provider::with_concurrency_limit(target, 1, 5)]),
+            ProviderPool::new(vec![Provider::with_concurrency_limit(target, 1, 5)]).into(),
         );
 
         let targets = Targets {
@@ -2086,6 +3546,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
         };
@@ -2131,7 +3592,8 @@ mod tests {
                 target::LoadBalanceStrategy::default(),
                 false,
                 Vec::new(),
-            ),
+            )
+            .into(),
         );
 
         let targets = Targets {
@@ -2139,6 +3601,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
         };
@@ -2170,10 +3633,11 @@ mod tests {
                     .json(&json!({"model": "limited-model", "messages": []}))
                     .await;
 
-                // Second request should be rejected (concurrency limit exceeded)
-                assert_eq!(response2.status_code(), 429);
+                // Second request should be rejected: the model's own cap is
+                // capacity, not the caller's limit
+                assert_eq!(response2.status_code(), 529);
                 let body: serde_json::Value = response2.json();
-                assert_eq!(body["error"]["code"], "concurrency_limit_exceeded");
+                assert_eq!(body["error"]["code"], "overloaded");
 
                 // Complete the first request
                 mock_client.complete_request(0);
@@ -2213,6 +3677,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters,
             key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
         };
@@ -2268,6 +3733,810 @@ mod tests {
             .await;
     }
 
+    fn inflight_limited_targets(limits: inflight::InflightLimits) -> Targets {
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "limited-model".to_string(),
+            ProviderPool::new(vec![Provider::new(
+                Target::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .build(),
+                1,
+            )])
+            .with_inflight_limits(Some(limits))
+            .into(),
+        );
+        let key_labels = Arc::new(DashMap::new());
+        for (key, account) in [
+            ("sk-acct-a", "acct-a"),
+            ("sk-acct-a-second", "acct-a"),
+            ("sk-acct-b", "acct-b"),
+        ] {
+            key_labels.insert(
+                key.to_string(),
+                std::collections::HashMap::from([(
+                    serving::ACCOUNT_LABEL.to_string(),
+                    account.to_string(),
+                )]),
+            );
+        }
+        Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels,
+            accounts: Arc::new(DashMap::new()),
+            strict_mode: false,
+            http_pool_config: None,
+        }
+    }
+
+    fn limited_chat_request(key: &str) -> axum::extract::Request {
+        inflight_chat_request("limited-model", key)
+    }
+
+    fn inflight_chat_request(model: &str, key: &str) -> axum::extract::Request {
+        axum::extract::Request::builder()
+            .uri("/v1/chat/completions")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {key}"))
+            .body(axum::body::Body::from(
+                json!({"model": model, "messages": []}).to_string(),
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_inflight_limit_holds_the_slot_until_the_response_body_finishes() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let targets = inflight_limited_targets(inflight::InflightLimits {
+            default: 1,
+            accounts: std::collections::HashMap::new(),
+        });
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let router = build_router(AppState::with_client(targets, mock_client.clone()));
+
+        let first = router
+            .clone()
+            .oneshot(limited_chat_request("sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let refused = router
+            .clone()
+            .oneshot(limited_chat_request("sk-acct-a-second"))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(refused.headers()["retry-after"], "1");
+        let refused_body: serde_json::Value =
+            serde_json::from_slice(&refused.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(refused_body["error"]["code"], "inflight_limit_exceeded");
+
+        first.into_body().collect().await.unwrap();
+
+        let after = router
+            .clone()
+            .oneshot(limited_chat_request("sk-acct-a-second"))
+            .await
+            .unwrap();
+        assert_eq!(after.status(), StatusCode::OK);
+        assert_eq!(mock_client.get_requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_inflight_limit_counts_each_account_against_its_own_limit() {
+        use tower::ServiceExt;
+
+        let targets = inflight_limited_targets(inflight::InflightLimits {
+            default: 1,
+            accounts: std::collections::HashMap::from([("acct-b".to_string(), 2)]),
+        });
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let router = build_router(AppState::with_client(targets, mock_client.clone()));
+
+        let mut held = Vec::new();
+        for key in ["sk-acct-a", "sk-acct-b", "sk-acct-b"] {
+            let response = router
+                .clone()
+                .oneshot(limited_chat_request(key))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            held.push(response);
+        }
+
+        for key in ["sk-acct-a", "sk-acct-b"] {
+            let response = router
+                .clone()
+                .oneshot(limited_chat_request(key))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+        assert_eq!(mock_client.get_requests().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_inflight_limit_skips_requests_carrying_the_exempt_header() {
+        use tower::ServiceExt;
+
+        let targets = inflight_limited_targets(inflight::InflightLimits {
+            default: 1,
+            accounts: std::collections::HashMap::new(),
+        });
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let router = build_router(
+            AppState::with_client(targets, mock_client.clone())
+                .with_first_token_timeout_exempt_header("x-dispatched"),
+        );
+        let exempt_request = || {
+            let mut request = limited_chat_request("sk-acct-a");
+            request
+                .headers_mut()
+                .insert("x-dispatched", axum::http::HeaderValue::from_static("1"));
+            request
+        };
+
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let response = router.clone().oneshot(exempt_request()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            held.push(response);
+        }
+        let realtime = router
+            .clone()
+            .oneshot(limited_chat_request("sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(realtime.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_inflight_limit_counts_a_redirected_request_against_the_model_it_named() {
+        use crate::target::{LoadBalanceStrategy, RoutingAction, RoutingRule};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let provider = || {
+            Provider::new(
+                Target::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .build(),
+                1,
+            )
+        };
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "named-model".to_string(),
+            ProviderPool::with_config(
+                vec![provider()],
+                None,
+                None,
+                None,
+                None,
+                LoadBalanceStrategy::default(),
+                false,
+                vec![RoutingRule {
+                    match_labels: std::collections::HashMap::from([(
+                        "purpose".to_string(),
+                        "realtime".to_string(),
+                    )]),
+                    action: RoutingAction::Redirect {
+                        target: "served-model".to_string(),
+                    },
+                }],
+            )
+            .with_inflight_limits(Some(inflight::InflightLimits {
+                default: 1,
+                accounts: std::collections::HashMap::new(),
+            }))
+            .into(),
+        );
+        targets_map.insert(
+            "served-model".to_string(),
+            ProviderPool::new(vec![provider()])
+                .with_inflight_limits(Some(inflight::InflightLimits {
+                    default: 5,
+                    accounts: std::collections::HashMap::new(),
+                }))
+                .into(),
+        );
+        let key_labels = Arc::new(DashMap::new());
+        key_labels.insert(
+            "sk-acct-a".to_string(),
+            std::collections::HashMap::from([
+                (serving::ACCOUNT_LABEL.to_string(), "acct-a".to_string()),
+                ("purpose".to_string(), "realtime".to_string()),
+            ]),
+        );
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels,
+            accounts: Arc::new(DashMap::new()),
+            strict_mode: false,
+            http_pool_config: None,
+        };
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let router = build_router(AppState::with_client(targets, mock_client.clone()));
+
+        let redirected = router
+            .clone()
+            .oneshot(inflight_chat_request("named-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(redirected.status(), StatusCode::OK);
+
+        let refused = router
+            .clone()
+            .oneshot(inflight_chat_request("named-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        let refused_body: serde_json::Value =
+            serde_json::from_slice(&refused.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert!(
+            refused_body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("'named-model'")
+        );
+
+        let direct = router
+            .clone()
+            .oneshot(inflight_chat_request("served-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(direct.status(), StatusCode::OK);
+        assert_eq!(mock_client.get_requests().len(), 2);
+    }
+
+    /// A pool with the batch cap under test and, optionally, a realtime limit.
+    fn batch_limited_targets(batch_limit: Option<u32>, realtime_limit: Option<u32>) -> Targets {
+        let targets_map = Arc::new(DashMap::new());
+        let mut pool = ProviderPool::new(vec![Provider::new(
+            Target::builder()
+                .url("https://api.example.com".parse().unwrap())
+                .build(),
+            1,
+        )])
+        .with_batch_inflight_limit(batch_limit);
+        if let Some(limit) = realtime_limit {
+            pool = pool.with_inflight_limits(Some(inflight::InflightLimits {
+                default: limit,
+                accounts: std::collections::HashMap::new(),
+            }));
+        }
+        targets_map.insert("batch-model".to_string(), pool.into());
+        let key_labels = Arc::new(DashMap::new());
+        key_labels.insert(
+            "sk-acct-a".to_string(),
+            std::collections::HashMap::from([(
+                serving::ACCOUNT_LABEL.to_string(),
+                "acct-a".to_string(),
+            )]),
+        );
+        Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels,
+            accounts: Arc::new(DashMap::new()),
+            strict_mode: false,
+            http_pool_config: None,
+        }
+    }
+
+    /// The dispatcher stamps every request it sends with the exempt header, so
+    /// this is what onwards classifies as batch traffic.
+    fn dispatched_chat_request(model: &str, key: &str) -> axum::extract::Request {
+        let mut request = inflight_chat_request(model, key);
+        request
+            .headers_mut()
+            .insert("x-dispatched", axum::http::HeaderValue::from_static("1"));
+        request
+    }
+
+    /// An unauthenticated dispatched request, for pools whose key labels are
+    /// empty (the fallback targets).
+    fn dispatched_request(model: &str) -> axum::extract::Request {
+        axum::extract::Request::builder()
+            .uri("/v1/chat/completions")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-dispatched", "1")
+            .body(axum::body::Body::from(
+                json!({"model": model, "messages": []}).to_string(),
+            ))
+            .unwrap()
+    }
+
+    /// Records every `try_acquire` so a test can assert the batch limiter was
+    /// (or was not) consulted and how many slots it was asked for.
+    #[derive(Debug, Default)]
+    struct CountingBatchLimiter {
+        calls: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl CountingBatchLimiter {
+        fn calls(&self) -> Vec<(String, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl inflight::InflightLimiter for CountingBatchLimiter {
+        fn try_acquire<'a>(
+            &'a self,
+            account: &'a str,
+            model: &'a str,
+            _limit: u32,
+        ) -> futures_util::future::BoxFuture<'a, Option<inflight::InflightSlot>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((account.to_owned(), model.to_owned()));
+            Box::pin(std::future::ready(Some(inflight::InflightSlot::new(()))))
+        }
+    }
+
+    fn batch_router_with_limiter(
+        targets: Targets,
+        mock_client: MockHttpClient,
+        enforce: bool,
+        limiter: Arc<dyn inflight::InflightLimiter>,
+    ) -> Router {
+        build_router(
+            AppState::with_client(targets, mock_client)
+                .with_first_token_timeout_exempt_header("x-dispatched")
+                .with_batch_inflight_enforce(enforce)
+                .with_batch_inflight_limiter(limiter),
+        )
+    }
+
+    /// Fallback targets carrying a global batch cap, for failover tests.
+    fn fallback_batch_targets(
+        alias: &str,
+        n: usize,
+        fallback: target::FallbackConfig,
+        batch_limit: Option<u32>,
+    ) -> target::Targets {
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::{LoadBalanceStrategy, Target};
+
+        let providers = (0..n)
+            .map(|i| {
+                let t = Target::builder()
+                    .url(format!("https://p{i}.example.com/").parse().unwrap())
+                    .request_timeout_secs(5)
+                    .build();
+                Provider::new(t, 1)
+            })
+            .collect();
+        let pool = ProviderPool::with_config(
+            providers,
+            None,
+            None,
+            None,
+            Some(fallback),
+            LoadBalanceStrategy::Priority,
+            false,
+            Vec::new(),
+        )
+        .with_batch_inflight_limit(batch_limit);
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(alias.to_string(), pool.into());
+        target::Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        }
+    }
+
+    fn batch_router(targets: Targets, mock_client: MockHttpClient, enforce: bool) -> Router {
+        build_router(
+            AppState::with_client(targets, mock_client)
+                .with_first_token_timeout_exempt_header("x-dispatched")
+                .with_batch_inflight_enforce(enforce),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_batch_inflight_cap_admits_up_to_the_limit() {
+        use tower::ServiceExt;
+
+        let targets = batch_limited_targets(Some(2), None);
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let router = batch_router(targets, mock_client.clone(), true);
+
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let response = router
+                .clone()
+                .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            held.push(response);
+        }
+        assert_eq!(mock_client.get_requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_batch_inflight_cap_refuses_at_the_cap_with_529() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let targets = batch_limited_targets(Some(1), None);
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let router = batch_router(targets, mock_client.clone(), true);
+
+        let admitted = router
+            .clone()
+            .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(admitted.status(), StatusCode::OK);
+
+        let refused = router
+            .clone()
+            .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::from_u16(529).unwrap());
+        assert_eq!(refused.headers()["retry-after"], "1");
+        let refused_body: serde_json::Value =
+            serde_json::from_slice(&refused.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(refused_body["error"]["type"], "overloaded_error");
+        assert_eq!(refused_body["error"]["code"], "batch_capacity_exceeded");
+        let message = refused_body["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("'batch-model'"),
+            "names the model: {message}"
+        );
+        assert!(message.contains('1'), "names the cap: {message}");
+        assert_eq!(mock_client.get_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_batch_inflight_slot_frees_when_body_finishes_or_drops() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let targets = batch_limited_targets(Some(1), None);
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let router = batch_router(targets, mock_client.clone(), true);
+
+        // Held until the body is fully consumed.
+        let first = router
+            .clone()
+            .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        let refused = router
+            .clone()
+            .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::from_u16(529).unwrap());
+        first.into_body().collect().await.unwrap();
+
+        let after = router
+            .clone()
+            .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(after.status(), StatusCode::OK);
+        drop(after);
+
+        // Dropping an unconsumed response frees the slot too (client
+        // disconnect).
+        let held = router
+            .clone()
+            .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(held.status(), StatusCode::OK);
+        drop(held);
+        let after_drop = router
+            .clone()
+            .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(after_drop.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_realtime_requests_never_touch_the_batch_cap() {
+        use tower::ServiceExt;
+
+        let targets = batch_limited_targets(Some(1), None);
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let router = batch_router(targets, mock_client.clone(), true);
+
+        let _batch = router
+            .clone()
+            .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+
+        // Realtime traffic is not counted against the batch cap.
+        let realtime = router
+            .clone()
+            .oneshot(inflight_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(realtime.status(), StatusCode::OK);
+
+        let refused = router
+            .clone()
+            .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::from_u16(529).unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_batch_inflight_null_cap_is_unlimited() {
+        use tower::ServiceExt;
+
+        let targets = batch_limited_targets(None, None);
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let router = batch_router(targets, mock_client.clone(), true);
+
+        let mut held = Vec::new();
+        for _ in 0..5 {
+            let response = router
+                .clone()
+                .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            held.push(response);
+        }
+        assert_eq!(mock_client.get_requests().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_batch_inflight_enforcement_off_never_refuses() {
+        use tower::ServiceExt;
+
+        let targets = batch_limited_targets(Some(1), None);
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let router = batch_router(targets, mock_client.clone(), false);
+
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            let response = router
+                .clone()
+                .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            held.push(response);
+        }
+        assert_eq!(mock_client.get_requests().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_batch_inflight_enforcement_off_does_not_consult_the_limiter() {
+        use tower::ServiceExt;
+
+        // Enforcement on proves the mock is wired in and counts.
+        let on_limiter = Arc::new(CountingBatchLimiter::default());
+        let on_router = batch_router_with_limiter(
+            batch_limited_targets(Some(1), None),
+            MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#),
+            true,
+            on_limiter.clone(),
+        );
+        let _held = on_router
+            .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(
+            on_limiter.calls().len(),
+            1,
+            "enforcement on consults the limiter"
+        );
+
+        // Off, the limiter must not be touched at all, so a request cannot be
+        // refused even when it is over the configured cap.
+        let off_limiter = Arc::new(CountingBatchLimiter::default());
+        let off_router = batch_router_with_limiter(
+            batch_limited_targets(Some(1), None),
+            MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#),
+            false,
+            off_limiter.clone(),
+        );
+        for _ in 0..3 {
+            let response = off_router
+                .clone()
+                .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert!(
+            off_limiter.calls().is_empty(),
+            "enforcement off must never call try_acquire: {:?}",
+            off_limiter.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_inflight_counts_a_redirected_request_against_the_model_it_named() {
+        use crate::target::{LoadBalanceStrategy, RoutingAction, RoutingRule};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let provider = || {
+            Provider::new(
+                Target::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .build(),
+                1,
+            )
+        };
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "named-model".to_string(),
+            ProviderPool::with_config(
+                vec![provider()],
+                None,
+                None,
+                None,
+                None,
+                LoadBalanceStrategy::default(),
+                false,
+                vec![RoutingRule {
+                    match_labels: std::collections::HashMap::from([(
+                        "purpose".to_string(),
+                        "batch".to_string(),
+                    )]),
+                    action: RoutingAction::Redirect {
+                        target: "served-model".to_string(),
+                    },
+                }],
+            )
+            .with_batch_inflight_limit(Some(1))
+            .into(),
+        );
+        targets_map.insert(
+            "served-model".to_string(),
+            ProviderPool::new(vec![provider()])
+                .with_batch_inflight_limit(Some(5))
+                .into(),
+        );
+        let key_labels = Arc::new(DashMap::new());
+        key_labels.insert(
+            "sk-acct-a".to_string(),
+            std::collections::HashMap::from([
+                (serving::ACCOUNT_LABEL.to_string(), "acct-a".to_string()),
+                ("purpose".to_string(), "batch".to_string()),
+            ]),
+        );
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels,
+            accounts: Arc::new(DashMap::new()),
+            strict_mode: false,
+            http_pool_config: None,
+        };
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let router = batch_router(targets, mock_client.clone(), true);
+
+        let redirected = router
+            .clone()
+            .oneshot(dispatched_chat_request("named-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(redirected.status(), StatusCode::OK);
+
+        // The named model's cap is 1, so the second request must be refused
+        // even though it is served by `served-model` (cap 5).
+        let refused = router
+            .clone()
+            .oneshot(dispatched_chat_request("named-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::from_u16(529).unwrap());
+        let refused_body: serde_json::Value =
+            serde_json::from_slice(&refused.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(refused_body["error"]["code"], "batch_capacity_exceeded");
+        assert!(
+            refused_body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("'named-model'")
+        );
+
+        // A request naming `served-model` uses that model's own cap and is
+        // admitted while the redirected one holds its slot on `named-model`.
+        let direct = router
+            .clone()
+            .oneshot(dispatched_chat_request("served-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(direct.status(), StatusCode::OK);
+        assert_eq!(mock_client.get_requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_batch_failover_acquires_only_one_slot() {
+        use tower::ServiceExt;
+
+        let targets = fallback_batch_targets("gpt-4", 2, retrying_fallback(vec![502], 2), Some(1));
+        let mock_client =
+            MockHttpClient::new(StatusCode::BAD_GATEWAY, r#"{"error":{"message":"bad"}}"#);
+        let limiter = Arc::new(CountingBatchLimiter::default());
+        let router = batch_router_with_limiter(targets, mock_client.clone(), true, limiter.clone());
+
+        let response = router.oneshot(dispatched_request("gpt-4")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            mock_client.get_requests().len(),
+            2,
+            "the request failed over to the second provider"
+        );
+        assert_eq!(
+            limiter.calls().len(),
+            1,
+            "one slot is held across failover, not one per attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_and_realtime_counts_are_independent() {
+        use tower::ServiceExt;
+
+        let targets = batch_limited_targets(Some(1), Some(1));
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let router = batch_router(targets, mock_client.clone(), true);
+
+        // One realtime request and one batch request can be in flight at once:
+        // they use different count scopes for the same alias.
+        let _realtime = router
+            .clone()
+            .oneshot(inflight_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        let _batch = router
+            .clone()
+            .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+
+        let refused_realtime = router
+            .clone()
+            .oneshot(inflight_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(refused_realtime.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let refused_batch = router
+            .clone()
+            .oneshot(dispatched_chat_request("batch-model", "sk-acct-a"))
+            .await
+            .unwrap();
+        assert_eq!(refused_batch.status(), StatusCode::from_u16(529).unwrap());
+    }
+
     mod metrics {
         use super::*;
         use axum_test::TestServer;
@@ -2283,13 +4552,14 @@ mod tests {
         #[fixture]
         #[once]
         fn get_shared_metrics_servers(
-            #[default(Arc::new(DashMap::new()))] targets: Arc<DashMap<String, ProviderPool>>,
+            #[default(Arc::new(DashMap::new()))] targets: Arc<DashMap<String, target::TargetPools>>,
         ) -> (TestServer, TestServer) {
             let targets = Targets {
                 targets,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 key_labels: Arc::new(DashMap::new()),
+                accounts: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
             };
@@ -2481,398 +4751,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_body_transformation_applied() {
-        use serde_json::json;
-
-        // Create a simple target
-        let targets_map = Arc::new(DashMap::new());
-        targets_map.insert(
-            "test-model".to_string(),
-            pool(
-                Target::builder()
-                    .url("https://api.example.com".parse().unwrap())
-                    .build(),
-            ),
-        );
-
-        let targets = target::Targets {
-            targets: targets_map,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
-            strict_mode: false,
-            http_pool_config: None,
-        };
-
-        // Create a body transformation function that adds a "transformed": true field
-        let transform_fn: BodyTransformFn = Arc::new(|_path, _headers, body_bytes| {
-            if let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes)
-                && let Some(obj) = json_body.as_object_mut()
-            {
-                obj.insert("transformed".to_string(), json!(true));
-                if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
-                    return Some(axum::body::Bytes::from(transformed_bytes));
-                }
-            }
-            None
-        });
-
-        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
-        let app_state =
-            AppState::with_client_and_transform(targets, mock_client.clone(), transform_fn);
-        let router = build_router(app_state);
-        let server = TestServer::new(router).unwrap();
-
-        // Make a request
-        let response = server
-            .post("/v1/chat/completions")
-            .json(&json!({
-                "model": "test-model",
-                "messages": [{"role": "user", "content": "Hello"}]
-            }))
-            .await;
-
-        assert_eq!(response.status_code(), 200);
-
-        // Check that the request was transformed before forwarding
-        let requests = mock_client.get_requests();
-        assert_eq!(requests.len(), 1);
-
-        let forwarded_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert_eq!(forwarded_body["transformed"], true);
-        assert_eq!(forwarded_body["model"], "test-model");
-        assert_eq!(forwarded_body["messages"][0]["content"], "Hello");
-    }
-
-    #[tokio::test]
-    async fn test_body_transformation_not_applied_when_none() {
-        use serde_json::json;
-
-        // Create a simple target
-        let targets_map = Arc::new(DashMap::new());
-        targets_map.insert(
-            "test-model".to_string(),
-            pool(
-                Target::builder()
-                    .url("https://api.example.com".parse().unwrap())
-                    .build(),
-            ),
-        );
-
-        let targets = target::Targets {
-            targets: targets_map,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
-            strict_mode: false,
-            http_pool_config: None,
-        };
-
-        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
-        let app_state = AppState::with_client(targets, mock_client.clone()); // No transform function
-        let router = build_router(app_state);
-        let server = TestServer::new(router).unwrap();
-
-        // Make a request
-        let original_body = json!({
-            "model": "test-model",
-            "messages": [{"role": "user", "content": "Hello"}]
-        });
-
-        let response = server
-            .post("/v1/chat/completions")
-            .json(&original_body)
-            .await;
-
-        assert_eq!(response.status_code(), 200);
-
-        // Check that the request was NOT transformed
-        let requests = mock_client.get_requests();
-        assert_eq!(requests.len(), 1);
-
-        let forwarded_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert!(forwarded_body.get("transformed").is_none());
-        assert_eq!(forwarded_body["model"], "test-model");
-        assert_eq!(forwarded_body["messages"][0]["content"], "Hello");
-    }
-
-    #[tokio::test]
-    async fn test_body_transformation_returns_none() {
-        use serde_json::json;
-
-        // Create a simple target
-        let targets_map = Arc::new(DashMap::new());
-        targets_map.insert(
-            "test-model".to_string(),
-            pool(
-                Target::builder()
-                    .url("https://api.example.com".parse().unwrap())
-                    .build(),
-            ),
-        );
-
-        let targets = target::Targets {
-            targets: targets_map,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
-            strict_mode: false,
-            http_pool_config: None,
-        };
-
-        // Create a transformation function that always returns None (no transformation)
-        let transform_fn: BodyTransformFn = Arc::new(|_path, _headers, _body_bytes| None);
-
-        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
-        let app_state =
-            AppState::with_client_and_transform(targets, mock_client.clone(), transform_fn);
-        let router = build_router(app_state);
-        let server = TestServer::new(router).unwrap();
-
-        // Make a request
-        let original_body = json!({
-            "model": "test-model",
-            "messages": [{"role": "user", "content": "Hello"}]
-        });
-
-        let response = server
-            .post("/v1/chat/completions")
-            .json(&original_body)
-            .await;
-
-        assert_eq!(response.status_code(), 200);
-
-        // Check that the request was NOT transformed since function returned None
-        let requests = mock_client.get_requests();
-        assert_eq!(requests.len(), 1);
-
-        let forwarded_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert_eq!(forwarded_body, original_body);
-    }
-
-    #[tokio::test]
-    async fn test_openai_streaming_include_usage_transformation() {
-        use serde_json::json;
-
-        // Create a target for OpenAI
-        let targets_map = Arc::new(DashMap::new());
-        targets_map.insert(
-            "gpt-4".to_string(),
-            pool(
-                Target::builder()
-                    .url("https://api.openai.com".parse().unwrap())
-                    .build(),
-            ),
-        );
-
-        let targets = target::Targets {
-            targets: targets_map,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
-            strict_mode: false,
-            http_pool_config: None,
-        };
-
-        // Create a transformation function that forces include_usage for streaming requests
-        let transform_fn: BodyTransformFn = Arc::new(|path, _headers, body_bytes| {
-            // Only transform requests to OpenAI chat completions endpoint
-            if path == "/v1/chat/completions"
-                && let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes)
-                && let Some(obj) = json_body.as_object_mut()
-            {
-                // Check if this is a streaming request
-                if let Some(stream) = obj.get("stream")
-                    && stream.as_bool() == Some(true)
-                {
-                    // Force include_usage to true for streaming requests
-                    obj.insert(
-                        "stream_options".to_string(),
-                        json!({
-                            "include_usage": true
-                        }),
-                    );
-
-                    if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
-                        return Some(axum::body::Bytes::from(transformed_bytes));
-                    }
-                }
-            }
-            None
-        });
-
-        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
-        let app_state =
-            AppState::with_client_and_transform(targets, mock_client.clone(), transform_fn);
-        let router = build_router(app_state);
-        let server = TestServer::new(router).unwrap();
-
-        // Test streaming request - should add include_usage
-        let response = server
-            .post("/v1/chat/completions")
-            .json(&json!({
-                "model": "gpt-4",
-                "messages": [{"role": "user", "content": "Hello"}],
-                "stream": true
-            }))
-            .await;
-
-        assert_eq!(response.status_code(), 200);
-
-        let requests = mock_client.get_requests();
-        assert_eq!(requests.len(), 1);
-
-        let forwarded_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert_eq!(forwarded_body["model"], "gpt-4");
-        assert_eq!(forwarded_body["stream"], true);
-        assert_eq!(forwarded_body["stream_options"]["include_usage"], true);
-    }
-
-    #[tokio::test]
-    async fn test_openai_non_streaming_not_transformed() {
-        use serde_json::json;
-
-        // Create a target for OpenAI
-        let targets_map = Arc::new(DashMap::new());
-        targets_map.insert(
-            "gpt-4".to_string(),
-            pool(
-                Target::builder()
-                    .url("https://api.openai.com".parse().unwrap())
-                    .build(),
-            ),
-        );
-
-        let targets = target::Targets {
-            targets: targets_map,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
-            strict_mode: false,
-            http_pool_config: None,
-        };
-
-        // Create the same transformation function
-        let transform_fn: BodyTransformFn = Arc::new(|path, _headers, body_bytes| {
-            if path == "/v1/chat/completions"
-                && let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes)
-                && let Some(obj) = json_body.as_object_mut()
-                && let Some(stream) = obj.get("stream")
-                && stream.as_bool() == Some(true)
-            {
-                obj.insert(
-                    "stream_options".to_string(),
-                    json!({
-                        "include_usage": true
-                    }),
-                );
-
-                if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
-                    return Some(axum::body::Bytes::from(transformed_bytes));
-                }
-            }
-            None
-        });
-
-        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
-        let app_state =
-            AppState::with_client_and_transform(targets, mock_client.clone(), transform_fn);
-        let router = build_router(app_state);
-        let server = TestServer::new(router).unwrap();
-
-        // Test non-streaming request - should NOT be transformed
-        let original_body = json!({
-            "model": "gpt-4",
-            "messages": [{"role": "user", "content": "Hello"}],
-            "stream": false
-        });
-
-        let response = server
-            .post("/v1/chat/completions")
-            .json(&original_body)
-            .await;
-
-        assert_eq!(response.status_code(), 200);
-
-        let requests = mock_client.get_requests();
-        assert_eq!(requests.len(), 1);
-
-        let forwarded_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert_eq!(forwarded_body, original_body);
-        assert!(forwarded_body.get("stream_options").is_none());
-    }
-
-    #[tokio::test]
-    async fn test_transformation_path_filtering() {
-        use serde_json::json;
-
-        // Create a target
-        let targets_map = Arc::new(DashMap::new());
-        targets_map.insert(
-            "test-model".to_string(),
-            pool(
-                Target::builder()
-                    .url("https://api.example.com".parse().unwrap())
-                    .build(),
-            ),
-        );
-
-        let targets = target::Targets {
-            targets: targets_map,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
-            strict_mode: false,
-            http_pool_config: None,
-        };
-
-        // Create a transformation function that only transforms specific paths
-        let transform_fn: BodyTransformFn = Arc::new(|path, _headers, body_bytes| {
-            if path == "/v1/chat/completions"
-                && let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes)
-                && let Some(obj) = json_body.as_object_mut()
-            {
-                obj.insert("path_transformed".to_string(), json!(path));
-                if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
-                    return Some(axum::body::Bytes::from(transformed_bytes));
-                }
-            }
-            None
-        });
-
-        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
-        let app_state =
-            AppState::with_client_and_transform(targets, mock_client.clone(), transform_fn);
-        let router = build_router(app_state);
-        let server = TestServer::new(router).unwrap();
-
-        // Test matching path - should be transformed
-        let response1 = server
-            .post("/v1/chat/completions")
-            .json(&json!({"model": "test-model", "test": "data"}))
-            .await;
-        assert_eq!(response1.status_code(), 200);
-
-        // Test non-matching path - should NOT be transformed
-        let response2 = server
-            .post("/v1/embeddings")
-            .json(&json!({"model": "test-model", "test": "data"}))
-            .await;
-        assert_eq!(response2.status_code(), 200);
-
-        let requests = mock_client.get_requests();
-        assert_eq!(requests.len(), 2);
-
-        // First request should be transformed
-        let forwarded_body1: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert_eq!(forwarded_body1["path_transformed"], "/v1/chat/completions");
-
-        // Second request should NOT be transformed
-        let forwarded_body2: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
-        assert!(forwarded_body2.get("path_transformed").is_none());
-    }
-
     mod response_headers_pricing {
         use super::*;
         use std::collections::HashMap;
@@ -2900,6 +4778,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 key_labels: Arc::new(DashMap::new()),
+                accounts: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
             };
@@ -2939,6 +4818,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 key_labels: Arc::new(DashMap::new()),
+                accounts: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
             };
@@ -2983,6 +4863,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 key_labels: Arc::new(DashMap::new()),
+                accounts: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
             };
@@ -3045,6 +4926,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 key_labels: Arc::new(DashMap::new()),
+                accounts: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
             };
@@ -3102,6 +4984,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 key_labels: Arc::new(DashMap::new()),
+                accounts: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
             };
@@ -3145,6 +5028,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 key_labels: Arc::new(DashMap::new()),
+                accounts: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
             };
@@ -3194,13 +5078,14 @@ mod tests {
             let pool = ProviderPool::new(providers);
 
             let targets_map = Arc::new(DashMap::new());
-            targets_map.insert("test-model".to_string(), pool);
+            targets_map.insert("test-model".to_string(), pool.into());
 
             let targets = Targets {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 key_labels: Arc::new(DashMap::new()),
+                accounts: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
             };
@@ -3250,13 +5135,14 @@ mod tests {
             let pool = ProviderPool::new(providers);
 
             let targets_map = Arc::new(DashMap::new());
-            targets_map.insert("weighted-model".to_string(), pool);
+            targets_map.insert("weighted-model".to_string(), pool.into());
 
             let targets = Targets {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 key_labels: Arc::new(DashMap::new()),
+                accounts: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
             };
@@ -3316,13 +5202,14 @@ mod tests {
             );
 
             let targets_map = Arc::new(DashMap::new());
-            targets_map.insert("single-model".to_string(), pool);
+            targets_map.insert("single-model".to_string(), pool.into());
 
             let targets = Targets {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 key_labels: Arc::new(DashMap::new()),
+                accounts: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
             };
@@ -3345,6 +5232,63 @@ mod tests {
             let requests = mock_client.get_requests();
             assert_eq!(requests.len(), 1);
             assert!(requests[0].uri.contains("api.single.com"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_provider_reasoning_fields_pass_through_only_in_non_strict_mode() {
+        for strict_mode in [false, true] {
+            for stream in [false, true] {
+                for path in ["/v1/chat/completions", "/v1/responses", "/v1/completions"] {
+                    let targets_map = Arc::new(DashMap::new());
+                    targets_map.insert(
+                        "model".to_string(),
+                        pool(
+                            Target::builder()
+                                .url("https://engine.example.com".parse().unwrap())
+                                .build(),
+                        ),
+                    );
+                    let targets = Targets {
+                        targets: targets_map,
+                        key_rate_limiters: Arc::new(DashMap::new()),
+                        key_concurrency_limiters: Arc::new(DashMap::new()),
+                        key_labels: Arc::new(DashMap::new()),
+                        accounts: Arc::new(DashMap::new()),
+                        strict_mode,
+                        http_pool_config: None,
+                    };
+                    let mock_client = MockHttpClient::new(StatusCode::OK, "{}");
+                    let server = TestServer::new(build_router(AppState::with_client(
+                        targets,
+                        mock_client.clone(),
+                    )))
+                    .unwrap();
+                    // Already translated by the public gateway; some mappings retain
+                    // the canonical effort alongside the provider-native controls.
+                    let mut body = json!({
+                        "model": "model", "messages": [], "input": "hello", "prompt": "hello",
+                        "stream": stream,
+                        "chat_template_kwargs": {"enable_thinking": true},
+                        "thinking_token_budget": 512
+                    });
+                    if path.ends_with("chat/completions") {
+                        body["reasoning_effort"] = json!("high");
+                    }
+                    let response = server.post(path).json(&body).await;
+                    let requests = mock_client.get_requests();
+                    if strict_mode {
+                        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+                        assert!(requests.is_empty());
+                    } else {
+                        assert_eq!(response.status_code(), StatusCode::OK);
+                        assert_eq!(requests.len(), 1);
+                        let forwarded: serde_json::Value =
+                            serde_json::from_slice(&requests[0].body).unwrap();
+                        assert_eq!(forwarded, body);
+                    }
+                }
+            }
         }
     }
 
@@ -3375,6 +5319,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
         };
@@ -3434,6 +5379,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
         };
@@ -3508,13 +5454,15 @@ mod tests {
                 target::LoadBalanceStrategy::Priority,
                 false,
                 Vec::new(),
-            ),
+            )
+            .into(),
         );
         let targets = Targets {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
         };
@@ -3554,6 +5502,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
         };
@@ -3602,6 +5551,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
         };
@@ -3675,13 +5625,15 @@ mod tests {
                 target::LoadBalanceStrategy::Priority,
                 false,
                 Vec::new(),
-            ),
+            )
+            .into(),
         );
         let targets = Targets {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
         };
@@ -3759,13 +5711,15 @@ mod tests {
                 target::LoadBalanceStrategy::Priority,
                 false,
                 Vec::new(),
-            ),
+            )
+            .into(),
         );
         let targets = Targets {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -3829,6 +5783,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 key_labels: Arc::new(DashMap::new()),
+                accounts: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
             };
@@ -3903,6 +5858,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 key_labels: Arc::new(DashMap::new()),
+                accounts: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
             };
@@ -3968,6 +5924,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 key_labels: Arc::new(DashMap::new()),
+                accounts: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
             };
@@ -4025,6 +5982,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 key_labels: Arc::new(DashMap::new()),
+                accounts: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
             };
@@ -4079,6 +6037,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 key_labels: Arc::new(DashMap::new()),
+                accounts: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
             };
@@ -4141,6 +6100,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 key_labels: Arc::new(DashMap::new()),
+                accounts: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
             };
@@ -4197,13 +6157,14 @@ mod tests {
             ]);
 
             let targets_map = Arc::new(DashMap::new());
-            targets_map.insert("test-model".to_string(), pool);
+            targets_map.insert("test-model".to_string(), pool.into());
 
             let targets = Targets {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 key_labels: Arc::new(DashMap::new()),
+                accounts: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
             };
@@ -4257,6 +6218,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 key_labels: Arc::new(DashMap::new()),
+                accounts: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
             };
@@ -4322,14 +6284,16 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 key_labels: Arc::new(DashMap::new()),
+                accounts: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
             };
 
-            // Upstream returns 503 with internal details
-            let upstream_error = r#"{"error": "GPU cluster overloaded", "retry_after": 30}"#;
+            // Upstream returns 500 with internal details
+            let upstream_error = r#"{"error": "worker crashed on gpu-12", "retry_after": 30}"#;
 
-            let mock_client = MockHttpClient::new(StatusCode::SERVICE_UNAVAILABLE, upstream_error);
+            let mock_client =
+                MockHttpClient::new(StatusCode::INTERNAL_SERVER_ERROR, upstream_error);
             let app_state = AppState::with_client(targets, mock_client)
                 .with_response_transform(create_openai_sanitizer());
             let router = build_router(app_state);
@@ -4343,8 +6307,8 @@ mod tests {
                 }))
                 .await;
 
-            // Original 503 status should be preserved
-            assert_eq!(response.status_code(), 503);
+            // Original 500 status should be preserved
+            assert_eq!(response.status_code(), 500);
 
             let body: serde_json::Value = response.json();
             // Should have generic error body, not upstream details
@@ -4379,6 +6343,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 key_labels: Arc::new(DashMap::new()),
+                accounts: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
             };
@@ -4405,6 +6370,194 @@ mod tests {
             // When sanitization is disabled, upstream error body should pass through
             let body: serde_json::Value = response.json();
             assert_eq!(body["error"]["message"], "provider-specific detail");
+        }
+    }
+
+    /// Per-request-class pools, end to end through the router.
+    ///
+    /// A composite with a `completions` pool must send `/v1/completions` into
+    /// that pool and everything else into `default`. Asserted on the URL the
+    /// upstream client actually received, under both routers.
+    mod completions_pool {
+        use super::*;
+        use crate::target::{COMPLETIONS_POOL, LoadBalanceStrategy, TargetPools};
+        use std::collections::HashMap;
+
+        fn priority_pool(urls: &[&str]) -> ProviderPool {
+            ProviderPool::with_config(
+                urls.iter()
+                    .map(|url| {
+                        Provider::new(Target::builder().url(url.parse().unwrap()).build(), 1)
+                    })
+                    .collect(),
+                None,
+                None,
+                None,
+                None,
+                LoadBalanceStrategy::Priority,
+                false,
+                Vec::new(),
+            )
+        }
+
+        /// dynamo sits at position 0 of BOTH pools — the same hosted model is a
+        /// member of each, with independent ordering behind it.
+        fn flash_pools() -> TargetPools {
+            TargetPools::with_pools(
+                priority_pool(&[
+                    "https://dynamo.example.com",
+                    "https://openrouter.example.com",
+                ]),
+                HashMap::from([(
+                    COMPLETIONS_POOL.to_string(),
+                    priority_pool(&[
+                        "https://dynamo.example.com",
+                        "https://fireworks.example.com",
+                    ]),
+                )]),
+            )
+        }
+
+        fn server_with(strict_mode: bool, pools: TargetPools) -> (TestServer, MockHttpClient) {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert("dsv4-flash".to_string(), pools);
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+                key_labels: Arc::new(DashMap::new()),
+                accounts: Arc::new(DashMap::new()),
+                strict_mode,
+                http_pool_config: None,
+            };
+            let mock_client = MockHttpClient::new(
+                StatusCode::OK,
+                r#"{"id":"cmpl-1","object":"text_completion","created":0,"model":"dsv4-flash","choices":[]}"#,
+            );
+            let app_state = AppState::with_client(targets, mock_client.clone());
+            let server = TestServer::new(build_router(app_state)).unwrap();
+            (server, mock_client)
+        }
+
+        /// The completions pool's first member answers — the on-prem one, which
+        /// is free for us; the validated third-party target is its failover.
+        #[tokio::test]
+        async fn completions_requests_are_served_by_the_completions_pool() {
+            for strict_mode in [false, true] {
+                let (server, client) = server_with(strict_mode, flash_pools());
+                let response = server
+                    .post("/v1/completions")
+                    .json(&json!({"model": "dsv4-flash", "prompt": [1, 2, 3]}))
+                    .await;
+                assert_eq!(
+                    response.status_code(),
+                    StatusCode::OK,
+                    "strict={strict_mode}"
+                );
+
+                let requests = client.requests.lock().unwrap();
+                assert_eq!(requests.len(), 1, "strict={strict_mode}");
+                assert!(
+                    requests[0].uri.starts_with("https://dynamo.example.com/"),
+                    "strict={strict_mode}: got {}",
+                    requests[0].uri
+                );
+            }
+        }
+
+        /// "Never serves chat" is structural: the validated completions target
+        /// is not a member of the default pool, so chat traffic cannot reach it
+        /// even when the default pool fails over.
+        #[tokio::test]
+        async fn chat_requests_never_reach_the_completions_pool() {
+            for strict_mode in [false, true] {
+                let (server, client) = server_with(strict_mode, flash_pools());
+                let response = server
+                    .post("/v1/chat/completions")
+                    .json(&json!({
+                        "model": "dsv4-flash",
+                        "messages": [{"role": "user", "content": "hi"}]
+                    }))
+                    .await;
+                assert!(
+                    response.status_code().is_success(),
+                    "strict={strict_mode}: {}",
+                    response.status_code()
+                );
+
+                let requests = client.requests.lock().unwrap();
+                assert!(
+                    requests.iter().all(|r| !r.uri.contains("fireworks")),
+                    "strict={strict_mode}: {:?}",
+                    requests.iter().map(|r| r.uri.clone()).collect::<Vec<_>>()
+                );
+            }
+        }
+
+        /// Rule 3: a composite with no completions pool serves completions from
+        /// its default pool, exactly as before named pools existed.
+        #[tokio::test]
+        async fn a_composite_without_a_completions_pool_serves_completions_from_default() {
+            for strict_mode in [false, true] {
+                let (server, client) = server_with(
+                    strict_mode,
+                    priority_pool(&["https://dynamo.example.com"]).into(),
+                );
+                let response = server
+                    .post("/v1/completions")
+                    .json(&json!({"model": "dsv4-flash", "prompt": "hi"}))
+                    .await;
+                assert_eq!(
+                    response.status_code(),
+                    StatusCode::OK,
+                    "strict={strict_mode}"
+                );
+
+                let requests = client.requests.lock().unwrap();
+                assert_eq!(requests.len(), 1, "strict={strict_mode}");
+                assert!(
+                    requests[0].uri.starts_with("https://dynamo.example.com/"),
+                    "strict={strict_mode}: got {}",
+                    requests[0].uri
+                );
+            }
+        }
+
+        /// An EMPTY completions pool is treated as an absent one: the default
+        /// pool serves the class, exactly as it did before the pool existed.
+        ///
+        /// A pool whose members were all removed or disabled must not start
+        /// 503-ing traffic the default pool handled the day before. Resume legs
+        /// are kept off unvalidated members upstream of here — dwctl only calls
+        /// a model resumable while its completions pool has a member.
+        #[tokio::test]
+        async fn an_empty_completions_pool_falls_back_to_the_default() {
+            let pools = TargetPools::with_pools(
+                priority_pool(&["https://openrouter.example.com"]),
+                HashMap::from([(COMPLETIONS_POOL.to_string(), ProviderPool::new(vec![]))]),
+            );
+            assert!(
+                pools
+                    .resolved_name(crate::target::RequestClass::Completions)
+                    .is_none(),
+                "an empty pool is not a picked pool"
+            );
+            let (server, client) = server_with(false, pools);
+
+            let response = server
+                .post("/v1/completions")
+                .json(&json!({"model": "dsv4-flash", "prompt": "hi"}))
+                .await;
+            assert_eq!(response.status_code(), StatusCode::OK);
+            let requests = client.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(
+                requests[0]
+                    .uri
+                    .starts_with("https://openrouter.example.com/"),
+                "got {}",
+                requests[0].uri
+            );
         }
     }
 }

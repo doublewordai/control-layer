@@ -203,11 +203,16 @@ pub struct Keystore {
 impl Keystore {
     /// Build from config: derive the keyring and create the Redis pool.
     pub fn from_config(cfg: &KeystoreConfig) -> Result<Self, KeystoreError> {
-        let keys = cfg
-            .wrap_keys
-            .iter()
-            .map(|(id, secret)| (id.clone(), encryption::derive_encryption_key(secret)))
-            .collect::<HashMap<_, _>>();
+        let mut keys = HashMap::with_capacity(cfg.wrap_keys.len());
+        for (id, secret) in &cfg.wrap_keys {
+            if secret.trim().is_empty() {
+                return Err(KeystoreError::Config(format!(
+                    "wrap key {id:?} is empty or whitespace; refusing to derive a key from an empty secret \
+                     (SHA-256(\"\") is a publicly-known constant and would disable crypto-shredding)"
+                )));
+            }
+            keys.insert(id.clone(), encryption::derive_encryption_key(secret));
+        }
         let keyring = WrapKeyring::new(cfg.current_wrap_key_id.clone(), keys)?;
         let pool = RedisConfig::from_url(cfg.redis_url.clone())
             .create_pool(Some(Runtime::Tokio1))
@@ -353,5 +358,40 @@ mod tests {
             WrapKeyring::new("missing".to_string(), keys).unwrap_err(),
             KeystoreError::Config(_)
         ));
+    }
+
+    fn keystore_config(secret: &str) -> KeystoreConfig {
+        KeystoreConfig {
+            redis_url: "redis://localhost:6379".into(),
+            default_ttl_seconds: 300,
+            current_wrap_key_id: "dev-1".into(),
+            wrap_keys: HashMap::from([("dev-1".into(), secret.into())]),
+        }
+    }
+
+    #[test]
+    fn from_config_rejects_empty_wrap_key() {
+        let cfg = keystore_config("");
+        assert!(matches!(Keystore::from_config(&cfg), Err(KeystoreError::Config(_))));
+    }
+
+    #[test]
+    fn from_config_rejects_whitespace_only_wrap_key() {
+        for ws in [" ", "\t", "\n", "   \t\n "] {
+            let cfg = keystore_config(ws);
+            assert!(
+                matches!(Keystore::from_config(&cfg), Err(KeystoreError::Config(_))),
+                "whitespace-only secret {ws:?} should be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn from_config_accepts_nonempty_wrap_key() {
+        let cfg = keystore_config("a-real-secret");
+        let store = Keystore::from_config(&cfg).unwrap();
+        let key = store.keyring.keys.get("dev-1").unwrap();
+        assert_eq!(key.as_slice(), encryption::derive_encryption_key("a-real-secret").as_slice());
+        assert_eq!(store.default_ttl(), Duration::from_secs(300));
     }
 }

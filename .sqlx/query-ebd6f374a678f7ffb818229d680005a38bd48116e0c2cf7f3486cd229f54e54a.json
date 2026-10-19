@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT ak.secret, u.zero_data_retention, u.disabled_modalities, u.pinned_tolerations\n        FROM api_keys ak\n        JOIN users u ON u.id = ak.user_id\n        WHERE NOT ak.is_deleted\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "secret",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "zero_data_retention",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 2,
+        "name": "disabled_modalities",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 3,
+        "name": "pinned_tolerations",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "ebd6f374a678f7ffb818229d680005a38bd48116e0c2cf7f3486cd229f54e54a"
+}

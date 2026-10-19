@@ -7,22 +7,71 @@
 //!
 //! Pool-level configuration (keys, rate limits) is shared across all providers.
 
+use crate::affinity::{self, AffinityConfig, Tracker};
+use crate::aimd::{AimdConfig, Controller, Observation};
 use crate::auth::KeySet;
+use crate::inflight::InflightLimits;
+use crate::serving::{ServingOverlay, ServingPresets};
 use crate::target::{
     ConcurrencyGuard, ConcurrencyLimiter, FallbackConfig, LoadBalanceStrategy, RateLimiter,
     RoutingAction, RoutingRule, Target,
 };
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use tokio::time::Instant;
+
+/// The AIMD configuration a pool would run with, independent of how many
+/// providers it currently has: fallback enabled, priority strategy, and an
+/// enabled, valid controller config (defaults when unset).
+fn configured_aimd(
+    fallback: Option<&FallbackConfig>,
+    strategy: LoadBalanceStrategy,
+) -> Option<AimdConfig> {
+    fallback
+        .filter(|f| f.enabled)
+        .map(|f| f.aimd.clone().unwrap_or_default())
+        .filter(|c| c.enabled && c.validate().is_ok() && strategy == LoadBalanceStrategy::Priority)
+}
+
+/// The conversation-affinity configuration a pool would run with: fallback
+/// enabled, priority strategy, and an enabled, valid affinity config.
+fn configured_affinity(
+    fallback: Option<&FallbackConfig>,
+    strategy: LoadBalanceStrategy,
+) -> Option<AffinityConfig> {
+    fallback
+        .filter(|f| f.enabled)
+        .and_then(|f| f.affinity.clone())
+        .filter(|c| c.enabled && c.validate().is_ok() && strategy == LoadBalanceStrategy::Priority)
+}
+
+/// What a controller's learning is about: the preferred provider it measured.
+fn provider_identity(target: &Target) -> (&url::Url, Option<&str>, Option<&str>) {
+    (
+        &target.url,
+        target.onwards_key.as_deref(),
+        target.onwards_model.as_deref(),
+    )
+}
+
+/// A controller carried across reloads while its pool cannot use it, with
+/// what it needs to decide whether a later pool may resume it.
+#[derive(Debug, Clone)]
+struct ParkedController {
+    controller: Arc<Mutex<Controller>>,
+    preferred: Target,
+    first_token_timeout_ms: Option<u64>,
+}
 
 /// A pool of providers that share an alias, with load balancing support
 #[derive(Debug, Clone)]
 pub struct ProviderPool {
     /// The list of providers in this pool
     providers: Vec<Provider>,
-    /// Pool-level access control keys (who can call this alias)
-    keys: Option<KeySet>,
+    /// Pool-level access control keys (who can call this alias). Shared, since
+    /// every request clones the pool that serves it.
+    keys: Option<Arc<KeySet>>,
     /// Pool-level rate limiter (applies to all requests to this alias)
     pool_limiter: Option<Arc<dyn RateLimiter>>,
     /// Pool-level concurrency limiter (applies to all requests to this alias)
@@ -31,6 +80,15 @@ pub struct ProviderPool {
     fallback: Option<FallbackConfig>,
     /// Load balancing strategy
     strategy: LoadBalanceStrategy,
+    controller: Option<Arc<Mutex<Controller>>>,
+    /// A controller kept while this pool is configured for AIMD but has too
+    /// few providers to use it (e.g. its preferred provider is disabled), so a
+    /// later reload that restores the same preferred provider resumes it
+    /// rather than starting over.
+    parked: Option<ParkedController>,
+    /// Per-process view of the pool's active conversations, when the pool
+    /// routes by conversation (see [`crate::affinity`]).
+    affinity: Option<Arc<Mutex<Tracker>>>,
     /// Mark this pool as trusted to bypass strict mode error sanitization.
     /// When strict_mode is enabled globally AND trusted is true for a pool,
     /// error response sanitization is skipped, but success responses are still sanitized.
@@ -40,6 +98,43 @@ pub struct ProviderPool {
     trusted: bool,
     /// Routing rules evaluated against key labels before processing
     routing_rules: Vec<RoutingRule>,
+    /// The alias's serving policy (default pool only): offered presets and
+    /// per-account overlays. Shared, so cloning the pool per request is
+    /// cheap however many organisations have overlays on the alias.
+    serving: AliasServing,
+    inflight: Option<Arc<InflightLimits>>,
+    /// The alias's global batch in-flight cap, shared across every daemon pod
+    /// and control-layer replica. `None` means batch is uncapped on this alias.
+    batch_inflight: Option<u32>,
+}
+
+/// The serving policy declared on an alias: the presets it offers and its
+/// per-account overlays. Both behind `Arc`: the handler clones the selected
+/// pool for every request and this must not scale with the number of
+/// organisations configured.
+#[derive(Clone, Debug, Default)]
+pub struct AliasServing {
+    presets: Arc<ServingPresets>,
+    overlays: Arc<HashMap<String, ServingOverlay>>,
+}
+
+impl AliasServing {
+    pub fn new(presets: ServingPresets, overlays: HashMap<String, ServingOverlay>) -> Self {
+        Self {
+            presets: Arc::new(presets),
+            overlays: Arc::new(overlays),
+        }
+    }
+
+    /// The classes the alias offers, each with its preset.
+    pub fn presets(&self) -> &ServingPresets {
+        &self.presets
+    }
+
+    /// Per-account overlays on the alias, keyed by account id.
+    pub fn overlays(&self) -> &HashMap<String, ServingOverlay> {
+        &self.overlays
+    }
 }
 
 /// A single provider within a pool
@@ -88,8 +183,14 @@ impl ProviderPool {
             pool_concurrency_limiter: None,
             fallback: None,
             strategy: LoadBalanceStrategy::default(),
+            controller: None,
+            parked: None,
+            affinity: None,
             trusted: false,
             routing_rules: Vec::new(),
+            serving: AliasServing::default(),
+            inflight: None,
+            batch_inflight: None,
         }
     }
 
@@ -105,16 +206,72 @@ impl ProviderPool {
         trusted: bool,
         routing_rules: Vec<RoutingRule>,
     ) -> Self {
+        let controller = configured_aimd(fallback.as_ref(), strategy)
+            .filter(|_| providers.len() > 1)
+            .map(|c| Arc::new(Mutex::new(Controller::new(c, Instant::now()))));
+        let affinity = configured_affinity(fallback.as_ref(), strategy)
+            .filter(|_| providers.len() > 1)
+            .map(|c| Arc::new(Mutex::new(Tracker::new(c))));
         Self {
+            controller,
+            parked: None,
+            affinity,
             providers,
-            keys,
+            keys: keys.map(Arc::new),
             pool_limiter,
             pool_concurrency_limiter,
             fallback,
             strategy,
             trusted,
             routing_rules,
+            serving: AliasServing::default(),
+            inflight: None,
+            batch_inflight: None,
         }
+    }
+
+    /// Attach the alias's offered serving presets and per-account overlays
+    /// (see [`crate::serving`]).
+    pub fn with_serving(
+        mut self,
+        serving_classes: ServingPresets,
+        overlays: HashMap<String, ServingOverlay>,
+    ) -> Self {
+        self.serving = AliasServing::new(serving_classes, overlays);
+        self
+    }
+
+    pub fn with_inflight_limits(mut self, limits: Option<InflightLimits>) -> Self {
+        self.inflight = limits.map(Arc::new);
+        self
+    }
+
+    pub fn inflight_limits(&self) -> Option<&Arc<InflightLimits>> {
+        self.inflight.as_ref()
+    }
+
+    pub fn with_batch_inflight_limit(mut self, limit: Option<u32>) -> Self {
+        self.batch_inflight = limit;
+        self
+    }
+
+    pub fn batch_inflight_limit(&self) -> Option<u32> {
+        self.batch_inflight
+    }
+
+    /// Elevated serving classes the alias offers.
+    pub fn serving_classes(&self) -> &ServingPresets {
+        self.serving.presets()
+    }
+
+    /// Per-account overrides on this alias, keyed by account id.
+    pub fn overlays(&self) -> &HashMap<String, ServingOverlay> {
+        self.serving.overlays()
+    }
+
+    /// The alias's serving policy, cheap to clone.
+    pub fn alias_serving(&self) -> &AliasServing {
+        &self.serving
     }
 
     /// Create a pool with a single provider
@@ -160,10 +317,187 @@ impl ProviderPool {
         SelectIter {
             pool: self,
             excluded: HashSet::new(),
+            ineligible: HashSet::new(),
+            refused: HashSet::new(),
             max_attempts,
             attempts: 0,
             with_replacement,
+            alternate_first: false,
         }
+    }
+
+    pub(crate) fn retire_aimd(&self) {
+        if let Some(controller) = &self.controller {
+            controller.lock().unwrap().retire();
+        }
+        if let Some(parked) = &self.parked {
+            parked.controller.lock().unwrap().retire();
+        }
+    }
+
+    pub(crate) fn aimd_enabled(&self) -> bool {
+        self.controller.is_some()
+    }
+
+    /// Whether this pool routes by conversation.
+    pub(crate) fn affinity_enabled(&self) -> bool {
+        self.affinity.is_some()
+    }
+
+    /// Keep the old pool's conversation tracker across a reload that leaves
+    /// its configuration unchanged, so the active set and share survive
+    /// routing-config updates.
+    fn adopt_affinity(&mut self, old: &ProviderPool) {
+        let (Some(new), Some(old)) = (&self.affinity, &old.affinity) else {
+            return;
+        };
+        if new.lock().unwrap().config() == old.lock().unwrap().config() {
+            self.affinity = Some(old.clone());
+        }
+    }
+
+    /// Carry the old pool's controller (active or parked) into this pool.
+    ///
+    /// - Same configuration and the same preferred provider: adopt it, resuming
+    ///   it if it was parked.
+    /// - Same configuration but this pool has too few providers to use it:
+    ///   park it here, so the preferred provider returning later resumes it.
+    ///   This is the common case of an autoscaler disabling and re-enabling a
+    ///   self-hosted preferred provider.
+    /// - Anything else changed what the controller learned about: retire it.
+    fn adopt_aimd(&mut self, old: &ProviderPool) {
+        let candidate = old
+            .controller
+            .as_ref()
+            .zip(old.providers.first())
+            .map(|(controller, preferred)| ParkedController {
+                controller: controller.clone(),
+                preferred: preferred.target.clone(),
+                first_token_timeout_ms: old
+                    .fallback
+                    .as_ref()
+                    .and_then(|f| f.first_token_timeout_ms),
+            })
+            .or_else(|| old.parked.clone());
+        let Some(candidate) = candidate else {
+            return;
+        };
+        let compatible = configured_aimd(self.fallback.as_ref(), self.strategy)
+            .is_some_and(|config| *candidate.controller.lock().unwrap().config() == config)
+            && candidate.first_token_timeout_ms
+                == self
+                    .fallback
+                    .as_ref()
+                    .and_then(|f| f.first_token_timeout_ms);
+        let same_preferred = self.providers.first().is_some_and(|p| {
+            provider_identity(&p.target) == provider_identity(&candidate.preferred)
+        });
+        match (self.controller.is_some(), compatible, same_preferred) {
+            (true, true, true) => {
+                candidate.controller.lock().unwrap().resume();
+                self.controller = Some(candidate.controller);
+            }
+            (false, true, _) => {
+                candidate.controller.lock().unwrap().park();
+                self.parked = Some(candidate);
+            }
+            _ => candidate.controller.lock().unwrap().retire(),
+        }
+    }
+
+    /// Select providers for a request, deciding whether the preferred provider
+    /// goes first.
+    ///
+    /// - With a conversation key and an affinity pool, the decision is
+    ///   deterministic per conversation: preferred first when the key's point
+    ///   is below the affinity share (capped by the AIMD share when the
+    ///   request is AIMD-eligible, so overload still sheds conversations).
+    /// - Otherwise an AIMD-eligible request draws against the AIMD share.
+    pub(crate) fn select_iter_routed(
+        &self,
+        aimd_eligible: bool,
+        conversation: Option<u64>,
+        model: &str,
+        pool: &str,
+    ) -> SelectIter<'_> {
+        self.select_iter_routed_at(aimd_eligible, conversation, model, pool, affinity::now_ms())
+    }
+
+    /// [`Self::select_iter_routed`] at an explicit wall-clock time (Unix ms).
+    pub(crate) fn select_iter_routed_at(
+        &self,
+        aimd_eligible: bool,
+        conversation: Option<u64>,
+        model: &str,
+        pool: &str,
+        now_ms: u64,
+    ) -> SelectIter<'_> {
+        let mut iter = self.select_iter();
+        let aimd_share = if aimd_eligible {
+            self.aimd_share(model, pool)
+        } else {
+            None
+        };
+        match (conversation, &self.affinity) {
+            (Some(key), Some(tracker)) => {
+                let mut tracker = tracker.lock().unwrap();
+                let (_, updated) = tracker.route(key, now_ms);
+                if updated {
+                    let snapshot = tracker.snapshot();
+                    metrics::gauge!("onwards_affinity_share", "model" => model.to_string(), "pool" => pool.to_string())
+                        .set(snapshot.share);
+                    metrics::gauge!("onwards_affinity_active_conversations", "model" => model.to_string(), "pool" => pool.to_string())
+                        .set(snapshot.active as f64);
+                    metrics::gauge!("onwards_affinity_admitted_conversations", "model" => model.to_string(), "pool" => pool.to_string())
+                        .set(snapshot.admitted as f64);
+                }
+                let threshold = tracker.share().min(aimd_share.unwrap_or(1.0));
+                let preferred = affinity::point(key) < threshold;
+                iter.alternate_first = !preferred;
+                metrics::counter!("onwards_affinity_routed_total", "model" => model.to_string(), "pool" => pool.to_string(), "side" => if preferred { "preferred" } else { "alternate" })
+                    .increment(1);
+            }
+            _ => {
+                if let Some(share) = aimd_share {
+                    iter.alternate_first = rand::rng().random::<f64>() >= share;
+                }
+            }
+        }
+        iter
+    }
+
+    /// The AIMD share for an eligible request, after the controller's
+    /// request-path bookkeeping; `None` without an active controller.
+    fn aimd_share(&self, model: &str, pool: &str) -> Option<f64> {
+        let controller = self.controller.as_ref()?;
+        let mut controller = controller.lock().unwrap();
+        if !controller.active() {
+            return None;
+        }
+        controller.remember_labels(model, pool);
+        // Idle recovery runs on the request path, so a pool that sees
+        // traffic but too little to judge still climbs back to full share.
+        if let Some(direction) = controller.tick(Instant::now()) {
+            metrics::counter!("onwards_share_adjustments_total", "model" => model.to_string(), "pool" => pool.to_string(), "direction" => direction).increment(1);
+        }
+        controller.publish();
+        Some(controller.share())
+    }
+
+    pub(crate) fn observe(
+        &self,
+        eligible: bool,
+        member: usize,
+        model: &str,
+        pool: &str,
+        start: Instant,
+    ) -> Option<Observation> {
+        if !eligible || member != 0 {
+            return None;
+        }
+        self.controller
+            .as_ref()
+            .and_then(|c| Observation::new(c.clone(), model, pool, start))
     }
 
     /// Internal: select excluding specific provider indices
@@ -289,7 +623,7 @@ impl ProviderPool {
 
     /// Get pool-level access control keys
     pub fn keys(&self) -> Option<&KeySet> {
-        self.keys.as_ref()
+        self.keys.as_deref()
     }
 
     /// Get pool-level rate limiter
@@ -317,6 +651,14 @@ impl ProviderPool {
         self.fallback
             .as_ref()
             .is_some_and(|f| f.should_fallback_on_status(status_code))
+    }
+
+    /// Check if a status code should trigger fallback for a realtime request,
+    /// including the pool's realtime-only fallback statuses.
+    pub fn should_fallback_on_realtime_status(&self, status_code: u16) -> bool {
+        self.fallback
+            .as_ref()
+            .is_some_and(|f| f.should_fallback_on_realtime_status(status_code))
     }
 
     /// Check if local rate limits should trigger fallback
@@ -385,6 +727,8 @@ impl ProviderPool {
     /// Removed providers (not in the new pool) are simply dropped.
     /// The pool-level concurrency limiter is also preserved if present in both.
     pub fn adopt_provider_state(&mut self, old: &ProviderPool) {
+        self.adopt_aimd(old);
+        self.adopt_affinity(old);
         for new_provider in &mut self.providers {
             if let Some(old_provider) = old.providers.iter().find(|old_p| {
                 old_p.target.url == new_provider.target.url
@@ -413,10 +757,66 @@ impl ProviderPool {
 /// ensuring the most up-to-date load information is used for each attempt.
 pub struct SelectIter<'a> {
     pool: &'a ProviderPool,
+    /// Members already tried in the current pass; cleared to start a new pass.
     excluded: HashSet<usize>,
+    /// Members that are never eligible for this request (a self-hosted-only
+    /// account's external members). Never cleared: the attempt budget is
+    /// spent on eligible members only, whatever the strategy.
+    ineligible: HashSet<usize>,
+    /// Members that refused this request for overload. Never cleared: a
+    /// member that has just said it is full is not retried within the same
+    /// request, so a new pass cannot spend the budget re-asking it.
+    refused: HashSet<usize>,
     max_attempts: usize,
     attempts: usize,
     with_replacement: bool,
+    alternate_first: bool,
+}
+
+impl SelectIter<'_> {
+    /// Narrow the iterator to the members NOT in `members` for its whole
+    /// life. Unlike a tried member, an ineligible one is never re-included
+    /// when a new pass starts.
+    pub fn excluding_members(mut self, members: impl IntoIterator<Item = usize>) -> Self {
+        self.ineligible.extend(members);
+        self
+    }
+
+    /// Take a member that refused this request for overload out of the rest
+    /// of the request, including later passes.
+    pub(crate) fn mark_refused(&mut self, member: usize) {
+        self.refused.insert(member);
+    }
+
+    /// The tried set plus the members out for the whole request.
+    fn exclusions(&self) -> HashSet<usize> {
+        self.excluded
+            .iter()
+            .chain(&self.ineligible)
+            .chain(&self.refused)
+            .copied()
+            .collect()
+    }
+
+    /// Whether a different, untried member can currently accept a failover.
+    /// This is a capacity snapshot, not a reservation: normal selection still
+    /// acquires its slot atomically. Do not abort a slow stream merely to retry
+    /// the same provider when the other eligible members are already full.
+    pub(crate) fn has_available_alternative(&self, current_member: usize) -> bool {
+        self.attempts < self.max_attempts
+            && self
+                .pool
+                .providers
+                .iter()
+                .enumerate()
+                .any(|(index, provider)| {
+                    index != current_member
+                        && !self.ineligible.contains(&index)
+                        && !self.refused.contains(&index)
+                        && !self.excluded.contains(&index)
+                        && !provider.limiter.at_capacity()
+                })
+    }
 }
 
 impl<'a> Iterator for SelectIter<'a> {
@@ -443,12 +843,20 @@ impl<'a> Iterator for SelectIter<'a> {
         // When `excluded` is already empty there is nothing to re-include, so a
         // `None` there means an empty pool or every provider at capacity: end the
         // iterator rather than re-running the same scan.
-        let result = match self.pool.select_excluding(&self.excluded) {
+        let first_override = if self.attempts == 1 && self.alternate_first {
+            let mut exclude = self.ineligible.clone();
+            exclude.insert(0);
+            self.pool.select_priority(&exclude)
+        } else {
+            None
+        };
+        let result = match first_override.or_else(|| self.pool.select_excluding(&self.exclusions()))
+        {
             Some(result) => result,
             None if self.excluded.is_empty() => return None,
             None => {
                 self.excluded.clear();
-                self.pool.select_excluding(&self.excluded)?
+                self.pool.select_excluding(&self.exclusions())?
             }
         };
 
@@ -476,6 +884,421 @@ mod tests {
 
     fn create_test_target(url: &str) -> Target {
         Target::builder().url(url.parse().unwrap()).build()
+    }
+
+    fn aimd_test_config() -> crate::aimd::AimdConfig {
+        crate::aimd::AimdConfig {
+            latency_budget_ms: 100,
+            breach_rate_target: 0.2,
+            recovery_breach_rate: 0.1,
+            window_samples: 10,
+            min_samples: 2,
+            share_step: 0.1,
+            share_decay: 0.5,
+            share_floor: 0.1,
+            dwell_ms: 1,
+            ..crate::aimd::AimdConfig::default()
+        }
+    }
+
+    fn aimd_pool_from(urls: &[&str], aimd: Option<crate::aimd::AimdConfig>) -> ProviderPool {
+        let providers = urls
+            .iter()
+            .enumerate()
+            .map(|(index, url)| {
+                if index == 1 {
+                    Provider::with_concurrency_limit(create_test_target(url), 1, 1)
+                } else {
+                    Provider::new(create_test_target(url), 1)
+                }
+            })
+            .collect();
+        ProviderPool::with_config(
+            providers,
+            None,
+            None,
+            None,
+            Some(FallbackConfig {
+                enabled: true,
+                first_token_timeout_ms: Some(0),
+                aimd,
+                max_attempts: Some(4),
+                ..Default::default()
+            }),
+            LoadBalanceStrategy::Priority,
+            false,
+            vec![],
+        )
+    }
+
+    fn aimd_pool() -> ProviderPool {
+        aimd_pool_from(
+            &["https://preferred.example", "https://alternate.example"],
+            Some(aimd_test_config()),
+        )
+    }
+
+    /// Drive the pool's controller down one step with overload breaches.
+    fn demote(pool: &ProviderPool) {
+        let controller = pool.controller.as_ref().unwrap();
+        for _ in 0..2 {
+            Observation::new(controller.clone(), "model", "default", Instant::now())
+                .unwrap()
+                .status(529);
+        }
+    }
+
+    fn affinity_pool(
+        target: usize,
+        aimd: Option<crate::aimd::AimdConfig>,
+        strategy: LoadBalanceStrategy,
+    ) -> ProviderPool {
+        ProviderPool::with_config(
+            vec![
+                Provider::new(create_test_target("https://preferred.example"), 1),
+                Provider::new(create_test_target("https://alternate.example"), 1),
+            ],
+            None,
+            None,
+            None,
+            Some(FallbackConfig {
+                enabled: true,
+                first_token_timeout_ms: Some(0),
+                aimd,
+                affinity: Some(AffinityConfig {
+                    target_conversations: target,
+                    margin: Some(1),
+                    ..AffinityConfig::default()
+                }),
+                ..Default::default()
+            }),
+            strategy,
+            false,
+            vec![],
+        )
+    }
+
+    fn conversation_keys(n: usize) -> Vec<u64> {
+        (0..n)
+            .map(|i| {
+                affinity::conversation_key(
+                    Some(&format!("conversation-{i}")),
+                    &serde_json::json!({}),
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    fn first_member(pool: &ProviderPool, aimd: bool, key: Option<u64>, now_ms: u64) -> usize {
+        pool.select_iter_routed_at(aimd, key, "model", "default", now_ms)
+            .next()
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn affinity_sends_each_conversation_to_one_side() {
+        let disabled = crate::aimd::AimdConfig {
+            enabled: false,
+            ..crate::aimd::AimdConfig::default()
+        };
+        let pool = affinity_pool(10, Some(disabled), LoadBalanceStrategy::Priority);
+        let keys = conversation_keys(100);
+        for key in &keys {
+            first_member(&pool, false, Some(*key), 1_000);
+        }
+        let first: Vec<usize> = keys
+            .iter()
+            .map(|k| first_member(&pool, false, Some(*k), 61_000))
+            .collect();
+        assert_eq!(first.iter().filter(|m| **m == 0).count(), 10);
+        // The same conversations keep their side while the population is steady.
+        let later: Vec<usize> = keys
+            .iter()
+            .map(|k| first_member(&pool, false, Some(*k), 121_000))
+            .collect();
+        assert_eq!(first, later);
+        // A request without a conversation key keeps ordinary priority order.
+        assert_eq!(first_member(&pool, false, None, 121_000), 0);
+    }
+
+    #[tokio::test]
+    async fn aimd_overload_caps_the_affinity_share() {
+        let pool = affinity_pool(
+            1_000,
+            Some(aimd_test_config()),
+            LoadBalanceStrategy::Priority,
+        );
+        // A decrease waits one dwell after the controller starts.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        demote(&pool);
+        let share = pool.controller.as_ref().unwrap().lock().unwrap().share();
+        assert!((share - 0.5).abs() < 1e-9, "share after demotion: {share}");
+        for key in conversation_keys(200) {
+            let expected = if affinity::point(key) < share { 0 } else { 1 };
+            assert_eq!(first_member(&pool, true, Some(key), 1_000), expected);
+            // Without AIMD eligibility only the affinity share (still 1.0) applies.
+            assert_eq!(first_member(&pool, false, Some(key), 1_000), 0);
+        }
+    }
+
+    #[test]
+    fn affinity_tracker_survives_a_reload_with_the_same_configuration() {
+        let old = affinity_pool(10, None, LoadBalanceStrategy::Priority);
+        let tracker = old.affinity.clone().unwrap();
+        let mut same = affinity_pool(10, None, LoadBalanceStrategy::Priority);
+        same.adopt_provider_state(&old);
+        assert!(Arc::ptr_eq(same.affinity.as_ref().unwrap(), &tracker));
+        let mut changed = affinity_pool(20, None, LoadBalanceStrategy::Priority);
+        changed.adopt_provider_state(&old);
+        assert!(!Arc::ptr_eq(changed.affinity.as_ref().unwrap(), &tracker));
+    }
+
+    #[test]
+    fn affinity_needs_a_priority_pool_with_an_alternate() {
+        assert!(affinity_pool(10, None, LoadBalanceStrategy::Priority).affinity_enabled());
+        assert!(!affinity_pool(10, None, LoadBalanceStrategy::WeightedRandom).affinity_enabled());
+        let single = ProviderPool::with_config(
+            vec![Provider::new(
+                create_test_target("https://preferred.example"),
+                1,
+            )],
+            None,
+            None,
+            None,
+            Some(FallbackConfig {
+                enabled: true,
+                affinity: Some(AffinityConfig {
+                    target_conversations: 10,
+                    ..AffinityConfig::default()
+                }),
+                ..Default::default()
+            }),
+            LoadBalanceStrategy::Priority,
+            false,
+            vec![],
+        );
+        assert!(!single.affinity_enabled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn aimd_parks_while_the_preferred_provider_is_disabled_and_resumes_on_return() {
+        let active = aimd_pool();
+        tokio::time::advance(std::time::Duration::from_millis(5)).await;
+        demote(&active);
+        let share = active.controller.as_ref().unwrap().lock().unwrap().share();
+        assert!((share - 0.5).abs() < 1e-9);
+
+        // The preferred provider is disabled: only the alternate remains.
+        let mut single = aimd_pool_from(&["https://alternate.example"], Some(aimd_test_config()));
+        single.adopt_provider_state(&active);
+        assert!(!single.aimd_enabled());
+        let parked = single.parked.as_ref().unwrap().controller.clone();
+        assert!(!parked.lock().unwrap().active());
+
+        // Further reloads while it is still disabled carry the parked controller.
+        let mut still_single =
+            aimd_pool_from(&["https://alternate.example"], Some(aimd_test_config()));
+        still_single.adopt_provider_state(&single);
+        assert!(Arc::ptr_eq(
+            &still_single.parked.as_ref().unwrap().controller,
+            &parked
+        ));
+
+        // The same preferred provider returns: resume with the learned share.
+        let mut restored = aimd_pool();
+        restored.adopt_provider_state(&still_single);
+        let resumed = restored.controller.as_ref().unwrap();
+        assert!(Arc::ptr_eq(resumed, &parked));
+        assert!(resumed.lock().unwrap().active());
+        assert!((resumed.lock().unwrap().share() - 0.5).abs() < 1e-9);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn aimd_parked_controller_is_retired_when_a_different_preferred_returns() {
+        let active = aimd_pool();
+        let mut single = aimd_pool_from(&["https://alternate.example"], Some(aimd_test_config()));
+        single.adopt_provider_state(&active);
+        let parked = single.parked.as_ref().unwrap().controller.clone();
+
+        let mut different = aimd_pool_from(
+            &["https://other.example", "https://alternate.example"],
+            Some(aimd_test_config()),
+        );
+        different.adopt_provider_state(&single);
+        assert!(!Arc::ptr_eq(
+            different.controller.as_ref().unwrap(),
+            &parked
+        ));
+        assert!(!parked.lock().unwrap().active());
+        assert!(!parked.lock().unwrap().resume(), "retired, not parked");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn aimd_opt_out_retires_rather_than_parks() {
+        let active = aimd_pool();
+        let controller = active.controller.clone().unwrap();
+        let mut disabled = aimd_pool_from(
+            &["https://alternate.example"],
+            Some(crate::aimd::AimdConfig {
+                enabled: false,
+                ..aimd_test_config()
+            }),
+        );
+        disabled.adopt_provider_state(&active);
+        assert!(disabled.parked.is_none());
+        assert!(!controller.lock().unwrap().resume(), "retired, not parked");
+    }
+
+    #[test]
+    fn aimd_is_default_on_only_for_eligible_pools_and_has_explicit_opt_out() {
+        let make = |strategy, providers, fallback| {
+            ProviderPool::with_config(
+                providers,
+                None,
+                None,
+                None,
+                Some(fallback),
+                strategy,
+                false,
+                vec![],
+            )
+        };
+        let providers = aimd_pool().providers;
+        let default_fallback = FallbackConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(
+            make(
+                LoadBalanceStrategy::Priority,
+                providers.clone(),
+                default_fallback.clone()
+            )
+            .aimd_enabled()
+        );
+        assert!(
+            !make(
+                LoadBalanceStrategy::WeightedRandom,
+                providers.clone(),
+                default_fallback.clone()
+            )
+            .aimd_enabled()
+        );
+        assert!(
+            !make(
+                LoadBalanceStrategy::Priority,
+                vec![providers[0].clone()],
+                default_fallback
+            )
+            .aimd_enabled()
+        );
+        assert!(
+            !make(
+                LoadBalanceStrategy::Priority,
+                providers.clone(),
+                FallbackConfig::default()
+            )
+            .aimd_enabled()
+        );
+        let disabled =
+            serde_json::from_value(serde_json::json!({"enabled":true,"aimd":{"enabled":false}}))
+                .unwrap();
+        assert!(!make(LoadBalanceStrategy::Priority, providers, disabled).aimd_enabled());
+    }
+
+    #[test]
+    fn aimd_first_override_preserves_cascade_and_guards() {
+        let pool = aimd_pool();
+        let mut iter = pool.select_iter();
+        iter.alternate_first = true;
+        let indices: Vec<_> = iter.map(|(index, _, _guard)| index).collect();
+        assert_eq!(indices, [1, 0, 0, 1]);
+        assert!(pool.providers.iter().all(|p| p.active_connections() == 0));
+        let held = pool.providers[1].limiter.try_acquire().unwrap();
+        let mut iter = pool.select_iter();
+        iter.alternate_first = true;
+        assert_eq!(iter.next().unwrap().0, 0); // unavailable alternate falls back to preferred
+        drop(held);
+    }
+
+    #[test]
+    fn aimd_reload_preserves_inherited_and_explicit_default_equivalence() {
+        let urls = ["https://preferred.example", "https://alternate.example"];
+        let old = aimd_pool_from(&urls, None);
+        let mut new = aimd_pool_from(&urls, Some(crate::aimd::AimdConfig::default()));
+        new.adopt_provider_state(&old);
+        assert!(Arc::ptr_eq(
+            new.controller.as_ref().unwrap(),
+            old.controller.as_ref().unwrap()
+        ));
+        assert!(old.controller.as_ref().unwrap().lock().unwrap().active());
+    }
+
+    #[test]
+    fn aimd_reload_adopts_only_same_preferred_and_configuration() {
+        let old = aimd_pool();
+        let mut new = aimd_pool();
+        new.adopt_provider_state(&old);
+        assert!(Arc::ptr_eq(
+            new.controller.as_ref().unwrap(),
+            old.controller.as_ref().unwrap()
+        ));
+        let mut reordered = aimd_pool();
+        reordered.providers.swap(0, 1);
+        reordered.adopt_provider_state(&old);
+        assert!(!Arc::ptr_eq(
+            reordered.controller.as_ref().unwrap(),
+            old.controller.as_ref().unwrap()
+        ));
+        assert!(!old.controller.as_ref().unwrap().lock().unwrap().active());
+        assert!(
+            reordered
+                .controller
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .active()
+        );
+        assert!(
+            old.observe(true, 0, "model", "default", Instant::now())
+                .is_none()
+        );
+        let mut changed = aimd_pool();
+        changed
+            .fallback
+            .as_mut()
+            .unwrap()
+            .aimd
+            .as_mut()
+            .unwrap()
+            .dwell_ms = 2;
+        changed.adopt_provider_state(&old);
+        assert!(!Arc::ptr_eq(
+            changed.controller.as_ref().unwrap(),
+            old.controller.as_ref().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            old.clone().controller.as_ref().unwrap(),
+            old.controller.as_ref().unwrap()
+        ));
+        assert!(
+            old.observe(true, 1, "model", "default", Instant::now())
+                .is_none()
+        );
+        assert!(
+            old.observe(false, 0, "model", "default", Instant::now())
+                .is_none()
+        );
+        assert_eq!(
+            old.select_iter_routed(false, None, "model", "default")
+                .next()
+                .unwrap()
+                .0,
+            0
+        );
     }
 
     #[test]
@@ -1021,6 +1844,47 @@ mod tests {
         assert_eq!(order.len(), 2);
         assert_eq!(order[0].1.url.as_str(), "https://primary.example.com/");
         assert_eq!(order[1].1.url.as_str(), "https://secondary.example.com/");
+    }
+
+    #[test]
+    fn test_select_iter_refused_member_sits_out_later_passes() {
+        use crate::target::{FallbackConfig, LoadBalanceStrategy};
+
+        let providers = vec![
+            Provider::new(create_test_target("https://primary.example.com"), 1),
+            Provider::new(create_test_target("https://secondary.example.com"), 1),
+        ];
+        let pool = ProviderPool::with_config(
+            providers,
+            None,
+            None,
+            None,
+            Some(FallbackConfig {
+                enabled: true,
+                max_attempts: Some(6),
+                ..Default::default()
+            }),
+            LoadBalanceStrategy::Priority,
+            false,
+            Vec::new(),
+        );
+
+        let mut iter = pool.select_iter();
+        let (first, _, guard) = iter.next().unwrap();
+        drop(guard);
+        assert_eq!(first, 0);
+        iter.mark_refused(first);
+
+        // The second pass re-includes members that merely failed, but never
+        // the refused one: only the secondary is left, again and again.
+        let rest: Vec<usize> = std::iter::from_fn(|| iter.next().map(|(idx, _, _)| idx)).collect();
+        assert_eq!(rest, vec![1, 1, 1, 1, 1]);
+
+        // With every member refused, the request ends instead of re-asking.
+        let mut iter = pool.select_iter();
+        iter.mark_refused(0);
+        iter.mark_refused(1);
+        assert!(iter.next().is_none());
     }
 
     #[test]

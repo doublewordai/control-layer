@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE api_keys SET secret_revealed_at = NOW()\n            WHERE id = $1 AND secret_revealed_at IS NULL\n              AND is_deleted = false AND hidden = false AND parent_api_key_id IS NULL\n            RETURNING secret\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "secret",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "b9dc6e5f6cbab4799720a74caa098b5ee45afb0cfcc67c6e8966f8b7cef95d55"
+}

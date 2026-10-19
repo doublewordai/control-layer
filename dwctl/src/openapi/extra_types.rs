@@ -629,9 +629,10 @@ pub struct ResponseRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
 
-    /// Include encrypted reasoning content for rehydration on subsequent requests.
+    /// Additional response data to include. Unsupported projections return a
+    /// structured client error rather than being silently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub include: Option<String>,
+    pub include: Option<Vec<String>>,
 
     /// Text output configuration.
     #[serde(skip_serializing_if = "Option::is_none")]

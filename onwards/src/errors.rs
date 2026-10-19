@@ -8,10 +8,49 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bon::Builder;
-use hyper::StatusCode;
+use hyper::{
+    StatusCode,
+    header::{HeaderValue, RETRY_AFTER},
+};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::reasoning::ReasoningError;
+
+/// Error code for a request refused because the caller's own concurrency
+/// limit is reached.
+const CONCURRENCY_LIMIT_CODE: &str = "concurrency_limit_exceeded";
+const INFLIGHT_LIMIT_CODE: &str = "inflight_limit_exceeded";
+/// Error code for a batch request refused because the model's global batch
+/// in-flight cap is reached. A 529, never a 429: the batch dispatcher cuts its
+/// adaptive concurrency on overload, so it must back off rather than treat the
+/// refusal as a per-key rate limit.
+const BATCH_CAPACITY_CODE: &str = "batch_capacity_exceeded";
+/// Error code for a request refused because the model's providers are full.
+const OVERLOADED_CODE: &str = "overloaded";
+/// Error code for a request refused because the model has no provider
+/// serving it right now.
+const NO_CAPACITY_CODE: &str = "no_capacity";
+
+/// Seconds a caller is told to wait before retrying a refusal with `code`.
+fn retry_after_secs(code: &str) -> Option<&'static str> {
+    match code {
+        // Room frees as in-flight requests finish.
+        CONCURRENCY_LIMIT_CODE | INFLIGHT_LIMIT_CODE | BATCH_CAPACITY_CODE | OVERLOADED_CODE => {
+            Some("1")
+        }
+        // A provider has to be placed and start before anything is served.
+        NO_CAPACITY_CODE => Some("30"),
+        _ => None,
+    }
+}
+
+/// 529: the platform refused the request for capacity. Distinct from 503,
+/// which generic infrastructure sends when a backend is down, and from 429,
+/// which is the caller's own limit.
+fn overload_status() -> StatusCode {
+    StatusCode::from_u16(529).expect("529 is a valid status code")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponseBody {
@@ -25,6 +64,16 @@ pub struct ErrorResponseBody {
 pub struct OnwardsErrorResponse {
     pub body: Option<ErrorResponseBody>,
     pub status: StatusCode,
+    /// What the request resolved to before it failed, when it got that far.
+    /// Attached to the response as an extension so analytics records the
+    /// class for failed requests too.
+    pub serving_outcome: Option<crate::serving::ServingClassOutcome>,
+    pub(crate) authenticated_api_key_id: Option<Uuid>,
+    pub(crate) identity: Option<crate::RequestIdentity>,
+    /// Reports an upstream's error rather than a refusal by onwards itself,
+    /// so it isn't counted as a gateway rejection.
+    #[builder(default)]
+    pub(crate) from_upstream: bool,
 }
 
 impl OnwardsErrorResponse {
@@ -38,6 +87,10 @@ impl OnwardsErrorResponse {
             }),
             status: StatusCode::from_u16(error.status_code())
                 .expect("reasoning errors use valid HTTP status codes"),
+            serving_outcome: None,
+            authenticated_api_key_id: None,
+            identity: None,
+            from_upstream: false,
         }
     }
 
@@ -52,6 +105,10 @@ impl OnwardsErrorResponse {
                 code: "model_not_found".to_string(),
             }),
             status: StatusCode::NOT_FOUND,
+            serving_outcome: None,
+            authenticated_api_key_id: None,
+            identity: None,
+            from_upstream: false,
         }
     }
 
@@ -64,6 +121,29 @@ impl OnwardsErrorResponse {
                 code: "rate_limit".to_string(),
             }),
             status: StatusCode::TOO_MANY_REQUESTS,
+            serving_outcome: None,
+            authenticated_api_key_id: None,
+            identity: None,
+            from_upstream: false,
+        }
+    }
+
+    /// An upstream rate limit, distinct from limits enforced by this proxy.
+    pub fn upstream_rate_limited(message: Option<&str>) -> Self {
+        Self {
+            body: Some(ErrorResponseBody {
+                message: message
+                    .unwrap_or("The upstream service is rate limited. Please try again later.")
+                    .to_string(),
+                r#type: "rate_limit_error".to_string(),
+                param: None,
+                code: "upstream_rate_limit".to_string(),
+            }),
+            status: StatusCode::TOO_MANY_REQUESTS,
+            serving_outcome: None,
+            authenticated_api_key_id: None,
+            identity: None,
+            from_upstream: true,
         }
     }
 
@@ -73,9 +153,88 @@ impl OnwardsErrorResponse {
                 message: "Too many concurrent requests. Please wait for some requests to complete before sending more.".to_string(),
                 r#type: "rate_limit_error".to_string(),
                 param: None,
-                code: "concurrency_limit_exceeded".to_string(),
+                code: CONCURRENCY_LIMIT_CODE.to_string(),
             }),
             status: StatusCode::TOO_MANY_REQUESTS,
+            serving_outcome: None,
+            authenticated_api_key_id: None,
+            identity: None,
+            from_upstream: false,
+        }
+    }
+
+    pub fn inflight_limited(model: &str, limit: u32) -> Self {
+        OnwardsErrorResponse {
+            body: Some(ErrorResponseBody {
+                message: format!(
+                    "Too many realtime requests in flight for model '{model}'. Your account's limit is {limit}; retry once one completes."
+                ),
+                r#type: "rate_limit_error".to_string(),
+                param: None,
+                code: INFLIGHT_LIMIT_CODE.to_string(),
+            }),
+            status: StatusCode::TOO_MANY_REQUESTS,
+            serving_outcome: None,
+            authenticated_api_key_id: None,
+            identity: None,
+            from_upstream: false,
+        }
+    }
+
+    /// A batch request refused because the model's global batch in-flight cap is
+    /// reached. Deliberately a 529 (`overloaded_error`), not a 429: the cap is a
+    /// ceiling on batch traffic so it cannot crowd out realtime, and the batch
+    /// dispatcher cuts its adaptive concurrency on 529.
+    pub fn batch_capacity_exceeded(model: &str, limit: u32) -> Self {
+        OnwardsErrorResponse {
+            body: Some(ErrorResponseBody {
+                message: format!(
+                    "The batch in-flight cap of {limit} for model '{model}' is reached; retry once a batch request completes."
+                ),
+                r#type: "overloaded_error".to_string(),
+                param: None,
+                code: BATCH_CAPACITY_CODE.to_string(),
+            }),
+            status: overload_status(),
+            serving_outcome: None,
+            authenticated_api_key_id: None,
+            identity: None,
+            from_upstream: false,
+        }
+    }
+
+    /// The model's providers are full right now.
+    pub fn overloaded() -> Self {
+        OnwardsErrorResponse {
+            body: Some(ErrorResponseBody {
+                message: "The model is at capacity. Please retry shortly.".to_string(),
+                r#type: "overloaded_error".to_string(),
+                param: None,
+                code: OVERLOADED_CODE.to_string(),
+            }),
+            status: overload_status(),
+            serving_outcome: None,
+            authenticated_api_key_id: None,
+            identity: None,
+            from_upstream: false,
+        }
+    }
+
+    /// The model has no provider serving it right now.
+    pub fn no_capacity() -> Self {
+        OnwardsErrorResponse {
+            body: Some(ErrorResponseBody {
+                message: "The model has no capacity available right now. Please retry later."
+                    .to_string(),
+                r#type: "overloaded_error".to_string(),
+                param: None,
+                code: NO_CAPACITY_CODE.to_string(),
+            }),
+            status: overload_status(),
+            serving_outcome: None,
+            authenticated_api_key_id: None,
+            identity: None,
+            from_upstream: false,
         }
     }
 
@@ -88,6 +247,10 @@ impl OnwardsErrorResponse {
                 code: "internal_error".to_string(),
             }),
             status: StatusCode::INTERNAL_SERVER_ERROR,
+            serving_outcome: None,
+            authenticated_api_key_id: None,
+            identity: None,
+            from_upstream: false,
         }
     }
 
@@ -100,6 +263,10 @@ impl OnwardsErrorResponse {
                 code: "internal_error".to_string(),
             }),
             status: StatusCode::BAD_GATEWAY,
+            serving_outcome: None,
+            authenticated_api_key_id: None,
+            identity: None,
+            from_upstream: false,
         }
     }
 
@@ -112,6 +279,10 @@ impl OnwardsErrorResponse {
                 code: "service_unavailable".to_string(),
             }),
             status: StatusCode::SERVICE_UNAVAILABLE,
+            serving_outcome: None,
+            authenticated_api_key_id: None,
+            identity: None,
+            from_upstream: false,
         }
     }
 
@@ -125,6 +296,10 @@ impl OnwardsErrorResponse {
                 code: "gateway_timeout".to_string(),
             }),
             status: StatusCode::GATEWAY_TIMEOUT,
+            serving_outcome: None,
+            authenticated_api_key_id: None,
+            identity: None,
+            from_upstream: false,
         }
     }
 
@@ -139,6 +314,10 @@ impl OnwardsErrorResponse {
                 code: "payload_too_large".to_string(),
             }),
             status: StatusCode::PAYLOAD_TOO_LARGE,
+            serving_outcome: None,
+            authenticated_api_key_id: None,
+            identity: None,
+            from_upstream: false,
         }
     }
 
@@ -151,6 +330,10 @@ impl OnwardsErrorResponse {
                 code: "unprocessable_request".to_string(),
             }),
             status: StatusCode::UNPROCESSABLE_ENTITY,
+            serving_outcome: None,
+            authenticated_api_key_id: None,
+            identity: None,
+            from_upstream: false,
         }
     }
 
@@ -167,6 +350,10 @@ impl OnwardsErrorResponse {
                 code: code.to_string(),
             }),
             status: StatusCode::BAD_REQUEST,
+            serving_outcome: None,
+            authenticated_api_key_id: None,
+            identity: None,
+            from_upstream: false,
         }
     }
 
@@ -179,6 +366,10 @@ impl OnwardsErrorResponse {
                 code: "forbidden".to_string(),
             }),
             status: StatusCode::FORBIDDEN,
+            serving_outcome: None,
+            authenticated_api_key_id: None,
+            identity: None,
+            from_upstream: false,
         }
     }
 
@@ -192,7 +383,34 @@ impl OnwardsErrorResponse {
                 code: "unauthenticated".to_string(),
             }),
             status: StatusCode::UNAUTHORIZED,
+            serving_outcome: None,
+            authenticated_api_key_id: None,
+            identity: None,
+            from_upstream: false,
         }
+    }
+
+    /// Marks an error onwards built to stand in for an upstream's response
+    /// (an embedded error, an empty body), so it is attributed to the provider.
+    pub(crate) fn reported_by_upstream(mut self) -> Self {
+        self.from_upstream = true;
+        self
+    }
+
+    pub(crate) fn with_identity(mut self, identity: Option<crate::RequestIdentity>) -> Self {
+        self.identity = identity;
+        self
+    }
+
+    pub(crate) fn with_authenticated_api_key_id(mut self, api_key_id: Option<Uuid>) -> Self {
+        self.authenticated_api_key_id = api_key_id;
+        self
+    }
+
+    /// A client error onwards decided on itself, rather than one reporting an
+    /// upstream's response.
+    pub(crate) fn is_gateway_rejection(&self) -> bool {
+        self.status.is_client_error() && !self.from_upstream
     }
 }
 
@@ -202,12 +420,56 @@ struct ErrorEnvelope<'a> {
     error: &'a ErrorResponseBody,
 }
 
+/// Where an error response came from, attached as a response extension to
+/// every error onwards returns (the extension never reaches the client).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ErrorOrigin {
+    /// Onwards decided on the error itself (rejection, limit, auth, no
+    /// capacity). `code` is the error code in the response body.
+    Gateway { code: String },
+    /// The status reports an upstream provider's response.
+    Provider,
+}
+
 impl IntoResponse for OnwardsErrorResponse {
     fn into_response(self) -> Response {
-        match self.body {
+        let mut response = match self.body {
             Some(ref body) => (self.status, Json(ErrorEnvelope { error: body })).into_response(),
             None => self.status.into_response(), // No body, just status
+        };
+        // SDKs that honour Retry-After wait this long before retrying.
+        if let Some(secs) = self
+            .body
+            .as_ref()
+            .and_then(|body| retry_after_secs(&body.code))
+        {
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_static(secs));
         }
+        if let Some(outcome) = self.serving_outcome {
+            response.extensions_mut().insert(outcome);
+        }
+        if let Some(api_key_id) = self.authenticated_api_key_id {
+            response
+                .extensions_mut()
+                .insert(crate::AuthenticatedApiKeyId(api_key_id));
+        }
+        if let Some(identity) = self.identity {
+            response.extensions_mut().insert(identity);
+        }
+        response.extensions_mut().insert(if self.from_upstream {
+            ErrorOrigin::Provider
+        } else {
+            ErrorOrigin::Gateway {
+                code: self
+                    .body
+                    .as_ref()
+                    .map(|body| body.code.clone())
+                    .unwrap_or_default(),
+            }
+        });
+        response
     }
 }
 

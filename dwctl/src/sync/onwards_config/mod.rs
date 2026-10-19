@@ -1,14 +1,23 @@
 //! Configuration synchronization to onwards routing layer.
 
+use crate::db::models::deployments::DEFAULT_COMPONENT_POOL;
 use crate::metrics::errors::component::ONWARDS_SYNC;
-use std::{collections::HashMap, num::NonZeroU32, sync::Arc};
+use crate::telemetry::span_account_name;
+use crate::types::UserId;
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 use metrics::histogram;
+use onwards::affinity::AffinityConfig;
+use onwards::aimd::AimdConfig;
 use onwards::target::{
-    Auth, BackoffConfig as OnwardsBackoffConfig, ConcurrencyLimitParameters, ConfigFile, FallbackConfig as OnwardsFallbackConfig,
-    JitterStrategy as OnwardsJitterStrategy, KeyDefinition, LoadBalanceStrategy as OnwardsLoadBalanceStrategy, OpenResponsesConfig,
-    PoolSpec, ProviderSpec, RateLimitParameters, RoutingAction, RoutingRule, TargetSpecOrList, Targets, WatchTargetsStream,
+    Auth, BackoffConfig as OnwardsBackoffConfig, ConfigFile, FallbackConfig as OnwardsFallbackConfig,
+    JitterStrategy as OnwardsJitterStrategy, KeyDefinition, LoadBalanceStrategy as OnwardsLoadBalanceStrategy, PoolSpec, PoolsSpec,
+    ProviderSpec, RoutingAction, RoutingRule, TargetSpecOrList, Targets, WatchTargetsStream, inheritable_routing_rules,
 };
+use onwards::{AccountServing, ProviderKind, ServingClass, ServingOverlay, ServingPresets, ServingTargets};
 use sqlx::{PgPool, postgres::PgListener};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -24,7 +33,7 @@ pub enum SyncStatus {
 }
 
 use crate::{
-    config::{ONWARDS_CONFIG_CHANGED_CHANNEL, RateLimitTiersConfig},
+    config::ONWARDS_CONFIG_CHANGED_CHANNEL,
     db::models::deployments::LoadBalancingStrategy,
     reasoning::{ReasoningTranslationConfig, resolve_reasoning_translation},
     types::{ApiKeyId, DeploymentId},
@@ -54,15 +63,14 @@ struct OnwardsTarget {
     // Deployment info
     model_name: String,
     alias: String,
-    requests_per_second: Option<f32>,
-    burst_size: Option<i32>,
-    capacity: Option<i32>,
     sanitize_responses: bool,
     trusted: bool,
-    open_responses_adapter: bool,
     reasoning_translation: Option<ReasoningTranslationConfig>,
     /// Traffic routing rules from the model_traffic_rules table
     routing_rules: Vec<RoutingRule>,
+    /// Serving classes this alias offers, each a preset of targets
+    /// (`deployed_models.serving_classes`).
+    serving_classes: ServingPresets,
 
     // Fallback / backoff config. Standard (single-provider) models only retry
     // when fallback is on AND `with_replacement` is true (otherwise the
@@ -71,6 +79,7 @@ struct OnwardsTarget {
     fallback_enabled: bool,
     fallback_on_rate_limit: bool,
     fallback_on_status: Vec<i32>,
+    fallback_realtime_on_status: Vec<i32>,
     fallback_with_replacement: bool,
     fallback_max_attempts: Option<i32>,
     backoff_enabled: bool,
@@ -79,12 +88,22 @@ struct OnwardsTarget {
     backoff_factor: f64,
     backoff_jitter: String,
     backoff_max_total_ms: Option<i32>,
+    first_token_timeout_ms: Option<i64>,
+    aimd: Option<AimdConfig>,
 
     // Endpoint info
     endpoint_url: url::Url,
     endpoint_api_key: Option<String>,
     auth_header_name: String,
     auth_header_prefix: String,
+    /// The endpoint's serving stack understands the scheduling `priority`
+    /// body field (dynamo). Onwards strips the field from named-pool attempts
+    /// to members without it, regardless of position.
+    endpoint_accepts_scheduling_priority: bool,
+    /// What kind of server the endpoint is (`inference_endpoints.kind`): only
+    /// `dynamo` receives the serving-class envelope; `external` is skipped for
+    /// self-hosted-only accounts.
+    endpoint_kind: ProviderKind,
 
     // API keys that have access to this deployment
     api_keys: Vec<OnwardsApiKey>,
@@ -96,34 +115,273 @@ struct OnwardsApiKey {
     id: ApiKeyId,
     secret: String,
     purpose: String,
-    requests_per_second: Option<f32>,
-    burst_size: Option<i32>,
-    /// `verified` flag on the api_key's owning user (api_keys.user_id), used to
-    /// pick between the verified/unverified default rate-limit tiers when this
-    /// key has no per-key override.
-    user_verified: bool,
     /// Account-wide zero-data-retention flag on the api_key's owning user.
     /// Surfaced to onwards as a "zdr" key label; onwards does not act on it yet.
     zero_data_retention: bool,
+    /// The owning account (`api_keys.user_id`): the org for org keys. Emitted
+    /// as the key's `account` label, through which onwards finds the
+    /// account's serving settings and an alias's overlay for it.
+    user_id: UserId,
+    username: String,
+    /// The account's display name, if it has one. Emitted as the key's
+    /// `account_display_name` label, which names the account on traces.
+    display_name: Option<String>,
+}
+
+/// Every alias's overlays, keyed by alias then by account id (as a string,
+/// the value of the key's `account` label), as read from `model_overlays`.
+type OverlaysByAlias = HashMap<String, HashMap<String, ServingOverlay>>;
+
+/// Serving account settings per account id, for accounts that have any.
+type AccountsById = HashMap<String, AccountServing>;
+
+type InflightOverridesByAlias = HashMap<String, HashMap<String, u32>>;
+
+/// Parse a stored class name; the CHECK constraints guarantee the set, so an
+/// unknown value is a schema drift worth a warning rather than a crash.
+fn parse_stored_class(value: Option<&str>) -> Option<ServingClass> {
+    let value = value?;
+    match value.parse::<ServingClass>() {
+        Ok(class) => Some(class),
+        Err(err) => {
+            warn!(%err, "ignoring unknown serving class stored in the database");
+            None
+        }
+    }
+}
+
+/// Parse a stored endpoint kind; the CHECK constraint guarantees the set.
+fn parse_provider_kind(value: &str) -> ProviderKind {
+    value.parse().unwrap_or_else(|err: String| {
+        warn!(%err, "ignoring unknown endpoint kind stored in the database; treating as external");
+        ProviderKind::External
+    })
+}
+
+fn parse_stored_classes(values: &[String]) -> Vec<ServingClass> {
+    values.iter().filter_map(|v| parse_stored_class(Some(v))).collect()
+}
+
+/// Parse a model's stored presets (`deployed_models.serving_classes`, JSONB
+/// object class → targets). The catalog writes them, so a malformed value is
+/// a schema drift worth a warning; the model then offers nothing.
+fn parse_stored_presets(value: &serde_json::Value, alias: &str) -> ServingPresets {
+    match serde_json::from_value(value.clone()) {
+        Ok(presets) => presets,
+        Err(err) => {
+            warn!(%err, alias, "ignoring malformed serving class presets stored in the database");
+            ServingPresets::new()
+        }
+    }
+}
+
+/// Parse an overlay's stored explicit targets (`model_overlays.targets`).
+fn parse_stored_targets(value: Option<serde_json::Value>) -> Option<ServingTargets> {
+    let value = value?;
+    match serde_json::from_value(value) {
+        Ok(targets) => Some(targets),
+        Err(err) => {
+            warn!(%err, "ignoring malformed overlay targets stored in the database");
+            None
+        }
+    }
+}
+
+/// Loads every alias's overlays, keyed by alias then account id.
+async fn load_overlays_from_db(db: &PgPool) -> Result<OverlaysByAlias, anyhow::Error> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT mo.user_id, dm.alias, mo.default_serving_class, mo.targets, mo.self_hosted_only
+        FROM model_overlays mo
+        INNER JOIN deployed_models dm ON dm.id = mo.deployed_model_id
+        INNER JOIN users u ON u.id = mo.user_id
+        WHERE dm.deleted = FALSE
+          AND u.is_deleted = FALSE
+        "#
+    )
+    .fetch_all(db)
+    .await?;
+
+    let mut overlays: OverlaysByAlias = HashMap::new();
+    for row in rows {
+        overlays.entry(row.alias).or_default().insert(
+            row.user_id.to_string(),
+            ServingOverlay {
+                default_class: parse_stored_class(row.default_serving_class.as_deref()),
+                targets: parse_stored_targets(row.targets),
+                self_hosted_only: row.self_hosted_only,
+            },
+        );
+    }
+    Ok(overlays)
+}
+
+async fn load_inflight_overrides_from_db(db: &PgPool) -> Result<InflightOverridesByAlias, anyhow::Error> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT dm.alias, o.user_id, o.inflight_limit
+        FROM realtime_inflight_limit_overrides o
+        INNER JOIN deployed_models dm ON dm.id = o.deployed_model_id
+        WHERE dm.deleted = FALSE
+        "#
+    )
+    .fetch_all(db)
+    .await?;
+
+    let mut overrides: InflightOverridesByAlias = HashMap::new();
+    for row in rows {
+        overrides
+            .entry(row.alias)
+            .or_default()
+            .insert(row.user_id.to_string(), row.inflight_limit as u32);
+    }
+    Ok(overrides)
+}
+
+/// Loads the serving account settings of every account that has any. An
+/// account with nothing set is absent, so the config for everyone else is
+/// byte-identical to before serving classes existed.
+async fn load_accounts_from_db(db: &PgPool) -> Result<AccountsById, anyhow::Error> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT id, granted_serving_classes, default_serving_class, self_hosted_only
+        FROM users
+        WHERE is_deleted = FALSE
+          AND (granted_serving_classes <> '{}' OR default_serving_class IS NOT NULL OR self_hosted_only)
+        "#
+    )
+    .fetch_all(db)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.id.to_string(),
+                AccountServing {
+                    granted: parse_stored_classes(&row.granted_serving_classes),
+                    default_class: parse_stored_class(row.default_serving_class.as_deref()),
+                    self_hosted_only: row.self_hosted_only,
+                },
+            )
+        })
+        .collect())
+}
+
+/// The labels every key carries: its purpose, the account's ZDR flag, the
+/// account itself so onwards can find the account's serving settings and an
+/// alias's overlay for it, the account's username to name it in metrics, and
+/// the account's display name (the username when it has none) to name it on
+/// traces. `account_name` stays the username: it is a metric label, and
+/// switching it would split existing series.
+fn key_labels(api_key: &OnwardsApiKey) -> HashMap<String, String> {
+    let display_name = span_account_name(api_key.display_name.as_deref(), &api_key.username);
+    HashMap::from([
+        (ACCOUNT_DISPLAY_NAME_LABEL.to_string(), display_name),
+        ("purpose".to_string(), api_key.purpose.clone()),
+        // Surface the account's zero-data-retention flag to onwards as a label.
+        // Always emitted ("true"/"false"); onwards does not act on it yet.
+        ("zdr".to_string(), api_key.zero_data_retention.to_string()),
+        (onwards::serving::ACCOUNT_LABEL.to_string(), api_key.user_id.to_string()),
+        (onwards::serving::ACCOUNT_NAME_LABEL.to_string(), api_key.username.clone()),
+        ("api_key_id".to_string(), api_key.id.to_string()),
+    ])
+}
+
+/// Key label carrying the account's display name for trace attributes.
+const ACCOUNT_DISPLAY_NAME_LABEL: &str = onwards::serving::ACCOUNT_DISPLAY_NAME_LABEL;
+
+const MIN_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+const RELOAD_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+struct NotificationLag {
+    table: String,
+    age_at_receipt: std::time::Duration,
+    received_at: tokio::time::Instant,
+}
+
+impl NotificationLag {
+    fn at_publication(&self, now: tokio::time::Instant) -> std::time::Duration {
+        // Include debounce, database work and retries in DB-change-to-publication lag.
+        self.age_at_receipt + now.duration_since(self.received_at)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReloadOutcome {
+    Published,
+    Retry,
+    Closed,
+}
+
+/// Coalesce notifications from slow reloads and retain failed refreshes for retry.
+struct ReloadSchedule {
+    next_allowed: tokio::time::Instant,
+    pending: Option<(tokio::time::Instant, &'static str)>,
+}
+
+impl ReloadSchedule {
+    fn new(now: tokio::time::Instant) -> Self {
+        Self {
+            next_allowed: now + MIN_RELOAD_INTERVAL,
+            pending: None,
+        }
+    }
+
+    fn notify(&mut self, now: tokio::time::Instant) {
+        self.pending.get_or_insert((
+            now.max(self.next_allowed),
+            if now < self.next_allowed { "coalesced" } else { "listen_notify" },
+        ));
+    }
+
+    fn fallback(&mut self, now: tokio::time::Instant) {
+        if now >= self.next_allowed {
+            self.pending.get_or_insert((now, "fallback"));
+        }
+    }
+
+    fn completed(&mut self, now: tokio::time::Instant, outcome: ReloadOutcome) {
+        // The quiet/retry window starts after the attempt, not before the DB work.
+        self.next_allowed = now
+            + if outcome == ReloadOutcome::Retry {
+                RELOAD_RETRY_INTERVAL
+            } else {
+                MIN_RELOAD_INTERVAL
+            };
+        self.pending = (outcome == ReloadOutcome::Retry).then_some((self.next_allowed, "retry"));
+    }
+}
+
+#[cfg(test)]
+struct ReloadCheckpoint {
+    outcome: ReloadOutcome,
+    resume: tokio::sync::oneshot::Sender<()>,
 }
 
 /// Manages the integration between onwards-pilot and the onwards proxy
 pub struct OnwardsConfigSync {
-    db: PgPool,
+    /// Query traffic (pooled endpoint when configured).
+    db: sqlx_pool_router::DynPools,
+    /// Direct connections for the LISTEN session; a transaction-mode pooler
+    /// cannot carry a subscription.
+    listener_db: sqlx_pool_router::DynPools,
     sender: watch::Sender<Targets>,
+    #[cfg(test)]
+    reload_checkpoint: Option<mpsc::Sender<ReloadCheckpoint>>,
     /// Shared map of model batch capacity limits for the daemon
     daemon_capacity_limits: Option<Arc<dashmap::DashMap<String, usize>>>,
     /// Default batch concurrency for models without explicit batch_capacity
     default_batch_capacity: usize,
+    /// Default global batch in-flight cap applied by onwards to virtual models
+    /// without their own positive `batch_capacity`. `None` means no default.
+    default_batch_inflight_capacity: Option<u32>,
     /// Model aliases that batch API keys should have automatic access to (escalation targets)
     escalation_models: Vec<String>,
     /// Tracks previous-cycle gauge label sets for zeroing stale metrics
     cache_info_state: crate::metrics::CacheInfoState,
     /// Enable strict mode with schema validation
     strict_mode: bool,
-    /// Default rate-limit tiers applied to API keys based on the owning user's
-    /// `verified` flag. Used when a key has no per-key override.
-    rate_limit_tiers: RateLimitTiersConfig,
 }
 
 pub struct SyncConfig {
@@ -149,36 +407,51 @@ impl OnwardsConfigSync {
     #[cfg(test)]
     #[instrument(skip(db))]
     pub async fn new(db: PgPool) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
-        Self::new_with_daemon_limits(db, None, 10, Vec::new(), false, RateLimitTiersConfig::default()).await
+        Self::new_with_daemon_limits(
+            db.clone(),
+            db,
+            None,
+            10,
+            Some(crate::config::DEFAULT_BATCH_INFLIGHT_CAPACITY),
+            Vec::new(),
+            false,
+        )
+        .await
     }
 
     /// Creates a new OnwardsConfigSync with optional daemon capacity limits map and escalation models
     ///
     /// `daemon_capacity_limits` - Shared map populated with per-model concurrency limits for the batch daemon.
     /// `default_batch_capacity` - Default concurrency limit for models without explicit `batch_capacity`.
+    /// `default_batch_inflight_capacity` - Default global batch in-flight cap for virtual models
+    ///   without their own positive `batch_capacity`; `None` means no default.
     /// `escalation_models` - Model aliases that batch API keys should have automatic access to.
     /// `strict_mode` - Enable strict mode with schema validation (only known OpenAI API paths accepted)
-    /// `rate_limit_tiers` - Default rate limits applied per-key based on the owning user's `verified` flag.
-    #[instrument(skip(db, daemon_capacity_limits, escalation_models, rate_limit_tiers))]
+    /// `listener_db` - Direct (non-pooled) connections for the LISTEN session.
+    #[instrument(skip(db, listener_db, daemon_capacity_limits, escalation_models))]
     pub async fn new_with_daemon_limits(
-        db: PgPool,
+        db: impl sqlx_pool_router::PoolProvider,
+        listener_db: impl sqlx_pool_router::PoolProvider,
         daemon_capacity_limits: Option<Arc<dashmap::DashMap<String, usize>>>,
         default_batch_capacity: usize,
+        default_batch_inflight_capacity: Option<u32>,
         escalation_models: Vec<String>,
         strict_mode: bool,
-        rate_limit_tiers: RateLimitTiersConfig,
     ) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
+        // Live provider (not a pinned pool): survives runtime pool swaps.
+        let db = sqlx_pool_router::DynPools::new(db);
         // Load initial configuration (including composite models)
-        let initial_targets = load_targets_from_db(&db, &escalation_models, strict_mode, &rate_limit_tiers).await?;
+        let initial_targets =
+            load_targets_from_db_with_batch_default(&db.write(), &escalation_models, strict_mode, default_batch_inflight_capacity).await?;
 
         // If daemon limits are provided, populate them
         if let Some(ref limits) = daemon_capacity_limits {
-            update_daemon_capacity_limits(&db, limits, default_batch_capacity).await?;
+            update_daemon_capacity_limits(&db.write(), limits, default_batch_capacity).await?;
         }
 
         // Populate cache info metrics on startup
         let mut cache_info_state = crate::metrics::CacheInfoState::new();
-        if let Err(e) = crate::metrics::update_cache_info_metrics(&db, &initial_targets, &mut cache_info_state).await {
+        if let Err(e) = crate::metrics::update_cache_info_metrics(&db.write(), &initial_targets, &mut cache_info_state).await {
             crate::background_error!(
                 ONWARDS_SYNC,
                 "cache_info_metrics",
@@ -193,13 +466,16 @@ impl OnwardsConfigSync {
 
         let integration = Self {
             db,
+            listener_db: sqlx_pool_router::DynPools::new(listener_db),
             sender,
+            #[cfg(test)]
+            reload_checkpoint: None,
             daemon_capacity_limits,
             default_batch_capacity,
+            default_batch_inflight_capacity,
             escalation_models,
             cache_info_state,
             strict_mode,
-            rate_limit_tiers,
         };
         let stream = WatchTargetsStream::new(receiver);
 
@@ -214,13 +490,8 @@ impl OnwardsConfigSync {
     /// Starts the background task that listens for database changes and updates the configuration
     #[instrument(skip(self, config, shutdown_token), err)]
     pub async fn start(mut self, config: SyncConfig, shutdown_token: CancellationToken) -> Result<(), anyhow::Error> {
-        // Debouncing for reloads. Notifications arriving inside the window
-        // are COALESCED into one trailing reload (pending_reload) rather than
-        // dropped - a dropped notification used to wait for the fallback
-        // timer, which is minutes in production.
-        let mut last_reload_time = std::time::Instant::now();
-        const MIN_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-        let mut pending_reload: Option<tokio::time::Instant> = None;
+        let mut schedule = ReloadSchedule::new(tokio::time::Instant::now());
+        let mut notification_lag = None;
 
         // Fallback sync interval (0 = disabled)
         let fallback_interval = if config.fallback_interval_milliseconds > 0 {
@@ -233,7 +504,7 @@ impl OnwardsConfigSync {
             if let Some(tx) = &config.status_tx {
                 tx.send(SyncStatus::Connecting).await?;
             }
-            let mut listener = PgListener::connect_with(&self.db).await?;
+            let mut listener = PgListener::connect_with(&self.listener_db.write()).await?;
             // Listen to auth config changes
             listener.listen(ONWARDS_CONFIG_CHANGED_CHANNEL).await?;
 
@@ -281,38 +552,13 @@ impl OnwardsConfigSync {
                                 debug!("Received notification on channel: {} with payload: {:?}",
                                       notification.channel(), notification.payload());
 
-                                // Parse the notification timestamp for lag measurement
-                                let notify_info = parse_notify_payload(notification.payload());
-
-                                // Inside the debounce window: coalesce into
-                                // one trailing reload instead of dropping the
-                                // notification.
-                                if last_reload_time.elapsed() < MIN_RELOAD_INTERVAL {
-                                    if pending_reload.is_none() {
-                                        let deadline = tokio::time::Instant::now()
-                                            + MIN_RELOAD_INTERVAL.saturating_sub(last_reload_time.elapsed());
-                                        pending_reload = Some(deadline);
-                                        debug!("Coalescing reload: trailing reload scheduled (last reload was {:?} ago)",
-                                               last_reload_time.elapsed());
-                                    }
-                                    continue;
-                                }
-
-                                last_reload_time = std::time::Instant::now();
-                                pending_reload = None;
-                                if !self.full_reload("listen_notify").await? {
-                                    break;
-                                }
-
-                                // Record cache sync lag metric (time from DB change to cache update)
-                                if let Some((table_name, lag)) = notify_info {
-                                    let lag_seconds = lag.as_secs_f64();
-                                    histogram!("dwctl_cache_sync_lag_seconds", "table" => table_name.to_string())
-                                        .record(lag_seconds);
-                                    info!("Updated onwards configuration successfully (sync lag: {:.3}ms from {})",
-                                          lag_seconds * 1000.0, table_name);
-                                } else {
-                                    info!("Updated onwards configuration successfully");
+                                schedule.notify(tokio::time::Instant::now());
+                                if let Some((table_name, lag)) = parse_notify_payload(notification.payload()) {
+                                    notification_lag.get_or_insert(NotificationLag {
+                                        table: table_name.to_string(),
+                                        age_at_receipt: lag,
+                                        received_at: tokio::time::Instant::now(),
+                                    });
                                 }
                             }
                             Err(e) => {
@@ -335,18 +581,24 @@ impl OnwardsConfigSync {
                         }
                     }
 
-                    // Coalesced trailing reload from a debounced notification
+                    // A single deadline handles direct, trailing and retry refreshes.
                     _ = async {
-                        match pending_reload {
-                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        match schedule.pending {
+                            Some((deadline, _)) => tokio::time::sleep_until(deadline).await,
                             None => std::future::pending().await,
                         }
                     } => {
-                        debug!("Coalesced trailing reload triggered");
-                        pending_reload = None;
-                        last_reload_time = std::time::Instant::now();
-                        if !self.full_reload("coalesced").await? {
-                            break;
+                        let (_, source) = schedule.pending.take().expect("reload deadline was scheduled");
+                        let outcome = self.full_reload(source).await?;
+                        schedule.completed(tokio::time::Instant::now(), outcome);
+                        if outcome == ReloadOutcome::Published
+                            && let Some(lag) = notification_lag.take()
+                        {
+                            let seconds = lag.at_publication(tokio::time::Instant::now()).as_secs_f64();
+                            histogram!("dwctl_cache_sync_lag_seconds", "table" => lag.table).record(seconds);
+                        }
+                        if outcome == ReloadOutcome::Closed {
+                            break 'outer;
                         }
                     }
 
@@ -354,22 +606,10 @@ impl OnwardsConfigSync {
                     _ = async {
                         match &mut fallback_timer {
                             Some(timer) => timer.tick().await,
-                            None => std::future::pending().await, // Never resolve if disabled
+                            None => std::future::pending().await,
                         }
                     } => {
-                        debug!("Fallback periodic sync triggered");
-
-                        // Skip if we just reloaded via notification (debounce);
-                        // the fallback timer fires again on its own.
-                        if last_reload_time.elapsed() < MIN_RELOAD_INTERVAL {
-                            debug!("Skipping fallback sync due to recent notification-triggered reload");
-                            continue;
-                        }
-
-                        last_reload_time = std::time::Instant::now();
-                        if !self.full_reload("fallback").await? {
-                            break;
-                        }
+                        schedule.fallback(tokio::time::Instant::now());
                     }
                 }
             }
@@ -380,11 +620,17 @@ impl OnwardsConfigSync {
     }
 
     /// Full config rebuild from the database: updates capacity limits and
-    /// cache metrics, and sends the new Targets. Returns Ok(false) if the
-    /// watch channel is closed (all receivers dropped); Err only for fatal
-    /// DB errors (closed pool / connection).
-    async fn full_reload(&mut self, source: &'static str) -> Result<bool, anyhow::Error> {
-        let new_targets = match load_targets_from_db(&self.db, &self.escalation_models, self.strict_mode, &self.rate_limit_tiers).await {
+    /// cache metrics, and sends the new Targets. Recoverable failures retain a
+    /// pending retry; closed receivers stop the task, and fatal DB errors propagate.
+    async fn full_reload(&mut self, source: &'static str) -> Result<ReloadOutcome, anyhow::Error> {
+        let new_targets = match load_targets_from_db_with_batch_default(
+            &self.db.write(),
+            &self.escalation_models,
+            self.strict_mode,
+            self.default_batch_inflight_capacity,
+        )
+        .await
+        {
             Ok(targets) => targets,
             Err(e) => {
                 crate::background_error!(ONWARDS_SYNC, "load_targets", Error, "Failed to load targets from database: {}", e);
@@ -392,15 +638,19 @@ impl OnwardsConfigSync {
                     error!("Database pool closed, exiting sync task");
                     return Err(e);
                 }
-                // Continue listening for other types of errors
-                return Ok(true);
+                #[cfg(test)]
+                self.checkpoint(ReloadOutcome::Retry).await;
+                return Ok(ReloadOutcome::Retry);
             }
         };
+        // Tests can commit a later change after this snapshot, before publication.
+        #[cfg(test)]
+        self.checkpoint(ReloadOutcome::Published).await;
         debug!("Loaded {} targets from database", new_targets.targets.len());
 
         // Update daemon capacity limits if configured
         if let Some(ref limits) = self.daemon_capacity_limits
-            && let Err(e) = update_daemon_capacity_limits(&self.db, limits, self.default_batch_capacity).await
+            && let Err(e) = update_daemon_capacity_limits(&self.db.write(), limits, self.default_batch_capacity).await
         {
             crate::background_error!(
                 ONWARDS_SYNC,
@@ -412,7 +662,7 @@ impl OnwardsConfigSync {
         }
 
         // Update cache info metrics
-        if let Err(e) = crate::metrics::update_cache_info_metrics(&self.db, &new_targets, &mut self.cache_info_state).await {
+        if let Err(e) = crate::metrics::update_cache_info_metrics(&self.db.write(), &new_targets, &mut self.cache_info_state).await {
             crate::background_error!(
                 ONWARDS_SYNC,
                 "cache_info_metrics",
@@ -426,11 +676,22 @@ impl OnwardsConfigSync {
         if let Err(e) = self.sender.send(new_targets) {
             error!("Failed to send targets update: {}", e);
             // If all receivers are dropped, we can exit
-            return Ok(false);
+            return Ok(ReloadOutcome::Closed);
         }
 
         metrics::counter!("dwctl_cache_sync_total", "source" => source).increment(1);
-        Ok(true)
+        info!("Updated onwards configuration successfully ({source})");
+        Ok(ReloadOutcome::Published)
+    }
+
+    #[cfg(test)]
+    async fn checkpoint(&self, outcome: ReloadOutcome) {
+        if let Some(tx) = &self.reload_checkpoint {
+            let (resume, wait) = tokio::sync::oneshot::channel();
+            if tx.send(ReloadCheckpoint { outcome, resume }).await.is_ok() {
+                let _ = wait.await;
+            }
+        }
     }
 }
 
@@ -445,6 +706,9 @@ impl OnwardsConfigSync {
 #[derive(Debug, Clone)]
 struct CompositeModelComponent {
     weight: i32,
+    /// Which of the composite's named pools this membership belongs to,
+    /// straight from `deployed_model_components.pool`.
+    pool: String,
     // Component target info (from the underlying deployed_model)
     target: OnwardsTarget,
 }
@@ -455,9 +719,10 @@ struct OnwardsCompositeModel {
     #[allow(dead_code)] // Useful for debug logging
     id: DeploymentId,
     alias: String,
-    requests_per_second: Option<f32>,
-    burst_size: Option<i32>,
-    capacity: Option<i32>,
+    realtime_inflight_limit: i32,
+    /// Per-model batch in-flight cap. `None` means batch is uncapped on this
+    /// alias. See `deployed_models.batch_capacity`.
+    batch_capacity: Option<i32>,
     /// Load balancing strategy (weighted_random or priority)
     lb_strategy: LoadBalancingStrategy,
     /// Fallback enabled
@@ -466,6 +731,7 @@ struct OnwardsCompositeModel {
     fallback_on_rate_limit: bool,
     /// HTTP status codes that trigger fallback
     fallback_on_status: Vec<i32>,
+    fallback_realtime_on_status: Vec<i32>,
     /// Sample with replacement during weighted random failover
     fallback_with_replacement: bool,
     /// Maximum number of failover attempts
@@ -481,21 +747,26 @@ struct OnwardsCompositeModel {
     /// Independent of `backoff_enabled` semantics; only consulted when
     /// backoff is enabled.
     backoff_max_total_ms: Option<i32>,
+    first_token_timeout_ms: Option<i64>,
+    aimd: Option<AimdConfig>,
+    affinity: Option<AffinityConfig>,
     /// Whether to sanitize/filter sensitive data from model responses
     sanitize_responses: bool,
     /// Whether to mark provider as trusted in strict mode
     #[allow(dead_code)] // Stored in DB but composite-level trust is not yet propagated to onwards
     trusted: bool,
-    /// Whether to enable the open_responses adapter at the pool level
-    open_responses_adapter: bool,
     /// Traffic routing rules from the database
     routing_rules: Vec<RoutingRule>,
+    /// Serving classes this alias offers, each a preset of targets.
+    serving_classes: ServingPresets,
     components: Vec<CompositeModelComponent>,
     // API keys that have access to this composite model
     api_keys: Vec<OnwardsApiKey>,
 }
 
 /// Loads composite models with their components and API keys from the database
+/// General paid admission deliberately includes future/internal-purpose open-ended
+/// tariffs, preserving existing free-model access rules independently of billing.
 #[tracing::instrument(skip(db, escalation_models))]
 async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]) -> Result<Vec<OnwardsCompositeModel>, anyhow::Error> {
     debug!(
@@ -509,9 +780,6 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
         SELECT
             cm.id as composite_model_id,
             cm.alias,
-            cm.requests_per_second,
-            cm.burst_size,
-            cm.capacity,
             cm.lb_strategy,
             cm.fallback_enabled,
             cm.fallback_on_rate_limit,
@@ -520,26 +788,24 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             cm.fallback_max_attempts,
             cm.sanitize_responses as composite_sanitize_responses,
             cm.trusted as composite_trusted,
-            cm.open_responses_adapter as "composite_open_responses_adapter?",
             -- Component info
             dmc.deployed_model_id,
             dmc.weight,
+            dmc.pool as component_pool,
             -- Underlying deployment info
             dm.model_name,
             dm.alias as deployment_alias,
-            dm.requests_per_second as deployment_requests_per_second,
-            dm.burst_size as deployment_burst_size,
-            dm.capacity as deployment_capacity,
             dm.sanitize_responses as deployment_sanitize_responses,
             dm.trusted as deployment_trusted,
-            dm.open_responses_adapter as "deployment_open_responses_adapter?",
             ie.reasoning_translation as endpoint_reasoning_translation,
             dm.reasoning_translation_overrides as model_reasoning_translation_overrides,
             -- Endpoint info
             ie.url as "endpoint_url!",
             ie.api_key as endpoint_api_key,
             ie.auth_header_name,
-            ie.auth_header_prefix
+            ie.auth_header_prefix,
+            ie.accepts_scheduling_priority as endpoint_accepts_scheduling_priority,
+            ie.kind as endpoint_kind
         FROM deployed_models cm
         INNER JOIN deployed_model_components dmc ON cm.id = dmc.composite_model_id
         INNER JOIN deployed_models dm ON dmc.deployed_model_id = dm.id
@@ -553,7 +819,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
         -- weight/created_at keys break any residual sort_order tie the same way
         -- the admin API does, so the provider shown as "Primary" is the one
         -- onwards actually tries first.
-        ORDER BY cm.id, dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC
+        ORDER BY cm.id, dmc.pool, dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC
         "#
     )
     .fetch_all(db)
@@ -567,20 +833,20 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             ak.id as api_key_id,
             ak.secret as api_key_secret,
             ak.purpose as api_key_purpose,
-            ak.requests_per_second,
-            ak.burst_size,
-            ak.user_verified,
-            ak.user_zero_data_retention
+            ak.user_zero_data_retention,
+            ak.user_id,
+            ak.user_username,
+            ak.user_display_name as "user_display_name?"
         FROM deployed_models cm
         CROSS JOIN LATERAL (
             SELECT DISTINCT
                 ak.id,
                 ak.secret,
                 ak.purpose,
-                ak.requests_per_second,
-                ak.burst_size,
-                u.verified as user_verified,
-                u.zero_data_retention as user_zero_data_retention
+                ak.user_id,
+                u.zero_data_retention as user_zero_data_retention,
+                u.username as user_username,
+                u.display_name as user_display_name
             FROM api_keys ak
             JOIN users u ON u.id = ak.user_id
             WHERE (
@@ -605,7 +871,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     AND cm.alias = ANY($1::text[])
                 )
             )
-            -- Require positive balance OR free model (system user always passes)
+            -- General free-model access is preserved; a zero customer deal does not make a paid model free.
             AND (
                 ak.user_id = '00000000-0000-0000-0000-000000000000'
                 -- Positive balance read directly from the total
@@ -614,27 +880,44 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 -- is_deleted guard mirrors the old balance CTE, which only
                 -- contained non-deleted users; key deletion is not implied by
                 -- user deletion, so this check is load-bearing.
-                OR (u.is_deleted = false AND EXISTS (
+                -- Keep this lookup inline so PostgreSQL can build a hashed
+                -- set of enabled accounts once instead of calling a function
+                -- for every model/key pair. The outer guard excludes deleted users.
+                OR (u.is_deleted = false AND (EXISTS (
+                    SELECT 1 FROM user_feature_flags f
+                    WHERE f.user_id = u.id
+                      AND f.feature_flag = 'ALLOW_NEGATIVE_BALANCE'
+                      AND f.enabled
+                ) OR EXISTS (
                     SELECT 1 FROM user_balance_checkpoints ub
                     WHERE ub.user_id = ak.user_id AND ub.balance > 0
-                ))
+                )))
                 OR (
+                    -- Keep the legacy general-tariff rule; only this account's
+                    -- positive deal can require credit on an otherwise free model.
                     NOT EXISTS (
                         SELECT 1 FROM model_tariffs mt
-                        WHERE mt.deployed_model_id = cm.id
+                        WHERE mt.deployed_model_id = cm.id AND mt.user_id IS NULL AND mt.serving_class IS NULL
                           AND mt.valid_until IS NULL
+                          AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                    ) AND NOT EXISTS (
+                        SELECT 1 FROM model_tariffs mt
+                        WHERE mt.deployed_model_id = cm.id AND mt.user_id = ak.user_id
+                          AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())
                           AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                     )
                 )
             )
+            -- Account deletion revokes access independently of key deletion.
+            AND (ak.user_id = '00000000-0000-0000-0000-000000000000' OR u.is_deleted = false)
             AND ak.is_deleted = false
             -- Spending-cap gate: exclude every key of a cap scope (the capped
             -- root and its hidden batch child alike) once the scope's
             -- CALENDAR-ALIGNED (UTC, non-rolling) window spend has reached the
             -- root's limit. Guarded so the uncapped majority short-circuits on
-            -- the first branch; the subquery is two PK probes. Free models
-            -- stay usable on an exhausted scope, mirroring the balance gate's
-            -- free-model arm. Un-capping needs no job or traffic: the
+            -- the first branch; the subquery is two PK probes. Generally free
+            -- models remain usable, but zero customer deals do not bypass caps
+            -- on paid models. Un-capping needs no job or traffic: the
             -- window-membership check (shared function, migration 123) turns
             -- false at the calendar boundary and the periodic fallback sync
             -- readmits the keys.
@@ -648,12 +931,17 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                       AND root.spend_limit IS NOT NULL
                       AND api_key_cap_window_current(ck.window_started_at, root.spend_limit_interval)
                       AND ck.window_spend >= root.spend_limit
-                      AND EXISTS (
-                          SELECT 1 FROM model_tariffs mt
-                          WHERE mt.deployed_model_id = cm.id
-                            AND mt.valid_until IS NULL
-                            AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
-                      )
+                      AND (EXISTS (
+                        SELECT 1 FROM model_tariffs mt
+                        WHERE mt.deployed_model_id = cm.id AND mt.user_id IS NULL AND mt.serving_class IS NULL
+                          AND mt.valid_until IS NULL
+                          AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                      ) OR EXISTS (
+                        SELECT 1 FROM model_tariffs mt
+                        WHERE mt.deployed_model_id = cm.id AND mt.user_id = ak.user_id
+                          AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())
+                          AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                      ))
                 )
             )
             -- Inference data plane only: platform (management) keys must never
@@ -663,7 +951,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             -- but is used internally for onwards inference, so it is exempt.
             AND (
                 ak.user_id = '00000000-0000-0000-0000-000000000000'
-                OR ak.purpose IN ('realtime', 'batch', 'playground')
+                OR ak.purpose IN ('realtime', 'batch', 'playground', 'continuation')
             )
         ) ak
         WHERE cm.is_composite = TRUE
@@ -683,13 +971,13 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
         SELECT
             id as composite_model_id,
             alias,
-            requests_per_second,
-            burst_size,
-            capacity,
+            realtime_inflight_limit,
+            batch_capacity,
             lb_strategy,
             fallback_enabled,
             fallback_on_rate_limit,
             fallback_on_status,
+            fallback_realtime_on_status,
             fallback_with_replacement,
             fallback_max_attempts,
             backoff_enabled,
@@ -698,9 +986,12 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             backoff_factor,
             backoff_jitter,
             backoff_max_total_ms,
+            first_token_timeout_ms,
+            aimd,
+            affinity,
             sanitize_responses,
             trusted,
-            open_responses_adapter as "open_responses_adapter?"
+            serving_classes
         FROM deployed_models
         WHERE is_composite = TRUE
           AND deleted = FALSE
@@ -718,18 +1009,19 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             .and_then(LoadBalancingStrategy::try_parse)
             .unwrap_or_default();
 
+        let presets = parse_stored_presets(&row.serving_classes, &row.alias);
         composite_map.insert(
             row.composite_model_id,
             OnwardsCompositeModel {
                 id: row.composite_model_id,
                 alias: row.alias,
-                requests_per_second: row.requests_per_second,
-                burst_size: row.burst_size,
-                capacity: row.capacity,
+                realtime_inflight_limit: row.realtime_inflight_limit,
+                batch_capacity: row.batch_capacity,
                 lb_strategy,
                 fallback_enabled: row.fallback_enabled.unwrap_or(true),
                 fallback_on_rate_limit: row.fallback_on_rate_limit.unwrap_or(true),
                 fallback_on_status: row.fallback_on_status.unwrap_or_else(|| vec![429, 499, 500, 502, 503, 504]),
+                fallback_realtime_on_status: row.fallback_realtime_on_status,
                 fallback_with_replacement: row.fallback_with_replacement.unwrap_or(false),
                 fallback_max_attempts: row.fallback_max_attempts,
                 backoff_enabled: row.backoff_enabled,
@@ -738,10 +1030,13 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 backoff_factor: row.backoff_factor,
                 backoff_jitter: row.backoff_jitter,
                 backoff_max_total_ms: row.backoff_max_total_ms,
+                first_token_timeout_ms: row.first_token_timeout_ms,
+                aimd: row.aimd.map(serde_json::from_value).transpose()?,
+                affinity: row.affinity.map(serde_json::from_value).transpose()?,
                 sanitize_responses: row.sanitize_responses,
                 trusted: row.trusted,
-                open_responses_adapter: row.open_responses_adapter.unwrap_or(true),
                 routing_rules: Vec::new(), // Populated from separate query below
+                serving_classes: presets,
                 components: Vec::new(),
                 api_keys: Vec::new(),
             },
@@ -765,27 +1060,26 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
         if let Some(composite) = composite_map.get_mut(&row.composite_model_id) {
             composite.components.push(CompositeModelComponent {
                 weight: row.weight,
+                pool: row.component_pool.clone(),
                 target: OnwardsTarget {
                     model_name: row.model_name.clone(),
                     alias: row.deployment_alias.clone(),
-                    requests_per_second: row.deployment_requests_per_second,
-                    burst_size: row.deployment_burst_size,
-                    capacity: row.deployment_capacity,
                     sanitize_responses: row.deployment_sanitize_responses,
                     trusted: row.deployment_trusted,
-                    open_responses_adapter: row.deployment_open_responses_adapter.unwrap_or(true),
                     reasoning_translation: resolve_reasoning_translation(
                         row.endpoint_reasoning_translation,
                         row.model_reasoning_translation_overrides,
                         &row.deployment_alias,
                     ),
-                    routing_rules: Vec::new(), // Components don't have their own routing rules
+                    routing_rules: Vec::new(),              // Components don't have their own routing rules
+                    serving_classes: ServingPresets::new(), // Activation is the composite's, not a member's
                     // Components don't surface their own fallback/backoff —
                     // the composite's PoolSpec.fallback drives retries across
                     // the whole pool.
                     fallback_enabled: false,
                     fallback_on_rate_limit: false,
                     fallback_on_status: Vec::new(),
+                    fallback_realtime_on_status: Vec::new(),
                     fallback_with_replacement: false,
                     fallback_max_attempts: None,
                     backoff_enabled: false,
@@ -794,10 +1088,14 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     backoff_factor: 2.0,
                     backoff_jitter: "full".to_string(),
                     backoff_max_total_ms: None,
+                    first_token_timeout_ms: None,
+                    aimd: None,
                     endpoint_url,
                     endpoint_api_key: row.endpoint_api_key.clone(),
                     auth_header_name: row.auth_header_name.clone(),
                     auth_header_prefix: row.auth_header_prefix.clone(),
+                    endpoint_accepts_scheduling_priority: row.endpoint_accepts_scheduling_priority,
+                    endpoint_kind: parse_provider_kind(&row.endpoint_kind),
                     api_keys: Vec::new(),
                 },
             });
@@ -813,10 +1111,10 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     id: row.api_key_id,
                     secret: row.api_key_secret,
                     purpose: row.api_key_purpose.clone(),
-                    requests_per_second: row.requests_per_second,
-                    burst_size: row.burst_size,
-                    user_verified: row.user_verified,
                     zero_data_retention: row.user_zero_data_retention,
+                    user_id: row.user_id,
+                    username: row.user_username,
+                    display_name: row.user_display_name,
                 });
             }
         }
@@ -832,6 +1130,36 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
     Ok(composites)
 }
 
+/// Resolves a virtual model's effective global batch in-flight cap.
+///
+/// A positive stored `batch_capacity` wins; a missing value falls back to the
+/// configured default. A non-positive stored value is invalid: interpreted as a
+/// cap it would either refuse every request (`0`) or silently read as uncapped,
+/// so it is ignored in favour of the default and warned about once per sync per
+/// model, matching [`update_daemon_capacity_limits`].
+fn effective_batch_inflight_limit(batch_capacity: Option<i32>, default_batch_inflight_capacity: Option<u32>, alias: &str) -> Option<u32> {
+    match batch_capacity {
+        Some(capacity) if capacity > 0 => Some(capacity as u32),
+        Some(capacity) => {
+            match default_batch_inflight_capacity {
+                Some(default) => warn!(
+                    alias = %alias,
+                    batch_capacity = capacity,
+                    default_capacity = default,
+                    "Invalid non-positive batch_capacity on a virtual model; capping batch at the default instead"
+                ),
+                None => warn!(
+                    alias = %alias,
+                    batch_capacity = capacity,
+                    "Invalid non-positive batch_capacity on a virtual model and no default cap is configured; batch is uncapped"
+                ),
+            }
+            default_batch_inflight_capacity
+        }
+        None => default_batch_inflight_capacity,
+    }
+}
+
 /// Converts a composite model to a TargetSpecOrList with weighted providers
 ///
 /// Uses onwards 0.10.0 weighted provider types for load balancing across
@@ -839,34 +1167,19 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
 fn convert_composite_to_target_spec(
     composite: &OnwardsCompositeModel,
     key_definitions: &mut HashMap<String, KeyDefinition>,
-    rate_limit_tiers: &RateLimitTiersConfig,
+    overlays: &OverlaysByAlias,
+    inflight_overrides: &InflightOverridesByAlias,
+    default_batch_inflight_capacity: Option<u32>,
 ) -> (String, TargetSpecOrList) {
     // Add this composite model's API keys to key_definitions
     for api_key in &composite.api_keys {
-        // The system key (nil UUID) carries internal traffic and is never tiered.
-        let rate_limit = if api_key.id.is_nil() {
-            None
-        } else {
-            resolve_key_rate_limit(
-                api_key.requests_per_second,
-                api_key.burst_size,
-                api_key.user_verified,
-                rate_limit_tiers,
-            )
-        };
-
-        let mut labels = HashMap::from([("purpose".to_string(), api_key.purpose.clone())]);
-        // Surface the account's zero-data-retention flag to onwards as a label.
-        // Always emitted ("true"/"false"); onwards does not act on it yet.
-        labels.insert("zdr".to_string(), api_key.zero_data_retention.to_string());
-
         key_definitions.insert(
             api_key.id.to_string(),
             KeyDefinition {
                 key: api_key.secret.clone(),
-                rate_limit,
+                rate_limit: None,
                 concurrency_limit: None,
-                labels,
+                labels: key_labels(api_key),
             },
         );
     }
@@ -877,34 +1190,6 @@ fn convert_composite_to_target_spec(
     } else {
         Some(composite.api_keys.iter().map(|k| k.secret.clone().into()).collect())
     };
-
-    // Build pool-level rate limiting
-    let rate_limit = match (composite.requests_per_second, composite.burst_size) {
-        (Some(rps), burst) if rps > 0.0 => {
-            let rps_u32 = NonZeroU32::new((rps.max(1.0) as u32).max(1)).unwrap();
-            let burst_u32 = burst.and_then(|b| NonZeroU32::new(b.max(1) as u32));
-            debug!(
-                "Composite model '{}' configured with {}req/s rate limit, burst: {:?}",
-                composite.alias, rps, burst_u32
-            );
-            Some(RateLimitParameters {
-                requests_per_second: rps_u32,
-                burst_size: burst_u32,
-            })
-        }
-        _ => None,
-    };
-
-    // Build pool-level concurrency limiting
-    let concurrency_limit = composite.capacity.map(|capacity| {
-        debug!(
-            "Composite model '{}' configured with {} max concurrent requests",
-            composite.alias, capacity
-        );
-        ConcurrencyLimitParameters {
-            max_concurrent_requests: capacity as usize,
-        }
-    });
 
     // Convert our LoadBalancingStrategy to onwards LoadBalanceStrategy
     let strategy = match composite.lb_strategy {
@@ -932,41 +1217,28 @@ fn convert_composite_to_target_spec(
             on_rate_limit: composite.fallback_on_rate_limit,
             // Convert i32 status codes to u16 for onwards
             on_status: composite.fallback_on_status.iter().map(|&s| s as u16).collect(),
+            realtime_on_status: composite.fallback_realtime_on_status.iter().map(|&s| s as u16).collect(),
             with_replacement: composite.fallback_with_replacement,
             max_attempts: composite
                 .fallback_max_attempts
                 .and_then(|n| usize::try_from(n).ok().filter(|&v| v >= 1)),
             backoff,
             max_total_backoff_ms,
+            first_token_timeout_ms: composite.first_token_timeout_ms.map(|ms| ms as u64),
+            aimd: composite.aimd.clone(),
+            affinity: composite.affinity.clone(),
         })
     } else {
         None
     };
 
-    // Build provider specs from components
-    let providers: Vec<ProviderSpec> = composite
-        .components
-        .iter()
-        .map(|component| {
+    // Build provider specs from components, grouped by the pool each membership
+    // belongs to. The query orders by (pool, sort_order), so each pool's members
+    // come out in its own failover order.
+    let mut pool_providers: BTreeMap<String, Vec<ProviderSpec>> = BTreeMap::new();
+    for component in composite.components.iter() {
+        let provider = {
             let target = &component.target;
-
-            // Build provider-level rate limiting (from underlying deployment)
-            let provider_rate_limit = match (target.requests_per_second, target.burst_size) {
-                (Some(rps), burst) if rps > 0.0 => {
-                    let rps_u32 = NonZeroU32::new((rps.max(1.0) as u32).max(1)).unwrap();
-                    let burst_u32 = burst.and_then(|b| NonZeroU32::new(b.max(1) as u32));
-                    Some(RateLimitParameters {
-                        requests_per_second: rps_u32,
-                        burst_size: burst_u32,
-                    })
-                }
-                _ => None,
-            };
-
-            // Build provider-level concurrency limiting
-            let provider_concurrency_limit = target.capacity.map(|capacity| ConcurrencyLimitParameters {
-                max_concurrent_requests: capacity as usize,
-            });
 
             {
                 debug!(
@@ -978,8 +1250,8 @@ fn convert_composite_to_target_spec(
                     onwards_key: target.endpoint_api_key.clone(),
                     onwards_model: Some(target.model_name.clone()),
                     weight: component.weight.max(1) as u32,
-                    rate_limit: provider_rate_limit,
-                    concurrency_limit: provider_concurrency_limit,
+                    rate_limit: None,
+                    concurrency_limit: None,
                     upstream_auth_header_name: if target.auth_header_name != "Authorization" {
                         Some(target.auth_header_name.clone())
                     } else {
@@ -994,9 +1266,6 @@ fn convert_composite_to_target_spec(
                     // For composite models, use the composite model's sanitize_responses setting
                     // This ensures the virtual model's toggle controls all providers
                     sanitize_response: composite.sanitize_responses,
-                    open_responses: Some(OpenResponsesConfig {
-                        adapter: target.open_responses_adapter,
-                    }),
                     request_timeout_secs: None,
                     // Each provider uses its own trusted setting from the database
                     // This allows fine-grained control over which providers bypass error sanitization
@@ -1008,80 +1277,132 @@ fn convert_composite_to_target_spec(
                     // leaked to them.
                     propagate_trace_context: None,
                     reasoning_translation: target.reasoning_translation.clone().map(Into::into),
+                    accepts_scheduling_priority: target.endpoint_accepts_scheduling_priority,
+                    kind: target.endpoint_kind,
                 }
             }
-        })
-        .collect();
+        };
+        pool_providers.entry(component.pool.clone()).or_default().push(provider);
+    }
+
+    // A composite always has a default pool, even with no members: an empty pool
+    // answers 503, which is what a composite with nothing enabled did before.
+    pool_providers.entry(DEFAULT_COMPONENT_POOL.to_string()).or_default();
 
     debug!(
-        "Composite model '{}' configured with {} providers, strategy: {:?}, fallback: {}, sanitize_responses: {}",
+        "Composite model '{}' configured with {} pool(s) ({} providers), strategy: {:?}, fallback: {}, sanitize_responses: {}",
         composite.alias,
-        providers.len(),
+        pool_providers.len(),
+        pool_providers.values().map(Vec::len).sum::<usize>(),
         strategy,
         composite.fallback_enabled,
         composite.sanitize_responses
     );
 
-    // Create PoolSpec with weighted providers
+    // Create a PoolSpec per pool, with the composite's settings applied to each.
     // Note: trusted is not set at the pool level for composite models
     // Each provider uses its own trusted setting via ProviderSpec.trusted
-    let pool_spec = PoolSpec {
-        keys,
-        rate_limit,
-        concurrency_limit,
-        fallback,
-        strategy,
+    //
+    // The model's traffic rules are the DEFAULT pool's rules. A named pool gets
+    // only the deny half (see `inheritable_routing_rules`): a redirect names
+    // another model alias, and following one out of a named pool would serve
+    // that class from a different model — for a `completions` resume leg, a
+    // token-id prefix rendered against model X decoded by model Y. Rules are
+    // per-model in the schema, so every pool we emit here is an inheriting
+    // pool; there is no such thing yet as a pool with rules of its own.
+    let make_pool = |pool_name: &str, providers: Vec<ProviderSpec>| PoolSpec {
+        keys: keys.clone(),
+        rate_limit: None,
+        concurrency_limit: None,
+        fallback: fallback.clone().map(|mut config| {
+            if pool_name != DEFAULT_COMPONENT_POOL {
+                // Continuation pools must preserve their validated first hop.
+                config.aimd = Some(AimdConfig {
+                    enabled: false,
+                    ..AimdConfig::default()
+                });
+                config.affinity = None;
+            }
+            config
+        }),
+        // A named pool's ordering is a validated failover list (dynamo first,
+        // the harness-validated continuation target behind it), never a
+        // load-balancing surface: under the composite's own strategy (DB
+        // default weighted_random) resume legs would split randomly between
+        // the free first hop and the paid provider.
+        strategy: if pool_name == DEFAULT_COMPONENT_POOL {
+            strategy
+        } else {
+            OnwardsLoadBalanceStrategy::Priority
+        },
         providers,
         response_headers: None,
         sanitize_response: composite.sanitize_responses,
         trusted: false, // Pool-level trusted defaults to false; providers set their own
-        open_responses: Some(OpenResponsesConfig {
-            adapter: composite.open_responses_adapter,
-        }),
-        routing_rules: composite.routing_rules.clone(),
+        routing_rules: if pool_name == DEFAULT_COMPONENT_POOL {
+            composite.routing_rules.clone()
+        } else {
+            inheritable_routing_rules(&composite.routing_rules)
+        },
+        // Offered classes and per-account overlays are properties of the
+        // alias, declared on its default pool.
+        serving_classes: if pool_name == DEFAULT_COMPONENT_POOL {
+            composite.serving_classes.clone()
+        } else {
+            ServingPresets::new()
+        },
+        overlays: if pool_name == DEFAULT_COMPONENT_POOL {
+            overlays.get(&composite.alias).cloned().unwrap_or_default()
+        } else {
+            HashMap::new()
+        },
+        inflight_limit: (pool_name == DEFAULT_COMPONENT_POOL).then_some(composite.realtime_inflight_limit as u32),
+        // Batch requests are counted on the named alias globally; only the
+        // composite's default pool carries the cap. A positive `batch_capacity`
+        // wins; a NULL one falls back to the configured default. A non-positive
+        // stored value is invalid and also falls back (with a warning).
+        // Realtime traffic is unaffected.
+        batch_inflight_limit: if pool_name == DEFAULT_COMPONENT_POOL {
+            effective_batch_inflight_limit(composite.batch_capacity, default_batch_inflight_capacity, &composite.alias)
+        } else {
+            None
+        },
+        account_inflight_limits: if pool_name == DEFAULT_COMPONENT_POOL {
+            inflight_overrides.get(&composite.alias).cloned().unwrap_or_default()
+        } else {
+            HashMap::new()
+        },
     };
 
-    (composite.alias.clone(), TargetSpecOrList::Pool(pool_spec))
-}
+    let mut pools: HashMap<String, PoolSpec> = pool_providers
+        .into_iter()
+        .map(|(name, p)| {
+            let spec = make_pool(&name, p);
+            (name, spec)
+        })
+        .collect();
 
-/// Resolves the rate limit for an API key. A non-NULL per-key
-/// `requests_per_second` always wins; otherwise we fall back to the
-/// verified/unverified tier defaults from config, which may themselves be unset
-/// (legacy "no limit unless overridden" behaviour).
-fn resolve_key_rate_limit(
-    per_key_rps: Option<f32>,
-    per_key_burst: Option<i32>,
-    user_verified: bool,
-    tiers: &RateLimitTiersConfig,
-) -> Option<RateLimitParameters> {
-    let (rps, burst) = match per_key_rps {
-        Some(rps) if rps > 0.0 => (rps, per_key_burst),
-        _ => {
-            let tier = if user_verified {
-                tiers.verified.as_ref()
-            } else {
-                tiers.unverified.as_ref()
-            };
-            let tier = tier?;
-            (tier.requests_per_second, tier.burst_size)
-        }
+    // A composite with only a default pool emits the single-pool shape it always
+    // emitted — no config churn for the models nobody has given a second pool.
+    let spec = if pools.len() == 1 {
+        TargetSpecOrList::Pool(pools.remove(DEFAULT_COMPONENT_POOL).expect("default pool is always present"))
+    } else {
+        TargetSpecOrList::Pools(PoolsSpec { pools })
     };
 
-    let rps_u32 = NonZeroU32::new((rps.max(1.0) as u32).max(1))?;
-    let burst_u32 = burst.and_then(|b| NonZeroU32::new(b.max(1) as u32));
-    Some(RateLimitParameters {
-        requests_per_second: rps_u32,
-        burst_size: burst_u32,
-    })
+    (composite.alias.clone(), spec)
 }
 
 /// Converts both regular targets and composite models to ConfigFile format
-#[tracing::instrument(skip(targets, composites, rate_limit_tiers))]
+#[tracing::instrument(skip(targets, composites))]
 fn convert_to_config_file(
     targets: Vec<OnwardsTarget>,
     composites: Vec<OnwardsCompositeModel>,
     strict_mode: bool,
-    rate_limit_tiers: &RateLimitTiersConfig,
+    overlays: &OverlaysByAlias,
+    inflight_overrides: &InflightOverridesByAlias,
+    accounts: AccountsById,
+    default_batch_inflight_capacity: Option<u32>,
 ) -> ConfigFile {
     let mut key_definitions = HashMap::new();
 
@@ -1091,31 +1412,13 @@ fn convert_to_config_file(
         .map(|target| {
             // Add this target's API keys to key_definitions
             for api_key in &target.api_keys {
-                // The system key (nil UUID) carries internal traffic and is never tiered.
-                let rate_limit = if api_key.id.is_nil() {
-                    None
-                } else {
-                    resolve_key_rate_limit(
-                        api_key.requests_per_second,
-                        api_key.burst_size,
-                        api_key.user_verified,
-                        rate_limit_tiers,
-                    )
-                };
-
-                // Build labels from API key purpose
-                let mut labels = HashMap::from([("purpose".to_string(), api_key.purpose.clone())]);
-                // Surface the account's zero-data-retention flag as a label.
-                // Always emitted ("true"/"false"); onwards does not act on it yet.
-                labels.insert("zdr".to_string(), api_key.zero_data_retention.to_string());
-
                 key_definitions.insert(
                     api_key.id.to_string(),
                     KeyDefinition {
                         key: api_key.secret.clone(),
-                        rate_limit,
+                        rate_limit: None,
                         concurrency_limit: None,
-                        labels,
+                        labels: key_labels(api_key),
                     },
                 );
             }
@@ -1124,18 +1427,6 @@ fn convert_to_config_file(
                 None
             } else {
                 Some(target.api_keys.iter().map(|k| k.secret.clone().into()).collect())
-            };
-
-            let rate_limit = match (target.requests_per_second, target.burst_size) {
-                (Some(rps), burst) if rps > 0.0 => {
-                    let rps_u32 = NonZeroU32::new((rps.max(1.0) as u32).max(1)).unwrap();
-                    let burst_u32 = burst.and_then(|b| NonZeroU32::new(b.max(1) as u32));
-                    Some(RateLimitParameters {
-                        requests_per_second: rps_u32,
-                        burst_size: burst_u32,
-                    })
-                }
-                _ => None,
             };
 
             let upstream_auth_header_name = if target.auth_header_name != "Authorization" {
@@ -1149,25 +1440,18 @@ fn convert_to_config_file(
                 None
             };
 
-            let concurrency_limit = target.capacity.map(|capacity| ConcurrencyLimitParameters {
-                max_concurrent_requests: capacity as usize,
-            });
-
             // Build provider spec from target
             let provider = ProviderSpec {
                 url: target.endpoint_url.clone(),
                 onwards_key: target.endpoint_api_key.clone(),
                 onwards_model: Some(target.model_name.clone()),
-                rate_limit,
-                concurrency_limit,
+                rate_limit: None,
+                concurrency_limit: None,
                 upstream_auth_header_name,
                 upstream_auth_header_prefix,
                 response_headers: None,
                 weight: 1,
                 sanitize_response: target.sanitize_responses,
-                open_responses: Some(OpenResponsesConfig {
-                    adapter: target.open_responses_adapter,
-                }),
                 request_timeout_secs: None,
                 trusted: Some(target.trusted),
                 // None → inherit from resolved `trusted` (see composite-model
@@ -1175,6 +1459,8 @@ fn convert_to_config_file(
                 // context, third-party providers do not.
                 propagate_trace_context: None,
                 reasoning_translation: target.reasoning_translation.clone().map(Into::into),
+                accepts_scheduling_priority: target.endpoint_accepts_scheduling_priority,
+                kind: target.endpoint_kind,
             };
 
             // Build fallback configuration. For single-provider (standard)
@@ -1196,12 +1482,18 @@ fn convert_to_config_file(
                     enabled: true,
                     on_rate_limit: target.fallback_on_rate_limit,
                     on_status: target.fallback_on_status.iter().map(|&s| s as u16).collect(),
+                    realtime_on_status: target.fallback_realtime_on_status.iter().map(|&s| s as u16).collect(),
                     with_replacement: target.fallback_with_replacement,
                     max_attempts: target
                         .fallback_max_attempts
                         .and_then(|n| usize::try_from(n).ok().filter(|&v| v >= 1)),
                     backoff,
                     max_total_backoff_ms,
+                    // A single-provider pool never arms first-token failover
+                    // (there is no other provider to fail over to).
+                    first_token_timeout_ms: target.first_token_timeout_ms.map(|ms| ms as u64),
+                    aimd: target.aimd.clone(),
+                    affinity: None,
                 })
             } else {
                 None
@@ -1216,10 +1508,14 @@ fn convert_to_config_file(
                 strategy: OnwardsLoadBalanceStrategy::default(),
                 providers: vec![provider],
                 response_headers: None,
-                open_responses: None,
                 sanitize_response: target.sanitize_responses,
                 trusted: false,
                 routing_rules: target.routing_rules,
+                serving_classes: target.serving_classes,
+                overlays: overlays.get(&target.alias).cloned().unwrap_or_default(),
+                inflight_limit: None,
+                batch_inflight_limit: None,
+                account_inflight_limits: HashMap::new(),
             };
 
             (target.alias, TargetSpecOrList::Pool(pool_spec))
@@ -1238,7 +1534,13 @@ fn convert_to_config_file(
             );
         }
 
-        let (alias, spec) = convert_composite_to_target_spec(&composite, &mut key_definitions, rate_limit_tiers);
+        let (alias, spec) = convert_composite_to_target_spec(
+            &composite,
+            &mut key_definitions,
+            overlays,
+            inflight_overrides,
+            default_batch_inflight_capacity,
+        );
         target_specs.insert(alias, spec);
     }
 
@@ -1258,21 +1560,48 @@ fn convert_to_config_file(
         auth,
         strict_mode,
         http_pool: None,
+        accounts,
     }
 }
 
 /// Loads the current targets configuration from the database (including composite models)
+/// using the built-in default batch in-flight cap for virtual models without their own
+/// `batch_capacity`.
+///
+/// Test helper: production code goes through
+/// [`load_targets_from_db_with_batch_default`] so the configured default is honoured.
 ///
 /// `escalation_models` - Model aliases that batch API keys should have automatic access to.
 /// This enables batch processing to route requests to escalation models without needing
 /// separate API key configuration.
 /// `strict_mode` - Enable strict mode with schema validation (only known OpenAI API paths accepted)
+#[cfg(test)]
 #[tracing::instrument(skip(db, escalation_models))]
-pub async fn load_targets_from_db(
+pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], strict_mode: bool) -> Result<Targets, anyhow::Error> {
+    load_targets_from_db_with_batch_default(
+        db,
+        escalation_models,
+        strict_mode,
+        Some(crate::config::DEFAULT_BATCH_INFLIGHT_CAPACITY),
+    )
+    .await
+}
+
+/// Loads the current targets configuration from the database (including composite models)
+/// General paid admission retains the same legacy tariff rule as composite loading.
+///
+/// `escalation_models` - Model aliases that batch API keys should have automatic access to.
+/// This enables batch processing to route requests to escalation models without needing
+/// separate API key configuration.
+/// `strict_mode` - Enable strict mode with schema validation (only known OpenAI API paths accepted)
+/// `default_batch_inflight_capacity` - Global onboard cap applied to virtual models without a
+/// positive `batch_capacity` of their own; `None` leaves them uncapped.
+#[tracing::instrument(skip(db, escalation_models))]
+pub async fn load_targets_from_db_with_batch_default(
     db: &PgPool,
     escalation_models: &[String],
     strict_mode: bool,
-    rate_limit_tiers: &RateLimitTiersConfig,
+    default_batch_inflight_capacity: Option<u32>,
 ) -> Result<Targets, anyhow::Error> {
     let query_start = std::time::Instant::now();
     debug!("Loading onwards targets from database (with composite models)");
@@ -1286,17 +1615,14 @@ pub async fn load_targets_from_db(
             dm.model_name,
             dm.alias,
             dm.hosted_on,
-            dm.requests_per_second as deployment_requests_per_second,
-            dm.burst_size as deployment_burst_size,
-            dm.capacity,
             dm.sanitize_responses,
             dm.trusted,
-            dm.open_responses_adapter,
             ie.reasoning_translation as endpoint_reasoning_translation,
             dm.reasoning_translation_overrides as model_reasoning_translation_overrides,
             dm.fallback_enabled,
             dm.fallback_on_rate_limit,
             dm.fallback_on_status,
+            dm.fallback_realtime_on_status,
             dm.fallback_with_replacement,
             dm.fallback_max_attempts,
             dm.backoff_enabled,
@@ -1305,18 +1631,23 @@ pub async fn load_targets_from_db(
             dm.backoff_factor,
             dm.backoff_jitter,
             dm.backoff_max_total_ms,
+            dm.first_token_timeout_ms,
+            dm.aimd,
             ie.id as endpoint_id,
             ie.url as "endpoint_url!",
             ie.api_key as endpoint_api_key,
             ie.auth_header_name,
             ie.auth_header_prefix,
+            ie.accepts_scheduling_priority as endpoint_accepts_scheduling_priority,
+            ie.kind as endpoint_kind,
             ak.id as "api_key_id?",
             ak.secret as "api_key_secret?",
             ak.purpose as "api_key_purpose?",
-            ak.requests_per_second as api_key_requests_per_second,
-            ak.burst_size as api_key_burst_size,
-            ak.user_verified as "api_key_user_verified?",
-            ak.user_zero_data_retention as "api_key_user_zero_data_retention?"
+            ak.user_zero_data_retention as "api_key_user_zero_data_retention?",
+            ak.user_id as "api_key_user_id?",
+            ak.user_username as "api_key_user_username?",
+            ak.user_display_name as "api_key_user_display_name?",
+            dm.serving_classes
         FROM deployed_models dm
         INNER JOIN inference_endpoints ie ON dm.hosted_on = ie.id
         LEFT JOIN LATERAL (
@@ -1324,10 +1655,10 @@ pub async fn load_targets_from_db(
                 ak.id,
                 ak.secret,
                 ak.purpose,
-                ak.requests_per_second,
-                ak.burst_size,
-                u.verified as user_verified,
-                u.zero_data_retention as user_zero_data_retention
+                ak.user_id,
+                u.zero_data_retention as user_zero_data_retention,
+                u.username as user_username,
+                u.display_name as user_display_name
             FROM api_keys ak
             JOIN users u ON u.id = ak.user_id
             WHERE (
@@ -1352,6 +1683,7 @@ pub async fn load_targets_from_db(
                     AND dm.alias = ANY($1::text[])
                 )
             )
+            -- General free-model access is preserved; a zero customer deal does not make a paid model free.
             AND (
                 ak.user_id = '00000000-0000-0000-0000-000000000000'
                 -- Positive balance read directly from the total
@@ -1360,27 +1692,44 @@ pub async fn load_targets_from_db(
                 -- is_deleted guard mirrors the old balance CTE, which only
                 -- contained non-deleted users; key deletion is not implied by
                 -- user deletion, so this check is load-bearing.
-                OR (u.is_deleted = false AND EXISTS (
+                -- Keep this lookup inline so PostgreSQL can build a hashed
+                -- set of enabled accounts once instead of calling a function
+                -- for every model/key pair. The outer guard excludes deleted users.
+                OR (u.is_deleted = false AND (EXISTS (
+                    SELECT 1 FROM user_feature_flags f
+                    WHERE f.user_id = u.id
+                      AND f.feature_flag = 'ALLOW_NEGATIVE_BALANCE'
+                      AND f.enabled
+                ) OR EXISTS (
                     SELECT 1 FROM user_balance_checkpoints ub
                     WHERE ub.user_id = ak.user_id AND ub.balance > 0
-                ))
+                )))
                 OR (
+                    -- Keep the legacy general-tariff rule; only this account's
+                    -- positive deal can require credit on an otherwise free model.
                     NOT EXISTS (
                         SELECT 1 FROM model_tariffs mt
-                        WHERE mt.deployed_model_id = dm.id
+                        WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL AND mt.serving_class IS NULL
                           AND mt.valid_until IS NULL
+                          AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                    ) AND NOT EXISTS (
+                        SELECT 1 FROM model_tariffs mt
+                        WHERE mt.deployed_model_id = dm.id AND mt.user_id = ak.user_id
+                          AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())
                           AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                     )
                 )
             )
+            -- Account deletion revokes access independently of key deletion.
+            AND (ak.user_id = '00000000-0000-0000-0000-000000000000' OR u.is_deleted = false)
             AND ak.is_deleted = false
             -- Spending-cap gate: exclude every key of a cap scope (the capped
             -- root and its hidden batch child alike) once the scope's
             -- CALENDAR-ALIGNED (UTC, non-rolling) window spend has reached the
             -- root's limit. Guarded so the uncapped majority short-circuits on
-            -- the first branch; the subquery is two PK probes. Free models
-            -- stay usable on an exhausted scope, mirroring the balance gate's
-            -- free-model arm. Un-capping needs no job or traffic: the
+            -- the first branch; the subquery is two PK probes. Generally free
+            -- models remain usable, but zero customer deals do not bypass caps
+            -- on paid models. Un-capping needs no job or traffic: the
             -- window-membership check (shared function, migration 123) turns
             -- false at the calendar boundary and the periodic fallback sync
             -- readmits the keys.
@@ -1394,12 +1743,17 @@ pub async fn load_targets_from_db(
                       AND root.spend_limit IS NOT NULL
                       AND api_key_cap_window_current(ck.window_started_at, root.spend_limit_interval)
                       AND ck.window_spend >= root.spend_limit
-                      AND EXISTS (
-                          SELECT 1 FROM model_tariffs mt
-                          WHERE mt.deployed_model_id = dm.id
-                            AND mt.valid_until IS NULL
-                            AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
-                      )
+                      AND (EXISTS (
+                        SELECT 1 FROM model_tariffs mt
+                        WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL AND mt.serving_class IS NULL
+                          AND mt.valid_until IS NULL
+                          AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                      ) OR EXISTS (
+                        SELECT 1 FROM model_tariffs mt
+                        WHERE mt.deployed_model_id = dm.id AND mt.user_id = ak.user_id
+                          AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())
+                          AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                      ))
                 )
             )
             -- Inference data plane only: platform (management) keys must never
@@ -1409,7 +1763,7 @@ pub async fn load_targets_from_db(
             -- but is used internally for onwards inference, so it is exempt.
             AND (
                 ak.user_id = '00000000-0000-0000-0000-000000000000'
-                OR ak.purpose IN ('realtime', 'batch', 'playground')
+                OR ak.purpose IN ('realtime', 'batch', 'playground', 'continuation')
             )
         ) ak ON true
         WHERE dm.deleted = FALSE
@@ -1432,25 +1786,24 @@ pub async fn load_targets_from_db(
     let mut targets_map: HashMap<DeploymentId, OnwardsTarget> = HashMap::new();
     for row in rows {
         let deployment_id = row.deployment_id;
+        let aimd = row.aimd.map(serde_json::from_value).transpose()?;
         let target = targets_map.entry(deployment_id).or_insert_with(|| {
             OnwardsTarget {
                 model_name: row.model_name.clone(),
                 alias: row.alias.clone(),
-                requests_per_second: row.deployment_requests_per_second,
-                burst_size: row.deployment_burst_size,
-                capacity: row.capacity,
                 sanitize_responses: row.sanitize_responses,
                 trusted: row.trusted,
-                open_responses_adapter: row.open_responses_adapter.unwrap_or(true),
                 reasoning_translation: resolve_reasoning_translation(
                     row.endpoint_reasoning_translation.clone(),
                     row.model_reasoning_translation_overrides.clone(),
                     &row.alias,
                 ),
                 routing_rules: Vec::new(), // Populated from separate query below
+                serving_classes: parse_stored_presets(&row.serving_classes, &row.alias),
                 fallback_enabled: row.fallback_enabled.unwrap_or(true),
                 fallback_on_rate_limit: row.fallback_on_rate_limit.unwrap_or(true),
                 fallback_on_status: row.fallback_on_status.clone().unwrap_or_else(|| vec![429, 499, 500, 502, 503, 504]),
+                fallback_realtime_on_status: row.fallback_realtime_on_status.clone(),
                 fallback_with_replacement: row.fallback_with_replacement.unwrap_or(false),
                 fallback_max_attempts: row.fallback_max_attempts,
                 backoff_enabled: row.backoff_enabled,
@@ -1459,34 +1812,34 @@ pub async fn load_targets_from_db(
                 backoff_factor: row.backoff_factor,
                 backoff_jitter: row.backoff_jitter.clone(),
                 backoff_max_total_ms: row.backoff_max_total_ms,
+                first_token_timeout_ms: row.first_token_timeout_ms,
+                aimd,
                 endpoint_url: url::Url::parse(&row.endpoint_url).expect("Invalid URL in database"),
                 endpoint_api_key: row.endpoint_api_key.clone(),
                 auth_header_name: row.auth_header_name.clone(),
                 auth_header_prefix: row.auth_header_prefix.clone(),
+                endpoint_accepts_scheduling_priority: row.endpoint_accepts_scheduling_priority,
+                endpoint_kind: parse_provider_kind(&row.endpoint_kind),
                 api_keys: Vec::new(),
             }
         });
 
-        // user_verified is Option only because of the outer LEFT JOIN; whenever the
-        // lateral subquery emits a row, the inner JOIN to users guarantees it. We
-        // tie it to the same "row materialised" check as the other api_key columns
-        // so a future schema/SQL change can't silently demote keys to the
-        // unverified tier.
-        if let (Some(api_key_id), Some(api_key_secret), Some(api_key_purpose), Some(user_verified), Some(zero_data_retention)) = (
+        if let (Some(api_key_id), Some(api_key_secret), Some(api_key_purpose), Some(zero_data_retention), Some(user_id), Some(username)) = (
             row.api_key_id,
             row.api_key_secret,
             row.api_key_purpose,
-            row.api_key_user_verified,
             row.api_key_user_zero_data_retention,
+            row.api_key_user_id,
+            row.api_key_user_username,
         ) {
             target.api_keys.push(OnwardsApiKey {
                 id: api_key_id,
                 secret: api_key_secret,
                 purpose: api_key_purpose,
-                requests_per_second: row.api_key_requests_per_second,
-                burst_size: row.api_key_burst_size,
-                user_verified,
                 zero_data_retention,
+                user_id,
+                username,
+                display_name: row.api_key_user_display_name,
             });
         }
     }
@@ -1549,7 +1902,20 @@ pub async fn load_targets_from_db(
         .collect();
 
     // Convert to ConfigFile format
-    let config = convert_to_config_file(targets, composites, strict_mode, rate_limit_tiers);
+    // Per-alias overlays and per-account serving settings, each loaded once.
+    let overlays = load_overlays_from_db(db).await?;
+    let inflight_overrides = load_inflight_overrides_from_db(db).await?;
+    let accounts = load_accounts_from_db(db).await?;
+
+    let config = convert_to_config_file(
+        targets,
+        composites,
+        strict_mode,
+        &overlays,
+        &inflight_overrides,
+        accounts,
+        default_batch_inflight_capacity,
+    );
 
     // Convert ConfigFile to Targets
     Targets::from_config(config)

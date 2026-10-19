@@ -19,7 +19,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rand::RngExt;
-use sqlx::PgPool;
 use tracing::instrument;
 
 use super::index::{CacheEntry, CacheError, CacheIndex, CacheMatch, CacheResult, IndexScope, PrefixHash, TtlTier};
@@ -28,14 +27,18 @@ use super::metrics as cache_metrics;
 /// Postgres-backed prefix index over `prompt_cache_entries`.
 #[derive(Clone)]
 pub struct PostgresIndex {
-    pool: PgPool,
+    /// Live provider (not a pinned pool): survives runtime pool swaps.
+    pool: sqlx_pool_router::DynPools,
     /// Connection-error retries per op (`cache.index_conn_retries`; 0 = never retry).
     conn_retries: u32,
 }
 
 impl PostgresIndex {
-    pub fn new(pool: PgPool, conn_retries: u32) -> Self {
-        Self { pool, conn_retries }
+    pub fn new(pool: impl sqlx_pool_router::PoolProvider, conn_retries: u32) -> Self {
+        Self {
+            pool: sqlx_pool_router::DynPools::new(pool),
+            conn_retries,
+        }
     }
 }
 
@@ -130,14 +133,19 @@ impl PostgresIndex {
     }
 
     async fn refresh_once(&self, scope: &IndexScope, prefix_hash: &PrefixHash, new_expires_at: DateTime<Utc>) -> Result<(), sqlx::Error> {
-        // Slide the window forward (the sliding-TTL refresh). In pure Postgres this
-        // is a direct UPDATE per read; the Redis accelerator debounces it.
+        // Slide the window forward (the sliding-TTL refresh). Every request that reads
+        // a shared prefix refreshes the same row, so under load an unconditional UPDATE
+        // queues every caller on that row's lock. Only write when the expiry would move
+        // by more than 1% of the window: a refresh that would change almost nothing
+        // matches no row and takes no lock, and the window still slides with at most
+        // 1% lag.
         sqlx::query!(
             r#"
             UPDATE prompt_cache_entries
-            SET expires_at = $5
+            SET expires_at = $5::timestamptz
             WHERE principal_id = $1 AND virtual_model = $2 AND tokenizer_version = $3
               AND prefix_hash = $4
+              AND expires_at < $5::timestamptz - ($5::timestamptz - now()) / 100
             "#,
             scope.principal_id,
             scope.virtual_model,
@@ -197,7 +205,6 @@ impl CacheIndex for PostgresIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::PgPool;
 
     fn scope() -> IndexScope {
         IndexScope {
@@ -217,8 +224,8 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
-    async fn write_then_lookup_returns_match(pool: PgPool) {
+    #[dwctl_test_macros::test]
+    async fn write_then_lookup_returns_match(pool: sqlx::PgPool) {
         let idx = PostgresIndex::new(pool, 1);
         let s = scope();
         idx.write(&entry(&s, b"hash-a", 1024, TtlTier::OneHour)).await.unwrap();
@@ -230,8 +237,8 @@ mod tests {
         assert_eq!(hits[0].ttl_tier, TtlTier::OneHour);
     }
 
-    #[sqlx::test]
-    async fn lookup_excludes_expired_and_other_scopes(pool: PgPool) {
+    #[dwctl_test_macros::test]
+    async fn lookup_excludes_expired_and_other_scopes(pool: sqlx::PgPool) {
         let idx = PostgresIndex::new(pool, 1);
         let s = scope();
 
@@ -250,8 +257,8 @@ mod tests {
         assert!(idx.lookup(&other, &[b"shared".to_vec()]).await.unwrap().is_empty());
     }
 
-    #[sqlx::test]
-    async fn refresh_slides_expiry(pool: PgPool) {
+    #[dwctl_test_macros::test]
+    async fn refresh_slides_expiry(pool: sqlx::PgPool) {
         let idx = PostgresIndex::new(pool, 1);
         let s = scope();
         let mut e = entry(&s, b"refreshable", 7, TtlTier::FiveMinutes);
@@ -267,8 +274,31 @@ mod tests {
         assert!(hits[0].expires_at > Utc::now() + chrono::Duration::minutes(30));
     }
 
-    #[sqlx::test]
-    async fn write_upserts_on_conflict(pool: PgPool) {
+    #[dwctl_test_macros::test]
+    async fn refresh_skips_a_negligible_extension(pool: sqlx::PgPool) {
+        let idx = PostgresIndex::new(pool, 1);
+        let s = scope();
+        let written = Utc::now() + chrono::Duration::hours(1);
+        let mut e = entry(&s, b"hot-prefix", 7, TtlTier::OneHour);
+        e.expires_at = written;
+        idx.write(&e).await.unwrap();
+
+        // A refresh moving the expiry by far less than 1% of the hour is skipped.
+        idx.refresh(&s, &b"hot-prefix".to_vec(), written + chrono::Duration::seconds(5))
+            .await
+            .unwrap();
+        let hits = idx.lookup(&s, &[b"hot-prefix".to_vec()]).await.unwrap();
+        assert_eq!(hits[0].expires_at.timestamp_micros(), written.timestamp_micros());
+
+        // One that moves it by more than 1% is written.
+        let later = written + chrono::Duration::minutes(5);
+        idx.refresh(&s, &b"hot-prefix".to_vec(), later).await.unwrap();
+        let hits = idx.lookup(&s, &[b"hot-prefix".to_vec()]).await.unwrap();
+        assert_eq!(hits[0].expires_at.timestamp_micros(), later.timestamp_micros());
+    }
+
+    #[dwctl_test_macros::test]
+    async fn write_upserts_on_conflict(pool: sqlx::PgPool) {
         let idx = PostgresIndex::new(pool, 1);
         let s = scope();
         idx.write(&entry(&s, b"dup", 100, TtlTier::FiveMinutes)).await.unwrap();

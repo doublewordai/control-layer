@@ -14,8 +14,6 @@ import {
   GripVertical,
   Shield,
   ShieldOff,
-  Zap,
-  ZapOff,
 } from "lucide-react";
 import {
   DndContext,
@@ -103,7 +101,6 @@ const ProviderRow: React.FC<{
   onRemove: () => void;
   onToggle: () => void;
   onToggleTrusted?: () => void;
-  onToggleAdapter?: () => void;
   canManage: boolean;
   isUpdating: boolean;
   strictModeEnabled?: boolean;
@@ -123,7 +120,6 @@ const ProviderRow: React.FC<{
   onRemove,
   onToggle,
   onToggleTrusted,
-  onToggleAdapter,
   canManage,
   isUpdating,
   strictModeEnabled,
@@ -274,30 +270,6 @@ const ProviderRow: React.FC<{
                   </TooltipContent>
                 </Tooltip>
               )}
-              {strictModeEnabled && onToggleAdapter && (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      onClick={onToggleAdapter}
-                      disabled={isUpdating}
-                      className="h-8 w-8"
-                    >
-                      {(component.model.open_responses_adapter ?? true) ? (
-                        <Zap className="h-4 w-4 text-yellow-500 fill-yellow-100" />
-                      ) : (
-                        <ZapOff className="h-4 w-4 text-gray-400" />
-                      )}
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent side="top">
-                    {(component.model.open_responses_adapter ?? true)
-                      ? "Responses API adapter enabled"
-                      : "Responses API adapter disabled"}
-                  </TooltipContent>
-                </Tooltip>
-              )}
               {!isPriorityMode && (
                 <Button
                   variant="ghost"
@@ -353,7 +325,6 @@ const SortableProviderRow: React.FC<{
   onRemove: () => void;
   onToggle: () => void;
   onToggleTrusted?: () => void;
-  onToggleAdapter?: () => void;
   canManage: boolean;
   isUpdating: boolean;
   strictModeEnabled?: boolean;
@@ -761,6 +732,9 @@ const EditRoutingModal: React.FC<{
   const [fallbackOn5xx, setFallbackOn5xx] = useState(
     model.fallback?.on_status?.some((s) => s >= 500 && s < 600) ?? false,
   );
+  const [fallbackOnRealtime529, setFallbackOnRealtime529] = useState(
+    model.fallback?.realtime_on_status?.includes(529) ?? false,
+  );
   const [withReplacement, setWithReplacement] = useState(
     model.fallback?.with_replacement ?? false
   );
@@ -781,6 +755,9 @@ const EditRoutingModal: React.FC<{
     setFallbackOn5xx(
       model.fallback?.on_status?.some((s) => s >= 500 && s < 600) ?? false,
     );
+    setFallbackOnRealtime529(
+      model.fallback?.realtime_on_status?.includes(529) ?? false,
+    );
     setWithReplacement(model.fallback?.with_replacement ?? false);
     setMaxAttempts(model.fallback?.max_attempts ?? null);
   }, [model]);
@@ -794,6 +771,8 @@ const EditRoutingModal: React.FC<{
       on499: fallbackOn499,
       on404: fallbackOn404,
       on5xx: fallbackOn5xx,
+      originalRealtimeStatuses: model.fallback?.realtime_on_status ?? [],
+      onRealtime529: fallbackOnRealtime529,
       withReplacement,
       maxAttempts,
     });
@@ -950,6 +929,22 @@ const EditRoutingModal: React.FC<{
                   />
                 </div>
 
+                <div className="flex items-center justify-between">
+                  <div>
+                    <Label className="text-sm">
+                      Overloaded (529, realtime only)
+                    </Label>
+                    <p className="text-xs text-gray-500">
+                      When the provider sheds load. Batch requests retry instead
+                    </p>
+                  </div>
+                  <Switch
+                    aria-label="Overloaded (529, realtime only)"
+                    checked={fallbackOnRealtime529}
+                    onCheckedChange={setFallbackOnRealtime529}
+                  />
+                </div>
+
                 {strategy === "weighted_random" && (
                   <>
                     <div className="border-t pt-3 mt-1" />
@@ -1033,12 +1028,23 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
   const queryClient = useQueryClient();
 
   const {
-    data: components,
+    data: allComponents,
     isLoading,
     error,
   } = useModelComponents(model.id, {
     enabled: model.is_composite === true,
   });
+
+  // This tab manages CHAT serving, i.e. the default pool only. The list
+  // endpoint returns memberships from every pool, and the PATCH/DELETE
+  // endpoints default to the default-pool membership — so rendering (and
+  // reordering/toggling) completions-pool rows here would silently write to
+  // the wrong membership and scramble chat failover. Completions pools get
+  // their own pool-aware surface later.
+  const components = React.useMemo(
+    () => allComponents?.filter((c) => (c.pool ?? "default") === "default"),
+    [allComponents],
+  );
 
   const updateComponentMutation = useUpdateModelComponent();
   const removeMutation = useRemoveModelComponent();
@@ -1108,8 +1114,14 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
     const previousComponents =
       queryClient.getQueryData<ModelComponent[]>(queryKey);
 
-    // Create optimistically updated components with new sort_order
-    const optimisticComponents = components.map((component) => {
+    // Create optimistically updated components with new sort_order. Built from
+    // the UNFILTERED list (the query cache holds every pool's memberships) but
+    // scoped to default-pool rows: the same deployment can also hold a
+    // completions membership whose sort_order must not be touched.
+    const isDefaultPool = (c: ModelComponent) =>
+      (c.pool ?? "default") === "default";
+    const optimisticComponents = (allComponents ?? []).map((component) => {
+      if (!isDefaultPool(component)) return component;
       const update = updates.find(
         (u) => u.componentModelId === component.model.id,
       );
@@ -1127,7 +1139,8 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
     try {
       for (const update of updates) {
         const currentComponent = previousComponents?.find(
-          (c) => c.model.id === update.componentModelId,
+          (c) =>
+            isDefaultPool(c) && c.model.id === update.componentModelId,
         );
         // Only update if sort_order actually changed
         if (
@@ -1159,13 +1172,6 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
     await updateModelMutation.mutateAsync({
       id: component.model.id,
       data: { trusted: !component.model.trusted },
-    });
-  };
-
-  const handleToggleAdapter = async (component: ModelComponent) => {
-    await updateModelMutation.mutateAsync({
-      id: component.model.id,
-      data: { open_responses_adapter: !(component.model.open_responses_adapter ?? true) },
     });
   };
 
@@ -1258,6 +1264,9 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
         fallbackTriggers.push(`Status codes: ${otherErrors.join(", ")}`);
       }
     }
+    if (model.fallback.realtime_on_status?.includes(529)) {
+      fallbackTriggers.push("Overloaded (529, realtime only)");
+    }
   }
 
   return (
@@ -1331,6 +1340,11 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                         <p>
                           <strong>Server errors (5xx):</strong> The upstream
                           provider returned a server error.
+                        </p>
+                        <p>
+                          <strong>Overloaded (529, realtime only):</strong> The
+                          provider is shedding load. Only realtime requests fail
+                          over; batch requests retry on their own schedule.
                         </p>
                       </div>
                     </HoverCardContent>
@@ -1456,7 +1470,6 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                         onRemove={() => setRemovingComponent(component)}
                         onToggle={() => handleToggle(component)}
                         onToggleTrusted={() => handleToggleTrusted(component)}
-                        onToggleAdapter={() => handleToggleAdapter(component)}
                         canManage={canManage}
                         isUpdating={
                           updateComponentMutation.isPending ||
@@ -1483,7 +1496,6 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                     onRemove={() => setRemovingComponent(component)}
                     onToggle={() => handleToggle(component)}
                     onToggleTrusted={() => handleToggleTrusted(component)}
-                    onToggleAdapter={() => handleToggleAdapter(component)}
                     canManage={canManage}
                     isUpdating={
                       updateComponentMutation.isPending ||

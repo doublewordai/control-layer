@@ -19,8 +19,12 @@ def load_expected() -> dict[str, str]:
 
 def main() -> None:
     expected = load_expected()
+    # Down migrations are covered too: a reviewed rollback boundary is as
+    # immutable as the forward migration it reverses.
     actual_paths = {
-        path.relative_to(ROOT).as_posix() for path in MIGRATIONS.glob("*.up.sql")
+        path.relative_to(ROOT).as_posix()
+        for pattern in ("*.up.sql", "*.down.sql")
+        for path in MIGRATIONS.glob(pattern)
     }
 
     if actual_paths != set(expected):

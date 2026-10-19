@@ -123,6 +123,8 @@ describe("virtual-model fallback status codes", () => {
       on499: true,
       on404: false,
       on5xx: true,
+      originalRealtimeStatuses: [529],
+      onRealtime529: true,
       fallbackOnRateLimit: true,
       withReplacement: true,
       maxAttempts: 3,
@@ -141,6 +143,7 @@ describe("virtual-model fallback status codes", () => {
       fallback_enabled: false,
       fallback_on_rate_limit: false,
       fallback_on_status: [5, 408, 429, 503, 499],
+      fallback_realtime_on_status: [529],
       fallback_with_replacement: false,
       fallback_max_attempts: null,
     });
@@ -151,5 +154,41 @@ describe("virtual-model fallback status codes", () => {
       fallback_with_replacement: true,
       fallback_max_attempts: 3,
     });
+  });
+
+  it("toggles only realtime 529 and keeps other realtime statuses", () => {
+    const base = {
+      originalStatuses: [500],
+      on429: false,
+      on499: false,
+      on404: false,
+      on5xx: true,
+      fallbackEnabled: true,
+      fallbackOnRateLimit: true,
+      withReplacement: false,
+      maxAttempts: null,
+    };
+
+    expect(
+      buildFallbackUpdatePayload({
+        ...base,
+        originalRealtimeStatuses: [],
+        onRealtime529: true,
+      }).fallback_realtime_on_status,
+    ).toEqual([529]);
+    expect(
+      buildFallbackUpdatePayload({
+        ...base,
+        originalRealtimeStatuses: [408, 529],
+        onRealtime529: false,
+      }).fallback_realtime_on_status,
+    ).toEqual([408]);
+    expect(
+      buildFallbackUpdatePayload({
+        ...base,
+        originalRealtimeStatuses: [408],
+        onRealtime529: false,
+      }).fallback_realtime_on_status,
+    ).toEqual([408]);
   });
 });

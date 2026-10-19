@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE users SET zero_data_retention = true WHERE id = '00000000-0000-0000-0000-0000000000a1'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "fc5f2a6fd84f882392d7a920b5d0140d25300a5bc4c8fa57a6a12034763f6c08"
+}

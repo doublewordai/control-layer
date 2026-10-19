@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE users SET\n                auto_topup_amount = 25.0,\n                auto_topup_threshold = 10.0,\n                auto_topup_monthly_limit = 25.0,\n                payment_provider_id = 'cus_test_456'\n            WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f04337dd4669a49985b771585ce6c0dc4167d506be1c019eefcf0cb5cb477412"
+}

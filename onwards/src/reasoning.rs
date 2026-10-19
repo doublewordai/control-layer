@@ -197,7 +197,7 @@ impl fmt::Display for ReasoningError {
 impl std::error::Error for ReasoningError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ApiSurface {
+pub(crate) enum ApiSurface {
     ChatCompletions,
     Responses,
     Completions,
@@ -205,7 +205,7 @@ enum ApiSurface {
 }
 
 impl ApiSurface {
-    fn from_path(path: &str) -> Self {
+    pub(crate) fn from_path(path: &str) -> Self {
         let path = path.trim_end_matches('/');
         if path.ends_with("/chat/completions") {
             Self::ChatCompletions
@@ -407,8 +407,21 @@ pub fn validate_canonical_reasoning(
     path: &str,
     body: &Value,
 ) -> Result<Option<CanonicalReasoningRequest>, ReasoningError> {
+    parse_reasoning_request(path, body, true)
+}
+
+/// Parse canonical controls while optionally rejecting provider-native fields.
+/// Internal non-strict gateways must accept bodies translated by an earlier hop.
+pub(crate) fn parse_reasoning_request(
+    path: &str,
+    body: &Value,
+    strict: bool,
+) -> Result<Option<CanonicalReasoningRequest>, ReasoningError> {
     let surface = ApiSurface::from_path(path);
     if surface == ApiSurface::Completions {
+        if !strict {
+            return Ok(None);
+        }
         let unsupported = [
             ("/reasoning_effort", "reasoning_effort"),
             ("/reasoning", "reasoning"),
@@ -465,7 +478,7 @@ pub fn validate_canonical_reasoning(
         .find(|(pointer, _)| body.pointer(pointer).is_some()),
         ApiSurface::Completions | ApiSurface::Other => None,
     };
-    if let Some((_, param)) = unsupported {
+    if strict && let Some((_, param)) = unsupported {
         let canonical = surface
             .parameter_name()
             .expect("reasoning API surfaces have canonical parameters");
@@ -723,14 +736,14 @@ fn remove_json_pointer_segments(current: &mut Value, segments: &[String]) -> boo
         return false;
     };
     if segments.len() == 1 {
-        return object.remove(&segments[0]).is_some() && object.is_empty();
+        return object.shift_remove(&segments[0]).is_some() && object.is_empty();
     }
 
     let child_is_empty = object
         .get_mut(&segments[0])
         .is_some_and(|child| remove_json_pointer_segments(child, &segments[1..]));
     if child_is_empty {
-        object.remove(&segments[0]);
+        object.shift_remove(&segments[0]);
         return object.is_empty();
     }
     false

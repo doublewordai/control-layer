@@ -3,7 +3,7 @@
 use crate::db::errors::{DbError, Result};
 use crate::db::handlers::repository::Repository;
 use crate::db::models::inference_endpoints::{
-    InferenceEndpointCreateDBRequest, InferenceEndpointDBResponse, InferenceEndpointUpdateDBRequest,
+    EndpointKind, InferenceEndpointCreateDBRequest, InferenceEndpointDBResponse, InferenceEndpointUpdateDBRequest,
 };
 use crate::types::{InferenceEndpointId, UserId, abbrev_uuid};
 use chrono::{DateTime, Utc};
@@ -36,6 +36,8 @@ struct InferenceEndpoint {
     pub auth_header_name: String,
     pub auth_header_prefix: String,
     pub reasoning_translation: Option<serde_json::Value>,
+    pub accepts_scheduling_priority: bool,
+    pub kind: String,
     pub created_by: UserId,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -55,6 +57,8 @@ impl TryFrom<InferenceEndpoint> for InferenceEndpointDBResponse {
             auth_header_name: src.auth_header_name,
             auth_header_prefix: src.auth_header_prefix,
             reasoning_translation: src.reasoning_translation.map(serde_json::from_value).transpose()?,
+            accepts_scheduling_priority: src.accepts_scheduling_priority,
+            kind: EndpointKind::from_db_str(&src.kind).ok_or_else(|| anyhow::anyhow!("unknown endpoint kind {:?}", src.kind))?,
             created_by: src.created_by,
             created_at: src.created_at,
             updated_at: src.updated_at,
@@ -74,7 +78,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
     type Id = InferenceEndpointId;
     type Filter = InferenceEndpointFilter;
 
-    #[instrument(skip(self, request), fields(name = %request.name, url = %request.url), err)]
+    #[instrument(level = "debug", skip(self, request), fields(name = %request.name, url = %request.url), err)]
     async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
         let reasoning_translation = request
             .reasoning_translation
@@ -86,9 +90,9 @@ impl<'c> Repository for InferenceEndpoints<'c> {
         let endpoint = sqlx::query_as!(
             InferenceEndpoint,
             r#"
-            INSERT INTO inference_endpoints (name, description, url, api_key, model_filter, auth_header_name, auth_header_prefix, created_by, reasoning_translation)
-            VALUES ($1, $2, $3, $4, $5, COALESCE($6, 'Authorization'), COALESCE($7, 'Bearer '), $8, $9)
-            RETURNING *
+            INSERT INTO inference_endpoints (name, description, url, api_key, model_filter, auth_header_name, auth_header_prefix, created_by, reasoning_translation, accepts_scheduling_priority, kind)
+            VALUES ($1, $2, $3, $4, $5, COALESCE($6, 'Authorization'), COALESCE($7, 'Bearer '), $8, $9, $10, $11)
+            RETURNING name, description, url, created_by, created_at, updated_at, model_filter, api_key, id, auth_header_name, auth_header_prefix, reasoning_translation, accepts_scheduling_priority, kind
             "#,
             request.name,
             request.description,
@@ -98,7 +102,9 @@ impl<'c> Repository for InferenceEndpoints<'c> {
             request.auth_header_name,
             request.auth_header_prefix,
             request.created_by,
-            reasoning_translation
+            reasoning_translation,
+            request.accepts_scheduling_priority,
+            request.kind.as_db_str()
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -106,9 +112,9 @@ impl<'c> Repository for InferenceEndpoints<'c> {
         Ok(endpoint.try_into()?)
     }
 
-    #[instrument(skip(self), fields(endpoint_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(endpoint_id = %abbrev_uuid(&id)), err)]
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
-        let endpoint = sqlx::query_as!(InferenceEndpoint, "SELECT * FROM inference_endpoints WHERE id = $1", id)
+        let endpoint = sqlx::query_as!(InferenceEndpoint, "SELECT name, description, url, created_by, created_at, updated_at, model_filter, api_key, id, auth_header_name, auth_header_prefix, reasoning_translation, accepts_scheduling_priority, kind FROM inference_endpoints WHERE id = $1", id)
             .fetch_optional(&mut *self.db)
             .await?;
 
@@ -118,13 +124,13 @@ impl<'c> Repository for InferenceEndpoints<'c> {
         }
     }
 
-    #[instrument(skip(self, ids), fields(count = ids.len()), err)]
+    #[instrument(level = "debug", skip(self, ids), fields(count = ids.len()), err)]
     async fn get_bulk(&mut self, ids: Vec<Self::Id>) -> Result<std::collections::HashMap<Self::Id, Self::Response>> {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
 
-        let rows = sqlx::query!("SELECT * FROM inference_endpoints WHERE id = ANY($1)", &ids)
+        let rows = sqlx::query!("SELECT name, description, url, created_by, created_at, updated_at, model_filter, api_key, id, auth_header_name, auth_header_prefix, reasoning_translation, accepts_scheduling_priority, kind FROM inference_endpoints WHERE id = ANY($1)", &ids)
             .fetch_all(&mut *self.db)
             .await?;
 
@@ -140,6 +146,8 @@ impl<'c> Repository for InferenceEndpoints<'c> {
                 auth_header_name: row.auth_header_name,
                 auth_header_prefix: row.auth_header_prefix,
                 reasoning_translation: row.reasoning_translation,
+                accepts_scheduling_priority: row.accepts_scheduling_priority,
+                kind: row.kind,
                 created_by: row.created_by,
                 created_at: row.created_at,
                 updated_at: row.updated_at,
@@ -154,7 +162,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
         Ok(result)
     }
 
-    #[instrument(skip(self), fields(endpoint_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(endpoint_id = %abbrev_uuid(&id)), err)]
     async fn delete(&mut self, id: Self::Id) -> Result<bool> {
         let result = sqlx::query!("DELETE FROM inference_endpoints WHERE id = $1", id)
             .execute(&mut *self.db)
@@ -163,7 +171,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
         Ok(result.rows_affected() > 0)
     }
 
-    #[instrument(skip(self, request), fields(endpoint_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self, request), fields(endpoint_id = %abbrev_uuid(&id)), err)]
     async fn update(&mut self, id: Self::Id, request: &Self::UpdateRequest) -> Result<Self::Response> {
         let reasoning_translation = request
             .reasoning_translation
@@ -197,9 +205,11 @@ impl<'c> Repository for InferenceEndpoints<'c> {
                     WHEN $9 THEN $10
                     ELSE reasoning_translation
                 END,
+                accepts_scheduling_priority = COALESCE($11, accepts_scheduling_priority),
+                kind = COALESCE($12, kind),
                 updated_at = NOW()
             WHERE id = $1
-            RETURNING *
+            RETURNING name, description, url, created_by, created_at, updated_at, model_filter, api_key, id, auth_header_name, auth_header_prefix, reasoning_translation, accepts_scheduling_priority, kind
             "#,
             id,
             request.name,
@@ -210,7 +220,9 @@ impl<'c> Repository for InferenceEndpoints<'c> {
             request.auth_header_name,
             request.auth_header_prefix,
             request.reasoning_translation.is_some(),
-            reasoning_translation
+            reasoning_translation,
+            request.accepts_scheduling_priority,
+            request.kind.map(EndpointKind::as_db_str)
         )
         .fetch_optional(&mut *self.db)
         .await?
@@ -219,11 +231,11 @@ impl<'c> Repository for InferenceEndpoints<'c> {
         Ok(endpoint.try_into()?)
     }
 
-    #[instrument(skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
+    #[instrument(level = "debug", skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
         let endpoints = sqlx::query_as!(
             InferenceEndpoint,
-            "SELECT * FROM inference_endpoints ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+            "SELECT name, description, url, created_by, created_at, updated_at, model_filter, api_key, id, auth_header_name, auth_header_prefix, reasoning_translation, accepts_scheduling_priority, kind FROM inference_endpoints ORDER BY created_at DESC LIMIT $1 OFFSET $2",
             filter.limit,
             filter.skip
         )
@@ -287,7 +299,9 @@ mod tests {
             auth_header_name: None,
             auth_header_prefix: None,
             reasoning_translation: None,
+            accepts_scheduling_priority: false,
             created_by,
+            kind: Default::default(),
         }
     }
 
@@ -317,7 +331,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn persists_and_clears_reasoning_translation(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -354,6 +368,8 @@ mod tests {
                     auth_header_name: None,
                     auth_header_prefix: None,
                     reasoning_translation: Some(None),
+                    accepts_scheduling_priority: None,
+                    kind: Default::default(),
                 },
             )
             .await
@@ -362,7 +378,7 @@ mod tests {
         assert_eq!(cleared.reasoning_translation, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_empty_ids(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
@@ -371,7 +387,7 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_single_endpoint(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -401,7 +417,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_multiple_endpoints(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -430,7 +446,7 @@ mod tests {
         assert_eq!(result[&endpoint3.id].name, "bulk-endpoint-3");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_nonexistent_ids(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -451,7 +467,7 @@ mod tests {
         assert!(!result.contains_key(&fake_id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_existing_endpoint(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -475,7 +491,7 @@ mod tests {
         assert!(found_endpoint.is_none());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_nonexistent_endpoint(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
@@ -487,7 +503,7 @@ mod tests {
         assert!(!deleted);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_apply_update_all_fields(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -508,6 +524,8 @@ mod tests {
             auth_header_name: None,
             auth_header_prefix: None,
             reasoning_translation: None,
+            accepts_scheduling_priority: None,
+            kind: Default::default(),
         };
 
         // Apply update
@@ -532,7 +550,47 @@ mod tests {
         assert_eq!(updated_endpoint.created_at, created_endpoint.created_at);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_endpoint_kind_round_trips_through_create_and_update(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = InferenceEndpoints::new(&mut conn);
+
+        let mut request = create_test_endpoint_request(user.id, "dynamo-endpoint");
+        request.kind = EndpointKind::Dynamo;
+        let created = repo.create(&request).await.unwrap();
+        assert_eq!(created.kind, EndpointKind::Dynamo);
+        assert_eq!(repo.get_by_id(created.id).await.unwrap().unwrap().kind, EndpointKind::Dynamo);
+
+        let updated = repo
+            .update(
+                created.id,
+                &InferenceEndpointUpdateDBRequest {
+                    kind: Some(EndpointKind::Hosted),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.kind, EndpointKind::Hosted);
+        assert_eq!(updated.name, created.name, "an update touching only the kind changes nothing else");
+
+        // Omitting the kind on an update leaves it unchanged.
+        let untouched = repo
+            .update(
+                created.id,
+                &InferenceEndpointUpdateDBRequest {
+                    description: Some("renamed".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(untouched.kind, EndpointKind::Hosted);
+    }
+
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_apply_update_partial_fields(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -553,6 +611,8 @@ mod tests {
             auth_header_name: None,
             auth_header_prefix: None,
             reasoning_translation: None,
+            accepts_scheduling_priority: None,
+            kind: Default::default(),
         };
 
         // Apply update
@@ -621,9 +681,11 @@ mod tests {
             auth_header_name: "Authorization".to_string(),
             auth_header_prefix: "Bearer ".to_string(),
             reasoning_translation: None,
+            accepts_scheduling_priority: false,
             created_by: uuid::Uuid::new_v4(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            kind: Default::default(),
         };
 
         // Test ApplyUpdate trait directly
@@ -636,6 +698,8 @@ mod tests {
             auth_header_name: None,
             auth_header_prefix: None,
             reasoning_translation: None,
+            accepts_scheduling_priority: None,
+            kind: Default::default(),
         };
 
         let updated_response = mock_coalesce_update(update_request, original_response.clone());
@@ -672,9 +736,11 @@ mod tests {
             auth_header_name: "Authorization".to_string(),
             auth_header_prefix: "Bearer ".to_string(),
             reasoning_translation: None,
+            accepts_scheduling_priority: false,
             created_by: uuid::Uuid::new_v4(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+            kind: Default::default(),
         };
 
         // Test ApplyUpdate with empty update (all None fields)
@@ -687,6 +753,8 @@ mod tests {
             auth_header_name: None,
             auth_header_prefix: None,
             reasoning_translation: None,
+            accepts_scheduling_priority: None,
+            kind: Default::default(),
         };
 
         let updated_response = mock_coalesce_update(update_request, original_response.clone());
@@ -705,7 +773,7 @@ mod tests {
         assert!(updated_response.updated_at >= original_response.updated_at);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_nonexistent_endpoint_returns_not_found(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
@@ -721,6 +789,8 @@ mod tests {
             auth_header_name: None,
             auth_header_prefix: None,
             reasoning_translation: None,
+            accepts_scheduling_priority: None,
+            kind: Default::default(),
         };
 
         let result = repo.update(fake_id, &update_request).await;
@@ -734,7 +804,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_endpoint_name_conflict(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -757,7 +827,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_endpoint_name_unique(pool: PgPool) {
         let user = create_test_user(&pool).await;

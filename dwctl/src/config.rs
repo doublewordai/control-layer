@@ -123,6 +123,11 @@ pub struct Config {
     /// Use DATABASE_REPLICA_URL or DWCTL_DATABASE_REPLICA_URL to set this
     #[serde(skip_serializing_if = "Option::is_none")]
     pub database_replica_url: Option<String>,
+    /// Pooled (PgBouncer / Neon `-pooler`) endpoint for the main database.
+    /// Convenience env override (`DATABASE_POOLED_URL` / `DWCTL_DATABASE_POOLED_URL`),
+    /// folded into `database.pooled_url` at load. See `DatabaseConfig::External`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_pooled_url: Option<String>,
     /// Database configuration - either embedded or external PostgreSQL
     pub database: DatabaseConfig,
     /// Threshold in milliseconds for logging slow SQL statements (default: 1000ms)
@@ -135,6 +140,11 @@ pub struct Config {
     pub secret_key: Option<String>,
     /// Model sources for syncing available models
     pub model_sources: Vec<ModelSource>,
+    /// Declarative model catalog applied transactionally during startup.
+    pub model_provisioning: ModelProvisioningConfig,
+    /// Whether this process applies schema migrations at startup or only
+    /// verifies that the database is compatible. See [`MigrationsConfig`].
+    pub migrations: MigrationsConfig,
     /// Frontend metadata displayed in the UI
     pub metadata: Metadata,
     /// Payment provider configuration (Stripe, PayPal, etc.)
@@ -185,12 +195,6 @@ pub struct Config {
     /// External data source connections configuration
     #[serde(default)]
     pub connections: ConnectionsConfig,
-    /// Multi-step Open Responses orchestration configuration. Only the
-    /// safety caps are exposed today; storage and dispatch are wired
-    /// implicitly when the multi-step processor is registered with
-    /// fusillade.
-    #[serde(default)]
-    pub responses: ResponsesConfig,
     /// Image-input normalisation configuration.
     ///
     /// When enabled, image references in `/v1/chat/completions` and
@@ -215,6 +219,149 @@ pub struct Config {
     /// tokenizer-svc URL, and the default pricing multipliers. See [`CacheConfig`].
     #[serde(default)]
     pub cache: CacheConfig,
+    /// The ClickHouse warehouse connection (endpoint, database, credential), shared by
+    /// every feature that writes analytics records directly to ClickHouse. Absent (the
+    /// default) means no such feature may be enabled. Table names and flush cadence live
+    /// on the writing feature's own section. See [`crate::clickhouse::ClickhouseConfig`].
+    #[serde(default)]
+    pub clickhouse: Option<crate::clickhouse::ClickhouseConfig>,
+    /// Prefix-chain capture for workload profiling: content-free records of prompt
+    /// structure per chat-completions request, written to ClickHouse. Off by default.
+    /// See [`crate::prefix_chain::PrefixChainConfig`].
+    #[serde(default)]
+    pub prefix_chain: crate::prefix_chain::PrefixChainConfig,
+    /// Mid-stream continuation (stream resume): the on/off flag, per-origin gates,
+    /// and resume-behavior knobs. See [`ContinuationConfig`].
+    #[serde(default)]
+    pub continuation: ContinuationConfig,
+    /// Opt-in sampled jemalloc heap profiling, served on a separate
+    /// cluster-internal listener. Off by default. See
+    /// [`crate::profiling::HeapProfilingConfig`].
+    #[serde(default)]
+    pub heap_profiling: crate::profiling::HeapProfilingConfig,
+    /// Account scheduling tolerations: the named presets an operator may pin to
+    /// an account. See [`SchedulingConfig`].
+    #[serde(default)]
+    pub scheduling: SchedulingConfig,
+}
+
+/// Operator-defined scheduling-toleration presets.
+///
+/// Each preset affixes a fixed, Kubernetes-style toleration list to every
+/// inference request from an account pinned to it, written to
+/// `nvext.routing_constraints.tolerations` before the request reaches the
+/// upstream inference backend. An account stores only the preset's `id`
+/// (`users.toleration_preset`); the tolerations themselves live here, so an
+/// operator can retune a preset without walking every account.
+///
+/// The list is deliberately backend-agnostic: a backend that honours
+/// tolerations uses it to decide which capacity may serve the request. An
+/// empty list (`[]`) asks a backend to keep the account's work off any
+/// tainted capacity.
+///
+/// Validate with [`SchedulingConfig::validate`], which is called at load time:
+/// ids must be unique slugs and every toleration must be one the request path
+/// could serialise into a valid body.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SchedulingConfig {
+    /// The presets an account may be pinned to, in display order.
+    pub toleration_presets: Vec<TolerationPreset>,
+}
+
+/// One operator-defined scheduling-toleration preset.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TolerationPreset {
+    /// Stable slug the account stores (`users.toleration_preset`). Unique
+    /// across presets; matched case-sensitively.
+    pub id: String,
+    /// Short human label for the control (e.g. "No overflow capacity").
+    pub label: String,
+    /// One or two sentences of help text (the dashboard tooltip).
+    pub description: String,
+    /// The toleration list written to `nvext.routing_constraints.tolerations`,
+    /// in the same shape as the request field. An empty list is a real preset.
+    pub tolerations: Vec<crate::scheduling::SchedulingToleration>,
+}
+
+impl SchedulingConfig {
+    /// The generic preset shipped in the default config: pin the account's
+    /// work off any tainted capacity, the most common operator intent.
+    pub fn default_preset() -> TolerationPreset {
+        TolerationPreset {
+            id: "no-overflow".to_string(),
+            label: "No overflow capacity".to_string(),
+            description: "Never placed on capacity the backend marks with any taint, such as overflow capacity; \
+                          requests may be refused when dedicated capacity is full."
+                .to_string(),
+            tolerations: Vec::new(),
+        }
+    }
+
+    /// Look up a preset by id.
+    pub fn preset(&self, id: &str) -> Option<&TolerationPreset> {
+        self.toleration_presets.iter().find(|preset| preset.id == id)
+    }
+
+    /// Resolve an account's stored preset id to the toleration list the request
+    /// path writes. `None` (the "Default" setting) means nothing is pinned, so
+    /// the backend decides. An id that is absent from the config is a
+    /// misconfiguration the caller must fail closed on; see
+    /// [`crate::scheduling::TolerationPresets::resolve`].
+    pub fn resolve(&self, id: Option<&str>) -> Option<&[crate::scheduling::SchedulingToleration]> {
+        id.and_then(|id| self.preset(id)).map(|preset| preset.tolerations.as_slice())
+    }
+
+    /// Whether every id is a unique slug and every toleration is valid.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
+        for (index, preset) in self.toleration_presets.iter().enumerate() {
+            if preset.id.trim().is_empty() {
+                return Err(format!("scheduling.toleration_presets[{index}] has an empty id"));
+            }
+            if preset.id != preset.id.trim() {
+                return Err(format!(
+                    "scheduling.toleration_presets[{index}] id {:?} has leading or trailing whitespace",
+                    preset.id
+                ));
+            }
+            if preset.id == crate::scheduling::DEFAULT_PRESET_SENTINEL {
+                return Err(format!(
+                    "scheduling.toleration_presets[{index}] id {:?} is reserved for the dashboard's \
+                     \"Default\" option",
+                    preset.id
+                ));
+            }
+            if !seen.insert(preset.id.as_str()) {
+                return Err(format!("scheduling.toleration_presets has a duplicate id {:?}", preset.id));
+            }
+            if preset.label.trim().is_empty() {
+                return Err(format!(
+                    "scheduling.toleration_presets[{index}] ({:?}) has an empty label",
+                    preset.id
+                ));
+            }
+            if preset.description.trim().is_empty() {
+                return Err(format!(
+                    "scheduling.toleration_presets[{index}] ({:?}) has an empty description",
+                    preset.id
+                ));
+            }
+            crate::scheduling::PinnedTolerations(preset.tolerations.clone())
+                .validate()
+                .map_err(|error| format!("scheduling.toleration_presets[{:?}] is invalid: {error}", preset.id))?;
+        }
+        Ok(())
+    }
+}
+
+impl Default for SchedulingConfig {
+    fn default() -> Self {
+        Self {
+            toleration_presets: vec![Self::default_preset()],
+        }
+    }
 }
 
 /// Controls exposure of the OpenAPI specs and Scalar doc UIs.
@@ -243,29 +390,6 @@ impl Default for OpenApiConfig {
         Self {
             admin_enabled: true,
             ai_enabled: true,
-        }
-    }
-}
-
-/// Configuration for `/v1/responses` multi-step orchestration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ResponsesConfig {
-    /// Maximum sub-agent recursion depth (per plan §C11). A
-    /// `tool_call` step whose sub-agent dispatch would exceed this
-    /// depth is failed with `max_depth_exceeded`.
-    pub max_response_step_depth: u32,
-    /// Maximum model_call ↔ tool_call iterations within a single loop
-    /// level (per plan §C11). A loop level that hits this cap fails
-    /// with `max_iterations_exceeded`.
-    pub max_response_iterations: u32,
-}
-
-impl Default for ResponsesConfig {
-    fn default() -> Self {
-        Self {
-            max_response_step_depth: 8,
-            max_response_iterations: 10,
         }
     }
 }
@@ -301,6 +425,17 @@ impl Default for PoolSettings {
     }
 }
 
+/// How schema-mode query connections select their PostgreSQL schema.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PooledSchemaMode {
+    /// Use a component login with a persistent schema default, verified at startup.
+    #[default]
+    RoleDefault,
+    /// Select the schema within every query transaction (Fusillade only).
+    Transaction,
+}
+
 /// How a component (fusillade/outlet) connects to its database.
 ///
 /// Components can either share the main database using a separate PostgreSQL schema,
@@ -313,6 +448,24 @@ pub enum ComponentDb {
     Schema {
         /// Schema name (e.g., "fusillade", "outlet")
         name: String,
+        /// Optional direct endpoint using a component identity in the same live
+        /// database as main. Used for migrations and session-scoped work.
+        /// Without it, the main direct credentials are reused.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        /// Optional transaction-pooled endpoint. Defaults to main's endpoint
+        /// only when `url` is omitted. An explicit identity with a split main
+        /// pool must also supply its own pooled endpoint.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pooled_url: Option<String>,
+        /// Schema selection for transaction-pooled queries. Role-default mode
+        /// verifies both primary and replica; transaction mode is Fusillade-only.
+        #[serde(default)]
+        pooled_schema_mode: PooledSchemaMode,
+        /// Optional replica endpoint. An explicit direct identity falls back to
+        /// its primary; otherwise the main replica is inherited when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replica_url: Option<String>,
         /// Connection pool settings for this component (primary and replica if not specified)
         #[serde(default)]
         pool: PoolSettings,
@@ -320,15 +473,26 @@ pub enum ComponentDb {
         /// If not specified, uses the same settings as `pool`
         #[serde(default, skip_serializing_if = "Option::is_none")]
         replica_pool: Option<PoolSettings>,
+        /// Direct (non-pooled) connections for this schema, used only for
+        /// session-scoped work: today its migrations. Only meaningful when the
+        /// main database or this component has a `pooled_url`; otherwise every
+        /// pool is direct and this is unused.
+        #[serde(default = "default_direct_pool")]
+        direct_pool: PoolSettings,
     },
     /// Use a dedicated database with its own connection.
     /// Useful for isolating workloads or using read replicas.
     Dedicated {
-        /// Primary database URL
+        /// Primary database URL (direct connections)
         url: String,
         /// Optional read replica URL for read-heavy operations
         #[serde(default, skip_serializing_if = "Option::is_none")]
         replica_url: Option<String>,
+        /// Optional pooled (transaction-pooling) endpoint for the same
+        /// database. When set, `pool` sizes the pooled pool and `direct_pool`
+        /// the direct one; when unset every pool is direct and sized by `pool`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pooled_url: Option<String>,
         /// Connection pool settings for primary (and replica if not specified)
         #[serde(default)]
         pool: PoolSettings,
@@ -336,15 +500,58 @@ pub enum ComponentDb {
         /// If not specified, uses the same settings as `pool`
         #[serde(default, skip_serializing_if = "Option::is_none")]
         replica_pool: Option<PoolSettings>,
+        /// Direct (non-pooled) connections, used only for session-scoped work
+        /// (migrations) when `pooled_url` is set.
+        #[serde(default = "default_direct_pool")]
+        direct_pool: PoolSettings,
     },
 }
 
 impl ComponentDb {
+    /// Reject configurations that would change the selected connection identity
+    /// or request transaction schema selection from an unsupported client.
+    pub(crate) fn validate_schema_pooling(&self, component_name: &str, main_is_split: bool) -> Result<(), String> {
+        if let Self::Schema {
+            url,
+            pooled_url,
+            pooled_schema_mode,
+            ..
+        } = self
+        {
+            if *pooled_schema_mode == PooledSchemaMode::Transaction && component_name != "fusillade" {
+                return Err(format!(
+                    "database.{component_name}.pooled_schema_mode: transaction is supported only for fusillade"
+                ));
+            }
+            if url.is_some() && main_is_split && pooled_url.is_none() {
+                return Err(format!(
+                    "database.{component_name}.pooled_url is required with an explicit schema url when main uses a pooled endpoint"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Get the primary pool settings for this component
     pub fn pool_settings(&self) -> &PoolSettings {
         match self {
             ComponentDb::Schema { pool, .. } => pool,
             ComponentDb::Dedicated { pool, .. } => pool,
+        }
+    }
+
+    /// Settings for this component's direct (non-pooled) pool.
+    pub fn direct_pool_settings(&self) -> &PoolSettings {
+        match self {
+            ComponentDb::Schema { direct_pool, .. } => direct_pool,
+            ComponentDb::Dedicated { direct_pool, .. } => direct_pool,
+        }
+    }
+
+    /// Explicit pooled endpoint for this component, if configured.
+    pub fn pooled_url(&self) -> Option<&str> {
+        match self {
+            ComponentDb::Schema { pooled_url, .. } | ComponentDb::Dedicated { pooled_url, .. } => pooled_url.as_deref(),
         }
     }
 
@@ -361,6 +568,10 @@ impl ComponentDb {
 /// Default fusillade component configuration (schema mode with "fusillade" schema)
 pub fn default_fusillade_component() -> ComponentDb {
     ComponentDb::Schema {
+        url: None,
+        pooled_schema_mode: PooledSchemaMode::default(),
+        pooled_url: None,
+        replica_url: None,
         name: "fusillade".into(),
         pool: PoolSettings {
             max_connections: 20,
@@ -370,12 +581,17 @@ pub fn default_fusillade_component() -> ComponentDb {
             max_lifetime_secs: 1800,
         },
         replica_pool: None,
+        direct_pool: default_direct_pool(),
     }
 }
 
 /// Default outlet component configuration (schema mode with "outlet" schema)
 pub fn default_outlet_component() -> ComponentDb {
     ComponentDb::Schema {
+        url: None,
+        pooled_schema_mode: PooledSchemaMode::default(),
+        pooled_url: None,
+        replica_url: None,
         name: "outlet".into(),
         pool: PoolSettings {
             max_connections: 5,
@@ -385,6 +601,21 @@ pub fn default_outlet_component() -> ComponentDb {
             max_lifetime_secs: 1800,
         },
         replica_pool: None,
+        direct_pool: default_direct_pool(),
+    }
+}
+
+/// Direct-connection pool defaults. Every direct connection is a real backend
+/// against the database's hard connection limit, so this stays small: it only
+/// has to cover session-scoped work (LISTEN connections, the leader-election
+/// lock, migrations), never query traffic. An API pod holds five of those at
+/// steady state (four listeners + the leader lock), so the default leaves a
+/// little headroom; anything below six is warned about at boot.
+pub fn default_direct_pool() -> PoolSettings {
+    PoolSettings {
+        max_connections: 8,
+        min_connections: 0,
+        ..Default::default()
     }
 }
 
@@ -432,14 +663,26 @@ pub enum DatabaseConfig {
         /// holds long-lived PgListener connections)
         #[serde(default = "default_underway_pool")]
         underway_pool: PoolSettings,
+        /// Direct-connection pool settings (unused for embedded: there is no
+        /// pooler, so every pool is direct and sized by `pool`).
+        #[serde(default = "default_direct_pool")]
+        direct_pool: PoolSettings,
     },
     /// Use external PostgreSQL database
     External {
-        /// Connection string for the main database
+        /// Connection string for the main database (direct connections)
         url: String,
         /// Optional read replica URL for the main database
         #[serde(default, skip_serializing_if = "Option::is_none")]
         replica_url: Option<String>,
+        /// Optional pooled (transaction-pooling, e.g. Neon `-pooler`) endpoint
+        /// for the same database. When set, all query traffic goes through it
+        /// (sized by `pool`) and only session-scoped work — LISTEN
+        /// connections, the leader-election lock, migrations — uses `url`
+        /// (sized by `direct_pool`). When unset, every pool is direct and
+        /// sized by `pool`, exactly as before pooling existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pooled_url: Option<String>,
         /// Main database connection pool settings for primary (and replica if not specified)
         #[serde(default)]
         pool: PoolSettings,
@@ -457,6 +700,9 @@ pub enum DatabaseConfig {
         /// holds long-lived PgListener connections)
         #[serde(default = "default_underway_pool")]
         underway_pool: PoolSettings,
+        /// Direct-connection pool settings; see `pooled_url`.
+        #[serde(default = "default_direct_pool")]
+        direct_pool: PoolSettings,
     },
 }
 
@@ -473,6 +719,7 @@ impl Default for DatabaseConfig {
                 fusillade: default_fusillade_component(),
                 outlet: default_outlet_component(),
                 underway_pool: default_underway_pool(),
+                direct_pool: default_direct_pool(),
             }
         }
         #[cfg(not(feature = "embedded-db"))]
@@ -480,11 +727,13 @@ impl Default for DatabaseConfig {
             DatabaseConfig::External {
                 url: "postgres://localhost:5432/control_layer".to_string(),
                 replica_url: None,
+                pooled_url: None,
                 pool: PoolSettings::default(),
                 replica_pool: None,
                 fusillade: default_fusillade_component(),
                 outlet: default_outlet_component(),
                 underway_pool: default_underway_pool(),
+                direct_pool: default_direct_pool(),
             }
         }
     }
@@ -509,6 +758,22 @@ impl DatabaseConfig {
         match self {
             DatabaseConfig::External { replica_url, .. } => replica_url.as_deref(),
             DatabaseConfig::Embedded { .. } => None,
+        }
+    }
+
+    /// Pooled endpoint for the main database, if configured (external only).
+    pub fn external_pooled_url(&self) -> Option<&str> {
+        match self {
+            DatabaseConfig::External { pooled_url, .. } => pooled_url.as_deref(),
+            DatabaseConfig::Embedded { .. } => None,
+        }
+    }
+
+    /// Settings for the main database's direct (non-pooled) pool.
+    pub fn direct_pool_settings(&self) -> &PoolSettings {
+        match self {
+            DatabaseConfig::Embedded { direct_pool, .. } => direct_pool,
+            DatabaseConfig::External { direct_pool, .. } => direct_pool,
         }
     }
 
@@ -613,6 +878,38 @@ pub struct StripeConfig {
     /// Stripe tax code for auto top-up tax calculations (e.g. "txcd_10000000").
     /// If not set, falls back to the account-level default tax code in Stripe Tax settings.
     pub tax_code: Option<String>,
+    /// Base URL of the Stripe API (e.g. "http://localhost:12111"). Unset in
+    /// production, which talks to `https://api.stripe.com/`; set it to point the
+    /// client at a Stripe-compatible mock server or an egress proxy. Must be an
+    /// http(s) URL without a query or fragment; a path prefix is allowed, with
+    /// or without a trailing slash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_base_url: Option<String>,
+}
+
+impl StripeConfig {
+    /// The configured Stripe API base, normalised to end in `/`.
+    ///
+    /// async-stripe appends `v1/...` to the base verbatim, so a path prefix
+    /// without its trailing slash (`https://proxy.example.test/stripe`) would
+    /// otherwise send requests to `.../stripev1/...`.
+    pub fn api_base(&self) -> Result<Option<String>, String> {
+        let Some(raw) = &self.api_base_url else {
+            return Ok(None);
+        };
+        let mut url = Url::parse(raw).map_err(|e| format!("payment.stripe.api_base_url {raw:?} is not a valid URL: {e}"))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(format!("payment.stripe.api_base_url {raw:?} must be an http or https URL"));
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(format!("payment.stripe.api_base_url {raw:?} must not have a query or fragment"));
+        }
+        if !url.path().ends_with('/') {
+            let path = format!("{}/", url.path());
+            url.set_path(&path);
+        }
+        Ok(Some(url.into()))
+    }
 }
 
 /// Dummy payment configuration for testing.
@@ -628,7 +925,13 @@ pub struct DummyConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Metadata {
-    /// Region name displayed in the UI (e.g., "UK South", "US East")
+    /// Region name displayed in the UI (e.g., "UK South", "US East").
+    ///
+    /// Surfaced verbatim on `GET /admin/api/v1/config`. Both dashboards hide
+    /// the region indicator entirely when this is `None`, rather than showing
+    /// an "unknown" placeholder — a deployment that serves one region has no
+    /// use for the label, and an account's region is where its data lives, so
+    /// displaying a guess is worse than displaying nothing.
     pub region: Option<String>,
     /// Organization name displayed in the UI
     pub organization: Option<String>,
@@ -698,10 +1001,38 @@ pub struct AuthConfig {
     /// Applies to user registration and proxy header auth auto-creation
     /// StandardUser role is always guaranteed to be present even if not specified
     pub default_user_roles: Vec<Role>,
-    /// Default rate-limit tiers applied to API keys based on the owning user's
-    /// `verified` flag. Only used when the api_key has no explicit per-key
-    /// override. Leaving either tier as `None` means "no limit for that tier".
-    pub rate_limits: RateLimitTiersConfig,
+    #[serde(rename = "rate_limits", skip_serializing)]
+    pub ignored_rate_limits: serde::de::IgnoredAny,
+    /// Extra email domains to treat as personal, on top of the built-in list
+    /// in `auth::utils`.
+    ///
+    /// A personal domain cannot be claimed by a workspace and is never used to
+    /// route a signup, so this is the lever for a free-mail or ISP provider the
+    /// built-in list has missed. It matters because the built-in list can only
+    /// ever be a snapshot: a provider that is absent gets claimed by whoever
+    /// signs up first, and every later signup at that provider is routed into
+    /// that stranger's workspace. Adding the domain here closes it immediately
+    /// and also retires the existing claim, because the claim is only ever
+    /// consulted after this check.
+    ///
+    /// Matched case-insensitively against the full domain. Entries duplicating
+    /// the built-in list are harmless.
+    pub personal_email_domains: Vec<String>,
+}
+
+impl AuthConfig {
+    /// Whether `domain` belongs to a personal/free email provider, per the
+    /// built-in list plus anything the deployment has added.
+    ///
+    /// Prefer this over [`crate::auth::utils::is_builtin_personal_email_domain`]
+    /// at call sites, so `auth.personal_email_domains` is actually honoured.
+    pub fn is_personal_email_domain(&self, domain: &str) -> bool {
+        crate::auth::utils::is_builtin_personal_email_domain(domain)
+            || self
+                .personal_email_domains
+                .iter()
+                .any(|configured| configured.trim().eq_ignore_ascii_case(domain))
+    }
 }
 
 impl Default for AuthConfig {
@@ -711,26 +1042,10 @@ impl Default for AuthConfig {
             proxy_header: ProxyHeaderAuthConfig::default(),
             security: SecurityConfig::default(),
             default_user_roles: vec![Role::StandardUser, Role::BackgroundInferenceUser],
-            rate_limits: RateLimitTiersConfig::default(),
+            ignored_rate_limits: serde::de::IgnoredAny,
+            personal_email_domains: Vec::new(),
         }
     }
-}
-
-/// Per-tier defaults for API key rate limits. A `None` tier means no default
-/// limit is applied, preserving the legacy "unlimited unless overridden"
-/// behaviour for that tier.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct RateLimitTiersConfig {
-    pub verified: Option<RateLimitTierConfig>,
-    pub unverified: Option<RateLimitTierConfig>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RateLimitTierConfig {
-    pub requests_per_second: f32,
-    pub burst_size: Option<i32>,
 }
 
 /// Native username/password authentication configuration.
@@ -987,6 +1302,95 @@ pub struct LimitsConfig {
     pub files: FileLimitsConfig,
     /// Request limits (per-request body size within batch files)
     pub requests: RequestLimitsConfig,
+    /// Realtime (interactive) per-account in-flight limits, counted per key
+    /// account.
+    pub realtime_inflight: RealtimeInflightLimitsConfig,
+    /// Global per-model batch in-flight cap. Reuses
+    /// [`RealtimeInflightLimitsConfig::redis_url`] for its shared counter, so
+    /// the cap holds across replicas; it is a separate switch because batch and
+    /// realtime limits can be rolled out independently.
+    pub batch_inflight: BatchInflightLimitsConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RealtimeInflightLimitsConfig {
+    pub enforce: bool,
+    pub redis_url: Option<String>,
+}
+
+/// Per-model batch in-flight cap.
+///
+/// When enforced, each virtual (composite) model's `batch_capacity` becomes a
+/// ceiling on how many batch (dispatched) requests may be in flight against
+/// that alias at once, counted globally across replicas in the same Redis used
+/// by [`RealtimeInflightLimitsConfig`]. `realtime_inflight` traffic is not
+/// affected. `redis_url` is intentionally not duplicated here: batch reuses
+/// `limits.realtime_inflight.redis_url`. With `enforce` false (the default)
+/// nothing is refused and no shared count is touched.
+///
+/// Enabling this changes the meaning of `batch_capacity`: without it the value
+/// is only fusillade's per-daemon *starting* concurrency (adaptive concurrency
+/// can grow past it), while with it the same value is also the *global*
+/// ceiling. Raise `batch_capacity` to the intended global cap before turning
+/// enforcement on. File batches, flex and background requests all share this
+/// single per-model ceiling.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BatchInflightLimitsConfig {
+    pub enforce: bool,
+    /// Default global batch in-flight cap applied to virtual (composite) models
+    /// that do not set their own positive `batch_capacity`. Default: 200.
+    ///
+    /// This only affects the onwards cap; it does not change fusillade's
+    /// per-daemon starting concurrency, which keeps using
+    /// `background_services.batch_daemon.default_model_concurrency` for models
+    /// without an explicit `batch_capacity`. Set to `null` or `0` to leave
+    /// virtual models without their own value uncapped. Negative values are
+    /// rejected at config load.
+    #[serde(
+        default = "default_batch_inflight_capacity",
+        deserialize_with = "deserialize_batch_inflight_default_capacity"
+    )]
+    pub default_capacity: Option<u32>,
+}
+
+/// Default global batch in-flight cap for virtual models without a positive
+/// `batch_capacity` of their own.
+pub const DEFAULT_BATCH_INFLIGHT_CAPACITY: u32 = 200;
+
+fn default_batch_inflight_capacity() -> Option<u32> {
+    Some(DEFAULT_BATCH_INFLIGHT_CAPACITY)
+}
+
+/// Accepts a positive integer, or the "off" forms `null` and `0`; rejects
+/// negative values with a clear config-load error.
+fn deserialize_batch_inflight_default_capacity<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let value: Option<i64> = Option::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(value) if value < 0 => Err(D::Error::custom(format!(
+            "limits.batch_inflight.default_capacity must not be negative, got {value}"
+        ))),
+        Some(0) => Ok(None),
+        Some(value) => u32::try_from(value)
+            .map(Some)
+            .map_err(|_| D::Error::custom(format!("limits.batch_inflight.default_capacity is too large, got {value}"))),
+    }
+}
+
+impl Default for BatchInflightLimitsConfig {
+    fn default() -> Self {
+        Self {
+            enforce: false,
+            default_capacity: default_batch_inflight_capacity(),
+        }
+    }
 }
 
 /// Request limits configuration.
@@ -1016,13 +1420,52 @@ impl Default for RequestLimitsConfig {
 /// Onwards AI proxy configuration.
 ///
 /// Controls behavior of the onwards routing layer used for AI proxy requests.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OnwardsConfig {
+    /// Maximum pending bytes of an unfinished SSE event in the proxy, cache, continuation and
+    /// client usage layers.
+    /// Complete events are forwarded first.
+    /// Increase for providers that emit large tool-call events. Default: 65536.
+    pub sse_buffer_limit: usize,
     /// Enable strict mode with schema validation and typed handlers.
     /// When false (default), all requests are passed through transparently.
     /// When true, only known OpenAI API paths are accepted and validated.
     pub strict_mode: bool,
+    /// Public message returned for upstream 429 responses, including exhausted
+    /// retries. Does not affect local request or concurrency limit messages.
+    pub upstream_rate_limit_message: String,
+    /// Failover deadline for the first token of a realtime streamed response,
+    /// in milliseconds. While a model still has another provider to fail over
+    /// to, an attempt that hasn't produced response headers and (in strict
+    /// mode) a first SSE frame within this window is abandoned and the next
+    /// provider tried. The final attempt is never cut off, and fusillade daemon
+    /// traffic (batch, flex, background) is exempt. Default: 20000. AIMD's
+    /// separate 10-second latency budget records a later first token as a
+    /// breach without cutting it off; once breaches exceed the controller's
+    /// target rate, later requests shift to the alternates. Set to 0 to disable.
+    pub first_token_timeout_ms: u64,
+    /// Strict-mode chat and legacy completions parameters that get a 400
+    /// instead of being forwarded.
+    /// Every parameter onwards flags as not servable by every worker is counted
+    /// (`onwards_unsupported_params_total`) and traced; only the ones listed
+    /// here are refused. Names must come from `onwards::unsupported_params::params()`.
+    /// Default: empty (observe only).
+    pub rejected_params: Vec<String>,
+}
+
+impl Default for OnwardsConfig {
+    fn default() -> Self {
+        Self {
+            sse_buffer_limit: onwards::sse::DEFAULT_SSE_BUFFER_LIMIT,
+            strict_mode: false,
+            upstream_rate_limit_message:
+                "This is a shared best-effort endpoint, rate limited under load – retry with backoff. For production workloads that aren't latency-sensitive, try our async or batch tiers (https://docs.doubleword.ai/inference-api/batch-inference); for a dedicated real-time endpoint with SLAs, higher rate limits, and volume pricing, contact support@doubleword.ai."
+                    .to_string(),
+            first_token_timeout_ms: 20_000,
+            rejected_params: Vec::new(),
+        }
+    }
 }
 
 /// Cached-input pricing — the dwctl-owned cache tower layer. All cache configuration lives
@@ -1094,6 +1537,18 @@ pub struct CacheConfig {
     /// Set via environment: `DWCTL_CACHE__INDEX_CONN_RETRIES=3`
     pub index_conn_retries: u32,
 
+    /// Exact chat-templated token counting via tokenizer-svc `/v1/render` (svc ≥ 0.3.0).
+    /// When true, cache splits are counted against the model's real chat-template
+    /// rendering — the same bytes the engine tokenizes — instead of raw content-block
+    /// text, eliminating the classifier-vs-engine drift that forces the billing caps to
+    /// engage. Per-alias it additionally requires a `template_version` from `/v1/models`;
+    /// aliases without one (and render failures) keep raw-segment counting. Rollout:
+    /// staging first, watch `dwctl_cache_render_drift_tokens` ≈ 0, then prod.
+    ///
+    /// Set via environment: `DWCTL_CACHE__RENDER_COUNTING=true`
+    #[serde(default)]
+    pub render_counting: bool,
+
     /// Handling of provider-injected per-request *telemetry* blocks (e.g. the Claude Code SDK's
     /// `x-anthropic-billing-header` line, whose nonce changes every request). Such a block sits
     /// ahead of the caller's `cache_control` breakpoint, so leaving it in would change the prefix
@@ -1113,6 +1568,7 @@ impl Default for CacheConfig {
             default_ttl: "5m".to_string(),
             classify_deadline_secs: 5,
             index_conn_retries: 1,
+            render_counting: false,
             telemetry_blocks: TelemetryBlockConfig::default(),
         }
     }
@@ -1154,6 +1610,153 @@ impl Default for TelemetryBlockConfig {
         Self {
             strip_from_prompt: true,
             prefixes: vec!["x-anthropic-billing-header:".to_string()],
+        }
+    }
+}
+
+/// Mid-stream continuation (stream resume) configuration.
+///
+/// When a stream dies mid-generation on a continuation-enabled model, the resume
+/// middleware rebuilds prompt + partial output as token ids (tokenizer-svc
+/// `/v1/render`) and re-enters onwards as a `/v1/completions` request on the
+/// model's continuation composite, splicing the new stream into the client's
+/// still-open connection. Per-model activation additionally requires a
+/// `continuation`-purpose traffic rule + composite; with none attached, enabling
+/// this flag changes nothing.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ContinuationConfig {
+    /// Global kill switch. When false (the default), the resume layer is not added
+    /// to the stack and the request path is byte-identical to today.
+    ///
+    /// Set via environment: `DWCTL_CONTINUATION__ENABLED=true`
+    pub enabled: bool,
+
+    /// Base URL of the tokenizer-svc used to render resume prefixes. `None` (the
+    /// default) falls back to `cache.tokenizer_url` — the same service serves both
+    /// layers; set this only to split them.
+    ///
+    /// Set via environment: `DWCTL_CONTINUATION__TOKENIZER_URL=http://tokenizer-svc:8088`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokenizer_url: Option<String>,
+
+    /// Per-origin gates. All origins ride the same middleware; these choose which
+    /// request populations are eligible for resume at all.
+    pub origins: ContinuationOriginsConfig,
+
+    /// Maximum resume legs for one logical stream (a resume leg that itself dies
+    /// mid-stream re-enters the flow). Exhausted → the error surfaces to the
+    /// client exactly as an unresumed death would.
+    ///
+    /// Set via environment: `DWCTL_CONTINUATION__MAX_ATTEMPTS=2`
+    pub max_attempts: u32,
+
+    /// Budget for one resume attempt (render + continuation-target time-to-first-
+    /// byte). Crossed → give up on that leg and surface the original error. Cold
+    /// provider prefill dominates this budget on long prompts; per-provider
+    /// TTFB-vs-prefix-length curves from the onboarding harness inform the value.
+    ///
+    /// Set via environment: `DWCTL_CONTINUATION__RESUME_DEADLINE_SECS=20`
+    pub resume_deadline_secs: u64,
+
+    /// Inter-frame silence after which an armed stream is declared STALLED and
+    /// rescued — which CANCELS the original leg and re-prefills, so this must
+    /// never undercut the platform's own liveness judgment: fusillade's SSE
+    /// clients allow 600s between events (prod `chunk_timeout_ms`), and a
+    /// preempted/kv-thrashed but progressing stream must be allowed to
+    /// continue. Default 540 = just inside fusillade's 600s so batch-origin
+    /// stalls are still rescuable before the daemon aborts the request.
+    /// Arms only after the first generated text (admission/prefill silence is
+    /// never bounded here).
+    ///
+    /// Set via environment: `DWCTL_CONTINUATION__STALL_TIMEOUT_SECS=540`
+    pub stall_timeout_secs: u64,
+
+    /// Per-stream cap applied SEPARATELY to each retained allocation: the
+    /// request body (eligibility gate) and the accumulated generation
+    /// (accumulator cap) — worst case an armed stream retains ~2x this value.
+    /// Deliberately not a shared budget: deducting a large body from the
+    /// generation allowance would disarm long generations on big-prompt
+    /// requests, exactly the streams most worth rescuing. Exceeding either
+    /// bound marks the stream non-resumable and drops the buffer (outlet's own
+    /// capture is unaffected); the outcome metric records `cap_exceeded`.
+    ///
+    /// Set via environment: `DWCTL_CONTINUATION__MAX_BUFFER_BYTES=2097152`
+    pub max_buffer_bytes: usize,
+
+    /// Numeric scheduling priority injected into resume-leg request bodies. The
+    /// dynamo scheduler orders by this field: batch/flex run negative
+    /// (deadline-derived), realtime runs 0 — any positive value puts resume legs
+    /// ahead of new realtime work, which is intentional: a resume finishes a
+    /// stream we already accepted, on a strict seam budget. Third-party providers
+    /// ignore the field.
+    ///
+    /// Set via environment: `DWCTL_CONTINUATION__PRIORITY=100`
+    pub priority: i32,
+
+    /// Cap on concurrently in-flight resume legs per model (middleware counter).
+    /// Mid-stream deaths cluster in incidents; this bounds the stampede a flapping
+    /// model can send at its continuation provider. Excess deaths surface as plain
+    /// errors (outcome `throttled`).
+    ///
+    /// Set via environment: `DWCTL_CONTINUATION__MAX_INFLIGHT_PER_MODEL=8`
+    pub max_inflight_per_model: u32,
+
+    /// Which reconstructor rebuilds the partial generation, per model alias.
+    ///
+    /// A stream is only resumable if we can rebuild the exact text the model had
+    /// already emitted. The default reconstructor handles plain `content` and
+    /// gives up on `reasoning_content` / `tool_calls`; a model whose family has a
+    /// byte-exactness verdict from the fidelity harness can name that family here
+    /// and stay resumable through reasoning and partial tool calls. Recognised
+    /// value: `dsv4` (DeepSeek-V4 / DSML). A model absent from the map — or
+    /// naming a family we do not know — keeps the default.
+    ///
+    /// This is deliberately a config map for the canary: it moves onto the
+    /// per-route DB row next to the `continuation` traffic rule once more than one
+    /// family is live.
+    ///
+    /// Set via environment: `DWCTL_CONTINUATION__MODEL_RECONSTRUCTORS='{"deepseek-ai/DeepSeek-V4-Flash":"dsv4"}'`
+    pub model_reconstructors: HashMap<String, String>,
+}
+
+impl Default for ContinuationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tokenizer_url: None,
+            origins: ContinuationOriginsConfig::default(),
+            max_attempts: 2,
+            resume_deadline_secs: 20,
+            stall_timeout_secs: 540,
+            max_buffer_bytes: 2 * 1024 * 1024,
+            priority: 100,
+            max_inflight_per_model: 8,
+            model_reconstructors: HashMap::new(),
+        }
+    }
+}
+
+/// Which request origins are eligible for mid-stream resume. Realtime leads the
+/// rollout (user-visible failures); batch resumes are a pure GPU saving vs
+/// fusillade's full retry and follow once realtime has bedded in.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ContinuationOriginsConfig {
+    /// Set via environment: `DWCTL_CONTINUATION__ORIGINS__REALTIME=true`
+    pub realtime: bool,
+    /// Set via environment: `DWCTL_CONTINUATION__ORIGINS__BATCH=true`
+    pub batch: bool,
+    /// Set via environment: `DWCTL_CONTINUATION__ORIGINS__PLAYGROUND=true`
+    pub playground: bool,
+}
+
+impl Default for ContinuationOriginsConfig {
+    fn default() -> Self {
+        Self {
+            realtime: true,
+            batch: false,
+            playground: false,
         }
     }
 }
@@ -1452,6 +2055,33 @@ pub enum DaemonMode {
     BatchOnly,
 }
 
+/// A database endpoint accepted from configuration but never exposed through
+/// debug output or serialized configuration snapshots.
+#[derive(Clone, Deserialize)]
+#[serde(transparent)]
+pub struct SensitiveDatabaseUrl(String);
+
+impl SensitiveDatabaseUrl {
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SensitiveDatabaseUrl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+impl Serialize for SensitiveDatabaseUrl {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str("<redacted>")
+    }
+}
+
 impl From<DaemonMode> for fusillade::DaemonMode {
     fn from(mode: DaemonMode) -> Self {
         match mode {
@@ -1460,6 +2090,18 @@ impl From<DaemonMode> for fusillade::DaemonMode {
             DaemonMode::BatchOnly => fusillade::DaemonMode::BatchOnly,
         }
     }
+}
+
+fn default_memory_gate_low_fraction() -> f64 {
+    0.65
+}
+
+fn default_adaptive_growth_factor() -> f64 {
+    1.5
+}
+
+fn default_adaptive_cut_factor() -> f64 {
+    0.8
 }
 
 /// The daemon processes batch requests asynchronously in the background.
@@ -1484,6 +2126,40 @@ pub struct DaemonConfig {
 
     /// Default concurrency limit per model (default: 10)
     pub default_model_concurrency: usize,
+
+    /// Discover each model's concurrency limit from downstream 529s instead of
+    /// using its configured value as a hard ceiling (default: false).
+    ///
+    /// When on, `default_model_concurrency` and per-model `batch_capacity`
+    /// become starting points rather than ceilings, and the memory gate becomes
+    /// the bound. The daemon refuses to enable this without
+    /// `memory_gate_high_fraction` set, since nothing else would bound growth.
+    #[serde(default)]
+    pub adaptive_concurrency: bool,
+
+    /// Multiplier applied to a model's limit each time it goes up
+    /// (default: 1.5).
+    #[serde(default = "default_adaptive_growth_factor")]
+    pub adaptive_growth_factor: f64,
+
+    /// Multiplier applied to a model's limit on downstream 529 (default: 0.8).
+    #[serde(default = "default_adaptive_cut_factor")]
+    pub adaptive_cut_factor: f64,
+
+    /// Fraction of the daemon's own memory limit at or above which it stops
+    /// claiming (default: 0, disabled).
+    ///
+    /// This is the process-wide bound. A count of in-flight requests cannot be
+    /// it, because per-request memory varies by more than an order of magnitude
+    /// between workloads; this measures the pod's actual usage instead. Required
+    /// when `adaptive_concurrency` is on.
+    #[serde(default)]
+    pub memory_gate_high_fraction: f64,
+
+    /// Fraction of the memory limit below which claiming resumes
+    /// (default: 0.65). Must be below `memory_gate_high_fraction`.
+    #[serde(default = "default_memory_gate_low_fraction")]
+    pub memory_gate_low_fraction: f64,
 
     /// How long to sleep between claim iterations in milliseconds (default: 1000)
     pub claim_interval_ms: u64,
@@ -1586,13 +2262,13 @@ pub struct DaemonConfig {
     pub batch_metadata_fields: Vec<String>,
 
     /// Interval for running the orphaned row purge task (milliseconds).
-    /// Deletes orphaned request_templates and requests whose parent file/batch
+    /// Deletes orphaned request templates and requests whose parent file/batch
     /// has been soft-deleted, for right-to-erasure compliance.
     /// Set to 0 to disable purging. Default: 600000 (10 minutes).
     pub purge_interval_ms: u64,
 
     /// Maximum number of orphaned rows to delete per purge iteration.
-    /// Each iteration deletes up to this many requests and this many request_templates.
+    /// Each iteration deletes up to this many requests and this many request templates.
     /// Default: 1000.
     pub purge_batch_size: i64,
 
@@ -1601,9 +2277,89 @@ pub struct DaemonConfig {
     /// exist. Default: 100.
     pub purge_throttle_ms: u64,
 
-    /// Request paths that should use SSE streaming for usage tracking.
-    /// When a request's path matches, an `X-Fusillade-Stream` header is sent
-    /// and the response is read as SSE, then reassembled into non-streaming JSON.
+    /// Optional automated content-expiration rules. The application ships
+    /// with no time-based content deletion until an operator configures it.
+    #[serde(default)]
+    pub retention: fusillade::RetentionPolicy,
+
+    /// Move newly terminal batchless response graphs with the steady archive
+    /// worker. Disabled by default.
+    #[serde(default)]
+    pub batchless_archive_sweep_enabled: bool,
+
+    /// Move historical nonexpired batchless response graphs with the backfill
+    /// worker. Disabled by default.
+    #[serde(default)]
+    pub batchless_archive_backfill_enabled: bool,
+
+    /// Maximum complete response graphs moved by either worker per tick.
+    #[serde(default = "default_batchless_archive_groups_per_tick")]
+    pub batchless_archive_groups_per_tick: i64,
+
+    /// Maximum retained payload bytes moved by either worker per tick.
+    #[serde(default = "default_batchless_archive_bytes_per_tick")]
+    pub batchless_archive_bytes_per_tick: i64,
+
+    /// Graphs the backfill worker moves concurrently within one tick. This
+    /// is the drain-throughput lever for the one-off historical drain: each
+    /// graph move is its own short transaction, so a tick's wall-clock time
+    /// is dominated by per-move round trips. The steady sweep is always
+    /// sequential. Must be at least 1 while the backfill is enabled; size the
+    /// fusillade write pool to hold this many extra connections.
+    #[serde(default = "default_batchless_archive_backfill_concurrency")]
+    pub batchless_archive_backfill_concurrency: usize,
+
+    /// Daily retained-response partition runway maintained by the archive owner.
+    #[serde(default = "default_retained_response_partitions_days_ahead")]
+    pub retained_response_partitions_days_ahead: i32,
+
+    /// Allow daily retained-response partition retirement. Disabled by default;
+    /// the retirement implementation is introduced separately.
+    #[serde(default)]
+    pub retained_response_retirement_enabled: bool,
+
+    /// Allow weekly batch-archive partition retirement. Disabled by default
+    /// and additionally requires an explicit retention period.
+    #[serde(default)]
+    pub batch_archive_retirement_enabled: bool,
+
+    /// Deprecated and ignored: the weekly generation-2 template store is the
+    /// only write path since the generation-1 heap was retired. The key is
+    /// still accepted so existing values files keep parsing; a warning is
+    /// logged at startup when it is set. Remove it from your configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_generation_writes_enabled: Option<bool>,
+
+    /// Allow file-content expiry and weekly template partition retirement.
+    /// Disabled by default and additionally requires an explicit retention
+    /// period.
+    #[serde(default)]
+    pub template_retirement_enabled: bool,
+
+    /// Creation-anchored input-content retention period in days. No default:
+    /// enabling template retirement without it fails startup.
+    #[serde(default)]
+    pub template_retention_days: Option<u32>,
+
+    /// Finalization-anchored batch content retention period in days. No
+    /// default: enabling batch-archive retirement without it fails startup.
+    #[serde(default)]
+    pub batch_archive_retention_days: Option<u32>,
+
+    /// Explicit direct/session-capable primary endpoint used only for
+    /// retained-response partition DDL. Dedicated databases and schema components
+    /// using a different query role require an explicit endpoint with that role.
+    /// Schema mode with the main query role reuses its direct pool. Startup attests
+    /// the database, role, schema, and ownership. Never serialized in config
+    /// snapshots and redacted from debug output.
+    #[serde(default, skip_serializing)]
+    pub retained_response_partition_maintenance_url: Option<SensitiveDatabaseUrl>,
+
+    /// Request paths whose batch traffic is dispatched as a stream so the provider
+    /// reports token usage, then reassembled back into a single JSON body before it
+    /// is stored or returned. Batch traffic is identified by the correlation header
+    /// the daemon stamps on everything it sends; a real client's request to the same
+    /// path is untouched.
     /// Example: `["/v1/chat/completions", "/v1/completions"]`
     #[serde(default)]
     pub streamable_endpoints: Vec<String>,
@@ -1663,6 +2419,10 @@ pub struct DaemonConfig {
     /// claimable immediately regardless of liveness). Default: 0.56.
     #[serde(default = "default_claim_ramp_exponent", deserialize_with = "deserialize_claim_ramp_exponent")]
     pub claim_ramp_exponent: f64,
+
+    /// Batch-only leaking controls. Async/flex retains its existing window-based rate.
+    #[serde(flatten)]
+    pub leak: fusillade::daemon::LeakConfig,
 
     /// Consecutive claim-cycle failures a claim loop tolerates (retrying with
     /// exponential backoff, capped at 30s) before it gives up and takes the
@@ -1734,6 +2494,22 @@ pub struct DaemonConfig {
 
 fn default_batch_archive_sweep_interval_ms() -> u64 {
     5_000
+}
+
+fn default_batchless_archive_groups_per_tick() -> i64 {
+    fusillade::RetentionMaintenanceConfig::default().batchless_archive_groups_per_tick()
+}
+
+fn default_batchless_archive_bytes_per_tick() -> i64 {
+    fusillade::RetentionMaintenanceConfig::default().batchless_archive_bytes_per_tick()
+}
+
+fn default_batchless_archive_backfill_concurrency() -> usize {
+    fusillade::RetentionMaintenanceConfig::default().batchless_archive_backfill_concurrency()
+}
+
+fn default_retained_response_partitions_days_ahead() -> i32 {
+    fusillade::RetentionMaintenanceConfig::default().retained_response_partitions_days_ahead()
 }
 
 fn default_batch_archive_moves_per_tick() -> i64 {
@@ -1890,6 +2666,11 @@ impl Default for DaemonConfig {
             mode: DaemonMode::Both,
             claim_batch_size: 100,
             default_model_concurrency: 10,
+            adaptive_concurrency: false,
+            adaptive_growth_factor: default_adaptive_growth_factor(),
+            adaptive_cut_factor: default_adaptive_cut_factor(),
+            memory_gate_high_fraction: 0.0,
+            memory_gate_low_fraction: default_memory_gate_low_fraction(),
             claim_interval_ms: 1000,
             max_retries: Some(1000),
             stop_before_deadline_ms: Some(900_000),
@@ -1913,6 +2694,20 @@ impl Default for DaemonConfig {
             purge_interval_ms: 600_000,
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
+            retention: fusillade::RetentionPolicy::default(),
+            batchless_archive_sweep_enabled: false,
+            batchless_archive_backfill_enabled: false,
+            batchless_archive_groups_per_tick: default_batchless_archive_groups_per_tick(),
+            batchless_archive_bytes_per_tick: default_batchless_archive_bytes_per_tick(),
+            batchless_archive_backfill_concurrency: default_batchless_archive_backfill_concurrency(),
+            retained_response_partitions_days_ahead: default_retained_response_partitions_days_ahead(),
+            retained_response_retirement_enabled: false,
+            batch_archive_retirement_enabled: false,
+            batch_archive_retention_days: None,
+            template_generation_writes_enabled: None,
+            template_retirement_enabled: false,
+            template_retention_days: None,
+            retained_response_partition_maintenance_url: None,
             streamable_endpoints: Vec::new(),
             urgency_weight: default_urgency_weight(),
             inject_deadline_priority: false,
@@ -1922,6 +2717,7 @@ impl Default for DaemonConfig {
             batch_claim_interval_ms: 0,
             batch_claim_require_live: false,
             claim_ramp_exponent: default_claim_ramp_exponent(),
+            leak: fusillade::daemon::LeakConfig::default(),
             claim_loop_max_consecutive_failures: default_claim_loop_max_consecutive_failures(),
             claim_query_timeout_ms: default_claim_query_timeout_ms(),
             batch_archive_sweep_enabled: false,
@@ -1939,6 +2735,20 @@ impl Default for DaemonConfig {
 }
 
 impl DaemonConfig {
+    pub fn to_fusillade_retention_maintenance_config(&self) -> fusillade::RetentionMaintenanceConfig {
+        fusillade::RetentionMaintenanceConfig::new(self.retention.clone())
+            .with_batchless_archive_sweep_enabled(self.batchless_archive_sweep_enabled)
+            .with_batchless_archive_backfill_enabled(self.batchless_archive_backfill_enabled)
+            .with_batchless_archive_limits(self.batchless_archive_groups_per_tick, self.batchless_archive_bytes_per_tick)
+            .with_batchless_archive_backfill_concurrency(self.batchless_archive_backfill_concurrency)
+            .with_retained_response_partitions_days_ahead(self.retained_response_partitions_days_ahead)
+            .with_retained_response_retirement_enabled(self.retained_response_retirement_enabled)
+            .with_batch_archive_retirement_enabled(self.batch_archive_retirement_enabled)
+            .with_batch_archive_retention_days(self.batch_archive_retention_days)
+            .with_template_retirement_enabled(self.template_retirement_enabled)
+            .with_template_retention_days(self.template_retention_days)
+    }
+
     /// Convert to fusillade daemon config
     pub fn to_fusillade_config(&self) -> fusillade::daemon::DaemonConfig {
         self.to_fusillade_config_with_limits(None)
@@ -1970,6 +2780,11 @@ impl DaemonConfig {
             mode: self.mode.into(),
             claim_batch_size: self.claim_batch_size,
             model_concurrency_limits: model_capacity_limits.unwrap_or_else(|| std::sync::Arc::new(dashmap::DashMap::new())),
+            adaptive_concurrency: self.adaptive_concurrency,
+            adaptive_growth_factor: self.adaptive_growth_factor,
+            adaptive_cut_factor: self.adaptive_cut_factor,
+            memory_gate_high_fraction: self.memory_gate_high_fraction,
+            memory_gate_low_fraction: self.memory_gate_low_fraction,
             model_escalations: Arc::new(DashMap::from_iter(self.model_escalations.clone())),
             claim_interval_ms: self.claim_interval_ms,
             max_retries: self.max_retries,
@@ -1992,7 +2807,6 @@ impl DaemonConfig {
             purge_interval_ms: self.purge_interval_ms,
             purge_batch_size: self.purge_batch_size,
             purge_throttle_ms: self.purge_throttle_ms,
-            streamable_endpoints: self.streamable_endpoints.clone(),
             urgency_weight: self.urgency_weight,
             inject_deadline_priority: self.inject_deadline_priority,
             background_concurrency_limit: self.background_concurrency_limit,
@@ -2084,6 +2898,11 @@ impl Default for NotificationsConfig {
 pub struct BackgroundServicesConfig {
     /// Configuration for onwards config sync service
     pub onwards_sync: OnwardsSyncConfig,
+    /// Configuration for the per-key account policy sync (ZDR flag and
+    /// disabled modalities). Independent of `onwards_sync`: the realtime
+    /// modality gate and ZDR handling both read this map, so it must keep
+    /// refreshing even where routing sync is turned off.
+    pub key_policy_sync: KeyPolicySyncConfig,
     /// Configuration for the usage-aggregate refresh daemon
     pub usage_refresh: UsageRefreshConfig,
     /// Configuration for probe scheduler service
@@ -2094,12 +2913,140 @@ pub struct BackgroundServicesConfig {
     pub leader_election: LeaderElectionConfig,
     /// Configuration for database pool metrics sampling
     pub pool_metrics: PoolMetricsSamplerConfig,
+    /// jemalloc statistics sampling for the allocator Prometheus gauges.
+    /// See [`crate::metrics::allocator::AllocatorMetricsConfig`].
+    pub allocator_metrics: crate::metrics::allocator::AllocatorMetricsConfig,
     /// Configuration for batch completion notifications (email + webhooks)
     pub notifications: NotificationsConfig,
     /// Configuration for connection sync workers (file ingestion, batch activation)
     pub sync_workers: SyncWorkersConfig,
     /// Worker counts for core batch task processing (always run, not gated by sync)
     pub task_workers: TaskWorkersConfig,
+    /// Bounded deletion of expired Underway tasks
+    pub task_retention: TaskRetentionConfig,
+    /// Bounded deletion of long-expired prompt-cache entries
+    pub prompt_cache_retention: PromptCacheRetentionConfig,
+}
+
+/// Underway task retention daemon configuration.
+///
+/// Underway tasks carry a `ttl` (14 days by default) but nothing deletes them unless a
+/// deletion routine runs. This daemon deletes expired tasks oldest-first in bounded
+/// batches so the task table stops growing without long transactions or large locks.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TaskRetentionConfig {
+    /// Enable the retention daemon (default: true).
+    pub enabled: bool,
+    /// Seconds between sweeps (default: 300).
+    pub interval_seconds: u64,
+    /// Rows deleted per statement (default: 1000). Each batch is its own transaction.
+    pub batch_size: u32,
+    /// Pause between consecutive batches of one sweep in milliseconds (default: 2000).
+    /// Throttles the sweep while a large backlog drains.
+    pub batch_pause_milliseconds: u64,
+    /// Minimum task age in days before a task is considered for deletion (default: 14,
+    /// the crate's default `ttl`). Bounds the sweep's index range; a task's own `ttl` is
+    /// still honoured when it is longer.
+    pub min_age_days: u64,
+}
+
+impl Default for TaskRetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_seconds: 300,
+            batch_size: 1000,
+            batch_pause_milliseconds: 2000,
+            min_age_days: 14,
+        }
+    }
+}
+
+impl TaskRetentionConfig {
+    /// Upper bound on `min_age_days` (a century): keeps the floor representable as a
+    /// `Duration`/`interval` and catches a unit mistake in configuration.
+    pub const MAX_MIN_AGE_DAYS: u64 = 36_500;
+
+    /// The age floor as a duration. `min_age_days` is bounded by [`Self::validate`], so
+    /// this cannot overflow.
+    pub fn min_age(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.min_age_days.min(Self::MAX_MIN_AGE_DAYS) * 86_400)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.batch_size == 0 {
+            return Err("batch_size must be at least 1".to_string());
+        }
+        if self.min_age_days > Self::MAX_MIN_AGE_DAYS {
+            return Err(format!("min_age_days must be at most {}", Self::MAX_MIN_AGE_DAYS));
+        }
+        Ok(())
+    }
+}
+
+/// Prompt-cache entry retention daemon configuration.
+///
+/// Expired prompt-cache entries serve no request, but nothing else deletes them. This
+/// daemon deletes entries that expired more than `grace_days` ago, oldest first, in bounded
+/// batches, so the table tracks the live cache plus the recompute grace instead of every
+/// prefix ever written.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PromptCacheRetentionConfig {
+    /// Enable the retention daemon (default: false).
+    pub enabled: bool,
+    /// Seconds between sweeps (default: 300).
+    pub interval_seconds: u64,
+    /// Rows deleted per statement (default: 1000). Each batch is its own transaction.
+    pub batch_size: u32,
+    /// Pause between consecutive batches of one sweep in milliseconds (default: 2000).
+    /// Throttles the sweep while a large backlog drains.
+    pub batch_pause_milliseconds: u64,
+    /// Days an entry is kept after it expires (default and minimum:
+    /// [`crate::recompute::report::CACHE_GRACE_DAYS`]). Usage recompute re-derives a past
+    /// request's cache split from the entries live at that time, so it needs this history.
+    pub grace_days: u64,
+}
+
+impl Default for PromptCacheRetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_seconds: 300,
+            batch_size: 1000,
+            batch_pause_milliseconds: 2000,
+            grace_days: crate::recompute::report::CACHE_GRACE_DAYS as u64,
+        }
+    }
+}
+
+impl PromptCacheRetentionConfig {
+    /// Upper bound on `grace_days` (a century): keeps the grace representable as a
+    /// `Duration`/`interval` and catches a unit mistake in configuration.
+    pub const MAX_GRACE_DAYS: u64 = 36_500;
+
+    /// The grace as a duration. `grace_days` is bounded by [`Self::validate`], so this
+    /// cannot overflow.
+    pub fn grace(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.grace_days.min(Self::MAX_GRACE_DAYS) * 86_400)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.batch_size == 0 {
+            return Err("batch_size must be at least 1".to_string());
+        }
+        let minimum = crate::recompute::report::CACHE_GRACE_DAYS as u64;
+        if self.grace_days < minimum {
+            return Err(format!(
+                "grace_days must be at least {minimum}: usage recompute re-derives cache splits from that much history"
+            ));
+        }
+        if self.grace_days > Self::MAX_GRACE_DAYS {
+            return Err(format!("grace_days must be at most {}", Self::MAX_GRACE_DAYS));
+        }
+        Ok(())
+    }
 }
 
 /// Database pool metrics sampling configuration.
@@ -2145,6 +3092,33 @@ pub struct OnwardsSyncConfig {
     /// removes protection against missed notifications and is generally not recommended
     /// in production environments.
     pub fallback_interval_milliseconds: u64,
+}
+
+/// Per-key account policy sync configuration ([`crate::sync::key_policy`]).
+///
+/// The map is always loaded once at startup; this controls the background
+/// task that keeps it fresh afterwards (LISTEN on `auth_config_changed` plus
+/// a periodic fallback reload).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KeyPolicySyncConfig {
+    /// Keep the map fresh after startup (default: true). With this off, a
+    /// change to an account's ZDR flag or disabled modalities only reaches
+    /// this instance on restart.
+    pub enabled: bool,
+    /// Fallback full-reload interval in milliseconds (default: 300000). The
+    /// reload is one small two-table join, and NOTIFY carries real changes,
+    /// so this only guards against a missed notification. `0` disables it.
+    pub fallback_interval_milliseconds: u64,
+}
+
+impl Default for KeyPolicySyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            fallback_interval_milliseconds: 300_000,
+        }
+    }
 }
 
 impl Default for OnwardsSyncConfig {
@@ -2310,6 +3284,11 @@ pub struct CreditsConfig {
     /// billing target (see `Credits::grant_verification_credits`).
     #[serde(default)]
     pub verification_credits: rust_decimal::Decimal,
+    /// Pause after a transient provider failure or the first soft card decline
+    /// before auto top-up is eligible again. Production defaults to 24 hours;
+    /// staging may shorten it to exercise the complete decline lifecycle.
+    #[serde(with = "humantime_serde")]
+    pub auto_topup_retry_delay: Duration,
 }
 
 impl Default for CreditsConfig {
@@ -2321,32 +3300,23 @@ impl Default for CreditsConfig {
             first_payment_match_up_to: rust_decimal::Decimal::ZERO,
             // Default to 0 (no signup credits on card verification)
             verification_credits: rust_decimal::Decimal::ZERO,
+            auto_topup_retry_delay: Duration::from_secs(24 * 60 * 60),
         }
     }
 }
 
-/// Analytics batching configuration.
-///
-/// The batcher uses a write-through strategy:
-/// 1. Block until at least one record arrives
-/// 2. Drain all available records (up to batch_size)
-/// 3. Write immediately (with retry on failure)
-///
-/// This minimizes latency at low load while getting batching efficiency at high load.
+/// Analytics outbox projection configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AnalyticsConfig {
     /// Maximum number of records to write in a single batch.
-    /// At high load, records queue while writing, naturally forming larger batches.
+    /// Raw records are already durable before this batch is formed.
     /// Default: 100
     pub batch_size: usize,
-    /// Maximum number of retry attempts for failed batch writes.
-    /// After all retries are exhausted, the batch is dropped and an error is logged.
-    /// Default: 3
+    /// Deprecated and unused. Direct outbox inserts report failures immediately;
+    /// durable rows remain available for projector retries.
     pub max_retries: u32,
-    /// Base delay in milliseconds for exponential backoff between retries.
-    /// Actual delay is: base_delay * 2^attempt (e.g., 100ms, 200ms, 400ms for base=100).
-    /// Default: 100
+    /// Deprecated and unused. Kept so existing configuration still parses.
     pub retry_base_delay_ms: u64,
     /// Deprecated and unused: balance depletion notifications are now
     /// edge-triggered (one per zero crossing, sent by the charging writers),
@@ -2474,12 +3444,15 @@ impl Default for Config {
             dashboard_url: "http://localhost:5173".to_string(),
             database_url: None, // Deprecated field
             database_replica_url: None,
+            database_pooled_url: None,
             database: DatabaseConfig::default(),
             slow_statement_threshold_ms: 1000,
             admin_email: "test@doubleword.ai".to_string(),
             admin_password: Some("hunter2".to_string()),
             secret_key: None,
             model_sources: vec![],
+            model_provisioning: ModelProvisioningConfig::default(),
+            migrations: MigrationsConfig::default(),
             metadata: Metadata::default(),
             payment: None,
             auth: AuthConfig::default(),
@@ -2498,11 +3471,15 @@ impl Default for Config {
             onboarding_url: None,
             support_email: "support@doubleword.ai".to_string(),
             connections: ConnectionsConfig::default(),
-            responses: ResponsesConfig::default(),
             image_normalizer: crate::image_normalizer::ImageNormalizerConfig::default(),
             keystore: None,
             openapi: OpenApiConfig::default(),
             cache: CacheConfig::default(),
+            clickhouse: None,
+            prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),
+            continuation: ContinuationConfig::default(),
+            heap_profiling: crate::profiling::HeapProfilingConfig::default(),
+            scheduling: SchedulingConfig::default(),
         }
     }
 }
@@ -2515,6 +3492,59 @@ impl Default for ModelSource {
             api_key: None,
             sync_interval: Duration::from_secs(10),
             default_models: None,
+        }
+    }
+}
+
+/// What a process does about schema migrations when it starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationsMode {
+    /// Apply pending migrations before serving (local development, single
+    /// instance installs, tests). This is what every version before the
+    /// migration Job did.
+    #[default]
+    Run,
+    /// Never execute DDL. Verify that every migration this binary ships is
+    /// recorded in the database with a matching checksum, and refuse to start
+    /// otherwise. Migrations the database has *beyond* this binary are
+    /// accepted: that is what lets an older replica keep serving while a
+    /// newer release's additive migration is applied ahead of its rollout.
+    Check,
+}
+
+/// Schema migration policy for the serving process.
+///
+/// Deployments that run `dwctl migrate` as a pre-rollout Job set `mode:
+/// check` on the application pods so that a pod never runs DDL and a pod of
+/// the new release cannot become Ready before the migration Job succeeded.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct MigrationsConfig {
+    pub mode: MigrationsMode,
+}
+
+/// Startup model provisioning configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModelProvisioningConfig {
+    /// When false, startup does not read the directory or alter provisioning markers.
+    pub enabled: bool,
+    /// Directory containing rendered model catalog YAML documents.
+    pub directory: PathBuf,
+    /// Directory containing per-organisation overlay YAML documents (see
+    /// `org_overlays`). A missing directory is an empty catalog.
+    pub org_overlays_directory: PathBuf,
+    pub account_limits_directory: PathBuf,
+}
+
+impl Default for ModelProvisioningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            directory: PathBuf::from("/app/model-provisioning.d"),
+            org_overlays_directory: PathBuf::from("/app/org-overlays.d"),
+            account_limits_directory: PathBuf::from("/app/account-limits.d"),
         }
     }
 }
@@ -2656,6 +3686,8 @@ impl Config {
             let fusillade = config.database.fusillade().clone();
             let outlet = config.database.outlet().clone();
             let underway_pool = config.database.underway_pool_settings().clone();
+            let direct_pool = config.database.direct_pool_settings().clone();
+            let pooled_url = config.database.external_pooled_url().map(str::to_string);
 
             // Preserve original replica_pool if it was explicitly configured (not using fallback)
             let original_replica_pool = match &config.database {
@@ -2669,11 +3701,13 @@ impl Config {
             config.database = DatabaseConfig::External {
                 url,
                 replica_url,
+                pooled_url,
                 pool,
                 replica_pool: original_replica_pool, // Always preserve original replica_pool if it existed
                 fusillade,
                 outlet,
                 underway_pool,
+                direct_pool,
             };
         } else if let Some(replica_url) = config.database_replica_url.take() {
             // Only replica_url is set via environment variable, apply it to existing config
@@ -2686,6 +3720,17 @@ impl Config {
                 }
                 DatabaseConfig::Embedded { .. } => {
                     // Can't set replica for embedded database
+                }
+            }
+        }
+
+        // The pooled endpoint override is independent of how the direct URL
+        // was supplied (YAML, nested environment variable, or DATABASE_URL).
+        if let Some(url) = config.database_pooled_url.take() {
+            match &mut config.database {
+                DatabaseConfig::External { pooled_url, .. } => *pooled_url = Some(url),
+                DatabaseConfig::Embedded { .. } => {
+                    return Err(figment::Error::from("a pooled endpoint requires an external database"));
                 }
             }
         }
@@ -2707,6 +3752,183 @@ impl Config {
 
     /// Validate the configuration for consistency and required fields
     pub fn validate(&self) -> Result<(), Error> {
+        for (name, component) in [("fusillade", self.database.fusillade()), ("outlet", self.database.outlet())] {
+            component
+                .validate_schema_pooling(name, self.database.external_pooled_url().is_some())
+                .map_err(|operation| Error::Internal {
+                    operation: format!("Config validation: {operation}"),
+                })?;
+        }
+        if let Err(error) = self.background_services.batch_daemon.retention.validate() {
+            return Err(Error::Internal {
+                operation: format!("Config validation: batch retention is invalid: {error}"),
+            });
+        }
+        if let Err(error) = self.background_services.task_retention.validate() {
+            return Err(Error::Internal {
+                operation: format!("Config validation: task retention is invalid: {error}"),
+            });
+        }
+        if let Err(error) = self.background_services.prompt_cache_retention.validate() {
+            return Err(Error::Internal {
+                operation: format!("Config validation: prompt-cache retention is invalid: {error}"),
+            });
+        }
+        if let Some(name) = self
+            .onwards
+            .rejected_params
+            .iter()
+            .find(|name| onwards::unsupported_params::known_param(name).is_none())
+        {
+            return Err(Error::Internal {
+                operation: format!("Config validation: onwards.rejected_params names an unknown parameter: {name}"),
+            });
+        }
+        // The payment provider is rebuilt from config on every request, so a
+        // bad base URL must fail here rather than panic in each handler.
+        if let Some(PaymentConfig::Stripe(stripe)) = &self.payment
+            && let Err(error) = stripe.api_base()
+        {
+            return Err(Error::Internal {
+                operation: format!("Config validation: {error}"),
+            });
+        }
+        if let Err(error) = self.scheduling.validate() {
+            return Err(Error::Internal {
+                operation: format!("Config validation: {error}"),
+            });
+        }
+        if self.background_services.batch_daemon.retention.expire_files
+            || self.background_services.batch_daemon.retention.terminal_batch_seconds.is_some()
+        {
+            return Err(Error::Internal {
+                operation: "Config validation: scheduled file and batch retention is not supported by retained-response maintenance"
+                    .to_string(),
+            });
+        }
+        let retention_enabled = self.background_services.batch_daemon.retention.is_enabled();
+        let daemon = &self.background_services.batch_daemon;
+        // A process that never runs the batch daemon owns no archive
+        // maintenance, whatever retention configuration it carries: in a
+        // split topology the API pods share the daemon pods' environment and
+        // must not reject it (the daemon pods validate what they run).
+        let owns_archive_maintenance = !matches!(daemon.mode, DaemonMode::RequestOnly) && daemon.enabled != DaemonEnabled::Never;
+        let batchless_policy_configured = !daemon.retention.batchless_seconds_by_service_tier.is_empty();
+        let batchless_movement_enabled = daemon.batchless_archive_sweep_enabled || daemon.batchless_archive_backfill_enabled;
+        if owns_archive_maintenance
+            && (batchless_movement_enabled || daemon.retained_response_retirement_enabled)
+            && !batchless_policy_configured
+        {
+            return Err(Error::Internal {
+                operation: "Config validation: batchless retention policy is required for retained-response maintenance".to_string(),
+            });
+        }
+        if owns_archive_maintenance
+            && (daemon.retained_response_retirement_enabled
+                || daemon.batch_archive_retirement_enabled
+                || daemon.template_retirement_enabled)
+            && matches!(self.database.fusillade(), ComponentDb::Dedicated { .. })
+            && daemon.retained_response_partition_maintenance_url.is_none()
+        {
+            return Err(Error::Internal {
+                operation: "Config validation: partition retirement on a dedicated database requires an explicit direct session endpoint using the same role as fusillade query traffic".to_string(),
+            });
+        }
+        if owns_archive_maintenance
+            && daemon.batch_archive_retirement_enabled
+            && daemon.batch_archive_retention_days.is_none_or(|days| days < 1)
+        {
+            return Err(Error::Internal {
+                operation:
+                    "Config validation: batch-archive partition retirement requires an explicit positive batch_archive_retention_days"
+                        .to_string(),
+            });
+        }
+        if owns_archive_maintenance && daemon.template_retirement_enabled && daemon.template_retention_days.is_none_or(|days| days < 1) {
+            return Err(Error::Internal {
+                operation: "Config validation: template partition retirement requires an explicit positive template_retention_days"
+                    .to_string(),
+            });
+        }
+        if owns_archive_maintenance
+            && batchless_movement_enabled
+            && (daemon.batchless_archive_groups_per_tick <= 0 || daemon.batchless_archive_bytes_per_tick <= 0)
+        {
+            return Err(Error::Internal {
+                operation: "Config validation: batchless archive group and byte budgets must be positive".to_string(),
+            });
+        }
+        if owns_archive_maintenance && daemon.batchless_archive_backfill_enabled {
+            let fusillade_pool_max = match self.database.fusillade() {
+                ComponentDb::Schema { pool, .. } | ComponentDb::Dedicated { pool, .. } => pool.max_connections,
+            };
+            // Every concurrent mover holds a write connection for its whole
+            // move; a fan-out at or above the pool ceiling starves the claim
+            // loops and turns into pool timeouts rather than throughput.
+            if daemon.batchless_archive_backfill_concurrency as u64 >= u64::from(fusillade_pool_max) {
+                return Err(Error::Internal {
+                    operation: format!(
+                        "Config validation: batchless archive backfill concurrency ({}) must be below the fusillade pool max_connections ({})",
+                        daemon.batchless_archive_backfill_concurrency, fusillade_pool_max
+                    ),
+                });
+            }
+        }
+        if owns_archive_maintenance && daemon.batchless_archive_backfill_enabled && daemon.batchless_archive_backfill_concurrency == 0 {
+            return Err(Error::Internal {
+                operation: "Config validation: batchless archive backfill concurrency must be at least 1 when the backfill is enabled"
+                    .to_string(),
+            });
+        }
+        if owns_archive_maintenance && batchless_policy_configured && daemon.retained_response_partitions_days_ahead <= 0 {
+            return Err(Error::Internal {
+                operation: "Config validation: retained-response partition runway must be positive".to_string(),
+            });
+        }
+        if owns_archive_maintenance
+            && batchless_movement_enabled
+            && daemon
+                .retention
+                .batchless_seconds_by_service_tier
+                .values()
+                .any(|seconds| daemon.batch_archive_sweep_dwell_secs >= *seconds as f64)
+        {
+            return Err(Error::Internal {
+                operation: "Config validation: batchless archive sweep dwell must be shorter than every configured retention period"
+                    .to_string(),
+            });
+        }
+        if owns_archive_maintenance
+            && batchless_movement_enabled
+            && daemon
+                .retention
+                .batchless_seconds_by_service_tier
+                .values()
+                .any(|seconds| daemon.batch_archive_cancel_grace_secs >= *seconds as f64)
+        {
+            return Err(Error::Internal {
+                operation: "Config validation: batchless archive cancellation grace must be shorter than every configured retention period"
+                    .to_string(),
+            });
+        }
+        if retention_enabled && daemon.enabled == DaemonEnabled::Never && !matches!(daemon.mode, DaemonMode::RequestOnly) {
+            // Not an error: another instance is expected to run the daemon.
+            // Surface it so a single-instance deployment cannot silently
+            // configure retention that nothing enforces.
+            tracing::warn!(
+                "automated retention is configured but the batch daemon never runs on this instance; \
+                 another instance must run it for retention to be enforced"
+            );
+        }
+        if owns_archive_maintenance
+            && retention_enabled
+            && (self.background_services.batch_daemon.purge_interval_ms == 0 || self.background_services.batch_daemon.purge_batch_size < 1)
+        {
+            return Err(Error::Internal {
+                operation: "Config validation: automated retention requires an enabled orphan purge and a positive purge batch size"
+                    .to_string(),
+            });
+        }
         // Validate native authentication requirements
         if self.auth.native.enabled {
             if self.secret_key.is_none() {
@@ -2734,6 +3956,22 @@ impl Config {
             }
         }
 
+        // Prefix-chain capture, when on, needs the warehouse connection, tokenizer-svc and a
+        // usable key — every missing piece is a startup error, never a sink that records nothing.
+        if let Err(e) = self.prefix_chain.validate(self.clickhouse.as_ref(), &self.cache.tokenizer_url) {
+            return Err(Error::Internal {
+                operation: format!("Config validation: {e}"),
+            });
+        }
+        // A present `clickhouse` section must be usable: a bad endpoint or a missing
+        // password is a startup error, not a sink that fails every insert forever.
+        if let Some(ch) = &self.clickhouse
+            && let Err(e) = ch.validate()
+        {
+            return Err(Error::Internal {
+                operation: format!("Config validation: {e}"),
+            });
+        }
         // Cached-input pricing needs a tokenizer-svc URL to count cache-prefix tokens.
         // Without it, every cacheable request silently degrades to no caching — fail fast
         // at startup instead, so an operator who flips the flag gets a clear error.
@@ -2748,7 +3986,9 @@ impl Config {
         // Cache TTL tiers: every enabled tier must be a known tier (5m/1h/24h), the set must be
         // non-empty, and the default tier must be one of them — otherwise a no-ttl marker would
         // default straight into a rejected tier. Fail fast at startup with a clear message.
-        if self.cache.enabled {
+        // The cache TTL policy is also consumed by prefix-chain capture, which parses with
+        // the same policies whether or not the cache layer is on.
+        if self.cache.enabled || self.prefix_chain.enabled {
             for ttl in &self.cache.enabled_ttls {
                 if crate::prompt_cache::TtlTier::parse(ttl).is_none() {
                     return Err(Error::Internal {
@@ -2987,11 +4227,16 @@ impl Config {
             .merge(Env::prefixed("DWCTL_").split("__"))
             // Common DATABASE_URL and DATABASE_REPLICA_URL patterns
             // Accept both DATABASE_REPLICA_URL and DWCTL_DATABASE_REPLICA_URL
-            .merge(Env::raw().only(&["DATABASE_URL", "DATABASE_REPLICA_URL"]))
+            .merge(Env::raw().only(&["DATABASE_URL", "DATABASE_REPLICA_URL", "DATABASE_POOLED_URL"]))
             .merge(
                 Env::raw()
                     .only(&["DWCTL_DATABASE_REPLICA_URL"])
                     .map(|_| "database_replica_url".into()),
+            )
+            .merge(
+                Env::raw()
+                    .only(&["DWCTL_DATABASE_POOLED_URL"])
+                    .map(|_| "database_pooled_url".into()),
             )
     }
 
@@ -3002,14 +4247,384 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    /// The built-in list is a snapshot and will always lag some provider.
+    /// `auth.personal_email_domains` is how an operator closes that gap without
+    /// waiting for a release, so it has to actually be consulted.
+    #[test]
+    fn configured_personal_domains_extend_the_builtin_list() {
+        let mut auth = super::AuthConfig::default();
+        assert!(auth.is_personal_email_domain("gmail.com"), "built-in list still applies");
+        assert!(!auth.is_personal_email_domain("example-isp.net"));
+
+        auth.personal_email_domains = vec!["example-isp.net".to_string()];
+        assert!(auth.is_personal_email_domain("example-isp.net"), "configured domain is personal");
+        assert!(
+            auth.is_personal_email_domain("EXAMPLE-ISP.NET"),
+            "and matches case-insensitively, like the built-in check"
+        );
+        assert!(auth.is_personal_email_domain("gmail.com"), "without displacing the built-in list");
+        assert!(!auth.is_personal_email_domain("acme.com"), "and without catching company domains");
+    }
+
     use super::*;
     use figment::Jail;
+
+    #[test]
+    fn auto_topup_retry_delay_defaults_to_24_hours() {
+        assert_eq!(CreditsConfig::default().auto_topup_retry_delay, Duration::from_secs(24 * 60 * 60));
+    }
 
     #[test]
     fn default_auth_roles_include_background_inference() {
         assert!(AuthConfig::default().default_user_roles.contains(&Role::BackgroundInferenceUser));
     }
 
+    #[test]
+    fn batch_inflight_enforcement_defaults_off_and_parses_on() {
+        assert!(!LimitsConfig::default().batch_inflight.enforce);
+
+        let parsed: LimitsConfig = serde_json::from_value(serde_json::json!({
+            "batch_inflight": { "enforce": true }
+        }))
+        .unwrap();
+        assert!(parsed.batch_inflight.enforce);
+    }
+
+    #[test]
+    fn batch_inflight_default_capacity_defaults_to_200() {
+        assert_eq!(LimitsConfig::default().batch_inflight.default_capacity, Some(200));
+    }
+
+    #[test]
+    fn batch_inflight_default_capacity_parses_an_explicit_positive_value() {
+        let parsed: LimitsConfig = serde_json::from_value(serde_json::json!({
+            "batch_inflight": { "default_capacity": 500 }
+        }))
+        .unwrap();
+        assert_eq!(parsed.batch_inflight.default_capacity, Some(500));
+    }
+
+    #[test]
+    fn batch_inflight_default_capacity_accepts_the_off_forms() {
+        for off in [serde_json::json!(null), serde_json::json!(0)] {
+            let parsed: LimitsConfig = serde_json::from_value(serde_json::json!({
+                "batch_inflight": { "default_capacity": off }
+            }))
+            .unwrap();
+            assert_eq!(parsed.batch_inflight.default_capacity, None, "{off} should mean no default");
+        }
+    }
+
+    #[test]
+    fn batch_inflight_default_capacity_rejects_negative_values() {
+        let error = serde_json::from_value::<LimitsConfig>(serde_json::json!({
+            "batch_inflight": { "default_capacity": -1 }
+        }))
+        .expect_err("a negative default capacity must be rejected");
+        assert!(error.to_string().contains("must not be negative"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn batch_inflight_default_capacity_rejects_out_of_range_values() {
+        let error = serde_json::from_value::<LimitsConfig>(serde_json::json!({
+            "batch_inflight": { "default_capacity": 5_000_000_000i64 }
+        }))
+        .expect_err("a default capacity beyond u32 must be rejected");
+        assert!(error.to_string().contains("too large"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn obsolete_retention_sweep_interval_is_rejected_on_a_complete_config() {
+        let mut serialized = serde_json::to_value(DaemonConfig::default()).unwrap();
+        serialized["retention_sweep_interval_ms"] = serde_json::json!(1_000);
+
+        let error = serde_json::from_value::<DaemonConfig>(serialized).expect_err("the removed standalone scheduler key must be rejected");
+
+        assert!(error.to_string().contains("retention_sweep_interval_ms"));
+    }
+
+    #[test]
+    fn retention_maintenance_controls_default_off_and_map_explicitly() {
+        let mut serialized = serde_json::to_value(DaemonConfig::default()).unwrap();
+        for key in [
+            "batchless_archive_sweep_enabled",
+            "batchless_archive_backfill_enabled",
+            "batchless_archive_groups_per_tick",
+            "batchless_archive_bytes_per_tick",
+            "batchless_archive_backfill_concurrency",
+            "retained_response_partitions_days_ahead",
+            "retained_response_retirement_enabled",
+            "batch_archive_retirement_enabled",
+            "batch_archive_retention_days",
+            "template_retirement_enabled",
+            "template_retention_days",
+        ] {
+            serialized.as_object_mut().unwrap().remove(key);
+        }
+
+        let daemon: DaemonConfig = serde_json::from_value(serialized).unwrap();
+        assert!(!daemon.batchless_archive_sweep_enabled);
+        assert!(!daemon.batchless_archive_backfill_enabled);
+        assert!(!daemon.retained_response_retirement_enabled);
+        assert!(daemon.retained_response_partition_maintenance_url.is_none());
+        assert!(daemon.batchless_archive_groups_per_tick > 0);
+        assert!(daemon.batchless_archive_bytes_per_tick > 0);
+        assert_eq!(daemon.batchless_archive_backfill_concurrency, 1);
+        assert!(daemon.retained_response_partitions_days_ahead > 0);
+
+        let mapped = daemon.to_fusillade_retention_maintenance_config();
+        assert_eq!(mapped.policy(), &daemon.retention);
+        assert_eq!(mapped.batchless_archive_sweep_enabled(), daemon.batchless_archive_sweep_enabled);
+        assert_eq!(
+            mapped.batchless_archive_backfill_enabled(),
+            daemon.batchless_archive_backfill_enabled
+        );
+        assert_eq!(mapped.batchless_archive_groups_per_tick(), daemon.batchless_archive_groups_per_tick);
+        assert_eq!(mapped.batchless_archive_bytes_per_tick(), daemon.batchless_archive_bytes_per_tick);
+        assert_eq!(
+            mapped.batchless_archive_backfill_concurrency(),
+            daemon.batchless_archive_backfill_concurrency
+        );
+        assert_eq!(
+            mapped.retained_response_partitions_days_ahead(),
+            daemon.retained_response_partitions_days_ahead
+        );
+        assert_eq!(
+            mapped.retained_response_retirement_enabled(),
+            daemon.retained_response_retirement_enabled
+        );
+        assert_eq!(mapped.batch_archive_retirement_enabled(), daemon.batch_archive_retirement_enabled);
+        assert_eq!(mapped.batch_archive_retention_days(), daemon.batch_archive_retention_days);
+    }
+
+    #[test]
+    fn retention_rejects_unknown_batchless_tiers() {
+        let mut config = Config::default();
+        config
+            .background_services
+            .batch_daemon
+            .retention
+            .batchless_seconds_by_service_tier
+            .insert("unknown".to_string(), 60);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("unsupported service tier"));
+    }
+
+    fn stripe_config_with_base(api_base_url: Option<&str>) -> StripeConfig {
+        StripeConfig {
+            api_key: "sk_test_fake".to_string(),
+            webhook_secret: "whsec_test".to_string(),
+            price_id: "price_ExampleCredits".to_string(),
+            enable_invoice_creation: false,
+            auto_topup_terms_of_service_text: None,
+            setup_terms_of_service_text: None,
+            tax_code: None,
+            api_base_url: api_base_url.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn stripe_api_base_is_normalised_to_a_trailing_slash() {
+        for (configured, expected) in [
+            (None, None),
+            (Some("http://localhost:12111"), Some("http://localhost:12111/")),
+            (Some("http://localhost:12111/"), Some("http://localhost:12111/")),
+            (
+                Some("https://egress.example.test/stripe"),
+                Some("https://egress.example.test/stripe/"),
+            ),
+            (
+                Some("https://egress.example.test/stripe/"),
+                Some("https://egress.example.test/stripe/"),
+            ),
+        ] {
+            assert_eq!(
+                stripe_config_with_base(configured).api_base().unwrap().as_deref(),
+                expected,
+                "{configured:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stripe_api_base_rejects_unusable_urls() {
+        for configured in [
+            "localhost:12111",
+            "not a url",
+            "ftp://files.example.test/",
+            "https://egress.example.test/stripe?region=a",
+            "https://egress.example.test/stripe#frag",
+        ] {
+            assert!(
+                stripe_config_with_base(Some(configured)).api_base().is_err(),
+                "{configured:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn config_validation_rejects_a_bad_stripe_api_base() {
+        let mut config = Config::default();
+        config.secret_key = Some("test-secret-key".to_string());
+        config.payment = Some(PaymentConfig::Stripe(stripe_config_with_base(Some(
+            "https://egress.example.test/stripe",
+        ))));
+        config.validate().unwrap();
+
+        config.payment = Some(PaymentConfig::Stripe(stripe_config_with_base(Some("not a url"))));
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("api_base_url"), "got {error}");
+    }
+
+    #[test]
+    fn rejected_params_must_be_known() {
+        let mut config = Config::default();
+        config.secret_key = Some("test-secret-key".to_string());
+        config.onwards.rejected_params = vec!["logprobs".to_string()];
+        config.validate().unwrap();
+
+        config.onwards.rejected_params.push("top_k".to_string());
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("onwards.rejected_params names an unknown parameter: top_k"));
+    }
+
+    #[test]
+    fn scheduled_file_and_batch_retention_fail_closed() {
+        let mut config = Config::default();
+        config.background_services.batch_daemon.retention.expire_files = true;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("file and batch retention is not supported"));
+
+        let mut config = Config::default();
+        config.background_services.batch_daemon.retention.terminal_batch_seconds = Some(60);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("file and batch retention is not supported"));
+    }
+
+    fn configure_batchless_retention(config: &mut Config) {
+        config.secret_key = Some("test-secret-key".to_string());
+        let daemon = &mut config.background_services.batch_daemon;
+        daemon.retention.batchless_seconds_by_service_tier.insert("flex".to_string(), 120);
+        daemon.retention.max_late_writer_seconds = Some(30);
+    }
+
+    #[test]
+    fn batchless_retention_validation_matrix_is_fail_closed() {
+        let mut config = Config::default();
+        config.background_services.batch_daemon.batchless_archive_sweep_enabled = true;
+        assert!(config.validate().unwrap_err().to_string().contains("batchless retention policy"));
+
+        let mut config = Config::default();
+        configure_batchless_retention(&mut config);
+        assert!(
+            config.validate().is_ok(),
+            "a configured policy must permit reader-safe runway preflight"
+        );
+
+        config.background_services.batch_daemon.retained_response_partitions_days_ahead = 0;
+        assert!(config.validate().unwrap_err().to_string().contains("partition runway"));
+
+        let mut config = Config::default();
+        configure_batchless_retention(&mut config);
+        let daemon = &mut config.background_services.batch_daemon;
+        daemon.batchless_archive_backfill_enabled = true;
+        daemon.batchless_archive_groups_per_tick = 0;
+        assert!(config.validate().unwrap_err().to_string().contains("group and byte budgets"));
+
+        let mut config = Config::default();
+        configure_batchless_retention(&mut config);
+        let daemon = &mut config.background_services.batch_daemon;
+        daemon.batchless_archive_backfill_concurrency = 0;
+        assert!(config.validate().is_ok(), "a disabled backfill ignores its concurrency");
+        let daemon = &mut config.background_services.batch_daemon;
+        daemon.batchless_archive_backfill_enabled = true;
+        // Keep the shared cancellation grace inside the 120s fixture retention
+        // so the only remaining objection is the concurrency itself.
+        daemon.batch_archive_cancel_grace_secs = 60.0;
+        assert!(config.validate().unwrap_err().to_string().contains("backfill concurrency"));
+        config.background_services.batch_daemon.batchless_archive_backfill_concurrency = 16;
+        assert!(config.validate().is_ok());
+        // A fan-out at or above the fusillade write pool ceiling would starve
+        // the claim loops rather than add throughput.
+        let pool_max = match config.database.fusillade() {
+            ComponentDb::Schema { pool, .. } | ComponentDb::Dedicated { pool, .. } => pool.max_connections,
+        };
+        config.background_services.batch_daemon.batchless_archive_backfill_concurrency = pool_max as usize;
+        assert!(config.validate().unwrap_err().to_string().contains("below the fusillade pool"));
+        config.background_services.batch_daemon.batchless_archive_backfill_concurrency = pool_max as usize - 1;
+        assert!(config.validate().is_ok());
+
+        let mut config = Config::default();
+        config.background_services.batch_daemon.retained_response_retirement_enabled = true;
+        assert!(config.validate().unwrap_err().to_string().contains("batchless retention policy"));
+    }
+
+    #[test]
+    fn retained_response_retirement_accepts_a_valid_batchless_policy_in_schema_mode() {
+        let mut config = Config::default();
+        configure_batchless_retention(&mut config);
+        config.background_services.batch_daemon.retained_response_retirement_enabled = true;
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn maintenance_endpoint_is_redacted_and_never_serialized() {
+        let mut daemon = DaemonConfig::default();
+        daemon.retained_response_partition_maintenance_url = Some(SensitiveDatabaseUrl(
+            "postgres://secret-user:secret-password@db.invalid/fusillade".to_string(),
+        ));
+        let debug = format!("{daemon:?}");
+        assert!(!debug.contains("secret-user"));
+        assert!(!debug.contains("secret-password"));
+        let serialized = serde_json::to_value(&daemon).unwrap();
+        assert!(serialized.get("retained_response_partition_maintenance_url").is_none());
+
+        let mut input = serde_json::to_value(DaemonConfig::default()).unwrap();
+        input["retained_response_partition_maintenance_url"] = serde_json::json!("postgres://configured.invalid/fusillade");
+        let parsed: DaemonConfig = serde_json::from_value(input).unwrap();
+        assert_eq!(
+            parsed
+                .retained_response_partition_maintenance_url
+                .as_ref()
+                .map(SensitiveDatabaseUrl::expose),
+            Some("postgres://configured.invalid/fusillade")
+        );
+    }
+
+    #[test]
+    fn request_only_ignores_shared_retirement_selection_configuration() {
+        let mut config = Config::default();
+        config.secret_key = Some("test-secret-key".to_string());
+        config.background_services.batch_daemon.mode = DaemonMode::RequestOnly;
+        config.background_services.batch_daemon.retained_response_retirement_enabled = true;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn batchless_movement_windows_precede_retention() {
+        let mut config = Config::default();
+        configure_batchless_retention(&mut config);
+        let daemon = &mut config.background_services.batch_daemon;
+        daemon.batchless_archive_sweep_enabled = true;
+        daemon.batch_archive_sweep_dwell_secs = 120.0;
+        assert!(config.validate().unwrap_err().to_string().contains("sweep dwell"));
+
+        let mut backfill = Config::default();
+        configure_batchless_retention(&mut backfill);
+        let daemon = &mut backfill.background_services.batch_daemon;
+        daemon.batchless_archive_backfill_enabled = true;
+        daemon.batch_archive_sweep_dwell_secs = 120.0;
+        assert!(backfill.validate().unwrap_err().to_string().contains("sweep dwell"));
+
+        let daemon = &mut config.background_services.batch_daemon;
+        daemon.batch_archive_sweep_dwell_secs = 119.0;
+        daemon.batch_archive_cancel_grace_secs = 120.0;
+        assert!(config.validate().unwrap_err().to_string().contains("cancellation grace"));
+
+        config.background_services.batch_daemon.batch_archive_cancel_grace_secs = 119.0;
+        assert!(config.validate().is_ok());
+    }
     /// Stamping a key into a batch's metadata does NOTHING unless the key is also on this
     /// list: fusillade copies only the listed keys onto each claimed request, so an
     /// unlisted one is written, persisted, and silently never sent as a header — and the
@@ -3122,6 +4737,112 @@ auth:
     }
 
     #[test]
+    fn pooled_url_and_direct_pool_parse_and_fold_from_env() {
+        Jail::expect_with(|jail| {
+            // The developer shell exports DATABASE_URL for sqlx; it must not leak in.
+            jail.clear_env();
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: hello
+database:
+  type: external
+  url: postgres://direct/db
+  pooled_url: postgres://pooled/db
+  pool:
+    max_connections: 400
+  direct_pool:
+    max_connections: 6
+  fusillade:
+    mode: schema
+    name: fusillade
+    direct_pool:
+      max_connections: 3
+"#,
+            )?;
+            let config = Config::load(&Args {
+                config: "test.yaml".into(),
+                validate: false,
+            })?;
+            assert_eq!(config.database.external_url(), Some("postgres://direct/db"));
+            assert_eq!(config.database.external_pooled_url(), Some("postgres://pooled/db"));
+            assert_eq!(config.database.main_pool_settings().max_connections, 400);
+            assert_eq!(config.database.direct_pool_settings().max_connections, 6);
+            assert_eq!(config.database.fusillade().direct_pool_settings().max_connections, 3);
+            assert_eq!(
+                config.database.outlet().direct_pool_settings().max_connections,
+                default_direct_pool().max_connections
+            );
+
+            // The env override rebuilds `database` from DATABASE_URL and must
+            // carry the pooled endpoint and direct settings across.
+            jail.set_env("DATABASE_URL", "postgres://env-direct/db");
+            jail.set_env("DWCTL_DATABASE_POOLED_URL", "postgres://env-pooled/db");
+            let config = Config::load(&Args {
+                config: "test.yaml".into(),
+                validate: false,
+            })?;
+            assert_eq!(config.database.external_url(), Some("postgres://env-direct/db"));
+            assert_eq!(config.database.external_pooled_url(), Some("postgres://env-pooled/db"));
+            assert_eq!(config.database.direct_pool_settings().max_connections, 6);
+            assert!(config.database_pooled_url.is_none(), "folded into database.pooled_url");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn pooled_schema_retirement_reuses_direct_session_endpoint() {
+        for component_only in [false, true] {
+            let mut config = Config::default();
+            configure_batchless_retention(&mut config);
+            config.database = serde_json::from_value(serde_json::json!({
+                "type": "external", "url": "postgres://main@localhost/db",
+                "pooled_url": if component_only { None } else { Some("postgres://main@pooler/db") },
+                "fusillade": { "mode": "schema", "name": "fusillade",
+                    "pooled_url": "postgres://main@pooler/db" }
+            }))
+            .unwrap();
+            config.background_services.batch_daemon.retained_response_retirement_enabled = true;
+            config.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn pooled_url_override_without_direct_url_override() {
+        for alias in ["DATABASE_POOLED_URL", "DWCTL_DATABASE_POOLED_URL"] {
+            for nested_direct in [false, true] {
+                Jail::expect_with(|jail| {
+                    jail.clear_env();
+                    jail.create_file("test.yaml", "secret_key: hello\ndatabase:\n  type: external\n  url: postgres://direct/db\n  pooled_url: postgres://old-pool/db\n")?;
+                    if nested_direct {
+                        jail.set_env("DWCTL_DATABASE__URL", "postgres://nested-direct/db");
+                    }
+                    jail.set_env(alias, "postgres://pooled/db");
+                    let config = Config::load_from_path("test.yaml")?;
+                    assert_eq!(
+                        config.database.external_url(),
+                        Some(if nested_direct {
+                            "postgres://nested-direct/db"
+                        } else {
+                            "postgres://direct/db"
+                        })
+                    );
+                    assert_eq!(config.database.external_pooled_url(), Some("postgres://pooled/db"));
+                    assert!(config.database_pooled_url.is_none());
+                    Ok(())
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn no_pooled_url_by_default() {
+        let config = Config::default();
+        assert!(config.database.external_pooled_url().is_none());
+        assert_eq!(config.database.direct_pool_settings().max_connections, 8);
+    }
+
+    #[test]
     fn test_env_override() {
         Jail::expect_with(|jail| {
             jail.create_file(
@@ -3197,6 +4918,14 @@ auth:
 
             Ok(())
         });
+    }
+
+    #[test]
+    fn test_onwards_sse_buffer_limit_config() {
+        let defaults: OnwardsConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaults.sse_buffer_limit, 65536);
+        let configured: OnwardsConfig = serde_json::from_str(r#"{"sse_buffer_limit":1048576}"#).unwrap();
+        assert_eq!(configured.sse_buffer_limit, 1048576);
     }
 
     #[test]
@@ -3397,6 +5126,29 @@ secret_key: "test-secret-key"
         config.batches.files.max_expiry_seconds = 3600;
         let result = config.validate();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn retention_config_is_accepted_on_an_instance_that_never_runs_the_daemon() {
+        // Split topology: API pods share the daemon pods' environment but run
+        // with the daemon disabled. They own no maintenance and must not
+        // reject the retention flags the daemon pods act on.
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.background_services.batch_daemon.enabled = DaemonEnabled::Never;
+        let daemon = &mut config.background_services.batch_daemon;
+        daemon.retention.batchless_seconds_by_service_tier.insert("flex".to_string(), 60);
+        daemon.retention.max_late_writer_seconds = Some(60);
+        daemon.batchless_archive_sweep_enabled = true;
+        daemon.retained_response_retirement_enabled = true;
+        daemon.batch_archive_retirement_enabled = true;
+        daemon.batch_archive_retention_days = Some(1);
+        // Deprecated no-op key: still parses, never rejects.
+        daemon.template_generation_writes_enabled = Some(true);
+        daemon.template_retirement_enabled = true;
+        daemon.template_retention_days = Some(1);
+        assert!(config.validate().is_ok(), "{:?}", config.validate().err());
     }
 
     #[test]
@@ -3668,6 +5420,65 @@ secret_key: "test-secret-key"
 
             let config = Config::load(&args)?;
             assert_eq!(config.batches.default_throughput, 75.5);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_batch_inflight_enforce_env_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            assert!(!Config::load(&args)?.limits.batch_inflight.enforce, "default is off");
+
+            jail.set_env("DWCTL_LIMITS__BATCH_INFLIGHT__ENFORCE", "true");
+            let config = Config::load(&args)?;
+            assert!(config.limits.batch_inflight.enforce);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_batch_inflight_default_capacity_env_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            assert_eq!(
+                Config::load(&args)?.limits.batch_inflight.default_capacity,
+                Some(200),
+                "default is 200"
+            );
+
+            jail.set_env("DWCTL_LIMITS__BATCH_INFLIGHT__DEFAULT_CAPACITY", "250");
+            assert_eq!(Config::load(&args)?.limits.batch_inflight.default_capacity, Some(250));
+
+            // 0 is the "off" form: no default cap.
+            jail.set_env("DWCTL_LIMITS__BATCH_INFLIGHT__DEFAULT_CAPACITY", "0");
+            assert_eq!(Config::load(&args)?.limits.batch_inflight.default_capacity, None);
+
+            // A negative override is rejected at load.
+            jail.set_env("DWCTL_LIMITS__BATCH_INFLIGHT__DEFAULT_CAPACITY", "-1");
+            assert!(Config::load(&args).is_err(), "a negative env override must be rejected");
 
             Ok(())
         });
@@ -3956,6 +5767,48 @@ background_services:
     }
 
     #[test]
+    fn test_adaptive_concurrency_default_override_and_mapping() {
+        Jail::expect_with(|jail| {
+            jail.create_file("test.yaml", "secret_key: test-secret-key\n")?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+
+            // Off by default: turning it on lets a model's limit exceed its
+            // configured value, so it has to be a deliberate opt-in.
+            let config = Config::load(&args)?;
+            assert!(!config.background_services.batch_daemon.adaptive_concurrency);
+            let fusillade_config = config.background_services.batch_daemon.to_fusillade_config();
+            assert!(!fusillade_config.adaptive_concurrency);
+            assert_eq!(fusillade_config.adaptive_growth_factor, 1.5);
+            assert_eq!(fusillade_config.adaptive_cut_factor, 0.8);
+            assert_eq!(fusillade_config.memory_gate_high_fraction, 0.0);
+
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: test-secret-key
+background_services:
+  batch_daemon:
+    adaptive_concurrency: true
+    adaptive_growth_factor: 2.0
+    adaptive_cut_factor: 0.5
+    memory_gate_high_fraction: 0.75
+"#,
+            )?;
+            let config = Config::load(&args)?;
+            let fusillade_config = config.background_services.batch_daemon.to_fusillade_config();
+            assert!(fusillade_config.adaptive_concurrency);
+            assert_eq!(fusillade_config.adaptive_growth_factor, 2.0);
+            assert_eq!(fusillade_config.adaptive_cut_factor, 0.5);
+            assert_eq!(fusillade_config.memory_gate_high_fraction, 0.75);
+
+            Ok(())
+        });
+    }
+
+    #[test]
     fn test_background_concurrency_limit_yaml_override_and_mapping() {
         Jail::expect_with(|jail| {
             jail.create_file(
@@ -4224,6 +6077,68 @@ background_services:
     }
 
     #[test]
+    fn test_leak_interval_defaults_and_overrides() {
+        Jail::expect_with(|jail| {
+            jail.create_file("test.yaml", "secret_key: test-secret-key")?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+            assert!(config.background_services.batch_daemon.leak.leak_enabled);
+            assert_eq!(config.background_services.batch_daemon.leak.leak_interval_seconds.get(), 60);
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: test-secret-key
+background_services:
+  batch_daemon:
+    leak_enabled: false
+    leak_interval_seconds: 30
+    model_leak_interval_seconds:
+      large/model: 10
+"#,
+            )?;
+            let config = Config::load(&args)?;
+            assert!(!config.background_services.batch_daemon.leak.leak_enabled);
+            assert_eq!(config.background_services.batch_daemon.leak.leak_interval_seconds.get(), 30);
+            assert_eq!(
+                config.background_services.batch_daemon.leak.model_leak_interval_seconds["large/model"].get(),
+                10
+            );
+            jail.set_env("DWCTL_BACKGROUND_SERVICES__BATCH_DAEMON__LEAK_ENABLED", "true");
+            jail.set_env("DWCTL_BACKGROUND_SERVICES__BATCH_DAEMON__LEAK_INTERVAL_SECONDS", "15");
+            let config = Config::load(&args)?;
+            assert!(config.background_services.batch_daemon.leak.leak_enabled);
+            assert_eq!(config.background_services.batch_daemon.leak.leak_interval_seconds.get(), 15);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_leak_interval_rejects_invalid_values() {
+        Jail::expect_with(|jail| {
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            for value in ["0", "-1", "1.5", ".nan", "4294967296"] {
+                for setting in [
+                    format!("leak_interval_seconds: {value}"),
+                    format!("model_leak_interval_seconds: {{large/model: {value}}}"),
+                ] {
+                    jail.create_file(
+                        "test.yaml",
+                        &format!("secret_key: test-secret-key\nbackground_services:\n  batch_daemon:\n    {setting}\n"),
+                    )?;
+                    assert!(Config::load(&args).is_err(), "accepted {setting}");
+                }
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
     fn test_claim_ramp_exponent_default_and_override() {
         Jail::expect_with(|jail| {
             jail.create_file(
@@ -4285,6 +6200,20 @@ background_services:
 
             Ok(())
         });
+    }
+
+    #[test]
+    fn prompt_cache_retention_keeps_at_least_the_recompute_grace() {
+        let config = PromptCacheRetentionConfig::default();
+        assert_eq!(config.grace_days, crate::recompute::report::CACHE_GRACE_DAYS as u64);
+        assert!(config.validate().is_ok());
+        let shorter = PromptCacheRetentionConfig {
+            grace_days: config.grace_days - 1,
+            ..config.clone()
+        };
+        assert!(shorter.validate().unwrap_err().contains("at least"));
+        let longer = PromptCacheRetentionConfig { grace_days: 30, ..config };
+        assert!(longer.validate().is_ok());
     }
 
     #[test]

@@ -1,8 +1,8 @@
 name: CI
 
 on:
-  pull_request:
-    branches: [main]
+  # Validate stacked pull requests as well as changes targeting main.
+  pull_request: {}
   merge_group:
     types: [checks_requested]
 
@@ -26,8 +26,27 @@ jobs:
           run_ci=true
           changed_files=$(git diff --name-only HEAD^1...HEAD) || changed_files=
 
+          # A release changes version numbers only: in Cargo files, `version`
+          # fields and the versions on path dependencies between workspace
+          # crates. Any other Cargo change adds, bumps or repoints a dependency,
+          # which changes what is built, so it runs the full suite.
+          versions_only() {
+            local lines normalize='s/"[0-9]+\.[0-9]+\.[0-9]+[^"]*"/"VERSION"/g'
+            lines=$(git diff -U0 HEAD^1...HEAD -- "$1" | grep -E '^[-+]' | grep -Ev '^(\+\+\+|---) ') || return 0
+            if grep -Evq '^[-+](version = |.*path = )' <<< "$lines"; then
+              return 1
+            fi
+            [[ "$(grep '^-' <<< "$lines" | cut -c2- | sed -E "$normalize" | sort)" == \
+               "$(grep '^+' <<< "$lines" | cut -c2- | sed -E "$normalize" | sort)" ]]
+          }
+
           if [[ -n "$changed_files" ]] && ! grep -Evq '^(\.release-please-manifest\.json|(.+/)?CHANGELOG\.md|(.+/)?Cargo\.(toml|lock))$' <<< "$changed_files"; then
             run_ci=false
+            while read -r file; do
+              if [[ "$file" =~ Cargo\.(toml|lock)$ ]] && ! versions_only "$file"; then
+                run_ci=true
+              fi
+            done <<< "$changed_files"
           fi
 
           echo "run-ci=$run_ci" >> "$GITHUB_OUTPUT"
@@ -138,7 +157,9 @@ jobs:
 
     # Each partition has an isolated PostgreSQL instance. SQLx tests create
     # their own databases, pools, and listeners, so retain the raised
-    # connection limit from the unpartitioned job.
+    # connection limit from the unpartitioned job. Durability is disabled, as
+    # in `just db-start`: every template clone uses `STRATEGY FILE_COPY`, whose
+    # checkpoints are cheap without fsync and slower than `WAL_LOG` with it.
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -152,14 +173,17 @@ jobs:
             -e POSTGRES_HOST_AUTH_METHOD=trust \
             -p 5432:5432 \
             postgres:latest \
-            -c max_connections=300
+            -c max_connections=300 \
+            -c fsync=off \
+            -c full_page_writes=off \
+            -c synchronous_commit=off
           for _ in $(seq 1 30); do
             docker exec postgres pg_isready -U postgres && break
             sleep 1
           done
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: llvm-tools-preview
 
@@ -200,9 +224,15 @@ jobs:
           source <(cargo llvm-cov show-env --export-prefix)
           export LLVM_PROFILE_FILE="$PWD/target/dwctl-${{ matrix.partition }}-%32m.profraw"
 
+          BUILD_START=$(date +%s)
+          cargo nextest run --package dwctl --cargo-profile ci --no-run
+          BUILD_END=$(date +%s)
+          echo "dwctl compile/link: $((BUILD_END - BUILD_START))s"
           cargo nextest run --package dwctl \
             --cargo-profile ci \
             --partition "count:${{ matrix.partition }}/4"
+          TEST_END=$(date +%s)
+          echo "dwctl test execution: $((TEST_END - BUILD_END))s"
           cargo llvm-cov report --profile ci \
             --lcov \
             --output-path "lcov-dwctl-${{ matrix.partition }}.info"
@@ -212,6 +242,15 @@ jobs:
           echo "dwctl partition ${{ matrix.partition }}/4 completed in ${CI_DURATION}s"
           curl -X POST \
             "https://charts.somnial.co/doubleword-control-layer/backend-dwctl-partition-${{ matrix.partition }}-ci-duration?value=${CI_DURATION}" || true
+
+      - name: Upload dwctl partition ${{ matrix.partition }} timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-test-timings-dwctl-${{ matrix.partition }}
+          path: target/nextest/default/junit.xml
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Upload dwctl partition ${{ matrix.partition }} coverage
         uses: actions/upload-artifact@v4
@@ -254,13 +293,13 @@ jobs:
           - package: fusillade-arsenal
             runner: depot-ubuntu-24.04-8
             database: true
+          - package: openai-reassembler
+            runner: depot-ubuntu-24.04-8
+            database: false
           - package: onwards
             runner: depot-ubuntu-24.04-8
             database: false
             cargo_args: --all-features
-          - package: onwards-fusillade
-            runner: depot-ubuntu-24.04-8
-            database: false
     runs-on: ${{ matrix.runner }}
     env:
       RUN_CI: ${{ needs.changes.outputs.run-ci }}
@@ -296,7 +335,7 @@ jobs:
 
       - name: Install Rust
         if: env.RUN_CI == 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: llvm-tools-preview
 
@@ -376,7 +415,12 @@ jobs:
           done
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        # Every workflow pins this same Rust release (search for
+        # `rust-toolchain@`). A new stable can add lints that fail
+        # `-D warnings`, so upgrade them together, deliberately.
+        uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: rustfmt, clippy
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
@@ -399,12 +443,18 @@ jobs:
       - name: Lint Rust workspace
         run: just lint rust -- -D warnings
 
+      - name: Validate model provisioning format
+        run: |
+          cargo run --quiet -p dwctl --bin dwctl-model-provisioning -- schema > /tmp/model-provisioning.schema.json
+          diff -u model-provisioning.schema.json /tmp/model-provisioning.schema.json
+          cargo run --quiet -p dwctl --bin dwctl-model-provisioning -- validate examples/model-provisioning
+
       - name: Validate publishable Onwards package
         run: cargo package --locked --package onwards --all-features
 
   backend-test:
     if: always() && needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
-    needs: [changes, backend-crate-test, backend-dwctl-test, backend-lint, frontend-test, build]
+    needs: [changes, backend-crate-test, backend-dwctl-test, backend-lint, frontend-test, build, pooled-e2e]
     runs-on: ubuntu-latest
     name: workspace / rust gate
     env:
@@ -422,6 +472,7 @@ jobs:
           CRATE_TEST_RESULT: ${{ needs.backend-crate-test.result }}
           DWCTL_TEST_RESULT: ${{ needs.backend-dwctl-test.result }}
           LINT_RESULT: ${{ needs.backend-lint.result }}
+          POOLED_RESULT: ${{ needs.pooled-e2e.result }}
         run: |
           if [[ "$CRATE_TEST_RESULT" != "success" ]]; then
             echo "One or more crate test jobs failed: $CRATE_TEST_RESULT" >&2
@@ -433,6 +484,10 @@ jobs:
           fi
           if [[ "$LINT_RESULT" != "success" ]]; then
             echo "Rust workspace lint failed: $LINT_RESULT" >&2
+            exit 1
+          fi
+          if [[ "$POOLED_RESULT" != "success" ]]; then
+            echo "Pooled application E2E failed: $POOLED_RESULT" >&2
             exit 1
           fi
 
@@ -533,321 +588,6 @@ jobs:
           sbom: true
           provenance: true
 
-  onwards-compliance-changes:
-    if: needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
-    needs: changes
-    name: onwards / compliance changes
-    runs-on: ubuntu-latest
-    outputs:
-      strict: ${{ steps.changes.outputs.strict }}
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Detect Onwards strict-mode changes
-        id: changes
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          PULL_REQUEST_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
-          MERGE_GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
-        run: |
-          if [[ "$EVENT_NAME" == "pull_request" ]]; then
-            BASE_SHA="$PULL_REQUEST_BASE_SHA"
-            HEAD_SHA="$PULL_REQUEST_HEAD_SHA"
-          else
-            BASE_SHA="$MERGE_GROUP_BASE_SHA"
-            HEAD_SHA="$MERGE_GROUP_HEAD_SHA"
-          fi
-
-          if [[ -z "$BASE_SHA" || -z "$HEAD_SHA" ]]; then
-            echo "Unable to determine the commit range for $EVENT_NAME" >&2
-            exit 1
-          fi
-
-          if git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- 'onwards/src/strict/**'; then
-            echo "strict=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "strict=true" >> "$GITHUB_OUTPUT"
-          fi
-
-  onwards-openresponses-compliance:
-    if: always()
-    needs: [changes, onwards-compliance-changes]
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        mode: [adapter, passthrough]
-    name: onwards / open responses (${{ matrix.mode }})
-
-    env:
-      RUN_STRICT_COMPLIANCE: ${{ needs.onwards-compliance-changes.outputs.strict == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' }}
-      TEST_MODEL: gemini-2.5-flash
-      # Match the supported HTTP /responses coverage exercised through dwctl below.
-      OPENRESPONSES_COMPLIANCE_FILTER: basic-response,assistant-phase,response-output-phase-schema,streaming-response,system-prompt,tool-calling,image-input,multi-turn
-
-    steps:
-      - name: Skip strict compliance for untrusted or unchanged events
-        if: env.RUN_STRICT_COMPLIANCE != 'true'
-        run: echo "Skipping strict compliance because this event is untrusted or has no strict-mode changes."
-
-      - name: Checkout code
-        if: env.RUN_STRICT_COMPLIANCE == 'true'
-        uses: actions/checkout@v6
-
-      - name: Require Gemini API key
-        if: env.RUN_STRICT_COMPLIANCE == 'true'
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: |
-          if [[ -z "$GEMINI_API_KEY" ]]; then
-            echo "GEMINI_API_KEY repository secret is required for Onwards Open Responses compliance" >&2
-            exit 1
-          fi
-
-      - name: Install Rust
-        if: env.RUN_STRICT_COMPLIANCE == 'true'
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Build Onwards
-        if: env.RUN_STRICT_COMPLIANCE == 'true'
-        working-directory: onwards
-        run: cargo build --release --package onwards
-
-      - name: Install Bun
-        if: env.RUN_STRICT_COMPLIANCE == 'true'
-        uses: oven-sh/setup-bun@v2
-
-      - name: Clone Open Responses
-        if: env.RUN_STRICT_COMPLIANCE == 'true'
-        run: |
-          git clone --depth 1 https://github.com/openresponses/openresponses /tmp/openresponses
-          cd /tmp/openresponses
-          echo "Open Responses commit: $(git rev-parse HEAD)"
-          git log -1 --oneline
-
-      - name: Install Open Responses dependencies
-        if: env.RUN_STRICT_COMPLIANCE == 'true'
-        run: cd /tmp/openresponses && bun install
-
-      - name: Write Gemini adapter config
-        if: env.RUN_STRICT_COMPLIANCE == 'true'
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: |
-          cat > /tmp/onwards-gemini-adapter-config.json <<EOF
-          {
-            "strict_mode": true,
-            "targets": {
-              "$TEST_MODEL": {
-                "url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-                "onwards_key": "$GEMINI_API_KEY",
-                "onwards_model": "$TEST_MODEL",
-                "trusted": true,
-                "open_responses": {
-                  "adapter": true
-                }
-              }
-            }
-          }
-          EOF
-
-      - name: Start Gemini adapter upstream
-        if: env.RUN_STRICT_COMPLIANCE == 'true'
-        run: |
-          ./target/release/onwards \
-            --port 3001 \
-            --metrics-port 9091 \
-            -f /tmp/onwards-gemini-adapter-config.json \
-            > /tmp/onwards-gemini-adapter.log 2>&1 &
-          echo "$!" > /tmp/onwards-gemini-adapter.pid
-
-          for attempt in $(seq 1 30); do
-            if curl -sf http://localhost:3001/v1/models > /dev/null 2>&1; then
-              echo "Gemini adapter upstream is ready"
-              exit 0
-            fi
-            echo "Waiting for Gemini adapter upstream (${attempt}/30)"
-            sleep 1
-          done
-
-          echo "Gemini adapter upstream failed to start" >&2
-          cat /tmp/onwards-gemini-adapter.log
-          exit 1
-
-      - name: Write Onwards config
-        if: env.RUN_STRICT_COMPLIANCE == 'true'
-        env:
-          ADAPTER_FLAG: ${{ matrix.mode == 'adapter' && 'true' || 'false' }}
-        run: |
-          cat > /tmp/onwards-openresponses-config.json <<EOF
-          {
-            "strict_mode": true,
-            "targets": {
-              "$TEST_MODEL": {
-                "url": "http://127.0.0.1:3001/v1/",
-                "onwards_model": "$TEST_MODEL",
-                "trusted": true,
-                "open_responses": {
-                  "adapter": $ADAPTER_FLAG
-                }
-              }
-            }
-          }
-          EOF
-
-      - name: Start Onwards
-        if: env.RUN_STRICT_COMPLIANCE == 'true'
-        run: |
-          ./target/release/onwards \
-            -f /tmp/onwards-openresponses-config.json \
-            > /tmp/onwards.log 2>&1 &
-          echo "$!" > /tmp/onwards.pid
-
-          for attempt in $(seq 1 30); do
-            if curl -sf http://localhost:3000/v1/models > /dev/null 2>&1; then
-              echo "Server is ready"
-              exit 0
-            fi
-            echo "Waiting for Onwards (${attempt}/30)"
-            sleep 1
-          done
-          echo "Server failed to start" >&2
-          cat /tmp/onwards.log
-          exit 1
-
-      - name: Run compliance tests
-        if: env.RUN_STRICT_COMPLIANCE == 'true'
-        env:
-          MODE: ${{ matrix.mode }}
-        run: |
-          cd /tmp/openresponses
-          echo "Open Responses commit: $(git rev-parse HEAD)"
-          echo "Mode: ${MODE}"
-          echo "Base URL: http://localhost:3000/v1"
-          echo "Model: ${TEST_MODEL}"
-          echo "Filter: ${OPENRESPONSES_COMPLIANCE_FILTER}"
-          echo
-
-          set +e
-          bun run bin/compliance-test.ts \
-            --base-url http://localhost:3000/v1 \
-            --api-key test \
-            --model "$TEST_MODEL" \
-            --filter "$OPENRESPONSES_COMPLIANCE_FILTER" \
-            --json > "/tmp/onwards-openresponses-${MODE}.json"
-          status=$?
-          set -e
-
-          if ! jq -e . "/tmp/onwards-openresponses-${MODE}.json" > /dev/null; then
-            echo "Compliance runner did not emit valid JSON. Raw output:"
-            cat "/tmp/onwards-openresponses-${MODE}.json"
-            # Malformed compliance output is always a failure.
-            exit 1
-          fi
-
-          jq -r '.results[] | "\(.status | ascii_upcase): \(.name)"' \
-            "/tmp/onwards-openresponses-${MODE}.json"
-          jq -r '
-            .results[]
-            | select(.status == "failed")
-            | "\n\(.name):\n" + ((.errors // []) | map("  - " + .) | join("\n"))
-          ' "/tmp/onwards-openresponses-${MODE}.json"
-          jq -r '
-            "Results: \(.summary.passed) passed, \(.summary.failed) failed, \(.summary.skipped) skipped, \(.summary.total) total"
-          ' "/tmp/onwards-openresponses-${MODE}.json"
-
-          if [[ "$status" -ne 0 ]]; then
-            failed_filters=$(
-              jq -r '
-                .results[]
-                | select(.status == "failed")
-                | .id
-              ' "/tmp/onwards-openresponses-${MODE}.json" | paste -sd, -
-            )
-
-            if [[ -n "$failed_filters" ]]; then
-              echo
-              echo "=== Retry failed test(s): ${failed_filters} ==="
-              set +e
-              bun run bin/compliance-test.ts \
-                --base-url http://localhost:3000/v1 \
-                --api-key test \
-                --model "$TEST_MODEL" \
-                --filter "$failed_filters" \
-                --json > "/tmp/onwards-openresponses-${MODE}-retry.json"
-              retry_status=$?
-              set -e
-
-              if jq -e . "/tmp/onwards-openresponses-${MODE}-retry.json" > /dev/null; then
-                jq -r '.results[] | "RETRY \(.status | ascii_upcase): \(.name)"' \
-                  "/tmp/onwards-openresponses-${MODE}-retry.json"
-                jq -r '
-                  .results[]
-                  | select(.status == "failed")
-                  | "\nRetry \(.name):\n" + ((.errors // []) | map("  - " + .) | join("\n"))
-                ' "/tmp/onwards-openresponses-${MODE}-retry.json"
-              else
-                echo "Compliance retry did not emit valid JSON. Raw output:"
-                cat "/tmp/onwards-openresponses-${MODE}-retry.json"
-                retry_status=1
-              fi
-
-              if [[ "$retry_status" -eq 0 ]]; then
-                echo
-                echo "Failed test(s) passed on retry; treating as a transient provider failure."
-                status=0
-              else
-                echo
-                echo "=== Verbose rerun of failed test(s): ${failed_filters} ==="
-                bun run bin/compliance-test.ts \
-                  --base-url http://localhost:3000/v1 \
-                  --api-key test \
-                  --model "$TEST_MODEL" \
-                  --filter "$failed_filters" \
-                  --verbose || true
-              fi
-            fi
-          fi
-
-          exit "$status"
-
-      - name: Show Onwards logs
-        if: always() && env.RUN_STRICT_COMPLIANCE == 'true'
-        run: |
-          echo "=== Onwards under test ==="
-          cat /tmp/onwards.log || echo "No Onwards log file found"
-          echo
-          echo "=== Gemini adapter upstream ==="
-          cat /tmp/onwards-gemini-adapter.log || echo "No upstream log file found"
-
-      - name: Upload Onwards compliance artifacts
-        if: always() && env.RUN_STRICT_COMPLIANCE == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: onwards-openresponses-${{ matrix.mode }}
-          path: |
-            /tmp/onwards-openresponses-${{ matrix.mode }}.json
-            /tmp/onwards-openresponses-${{ matrix.mode }}-retry.json
-            /tmp/onwards.log
-            /tmp/onwards-gemini-adapter.log
-          if-no-files-found: ignore
-
-      - name: Stop Onwards processes
-        if: always() && env.RUN_STRICT_COMPLIANCE == 'true'
-        run: |
-          if [[ -f /tmp/onwards.pid ]]; then
-            kill "$(cat /tmp/onwards.pid)" || true
-          fi
-          if [[ -f /tmp/onwards-gemini-adapter.pid ]]; then
-            kill "$(cat /tmp/onwards-gemini-adapter.pid)" || true
-          fi
-
   # Sibling image build to `onwards-pr-image`; both start after classification.
   build:
     if: needs.changes.outputs.run-ci == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'
@@ -920,10 +660,32 @@ jobs:
       image-digest: ${{ steps.preview-image.outputs.digest }}
 
   openresponses-compliance:
-    if: needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+    # Runs unconditionally so the matrix expands and BOTH legs report under their
+    # static check names. A job skipped at this level reports once as the
+    # unexpanded `matrix.check`, which never satisfies the required contexts on
+    # release-only pull requests. The steps gate on RUN_COMPLIANCE instead.
+    if: always()
     runs-on: ubuntu-latest
     needs: [changes, build]
-    name: dwctl / open responses
+    # Two legs share the dwctl bring-up below. The dwctl leg runs the suite
+    # against dwctl's edge directly. The onwards leg puts a standalone onwards
+    # (strict mode, no adapter) in front of that same dwctl and runs the suite
+    # against onwards, so native /responses passthrough (schema validation,
+    # forwarding, sanitizers) is exercised with dwctl as the Responses-speaking
+    # upstream.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - surface: dwctl
+            check: dwctl / open responses
+            base_url: http://localhost:3001/ai/v1
+            api_key: sk-openresponses-compliance
+          - surface: onwards-passthrough
+            check: onwards / open responses (passthrough)
+            base_url: http://localhost:3000/v1
+            api_key: test
+    name: ${{ matrix.check }}
 
     permissions:
       contents: read
@@ -947,14 +709,22 @@ jobs:
 
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/dwctl
+      RUN_COMPLIANCE: ${{ needs.changes.outputs.run-ci == 'true' && needs.build.result == 'success' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') }}
       TEST_API_KEY: sk-openresponses-compliance
       TEST_MODEL: gemini-2.5-flash
+      COMPLIANCE_BASE_URL: ${{ matrix.base_url }}
+      COMPLIANCE_API_KEY: ${{ matrix.api_key }}
       # Run currently supported HTTP /responses tests. Remove this filter once
       # WebSocket transport (#1178) and /responses/compact (#1179) are supported.
       OPENRESPONSES_COMPLIANCE_FILTER: basic-response,assistant-phase,response-output-phase-schema,streaming-response,system-prompt,tool-calling,image-input,multi-turn
 
     steps:
+      - name: Skip compliance for release-only changes
+        if: env.RUN_COMPLIANCE != 'true'
+        run: echo "Skipping Open Responses compliance because this event has no code changes."
+
       - name: Log in to GitHub Container Registry
+        if: env.RUN_COMPLIANCE == 'true'
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -962,6 +732,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Select built image
+        if: env.RUN_COMPLIANCE == 'true'
         id: image
         run: |
           IMAGE_LIST="${{ needs.build.outputs.image-tag }}"
@@ -970,6 +741,7 @@ jobs:
           echo "Using image: $IMAGE"
 
       - name: Write config
+        if: env.RUN_COMPLIANCE == 'true'
         run: |
           cat > /tmp/dwctl-openresponses-compliance.yaml <<EOF
           host: "0.0.0.0"
@@ -1009,6 +781,7 @@ jobs:
           EOF
 
       - name: Validate Gemini upstream
+        if: env.RUN_COMPLIANCE == 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
@@ -1036,6 +809,7 @@ jobs:
           JSON
 
       - name: Start dwctl
+        if: env.RUN_COMPLIANCE == 'true'
         run: |
           docker run \
             --detach \
@@ -1058,6 +832,7 @@ jobs:
           exit 1
 
       - name: Seed compliance fixture
+        if: env.RUN_COMPLIANCE == 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
@@ -1106,8 +881,7 @@ jobs:
             capabilities,
             created_by,
             hosted_on,
-            trusted,
-            open_responses_adapter
+            trusted
           )
           VALUES (
             '10000000-0000-0000-0000-000000000003',
@@ -1118,7 +892,6 @@ jobs:
             ARRAY['chat'],
             '10000000-0000-0000-0000-000000000001',
             '10000000-0000-0000-0000-000000000002',
-            true,
             true
           )
           ON CONFLICT (id) DO UPDATE SET
@@ -1126,7 +899,6 @@ jobs:
             alias = EXCLUDED.alias,
             hosted_on = EXCLUDED.hosted_on,
             trusted = EXCLUDED.trusted,
-            open_responses_adapter = EXCLUDED.open_responses_adapter,
             deleted = FALSE,
             updated_at = NOW();
 
@@ -1191,6 +963,7 @@ jobs:
           SQL
 
       - name: Wait for compliance fixture
+        if: env.RUN_COMPLIANCE == 'true'
         run: |
           for attempt in $(seq 1 30); do
             models_response=$(curl -sf \
@@ -1241,10 +1014,61 @@ jobs:
           docker logs dwctl-openresponses-compliance
           exit 1
 
+      - name: Checkout code
+        if: env.RUN_COMPLIANCE == 'true'
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        if: env.RUN_COMPLIANCE == 'true' && matrix.surface == 'onwards-passthrough'
+        uses: dtolnay/rust-toolchain@1.99.0
+
+      - name: Build onwards
+        if: env.RUN_COMPLIANCE == 'true' && matrix.surface == 'onwards-passthrough'
+        run: cargo build --release --package onwards
+
+      - name: Write onwards passthrough config
+        if: env.RUN_COMPLIANCE == 'true' && matrix.surface == 'onwards-passthrough'
+        run: |
+          cat > /tmp/onwards-passthrough-config.json <<EOF
+          {
+            "strict_mode": true,
+            "targets": {
+              "${TEST_MODEL}": {
+                "url": "http://127.0.0.1:3001/ai/v1/",
+                "onwards_key": "${TEST_API_KEY}",
+                "onwards_model": "${TEST_MODEL}",
+                "trusted": true
+              }
+            }
+          }
+          EOF
+
+      - name: Start onwards
+        if: env.RUN_COMPLIANCE == 'true' && matrix.surface == 'onwards-passthrough'
+        run: |
+          ./target/release/onwards \
+            -f /tmp/onwards-passthrough-config.json \
+            > /tmp/onwards-passthrough.log 2>&1 &
+          echo "$!" > /tmp/onwards-passthrough.pid
+
+          for attempt in $(seq 1 30); do
+            if curl -sf http://localhost:3000/v1/models > /dev/null 2>&1; then
+              echo "onwards is ready"
+              exit 0
+            fi
+            echo "Waiting for onwards (${attempt}/30)"
+            sleep 1
+          done
+          echo "onwards failed to start" >&2
+          cat /tmp/onwards-passthrough.log
+          exit 1
+
       - name: Install bun
+        if: env.RUN_COMPLIANCE == 'true'
         uses: oven-sh/setup-bun@v2
 
       - name: Clone openresponses
+        if: env.RUN_COMPLIANCE == 'true'
         # Track upstream main so CI surfaces newly added compliance coverage.
         run: |
           git clone --depth 1 https://github.com/openresponses/openresponses /tmp/openresponses
@@ -1253,21 +1077,28 @@ jobs:
           git log -1 --oneline
 
       - name: Install openresponses dependencies
+        if: env.RUN_COMPLIANCE == 'true'
         run: cd /tmp/openresponses && bun install
 
+      - name: Test compliance runner adapter
+        if: env.RUN_COMPLIANCE == 'true'
+        run: bun test ./.github/scripts/openresponses-compliance.test.mjs
+
       - name: Run compliance tests
+        if: env.RUN_COMPLIANCE == 'true'
         run: |
           cd /tmp/openresponses
           echo "Open Responses commit: $(git rev-parse HEAD)"
-          echo "Base URL: http://localhost:3001/ai/v1"
+          echo "Surface: ${{ matrix.surface }}"
+          echo "Base URL: ${COMPLIANCE_BASE_URL}"
           echo "Model: ${TEST_MODEL}"
           echo "Filter: ${OPENRESPONSES_COMPLIANCE_FILTER}"
           echo
 
           set +e
-          bun run bin/compliance-test.ts \
-            --base-url http://localhost:3001/ai/v1 \
-            --api-key "${TEST_API_KEY}" \
+          bun run "${GITHUB_WORKSPACE}/.github/scripts/openresponses-compliance.mjs" \
+            --base-url "${COMPLIANCE_BASE_URL}" \
+            --api-key "${COMPLIANCE_API_KEY}" \
             --model "${TEST_MODEL}" \
             --filter "${OPENRESPONSES_COMPLIANCE_FILTER}" \
             --json > /tmp/openresponses-compliance-results.json
@@ -1314,9 +1145,9 @@ jobs:
               echo
               echo "=== Retry failed test(s): ${failed_filters} ==="
               set +e
-              bun run bin/compliance-test.ts \
-                --base-url http://localhost:3001/ai/v1 \
-                --api-key "${TEST_API_KEY}" \
+              bun run "${GITHUB_WORKSPACE}/.github/scripts/openresponses-compliance.mjs" \
+                --base-url "${COMPLIANCE_BASE_URL}" \
+                --api-key "${COMPLIANCE_API_KEY}" \
                 --model "${TEST_MODEL}" \
                 --filter "${failed_filters}" \
                 --json > /tmp/openresponses-compliance-retry-results.json
@@ -1347,9 +1178,9 @@ jobs:
               else
                 echo
                 echo "=== Verbose rerun of failed test(s): ${failed_filters} ==="
-                bun run bin/compliance-test.ts \
-                  --base-url http://localhost:3001/ai/v1 \
-                  --api-key "${TEST_API_KEY}" \
+                bun run "${GITHUB_WORKSPACE}/.github/scripts/openresponses-compliance.mjs" \
+                  --base-url "${COMPLIANCE_BASE_URL}" \
+                  --api-key "${COMPLIANCE_API_KEY}" \
                   --model "${TEST_MODEL}" \
                   --filter "${failed_filters}" \
                   --verbose || true
@@ -1369,7 +1200,6 @@ jobs:
                 SELECT
                   dm.alias,
                   dm.model_name,
-                  dm.open_responses_adapter,
                   dm.trusted,
                   dm.deleted,
                   ie.url AS endpoint_url,
@@ -1388,24 +1218,38 @@ jobs:
           exit "$status"
 
       - name: Show dwctl logs
-        if: always()
+        if: always() && env.RUN_COMPLIANCE == 'true'
         run: |
           echo "=== dwctl Server Logs ==="
           docker logs dwctl-openresponses-compliance 2>&1 | tee /tmp/dwctl-openresponses-compliance.log || echo "No dwctl container found"
 
+      - name: Show onwards logs
+        if: always() && env.RUN_COMPLIANCE == 'true' && matrix.surface == 'onwards-passthrough'
+        run: |
+          echo "=== onwards passthrough logs ==="
+          cat /tmp/onwards-passthrough.log || echo "No onwards log found"
+
       - name: Upload Open Responses compliance artifacts
-        if: always()
+        if: always() && env.RUN_COMPLIANCE == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: openresponses-compliance-results
+          name: openresponses-compliance-results-${{ matrix.surface }}
           path: |
             /tmp/openresponses-compliance-results.json
             /tmp/openresponses-compliance-retry-results.json
             /tmp/dwctl-openresponses-compliance.log
+            /tmp/onwards-passthrough.log
           if-no-files-found: ignore
 
+      - name: Stop onwards
+        if: always() && env.RUN_COMPLIANCE == 'true' && matrix.surface == 'onwards-passthrough'
+        run: |
+          if [[ -f /tmp/onwards-passthrough.pid ]]; then
+            kill "$(cat /tmp/onwards-passthrough.pid)" || true
+          fi
+
       - name: Stop dwctl
-        if: always()
+        if: always() && env.RUN_COMPLIANCE == 'true'
         run: docker rm -f dwctl-openresponses-compliance || true
 
   security-scan:
@@ -1495,8 +1339,12 @@ jobs:
       packages: read
 
     steps:
+      # The image is built from the PR head, so mount config and run tests
+      # from that same revision rather than GitHub's synthetic merge commit.
       - name: Checkout code
         uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
       - name: Install just
         uses: extractions/setup-just@v3
@@ -1566,3 +1414,96 @@ jobs:
 
           # Report metrics to Somnial
           curl -X POST "https://charts.somnial.co/doubleword-control-layer/e2e-docker-duration?value=${E2E_DURATION}" || true
+
+  pooled-e2e:
+    if: always() && needs.changes.outputs.run-ci == 'true' && (needs.build.result == 'success' || needs.build.result == 'skipped') && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+    name: dwctl / pooled database e2e (${{ matrix.schema-mode }})
+    strategy:
+      fail-fast: false
+      matrix:
+        schema-mode: [shared, scoped]
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 30
+    needs: [changes, build]
+    permissions:
+      contents: read
+      packages: read
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install transaction pooler and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pgbouncer
+          python -m pip install -r scripts/tests/pooled/requirements.txt
+          pgbouncer --version
+
+      - name: Log in to GitHub Container Registry
+        if: needs.build.result == 'success'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Merge queues, fork PRs, and Dependabot do not publish an image. Build
+      # the checked-out application locally without registry write privileges.
+      - name: Install Rust for unpublished builds
+        if: needs.build.result == 'skipped'
+        uses: dtolnay/rust-toolchain@1.99.0
+
+      - name: Cache unpublished application build
+        if: needs.build.result == 'skipped'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: pooled-e2e-binary
+
+      - name: Build unpublished application
+        if: needs.build.result == 'skipped'
+        env:
+          SQLX_OFFLINE: "true"
+        run: cargo build --locked --profile ci --package dwctl
+
+      - name: Test session isolation and pooled application lifecycle
+        shell: bash
+        env:
+          BUILT_IMAGES: ${{ needs.build.outputs.image-tag }}
+          POOLED_TEST_DATABASE_URL: postgres://postgres:password@127.0.0.1:5432/postgres
+        run: |
+          set -euo pipefail
+          if [[ -n "$BUILT_IMAGES" ]]; then
+            image=$(head -n1 <<< "$BUILT_IMAGES")
+            docker pull "$image"
+            target=(--image "$image")
+          else
+            target=(--binary target/ci/dwctl)
+          fi
+          python scripts/tests/pooled/e2e.py "${target[@]}" --schema-mode "${{ matrix.schema-mode }}" --artifacts pooled-e2e-results 2>&1 | tee pooled-e2e.log
+
+      - name: Upload pooled database diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pooled-database-e2e-${{ matrix.schema-mode }}
+          path: |
+            pooled-e2e.log
+            pooled-e2e-results/
+          if-no-files-found: ignore

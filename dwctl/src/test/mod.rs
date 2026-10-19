@@ -1,11 +1,16 @@
 pub mod anthropic;
+pub mod batch_trace_attributes;
 pub mod cache_classifier;
 pub mod databases;
-pub mod multi_step_executor;
+pub mod modalities;
+pub mod rejections;
 pub mod responses;
+pub mod serving_classes;
 pub mod sigterm_drain;
 pub mod sla;
 pub mod strict_mode;
+pub mod template;
+pub mod toleration_presets;
 pub mod utils;
 pub mod zdr_sentinel;
 
@@ -36,16 +41,14 @@ struct StreamingFixture {
     group_id: Uuid,
 }
 
-async fn setup_streaming_fixture(
-    pool: &PgPool,
-    mock_endpoint_url: String,
-    model_name: &str,
-    alias: &str,
-    open_responses_adapter: Option<bool>,
-) -> StreamingFixture {
+async fn setup_streaming_fixture(pool: &PgPool, mock_endpoint_url: String, model_name: &str, alias: &str) -> StreamingFixture {
     let mut config = crate::test::utils::create_test_config();
     config.background_services.onwards_sync.enabled = true;
     config.enable_request_logging = true;
+    config.onwards.strict_mode = true;
+    // Batch traffic to these paths is forced to stream and reassembled on the way
+    // back, which is what these fixtures exercise.
+    config.background_services.batch_daemon.streamable_endpoints = vec!["/v1/chat/completions".to_string(), "/v1/completions".to_string()];
 
     let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
         .await
@@ -114,7 +117,6 @@ async fn setup_streaming_fixture(
             "alias": alias,
             "description": "Test model deployment",
             "hosted_on": endpoint.id,
-            "open_responses_adapter": open_responses_adapter,
             "tariffs": [{
                 "name": "batch",
                 "input_price_per_token": "0.001",
@@ -220,7 +222,7 @@ async fn create_standard_model_for_test(
     response.json()
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn ai_models_lists_group_accessible_paid_models_without_credits(pool: PgPool) {
     let mut config = crate::test::utils::create_test_config();
     config.background_services.onwards_sync.enabled = true;
@@ -346,7 +348,7 @@ async fn ai_models_lists_group_accessible_paid_models_without_credits(pool: PgPo
     );
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn ai_models_supports_optional_group_and_realtime_filters(pool: PgPool) {
     let config = crate::test::utils::create_test_config();
 
@@ -554,6 +556,39 @@ async fn ai_models_supports_optional_group_and_realtime_filters(pool: PgPool) {
     assert_eq!(invalid_capabilities_response.status_code(), 400);
 }
 
+#[dwctl_test_macros::test]
+async fn ai_models_unknown_key_401_points_at_regional_endpoints_docs(pool: PgPool) {
+    let config = crate::test::utils::create_test_config();
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        .await
+        .expect("Failed to create application");
+    let (server, _bg_services) = app.into_test_server();
+
+    let response = server
+        .get("/ai/v1/models")
+        .add_header("authorization", "Bearer not-a-real-key")
+        .await;
+    assert_eq!(response.status_code(), 401);
+
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["error"]["type"], "authentication_error");
+    assert_eq!(body["error"]["code"], "invalid_api_key");
+    assert_eq!(body["error"]["message"], crate::errors::INVALID_API_KEY_MESSAGE);
+
+    // The copy stays generic: it must point at the regional-endpoints docs page
+    // without enumerating regional API base URLs in the error body.
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("https://docs.doubleword.ai/inference-api/regional-endpoints"));
+    assert!(
+        !message.contains("api.doubleword.ai"),
+        "401 copy must not enumerate regional base URLs"
+    );
+    assert!(
+        !message.contains("api.us.doubleword.ai"),
+        "401 copy must not enumerate regional base URLs"
+    );
+}
+
 async fn assert_usage_recorded(fixture: &StreamingFixture, expected_uri: &str, prompt_tokens: i64, completion_tokens: i64) {
     let mut tries = 0;
     // The batcher flush folds the balance in the same transaction that
@@ -626,7 +661,151 @@ async fn cleanup_fixture(fixture: StreamingFixture) {
     fixture.bg_services.shutdown().await;
 }
 
-#[sqlx::test]
+/// A client asking for a stream must receive one, through the whole app.
+///
+/// This is the regression that shipped: the edge decided to reassemble from a
+/// header it stamps on every inbound request, so a client's `stream: true` came
+/// back as one `chat.completion` object. Nothing at this level covered it - both
+/// streaming fixtures sent the daemon's headers, so both took the daemon's path.
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_e2e_ai_proxy_client_stream_is_not_reassembled(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    let sse_response = "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello!\"}}],\"usage\":null}\n\ndata: [DONE]\n\n";
+
+    wiremock::Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(serde_json::json!({ "stream": true })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse_response, "text/event-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo", "test-model").await;
+
+    // No daemon headers at all: this is a client, and the client asked to stream.
+    let inference_response = fixture
+        .server
+        .post("/ai/v1/chat/completions")
+        .add_header("authorization", format!("Bearer {}", fixture.api_key))
+        .json(&serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello from E2E test"}],
+            "stream": true
+        }))
+        .await;
+
+    assert_eq!(inference_response.status_code().as_u16(), 200);
+    let content_type = inference_response
+        .headers()
+        .get("content-type")
+        .map_or("", |v| v.to_str().unwrap_or_default())
+        .to_string();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "a client that asked to stream must not be handed an assembled body, got {content_type:?}"
+    );
+    assert!(
+        inference_response.text().starts_with("data:"),
+        "the frames themselves must reach the client"
+    );
+
+    cleanup_fixture(fixture).await;
+}
+
+/// A client's stream follows OpenAI's `include_usage` contract and carries the
+/// gateway's id, while billing still reads the usage the gateway forced on.
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_e2e_ai_proxy_client_stream_usage_and_ids(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    let sse_response = concat!(
+        "data: {\"id\":\"chatcmpl-upstream\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello!\"}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"chatcmpl-upstream\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+        "data: {\"id\":\"chatcmpl-upstream\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo\",\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":12,\"total_tokens\":21}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    // The gateway always asks upstream for usage, whatever the client sent.
+    wiremock::Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(serde_json::json!({
+            "stream": true,
+            "stream_options": { "include_usage": true }
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse_response, "text/event-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo", "test-model").await;
+
+    // Missing first: billing must still see the usage the client never asked for.
+    for stream_options in [None, Some(false), Some(true)] {
+        let mut body = serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello from E2E test"}],
+            "stream": true
+        });
+        if let Some(include_usage) = stream_options {
+            body["stream_options"] = serde_json::json!({ "include_usage": include_usage });
+        }
+        let response = fixture
+            .server
+            .post("/ai/v1/chat/completions")
+            .add_header("authorization", format!("Bearer {}", fixture.api_key))
+            .json(&body)
+            .await;
+        assert_eq!(response.status_code().as_u16(), 200, "{stream_options:?}");
+
+        let text = response.text();
+        assert!(text.ends_with("data: [DONE]\n\n"), "{stream_options:?}: {text}");
+        let chunks: Vec<serde_json::Value> = text
+            .split("\n\n")
+            .filter_map(|event| event.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect();
+
+        let id = chunks[0]["id"].as_str().unwrap();
+        assert!(id.starts_with("resp_"), "{stream_options:?}: {id}");
+        assert!(chunks.iter().all(|chunk| chunk["id"] == id), "{stream_options:?}: {text}");
+
+        if stream_options == Some(true) {
+            assert_eq!(chunks.len(), 3, "{text}");
+            assert!(
+                chunks[..2].iter().all(|chunk| chunk.get("usage") == Some(&serde_json::Value::Null)),
+                "{text}"
+            );
+            assert_eq!(chunks[2]["choices"], serde_json::json!([]));
+            assert_eq!(chunks[2]["usage"]["total_tokens"], 21);
+        } else {
+            assert_eq!(chunks.len(), 2, "{stream_options:?}: {text}");
+            assert!(
+                chunks.iter().all(|chunk| chunk.get("usage").is_none()),
+                "{stream_options:?}: {text}"
+            );
+            assert!(
+                chunks.iter().all(|chunk| chunk["choices"][0].is_object()),
+                "{stream_options:?}: {text}"
+            );
+        }
+
+        if stream_options.is_none() {
+            assert_usage_recorded(&fixture, "http://localhost/chat/completions", 9, 12).await;
+        }
+    }
+
+    cleanup_fixture(fixture).await;
+}
+
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_e2e_ai_proxy_streaming_chat_completions_with_fusillade_header(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -647,13 +826,18 @@ async fn test_e2e_ai_proxy_streaming_chat_completions_with_fusillade_header(pool
         .mount(&mock_server)
         .await;
 
-    let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo", "test-model", None).await;
+    let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo", "test-model").await;
 
+    let request_id = uuid::Uuid::new_v4();
     let inference_response = fixture
         .server
         .post("/ai/v1/chat/completions")
         .add_header("authorization", format!("Bearer {}", fixture.api_key))
-        .add_header("x-fusillade-stream", "true")
+        // Both headers, because a real daemon dispatch carries both: the mark it
+        // sets for itself, and the correlation id the edge takes an early return
+        // on so a dispatch does not create a second row.
+        .add_header(crate::inference::outbound_request::STREAM_MARKER_HEADER, "1")
+        .add_header("x-fusillade-request-id", request_id.to_string())
         .json(&serde_json::json!({
             "model": "test-model",
             "messages": [{"role": "user", "content": "Hello from E2E test"}]
@@ -661,12 +845,19 @@ async fn test_e2e_ai_proxy_streaming_chat_completions_with_fusillade_header(pool
         .await;
 
     assert_eq!(inference_response.status_code().as_u16(), 200);
-    assert_eq!(inference_response.text(), sse_response);
+    let assembled: serde_json::Value = inference_response.json();
+    assert_eq!(
+        assembled["id"],
+        format!("resp_{request_id}"),
+        "the batch result carries the request's id"
+    );
+    assert_eq!(assembled["choices"][0]["message"]["content"], "Hello! How can I help you today?");
+    assert_eq!(assembled["usage"]["total_tokens"], 21);
     assert_usage_recorded(&fixture, "http://localhost/chat/completions", 9, 12).await;
     cleanup_fixture(fixture).await;
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_e2e_ai_proxy_streaming_completions_with_fusillade_header(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -687,20 +878,18 @@ async fn test_e2e_ai_proxy_streaming_completions_with_fusillade_header(pool: PgP
         .mount(&mock_server)
         .await;
 
-    let fixture = setup_streaming_fixture(
-        &pool,
-        format!("{}/v1", mock_server.uri()),
-        "gpt-3.5-turbo-instruct",
-        "test-model",
-        None,
-    )
-    .await;
+    let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo-instruct", "test-model").await;
 
+    let request_id = uuid::Uuid::new_v4();
     let inference_response = fixture
         .server
         .post("/ai/v1/completions")
         .add_header("authorization", format!("Bearer {}", fixture.api_key))
-        .add_header("x-fusillade-stream", "true")
+        // Both headers, because a real daemon dispatch carries both: the mark it
+        // sets for itself, and the correlation id the edge takes an early return
+        // on so a dispatch does not create a second row.
+        .add_header(crate::inference::outbound_request::STREAM_MARKER_HEADER, "1")
+        .add_header("x-fusillade-request-id", request_id.to_string())
         .json(&serde_json::json!({
             "model": "test-model",
             "prompt": "Hello from E2E test"
@@ -708,7 +897,13 @@ async fn test_e2e_ai_proxy_streaming_completions_with_fusillade_header(pool: PgP
         .await;
 
     assert_eq!(inference_response.status_code().as_u16(), 200);
-    assert_eq!(inference_response.text(), sse_response);
+    let assembled: serde_json::Value = inference_response.json();
+    assert_eq!(
+        assembled["id"],
+        format!("resp_{request_id}"),
+        "the batch result carries the request's id"
+    );
+    assert_eq!(assembled["usage"]["total_tokens"], 20);
     assert_usage_recorded(&fixture, "http://localhost/completions", 8, 12).await;
     cleanup_fixture(fixture).await;
 }
@@ -718,17 +913,16 @@ async fn test_e2e_ai_proxy_streaming_completions_with_fusillade_header(pool: PgP
 // The original test proxied a streaming `/v1/responses` request to a
 // wiremock that returned an SSE response and asserted the proxied
 // stream made it through unchanged. Since commit `6a7c24d7`,
-// `/v1/responses` doesn't proxy — it engages the multi-step warm
-// path which builds chat-completions payloads itself and fires per-
-// step model_calls over an HTTP loopback (unreachable from the
-// axum_test in-memory transport). Streaming coverage of the warm
-// path's SSE event sink lives in `responses::streaming`'s unit tests
-// and the `multi_step_executor` integration test; an e2e proxy test
-// for `/v1/responses` would need a real loopback listener.
+// `/v1/responses` doesn't proxy — the edge translates it to a
+// chat-completions call itself (the multi-step tool loop that once
+// lived here was removed in 2026-08, along with `response_steps`).
+// Streaming coverage lives in `responses::streaming`'s unit tests;
+// an e2e proxy test for `/v1/responses` would need a real loopback
+// listener.
 
 /// End-to-end test: Traffic routing rules are enforced by onwards after sync.
 /// Covers three scenarios: baseline allow, deny by purpose, and redirect by purpose.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_e2e_traffic_routing_rules(pool: PgPool) {
     // Setup wiremock server to mock inference endpoint
@@ -1032,7 +1226,7 @@ async fn test_e2e_traffic_routing_rules(pool: PgPool) {
     bg_services.shutdown().await;
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_database_seeding_behavior(pool: PgPool) {
     use crate::config::ModelSource;
@@ -1145,7 +1339,7 @@ async fn test_database_seeding_behavior(pool: PgPool) {
     assert_eq!(final_count, Some(2), "Should still have 2 endpoints");
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_request_logging_enabled(pool: PgPool) {
     // Create test config with request logging enabled
@@ -1160,8 +1354,8 @@ async fn test_request_logging_enabled(pool: PgPool) {
 
     // Get outlet_db from app_state to query logs
     let outlet_pool = app.app_state.outlet_db.clone().expect("outlet_db should exist");
-    let repository: outlet_postgres::RequestRepository<DbPools, AiRequest, AiResponse> =
-        outlet_postgres::RequestRepository::new(outlet_pool);
+    let repository: outlet_postgres::RequestRepository<sqlx::PgPool, AiRequest, AiResponse> =
+        outlet_postgres::RequestRepository::new(outlet_pool.write().into_inner());
 
     let (server, _drop_guard) = app.into_test_server();
 
@@ -1193,7 +1387,7 @@ async fn test_request_logging_enabled(pool: PgPool) {
 /// ones normally. Drives the handler directly against the real outlet tables so
 /// the assertion is at the DB layer, no Redis or proxy needed. Remove with
 /// `ZdrBodyScrubber`.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_outlet_suppresses_zdr_bodies(pool: PgPool) {
     use bytes::Bytes;
@@ -1201,11 +1395,12 @@ async fn test_outlet_suppresses_zdr_bodies(pool: PgPool) {
     use std::collections::HashMap;
     use std::time::{Duration, SystemTime};
 
-    // Create the outlet logging tables (http_requests / http_responses). Apply
-    // the DDL directly rather than via `.run()`: `#[sqlx::test]` already ran
-    // dwctl's migrations into this database's shared `_sqlx_migrations`, and
-    // outlet's migrator would reject that unknown history (in production outlet
-    // gets its own schema/DB with its own migration table).
+    // Create the outlet logging tables (http_requests / http_responses) in
+    // `public`, where this pool resolves unqualified names. The template's
+    // `outlet` schema is not on that search path. Apply the DDL directly rather
+    // than via `.run()`: `public._sqlx_migrations` already holds dwctl's
+    // history, which outlet's migrator would reject (in production outlet gets
+    // its own schema/DB with its own migration table).
     for migration in outlet_postgres::migrator().iter() {
         sqlx::raw_sql(migration.sql.as_ref())
             .execute(&pool)
@@ -1214,10 +1409,9 @@ async fn test_outlet_suppresses_zdr_bodies(pool: PgPool) {
     }
 
     // Real analytics handler wrapped in the scrubber, mirroring lib.rs wiring.
-    let handler =
-        outlet_postgres::PostgresHandler::<DbPools, serde_json::Value, serde_json::Value>::from_pool_provider(DbPools::new(pool.clone()))
-            .await
-            .expect("build PostgresHandler");
+    let handler = outlet_postgres::PostgresHandler::<sqlx::PgPool, serde_json::Value, serde_json::Value>::from_pool_provider(pool.clone())
+        .await
+        .expect("build PostgresHandler");
     let handler = crate::inference::engine::outlet_handler::ZdrBodyScrubber::new(handler);
 
     fn request(correlation_id: u64, zdr: bool) -> RequestData {
@@ -1295,7 +1489,7 @@ async fn test_request_logging_disabled(pool: PgPool) {
     underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
     let task_state = TaskState {
         request_manager: request_manager.clone(),
-        dwctl_pool: pool.clone(),
+        dwctl_pool: sqlx_pool_router::DynPools::new(pool.clone()),
         config: shared_config.clone(),
         encryption_key: None,
         ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -1327,9 +1521,10 @@ async fn test_request_logging_disabled(pool: PgPool) {
         .response_store(response_store)
         .image_normalizer(std::sync::Arc::new(crate::image_normalizer::DisabledNormalizer)
             as std::sync::Arc<dyn crate::image_normalizer::ImageNormalizer>)
+        .key_policy_cache(crate::sync::key_policy::KeyPolicyCache::empty())
         .build();
     let onwards_router = axum::Router::new(); // Empty onwards router for testing
-    let router = super::build_router(&mut app_state, onwards_router, None, None, None, false, None)
+    let router = super::build_router(&mut app_state, onwards_router, None, None, None, false, None, None)
         .await
         .expect("Failed to build router");
 
@@ -1376,11 +1571,15 @@ async fn test_dedicated_databases_for_components(pool: PgPool) {
 
     // Configure fusillade to use dedicated database
     config.database = crate::config::DatabaseConfig::External {
+        pooled_url: None,
+        direct_pool: crate::config::default_direct_pool(),
         url: "ignored".to_string(), // Will be overridden by pool
         replica_url: None,
         pool: PoolSettings::default(),
         replica_pool: None,
         fusillade: ComponentDb::Dedicated {
+            pooled_url: None,
+            direct_pool: crate::config::default_direct_pool(),
             url: test_dbs.fusillade_url.clone(),
             replica_url: None,
             pool: PoolSettings {
@@ -1391,6 +1590,8 @@ async fn test_dedicated_databases_for_components(pool: PgPool) {
             replica_pool: None,
         },
         outlet: ComponentDb::Dedicated {
+            pooled_url: None,
+            direct_pool: crate::config::default_direct_pool(),
             url: test_dbs.outlet_url.clone(),
             replica_url: None,
             pool: PoolSettings {
@@ -1455,8 +1656,8 @@ async fn test_dedicated_databases_for_components(pool: PgPool) {
     );
 
     // Make a request and verify it gets logged to the dedicated outlet database
-    let repository: outlet_postgres::RequestRepository<DbPools, AiRequest, AiResponse> =
-        outlet_postgres::RequestRepository::new(outlet_pool);
+    let repository: outlet_postgres::RequestRepository<sqlx::PgPool, AiRequest, AiResponse> =
+        outlet_postgres::RequestRepository::new(outlet_pool.write().into_inner());
 
     let (server, bg_services) = app.into_test_server();
 
@@ -1544,7 +1745,7 @@ async fn test_dedicated_databases_for_components(pool: PgPool) {
     test_dbs.cleanup().await.expect("Failed to cleanup test databases");
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn test_create_initial_admin_user_new_user(pool: PgPool) {
     let test_email = "new-admin@example.com";
 
@@ -1583,7 +1784,7 @@ async fn test_create_initial_admin_user_new_user(pool: PgPool) {
     assert!(created_user.roles.contains(&Role::PlatformManager));
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn test_create_initial_admin_user_existing_user(pool: PgPool) {
     let test_email = "existing-admin@example.com";
 
@@ -1722,8 +1923,6 @@ mod openapi_access_control {
                 name: format!("{purpose:?} key"),
                 description: None,
                 purpose,
-                requests_per_second: None,
-                burst_size: None,
                 member_id: None,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -1734,7 +1933,7 @@ mod openapi_access_control {
         .secret
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn admin_spec_returns_404_when_disabled(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -1756,7 +1955,7 @@ mod openapi_access_control {
         assert_eq!(response.status_code().as_u16(), 404);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn admin_spec_rejects_unauthenticated(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool, true).await;
 
@@ -1767,7 +1966,7 @@ mod openapi_access_control {
         assert_eq!(response.status_code().as_u16(), 401);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn admin_spec_rejects_inference_api_key(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
@@ -1785,7 +1984,7 @@ mod openapi_access_control {
         assert_eq!(response.status_code().as_u16(), 403);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn admin_spec_rejects_standard_user_session(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
@@ -1801,7 +2000,7 @@ mod openapi_access_control {
         assert_eq!(response.status_code().as_u16(), 403);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn admin_spec_rejects_request_viewer(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
         let user = crate::test::utils::create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::RequestViewer]).await;
@@ -1816,7 +2015,7 @@ mod openapi_access_control {
         assert_eq!(response.status_code().as_u16(), 403);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn admin_spec_allows_platform_manager_session(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -1839,7 +2038,7 @@ mod openapi_access_control {
         assert_eq!(response.status_code().as_u16(), 200);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn admin_spec_allows_platform_api_key(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -1852,14 +2051,64 @@ mod openapi_access_control {
         assert_eq!(response.status_code().as_u16(), 200);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn ai_spec_rejects_unauthenticated(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool, true).await;
         let response = server.get("/ai/openapi.json").await;
         assert_eq!(response.status_code().as_u16(), 401);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
+    async fn unknown_bearer_key_401_points_at_regional_endpoints_docs(pool: PgPool) {
+        let (server, _bg) = make_app_with_admin_docs(pool, true).await;
+
+        // The CurrentUser extractor rejects unknown bearer keys for every
+        // dwctl-authenticated surface; the copy must nudge users to check
+        // their regional endpoint without enumerating base URLs.
+        let response = server
+            .get("/ai/openapi.json")
+            .add_header("authorization", "Bearer not-a-real-key")
+            .await;
+        assert_eq!(response.status_code().as_u16(), 401);
+
+        let text = response.text();
+        assert!(
+            text.contains(crate::errors::INVALID_API_KEY_MESSAGE),
+            "unknown-key 401 should carry the regional-endpoints copy, got: {text}"
+        );
+        assert!(
+            !text.contains("api.doubleword.ai"),
+            "401 copy must not enumerate regional base URLs"
+        );
+        assert!(
+            !text.contains("api.us.doubleword.ai"),
+            "401 copy must not enumerate regional base URLs"
+        );
+    }
+
+    #[dwctl_test_macros::test]
+    async fn ai_spec_error_example_matches_live_copy(pool: PgPool) {
+        let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let headers = add_auth_headers(&user);
+
+        let response = server
+            .get("/ai/openapi.json")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        assert_eq!(response.status_code().as_u16(), 200);
+
+        // The documented error example in the AI spec description is a separate
+        // string literal; keep it from drifting away from the live 401 copy.
+        let text = response.text();
+        assert!(
+            text.contains(crate::errors::INVALID_API_KEY_MESSAGE),
+            "AI OpenAPI description should embed the live invalid-API-key copy"
+        );
+    }
+
+    #[dwctl_test_macros::test]
     async fn ai_spec_allows_any_authenticated_identity(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
 
@@ -1893,7 +2142,7 @@ mod openapi_access_control {
     }
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn test_build_router_with_metrics_disabled(pool: PgPool) {
     let mut config = create_test_config();
     config.enable_metrics = false;
@@ -1908,7 +2157,7 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
     underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
     let task_state = crate::tasks::TaskState {
         request_manager: request_manager.clone(),
-        dwctl_pool: pool.clone(),
+        dwctl_pool: sqlx_pool_router::DynPools::new(pool.clone()),
         config: shared_config.clone(),
         encryption_key: None,
         ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -1940,10 +2189,11 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
         .response_store(response_store)
         .image_normalizer(std::sync::Arc::new(crate::image_normalizer::DisabledNormalizer)
             as std::sync::Arc<dyn crate::image_normalizer::ImageNormalizer>)
+        .key_policy_cache(crate::sync::key_policy::KeyPolicyCache::empty())
         .build();
 
     let onwards_router = axum::Router::new();
-    let router = super::build_router(&mut app_state, onwards_router, None, None, None, false, None)
+    let router = super::build_router(&mut app_state, onwards_router, None, None, None, false, None, None)
         .await
         .expect("Failed to build router");
     let server = axum_test::TestServer::new(router).expect("Failed to create test server");
@@ -1955,7 +2205,7 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
     assert!(!metrics_content.contains("# HELP") && !metrics_content.contains("# TYPE"));
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn test_build_router_with_metrics_enabled(pool: PgPool) {
     let mut config = create_test_config();
     config.enable_metrics = true;
@@ -1970,7 +2220,7 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
     underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
     let task_state = TaskState {
         request_manager: request_manager.clone(),
-        dwctl_pool: pool.clone(),
+        dwctl_pool: sqlx_pool_router::DynPools::new(pool.clone()),
         config: shared_config.clone(),
         encryption_key: None,
         ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -2002,10 +2252,11 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
         .response_store(response_store)
         .image_normalizer(std::sync::Arc::new(crate::image_normalizer::DisabledNormalizer)
             as std::sync::Arc<dyn crate::image_normalizer::ImageNormalizer>)
+        .key_policy_cache(crate::sync::key_policy::KeyPolicyCache::empty())
         .build();
 
     let onwards_router = axum::Router::new();
-    let router = super::build_router(&mut app_state, onwards_router, None, None, None, false, None)
+    let router = super::build_router(&mut app_state, onwards_router, None, None, None, false, None, None)
         .await
         .expect("Failed to build router");
     let server = axum_test::TestServer::new(router).expect("Failed to create test server");
@@ -2023,7 +2274,7 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
 // ===== Composite Model Tests =====
 
 /// Test creating a composite model
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_create_composite_model(pool: PgPool) {
     let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
@@ -2053,7 +2304,7 @@ async fn test_create_composite_model(pool: PgPool) {
 }
 
 /// Test adding components to a composite model
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_add_component_to_composite_model(pool: PgPool) {
     let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
@@ -2124,7 +2375,7 @@ async fn test_add_component_to_composite_model(pool: PgPool) {
 }
 
 /// Test that adding a composite model as a component fails
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_cannot_add_composite_as_component(pool: PgPool) {
     let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
@@ -2173,7 +2424,7 @@ async fn test_cannot_add_composite_as_component(pool: PgPool) {
 }
 
 /// Test that adding components to a non-composite model fails
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_cannot_add_component_to_standard_model(pool: PgPool) {
     let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
@@ -2241,7 +2492,7 @@ async fn test_cannot_add_component_to_standard_model(pool: PgPool) {
 }
 
 /// Test updating a component's weight and enabled status
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_update_component(pool: PgPool) {
     let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
@@ -2321,7 +2572,7 @@ async fn test_update_component(pool: PgPool) {
 }
 
 /// Test removing a component from a composite model
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_remove_component(pool: PgPool) {
     let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
@@ -2402,7 +2653,7 @@ async fn test_remove_component(pool: PgPool) {
 }
 
 /// Test weight validation (must be 1-100)
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_component_weight_validation(pool: PgPool) {
     let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
@@ -2495,7 +2746,7 @@ async fn test_component_weight_validation(pool: PgPool) {
 /// This demonstrates sqlx_pool_router::TestDbPools' ability to catch pool routing violations.
 /// The replica pool is configured with `default_transaction_read_only = on`,
 /// so any write operations will fail with a PostgreSQL error.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn test_read_pool_enforces_readonly(pool: PgPool) {
     // Create test pools with read-only enforcement on replica using sqlx_pool_router
     let db_pools = sqlx_pool_router::TestDbPools::new(pool).await.unwrap();
@@ -2524,4 +2775,138 @@ async fn test_read_pool_enforces_readonly(pool: PgPool) {
         .await;
 
     assert!(result.is_ok(), "Write operation on write pool should succeed");
+}
+
+/// The components API round-trips a member's pool, and lets the SAME hosted
+/// model be a member of two pools with independent per-pool ordering — which is
+/// how the canary is wired (dynamo position 0 in both).
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_component_pool_round_trips_and_allows_dual_membership(pool: PgPool) {
+    let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
+    let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let headers = add_auth_headers(&admin);
+
+    let endpoint: serde_json::Value = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({"name": "Test Endpoint", "url": "https://api.example.com/v1"}))
+        .await
+        .json();
+
+    let mut members = Vec::new();
+    for name in ["dynamo-flash", "fireworks-flash", "novita-flash"] {
+        let model: serde_json::Value = server
+            .post("/admin/api/v1/models")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&serde_json::json!({"type": "standard", "model_name": name, "hosted_on": endpoint["id"]}))
+            .await
+            .json();
+        members.push(model["id"].as_str().unwrap().to_string());
+    }
+
+    let composite: serde_json::Value = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({"type": "composite", "model_name": "dsv4-flash"}))
+        .await
+        .json();
+    let composite_id = composite["id"].as_str().unwrap().to_string();
+
+    let add = async |member: &str, body: serde_json::Value| {
+        server
+            .post(&format!("/admin/api/v1/models/{composite_id}/components/{member}"))
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&body)
+            .await
+    };
+
+    // An add that names no pool keeps today's behaviour: the default pool.
+    let plain = add(&members[2], serde_json::json!({"weight": 50})).await;
+    assert_eq!(plain.status_code(), 200);
+    assert_eq!(plain.json::<serde_json::Value>()["pool"], "default");
+
+    let on_prem = add(&members[0], serde_json::json!({"weight": 50})).await;
+    assert_eq!(on_prem.status_code(), 200);
+    assert_eq!(on_prem.json::<serde_json::Value>()["pool"], "default");
+
+    // The same hosted model joins the completions pool too — position 0 there,
+    // independent of its position in the default pool.
+    let on_prem_completions = add(&members[0], serde_json::json!({"weight": 50, "pool": "completions"})).await;
+    assert_eq!(on_prem_completions.status_code(), 200, "a member may belong to more than one pool");
+    let on_prem_completions: serde_json::Value = on_prem_completions.json();
+    assert_eq!(on_prem_completions["pool"], "completions");
+    assert_eq!(on_prem_completions["sort_order"], 0, "ordering is per pool");
+
+    // The validated target sits behind it, in the completions pool only.
+    let validated = add(&members[1], serde_json::json!({"weight": 50, "pool": "completions"})).await;
+    assert_eq!(validated.status_code(), 200);
+    let validated_body: serde_json::Value = validated.json();
+    assert_eq!(validated_body["pool"], "completions");
+    assert_eq!(validated_body["sort_order"], 1);
+
+    // A pool name outside the CHECK constraint is refused at the schema.
+    let bogus = add(&members[1], serde_json::json!({"weight": 50, "pool": "chat"})).await;
+    assert!(
+        bogus.status_code().is_client_error(),
+        "unknown pool names must not reach the database: {}",
+        bogus.status_code()
+    );
+
+    // A PATCH addresses one membership, named by `?pool=`; the other is untouched.
+    let moved = server
+        .patch(&format!(
+            "/admin/api/v1/models/{composite_id}/components/{}?pool=completions",
+            members[1]
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({"sort_order": 0}))
+        .await;
+    assert_eq!(moved.status_code(), 200);
+    assert_eq!(moved.json::<serde_json::Value>()["sort_order"], 0);
+
+    let listed: serde_json::Value = server
+        .get(&format!("/admin/api/v1/models/{composite_id}/components"))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .await
+        .json();
+    let pools: Vec<&str> = listed.as_array().unwrap().iter().map(|c| c["pool"].as_str().unwrap()).collect();
+    assert_eq!(pools.iter().filter(|p| **p == "completions").count(), 2);
+    assert_eq!(pools.iter().filter(|p| **p == "default").count(), 2);
+
+    // Removing a completions membership leaves the default one alone: the same
+    // model is still serving chat.
+    let removed = server
+        .delete(&format!(
+            "/admin/api/v1/models/{composite_id}/components/{}?pool=completions",
+            members[0]
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .await;
+    assert_eq!(removed.status_code(), 200);
+
+    let listed: serde_json::Value = server
+        .get(&format!("/admin/api/v1/models/{composite_id}/components"))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .await
+        .json();
+    let remaining: Vec<(&str, &str)> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["model"]["id"].as_str().unwrap(), c["pool"].as_str().unwrap()))
+        .collect();
+    assert!(
+        remaining.contains(&(members[0].as_str(), "default")),
+        "the default-pool membership survives: {remaining:?}"
+    );
+    assert!(!remaining.contains(&(members[0].as_str(), "completions")));
 }

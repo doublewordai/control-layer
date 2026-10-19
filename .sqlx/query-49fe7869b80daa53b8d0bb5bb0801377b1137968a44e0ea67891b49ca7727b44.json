@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT usage_date, input_tokens, output_tokens, request_count\n            FROM user_model_usage_daily\n            WHERE user_id = $1 AND model = 'gpt-4'\n            ORDER BY usage_date\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "usage_date",
+        "type_info": "Date"
+      },
+      {
+        "ordinal": 1,
+        "name": "input_tokens",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "output_tokens",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "request_count",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "49fe7869b80daa53b8d0bb5bb0801377b1137968a44e0ea67891b49ca7727b44"
+}

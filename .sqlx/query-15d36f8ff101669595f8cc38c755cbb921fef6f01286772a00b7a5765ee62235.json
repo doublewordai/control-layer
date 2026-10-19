@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO http_analytics\n               (instance_id, correlation_id, timestamp, method, uri, model, status_code, user_id,\n                prompt_tokens, completion_tokens, total_tokens,\n                total_cost, input_price_per_token, output_price_per_token, fusillade_request_id)\n             VALUES ($1,1,NOW(),'POST','/messages',$2,200,$3,$4,$5,$6,$7,0.000001,0.000002,$8)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Uuid",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Numeric",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "15d36f8ff101669595f8cc38c755cbb921fef6f01286772a00b7a5765ee62235"
+}

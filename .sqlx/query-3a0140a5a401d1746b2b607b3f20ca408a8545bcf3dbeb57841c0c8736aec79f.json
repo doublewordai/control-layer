@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT name as \"name!\" FROM api_keys WHERE user_id = $1 AND is_deleted = false ORDER BY name",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name!",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "3a0140a5a401d1746b2b607b3f20ca408a8545bcf3dbeb57841c0c8736aec79f"
+}

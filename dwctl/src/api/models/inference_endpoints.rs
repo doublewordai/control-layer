@@ -1,7 +1,7 @@
 //! API request/response models for inference endpoints.
 
 use super::pagination::Pagination;
-use crate::db::models::inference_endpoints::InferenceEndpointDBResponse;
+use crate::db::models::inference_endpoints::{EndpointKind, InferenceEndpointDBResponse};
 use crate::reasoning::ReasoningTranslationConfig;
 use crate::types::{InferenceEndpointId, UserId};
 use chrono::{DateTime, Utc};
@@ -135,6 +135,32 @@ pub struct InferenceEndpointCreate {
     /// Default provider mapping for canonical reasoning controls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_translation: Option<ReasoningTranslationConfig>,
+    /// This endpoint's serving stack understands the scheduling `priority`
+    /// request field (the dynamo frontend does; third-party APIs reject
+    /// unknown fields). Onwards strips the field from named-pool attempts to
+    /// members of endpoints without it. Defaults to false.
+    #[serde(default)]
+    pub accepts_scheduling_priority: bool,
+    /// What kind of server this is: `dynamo` (self-hosted behind the dynamo
+    /// frontend; the only kind that receives the serving-class envelope),
+    /// `hosted` (self-hosted, not dynamo) or `external` (third-party
+    /// provider; skipped for self-hosted-only accounts). When omitted:
+    /// `dynamo` if `accepts_scheduling_priority` is set (the two describe
+    /// the same server, as the migration backfill assumes), else `external`,
+    /// which stamps nothing and is never skipped for the wrong reason.
+    #[serde(default)]
+    pub kind: Option<EndpointKind>,
+}
+
+impl InferenceEndpointCreate {
+    /// The kind to store: explicit, else derived from the priority capability.
+    pub fn resolved_kind(&self) -> EndpointKind {
+        self.kind.unwrap_or(if self.accepts_scheduling_priority {
+            EndpointKind::Dynamo
+        } else {
+            EndpointKind::External
+        })
+    }
 }
 
 fn default_sync() -> bool {
@@ -157,6 +183,12 @@ pub struct InferenceEndpointUpdate {
     /// Endpoint reasoning default (omitted = unchanged, null = clear).
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub reasoning_translation: Option<Option<ReasoningTranslationConfig>>,
+    /// See `InferenceEndpointCreate::accepts_scheduling_priority` (omitted = unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepts_scheduling_priority: Option<bool>,
+    /// See `InferenceEndpointCreate::kind` (omitted = unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<EndpointKind>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -197,6 +229,8 @@ pub struct InferenceEndpointResponse {
     pub auth_header_prefix: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_translation: Option<ReasoningTranslationConfig>,
+    pub accepts_scheduling_priority: bool,
+    pub kind: EndpointKind,
     #[schema(value_type = String, format = "uuid")]
     pub created_by: UserId,
     pub created_at: DateTime<Utc>,
@@ -215,6 +249,8 @@ impl From<InferenceEndpointDBResponse> for InferenceEndpointResponse {
             auth_header_name: db.auth_header_name,
             auth_header_prefix: db.auth_header_prefix,
             reasoning_translation: db.reasoning_translation,
+            accepts_scheduling_priority: db.accepts_scheduling_priority,
+            kind: db.kind,
             created_by: db.created_by,
             created_at: db.created_at,
             updated_at: db.updated_at,

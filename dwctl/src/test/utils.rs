@@ -1,4 +1,6 @@
 //! Test utilities for integration testing
+use std::time::Instant;
+
 use crate::config::{
     BatchConfig, DaemonConfig, DaemonEnabled, FileLimitsConfig, FilesConfig, LeaderElectionConfig, LimitsConfig, NativeAuthConfig,
     OnwardsSyncConfig, PasswordConfig, PoolSettings, ProbeSchedulerConfig, ProxyHeaderAuthConfig, SecurityConfig,
@@ -36,14 +38,17 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
         .await
         .expect("Failed to create fusillade TestDbPools");
 
-    let request_manager = std::sync::Arc::new(fusillade_arsenal::PostgresRequestManager::new(fusillade_pools, Default::default()));
+    let request_manager = std::sync::Arc::new(
+        fusillade_arsenal::PostgresRequestManager::new(fusillade_pools, Default::default())
+            .with_retained_response_fence_seconds(config.background_services.batch_daemon.retention.max_late_writer_seconds),
+    );
     let limiters = crate::limits::Limiters::new(&config.limits);
     let shared_config = crate::SharedConfig::new(config);
 
     underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
     let task_state = crate::tasks::TaskState {
         request_manager: request_manager.clone(),
-        dwctl_pool: pool.clone(),
+        dwctl_pool: sqlx_pool_router::DynPools::new(pool.clone()),
         config: shared_config.clone(),
         encryption_key: None,
         ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -79,6 +84,7 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
         .limiters(limiters)
         .response_store(response_store)
         .image_normalizer(image_normalizer)
+        .key_policy_cache(crate::sync::key_policy::KeyPolicyCache::empty())
         .build()
 }
 
@@ -86,6 +92,56 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
 /// test DB and return a small (max 4 conns) fusillade-schema pool. Use
 /// this from integration tests that drive fusillade directly without
 /// constructing the full Application.
+/// Insert a fusillade request template the way the production write path
+/// does: into this week's `request_templates_g2` partition with its
+/// `request_template_routes` row, so `fusillade.requests` can reference it and
+/// the `active_request_templates` / `request_templates_all` views resolve it.
+///
+/// `file_id = None` makes a dedicated (batchless) template.
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_fusillade_template(
+    pool: &PgPool,
+    template_id: Uuid,
+    file_id: Option<Uuid>,
+    model: &str,
+    api_key: &str,
+    endpoint: &str,
+    path: &str,
+    body: &str,
+    custom_id: Option<&str>,
+) {
+    let mut tx = pool.begin().await.expect("begin template insert transaction");
+    sqlx::query(
+        "SELECT fusillade.ensure_request_template_partition( \
+             date_trunc('week', transaction_timestamp() AT TIME ZONE 'UTC')::date, NULL)",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("ensure current template partition");
+    sqlx::query(
+        "WITH inserted AS ( \
+             INSERT INTO fusillade.request_templates_g2 \
+                 (created_on, id, file_id, custom_id, endpoint, method, path, body, model, api_key, body_byte_size) \
+             VALUES ((transaction_timestamp() AT TIME ZONE 'UTC')::date, $1, $2, $3, $4, 'POST', $5, $6, $7, $8, octet_length($6)) \
+             RETURNING id, created_on \
+         ) \
+         INSERT INTO fusillade.request_template_routes (template_id, week_start) \
+         SELECT id, date_trunc('week', created_on)::date FROM inserted",
+    )
+    .bind(template_id)
+    .bind(file_id)
+    .bind(custom_id)
+    .bind(endpoint)
+    .bind(path)
+    .bind(body)
+    .bind(model)
+    .bind(api_key)
+    .execute(&mut *tx)
+    .await
+    .expect("insert request template");
+    tx.commit().await.expect("commit template insert transaction");
+}
+
 pub async fn setup_fusillade_pool(pool: &PgPool) -> PgPool {
     use sqlx::Executor;
     use sqlx::postgres::PgConnectOptions;
@@ -129,17 +185,17 @@ pub async fn create_test_app_state_with_database_pools(
     let fusillade_test_pools = TestDbPools::new(fusillade_pool)
         .await
         .expect("Failed to create fusillade TestDbPools");
-    let request_manager = std::sync::Arc::new(fusillade_arsenal::PostgresRequestManager::new(
-        fusillade_test_pools,
-        Default::default(),
-    ));
+    let request_manager = std::sync::Arc::new(
+        fusillade_arsenal::PostgresRequestManager::new(fusillade_test_pools, Default::default())
+            .with_retained_response_fence_seconds(config.background_services.batch_daemon.retention.max_late_writer_seconds),
+    );
     let limiters = crate::limits::Limiters::new(&config.limits);
     let shared_config = crate::SharedConfig::new(config);
 
     underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
     let task_state = crate::tasks::TaskState {
         request_manager: request_manager.clone(),
-        dwctl_pool: pool.clone(),
+        dwctl_pool: sqlx_pool_router::DynPools::new(pool.clone()),
         config: shared_config.clone(),
         encryption_key: None,
         ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -173,18 +229,12 @@ pub async fn create_test_app_state_with_database_pools(
         .limiters(limiters)
         .response_store(response_store)
         .image_normalizer(image_normalizer)
+        .key_policy_cache(crate::sync::key_policy::KeyPolicyCache::empty())
         .build()
 }
 
 pub async fn create_test_app(pool: PgPool, _enable_sync: bool) -> (TestServer, crate::BackgroundServices) {
-    let config = create_test_config();
-
-    let app = crate::Application::new_with_pool(config, Some(pool), None)
-        .await
-        .expect("Failed to create application");
-
-    // Convert to test server (sync is always enabled in new())
-    app.into_test_server()
+    create_test_app_with_config(pool, create_test_config(), _enable_sync).await
 }
 
 pub async fn create_test_app_with_config(
@@ -192,9 +242,14 @@ pub async fn create_test_app_with_config(
     config: crate::config::Config,
     _enable_sync: bool,
 ) -> (TestServer, crate::BackgroundServices) {
+    let start = Instant::now();
     let app = crate::Application::new_with_pool(config, Some(pool), None)
         .await
         .expect("Failed to create application");
+
+    if std::env::var_os("DW_TEST_TIMINGS").is_some() {
+        eprintln!("test-app-startup {:?}", start.elapsed());
+    }
 
     // Convert to test server (sync is always enabled in new())
     app.into_test_server()
@@ -205,9 +260,15 @@ pub fn create_test_config() -> crate::config::Config {
     let temp_dir = std::env::temp_dir().join(format!("dwctl-test-emails-{}", std::process::id()));
 
     crate::config::Config {
+        database_pooled_url: None,
+        clickhouse: None,
+        prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),
+        scheduling: Default::default(),
         database_url: None,
         database_replica_url: None,
         database: crate::config::DatabaseConfig::External {
+            pooled_url: None,
+            direct_pool: crate::config::default_direct_pool(),
             url: "Something".to_string(), // Will get overriden by env var
             replica_url: None,
             pool: PoolSettings {
@@ -217,6 +278,11 @@ pub fn create_test_config() -> crate::config::Config {
             },
             replica_pool: None,
             fusillade: crate::config::ComponentDb::Schema {
+                url: None,
+                pooled_schema_mode: crate::config::PooledSchemaMode::default(),
+                pooled_url: None,
+                replica_url: None,
+                direct_pool: crate::config::default_direct_pool(),
                 name: "fusillade".to_string(),
                 pool: PoolSettings {
                     max_connections: 4,
@@ -226,6 +292,11 @@ pub fn create_test_config() -> crate::config::Config {
                 replica_pool: None,
             },
             outlet: crate::config::ComponentDb::Schema {
+                url: None,
+                pooled_schema_mode: crate::config::PooledSchemaMode::default(),
+                pooled_url: None,
+                replica_url: None,
+                direct_pool: crate::config::default_direct_pool(),
                 name: "outlet".to_string(),
                 pool: PoolSettings {
                     max_connections: 4,
@@ -264,6 +335,8 @@ pub fn create_test_config() -> crate::config::Config {
             sync_interval: std::time::Duration::from_secs(60),
             default_models: None,
         }],
+        model_provisioning: Default::default(),
+        migrations: Default::default(),
         metadata: crate::config::Metadata::default(),
         payment: None,
         auth: crate::config::AuthConfig {
@@ -285,7 +358,8 @@ pub fn create_test_config() -> crate::config::Config {
             },
             security: SecurityConfig::default(),
             default_user_roles: vec![crate::api::models::users::Role::StandardUser],
-            rate_limits: crate::config::RateLimitTiersConfig::default(),
+            ignored_rate_limits: serde::de::IgnoredAny,
+            personal_email_domains: Vec::new(),
         },
         enable_metrics: false,
         enable_request_logging: false,
@@ -303,9 +377,19 @@ pub fn create_test_config() -> crate::config::Config {
                 enabled: false,
                 fallback_interval_milliseconds: 10000,
             },
+            // Tests refresh the map explicitly (`sync_key_policy`) rather than
+            // holding a LISTEN connection open per test app.
+            key_policy_sync: crate::config::KeyPolicySyncConfig {
+                enabled: false,
+                fallback_interval_milliseconds: 0,
+            },
             probe_scheduler: ProbeSchedulerConfig { enabled: false },
             batch_daemon: DaemonConfig {
                 enabled: DaemonEnabled::Never,
+                retention: fusillade::RetentionPolicy {
+                    max_late_writer_seconds: Some(3_600),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             leader_election: LeaderElectionConfig { enabled: false },
@@ -346,20 +430,35 @@ pub fn create_test_config() -> crate::config::Config {
         onboarding_url: None,
         support_email: "support@test.com".to_string(),
         connections: Default::default(),
-        responses: Default::default(),
         image_normalizer: Default::default(),
         openapi: Default::default(),
         cache: Default::default(),
+        continuation: Default::default(),
+        heap_profiling: Default::default(),
         keystore: None,
     }
 }
 
+/// A test user on a caller-chosen email domain.
+///
+/// Organizations claim their owner's email domain as their username, so tests
+/// that create more than one organization need owners on *different* domains -
+/// and tests about domain collisions need them on the same one. The default
+/// helper puts everyone on example.com, which makes both impossible to express.
+pub async fn create_test_user_on_domain(pool: &PgPool, role: Role, domain: &str) -> UserResponse {
+    create_test_user_inner(pool, role, Some(domain)).await
+}
+
 pub async fn create_test_user(pool: &PgPool, role: Role) -> UserResponse {
+    create_test_user_inner(pool, role, None).await
+}
+
+async fn create_test_user_inner(pool: &PgPool, role: Role, domain: Option<&str>) -> UserResponse {
     let mut conn = pool.acquire().await.expect("Failed to acquire connection");
     let mut users_repo = Users::new(&mut conn);
     let user_id = Uuid::new_v4();
     let username = format!("testuser_{}", user_id.simple());
-    let email = format!("{username}@example.com");
+    let email = format!("{username}@{}", domain.unwrap_or("example.com"));
 
     let roles = vec![role];
 
@@ -490,6 +589,7 @@ pub async fn get_system_user(pool: &mut PgConnection) -> UserResponse {
         external_user_id: None,
         groups: None, // Groups not included in test users by default
         credit_balance: None,
+        has_purchased: None,
         has_payment_provider_id: false,
         batch_notifications_enabled: false,
         low_balance_threshold: None,
@@ -499,10 +599,15 @@ pub async fn get_system_user(pool: &mut PgConnection) -> UserResponse {
         auto_topup_monthly_limit: None,
         user_type: "individual".to_string(),
         verified: false,
+        invoicing_enabled: false,
         zero_data_retention: false,
         organizations: None,
         active_organization_id: None,
         onboarding_redirect_url: None,
+        default_serving_class: None,
+        self_hosted_only: false,
+        granted_serving_classes: Default::default(),
+        toleration_preset: Default::default(),
     }
 }
 
@@ -525,8 +630,6 @@ pub async fn create_test_api_key_for_user(pool: &PgPool, user_id: UserId) -> Api
             name: format!("Test API Key {}", Uuid::new_v4().simple()),
             description: Some("Test description".to_string()),
             purpose: ApiKeyPurpose::Realtime,
-            requests_per_second: None,
-            burst_size: None,
             member_id: None,
             spend_limit: None,
             spend_limit_interval: None,
@@ -680,6 +783,7 @@ pub async fn create_test_org(pool: &PgPool, created_by: UserId) -> UserResponse 
         external_user_id: None,
         groups: None,
         credit_balance: None,
+        has_purchased: None,
         has_payment_provider_id: false,
         batch_notifications_enabled: false,
         low_balance_threshold: None,
@@ -689,10 +793,15 @@ pub async fn create_test_org(pool: &PgPool, created_by: UserId) -> UserResponse 
         auto_topup_monthly_limit: None,
         user_type: org.user_type,
         verified: org.verified,
+        invoicing_enabled: org.invoicing_enabled,
         zero_data_retention: org.zero_data_retention,
         organizations: None,
         active_organization_id: None,
         onboarding_redirect_url: None,
+        default_serving_class: None,
+        self_hosted_only: false,
+        granted_serving_classes: Default::default(),
+        toleration_preset: Default::default(),
     }
 }
 
@@ -731,4 +840,24 @@ pub async fn create_test_model(pool: &PgPool, model_name: &str, alias: &str, end
     .await
     .expect("Failed to create test model");
     deployment_id
+}
+
+/// Wait until a test reconciliation actually blocks behind another replica's lock.
+pub async fn wait_for_advisory_waiter(pool: &PgPool, pid: i32) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let waiting: bool =
+                sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid=$1 AND locktype='advisory' AND NOT granted)")
+                    .bind(pid)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            if waiting {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("replica did not wait for the catalog lock");
 }

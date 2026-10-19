@@ -257,6 +257,7 @@ function resolveComponents(modelId: string): import("../types").ModelComponent[]
       enabled: sc.enabled,
       sort_order: sc.sort_order,
       created_at: "2025-09-15T00:00:00Z",
+      pool: "default" as const,
       model: {
         id: componentModel?.id ?? sc.componentModelId,
         alias: componentModel?.alias ?? "unknown",
@@ -265,7 +266,6 @@ function resolveComponents(modelId: string): import("../types").ModelComponent[]
         model_type: componentModel?.model_type ?? undefined,
         endpoint: endpoint ? { id: endpoint.id, name: endpoint.name } : undefined,
         trusted: componentModel?.trusted,
-        open_responses_adapter: componentModel?.open_responses_adapter,
       },
     };
   });
@@ -1004,6 +1004,13 @@ export const handlers = [
       demoState = setCurrentUserRoles(demoState, body.roles);
     }
 
+    // Persist the pinned preset so the GET the update hook refetches (usersData
+    // is the source for the detail and list endpoints) shows it instead of the
+    // fixture. `null` clears the pin back to Default.
+    if (body.toleration_preset !== undefined) {
+      user.toleration_preset = body.toleration_preset;
+    }
+
     const updatedUser = {
       ...user,
       ...body,
@@ -1025,12 +1032,18 @@ export const handlers = [
     const url = new URL(request.url);
     const skip = parseInt(url.searchParams.get("skip") || "0", 10);
     const limit = parseInt(url.searchParams.get("limit") || "10", 10);
+    // Server-side holder filter: pagination/total_count cover the filtered
+    // set, mirroring the real API.
+    const createdBy = url.searchParams.get("created_by");
+    const filtered = createdBy
+      ? apiKeysData.filter((k) => k.created_by === createdBy)
+      : apiKeysData;
 
-    const paginatedData = apiKeysData.slice(skip, skip + limit);
+    const paginatedData = filtered.slice(skip, skip + limit);
 
     return HttpResponse.json({
       data: paginatedData,
-      total_count: apiKeysData.length,
+      total_count: filtered.length,
       skip,
       limit,
     });
@@ -1139,6 +1152,28 @@ export const handlers = [
   ),
 
   // Webhooks under users
+  // One-off reveal of an issued key's secret (holder only; consumed forever).
+  http.post(
+    "/admin/api/v1/users/:userId/api-keys/:keyId/reveal",
+    ({ params }) => {
+      const apiKey = apiKeysData.find((k) => k.id === params.keyId);
+      if (!apiKey) {
+        return HttpResponse.json(
+          { error: "API key not found" },
+          { status: 404 },
+        );
+      }
+      if (apiKey.secret_revealed_at != null) {
+        return HttpResponse.json(
+          { error: "This key's one-off reveal has already been used." },
+          { status: 409 },
+        );
+      }
+      apiKey.secret_revealed_at = new Date().toISOString();
+      return HttpResponse.json({ key: `sk-revealed-${params.keyId}` });
+    },
+  ),
+
   http.get("/admin/api/v1/users/:userId/webhooks", () => {
     return HttpResponse.json([]);
   }),
@@ -1306,13 +1341,18 @@ export const handlers = [
       models = models.filter((m) => !!m.is_composite === wantComposite);
     }
 
-    // Apply search filter (case-insensitive substring match on alias or model_name)
+    // Apply search filter using the same customer-visible fields as the API
     if (search) {
       const searchLower = search.toLowerCase();
       models = models.filter(
         (m) =>
           m.alias.toLowerCase().includes(searchLower) ||
-          m.model_name.toLowerCase().includes(searchLower),
+          m.model_name.toLowerCase().includes(searchLower) ||
+          (m.display_name?.toLowerCase().includes(searchLower) ?? false) ||
+          (endpointsData
+            .find((endpoint) => endpoint.id === m.hosted_on)
+            ?.name.toLowerCase()
+            .includes(searchLower) ?? false),
       );
     }
 
@@ -1983,6 +2023,15 @@ export const handlers = [
         enabled: true,
         allowed_completion_windows: ["24h", "1h"],
       },
+      onwards: { strict_mode: false },
+      scheduling_toleration_presets: [
+        {
+          id: "no-overflow",
+          label: "No overflow capacity",
+          description:
+            "Never placed on capacity the backend marks with any taint, such as overflow capacity.",
+        },
+      ],
     });
   }),
 
@@ -2548,10 +2597,14 @@ export const handlers = [
     const newTransaction: Transaction = {
       id: `txn-${Date.now()}`,
       user_id: body.user_id,
-      transaction_type: "admin_grant",
+      transaction_type: body.transaction_type ?? "admin_grant",
       amount: body.amount,
       source_id: "admin",
-      description: body.description || "Funds added by admin",
+      description:
+        body.description ||
+        (body.transaction_type === "admin_removal"
+          ? "Funds removed by admin"
+          : "Funds added by admin"),
       created_at: new Date().toISOString(),
     };
 
@@ -2850,6 +2903,25 @@ export const handlers = [
     });
   }),
 
+  http.get("/admin/api/v1/models/:id/overlays", ({ params }) => {
+    const model = modelsData.find((m) => m.id === params.id);
+    if (!model) return HttpResponse.json({ error: "Not found" }, { status: 404 });
+    return HttpResponse.json([]);
+  }),
+
+  http.get("/admin/api/v1/organizations/:id/serving", ({ params }) => {
+    const org = organizationsData.find((o) => o.id === params.id);
+    if (!org) return HttpResponse.json({ error: "Not found" }, { status: 404 });
+    return HttpResponse.json({
+      organization_id: org.id,
+      granted_serving_classes: [],
+      self_hosted_only: false,
+      overlays: [],
+      tariffs: [],
+      cache_tariffs: [],
+    });
+  }),
+
   http.get("/admin/api/v1/organizations/:id", ({ params }) => {
     const org = organizationsData.find((o) => o.id === params.id);
     if (!org) return HttpResponse.json({ error: "Not found" }, { status: 404 });
@@ -2884,7 +2956,46 @@ export const handlers = [
     const body = (await request.json()) as OrganizationUpdateRequest;
     const org = organizationsData.find((o) => o.id === params.id);
     if (!org) return HttpResponse.json({ error: "Not found" }, { status: 404 });
-    return HttpResponse.json({ ...org, ...body });
+    // Mirror the backend: the contact email is never applied directly. A
+    // differing email raises a pending change that both mailboxes must
+    // confirm, and the response keeps the current email.
+    const { email, ...rest } = body;
+    const newEmail = email?.trim().toLowerCase();
+    // The backend validates the address before raising a pending change;
+    // an empty or malformed email is a 400, never a pending state.
+    if (newEmail !== undefined && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail)) {
+      return HttpResponse.json(
+        { error: "Invalid email address" },
+        { status: 400 },
+      );
+    }
+    const emailChanged =
+      newEmail !== undefined && newEmail !== org.email.toLowerCase();
+    // Persist owner-only settings so the GET the update hook refetches shows
+    // the new state instead of the fixture.
+    if (rest.disabled_modalities !== undefined) {
+      org.disabled_modalities = rest.disabled_modalities;
+    }
+    if (rest.toleration_preset !== undefined) {
+      // `null` clears the pin back to Default.
+      org.toleration_preset = rest.toleration_preset;
+    }
+    return HttpResponse.json({
+      ...org,
+      ...rest,
+      ...(emailChanged
+        ? {
+            pending_email_change: {
+              new_email: newEmail,
+              expires_at: new Date(
+                Date.now() + 24 * 60 * 60 * 1000,
+              ).toISOString(),
+              new_email_confirmed_at: null,
+              old_email_confirmed_at: null,
+            },
+          }
+        : {}),
+    });
   }),
 
   http.delete("/admin/api/v1/organizations/:id", ({ params }) => {

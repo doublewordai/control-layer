@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { Code, Play, Filter, Clock, DollarSign, Check, ChevronsUpDown, Zap, FastForward, Moon, Trash2, Loader2 } from "lucide-react";
+import { Code, Play, Filter, Clock, DollarSign, Check, ChevronsUpDown, Users, Zap, FastForward, Moon, Trash2, Loader2 } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
 import { toast } from "sonner";
 import { Button } from "../../ui/button";
@@ -36,8 +36,9 @@ import {
   CommandList,
 } from "../../ui/command";
 import { cn } from "../../../lib/utils";
-import { useAsyncRequests, useDeleteAsyncRequest, useModels } from "../../../api/control-layer/hooks";
+import { useAsyncRequests, useDeleteAsyncRequest, useModels, useUsers } from "../../../api/control-layer/hooks";
 import { useAuthorization } from "../../../utils/authorization";
+import { useDebounce } from "../../../hooks/useDebounce";
 import type {
   AsyncRequest,
   AsyncRequestStatus,
@@ -309,10 +310,57 @@ export function AsyncRequests() {
   const modelParam = searchParams.get("model");
   const [createModalOpen, setCreateModalOpen] = useState(createParam === "true");
   const [showApiExamples, setShowApiExamples] = useState(false);
-  const { hasPermission } = useAuthorization();
+  const { userRoles, hasPermission } = useAuthorization();
   const isPlatformManager = hasPermission("manage-models");
   const { isOrgContext, activeOrganizationId } = useOrganizationContext();
   const showUserColumn = isPlatformManager || isOrgContext;
+
+  // Account filter. `member_id` on /batches/requests filters
+  // `fusillade.requests.created_by` — the account a request was BILLED to,
+  // which ingest takes from `api_keys.user_id`. So it selects an *account*,
+  // not a person:
+  //   - an individual  → their personal-key traffic
+  //   - an organization → that org's traffic, all members together
+  // Organizations are therefore included in the picker, unlike the Batches
+  // member filter (which resolves a person to their hidden per-member batch
+  // keys and so deliberately excludes orgs). Picking an org *member* here
+  // would return nothing, because their org-key traffic bills to the org.
+  //
+  // Gated on the PlatformManager ROLE, not on `hasPermission("manage-models")`
+  // above: dwctl gates `member_id` on `can_read_all_resources(Batches)`, which
+  // is PlatformManager (or a legacy admin) and nothing else. Anyone else gets
+  // a 400, so the control must not render for them.
+  //
+  // Personal context only. In an org context the page is already scoped to
+  // that org, which is the right answer there; offering a cross-account picker
+  // on top would only let a PM contradict the context they are sitting in.
+  const showAccountFilter =
+    userRoles.includes("PlatformManager") && !isOrgContext;
+
+  const [accountSearch, setAccountSearch] = useState("");
+  const debouncedAccountSearch = useDebounce(accountSearch, 300);
+  const { data: searchedAccounts } = useUsers({
+    search: debouncedAccountSearch,
+    limit: 50,
+    enabled: showAccountFilter,
+  });
+  // Only the id is persisted — an address list is PII and there is no reason
+  // to leave customer emails in localStorage on a shared workstation. The
+  // label is re-resolved from the live search results on render.
+  const [selectedAccountId, setSelectedAccountId] = usePersistedFilter(
+    PERSIST_SCOPE,
+    "account",
+    "",
+  );
+  const [accountPopoverOpen, setAccountPopoverOpen] = useState(false);
+  const accountList = searchedAccounts?.data ?? [];
+  const selectedAccount = accountList.find((a) => a.id === selectedAccountId);
+  // Never send a persisted id while the control is hidden — an org context
+  // would otherwise be silently overridden by a stale personal-context filter,
+  // since dwctl checks `member_id` before it checks the active organization.
+  const accountIdFilter = showAccountFilter
+    ? selectedAccountId || undefined
+    : undefined;
   // Filters — persisted to URL params + localStorage so they survive
   // navigation to detail pages and across reloads. Date range is intentionally
   // excluded — restoring stale absolute timestamps on a later visit would be
@@ -365,6 +413,10 @@ export function AsyncRequests() {
     setModelFilter(EMPTY_MODEL_FILTER);
     setTierFilter(DEFAULT_TIER_FILTER);
     setDateRange(undefined);
+    // An account selected in personal context means nothing inside an org,
+    // and vice versa — clear it rather than carry it across the switch.
+    setSelectedAccountId("");
+    setAccountSearch("");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeOrganizationId]);
 
@@ -405,6 +457,7 @@ export function AsyncRequests() {
         ? (statusFilter as AsyncRequestStatus)
         : undefined,
     model: modelFilter.length > 0 ? modelFilter.join(",") : undefined,
+    member_id: accountIdFilter,
     created_after: dateRange?.from.toISOString(),
     created_before: dateRange?.to.toISOString(),
     ...pagination.queryParams,
@@ -471,6 +524,98 @@ export function AsyncRequests() {
                 Active first
               </label>
             </div>
+            {showAccountFilter && (
+              <Popover
+                open={accountPopoverOpen}
+                onOpenChange={setAccountPopoverOpen}
+              >
+                <PopoverTrigger asChild>
+                  <Button
+                    variant="outline"
+                    role="combobox"
+                    aria-expanded={accountPopoverOpen}
+                    // role="combobox" does not take its accessible name from
+                    // its content, so the visible label alone leaves this
+                    // button unnamed to assistive tech.
+                    aria-label="Filter by account"
+                    className="w-[220px] h-9 justify-between font-normal"
+                  >
+                    <div className="flex items-center gap-1.5 truncate">
+                      <Users className="w-3.5 h-3.5 shrink-0 text-gray-500" />
+                      <span className="truncate">
+                        {!selectedAccountId
+                          ? "All accounts"
+                          : (selectedAccount?.email ?? "Selected account")}
+                      </span>
+                    </div>
+                    <ChevronsUpDown className="ml-1 h-3.5 w-3.5 shrink-0 opacity-50" />
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent className="w-[300px] p-0" align="start">
+                  {/* Server-side search — the results are already narrowed by
+                      the query, so the Command must not filter them again. */}
+                  <Command shouldFilter={false}>
+                    <CommandInput
+                      placeholder="Search users and organizations..."
+                      value={accountSearch}
+                      onValueChange={setAccountSearch}
+                    />
+                    <CommandList>
+                      <CommandEmpty>No accounts found.</CommandEmpty>
+                      <CommandGroup>
+                        <CommandItem
+                          value="all-accounts"
+                          onSelect={() => {
+                            setSelectedAccountId("");
+                            setAccountSearch("");
+                            setAccountPopoverOpen(false);
+                            pagination.handleReset();
+                          }}
+                        >
+                          <Check
+                            className={cn(
+                              "mr-2 h-4 w-4",
+                              !selectedAccountId ? "opacity-100" : "opacity-0",
+                            )}
+                          />
+                          All accounts
+                        </CommandItem>
+                        {accountList.map((account) => (
+                          <CommandItem
+                            key={account.id}
+                            value={account.id}
+                            onSelect={() => {
+                              setSelectedAccountId(account.id);
+                              setAccountSearch("");
+                              setAccountPopoverOpen(false);
+                              pagination.handleReset();
+                            }}
+                          >
+                            <Check
+                              className={cn(
+                                "mr-2 h-4 w-4",
+                                selectedAccountId === account.id
+                                  ? "opacity-100"
+                                  : "opacity-0",
+                              )}
+                            />
+                            <span className="truncate">{account.email}</span>
+                            {/* Organizations hold every member's org-key
+                                traffic, so the distinction changes what the
+                                filter returns and has to be visible. */}
+                            {account.user_type === "organization" && (
+                              <span className="ml-2 shrink-0 rounded bg-gray-100 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-gray-600">
+                                Org
+                              </span>
+                            )}
+                          </CommandItem>
+                        ))}
+                      </CommandGroup>
+                    </CommandList>
+                  </Command>
+                </PopoverContent>
+              </Popover>
+            )}
             <Select
               value={statusFilter}
               onValueChange={(v) => {

@@ -65,6 +65,28 @@ Created on first startup if it doesn't exist. The admin user has the `PlatformMa
 >
 > Change the default admin password immediately in production!
 
+### Model Provisioning
+
+```yaml
+model_provisioning:
+  enabled: true
+  directory: /app/model-provisioning.d
+  org_overlays_directory: /app/org-overlays.d
+  account_limits_directory: /app/account-limits.d
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | boolean | `false` | Apply the declarative model catalog during startup. |
+| `directory` | path | `/app/model-provisioning.d` | Directory containing one `.yaml` or `.yml` document per canonical model. |
+| `org_overlays_directory` | path | `/app/org-overlays.d` | Directory containing one `.yaml` or `.yml` document per organisation with per-model serving overrides (`default_class` or explicit `targets`, `self_hosted_only`). Applied after the model catalog when `enabled` is set. A missing directory is an empty catalog, so a deployment that does not mount one applies no overlays; an existing path that is not a directory fails startup. |
+| `account_limits_directory` | path | `/app/account-limits.d` | Directory containing one `.yaml` or `.yml` document per account with its own realtime in-flight limits on virtual models. Applied after the model catalog when `enabled` is set, replacing every stored per-account limit. A missing directory changes nothing; an empty one clears every per-account limit. See [Account limits](./model-provisioning.md#account-limits). |
+
+When enabled, the directory must exist. Startup fails before any provisioning
+writes if loading, validation, or a referenced endpoint/group lookup fails.
+See [Model Provisioning](model-provisioning.md) for the document format and
+ownership rules.
+
 ## Database Configuration
 
 The Control Layer requires PostgreSQL. Two modes are available:
@@ -424,6 +446,69 @@ background_services:
         allowed_states: ["pending", "claimed"]
 ```
 
+### Task Retention
+
+Deletes expired Underway background tasks in bounded batches. Every task carries
+a `ttl` (14 days by default); nothing else removes finished tasks, so without this
+daemon the task table grows for the life of the installation and slows every
+task claim.
+
+```yaml
+background_services:
+  task_retention:
+    enabled: true
+    interval_seconds: 300
+    batch_size: 1000
+    batch_pause_milliseconds: 2000
+    min_age_days: 14
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | boolean | `true` | Run the retention daemon. |
+| `interval_seconds` | integer | `300` | Seconds between sweeps. |
+| `batch_size` | integer | `1000` | Rows deleted per statement; each batch is its own short transaction. |
+| `batch_pause_milliseconds` | integer | `2000` | Pause between batches of one sweep, to throttle a large backlog. |
+| `min_age_days` | integer | `14` | Tasks younger than this are never considered. A task's own longer `ttl` is still honoured. |
+
+Every instance runs the daemon; an advisory lock collapses concurrent sweeps to
+one. Only `succeeded` and `failed` tasks are deleted; `pending` and `in_progress` tasks are preserved.
+Each batch has a 2-second lock timeout and a 30-second statement timeout.
+The daemon uses direct database connections for its session-level advisory lock. For a very large existing
+backlog, run `scripts/purge_underway_tasks.sh` once beforehand so the first
+sweeps stay short.
+
+### Prompt Cache Retention
+
+Deletes prompt-cache entries that expired more than a grace period ago, in bounded
+batches. Expired entries serve no request, but nothing else removes them, so without
+this daemon the prefix table keeps every prefix ever written.
+
+```yaml
+background_services:
+  prompt_cache_retention:
+    enabled: false
+    interval_seconds: 300
+    batch_size: 1000
+    batch_pause_milliseconds: 2000
+    grace_days: 7
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | boolean | `false` | Run the retention daemon. Off by default so a deployment chooses when to start clearing an existing history. |
+| `interval_seconds` | integer | `300` | Seconds between sweeps. |
+| `batch_size` | integer | `1000` | Rows deleted per statement; each batch is its own short transaction. |
+| `batch_pause_milliseconds` | integer | `2000` | Pause between batches of one sweep, to throttle a large backlog. |
+| `grace_days` | integer | `7` | Days an entry is kept after it expires. Usage recompute re-derives a past request's cache split from the entries live at the time, so values below 7 are rejected. |
+
+Every instance runs the daemon; an advisory lock collapses concurrent sweeps to one.
+Entries are deleted oldest-expiry first; an entry that a request is refreshing or
+re-writing at that moment is skipped. Each batch has a 2-second lock timeout and a
+30-second statement timeout. At the default pace a sweep deletes at most about 1.8
+million entries an hour, so an installation with a long existing history clears it over
+several sweeps without a burst of write and vacuum load.
+
 ### Leader Election
 
 For multi-instance deployments:
@@ -486,6 +571,155 @@ metadata:
 | `docs_url` | string | `"https://doublewordai.github.io/control-layer/"` | Documentation link in header. |
 | `docs_jsonl_url` | string | - | JSONL docs link in batch upload modal. |
 
+## Realtime In-Flight Limits
+
+Each virtual model has a default number of realtime requests one account may
+have in flight on it (`realtime_inflight_limit`), and an
+[account limit file](./model-provisioning.md#account-limits) can give one
+account a different limit. Replicas share their counts through Redis:
+
+```yaml
+limits:
+  realtime_inflight:
+    enforce: true
+    redis_url: rediss://:password@limits-redis.example:6379
+```
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `limits.realtime_inflight.enforce` | `false` | Refuse requests over the limit. Off, every request is admitted, so defaults and account limits can be in place before the limit takes effect. |
+| `limits.realtime_inflight.redis_url` | unset | Redis holding the shared counts. Unset, or unreachable, each replica counts only its own requests. |
+
+`auth.rate_limits` is no longer used and is ignored if present.
+
+## Batch In-Flight Limits
+
+A virtual model's `batch_capacity` also caps how many **batch** requests may be
+in flight on it at once. Unlike the realtime limit, this is a single global
+count for the model, not a per-account one: batch traffic is dispatched by
+worker pods, so the cap has to hold across all of them. It reuses the same
+Redis as the realtime limit but has its own switch:
+
+```yaml
+limits:
+  realtime_inflight:
+    enforce: true
+    redis_url: rediss://:password@limits-redis.example:6379
+  batch_inflight:
+    enforce: true
+    default_capacity: 200
+```
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `limits.batch_inflight.enforce` | `false` | Refuse batch requests that would exceed a virtual model's effective batch cap. Off, every batch request is admitted and no shared count is touched, so no cap applies however it was configured. |
+| `limits.batch_inflight.default_capacity` | `200` | Global batch cap for a virtual model that does not set its own positive `batch_capacity`. Set to `0` (or `null`) for no default. Must not be negative. |
+
+A virtual model's effective cap is its own `batch_capacity` when that is
+positive, otherwise `limits.batch_inflight.default_capacity`. This default only
+feeds the onwards cap: it does **not** change fusillade's per-daemon *starting*
+concurrency, which keeps using
+`background_services.batch_daemon.default_model_concurrency` for models without
+an explicit `batch_capacity`. Because an enforced default caps **every** virtual
+model that has not set its own value, raise `default_capacity` (or set it per
+model) wherever batch runs higher than 200, or the first requests past the
+default will be refused.
+
+### Why realtime and batch differ
+
+Realtime has per-account limits and no per-model cap: when a model is full,
+the downstream answers `529`, and realtime traffic may grow into whatever
+capacity exists (the per-account limit keeps one tenant from consuming it
+all). Batch instead has a per-model cap, because batch must never crowd out
+realtime and can always be processed later — a refused batch request is
+rescheduled, not lost.
+
+### `batch_capacity` means two things
+
+The same `settings.batch_capacity` value now has two roles:
+
+- fusillade's **starting** per-daemon concurrency for the model, which
+  adaptive concurrency may grow beyond, and
+- the **global** onwards cap on batch requests in flight on the alias, once
+  `limits.batch_inflight.enforce` is on.
+
+Enabling enforcement therefore turns `batch_capacity` from a per-pod starting
+point into a global ceiling. Raise the value to the intended global cap
+**before** turning enforcement on, or the first batch requests will be refused
+against the old, smaller starting point.
+
+The cap is shared by every kind of dispatched request: file batches, flex
+requests and background requests all count against the same per-model ceiling.
+
+### Behaviour over the cap
+
+The Redis connection is shared with `limits.realtime_inflight.redis_url`;
+reachability and per-replica fallback behave the same way. The two limits are
+independent and use separate key spaces, so realtime `realtime_inflight_limit`
+and batch `batch_capacity` can be enforced in any combination. A batch request
+over the cap is refused with `529` and code `batch_capacity_exceeded` (never
+`429`), naming the model and its cap, so the batch dispatcher backs off without
+spending a retry attempt and reschedules the request later.
+
+## Account Scheduling: Tolerations and Provider Fallback
+
+Two account settings influence scheduling, and they are deliberately separate.
+
+**Scheduling-toleration presets** (`scheduling.toleration_presets`) let an
+operator pin an account to a named list of Kubernetes-style tolerations that is
+written to every inference request from that account at
+`nvext.routing_constraints.tolerations`, for realtime, flex and batch traffic
+alike. A backend that honours tolerations uses them to decide which capacity may
+serve the request. The wording is backend-agnostic. Pinning restricts where an
+account's requests can be placed, and can make scheduling harder for accounts
+sharing the same capacity, depending on how the backend treats tolerations; pin
+as few accounts as possible and only when a customer requires it.
+
+```yaml
+scheduling:
+  toleration_presets:
+    # An empty list asks the backend to keep the account off any tainted
+    # capacity (e.g. overflow capacity).
+    - id: "no-overflow"
+      label: "No overflow capacity"
+      description: >-
+        Never placed on capacity the backend marks with any taint, such as
+        overflow capacity; requests may be refused when dedicated capacity is
+        full.
+      tolerations: []
+    - id: "gpu-only"
+      label: "GPU only"
+      description: "Only serve this account on GPU capacity."
+      tolerations:
+        - key: "pool"
+          operator: Equal
+          value: "gpu"
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Stable slug stored on the account (`users.toleration_preset`). Must be unique and non-empty; leading/trailing whitespace is rejected. |
+| `label` | string | Short human label for the dashboard control. Must be non-empty. |
+| `description` | string | One or two sentences of help text shown as the dashboard tooltip. Must be non-empty. |
+| `tolerations` | list | The request-field list (`{key, operator?, value?, effect?}`). `operator` defaults to `Equal` and then requires `value`; `Exists` forbids `value`; `effect` may be `NoSchedule` or `PreferNoSchedule`. May be empty; validated at config load. |
+
+The `GET /admin/api/v1/config` endpoint exposes the presets (id, label,
+description) so the dashboard can render the control. An account stores only the
+preset's id; an id the config no longer defines is logged and the request path
+**fails closed** by applying the empty (most restrictive) list. A preset id that
+is not configured is rejected with a 400 on write. This setting is independent
+of `self_hosted_only`: it says nothing about which provider is chosen, only
+where the chosen backend may place an accepted request.
+
+**`self_hosted_only`** (per account: `users.self_hosted_only`,
+`organizations.self_hosted_only`) is the gateway's provider-fallback control.
+When on, onwards restricts the account's requests to the composite's
+self-hosted members — providers whose endpoint kind (`inference_endpoints.kind`)
+is not `external` — so a third-party provider is never eligible regardless of
+the attempt budget. It does not influence where the inference backend places an
+accepted request; that is the tolerations setting. The API field keeps its name;
+the dashboard labels it "No external-provider fallback (gateway)".
+
 ## Observability
 
 ### Metrics
@@ -495,6 +729,13 @@ enable_metrics: true
 ```
 
 Exposes Prometheus metrics at `/internal/metrics`.
+
+`dwctl_model_batch_inflight_limit` reports each virtual model's **effective**
+global batch cap: its own positive `batch_capacity`, or the configured
+`limits.batch_inflight.default_capacity` when it has none. It reports even when
+`limits.batch_inflight.enforce` is off, and a model with no effective cap (the
+default turned off and no own value) reports `0`, so a zero does not by itself
+mean the cap is enforced — check the config switch.
 
 ### Request Logging
 
@@ -511,6 +752,61 @@ enable_otel_export: false
 ```
 
 Exports traces via OTLP. Configure the exporter endpoint with standard OpenTelemetry environment variables (`OTEL_EXPORTER_OTLP_ENDPOINT`, etc.).
+
+Logs and traces are filtered separately. `RUST_LOG` controls the log output.
+`OTEL_TRACES_FILTER` (a dwctl variable, not an OpenTelemetry standard one)
+uses the same directive syntax and controls what the exporter sends; it
+defaults to `info`, which exports the request, routing and provider spans and
+their info-and-above events but not repository spans or debug lines. `RUST_LOG`
+applies first, so the exporter never sees more than the logs do. For example,
+`RUST_LOG=debug` with the default exporter filter gives verbose logs and
+compact traces; `OTEL_TRACES_FILTER=debug,sqlx=warn` additionally exports
+repository spans without sqlx's per-query statement events.
+
+Exported spans omit the source location (`code.*`), thread and
+`busy_ns`/`idle_ns` attributes.
+
+When request analytics and tracing are enabled, the pair `http_analytics.trace_id`
+and `gateway_span_id` identifies the gateway span for a captured request. Follow
+its descendant `onwards.provider_attempt` spans to the downstream serving spans.
+The gateway span's `doubleword.request_id` attribute holds the logical request
+UUID for reverse lookup in request records.
+
+#### Customer attributes on spans
+
+Spans carry the account, model and error class so alerts and dashboards can be
+built from traces. Attribute names are a contract. `gen_ai.*`, `http.*` and
+`error.type` follow OpenTelemetry semantic conventions; the rest, including
+`doubleword.*`, `onwards.*`, `batch.*` and the unprefixed batch attributes,
+are our own.
+
+| Span | Attributes |
+|---|---|
+| `request` (root, AI requests) | `doubleword.account_id`, `doubleword.account_name`, `doubleword.api_key_id`, `doubleword.key_purpose`, `gen_ai.request.model`, `doubleword.traffic` (`batch` for a batch key, otherwise `realtime`), `doubleword.batch.completion_window` (batch only), `http.response.status_code`, and for 4xx/5xx `error.type`, plus `doubleword.error.source` (`gateway` or `provider`) and `doubleword.rejection.code` (gateway errors) when onwards or a dwctl inference layer produced or relayed the error |
+| `onwards.request` | `onwards.account`, `onwards.account_name`, `onwards.api_key_id`, `onwards.key_purpose`, `gen_ai.request.model`, `http.response.status_code`, and for gateway rejections `error.type` (the rejection code), `onwards.rejection.param` (when the error names one) and `onwards.rejection.reason` (for `schema_mismatch`). Strict mode refuses body errors before this span exists, so their attributes are on the enclosing gateway request span |
+| `fusillade.process_request` | `doubleword.account_id`, `completion_window`, `custom_id` (first 128 characters), `model`, `outcome` |
+| `fusillade.batch_finalized` | `batch_id`, `doubleword.account_id`, `doubleword.account_name`, `gen_ai.request.model` (every model the batch used, joined with `, `, for display), `batch.models` (the same models as a string array, for filtering), `completion_window`, `batch.total_requests`, `batch.completed_requests`, `batch.failed_requests`, `batch.canceled_requests`, `batch.outcome` (`completed`, `partially_completed` or `failed`), `batch.sample_error` (failed batches: `http_<status>`, the failure type such as `timeout`, `canceled` when every request was cancelled, or `unknown` when the failure cannot be classified), `batch.finalized_at` (when the batch finished) |
+
+The account, key and traffic attributes are recorded once the key is
+recognised, whether the request succeeds or onwards, a dwctl inference layer or
+the provider refuses it, so a request with an unknown key has none. On request
+spans, `gen_ai.request.model` is only ever a configured model alias, never
+arbitrary client input. `doubleword.account_name` is the account's display
+name, falling back to its username when it has none or it is blank, and cut to
+128 characters.
+`fusillade.batch_finalized` is a root span emitted once per batch by the batch
+notification poller when it claims the finished batch, so it appears whether
+or not email or webhooks are configured, as long as the poller runs. The span
+starts when the batch is claimed; `batch.finalized_at` records when the batch
+itself finished. Batches cancelled as a whole are not claimed and emit no span.
+Cancelled requests count against the outcome like failed ones: a batch none of
+whose requests completed is `failed`. Filter on one model with
+`{ span.batch.models = "<alias>" }`, which matches any element of the array.
+
+Trace context must be propagated on every required forwarding hop. Propagation
+does not itself enable span export: correlation also depends on the connecting
+spans being sampled, exported, and retained. Stored IDs can therefore refer to
+unavailable spans, and older analytics records may have no gateway span ID.
 
 ## Sample Files
 

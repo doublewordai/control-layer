@@ -86,6 +86,37 @@ pub struct UserUpdate {
     /// account; callers with UpdateAll on users may set it for any account.
     /// Omit to leave unchanged.
     pub zero_data_retention: Option<bool>,
+    /// Account setting: elevated serving classes this account holds
+    /// (`interactive`, `throughput`). A request naming a class the account
+    /// does not hold is refused. Settable only by callers with UpdateAll on
+    /// users. Omit to leave unchanged; an empty list revokes all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted_serving_classes: Option<Vec<String>>,
+    /// Account setting: serving class this account's realtime requests ask
+    /// for when the request names none (`interactive` or `throughput`).
+    /// Applies where the account holds it and the model offers it. Settable
+    /// only by callers with UpdateAll on users. Omit to leave unchanged; null
+    /// clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub default_serving_class: Option<Option<String>>,
+    /// Account setting: never fall over to an external provider. When on,
+    /// onwards restricts the account's requests to the composite's
+    /// self-hosted members — providers whose endpoint kind is not `external`
+    /// (the `inference_endpoints.kind` column) — so a third-party provider is
+    /// never eligible. This is the *gateway's* provider-fallback setting
+    /// (`/admin/api/v1/users`); it does not influence where the inference
+    /// backend places an accepted request, which is what `toleration_preset`
+    /// controls. Settable only by callers with UpdateAll on users. Omit to
+    /// leave unchanged.
+    pub self_hosted_only: Option<bool>,
+    /// Account setting: the id of a scheduling-toleration preset
+    /// (`scheduling.toleration_presets` in config) pinned to every request from
+    /// this account, written to `nvext.routing_constraints.tolerations`. An
+    /// unknown id is rejected with a 400; `null` clears the preset (the
+    /// "Default" setting: nothing pinned, the backend decides). Settable only
+    /// by callers with UpdateAll on users. Omit to leave unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub toleration_preset: Option<Option<String>>,
 }
 
 /// Full user details returned by the API.
@@ -125,6 +156,17 @@ pub struct UserResponse {
     /// User's credit balance (only included if `include=billing` is specified)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credit_balance: Option<f64>,
+    /// Whether this billing target has ever completed a purchase (only included
+    /// if `include=billing` is specified).
+    ///
+    /// This is the ledger truth behind the first-payment-match promotion: the
+    /// match is granted exactly when no earlier `purchase` exists for the
+    /// target. Clients gating on "has this account already had its first
+    /// top-up?" must read this rather than `has_payment_provider_id`, which is
+    /// true for accounts that only verified a card or merely attempted to turn
+    /// on auto top-up.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_purchased: Option<bool>,
     /// Indicates whether this user has an associated payment provider customer record.
     ///
     /// Note: This field replaces the previous `payment_provider_id` response field to avoid
@@ -157,6 +199,22 @@ pub struct UserResponse {
     pub verified: bool,
     /// Account-wide zero-data-retention flag.
     pub zero_data_retention: bool,
+    /// Whether this account is billed by emailed invoice rather than an
+    /// immediate card charge. Enabled by Doubleword after approval, not
+    /// self-service - it extends credit on payment terms.
+    pub invoicing_enabled: bool,
+    /// Account setting: elevated serving classes this account holds.
+    pub granted_serving_classes: Vec<String>,
+    /// Account setting: serving class this account's requests ask for by default.
+    pub default_serving_class: Option<String>,
+    /// Account setting: never fall over to an external provider.
+    pub self_hosted_only: bool,
+    /// Account setting: the id of the scheduling-toleration preset pinned to
+    /// this account's every request, or `null` for the "Default" setting
+    /// (nothing pinned). Present only for callers with UpdateAll on users: it
+    /// is an operator's routing decision, not account data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub toleration_preset: Option<String>,
     /// Organizations this user belongs to (only included if `include=organizations` is specified)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organizations: Option<Vec<super::organizations::OrganizationSummary>>,
@@ -225,6 +283,9 @@ pub struct CurrentUser {
 pub struct UserOrganizationContext {
     #[schema(value_type = String, format = "uuid")]
     pub id: UserId,
+    /// Display name where the organization has one, `username` otherwise —
+    /// which for a row with no display name is the bare domain-routing key.
+    /// See `PendingJoinRequestResponse::organization_name`.
     pub name: String,
     pub role: String,
     /// Effective key-creation capability in this org: owners/admins always
@@ -256,6 +317,7 @@ impl From<UserDBResponse> for UserResponse {
             last_login: db.last_login,
             groups: None,         // By default, relationships are not included
             credit_balance: None, // By default, credit balances are not included
+            has_purchased: None,  // Ditto: only populated for include=billing
             has_payment_provider_id: db.payment_provider_id.as_ref().is_some_and(|s| !s.is_empty()),
             batch_notifications_enabled: db.batch_notifications_enabled,
             low_balance_threshold: db.low_balance_threshold,
@@ -266,6 +328,12 @@ impl From<UserDBResponse> for UserResponse {
             user_type: db.user_type,
             verified: db.verified,
             zero_data_retention: db.zero_data_retention,
+            invoicing_enabled: db.invoicing_enabled,
+            granted_serving_classes: db.granted_serving_classes,
+            default_serving_class: db.default_serving_class,
+            self_hosted_only: db.self_hosted_only,
+            // Filled in by the handler for platform managers only.
+            toleration_preset: None,
             organizations: None,
             active_organization_id: None,
             onboarding_redirect_url: None,
@@ -274,6 +342,13 @@ impl From<UserDBResponse> for UserResponse {
 }
 
 impl UserResponse {
+    /// Create a response with the scheduling-toleration preset included. Only
+    /// the handlers that have already checked the caller may see it call this.
+    pub fn with_toleration_preset(mut self, preset: Option<String>) -> Self {
+        self.toleration_preset = preset;
+        self
+    }
+
     /// Create a response with groups included
     pub fn with_groups(mut self, groups: Vec<GroupResponse>) -> Self {
         self.groups = Some(groups);
@@ -283,6 +358,12 @@ impl UserResponse {
     /// Create a response with credit balance included
     pub fn with_credit_balance(mut self, balance: f64) -> Self {
         self.credit_balance = Some(balance);
+        self
+    }
+
+    /// Create a response with the first-purchase flag included
+    pub fn with_has_purchased(mut self, has_purchased: bool) -> Self {
+        self.has_purchased = Some(has_purchased);
         self
     }
 

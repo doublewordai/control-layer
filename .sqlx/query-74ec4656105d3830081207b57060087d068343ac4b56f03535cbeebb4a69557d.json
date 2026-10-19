@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE deployed_model_components SET enabled = false WHERE composite_model_id = $1 AND pool = 'completions'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "74ec4656105d3830081207b57060087d068343ac4b56f03535cbeebb4a69557d"
+}

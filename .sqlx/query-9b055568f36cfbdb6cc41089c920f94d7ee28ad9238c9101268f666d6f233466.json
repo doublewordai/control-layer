@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO fusillade.requests (id, template_id, state, model, response_status, response_body,\n                                             claimed_at, started_at, completed_at, created_by)\n             VALUES ($1,$2,'completed','m',200,$3,NOW(),NOW(),NOW(),$4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9b055568f36cfbdb6cc41089c920f94d7ee28ad9238c9101268f666d6f233466"
+}

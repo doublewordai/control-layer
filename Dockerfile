@@ -9,16 +9,19 @@ COPY fusillade/ fusillade/
 COPY fusillade-core/ fusillade-core/
 COPY fusillade-arsenal/ fusillade-arsenal/
 COPY onwards/ onwards/
-COPY onwards-fusillade/ onwards-fusillade/
+COPY openai-reassembler/ openai-reassembler/
 RUN cargo chef prepare --recipe-path recipe.json
 
 # Backend build stage
 FROM chef AS builder
 
-# Install build dependencies including Node.js
+# Install build dependencies including Node.js.
+# `make` is required by tikv-jemalloc-sys, which builds jemalloc from its C
+# sources via autotools rather than shipping a prebuilt library.
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
+    make \
     curl \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
@@ -45,7 +48,7 @@ COPY fusillade/ fusillade/
 COPY fusillade-core/ fusillade-core/
 COPY fusillade-arsenal/ fusillade-arsenal/
 COPY onwards/ onwards/
-COPY onwards-fusillade/ onwards-fusillade/
+COPY openai-reassembler/ openai-reassembler/
 RUN rm -rf dwctl/static && cp -r dashboard/dist dwctl/static
 ENV SQLX_OFFLINE=true
 RUN cargo build --release -p dwctl
@@ -66,6 +69,7 @@ WORKDIR /app
 
 # Copy the binary from builder stage (frontend is already embedded in the binary)
 COPY --from=builder /app/target/release/dwctl /app/dwctl
+COPY --from=builder /app/target/release/dwctl-model-provisioning /app/dwctl-model-provisioning
 
 # Copy default email templates (can be overridden via volume mount)
 COPY dwctl/default_templates/ /app/default_templates/

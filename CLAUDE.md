@@ -2,6 +2,22 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Repository Skills
+
+Maintain shared skills in `.claude/skills/`. Codex discovers the same skills via
+`.agents/skills -> ../.claude/skills`; no per-skill links or inventory are needed.
+
+## Public repository confidentiality
+
+This is a public, open-source repository. Use fictional organizations, model
+aliases and illustrative prices in examples and test fixtures. Never include
+real customer identities, private aliases, negotiated terms, account identifiers
+or customer-specific operational details in code, docs, fixtures, commit
+messages, pull-request text or review comments. Keep private deployment paths,
+internal runbooks and customer investigations outside this repository. Describe
+built-in features generically, with configuration that any installation can use.
+Check the diff and publication text for these details before committing or posting.
+
 ## Project Overview
 
 The Doubleword Control Layer (dwctl) is a high-performance AI model gateway
@@ -44,7 +60,20 @@ Uses SQLx with PostgreSQL following the Repository pattern:
 Handlers (API) → Repositories (db::handlers) → Models (db::models) → PostgreSQL
 ```
 
-- Migrations run automatically on startup from `dwctl/migrations/`
+- Migrations live in `dwctl/migrations/` (main schema) and
+  `fusillade-arsenal/migrations/` (Fusillade). `dwctl migrate` applies them;
+  `migrations.mode` (`run` locally, `check` in deployments) decides whether
+  the serving process applies them or only verifies compatibility. Every
+  statement that changes the schema lives in a migration file; read
+  `docs/migrations.md` before adding one, especially an index built
+  `CONCURRENTLY`
+- New main migrations must use UTC `YYYYMMDDhhmmss_description.sql` versions
+  newer than the target branch's latest migration. Integer versions through 156
+  are frozen; never add another integer or fill a historical gap. See
+  `docs/migrations.md`; migration tests enforce the numbering rule.
+- The `underway` crate (background task queue) ships its own SQLx migrations
+  that create the `underway` schema; `just db-setup` applies these too, but
+  they are also applied at runtime via `underway::run_migrations`
 - Schema uses PostgreSQL LISTEN/NOTIFY for real-time config updates
 - Advisory locks for leader election - leader election is used to choose who
 runs the probe service, and (configurably) the batch daemon
@@ -55,8 +84,11 @@ runs the probe service, and (configurably) the batch daemon
 ### Initial Setup
 
 ```bash
-# Install prerequisites (macOS)
-brew install just hurl postgresql
+# Install prerequisites (macOS). `just check` verifies all of these:
+#   docker + compose plugin, hurl, psql, createdb, cargo, pnpm
+brew install just hurl postgresql pnpm
+brew install --cask docker   # any Docker runtime works (Docker Desktop, OrbStack, colima)
+# cargo comes from rustup, not Homebrew: https://rustup.rs
 
 # Check all dependencies installed
 just check
@@ -75,16 +107,26 @@ just db-setup
 
 ```bash
 # Start backend (from project root)
-cargo run
+just dev-native
 
 # Start frontend dev server (from dashboard/)
 pnpm run dev
 ```
 
+`just dev-native` is `cargo run` plus two things you need locally: it checks
+whether Postgres is up before starting a build that would fail
+without it, and it relaxes the session cookie for plain HTTP.
+
+```bash
+DWCTL_AUTH__NATIVE__SESSION__COOKIE_SECURE=false \
+DWCTL_AUTH__NATIVE__SESSION__COOKIE_SAME_SITE=lax \
+cargo run
+```
+
 ### Testing
 
 ```bash
-# Backend unit tests (requires database)
+# Backend tests via nextest, followed by doctests (requires database)
 just test rust
 just test rust --watch      # Watch mode
 just test rust --coverage   # With coverage
@@ -261,6 +303,8 @@ TAGS=v1.0.0 PLATFORMS=linux/amd64,linux/arm64 docker buildx bake --push
 
 ## Testing Philosophy
 
+- For Rust test changes, use the [test-efficiency skill](.claude/skills/rust-test-efficiency/SKILL.md)
+  for isolated template databases, permission matrices, and timing slow tests.
 - **Backend**: `cargo test` provides comprehensive API integration tests using `axum-test` to spin up the full API server and make ~real HTTP requests
 - **Frontend**: `pnpm test` in `dashboard/` runs Vitest unit tests for React components and utilities. Always scope queries using `within(container)` instead of `screen` to avoid querying multiple test instances in the DOM (see TypeScript/React Testing section for details)
 - Hurl and Playwright E2E tests exist but are currently minimal (not the main test suite)
@@ -351,7 +395,9 @@ Note: Even databases claiming "zero replication lag" (like Neon) can exhibit lag
 
 - Test incrementally: write one test, make it pass, write the next test (not all at once)
 - Prefer orthogonality and simplicity in test design - test one thing clearly per test
-- Use `#[sqlx::test]` attribute to get a fresh database per test (automatic setup/teardown)
+- Use `#[dwctl_test_macros::test]` for dwctl unit tests to clone an isolated migrated database.
+  Retain `#[sqlx::test]` for migration/schema-startup tests and other crates;
+  see the test-efficiency skill for choosing the required initial schema state.
 - Use `create_test_user()`, `create_test_app()` helpers from `test_utils` module
 - Integration tests use `axum_test::TestServer` to make real HTTP requests
 

@@ -3,7 +3,7 @@
 use chrono::{DateTime, Duration, Timelike, Utc};
 use moka::future::Cache;
 use once_cell::sync::Lazy;
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use std::collections::HashMap;
 use tracing::instrument;
 
@@ -29,6 +29,24 @@ static METRICS_CACHE: Lazy<Cache<String, HashMap<String, ModelMetrics>>> = Lazy:
         .time_to_live(std::time::Duration::from_secs(60))
         .build()
 });
+
+/// Bounds every dashboard read over `http_analytics`.
+///
+/// These reads aggregate caller-chosen ranges of an append-only table that grows without
+/// limit. Postgres keeps executing a statement after its HTTP client has gone, and while it
+/// runs its snapshot holds back vacuum for the whole database: dead rows then pile up in
+/// hot queue tables such as `analytics_outbox`, and every claim from them slows down.
+const DASHBOARD_READ_TIMEOUT: &str = "SET LOCAL statement_timeout = '30s'";
+
+/// Begin a read transaction whose statements Postgres cancels after 30 seconds.
+///
+/// `SET LOCAL` scopes the limit to this transaction, so it holds behind a transaction-mode
+/// connection pooler and never leaks onto the pooled connection.
+async fn begin_dashboard_read(db: &PgPool) -> Result<Transaction<'static, Postgres>> {
+    let mut tx = db.begin().await?;
+    sqlx::query(DASHBOARD_READ_TIMEOUT).execute(&mut *tx).await?;
+    Ok(tx)
+}
 
 /// Time granularity for analytics queries
 #[derive(Debug, Clone, Copy)]
@@ -92,13 +110,14 @@ struct BulkTimeSeriesRow {
 }
 
 /// Get total request count
-#[instrument(skip(db), err)]
+#[instrument(level = "debug", skip(db), err)]
 async fn get_total_requests(
     db: &PgPool,
     time_range_start: DateTime<Utc>,
     time_range_end: DateTime<Utc>,
     model_filter: Option<&str>,
 ) -> Result<i64> {
+    let mut tx = begin_dashboard_read(db).await?;
     let total_requests = if let Some(model) = model_filter {
         sqlx::query_as!(
             TotalRequestsRow,
@@ -107,7 +126,7 @@ async fn get_total_requests(
             time_range_end,
             model
         )
-        .fetch_one(db)
+        .fetch_one(&mut *tx)
         .await?
         .total_requests
         .unwrap_or(0)
@@ -118,16 +137,18 @@ async fn get_total_requests(
             time_range_start,
             time_range_end
         )
-        .fetch_one(db)
+        .fetch_one(&mut *tx)
         .await?
         .total_requests
         .unwrap_or(0)
     };
+    tx.commit().await?;
+
     Ok(total_requests)
 }
 
 /// Get time series data with configurable granularity
-#[instrument(skip(db), err)]
+#[instrument(level = "debug", skip(db), err)]
 async fn get_time_series(
     db: &PgPool,
     time_range_start: DateTime<Utc>,
@@ -142,13 +163,14 @@ async fn get_time_series(
 }
 
 /// Get time series data with hourly granularity (existing implementation)
-#[instrument(skip(db), err)]
+#[instrument(level = "debug", skip(db), err)]
 async fn get_time_series_hourly(
     db: &PgPool,
     time_range_start: DateTime<Utc>,
     time_range_end: DateTime<Utc>,
     model_filter: Option<&str>,
 ) -> Result<Vec<TimeSeriesPoint>> {
+    let mut tx = begin_dashboard_read(db).await?;
     let rows = if let Some(model) = model_filter {
         sqlx::query_as!(
             TimeSeriesRow,
@@ -170,7 +192,7 @@ async fn get_time_series_hourly(
             time_range_end,
             model
         )
-        .fetch_all(db)
+        .fetch_all(&mut *tx)
         .await?
     } else {
         sqlx::query_as!(
@@ -192,9 +214,11 @@ async fn get_time_series_hourly(
             time_range_start,
             time_range_end
         )
-        .fetch_all(db)
+        .fetch_all(&mut *tx)
         .await?
     };
+
+    tx.commit().await?;
 
     let time_series = rows
         .into_iter()
@@ -219,13 +243,14 @@ async fn get_time_series_hourly(
 }
 
 /// Get time series data with 10-minute granularity
-#[instrument(skip(db), err)]
+#[instrument(level = "debug", skip(db), err)]
 async fn get_time_series_ten_minutes(
     db: &PgPool,
     time_range_start: DateTime<Utc>,
     time_range_end: DateTime<Utc>,
     model_filter: Option<&str>,
 ) -> Result<Vec<TimeSeriesPoint>> {
+    let mut tx = begin_dashboard_read(db).await?;
     let rows = if let Some(model) = model_filter {
         sqlx::query_as!(
             TimeSeriesRow,
@@ -247,7 +272,7 @@ async fn get_time_series_ten_minutes(
             time_range_end,
             model
         )
-        .fetch_all(db)
+        .fetch_all(&mut *tx)
         .await?
     } else {
         sqlx::query_as!(
@@ -269,9 +294,11 @@ async fn get_time_series_ten_minutes(
             time_range_start,
             time_range_end
         )
-        .fetch_all(db)
+        .fetch_all(&mut *tx)
         .await?
     };
+
+    tx.commit().await?;
 
     let time_series = rows
         .into_iter()
@@ -428,13 +455,14 @@ fn fill_missing_intervals_for_sparklines(
 }
 
 /// Get status code breakdown (raw counts, percentages calculated later)
-#[instrument(skip(db), err)]
+#[instrument(level = "debug", skip(db), err)]
 async fn get_status_codes(
     db: &PgPool,
     time_range_start: DateTime<Utc>,
     time_range_end: DateTime<Utc>,
     model_filter: Option<&str>,
 ) -> Result<Vec<StatusCodeRow>> {
+    let mut tx = begin_dashboard_read(db).await?;
     let rows = if let Some(model) = model_filter {
         sqlx::query_as!(
             StatusCodeRow,
@@ -443,7 +471,7 @@ async fn get_status_codes(
             time_range_end,
             model
         )
-        .fetch_all(db)
+        .fetch_all(&mut *tx)
         .await?
     } else {
         sqlx::query_as!(
@@ -452,30 +480,35 @@ async fn get_status_codes(
             time_range_start,
             time_range_end
         )
-        .fetch_all(db)
+        .fetch_all(&mut *tx)
         .await?
     };
+
+    tx.commit().await?;
 
     Ok(rows)
 }
 
 /// Get model usage data (raw counts, percentages calculated later)
-#[instrument(skip(db), err)]
+#[instrument(level = "debug", skip(db), err)]
 async fn get_model_usage(db: &PgPool, time_range_start: DateTime<Utc>, time_range_end: DateTime<Utc>) -> Result<Vec<ModelUsageRow>> {
+    let mut tx = begin_dashboard_read(db).await?;
     let rows = sqlx::query_as!(
         ModelUsageRow,
         "SELECT model as model_name, COUNT(*) as model_count, COALESCE(AVG(duration_ms), 0)::float8 as model_avg_latency_ms FROM http_analytics WHERE timestamp >= $1 AND timestamp <= $2 AND model IS NOT NULL GROUP BY model ORDER BY model_count DESC",
         time_range_start,
         time_range_end
     )
-    .fetch_all(db)
+    .fetch_all(&mut *tx)
     .await?;
+
+    tx.commit().await?;
 
     Ok(rows)
 }
 
 /// Get aggregated analytics data for HTTP requests
-#[instrument(skip(db), err)]
+#[instrument(level = "debug", skip(db), err)]
 pub async fn get_requests_aggregate(
     db: &PgPool,
     time_range_start: DateTime<Utc>,
@@ -552,7 +585,7 @@ pub async fn get_requests_aggregate(
 }
 
 /// Get aggregated metrics for one or more models (with 60s cache)
-#[instrument(skip(db), err)]
+#[instrument(level = "debug", skip(db), err)]
 pub async fn get_model_metrics(db: &PgPool, mut model_aliases: Vec<String>) -> Result<HashMap<String, ModelMetrics>> {
     if model_aliases.is_empty() {
         return Ok(HashMap::new());
@@ -596,6 +629,8 @@ async fn get_model_metrics_impl(db: &PgPool, model_aliases: Vec<String>) -> Resu
         );
     }
 
+    let mut tx = begin_dashboard_read(db).await?;
+
     // Get basic metrics for models that have activity
     let metrics_rows = sqlx::query_as!(
         ModelMetricsRow,
@@ -613,7 +648,7 @@ async fn get_model_metrics_impl(db: &PgPool, model_aliases: Vec<String>) -> Resu
         "#,
         &model_aliases
     )
-    .fetch_all(db)
+    .fetch_all(&mut *tx)
     .await?;
 
     // Update metrics for models that have actual data
@@ -651,8 +686,10 @@ async fn get_model_metrics_impl(db: &PgPool, model_aliases: Vec<String>) -> Resu
         two_hours_ago,
         now
     )
-    .fetch_all(db)
+    .fetch_all(&mut *tx)
     .await;
+
+    tx.commit().await?;
 
     // Process time series data if successful
     if let Ok(rows) = time_series_rows {
@@ -704,7 +741,7 @@ struct UserUsageRow {
 /// requests don't inflate the counts. Because it is keyed by UTC `usage_date`,
 /// the range is whole-UTC-day and `last_active_at` is day-granular
 /// (`MAX(usage_date)`), not the exact last-request timestamp.
-#[instrument(skip(db), err)]
+#[instrument(level = "debug", skip(db), err)]
 pub async fn get_model_user_usage(
     db: &PgPool,
     model_alias: &str,
@@ -796,7 +833,7 @@ pub async fn get_model_user_usage(
 /// means the batch predates the read model and its raw analytics have aged out — the caller
 /// surfaces this as a 404 ("analytics no longer available") rather than a misleading all-zero
 /// result. (It also covers a batch that never had a foldable request, e.g. all-non-2xx.)
-#[instrument(skip(pool))]
+#[instrument(level = "debug", skip(pool))]
 pub async fn get_batch_analytics(pool: &PgPool, batch_id: &Uuid) -> Result<Option<BatchAnalytics>> {
     let row = sqlx::query!(
         r#"
@@ -875,7 +912,7 @@ fn batch_analytics_from_row(
 }
 
 /// Get aggregated analytics metrics for multiple batches in a single query
-#[instrument(skip(pool))]
+#[instrument(level = "debug", skip(pool))]
 pub async fn get_batches_analytics_bulk(pool: &PgPool, batch_ids: &[Uuid]) -> Result<HashMap<Uuid, BatchAnalytics>> {
     if batch_ids.is_empty() {
         return Ok(HashMap::new());
@@ -958,7 +995,7 @@ struct HttpAnalyticsRow {
 }
 
 /// List HTTP analytics entries with filtering and pagination
-#[instrument(skip(pool), err)]
+#[instrument(level = "debug", skip(pool), err)]
 pub async fn list_http_analytics(
     pool: &PgPool,
     skip: i64,
@@ -1084,7 +1121,7 @@ struct ModelBreakdownRow {
 /// Returns (batch_count, avg_requests_per_batch, total_cost).
 /// Batch count and avg can't be derived from per-model breakdown
 /// (batches may span multiple models). Cost is already aggregated here.
-#[instrument(skip(pool), err)]
+#[instrument(level = "debug", skip(pool), err)]
 pub async fn get_user_batch_counts(pool: &PgPool, user_id: Uuid) -> Result<(i64, f64, String)> {
     let row = sqlx::query_as!(
         BatchCountRow,
@@ -1125,7 +1162,7 @@ const USAGE_DAILY_REFRESH_LOCK: i64 = 0x4457_4354_5553_4744;
 /// The `WHERE id > last_processed_id` scan is disjoint from the one-off backfill's
 /// `WHERE id <= backfill_watermark`, so the two can run concurrently without double
 /// counting (a day straddling the boundary gets each side summed via the additive upsert).
-#[instrument(skip(pool), err)]
+#[instrument(level = "debug", skip(pool), err)]
 pub async fn refresh_user_model_usage_daily(pool: &PgPool) -> Result<()> {
     let mut tx = pool.begin().await?;
 
@@ -1196,18 +1233,33 @@ pub async fn refresh_user_model_usage_daily(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
+/// Usage comparison only: prefer the account's all-class realtime deal, then
+/// its standard-class deal, then general realtime. Never borrow an interactive
+/// price or reprice actual usage totals. This differs intentionally from billing.
 /// Load current realtime tariff rates keyed by model alias.
 /// Returns a map of model alias → (input_price_per_token, output_price_per_token).
-/// This is a tiny table (~12 rows) so it's efficient to load entirely.
-#[instrument(skip(pool), err)]
-pub async fn get_realtime_tariffs(pool: &PgPool) -> Result<HashMap<String, (Decimal, Decimal)>> {
+/// Only resolve models present in this usage response, including retired models.
+#[instrument(level = "debug", skip(pool), err)]
+pub async fn get_realtime_tariffs(pool: &PgPool, account: Uuid, models: &[String]) -> Result<HashMap<String, (Decimal, Decimal)>> {
     let rows = sqlx::query!(
         r#"
-        SELECT dm.alias, t.input_price_per_token, t.output_price_per_token
-        FROM model_tariffs t
-        JOIN deployed_models dm ON dm.id = t.deployed_model_id
-        WHERE t.api_key_purpose = 'realtime' AND t.valid_until IS NULL
-        "#
+        SELECT dm.alias, t.input_price_per_token as "input_price_per_token!", t.output_price_per_token as "output_price_per_token!"
+        FROM deployed_models dm
+        CROSS JOIN LATERAL (
+            SELECT choices.input_price_per_token, choices.output_price_per_token FROM (
+                SELECT user_id, serving_class, input_price_per_token, output_price_per_token
+                FROM effective_model_display_tariff(dm.id, $1, 'realtime', NULL, NOW())
+                UNION SELECT user_id, serving_class, input_price_per_token, output_price_per_token
+                FROM effective_model_tariff(dm.id, $1, 'realtime', NULL, 'standard', NOW())
+            ) choices
+            ORDER BY CASE WHEN choices.user_id = $1 AND choices.serving_class IS NULL THEN 0
+                          WHEN choices.user_id = $1 THEN 1 ELSE 2 END
+            LIMIT 1
+        ) t
+        WHERE dm.alias = ANY($2)
+        "#,
+        account,
+        models
     )
     .fetch_all(pool)
     .await?;
@@ -1221,7 +1273,7 @@ pub async fn get_realtime_tariffs(pool: &PgPool) -> Result<HashMap<String, (Deci
 /// Get all-time per-model breakdown from the pre-aggregated `user_model_usage_daily`
 /// rollup, summed across every day. Totals (tokens, cost, request count) are derived from
 /// these results by the handler.
-#[instrument(skip(pool), err)]
+#[instrument(level = "debug", skip(pool), err)]
 pub async fn get_user_model_breakdown(pool: &PgPool, user_id: Uuid) -> Result<Vec<ModelBreakdownEntry>> {
     let rows = sqlx::query_as!(
         ModelBreakdownRow,
@@ -1262,7 +1314,7 @@ pub async fn get_user_model_breakdown(pool: &PgPool, user_id: Uuid) -> Result<Ve
 /// The rollup is keyed by UTC `usage_date`, so the range is matched at **day** granularity:
 /// the start/end timestamps are truncated to their UTC date. Sub-day ranges therefore
 /// collapse to whole days — callers (and the UI) present usage at day granularity.
-#[instrument(skip(pool), err)]
+#[instrument(level = "debug", skip(pool), err)]
 pub async fn get_user_model_breakdown_for_range(
     pool: &PgPool,
     user_id: Uuid,
@@ -1308,7 +1360,7 @@ pub async fn get_user_model_breakdown_for_range(
 /// Get distinct batch count for a date range from `batch_aggregates` (one row per batch,
 /// filtered by `created_at`). Batch counts are not summable across day boundaries, so they
 /// come from `batch_aggregates` rather than the daily rollup.
-#[instrument(skip(pool), err)]
+#[instrument(level = "debug", skip(pool), err)]
 pub async fn get_user_batch_count_for_range(pool: &PgPool, user_id: Uuid, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<i64> {
     let row = sqlx::query_scalar!(
         r#"
@@ -1514,7 +1566,27 @@ mod tests {
         .expect("Failed to insert test analytics data");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
+    async fn test_dashboard_read_timeout_is_scoped_to_its_transaction(pool: PgPool) {
+        // One connection, so the check after commit runs on the connection the limit was set on.
+        let single = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .unwrap();
+        let before: String = sqlx::query_scalar("SHOW statement_timeout").fetch_one(&single).await.unwrap();
+        assert_eq!(before, "0");
+
+        let mut tx = begin_dashboard_read(&single).await.unwrap();
+        let inside: String = sqlx::query_scalar("SHOW statement_timeout").fetch_one(&mut *tx).await.unwrap();
+        assert_eq!(inside, "30s");
+        tx.commit().await.unwrap();
+
+        let after: String = sqlx::query_scalar("SHOW statement_timeout").fetch_one(&single).await.unwrap();
+        assert_eq!(after, "0");
+    }
+
+    #[dwctl_test_macros::test]
     async fn test_get_total_requests_no_filter(pool: PgPool) {
         let now = Utc::now();
         let one_hour_ago = now - Duration::hours(1);
@@ -1529,7 +1601,7 @@ mod tests {
         assert_eq!(result, 3);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_total_requests_with_model_filter(pool: PgPool) {
         let now = Utc::now();
         let one_hour_ago = now - Duration::hours(1);
@@ -1549,7 +1621,7 @@ mod tests {
         assert_eq!(result, 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_time_series_basic(pool: PgPool) {
         let base_time = Utc.with_ymd_and_hms(2024, 1, 1, 10, 0, 0).unwrap();
         let hour1 = base_time;
@@ -1591,7 +1663,7 @@ mod tests {
         assert_eq!(h2.output_tokens, 30);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_status_codes(pool: PgPool) {
         let now = Utc::now();
         let one_hour_ago = now - Duration::hours(1);
@@ -1618,7 +1690,7 @@ mod tests {
         assert_eq!(result[1].status_count, Some(1));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_model_usage(pool: PgPool) {
         let now = Utc::now();
         let one_hour_ago = now - Duration::hours(1);
@@ -1641,7 +1713,7 @@ mod tests {
         assert_eq!(result[1].model_avg_latency_ms, Some(300.0));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_requests_aggregate_full_integration(pool: PgPool) {
         let base_time = Utc.with_ymd_and_hms(2024, 1, 1, 10, 0, 0).unwrap();
 
@@ -1679,7 +1751,7 @@ mod tests {
         assert!(!result.time_series.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_requests_aggregate_with_model_filter(pool: PgPool) {
         let base_time = Utc::now() - Duration::hours(2);
 
@@ -1702,7 +1774,7 @@ mod tests {
         assert_eq!(result.status_codes[0].status, "200");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_requests_aggregate_empty_database(pool: PgPool) {
         let base_time = Utc::now() - Duration::hours(24);
         let end_time = Utc::now();
@@ -1718,7 +1790,7 @@ mod tests {
         assert!(result.time_series.iter().all(|p| p.requests == 0));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_percentage_calculations_precision(pool: PgPool) {
         let base_time = Utc::now() - Duration::hours(1);
 
@@ -1773,7 +1845,7 @@ mod tests {
     // repeated calls for a batch accumulate.
     async fn insert_test_analytics_with_batch_id(pool: &PgPool, data: TestBatchAnalyticsData<'_>) {
         use crate::api::models::users::Role;
-        use crate::request_logging::batcher::list_price;
+        use crate::pricing::list_price;
         use crate::test::utils::create_test_user;
         use rust_decimal::Decimal;
         use uuid::Uuid;
@@ -1858,7 +1930,7 @@ mod tests {
         .expect("Failed to fold test batch_aggregates row");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_batch_analytics_single_request(pool: PgPool) {
         let batch_id = Uuid::new_v4();
         let now = Utc::now();
@@ -1902,7 +1974,7 @@ mod tests {
         assert!((cost_f64 - 0.0025).abs() < 0.00001);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_batch_analytics_serves_billed_cost_not_list_price(pool: PgPool) {
         // The regression a customer caught from outside (2026-07): the endpoint served
         // `total_list_cost` (un-discounted list price) as `total_cost`, while the ledger billed
@@ -1944,7 +2016,7 @@ mod tests {
         assert!(billed < list, "cache-discounted billed cost sits below list price");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_batch_analytics_multiple_requests(pool: PgPool) {
         let batch_id = Uuid::new_v4();
         let now = Utc::now();
@@ -2035,7 +2107,7 @@ mod tests {
         assert!((cost_f64 - 0.00665).abs() < 0.00001);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_batch_analytics_nonexistent_batch_id(pool: PgPool) {
         let nonexistent_batch_id = Uuid::new_v4();
 
@@ -2046,7 +2118,7 @@ mod tests {
         assert!(result.is_none());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_batch_analytics_filters_by_batch_id(pool: PgPool) {
         let batch_id_1 = Uuid::new_v4();
         let batch_id_2 = Uuid::new_v4();
@@ -2106,7 +2178,7 @@ mod tests {
         assert_eq!(result.avg_duration_ms, Some(100.0));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_batch_analytics_missing_optional_fields(pool: PgPool) {
         let batch_id = Uuid::new_v4();
         let now = Utc::now();
@@ -2149,7 +2221,7 @@ mod tests {
         assert_eq!(cost_f64, 0.0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_batch_analytics_multiple_requests_same_batch(pool: PgPool) {
         let batch_id = Uuid::new_v4();
         let other_batch_id = Uuid::new_v4();
@@ -2227,14 +2299,14 @@ mod tests {
         assert_eq!(result.avg_duration_ms, Some(125.0)); // (100 + 150) / 2
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_batches_analytics_bulk_empty_input(pool: PgPool) {
         // Empty batch IDs should return empty HashMap
         let result = get_batches_analytics_bulk(&pool, &[]).await.unwrap();
         assert!(result.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_batches_analytics_bulk_multiple_batches(pool: PgPool) {
         let batch_id_1 = Uuid::new_v4();
         let batch_id_2 = Uuid::new_v4();
@@ -2432,7 +2504,7 @@ mod tests {
         user_id
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_all_time_breakdown_includes_realtime_requests(pool: PgPool) {
         let user_id = create_usage_test_user(&pool).await;
         let now = Utc::now();
@@ -2479,7 +2551,7 @@ mod tests {
         assert_eq!(breakdown[0].output_tokens, 150); // 50 + 100
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_refresh_user_model_usage_daily_aggregates_per_day(pool: PgPool) {
         let user_id = create_usage_test_user(&pool).await;
         let day1_am = Utc.with_ymd_and_hms(2026, 1, 1, 10, 0, 0).unwrap();
@@ -2547,7 +2619,7 @@ mod tests {
         assert_eq!(rows[1].request_count, 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_refresh_user_model_usage_daily_is_additive_across_runs(pool: PgPool) {
         let user_id = create_usage_test_user(&pool).await;
         let day = Utc.with_ymd_and_hms(2026, 2, 3, 12, 0, 0).unwrap();
@@ -2597,7 +2669,7 @@ mod tests {
         assert_eq!(row.request_count, 2);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_user_model_breakdown_for_range_includes_realtime_requests(pool: PgPool) {
         let user_id = create_usage_test_user(&pool).await;
         let now = Utc::now();
@@ -2644,7 +2716,7 @@ mod tests {
         assert_eq!(breakdown[0].output_tokens, 100); // 40 + 60
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_user_model_breakdown_for_range_spans_utc_midnight(pool: PgPool) {
         // The range is matched at UTC-day granularity, so a window straddling UTC
         // midnight must include BOTH days it touches. Seed one request just before
@@ -2701,7 +2773,7 @@ mod tests {
         .expect("Failed to insert batch_aggregate");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_batch_count_for_range_counts_batches_in_window(pool: PgPool) {
         let user_id = create_usage_test_user(&pool).await;
         let now = Utc::now();
@@ -2716,7 +2788,7 @@ mod tests {
         assert_eq!(count, 2);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_all_time_breakdown_excludes_errors(pool: PgPool) {
         let user_id = create_usage_test_user(&pool).await;
         let now = Utc::now();
@@ -2805,7 +2877,7 @@ mod tests {
         assert_eq!(breakdown[0].output_tokens, 150); // 50 + 100
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_user_model_breakdown_for_range_excludes_errors(pool: PgPool) {
         let user_id = create_usage_test_user(&pool).await;
         let now = Utc::now();
@@ -2867,7 +2939,7 @@ mod tests {
         assert_eq!(breakdown[0].output_tokens, 40);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_batch_count_for_range_respects_window(pool: PgPool) {
         let user_id = create_usage_test_user(&pool).await;
         let now = Utc::now();

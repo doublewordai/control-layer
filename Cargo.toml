@@ -5,7 +5,8 @@ members = [
   "fusillade-arsenal",
   "fusillade-core",
   "onwards",
-  "onwards-fusillade",
+  "openai-reassembler",
+  "dwctl/test-macros",
 ]
 default-members = ["dwctl"]
 resolver = "2"

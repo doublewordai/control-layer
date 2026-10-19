@@ -61,6 +61,8 @@ export interface FallbackConfig {
   enabled: boolean;
   on_rate_limit: boolean;
   on_status: number[];
+  /** Extra statuses that fail over realtime traffic only; batch traffic runs its own retries. */
+  realtime_on_status?: number[];
   with_replacement: boolean;
   max_attempts: number | null;
   /** Inter-attempt exponential backoff. `null` (or omitted) = no delay between retries. */
@@ -82,7 +84,6 @@ export interface ComponentModelSummary {
   model_type?: ModelType;
   endpoint?: ComponentEndpointSummary;
   trusted?: boolean;
-  open_responses_adapter?: boolean;
 }
 
 export interface ModelComponent {
@@ -90,6 +91,12 @@ export interface ModelComponent {
   enabled: boolean;
   sort_order: number; // Lower = higher priority for priority-based routing
   created_at: string;
+  // Which routing pool this membership belongs to. "default" serves chat;
+  // "completions" holds validated continuation targets for /v1/completions.
+  // The same hosted model can be a member of both, with independent ordering,
+  // and component PATCH/DELETE endpoints address one membership at a time
+  // (server default: ?pool=default).
+  pool: "default" | "completions";
   model: ComponentModelSummary;
 }
 
@@ -115,6 +122,16 @@ export type Role =
   | "ConnectionsUser";
 export type ApiKeyPurpose = "platform" | "realtime" | "batch" | "playground";
 export type TariffApiKeyPurpose = "realtime" | "batch" | "playground";
+
+// Serving classes (operator-only; customers only ever see the model suffix)
+export type ServingClassName = "interactive" | "throughput";
+/** A model's preset for one class: the router targets its requests ask for. */
+export interface ServingPreset {
+  ttft_ms: number;
+  itl_ms: number;
+  priority: number;
+}
+export type EndpointKind = "dynamo" | "hosted" | "external";
 
 export type TrafficRoutingAction =
   | { type: "deny" }
@@ -152,6 +169,12 @@ export interface ConfigResponse {
     /** Whether strict mode is enabled (uses trusted flag for providers) */
     strict_mode: boolean;
   };
+  /**
+   * The scheduling-toleration presets an account may be pinned to
+   * (`scheduling.toleration_presets`). The account settings control renders
+   * these; an empty list means no presets are configured.
+   */
+  scheduling_toleration_presets?: SchedulingTolerationPreset[];
 }
 
 // Model metrics time series point
@@ -192,6 +215,9 @@ export interface ModelTariff {
   api_key_purpose?: TariffApiKeyPurpose | null;
   completion_window?: string | null; // Completion window like "24h", "1h"
   is_active: boolean;
+  /** Set on an organisation's own price (a deal); absent on the model's general price. */
+  organization_id?: string | null;
+  serving_class?: string | null;
 }
 
 // Cache pricing (Anthropic-style prompt-cache multipliers). Multipliers are decimal
@@ -310,9 +336,7 @@ export interface Model {
   model_type?: ModelType | null;
   capabilities?: string[] | null;
   hosted_on?: string | null; // endpoint ID (UUID) - null for virtual models
-  requests_per_second?: number | null; // Global rate limiting: requests per second
-  burst_size?: number | null; // Global rate limiting: burst capacity
-  capacity?: number | null; // Maximum concurrent requests allowed
+  realtime_inflight_limit?: number | null; // Virtual models: default realtime requests in flight per account
   batch_capacity?: number | null; // Maximum concurrent batch requests allowed
   throughput?: number | null; // Throughput in requests/second for batch SLA capacity calculations
   groups?: Group[]; // array of group IDs - only present when include=groups
@@ -322,16 +346,57 @@ export interface Model {
   endpoint?: Endpoint; // only present when include=endpoints
   // Virtual model fields (is_composite maps to "virtual" in UI terminology)
   is_composite?: boolean; // true = virtual model, false = hosted model
+  provisioning_source?: string;
   lb_strategy?: LoadBalancingStrategy | null;
   fallback?: FallbackConfig | null;
   components?: ModelComponent[]; // only present when include=components
   sanitize_responses?: boolean | null; // only present for virtual models
   trusted?: boolean; // Mark provider as trusted in strict mode (bypasses error sanitization)
-  open_responses_adapter?: boolean; // Enable adapter that converts /v1/responses to /v1/chat/completions
   reasoning_translation_overrides?: ReasoningTranslationOverrides | null;
   traffic_routing_rules?: TrafficRoutingRule[] | null;
   allowed_batch_completion_windows?: string[] | null;
   metadata?: ModelMetadata | null;
+  /** Serving classes the model offers, keyed by class, each a preset of router targets.
+   *  Only present for platform managers; declared in the model catalog. */
+  serving_classes?: Record<string, ServingPreset>;
+}
+
+/** One organisation's serving overrides on one model (platform managers only). */
+export interface ServingOverlay {
+  organization_id: string;
+  organization_name: string;
+  organization_display_name?: string | null;
+  deployed_model_id: string;
+  alias: string;
+  default_serving_class?: ServingClassName;
+  targets?: ServingPreset;
+  self_hosted_only?: boolean;
+  provisioning_source?: string;
+  updated_at: string;
+}
+
+export interface OrganizationCacheTariff {
+  deployed_model_id: string;
+  alias: string;
+  write_multiplier_5m: string;
+  write_multiplier_1h: string;
+  write_multiplier_24h: string;
+  read_multiplier: string;
+  serving_class?: string;
+  valid_from: string;
+}
+
+/** Everything serving-related about one organisation (platform managers only). */
+export interface OrganizationServing {
+  organization_id: string;
+  granted_serving_classes: ServingClassName[];
+  default_serving_class?: ServingClassName;
+  self_hosted_only: boolean;
+  overlays: ServingOverlay[];
+  tariffs: ModelTariff[];
+  /** Token-price model aliases, returned together to avoid per-model requests. */
+  model_aliases?: Record<string, string>;
+  cache_tariffs: OrganizationCacheTariff[];
 }
 
 // Model creation types - discriminated union with "type" field
@@ -344,13 +409,9 @@ export interface StandardModelCreate {
   description?: string;
   model_type?: ModelType;
   capabilities?: string[];
-  requests_per_second?: number;
-  burst_size?: number;
-  capacity?: number;
   batch_capacity?: number;
   throughput?: number;
   trusted?: boolean;
-  open_responses_adapter?: boolean;
   reasoning_translation_overrides?: ReasoningTranslationOverrides;
   traffic_routing_rules?: TrafficRoutingRule[];
   allowed_batch_completion_windows?: string[];
@@ -366,15 +427,14 @@ export interface VirtualModelCreate {
   description?: string;
   model_type?: ModelType;
   capabilities?: string[];
-  requests_per_second?: number;
-  burst_size?: number;
-  capacity?: number;
+  realtime_inflight_limit?: number;
   batch_capacity?: number;
   throughput?: number;
   lb_strategy?: LoadBalancingStrategy;
   fallback_enabled?: boolean;
   fallback_on_rate_limit?: boolean;
   fallback_on_status?: number[];
+  fallback_realtime_on_status?: number[];
   fallback_with_replacement?: boolean;
   fallback_max_attempts?: number | null;
   /** Inter-attempt backoff toggle; defaults to false (legacy zero-delay retry). */
@@ -407,6 +467,8 @@ export interface Endpoint {
   auth_header_name: string;
   auth_header_prefix: string;
   reasoning_translation?: ReasoningTranslationConfig | null;
+  /** What kind of server this is; only `dynamo` receives serving targets. */
+  kind?: EndpointKind;
 }
 
 export interface EndpointSyncResponse {
@@ -455,6 +517,14 @@ export interface User {
   has_auto_topup_payment_method: boolean; // Whether user has a saved payment method for auto top-up
   auto_topup_monthly_limit: number | null; // Monthly spending limit for auto top-ups (null = no limit)
   zero_data_retention: boolean; // Account-wide zero-data-retention flag
+  // Serving account settings (platform managers only)
+  granted_serving_classes?: ServingClassName[];
+  default_serving_class?: ServingClassName | null;
+  self_hosted_only?: boolean;
+  // Scheduling-toleration preset the account is pinned to (platform managers
+  // only). null/absent = "Default" (nothing pinned); a string is a configured
+  // preset id.
+  toleration_preset?: string | null;
   user_type?: "individual" | "organization"; // User type
   organizations?: OrganizationSummary[]; // only present when include=organizations or for current user
   active_organization_id?: string; // only present for /users/current
@@ -475,14 +545,16 @@ export interface ApiKey {
   purpose: ApiKeyPurpose; // Purpose of the key; see ApiKeyPurpose for allowed values
   created_at: string; // ISO 8601 timestamp
   last_used?: string; // ISO 8601 timestamp
-  requests_per_second?: number | null; // Rate limiting: requests per second
-  burst_size?: number | null; // Rate limiting: burst capacity
   created_by: string; // UUID of the user who created the key (always present in API responses)
   spend_limit?: string | null; // Spending cap in credits (decimal string); null = no cap
   spend_limit_interval?: SpendLimitInterval | null; // null = one-off cap
   spend?: string | null; // Spend counted against the cap in the current window (decimal string; null when uncapped)
   total_spend?: string | null; // Lifetime tracked spend for the cap scope (null when uncapped)
   resets_at?: string | null; // ISO 8601: next calendar reset (null for one-off caps / uncapped)
+  // When the HOLDER first fetched the secret. null = an issued key whose
+  // one-off reveal is still pending; self-created keys are born revealed.
+  // Rotation never changes this. Admins render it as "opened at".
+  secret_revealed_at?: string | null;
   // Note: actual key value only returned on creation
 }
 
@@ -540,7 +612,7 @@ export interface ModelsQuery {
   group?: string; // Filter by group IDs (comma-separated UUIDs)
   include?: ModelsInclude;
   accessible?: boolean; // Filter to only models the current user can access
-  search?: string; // Search query to filter models by alias or model_name
+  search?: string; // Case-insensitive search across alias, model name, display name, and endpoint name
   is_composite?: boolean; // Filter by composite/virtual model status (true = virtual, false = hosted)
   provider?: string; // Filter by provider name (case-insensitive exact match)
   model_type?: ModelType; // Filter by model type (CHAT, EMBEDDINGS, RERANKER)
@@ -588,8 +660,6 @@ export interface ApiKeyCreateRequest {
   name: string;
   description?: string;
   purpose: ApiKeyPurpose; // Required: purpose of the key
-  requests_per_second?: number | null;
-  burst_size?: number | null;
   spend_limit?: string | null; // Spending cap in credits (decimal string)
   spend_limit_interval?: SpendLimitInterval | null; // Requires spend_limit; null = one-off
   // Issue the key to another org member (org targets only; PlatformManager or
@@ -610,6 +680,9 @@ export interface ApiKeyUpdateRequest {
 export interface ApiKeysQuery {
   skip?: number;
   limit?: number;
+  // Server-side holder filter (org managers/PMs only): pagination and
+  // total_count then cover just that member's keys.
+  created_by?: string;
 }
 
 // Update endpoint bodies
@@ -623,6 +696,13 @@ export interface UserUpdateRequest {
   auto_topup_threshold?: number | null; // Set a threshold to enable, null to disable
   auto_topup_monthly_limit?: number | null; // Set a limit to cap, null to remove limit
   zero_data_retention?: boolean; // Users may update this for their own account
+  // Serving account settings: platform managers only (dwctl rejects the whole request otherwise)
+  granted_serving_classes?: ServingClassName[];
+  default_serving_class?: ServingClassName | null;
+  self_hosted_only?: boolean;
+  // Scheduling-toleration preset to pin the account to: platform managers
+  // only. A preset id pins it; null clears the pin ("Default").
+  toleration_preset?: string | null;
 }
 
 export interface GroupUpdateRequest {
@@ -636,9 +716,7 @@ export interface ModelUpdateRequest {
   description?: string | null;
   model_type?: ModelType | null;
   capabilities?: string[] | null;
-  requests_per_second?: number | null;
-  burst_size?: number | null;
-  capacity?: number | null;
+  realtime_inflight_limit?: number | null;
   batch_capacity?: number | null;
   throughput?: number | null;
   tariffs?: TariffDefinition[];
@@ -647,6 +725,7 @@ export interface ModelUpdateRequest {
   fallback_enabled?: boolean | null;
   fallback_on_rate_limit?: boolean | null;
   fallback_on_status?: number[] | null;
+  fallback_realtime_on_status?: number[] | null;
   fallback_with_replacement?: boolean | null;
   fallback_max_attempts?: number | null;
   /** Inter-attempt backoff toggle. `null` (or omitted) = no change. */
@@ -659,7 +738,6 @@ export interface ModelUpdateRequest {
   backoff_max_total_ms?: number | null;
   sanitize_responses?: boolean | null;
   trusted?: boolean | null;
-  open_responses_adapter?: boolean | null;
   reasoning_translation_overrides?: ReasoningTranslationOverrides | null;
   traffic_routing_rules?: TrafficRoutingRule[] | null;
   allowed_batch_completion_windows?: string[] | null;
@@ -679,6 +757,7 @@ export interface EndpointCreateRequest {
   sync?: boolean; // Whether to sync models during creation (defaults to true)
   skip_fetch?: boolean; // Create deployments directly from model_filter without fetching (defaults to false)
   reasoning_translation?: ReasoningTranslationConfig;
+  kind?: EndpointKind;
 }
 
 export interface EndpointUpdateRequest {
@@ -691,6 +770,7 @@ export interface EndpointUpdateRequest {
   auth_header_name?: string;
   auth_header_prefix?: string;
   reasoning_translation?: ReasoningTranslationConfig | null;
+  kind?: EndpointKind;
 }
 
 export type EndpointValidateRequest =
@@ -1135,11 +1215,16 @@ export interface TransactionsQuery {
   end_date?: string; // Filter transactions created on or before this date/time (ISO 8601 format)
 }
 
+/** Admin-initiated balance adjustments: gift funds or claw them back. */
+export type AdminTransactionType = "admin_grant" | "admin_removal";
+
 export interface AddFundsRequest {
   user_id: string; // UUID of the user to add funds to
   source_id: string; // UUID of the user providing the funds
-  amount: number; // Amount in dollars
+  amount: number; // Amount in dollars (always positive; the type decides the sign)
   description?: string;
+  /** Defaults to "admin_grant". Use "admin_removal" to remove funds. */
+  transaction_type?: AdminTransactionType;
 }
 
 export type AddFundsResponse = Transaction;
@@ -1340,6 +1425,12 @@ export interface Batch {
   cancelled_at?: number | null;
   request_counts: BatchRequestCounts;
   metadata?: Record<string, string>;
+  /**
+   * Model alias used by the batch's requests, or "mixed" when the input
+   * file spans multiple models. Absent on batches created before the
+   * backend started stamping it.
+   */
+  model?: string | null;
   usage?: BatchUsage;
   /** Included when requesting with include=analytics */
   analytics?: BatchAnalytics;
@@ -1696,6 +1787,29 @@ export interface SyncedKey {
 
 export type OrgMemberRole = "owner" | "admin" | "member";
 
+/**
+ * A product surface an organization owner can switch off for the whole
+ * organization. `realtime` is the synchronous inference endpoints (all
+ * service tiers); `batch` is the Files and Batches API.
+ */
+export type Modality = "realtime" | "batch";
+
+/**
+ * One operator-defined scheduling-toleration preset, declared in the
+ * deployment's `scheduling.toleration_presets`. An account stores only the
+ * preset's `id` (`toleration_preset`); the deployment resolves id to
+ * tolerations. `GET /admin/api/v1/config` exposes these for the account
+ * settings control.
+ */
+export interface SchedulingTolerationPreset {
+  /** Stable slug stored on the account. */
+  id: string;
+  /** Short human label for the control. */
+  label: string;
+  /** One or two sentences of help text (the tooltip). */
+  description: string;
+}
+
 export interface OrganizationSummary {
   id: string;
   name: string;
@@ -1707,9 +1821,37 @@ export interface OrganizationSummary {
   can_manage_keys: boolean;
 }
 
+/**
+ * An organization contact-email change that is still awaiting verification.
+ * The backend never applies an email change directly: both the current and
+ * the new mailbox must click a confirmation link before `email` updates.
+ */
+export interface PendingEmailChange {
+  /** The address `email` will become once both sides confirm. */
+  new_email: string;
+  /** When the confirmation links expire (ISO 8601). */
+  expires_at: string;
+  /** When the new mailbox confirmed; null/absent while still outstanding. */
+  new_email_confirmed_at?: string | null;
+  /** When the current mailbox confirmed; null/absent while still outstanding. */
+  old_email_confirmed_at?: string | null;
+}
+
 /** Organization response — flattened User with org-specific fields */
 export interface Organization extends User {
   member_count?: number;
+  /** Present while an email change is waiting on confirmation. */
+  pending_email_change?: PendingEmailChange;
+  /**
+   * Product surfaces an owner has switched off for every key this
+   * organization owns. Empty (or absent) means everything is allowed.
+   */
+  disabled_modalities?: Modality[];
+  /**
+   * Scheduling-toleration preset every request from this organization is
+   * pinned to (platform managers only). null/absent = "Default".
+   */
+  toleration_preset?: string | null;
 }
 
 export interface OrganizationMember {
@@ -1736,6 +1878,15 @@ export interface OrganizationUpdateRequest {
   batch_notifications_enabled?: boolean;
   low_balance_threshold?: number | null;
   zero_data_retention?: boolean; // Account-wide zero-data-retention flag (admin-only)
+  // Serving account settings: platform managers only
+  granted_serving_classes?: ServingClassName[];
+  default_serving_class?: ServingClassName | null;
+  self_hosted_only?: boolean;
+  /** Replaces the whole set; owner-only. An empty list re-enables everything. */
+  disabled_modalities?: Modality[];
+  // Scheduling-toleration preset to pin the organization to: platform managers
+  // only. A preset id pins it; null clears the pin ("Default").
+  toleration_preset?: string | null;
 }
 
 export interface InviteMemberRequest {

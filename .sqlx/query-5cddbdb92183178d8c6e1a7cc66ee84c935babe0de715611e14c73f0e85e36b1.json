@@ -1,0 +1,164 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            cm.id as composite_model_id,\n            cm.alias,\n            cm.lb_strategy,\n            cm.fallback_enabled,\n            cm.fallback_on_rate_limit,\n            cm.fallback_on_status,\n            cm.fallback_with_replacement,\n            cm.fallback_max_attempts,\n            cm.sanitize_responses as composite_sanitize_responses,\n            cm.trusted as composite_trusted,\n            -- Component info\n            dmc.deployed_model_id,\n            dmc.weight,\n            dmc.pool as component_pool,\n            -- Underlying deployment info\n            dm.model_name,\n            dm.alias as deployment_alias,\n            dm.sanitize_responses as deployment_sanitize_responses,\n            dm.trusted as deployment_trusted,\n            ie.reasoning_translation as endpoint_reasoning_translation,\n            dm.reasoning_translation_overrides as model_reasoning_translation_overrides,\n            -- Endpoint info\n            ie.url as \"endpoint_url!\",\n            ie.api_key as endpoint_api_key,\n            ie.auth_header_name,\n            ie.auth_header_prefix,\n            ie.accepts_scheduling_priority as endpoint_accepts_scheduling_priority,\n            ie.kind as endpoint_kind\n        FROM deployed_models cm\n        INNER JOIN deployed_model_components dmc ON cm.id = dmc.composite_model_id\n        INNER JOIN deployed_models dm ON dmc.deployed_model_id = dm.id\n        INNER JOIN inference_endpoints ie ON dm.hosted_on = ie.id\n        WHERE cm.is_composite = TRUE\n          AND cm.deleted = FALSE\n          AND dmc.enabled = TRUE\n          AND dm.deleted = FALSE\n        -- Deterministic priority order: sort_order is the failover order onwards\n        -- uses (Priority strategy iterates providers in definition order). The\n        -- weight/created_at keys break any residual sort_order tie the same way\n        -- the admin API does, so the provider shown as \"Primary\" is the one\n        -- onwards actually tries first.\n        ORDER BY cm.id, dmc.pool, dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "composite_model_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "lb_strategy",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "fallback_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 4,
+        "name": "fallback_on_rate_limit",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 5,
+        "name": "fallback_on_status",
+        "type_info": "Int4Array"
+      },
+      {
+        "ordinal": 6,
+        "name": "fallback_with_replacement",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 7,
+        "name": "fallback_max_attempts",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "composite_sanitize_responses",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 9,
+        "name": "composite_trusted",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 10,
+        "name": "deployed_model_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 11,
+        "name": "weight",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 12,
+        "name": "component_pool",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 13,
+        "name": "model_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 14,
+        "name": "deployment_alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 15,
+        "name": "deployment_sanitize_responses",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 16,
+        "name": "deployment_trusted",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 17,
+        "name": "endpoint_reasoning_translation",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 18,
+        "name": "model_reasoning_translation_overrides",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 19,
+        "name": "endpoint_url!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 20,
+        "name": "endpoint_api_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 21,
+        "name": "auth_header_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 22,
+        "name": "auth_header_prefix",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 23,
+        "name": "endpoint_accepts_scheduling_priority",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 24,
+        "name": "endpoint_kind",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "5cddbdb92183178d8c6e1a7cc66ee84c935babe0de715611e14c73f0e85e36b1"
+}

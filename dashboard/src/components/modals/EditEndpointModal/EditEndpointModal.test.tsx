@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { setupServer } from "msw/node";
 import { http, HttpResponse } from "msw";
@@ -619,4 +619,24 @@ describe("EditEndpointModal", () => {
       expect(screen.getByText(/Testing Connection.../i)).toBeInTheDocument();
     });
   });
+  it.each([false, true])("submits server kind only when changed: %s", async (changeKind) => {
+    let submitted: Record<string, unknown> | undefined;
+    server.use(http.patch("/admin/api/v1/endpoints/:id", async ({ request }) => {
+      submitted = await request.json() as Record<string, unknown>;
+      return HttpResponse.json({ ...mockEndpoint, ...submitted });
+    }));
+    render(<EditEndpointModal isOpen onClose={mockOnClose} onSuccess={mockOnSuccess} endpoint={{ ...mockEndpoint, kind: "hosted" }} />, { wrapper: createWrapper() });
+    if (changeKind) {
+      fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: /advanced configuration/i }));
+      fireEvent.change(screen.getByLabelText("Server kind"), { target: { value: "dynamo" } });
+      fireEvent.keyDown(screen.getByLabelText("Server kind"), { key: "Escape" });
+    }
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: /discover models/i }));
+    const update = await screen.findByRole("button", { name: /update endpoint/i });
+    fireEvent.click(update);
+    await waitFor(() => expect(submitted).toBeDefined());
+    if (changeKind) expect(submitted?.kind).toBe("dynamo");
+    else expect(submitted).not.toHaveProperty("kind");
+  });
+
 });

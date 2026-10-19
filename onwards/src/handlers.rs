@@ -4,12 +4,18 @@
 //! route them to appropriate targets, and handle authentication and rate limiting.
 
 use crate::AppState;
+use crate::affinity;
 use crate::auth;
 use crate::client::HttpClient;
 use crate::errors::{ErrorResponseBody, OnwardsErrorResponse};
+use crate::inflight::{BATCH_INFLIGHT_SCOPE, InflightSlot};
 use crate::models::ListModelResponse;
+use crate::rejections::RejectionContext;
+use crate::serving::{
+    self, ProviderKind, RequestedServingClass, ServingClassOutcome, ServingResolution,
+};
 use crate::sse::SseBufferedStream;
-use crate::target::{ConcurrencyGuard, RoutingAction, Target};
+use crate::target::{ConcurrencyGuard, RequestClass, RoutingAction, Target};
 use axum::{
     Json,
     extract::Request,
@@ -23,9 +29,11 @@ use axum::{
 use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
 use serde_json::map::Entry;
 use tracing::{Instrument, debug, error, instrument, trace, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+use uuid::Uuid;
 
 /// Adapter to extract W3C trace context from an axum HeaderMap.
-struct HeaderExtractor<'a>(&'a HeaderMap);
+pub struct HeaderExtractor<'a>(pub &'a HeaderMap);
 
 impl Extractor for HeaderExtractor<'_> {
     fn get(&self, key: &str) -> Option<&str> {
@@ -51,6 +59,13 @@ impl Injector for HeaderInjector<'_> {
 /// Record HTTP response status code on the current span
 fn record_response_status(status_code: u16) {
     tracing::Span::current().record("http.response.status_code", status_code);
+}
+
+/// Whether an upstream status means the provider had no room for the request.
+/// A provider that is up answers 529 when its workers are busy and 503 when no
+/// worker can take the request; a provider that is down never answers at all.
+fn is_capacity_refusal(status: u16) -> bool {
+    matches!(status, 503 | 529)
 }
 
 /// Detect a provider error envelope embedded in an HTTP 200 body.
@@ -81,9 +96,14 @@ fn embedded_error_status(body: &serde_json::Value) -> Option<u16> {
 enum SseEventKind {
     /// A `data:` frame carrying an embedded provider error — the contained
     /// `error.code`, per [`embedded_error_status`].
-    Error(u16),
-    /// A `data:` frame carrying normal content (or the `[DONE]` sentinel).
+    Error(u16, serde_json::Value),
+    /// A non-sentinel `data:` frame (possibly metadata rather than generated text).
     Data,
+    /// The `[DONE]` sentinel. A `data:` frame, but not a token: it ends a
+    /// stream rather than carrying content. Decisive like [`SseEventKind::Data`]
+    /// and equally proof the stream was not empty, but it must never be counted
+    /// as a first token.
+    Done,
     /// No `data:` field: an SSE comment / keep-alive (e.g. `: keep-alive`), which
     /// the caller peeks past to reach the first real frame.
     Comment,
@@ -118,15 +138,94 @@ fn classify_sse_event(chunk: &[u8]) -> SseEventKind {
         return SseEventKind::Comment;
     }
     if data.trim() == "[DONE]" {
-        return SseEventKind::Data;
+        return SseEventKind::Done;
     }
-    match serde_json::from_str::<serde_json::Value>(data.trim())
-        .ok()
-        .as_ref()
-        .and_then(embedded_error_status)
+    if let Ok(body) = serde_json::from_str::<serde_json::Value>(data.trim())
+        && let Some(status) = embedded_error_status(&body)
     {
-        Some(status) => SseEventKind::Error(status),
-        None => SseEventKind::Data,
+        SseEventKind::Error(status, body["error"].clone())
+    } else {
+        SseEventKind::Data
+    }
+}
+
+/// Whether a request body asks for a streamed response (`"stream": true`).
+/// The substring guard skips the parse for the common non-streaming body.
+fn requests_stream(body: &[u8]) -> bool {
+    body.windows(8).any(|w| w == b"\"stream\"")
+        && serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("stream")?.as_bool())
+            .unwrap_or(false)
+}
+
+/// What reading the lead frames of a 2xx SSE stream has established so far.
+#[derive(Default)]
+struct LeadFrames {
+    /// The provider embedded an error status in the first real frame.
+    embedded: Option<(u16, serde_json::Value)>,
+    /// A `data:` frame arrived, so the stream is definitely not empty. Set for
+    /// the `[DONE]` sentinel too: it proves non-emptiness even though it carries
+    /// no token. This is what suppresses the retryable `EmptyBody` verdict, so
+    /// it must stay set for `[DONE]`.
+    saw_data: bool,
+    /// A data frame carrying actual content arrived — `[DONE]` excluded. This,
+    /// not `saw_data`, is the first-token signal: a zero-token stream can open
+    /// with `[DONE]`.
+    saw_content: bool,
+    /// The stream closed (`None`) or errored (`Err`) before any content — a
+    /// *terminal* empty, safe to retry.
+    stream_ended: bool,
+}
+
+/// Pull up to `max_events` frames from `events` into `peeked`, stopping at the
+/// first decisive one: an embedded error, real content, or end of stream.
+/// Keep-alive / comment frames are buffered and skipped. `peeked` and `lead`
+/// live outside this future so a caller's timeout cancelling it loses nothing:
+/// frames consumed so far are still replayed to the client.
+async fn read_lead_frames<S, E>(
+    events: &mut S,
+    peeked: &mut Vec<Result<axum::body::Bytes, E>>,
+    lead: &mut LeadFrames,
+    max_events: usize,
+) where
+    S: futures_util::Stream<Item = Result<axum::body::Bytes, E>> + Unpin,
+{
+    use futures_util::StreamExt;
+    for _ in 0..max_events {
+        match events.next().await {
+            Some(Ok(chunk)) => match classify_sse_event(&chunk) {
+                SseEventKind::Error(status, error) => {
+                    lead.embedded = Some((status, error));
+                    peeked.push(Ok(chunk));
+                    return;
+                }
+                SseEventKind::Data => {
+                    lead.saw_data = true;
+                    lead.saw_content = true;
+                    peeked.push(Ok(chunk));
+                    return;
+                }
+                // Decisive exactly as `Data` is — it ends the peek and marks the
+                // stream non-empty — but it is not a first token, so it leaves
+                // `saw_content` alone.
+                SseEventKind::Done => {
+                    lead.saw_data = true;
+                    peeked.push(Ok(chunk));
+                    return;
+                }
+                SseEventKind::Comment => peeked.push(Ok(chunk)),
+            },
+            Some(Err(e)) => {
+                lead.stream_ended = true;
+                peeked.push(Err(e));
+                return;
+            }
+            None => {
+                lead.stream_ended = true;
+                return;
+            }
+        }
     }
 }
 
@@ -194,6 +293,8 @@ struct GuardedStream<S> {
     inner: S,
     _guard: ConcurrencyGuard,
     _inflight_guard: InflightGuard,
+    _inflight_slot: Option<InflightSlot>,
+    _batch_inflight_slot: Option<InflightSlot>,
 }
 
 impl<S, E> futures_util::Stream for GuardedStream<S>
@@ -241,6 +342,29 @@ pub struct ServedBy {
     /// The upstream model name after any `onwards_model` rewrite, when configured.
     pub onwards_model: Option<String>,
 }
+
+/// Rewrite the request body's `model` to the bare alias after a class suffix
+/// was stripped. Bodies that do not parse (or carry no `model`) are returned
+/// untouched: the `Model-Override` header path has no body model to rewrite.
+fn rewrite_body_model(body: axum::body::Bytes, alias: &str) -> axum::body::Bytes {
+    if body.is_empty() {
+        return body;
+    }
+    let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return body;
+    };
+    match parsed.get_mut("model") {
+        Some(model) if model.is_string() => {
+            *model = serde_json::Value::String(alias.to_string());
+            serde_json::to_vec(&parsed).map(Into::into).unwrap_or(body)
+        }
+        _ => body,
+    }
+}
+/// Stable identity of the API key accepted for this request. This is carried
+/// only in the in-process response extensions and is never sent to the client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthenticatedApiKeyId(pub Uuid);
 
 /// Resolve whether W3C trace context headers should be propagated to an
 /// upstream provider. The per-provider `propagate_trace_context` overrides;
@@ -368,19 +492,25 @@ pub async fn target_message_handler<T: HttpClient>(
         otel.name = "onwards.request",
         gen_ai.request.model = tracing::field::Empty,
         http.response.status_code = tracing::field::Empty,
+        onwards.serving.requested = tracing::field::Empty,
+        onwards.serving.resolved = tracing::field::Empty,
     );
 
     // Extract W3C trace context (traceparent + tracestate) from inbound headers
     // BEFORE the span is first entered. This stitches cross-service traces (e.g.
-    // remote onwards receiving requests from local onwards).
+    // remote onwards receiving requests from local onwards). An embedding
+    // gateway that has already adopted these headers strips them first, so
+    // this span then nests under its request span instead.
     if req.headers().contains_key("traceparent") {
         let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
         let parent_ctx = propagator.extract(&HeaderExtractor(req.headers()));
-        use tracing_opentelemetry::OpenTelemetrySpanExt;
         let _ = span.set_parent(parent_ctx);
     }
 
     async move {
+
+    let mut rejection = RejectionContext::from_request(&state, req.headers());
+    let result = async {
 
     // Track inflight requests for observability. The guard is moved into GuardedStream
     // on the success path so the gauge stays incremented for the full lifetime of
@@ -390,7 +520,7 @@ pub async fn target_message_handler<T: HttpClient>(
 
     // Extract the request body. TODO(fergus): make this step conditional: its not necessary if we
     // extract the model from the header.
-    let mut body_bytes =
+    let body_bytes =
         match axum::body::to_bytes(std::mem::take(req.body_mut()), state.body_limit).await {
             Ok(bytes) => bytes,
             // to_bytes only fails when the body exceeds the limit (or the
@@ -398,15 +528,6 @@ pub async fn target_message_handler<T: HttpClient>(
             // than an opaque 500.
             Err(_) => return Err(OnwardsErrorResponse::payload_too_large(state.body_limit)),
         };
-
-    // Apply body transformation if provided
-    if let Some(ref transform_fn) = state.body_transform_fn {
-        let path = req.uri().path();
-        if let Some(transformed_body) = transform_fn(path, req.headers(), &body_bytes) {
-            debug!("Applied body transformation for path: {}", path);
-            body_bytes = transformed_body;
-        }
-    }
 
     // Log incoming request metadata for debugging.
     // ZDR: never log the request body or headers — bodies carry prompt content
@@ -430,6 +551,35 @@ pub async fn target_message_handler<T: HttpClient>(
         }
     };
 
+    // A class suffix requests a serving class on the base alias. DWCTL strips
+    // it and hands it over as an extension; standalone callers are parsed here.
+    // Unknown class suffixes are a 400.
+    let suffix_class = req.extensions().get::<RequestedServingClass>().map(|c| c.0);
+    // DWCTL has already split the body selector once. Do not reinterpret its
+    // base alias (e.g. turn nonexistent `model:interactive` into `model`). A
+    // Model-Override header is a separate selector and still needs resolution.
+    let has_model_override = req.headers().get("model-override").and_then(|value| value.to_str().ok()).is_some();
+    let selected_model = if suffix_class.is_some() && !has_model_override {
+        Ok((model_name.as_str(), None))
+    } else {
+        serving::split_class_suffix(&model_name)
+    };
+    let (model_name, suffix_class, body_bytes) = match selected_model {
+        Ok((_, None)) => (model_name, suffix_class, body_bytes),
+        Ok((alias, Some(class))) => {
+            let alias = alias.to_string();
+            let body_bytes = rewrite_body_model(body_bytes, &alias);
+            // The suffix on the selected model string wins over the
+            // extension: the string is the source that took precedence
+            // (a `Model-Override` header over the body), so its class does too.
+            (alias, Some(class), body_bytes)
+        }
+        Err(unknown) => {
+            record_response_status(400);
+            return Err(OnwardsErrorResponse::bad_request(&unknown.to_string(), Some("model")));
+        }
+    };
+
     // Record model in span for trace correlation
     tracing::Span::current().record("gen_ai.request.model", &model_name);
 
@@ -448,8 +598,19 @@ pub async fn target_message_handler<T: HttpClient>(
             .collect::<Vec<_>>()
     );
 
-    let mut pool = match state.targets.targets.get(&model_name) {
-        Some(pool) => {
+    let canonical_request_path = req.uri().path().to_string();
+
+    // Resolve which of the composite's pools serves this request, once, from
+    // the path alone — before auth, limits or provider selection, all of which
+    // then run on the chosen pool exactly as they ran on the single pool
+    // before. A composite with no pool for this class resolves to its default,
+    // which is byte-identically today's behaviour. Resolution happens INSIDE
+    // the map guard so only the chosen pool is cloned, not every pool.
+    let request_class = RequestClass::from_path(&canonical_request_path);
+    // The alias's serving policy (presets, overlays) is declared on its
+    // default pool and applies whichever pool serves this request's class.
+    let (mut resolved_pool_name, mut pool, mut alias_serving, alias_inflight, alias_batch_inflight) = match state.targets.targets.get(&model_name) {
+        Some(pools) => {
             // Now that the model is known to be a configured target, tag the
             // in-flight guard so `onwards_model_inflight{model=…}` tracks this
             // request for its whole lifetime (the guard moves into GuardedStream on
@@ -459,7 +620,14 @@ pub async fn target_message_handler<T: HttpClient>(
             if let Some(guard) = inflight_guard.as_mut() {
                 guard.set_model(&model_name);
             }
-            pool.clone()
+            rejection.set_model(&model_name);
+            (
+                pools.resolved_name(request_class),
+                pools.resolve(request_class).clone(),
+                pools.default_pool().alias_serving().clone(),
+                pools.default_pool().inflight_limits().cloned(),
+                pools.default_pool().batch_inflight_limit(),
+            )
         }
         None => {
             debug!("No target found for model: {}", model_name);
@@ -467,8 +635,6 @@ pub async fn target_message_handler<T: HttpClient>(
             return Err(OnwardsErrorResponse::model_not_found(model_name.as_str()));
         }
     };
-
-    let canonical_request_path = req.uri().path().to_string();
 
     // Extract bearer token for authentication and rate limiting
     let bearer_token = req
@@ -503,11 +669,24 @@ pub async fn target_message_handler<T: HttpClient>(
         );
     }
 
+    let bearer_token = bearer_token.map(str::to_owned);
+    let authenticated_api_key_id = bearer_token
+        .as_deref()
+        .filter(|token| {
+            pool.keys()
+                .is_some_and(|keys| auth::validate_bearer_token(keys, token))
+        })
+        .and_then(|token| state.targets.key_labels.get(token))
+            .and_then(|labels| labels.get("api_key_id").cloned())
+        .and_then(|id| id.parse::<Uuid>().ok());
+
+    let result = async move {
+
     // Evaluate routing rules against key labels (after auth, before rate limiting).
     // Rules on the pool are matched against the authenticated key's labels.
     // Note: routing rules are NOT re-evaluated on the redirect target pool.
     if !pool.routing_rules().is_empty()
-        && let Some(token) = bearer_token
+        && let Some(token) = bearer_token.as_deref()
     {
             let labels = state
                 .targets
@@ -537,7 +716,17 @@ pub async fn target_message_handler<T: HttpClient>(
                             model_name, redirect_alias, labels
                         );
                         pool = match state.targets.targets.get(redirect_alias) {
-                            Some(p) => p.clone(),
+                            // The redirect names an alias, so its pools are
+                            // resolved for this request's class just as the
+                            // original alias's were — and `resolved_pool_name`
+                            // is recomputed with it: the capability strip and
+                            // the span field must describe the pool that
+                            // actually serves, not the source alias's.
+                            Some(p) => {
+                                resolved_pool_name = p.resolved_name(request_class);
+                                alias_serving = p.default_pool().alias_serving().clone();
+                                p.resolve(request_class).clone()
+                            }
                             None => {
                                 debug!("Redirect target '{}' not found", redirect_alias);
                                 return Err(OnwardsErrorResponse::bad_gateway());
@@ -553,23 +742,153 @@ pub async fn target_message_handler<T: HttpClient>(
         // If no bearer token, no labels to match — rules are skipped (allow by default)
     }
 
+    // Resolve the serving class: one flat field from the request's suffix,
+    // the owning account's settings (found through the key's `account`
+    // label), the account's overlay on THIS alias and the classes the alias
+    // offers. Done after routing rules so a redirected request is resolved
+    // against the pool that will serve it. Strict: a class named on the
+    // request that the account does not hold, or the alias does not offer,
+    // is refused rather than quietly downgraded.
+    let (account_id, account_name, key_purpose) = bearer_token
+        .as_ref()
+        .and_then(|token| state.targets.key_labels.get(token))
+        .map(|labels| {
+            (
+                labels.get(serving::ACCOUNT_LABEL).cloned(),
+                labels.get(serving::ACCOUNT_NAME_LABEL).cloned(),
+                labels.get("purpose").cloned(),
+            )
+        })
+        .unwrap_or((None, None, None));
+    let serving_resolution: ServingResolution = {
+        let account = account_id
+            .as_deref()
+            .and_then(|id| state.targets.accounts.get(id).map(|r| r.value().clone()));
+        let overlay = account_id
+            .as_deref()
+            .and_then(|id| alias_serving.overlays().get(id).cloned());
+        let resolution = match serving::resolve(
+            suffix_class,
+            account.as_ref(),
+            overlay.as_ref(),
+            &model_name,
+            alias_serving.presets(),
+            key_purpose.as_deref(),
+        ) {
+            Ok(resolution) => resolution,
+            Err(rejection) => {
+                debug!("Serving class refused for model '{}': {}", model_name, rejection);
+                metrics::counter!(
+                    "onwards_serving_class_rejections_total",
+                    "model" => model_name.to_string(),
+                )
+                .increment(1);
+                record_response_status(403);
+                return Err(OnwardsErrorResponse::builder()
+                    .body(ErrorResponseBody {
+                        message: rejection.to_string(),
+                        r#type: "invalid_request_error".to_string(),
+                        param: Some("model".to_string()),
+                        code: "serving_class_unavailable".to_string(),
+                    })
+                    .status(StatusCode::FORBIDDEN)
+                    .build());
+            }
+        };
+        let span = tracing::Span::current();
+        if let Some(requested) = resolution.requested {
+            span.record("onwards.serving.requested", requested.as_str());
+        }
+        span.record("onwards.serving.resolved", resolution.resolved.as_str());
+        metrics::counter!(
+            "onwards_serving_class_requests_total",
+            "model" => model_name.to_string(),
+            "requested" => resolution.requested.map(|c| c.as_str()).unwrap_or(""),
+            "resolved" => resolution.resolved.as_str(),
+        )
+        .increment(1);
+        resolution
+    };
+
+    // Realtime traffic is everything the batch dispatcher did not stamp with
+    // the exempt header.
+    let is_realtime = !state
+        .first_token_timeout_exempt_header
+        .as_deref()
+        .is_some_and(|header| req.headers().contains_key(header));
+    // Labels failure outcomes, so a realtime outage can be told apart from a
+    // batch backlog retrying against the same model.
+    let traffic = if is_realtime { "realtime" } else { "dispatched" };
+
+    let body_json = if !body_bytes.is_empty()
+        && crate::reasoning::uses_reasoning_contract(&canonical_request_path)
+    {
+        Some(serde_json::from_slice::<serde_json::Value>(&body_bytes).map_err(|_| {
+            OnwardsErrorResponse::bad_request("Request body must be valid JSON.", None)
+        })?)
+    } else {
+        None
+    };
+
+    // Parameters not every worker can serve. Each is counted and recorded on
+    // the request span; the configured ones are refused here.
+    let flagged_params = match body_json.as_ref() {
+        Some(body) if state.targets.strict_mode => {
+            crate::unsupported_params::request_params(&canonical_request_path, body)
+        }
+        _ => Vec::new(),
+    };
+    if !flagged_params.is_empty() {
+        let rejected: Vec<&'static str> = flagged_params
+            .iter()
+            .copied()
+            .filter(|param| state.rejected_params.contains(param))
+            .collect();
+        for param in &flagged_params {
+            let action = if rejected.contains(param) { "rejected" } else { "logged" };
+            metrics::counter!(
+                "onwards_unsupported_params_total",
+                "param" => *param,
+                "model" => model_name.to_string(),
+                "traffic" => traffic,
+                "action" => action,
+            )
+            .increment(1);
+        }
+        let span = tracing::Span::current();
+        span.set_attribute("onwards.unsupported_params", flagged_params.join(","));
+        if let Some(account) = &account_id {
+            span.set_attribute("onwards.account", account.clone());
+        }
+        if let Some(api_key_id) = authenticated_api_key_id {
+            span.set_attribute("onwards.api_key_id", api_key_id.to_string());
+        }
+        if let Some(first) = rejected.first() {
+            record_response_status(400);
+            return Err(OnwardsErrorResponse::invalid_request(
+                &crate::unsupported_params::rejection_message(&rejected),
+                Some(first),
+                "unsupported_parameter",
+            ));
+        }
+    }
+
     let canonical_reasoning = if let Some(reasoning) = req
         .extensions()
         .get::<crate::reasoning::CanonicalReasoningRequest>()
     {
         Some(reasoning.clone())
-    } else if !body_bytes.is_empty()
-        && crate::reasoning::uses_reasoning_contract(&canonical_request_path)
-    {
-        let body: serde_json::Value = serde_json::from_slice(&body_bytes).map_err(|_| {
-            OnwardsErrorResponse::bad_request("Request body must be valid JSON.", None)
-        })?;
-        crate::reasoning::validate_canonical_reasoning(&canonical_request_path, &body).map_err(
-            |error| OnwardsErrorResponse::reasoning(&error),
-        )?
+    } else if let Some(body) = body_json.as_ref() {
+        crate::reasoning::parse_reasoning_request(
+            &canonical_request_path,
+            body,
+            state.targets.strict_mode,
+        ).map_err(|error| OnwardsErrorResponse::reasoning(&error))?
     } else {
         None
     };
+    // Not needed past here; don't hold the parsed body while the upstream works.
+    drop(body_json);
 
     if let Some(reasoning) = canonical_reasoning.as_ref() {
         for provider in pool.providers() {
@@ -585,8 +904,98 @@ pub async fn target_message_handler<T: HttpClient>(
     // This runs after routing rules so that redirects get a chance to replace the pool.
     if pool.is_empty() {
         debug!("Pool for model '{}' has no providers", model_name);
-        return Err(OnwardsErrorResponse::service_unavailable());
+        // Counted, not just logged: this is a debug line on a hot path, so under
+        // load it is exactly the signal a log pipeline sheds. Nothing is
+        // serving the model, which is a capacity refusal, not an outage.
+        metrics::counter!(
+            "onwards_upstream_failed_total",
+            "reason" => "no_providers",
+            "status" => "529",
+            "model" => model_name.to_string(),
+            "traffic" => traffic,
+        )
+        .increment(1);
+        record_response_status(529);
+        return Err(OnwardsErrorResponse::no_capacity());
     }
+
+    let mut inflight_slot = match (is_realtime, alias_inflight.as_deref(), account_id.as_deref()) {
+        (true, Some(limits), Some(account)) => {
+            let limit = limits.for_account(account);
+            let account_name = account_name.unwrap_or_default();
+            metrics::gauge!(
+                "onwards_inflight_account_limit",
+                "model" => model_name.clone(),
+                "account" => account.to_string(),
+                "account_name" => account_name.clone(),
+            )
+            .set(f64::from(limit));
+            metrics::counter!(
+                "onwards_inflight_limit_checks_total",
+                "model" => model_name.clone(),
+                "account" => account.to_string(),
+                "account_name" => account_name.clone(),
+            )
+            .increment(1);
+            match state
+                .inflight_limiter
+                .try_acquire(account, &model_name, limit)
+                .await
+            {
+                Some(slot) => Some(slot),
+                None => {
+                    debug!(
+                        "In-flight limit of {} reached for account {} on model {}",
+                        limit, account, model_name
+                    );
+                    metrics::counter!(
+                        "onwards_inflight_limit_refusals_total",
+                        "model" => model_name.clone(),
+                        "account" => account.to_string(),
+                        "account_name" => account_name,
+                    )
+                    .increment(1);
+                    record_response_status(429);
+                    return Err(OnwardsErrorResponse::inflight_limited(&model_name, limit));
+                }
+            }
+        }
+        _ => None,
+    };
+
+    // Batch (dispatched) traffic gets its own per-model ceiling, held in the
+    // same shared limiter under a reserved scope so it is counted globally on
+    // the alias the request named. Realtime requests skip it; batch requests
+    // skip the per-account realtime limit above. A refusal is a 529, not a
+    // 429, so the batch dispatcher backs off instead of treating it as a
+    // per-key rate limit.
+    let mut batch_inflight_slot = if !is_realtime
+        && state.batch_inflight_enforce
+        && let Some(limit) = alias_batch_inflight
+    {
+        match state
+            .batch_inflight_limiter
+            .try_acquire(BATCH_INFLIGHT_SCOPE, &model_name, limit)
+            .await
+        {
+            Some(slot) => Some(slot),
+            None => {
+                debug!(
+                    "Batch in-flight cap of {} reached for model {}",
+                    limit, model_name
+                );
+                metrics::counter!(
+                    "onwards_batch_inflight_refusals_total",
+                    "model" => model_name.clone(),
+                )
+                .increment(1);
+                record_response_status(529);
+                return Err(OnwardsErrorResponse::batch_capacity_exceeded(&model_name, limit));
+            }
+        }
+    } else {
+        None
+    };
 
     // Check pool-level rate limit before selecting a provider
     {
@@ -600,11 +1009,14 @@ pub async fn target_message_handler<T: HttpClient>(
         }
 
         // Check per-key rate limits if bearer token is present
-        if let Some(token) = bearer_token
+        if let Some(token) = bearer_token.as_deref()
             && let Some(limiter) = state.targets.key_rate_limiters.get(token)
             && limiter.check().is_err()
         {
-            debug!("Per-key rate limit exceeded for token: {}", token);
+            debug!(
+                api_key_id = ?authenticated_api_key_id,
+                "Per-key rate limit exceeded"
+            );
             record_response_status(429);
             return Err(OnwardsErrorResponse::rate_limited());
         }
@@ -621,7 +1033,17 @@ pub async fn target_message_handler<T: HttpClient>(
                         "Pool-level concurrency limit exceeded for model: {}",
                         model_name
                     );
-                    return Err(OnwardsErrorResponse::concurrency_limited());
+                    // The model's own cap is capacity, not the caller's limit.
+                    metrics::counter!(
+                        "onwards_upstream_failed_total",
+                        "reason" => "model_at_capacity",
+                        "status" => "529",
+                        "model" => model_name.to_string(),
+                        "traffic" => traffic,
+                    )
+                    .increment(1);
+                    record_response_status(529);
+                    return Err(OnwardsErrorResponse::overloaded());
                 }
             }
         } else {
@@ -629,12 +1051,15 @@ pub async fn target_message_handler<T: HttpClient>(
         };
 
         // Acquire per-key concurrency permit
-        let key_guard = if let Some(token) = bearer_token {
+        let key_guard = if let Some(token) = bearer_token.as_deref() {
             if let Some(limiter) = state.targets.key_concurrency_limiters.get(token) {
                 match limiter.try_acquire() {
                     Some(guard) => Some(guard),
                     None => {
-                        debug!("Per-key concurrency limit exceeded for token: {}", token);
+                        debug!(
+                            api_key_id = ?authenticated_api_key_id,
+                            "Per-key concurrency limit exceeded"
+                        );
                         return Err(OnwardsErrorResponse::concurrency_limited());
                     }
                 }
@@ -661,6 +1086,42 @@ pub async fn target_message_handler<T: HttpClient>(
 
     // Track last error for fallback scenarios
     let mut last_error: Option<OnwardsErrorResponse> = None;
+    // The status the UPSTREAM returned on the most recent attempt, before any
+    // sanitization. `last_error` cannot serve this purpose: by the time an
+    // attempt is recorded there it has already been mapped onto a gateway
+    // response, so an upstream 529 and an upstream 500 are both 503 and the
+    // distinction that matters for backpressure is gone.
+    let mut last_upstream_status: Option<u16> = None;
+
+    // A self-hosted-only account never reaches an external member: the
+    // composite's eligible set is narrowed to its non-external providers for
+    // this request, whatever the alias's own failover list says, BEFORE the
+    // attempt budget is spent, so the budget goes to eligible members under
+    // every strategy and a pool of [dynamo, external] ends with a dynamo
+    // outcome rather than an external one.
+    let ineligible_members: Vec<usize> = if serving_resolution.self_hosted_only {
+        pool.providers()
+            .iter()
+            .enumerate()
+            .filter(|(_, provider)| provider.target.kind == ProviderKind::External)
+            .map(|(idx, _)| idx)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if !ineligible_members.is_empty() {
+        debug!(
+            "Excluding {} external provider(s) for a self-hosted-only account",
+            ineligible_members.len()
+        );
+        metrics::counter!(
+            "onwards_self_hosted_only_skips_total",
+            "model" => model_name.to_string(),
+        )
+        .increment(ineligible_members.len() as u64);
+    }
+    let no_eligible_member = !pool.is_empty() && ineligible_members.len() == pool.len();
+    let eligible_member_count = pool.len() - ineligible_members.len();
 
     // Iterate through providers (with fallback support).
     // select_iter() uses weighted least connections: picks the provider with the
@@ -669,10 +1130,101 @@ pub async fn target_message_handler<T: HttpClient>(
     let mut any_attempted = false;
     let mut attempt_number: u32 = 0;
     let mut total_backoff_ms: u64 = 0;
-    let pool_max_attempts = pool.fallback_max_attempts();
-    for (_idx, target, connection_guard) in pool.select_iter() {
+    let pool_max_attempts = if pool.fallback().is_some_and(|f| f.with_replacement) {
+        pool.fallback_max_attempts()
+    } else {
+        pool.fallback_max_attempts().min(eligible_member_count)
+    };
+
+    // First-token failover: bound how long a streamed attempt may go without
+    // producing its first frame before it is abandoned for another provider.
+    // Armed only while a *different* provider is left to take over (the pool
+    // has more than one) and never on the final attempt (checked per attempt
+    // below), so it can reroute a stalled request but never fail one that
+    // would otherwise have succeeded. Non-streaming requests are exempt: their
+    // headers only arrive once the whole completion is done, so a deadline
+    // would cut off legitimately long answers. So is traffic carrying the
+    // configured exempt header (e.g. batch dispatch, which runs its own retries).
+    // Only realtime traffic (see `is_realtime`) gets the first-token deadline,
+    // AIMD observation and the realtime-only fallback statuses: dispatched
+    // traffic tolerates latency and runs its own retries.
+    let first_token_timeout = pool
+        .fallback()
+        .filter(|f| f.enabled)
+        .and_then(|f| {
+            f.first_token_timeout_ms
+                .map(std::time::Duration::from_millis)
+                .or(state.first_token_timeout)
+        })
+        .filter(|timeout| {
+            !timeout.is_zero() && eligible_member_count > 1 && is_realtime && requests_stream(&body_bytes)
+        });
+    // A status triggers failover when the pool lists it, or when it is one of
+    // the pool's realtime-only fallback statuses, this request is realtime and
+    // another provider is left to try. A realtime-only status on the final
+    // attempt (or in a single-provider pool) is returned to the caller as the
+    // upstream sent it, exactly as without the setting, rather than collapsing
+    // into a generic gateway error.
+    let realtime_failover_attempts = if pool.fallback().is_some_and(|f| f.with_replacement) {
+        pool_max_attempts
+    } else {
+        pool_max_attempts.min(eligible_member_count)
+    };
+    // An upstream with no room answers 503 or 529 depending on what sits in
+    // front of its workers, so a pool that fails over on either refusal fails
+    // over on both.
+    let listed = |lists: &dyn Fn(u16) -> bool, status: u16| {
+        lists(status) || (is_capacity_refusal(status) && (lists(503) || lists(529)))
+    };
+    let fails_over_on = |status: u16, attempt_number: u32| {
+        listed(&|s| pool.should_fallback_on_status(s), status)
+            || (is_realtime
+                && eligible_member_count > 1
+                && (attempt_number as usize) < realtime_failover_attempts
+                && listed(&|s| pool.should_fallback_on_realtime_status(s), status))
+    };
+
+    // Unsupported traffic keeps ordinary routing and contributes no observations.
+    let aimd_eligible = pool.aimd_enabled()
+        && state.targets.strict_mode
+        && requests_stream(&body_bytes)
+        && is_realtime;
+    // Conversation affinity decides preferred-first once per conversation;
+    // only realtime traffic on pools that opt in pays for the body parse.
+    let conversation = if pool.affinity_enabled() && is_realtime {
+        serde_json::from_slice::<serde_json::Value>(&body_bytes)
+            .ok()
+            .and_then(|body| {
+                let header = original_headers
+                    .get(affinity::SESSION_HEADER)
+                    .and_then(|v| v.to_str().ok());
+                affinity::conversation_key(header, &body)
+            })
+    } else {
+        None
+    };
+    let mut providers = pool
+        .select_iter_routed(aimd_eligible, conversation, &model_name, resolved_pool_name.unwrap_or("default"))
+        .excluding_members(ineligible_members.iter().copied());
+    while let Some((member_idx, target, connection_guard)) = providers.next() {
         any_attempted = true;
         attempt_number += 1;
+        // First-token observations are attributed to the provider actually
+        // tried: `preferred` is the pool's first provider in definition order,
+        // anything else is an alternate. Two values, so the label stays bounded
+        // on a recorder that deliberately never evicts series.
+        let provider_role = if member_idx == 0 {
+            "preferred"
+        } else {
+            "alternate"
+        };
+        let attempt_start = tokio::time::Instant::now();
+        let observation = pool.observe(aimd_eligible, member_idx, &model_name, resolved_pool_name.unwrap_or("default"), attempt_start);
+        // A failover deadline needs both remaining budget and an available
+        // alternative. Configured members at capacity cannot rescue this stream.
+        let first_token_deadline = first_token_timeout
+            .filter(|_| (attempt_number as usize) < pool_max_attempts && providers.has_available_alternative(member_idx))
+            .map(|timeout| attempt_start + timeout);
 
         let attempt_span = tracing::info_span!(
             "onwards.provider_attempt",
@@ -683,7 +1235,13 @@ pub async fn target_message_handler<T: HttpClient>(
             provider.timeout_secs = target.request_timeout_secs,
             http.response.status_code = tracing::field::Empty,
             onwards.fallback = tracing::field::Empty,
+            onwards.pool = tracing::field::Empty,
         );
+        // Recorded only when a non-default pool served the request, so the
+        // field's presence answers "did per-class routing engage here?".
+        if let Some(pool_name) = resolved_pool_name {
+            attempt_span.record("onwards.pool", pool_name);
+        }
 
         // The loop body is wrapped in an instrumented async block so that
         // attempt_span is the "current" span for all logging / field recording,
@@ -706,6 +1264,11 @@ pub async fn target_message_handler<T: HttpClient>(
             .get::<OriginalModel>()
             .map(|m| m.0.to_string());
 
+        // The upstream status THIS attempt received, if it got that far.
+        // Unlike `last_upstream_status` it never carries over from an earlier
+        // attempt, so it can say whether this member refused the request.
+        let mut attempt_upstream_status: Option<u16> = None;
+
         let action = async {
 
         // Check provider-level rate limit (skip to next if configured for rate limit fallback)
@@ -727,6 +1290,36 @@ pub async fn target_message_handler<T: HttpClient>(
 
         // Prepare body for this attempt (may need model rewrite)
         let mut attempt_body = body_bytes.clone();
+
+        // Within a non-default pool, scheduling fields are only meaningful to
+        // a member whose serving stack understands them
+        // (`accepts_scheduling_priority` — the dynamo frontend); third-party
+        // members reject unknown fields outright (Fireworks: "Extra inputs are
+        // not permitted"). Strip them from every attempt whose provider lacks
+        // the capability, REGARDLESS of position: keying on member index broke
+        // the moment the dynamo member was disabled during an incident and a
+        // third party became index 0 (every resume 400'd). Two carriers:
+        // `nvext` (the self-hosted stack's vendor extension — the WHOLE object
+        // goes, since no third party understands any of it and Fireworks 400s
+        // on its presence) and a legacy top-level `priority`. Default-pool
+        // traffic is untouched: batch/flex deadline priorities must keep
+        // reaching dynamo exactly as today.
+        let scheduling_fields_refused =
+            resolved_pool_name.is_some() && !target.accepts_scheduling_priority;
+        if scheduling_fields_refused
+            && (attempt_body.windows(10).any(|w| w == b"\"priority\"")
+                || attempt_body.windows(7).any(|w| w == b"\"nvext\""))
+            && let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&attempt_body)
+            && let Some(obj) = parsed.as_object_mut()
+        {
+            let removed = [obj.shift_remove("priority"), obj.shift_remove("nvext")];
+            if removed.iter().any(Option::is_some)
+                && let Ok(stripped) = serde_json::to_vec(&parsed)
+            {
+                debug!("Stripped scheduling fields for a pool member that does not accept them");
+                attempt_body = stripped.into();
+            }
+        }
 
         // Rewrite model field if configured
         if let Some(ref rewrite) = target.onwards_model
@@ -786,6 +1379,48 @@ pub async fn target_message_handler<T: HttpClient>(
                 Ok(bytes) => axum::body::Bytes::from(bytes),
                 Err(_) => return LoopAction::Done(Err(OnwardsErrorResponse::internal())),
             };
+        }
+
+        // Send the resolved serving targets to a member of kind `dynamo`, the
+        // only serving stack that reads them, as `nvext.router` targets plus
+        // (when the preset carries one) `nvext.agent_hints.priority`. Every
+        // JSON request to a `dynamo` member also carries a priority (unless
+        // the capability strip above refused scheduling fields for it): when
+        // neither the body nor the preset sets one, realtime's 0, so the
+        // dynamo frontend is never left to pick a value for a missing one.
+        // A priority already present is kept, and targets overwrite rather
+        // than remove: this same crate runs again as the hop inside the
+        // serving namespace, with no key policy of its own, and must forward
+        // what the first hop set. Client-supplied targets are scrubbed at
+        // dwctl's ingress, alongside the body priority (the same perimeter
+        // the priority strip relies on).
+        if target.kind == ProviderKind::Dynamo && !attempt_body.is_empty() {
+            match serde_json::from_slice::<serde_json::Value>(&attempt_body) {
+                Ok(mut body) => {
+                    if let Some(object) = body.as_object_mut() {
+                        if let Some(targets) = serving_resolution.targets {
+                            targets.stamp(object);
+                        }
+                        if !scheduling_fields_refused {
+                            serving::stamp_default_priority(object);
+                        }
+                        attempt_body = match serde_json::to_vec(&body) {
+                            Ok(bytes) => axum::body::Bytes::from(bytes),
+                            Err(_) => return LoopAction::Done(Err(OnwardsErrorResponse::internal())),
+                        };
+                    }
+                }
+                // Targets must reach the member; a body that cannot carry
+                // them is refused. Without targets a non-JSON body (a
+                // multipart upload) is forwarded as it came.
+                Err(_) if serving_resolution.targets.is_some() => {
+                    return LoopAction::Done(Err(OnwardsErrorResponse::bad_request(
+                        "Request body must be valid JSON.",
+                        None,
+                    )))
+                }
+                Err(_) => {}
+            }
         }
 
         // Build the upstream URI for this target
@@ -862,7 +1497,6 @@ pub async fn target_message_handler<T: HttpClient>(
         //   letting the third party re-emit our trace IDs on its own outbound
         //   calls.
         if resolve_trace_propagation(target, pool.is_trusted()) {
-            use tracing_opentelemetry::OpenTelemetrySpanExt;
             let ctx = tracing::Span::current().context();
             let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
             propagator.inject_context(&ctx, &mut HeaderInjector(&mut attempt_headers));
@@ -896,18 +1530,23 @@ pub async fn target_message_handler<T: HttpClient>(
             url.full = %upstream_uri,
             http.response.status_code = tracing::field::Empty,
         );
+        // The header wait ends at the earlier of the provider's request timeout
+        // and this attempt's first-token deadline.
+        let request_deadline = target
+            .request_timeout_secs
+            .map(|secs| tokio::time::Instant::now() + std::time::Duration::from_secs(secs));
+        let header_deadline = match (request_deadline, first_token_deadline) {
+            (Some(request), Some(first_token)) => Some(request.min(first_token)),
+            (request, first_token) => request.or(first_token),
+        };
         let request_result = async {
-            if let Some(timeout_secs) = target.request_timeout_secs {
-                let timeout_duration = std::time::Duration::from_secs(timeout_secs);
-                match tokio::time::timeout(timeout_duration, state.http_client.request(attempt_req))
+            if let Some(deadline) = header_deadline {
+                match tokio::time::timeout_at(deadline, state.http_client.request(attempt_req))
                     .await
                 {
                     Err(_) => {
                         // Timeout occurred
-                        debug!(
-                            "Request to {} timed out after {:?}",
-                            upstream_uri, timeout_duration
-                        );
+                        debug!("Request to {} timed out waiting for response headers", upstream_uri);
                         Err(UpstreamOutcome::Timeout)
                     }
                     Ok(result) => result.map_err(UpstreamOutcome::Error),
@@ -924,7 +1563,25 @@ pub async fn target_message_handler<T: HttpClient>(
         let mut response = match request_result {
             Err(UpstreamOutcome::Timeout) => {
                 upstream_span.record("http.response.status_code", 504_u16);
-                tracing::Span::current().record("onwards.fallback", "timeout");
+                // Name the deadline that fired, so first-token failovers are
+                // distinguishable from provider request timeouts in traces.
+                let reason = if header_deadline == first_token_deadline {
+                    if let Some(observation) = &observation { observation.deadline(); }
+                    // Header waits are part of the same first-token deadline.
+                    // A provider request timeout that fires earlier is not a
+                    // first-token breach.
+                    metrics::counter!(
+                        "onwards_first_token_breaches_total",
+                        "model" => model_name.to_string(),
+                        "pool" => resolved_pool_name.unwrap_or("default"),
+                        "role" => provider_role,
+                    )
+                    .increment(1);
+                    "first_token_timeout"
+                } else {
+                    "timeout"
+                };
+                tracing::Span::current().record("onwards.fallback", reason);
                 if pool.fallback_enabled() {
                     return LoopAction::Continue(Some(OnwardsErrorResponse::gateway_timeout()));
                 } else {
@@ -949,17 +1606,51 @@ pub async fn target_message_handler<T: HttpClient>(
         };
 
         let status = response.status().as_u16();
+        last_upstream_status = Some(status);
+        attempt_upstream_status = Some(status);
         upstream_span.record("http.response.status_code", status);
         tracing::Span::current().record("http.response.status_code", status);
+        // An error status settles the attempt's observation now: overload
+        // statuses are breaches, anything else is unknown. Left to drop, an
+        // error would only ever read as unknown.
+        if !(200..300).contains(&status)
+            && let Some(observation) = &observation
+        {
+            observation.status(status);
+        }
 
         // Check if we should fallback based on status code
-        if pool.should_fallback_on_status(status) {
+        if fails_over_on(status, attempt_number) {
             debug!(
                 "Provider returned fallback status {}, trying next: {:?}",
                 status, target.url
             );
             tracing::Span::current().record("onwards.fallback", "status_fallback");
-            return LoopAction::Continue(Some(OnwardsErrorResponse::bad_gateway()));
+            // A 503 or 529 means the provider is full, not broken. If it is
+            // the last word, the caller is told to retry shortly rather than
+            // handed a 502 that reads as an outage.
+            let error = if status == 429 {
+                OnwardsErrorResponse::upstream_rate_limited(state.upstream_rate_limit_message.as_deref())
+            } else if is_capacity_refusal(status) {
+                OnwardsErrorResponse::overloaded()
+            } else {
+                OnwardsErrorResponse::bad_gateway()
+            };
+            return LoopAction::Continue(Some(error));
+        }
+
+        if is_capacity_refusal(status) {
+            record_response_status(529);
+            return LoopAction::Done(Err(OnwardsErrorResponse::overloaded()));
+        }
+
+        if status == 429
+            && (target.sanitize_response || state.upstream_rate_limit_message.is_some())
+        {
+            record_response_status(429);
+            return LoopAction::Done(Err(OnwardsErrorResponse::upstream_rate_limited(
+                state.upstream_rate_limit_message.as_deref(),
+            )));
         }
 
         // Sanitize error responses when sanitize_response is enabled.
@@ -991,6 +1682,7 @@ pub async fn target_message_handler<T: HttpClient>(
                         code: "upstream_error".to_string(),
                     })
                     .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST))
+                    .from_upstream(true)
                     .build()
             } else {
                 OnwardsErrorResponse::builder()
@@ -1001,6 +1693,7 @@ pub async fn target_message_handler<T: HttpClient>(
                         code: "internal_error".to_string(),
                     })
                     .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY))
+                    .from_upstream(true)
                     .build()
             };
 
@@ -1044,7 +1737,7 @@ pub async fn target_message_handler<T: HttpClient>(
             Clean,
             /// Provider embedded an error status in the 2xx body
             /// (`{"error":{"code":N}}`).
-            Embedded(u16),
+            Embedded(u16, serde_json::Value),
             /// 2xx whose body *terminated* empty before any content frame — e.g.
             /// an upstream `200 OK` with an empty body. Treated as a retryable
             /// 502. Keyed on stream termination, never a time budget, so a
@@ -1062,70 +1755,132 @@ pub async fn target_message_handler<T: HttpClient>(
                 // one. Holding the `200` headers until the first frame costs
                 // nothing in time-to-first-*token* (onwards must receive it to
                 // forward it anyway). The whole peek is bounded by a short fixed
-                // budget — NOT the request timeout, which governs header receipt —
-                // so a `200`-then-idle stream isn't withheld from the client; on
-                // timeout we forward whatever we have, unmodified (no retry).
+                // budget — NOT the request timeout, which governs header receipt.
+                // If that budget expires, keep control for a bounded second window
+                // until the next decisive event: terminal empty is retryable, while
+                // the first real content frame is reattached and forwarded without
+                // retry. If the upstream remains idle beyond that, forward the
+                // still-open stream instead of withholding headers indefinitely.
                 use futures_util::StreamExt;
+                #[cfg(not(test))]
                 const SSE_PEEK_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+                #[cfg(test)]
+                const SSE_PEEK_BUDGET: std::time::Duration = std::time::Duration::from_millis(10);
+                #[cfg(not(test))]
+                const SSE_DECISIVE_WAIT_BUDGET: std::time::Duration =
+                    std::time::Duration::from_secs(30);
+                #[cfg(test)]
+                const SSE_DECISIVE_WAIT_BUDGET: std::time::Duration =
+                    std::time::Duration::from_millis(50);
                 const SSE_PEEK_MAX_EVENTS: usize = 4;
 
                 let (parts, body) = response.into_parts();
-                let mut events = SseBufferedStream::new(body.into_data_stream());
-                // `peeked` / `embedded` live outside the peek future so a partial
-                // peek survives a budget timeout (consumed frames are not lost).
-                let mut peeked = Vec::new();
-                let mut embedded = None;
-                // `saw_data` = a real content frame arrived (definitely not empty).
-                // `stream_ended` = the stream closed (`None`) or errored (`Err`)
-                // before any content — a *terminal* empty, safe to retry.
-                let mut saw_data = false;
-                let mut stream_ended = false;
-                let peek = async {
-                    for _ in 0..SSE_PEEK_MAX_EVENTS {
-                        match events.next().await {
-                            Some(Ok(chunk)) => match classify_sse_event(&chunk) {
-                                SseEventKind::Error(status) => {
-                                    embedded = Some(status);
-                                    peeked.push(Ok(chunk));
-                                    break;
-                                }
-                                // First real data frame is normal content — stop.
-                                SseEventKind::Data => {
-                                    saw_data = true;
-                                    peeked.push(Ok(chunk));
-                                    break;
-                                }
-                                // Keep-alive / comment — keep looking.
-                                SseEventKind::Comment => peeked.push(Ok(chunk)),
-                            },
-                            Some(Err(e)) => {
-                                stream_ended = true;
-                                peeked.push(Err(e));
-                                break;
-                            }
-                            None => {
-                                stream_ended = true;
-                                break;
-                            }
+                // Observe the same parsed events the strict path already consumes,
+                // including events polled after the bounded lead peek returns.
+                // This changes neither framing nor buffering and owns the attempt
+                // until response completion/cancellation (an unknown outcome).
+                let mut stream_observation = observation.clone();
+                let mut events = SseBufferedStream::with_limit(body.into_data_stream(), state.sse_buffer_limit).inspect(move |event| {
+                    if stream_observation.is_none() { return; }
+                    let kind = match event {
+                        Ok(bytes) if bytes.ends_with(b"\n\n") => classify_sse_event(bytes),
+                        // The buffer flushes an incomplete final event at EOF.
+                        // Preserve its bytes, but do not count it as a first frame.
+                        _ => SseEventKind::Done,
+                    };
+                    if matches!(kind, SseEventKind::Comment) { return; }
+                    if let Some(observation) = stream_observation.take() {
+                        match kind {
+                            SseEventKind::Data => observation.frame(),
+                            // An error status embedded in a 2xx stream is judged
+                            // like the same status on the response line.
+                            SseEventKind::Error(status, _) => observation.status(status),
+                            _ => observation.unknown(),
                         }
                     }
-                };
-                let timed_out = tokio::time::timeout(SSE_PEEK_BUDGET, peek).await.is_err();
-                if timed_out {
-                    debug!("Timed out peeking SSE lead frames; forwarding stream unmodified");
+                });
+                let mut peeked = Vec::new();
+                let mut lead = LeadFrames::default();
+                if let Some(deadline) = first_token_deadline {
+                    // First-token failover is armed: hold out for the first
+                    // decisive frame until this attempt's deadline. Keep-alive
+                    // comments don't count — a stalled provider may keep sending
+                    // them — so there is no event cap. Nothing has reached the
+                    // client yet, so abandoning the stream is safe.
+                    if tokio::time::timeout_at(
+                        deadline,
+                        read_lead_frames(&mut events, &mut peeked, &mut lead, usize::MAX),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        if let Some(observation) = &observation { observation.deadline(); }
+                        warn!(
+                            upstream = %target.url,
+                            "No first token before the failover deadline; trying the next provider"
+                        );
+                        tracing::Span::current().record("onwards.fallback", "first_token_timeout");
+                        // A breach is a CENSORED observation: it establishes only
+                        // that the first token took longer than the deadline, not
+                        // how long it would have taken. Counted separately so the
+                        // deadline value never contaminates the latency histogram.
+                        metrics::counter!(
+                            "onwards_first_token_breaches_total",
+                            "model" => model_name.to_string(),
+                            "pool" => resolved_pool_name.unwrap_or("default"),
+                            "role" => provider_role,
+                        )
+                        .increment(1);
+                        // Dropping `events` closes the upstream stream, which is
+                        // the provider's signal to stop generating.
+                        return LoopAction::Continue(Some(OnwardsErrorResponse::gateway_timeout()));
+                    }
+                } else if tokio::time::timeout(
+                    SSE_PEEK_BUDGET,
+                    read_lead_frames(&mut events, &mut peeked, &mut lead, SSE_PEEK_MAX_EVENTS),
+                )
+                .await
+                .is_err()
+                {
+                    debug!("Timed out peeking SSE lead frames; waiting for first terminal frame");
+                    if tokio::time::timeout(
+                        SSE_DECISIVE_WAIT_BUDGET,
+                        read_lead_frames(&mut events, &mut peeked, &mut lead, SSE_PEEK_MAX_EVENTS),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        debug!(
+                            "Timed out waiting for decisive SSE frame; forwarding stream unmodified"
+                        );
+                    }
+                }
+                // An actual first token arrived: record the uncensored latency.
+                // `saw_content` excludes the `[DONE]` sentinel, which is a data
+                // frame but carries no token. Only reached on the success paths —
+                // a breach returns above — so this histogram holds observed
+                // latencies only, never censored ones.
+                if lead.saw_content {
+                    metrics::histogram!(
+                        "onwards_first_token_seconds",
+                        "model" => model_name.to_string(),
+                        "pool" => resolved_pool_name.unwrap_or("default"),
+                        "role" => provider_role,
+                    )
+                    .record(attempt_start.elapsed().as_secs_f64());
                 }
                 // Forward the consumed frames followed by the remainder, so a clean
                 // (or slow) stream is intact; on a retry path below this `response`
                 // is dropped when we return.
                 let rest = futures_util::stream::iter(peeked).chain(events);
                 response = Response::from_parts(parts, axum::body::Body::from_stream(rest));
-                if let Some(status) = embedded {
-                    Scan2xx::Embedded(status)
-                } else if !timed_out && stream_ended && !saw_data {
+                if let Some((status, error)) = lead.embedded {
+                    Scan2xx::Embedded(status, error)
+                } else if lead.stream_ended && !lead.saw_data {
                     // Stream closed/errored before any content frame: nothing was
-                    // forwarded, so retrying is safe. A *timeout* (stream still open,
-                    // just slow to first token) deliberately falls through to `Clean`
-                    // — that's the valid-but-slow case we must never retry.
+                    // forwarded, so retrying is safe. A valid-but-slow stream that
+                    // eventually produces content falls through to `Clean` with the
+                    // consumed frames reattached below.
                     Scan2xx::EmptyBody
                 } else {
                     Scan2xx::Clean
@@ -1153,8 +1908,10 @@ pub async fn target_message_handler<T: HttpClient>(
                     let embedded = if buffered.windows(ERROR_KEY.len()).any(|w| w == ERROR_KEY) {
                         serde_json::from_slice::<serde_json::Value>(&buffered)
                             .ok()
-                            .as_ref()
-                            .and_then(embedded_error_status)
+                            .and_then(|body| {
+                                embedded_error_status(&body)
+                                    .map(|status| (status, body["error"].clone()))
+                            })
                     } else {
                         None
                     };
@@ -1166,7 +1923,7 @@ pub async fn target_message_handler<T: HttpClient>(
                         .headers_mut()
                         .insert(CONTENT_LENGTH, HeaderValue::from(len));
                     match embedded {
-                        Some(status) => Scan2xx::Embedded(status),
+                        Some((status, error)) => Scan2xx::Embedded(status, error),
                         None => Scan2xx::Clean,
                     }
                 }
@@ -1176,7 +1933,7 @@ pub async fn target_message_handler<T: HttpClient>(
         };
 
         match scan {
-            Scan2xx::Embedded(embedded) => {
+            Scan2xx::Embedded(embedded, provider_error) => {
                 warn!(
                     http_status = status,
                     embedded_status = embedded,
@@ -1185,35 +1942,67 @@ pub async fn target_message_handler<T: HttpClient>(
                 );
                 upstream_span.record("http.response.status_code", embedded);
                 tracing::Span::current().record("http.response.status_code", embedded);
+                // A 200 carrying an embedded error IS that error for our
+                // purposes, so it overrides the 200 recorded above.
+                last_upstream_status = Some(embedded);
+                attempt_upstream_status = Some(embedded);
 
-                let retryable = pool.should_fallback_on_status(embedded)
+                let retryable = fails_over_on(embedded, attempt_number)
                     || (embedded == 429 && pool.should_fallback_on_rate_limit());
                 if retryable {
                     tracing::Span::current().record("onwards.fallback", "embedded_error");
-                    // Retry internally. If every attempt / provider fallback is
-                    // exhausted the caller gets a sanitized 503 — never the
-                    // upstream's rate limit (see the non-retryable arm below).
-                    return LoopAction::Continue(Some(OnwardsErrorResponse::service_unavailable()));
+                    // Retain rate-limit and overload semantics if all attempts
+                    // are exhausted.
+                    let error = if embedded == 429 {
+                        OnwardsErrorResponse::upstream_rate_limited(state.upstream_rate_limit_message.as_deref())
+                    } else if is_capacity_refusal(embedded) {
+                        OnwardsErrorResponse::overloaded().reported_by_upstream()
+                    } else {
+                        OnwardsErrorResponse::service_unavailable().reported_by_upstream()
+                    };
+                    return LoopAction::Continue(Some(error));
                 }
 
+                if is_capacity_refusal(embedded) {
+                    record_response_status(529);
+                    return LoopAction::Done(Err(OnwardsErrorResponse::overloaded().reported_by_upstream()));
+                }
                 record_response_status(embedded);
-                // Don't leak an upstream rate limit: a 429 — and *any* 5xx, including
-                // non-retryable ones like 501/505 — collapses to a generic 503. This is
-                // deliberately more opaque than the non-embedded error path: a
-                // 200-with-error body is already anomalous, so we hide the specifics.
-                // Genuine client errors (other 4xx) are surfaced, sanitized, so the
-                // caller can fix the request.
-                let err = if embedded == 429 || embedded >= 500 {
-                    OnwardsErrorResponse::service_unavailable()
+                // Keep upstream details private while preserving rate-limit semantics.
+                // Other embedded server errors still collapse to a generic 503.
+                // For trusted providers, retain the standard client-error fields
+                // so the caller can fix the request. Never log the body: even
+                // validation errors can echo request content.
+                let trusted = target.trusted.unwrap_or_else(|| pool.is_trusted());
+                let err = if embedded == 429 {
+                    OnwardsErrorResponse::upstream_rate_limited(state.upstream_rate_limit_message.as_deref())
+                } else if embedded >= 500 {
+                    OnwardsErrorResponse::service_unavailable().reported_by_upstream()
                 } else {
                     OnwardsErrorResponse::builder()
                         .body(ErrorResponseBody {
-                            message: "The upstream provider rejected the request.".to_string(),
-                            r#type: "invalid_request_error".to_string(),
-                            param: None,
-                            code: "upstream_error".to_string(),
+                            message: trusted
+                                .then(|| provider_error["message"].as_str())
+                                .flatten()
+                                .unwrap_or("The upstream provider rejected the request.")
+                                .to_string(),
+                            r#type: trusted
+                                .then(|| provider_error["type"].as_str())
+                                .flatten()
+                                .unwrap_or("invalid_request_error")
+                                .to_string(),
+                            param: trusted
+                                .then(|| provider_error["param"].as_str())
+                                .flatten()
+                                .map(str::to_string),
+                            code: if trusted {
+                                embedded.to_string()
+                            } else {
+                                "upstream_error".to_string()
+                            },
                         })
                         .status(StatusCode::from_u16(embedded).unwrap_or(StatusCode::BAD_REQUEST))
+                        .from_upstream(true)
                         .build()
                 };
                 return LoopAction::Done(Err(err));
@@ -1231,13 +2020,13 @@ pub async fn target_message_handler<T: HttpClient>(
                     tracing::Span::current().record("onwards.fallback", "empty_body");
                     // Retry internally; on exhaustion the loop's final-error handling
                     // surfaces the sanitized 503 carried below.
-                    return LoopAction::Continue(Some(OnwardsErrorResponse::service_unavailable()));
+                    return LoopAction::Continue(Some(OnwardsErrorResponse::service_unavailable().reported_by_upstream()));
                 }
 
                 // Not configured to retry 502s: collapse the anomalous empty 200 to a
                 // generic 503 rather than forwarding a bodyless success to the client.
                 record_response_status(503);
-                return LoopAction::Done(Err(OnwardsErrorResponse::service_unavailable()));
+                return LoopAction::Done(Err(OnwardsErrorResponse::service_unavailable().reported_by_upstream()));
             }
             Scan2xx::Clean => {}
         }
@@ -1257,7 +2046,7 @@ pub async fn target_message_handler<T: HttpClient>(
             debug!("Wrapping SSE response with buffered stream for non-strict sanitization");
             let (parts, body) = response.into_parts();
             let byte_stream = body.into_data_stream();
-            let buffered = SseBufferedStream::new(byte_stream);
+            let buffered = SseBufferedStream::with_limit(byte_stream, state.sse_buffer_limit);
             let new_body = axum::body::Body::from_stream(buffered);
             response = Response::from_parts(parts, new_body);
         }
@@ -1381,18 +2170,17 @@ pub async fn target_message_handler<T: HttpClient>(
             }
         }
 
-        // Override the response `id` field for /responses and /chat/completions
-        // requests when the caller supplied a response ID via the configured
-        // header. Both response bodies expose a top-level `id` we can rewrite.
+        // Override the response `id` field for /responses, /chat/completions and
+        // /completions requests when the caller supplied a response ID via the
+        // configured header. All three bodies expose a top-level `id` we can
+        // rewrite; strict mode does the same for streamed chunks.
         if let Some(ref header_name) = state.response_id_header
             && crate::response_id::path_supports_id_override(&path_and_query)
             && (200..300).contains(&status)
-        {
-            if let Some(override_id) =
+            && let Some(override_id) =
                 crate::response_id::extract_override_id(&original_headers, header_name)
-            {
-                crate::response_id::patch_response_body_id(&mut response, override_id).await;
-            }
+        {
+            crate::response_id::patch_response_body_id(&mut response, override_id).await;
         }
 
         // Add custom response headers
@@ -1426,6 +2214,14 @@ pub async fn target_message_handler<T: HttpClient>(
             url: target.url.to_string(),
             onwards_model: target.onwards_model.clone(),
         });
+        response
+            .extensions_mut()
+            .insert::<ServingClassOutcome>(serving_resolution.outcome());
+        if let Some(api_key_id) = authenticated_api_key_id {
+            response
+                .extensions_mut()
+                .insert(AuthenticatedApiKeyId(api_key_id));
+        }
 
         // Attach the connection guard and inflight guard to the response body so both
         // are decremented when the body stream completes, not when the handler returns.
@@ -1435,6 +2231,8 @@ pub async fn target_message_handler<T: HttpClient>(
             inner: body.into_data_stream(),
             _guard: connection_guard,
             _inflight_guard: inflight_guard.take().expect("inflight_guard taken once on success path"),
+            _inflight_slot: inflight_slot.take(),
+            _batch_inflight_slot: batch_inflight_slot.take(),
         };
         let response = Response::from_parts(parts, axum::body::Body::from_stream(guarded));
 
@@ -1445,6 +2243,12 @@ pub async fn target_message_handler<T: HttpClient>(
         match action {
             LoopAction::Continue(err) => {
                 last_error = err;
+                // A member that refused for overload is full right now: trying
+                // it again within this request cannot succeed, so it sits out
+                // the rest of the request.
+                if attempt_upstream_status.is_some_and(|s| s == 429 || is_capacity_refusal(s)) {
+                    providers.mark_refused(member_idx);
+                }
                 // Sleep here — *after* the current connection_guard has gone
                 // out of scope but *before* select_iter().next() grabs the
                 // next one — so we don't pin a concurrency slot while waiting.
@@ -1493,28 +2297,123 @@ pub async fn target_message_handler<T: HttpClient>(
         // We tried at least one provider but all failed
         let final_error = last_error
             .unwrap_or_else(|| OnwardsErrorResponse::model_not_found(model_name.as_str()));
-        record_response_status(final_error.status.as_u16());
+        // `status` carries the PRE-sanitization status of the last attempt, which
+        // the response itself discards: a 529 and a 500 both leave here as 503,
+        // so without this the caller cannot tell saturation from failure. This is
+        // the single exit where a candidate error actually becomes the response,
+        // so counting here counts outcomes rather than attempts.
+        let status = final_error.status.as_u16();
+        metrics::counter!(
+            "onwards_upstream_failed_total",
+            "reason" => "retries_exhausted",
+            // The upstream's own status on the final attempt, NOT the gateway
+            // response above, which collapses several upstream statuses into
+            // one. Falls back to the response status when no attempt got far
+            // enough to see one.
+            "status" => last_upstream_status.unwrap_or(status).to_string(),
+            "model" => model_name.to_string(),
+            "traffic" => traffic,
+        )
+        .increment(1);
+        record_response_status(status);
+        // The outcome rides on the error too: analytics records what the
+        // request resolved to whether or not the upstream served it.
+        let mut final_error = final_error;
+        final_error.serving_outcome = Some(serving_resolution.outcome());
         Err(final_error)
+    } else if no_eligible_member {
+        // Every member is external and the account never uses those: not a
+        // capacity condition, and nothing to retry.
+        metrics::counter!(
+            "onwards_upstream_failed_total",
+            "reason" => "no_eligible_provider",
+            "status" => "503",
+            "model" => model_name.to_string(),
+            "traffic" => traffic,
+        )
+        .increment(1);
+        record_response_status(503);
+        Err(OnwardsErrorResponse::builder()
+            .body(ErrorResponseBody {
+                message: format!("Model '{model_name}' has no self-hosted provider available to this account."),
+                r#type: "server_error".to_string(),
+                param: Some("model".to_string()),
+                code: "no_eligible_provider".to_string(),
+            })
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .serving_outcome(serving_resolution.outcome())
+            .build())
     } else if !pool.is_empty() {
         // Pool has providers but select_iter() yielded nothing — all at capacity
-        record_response_status(429);
-        Err(OnwardsErrorResponse::concurrency_limited())
+        metrics::counter!(
+            "onwards_upstream_failed_total",
+            "reason" => "all_at_capacity",
+            "status" => "529",
+            "model" => model_name.to_string(),
+            "traffic" => traffic,
+        )
+        .increment(1);
+        record_response_status(529);
+        Err(OnwardsErrorResponse::overloaded())
     } else {
         // Empty pool (shouldn't normally happen, targets resolved earlier)
         let err = OnwardsErrorResponse::model_not_found(model_name.as_str());
-        record_response_status(err.status.as_u16());
+        let status = err.status.as_u16();
+        metrics::counter!(
+            "onwards_upstream_failed_total",
+            "reason" => "empty_pool_late",
+            "status" => status.to_string(),
+            "model" => model_name.to_string(),
+            "traffic" => traffic,
+        )
+        .increment(1);
+        record_response_status(status);
         Err(err)
     }
+    }
+    .await;
+
+    result.map_err(|error| error.with_authenticated_api_key_id(authenticated_api_key_id))
+    }
+    .await;
+
+    if let Err(error) = &result {
+        rejection.record_error(error);
+    }
+    // Every authenticated request, whatever its outcome, names its caller on
+    // this span and on the response, so an embedding gateway can attribute
+    // provider errors and successes the same way as refusals.
+    rejection.record_identity();
+    let identity = rejection.identity();
+    // The status the caller receives, on this span. Upstream responses record
+    // theirs from inside a provider-attempt span, so it is set here too.
+    let final_status = match &result {
+        Ok(response) => response.status().as_u16(),
+        Err(error) => error.status.as_u16(),
+    };
+    record_response_status(final_status);
+    result
+        .map(|mut response| {
+            if let Some(identity) = identity.clone() {
+                response.extensions_mut().insert(identity);
+            }
+            // An error status on a response (rather than an `Err`) reports
+            // what an upstream answered, even when its body was sanitized.
+            if response.status().as_u16() >= 400
+                && response.extensions().get::<crate::ErrorOrigin>().is_none()
+            {
+                response.extensions_mut().insert(crate::ErrorOrigin::Provider);
+            }
+            response
+        })
+        .map_err(|error| error.with_identity(identity))
     }
     .instrument(span)
     .await
 }
 
 #[instrument(skip(state, req))]
-pub async fn models<T: HttpClient>(
-    State(state): State<AppState<T>>,
-    req: Request,
-) -> impl IntoResponse {
+pub async fn models<T: HttpClient>(State(state): State<AppState<T>>, req: Request) -> Response {
     // Extract bearer token from Authorization header
     let bearer_token = req
         .headers()
@@ -1528,7 +2427,10 @@ pub async fn models<T: HttpClient>(
         .targets
         .iter()
         .filter(|entry| {
-            let pool = entry.value();
+            // Model listing is about the alias, not about a request class, and
+            // a non-default pool inherits the default's keys unless it states
+            // its own — so the default pool's keys are the alias's visibility.
+            let pool = entry.value().default_pool();
 
             // If pool has no keys configured, it's publicly accessible
             let Some(keys) = pool.keys() else {
@@ -1546,8 +2448,21 @@ pub async fn models<T: HttpClient>(
         .map(|entry| entry.key().clone())
         .collect();
 
-    // Create filtered response
-    Json(ListModelResponse::from_model_names(&accessible_models))
+    let authenticated_api_key_id = bearer_token
+        .and_then(|token| state.targets.key_labels.get(token))
+        .and_then(|labels| labels.get("api_key_id").cloned())
+        .and_then(|id| id.parse::<Uuid>().ok());
+
+    // Create filtered response and retain the authenticated identity for
+    // in-process analytics. Response extensions are never sent to the client.
+    let mut response =
+        Json(ListModelResponse::from_model_names(&accessible_models)).into_response();
+    if let Some(api_key_id) = authenticated_api_key_id {
+        response
+            .extensions_mut()
+            .insert(AuthenticatedApiKeyId(api_key_id));
+    }
+    response
 }
 
 #[cfg(test)]
@@ -1609,37 +2524,39 @@ mod tests {
 
     #[test]
     fn classify_sse_event_distinguishes_error_data_and_comment() {
-        use SseEventKind::{Comment, Data, Error};
+        use SseEventKind::{Comment, Data, Done, Error};
 
         // A provider's first-frame error on a 200 stream.
         assert_eq!(
             classify_sse_event(b"data: {\"error\":{\"code\":429,\"message\":\"x\"}}\n\n"),
-            Error(429)
+            Error(429, serde_json::json!({"code":429,"message":"x"}))
         );
         // Error alongside otherwise-valid chunk fields (provider shape).
         assert_eq!(
             classify_sse_event(b"data: {\"id\":\"g\",\"choices\":[],\"error\":{\"code\":502}}\n\n"),
-            Error(502)
+            Error(502, serde_json::json!({"code":502}))
         );
         // Tolerant of `data:` with no space after the colon.
         assert_eq!(
             classify_sse_event(b"data:{\"error\":{\"code\":503}}\n\n"),
-            Error(503)
+            Error(503, serde_json::json!({"code":503}))
         );
         // Multi-line `data:` fields are concatenated with `\n` before parsing
         // (SSE spec): the two `data:` lines here join to the valid JSON
         // `{"error":{"code":429}}` (the embedded `\n` is JSON whitespace).
         assert_eq!(
             classify_sse_event(b"data: {\"error\":\ndata: {\"code\":429}}\n\n"),
-            Error(429)
+            Error(429, serde_json::json!({"code":429}))
         );
 
-        // Normal content and the [DONE] sentinel are data frames, not errors.
+        // Normal content is a data frame, not an error.
         assert_eq!(
             classify_sse_event(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"),
             Data
         );
-        assert_eq!(classify_sse_event(b"data: [DONE]\n\n"), Data);
+        // The [DONE] sentinel is a data frame but NOT content: it closes a stream
+        // without carrying a token, so it must not count as a first token.
+        assert_eq!(classify_sse_event(b"data: [DONE]\n\n"), Done);
 
         // Comment / keep-alive frames carry no `data:` field.
         assert_eq!(classify_sse_event(b": keep-alive\n\n"), Comment);
@@ -2386,17 +3303,24 @@ mod tests {
                 key_rate_limiters: std::sync::Arc::new(dashmap::DashMap::new()),
                 key_concurrency_limiters: std::sync::Arc::new(dashmap::DashMap::new()),
                 key_labels: std::sync::Arc::new(dashmap::DashMap::new()),
+                accounts: std::sync::Arc::new(dashmap::DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
             },
             http_client: mock_client,
-            body_transform_fn: None,
             response_transform_fn: None,
-            streaming_header: None,
+            upstream_rate_limit_message: None,
             response_id_header: None,
-            tool_executor: std::sync::Arc::new(crate::NoOpToolExecutor),
-            response_store: std::sync::Arc::new(crate::NoOpResponseStore),
             body_limit: crate::DEFAULT_BODY_LIMIT,
+            sse_buffer_limit: crate::sse::DEFAULT_SSE_BUFFER_LIMIT,
+            first_token_timeout: None,
+            first_token_timeout_exempt_header: None,
+            rejected_params: Vec::new(),
+            inflight_limiter: std::sync::Arc::new(crate::inflight::LocalInflightLimiter::default()),
+            batch_inflight_enforce: false,
+            batch_inflight_limiter: std::sync::Arc::new(
+                crate::inflight::LocalInflightLimiter::default(),
+            ),
         };
 
         // Create a simple POST request
@@ -2408,7 +3332,7 @@ mod tests {
             .unwrap();
 
         // Test the timeout logic directly (not the full handler)
-        let target = pool.first_target().unwrap();
+        let target = pool.default_pool().first_target().unwrap();
         let timeout_secs = target.request_timeout_secs.unwrap();
         let timeout_duration = std::time::Duration::from_secs(timeout_secs);
 
@@ -2475,11 +3399,12 @@ mod tests {
             upstream_auth_header_prefix: None,
             response_headers: None,
             sanitize_response: false,
-            open_responses: None,
             request_timeout_secs: None,
             trusted,
             propagate_trace_context,
             reasoning_translation: None,
+            accepts_scheduling_priority: false,
+            kind: Default::default(),
         }
     }
 

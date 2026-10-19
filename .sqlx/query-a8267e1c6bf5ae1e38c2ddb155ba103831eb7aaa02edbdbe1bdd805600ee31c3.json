@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, granted_serving_classes, default_serving_class, self_hosted_only\n        FROM users\n        WHERE is_deleted = FALSE\n          AND (granted_serving_classes <> '{}' OR default_serving_class IS NOT NULL OR self_hosted_only)\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "granted_serving_classes",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 2,
+        "name": "default_serving_class",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "self_hosted_only",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "a8267e1c6bf5ae1e38c2ddb155ba103831eb7aaa02edbdbe1bdd805600ee31c3"
+}

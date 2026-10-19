@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT retry_version, total_requests\n                FROM batches\n                WHERE id = $1\n                  AND cancelled_at IS NOT NULL\n                  AND counts_frozen_at IS NULL\n                  AND deleted_at IS NULL\n                FOR UPDATE\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "retry_version",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "total_requests",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "e3d694c77d1cbdedf1ddaea2d0eb4cb46bf2c135b187c723550d5cdb4962bc12"
+}

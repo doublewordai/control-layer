@@ -142,7 +142,7 @@ impl<'c> Connections<'c> {
         Self { db }
     }
 
-    #[instrument(skip(self, config_encrypted), fields(name = %name, provider = %provider), err)]
+    #[instrument(level = "debug", skip(self, config_encrypted), fields(name = %name, provider = %provider), err)]
     pub async fn create(
         &mut self,
         user_id: Uuid,
@@ -157,7 +157,7 @@ impl<'c> Connections<'c> {
             r#"
             INSERT INTO connections (user_id, api_key_id, kind, provider, name, config_encrypted)
             VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING *
+            RETURNING id, user_id, api_key_id, kind, provider, name, config_encrypted, created_at, updated_at, deleted_at
             "#,
             user_id,
             api_key_id,
@@ -172,9 +172,9 @@ impl<'c> Connections<'c> {
         Ok(Connection::from(row))
     }
 
-    #[instrument(skip(self), fields(id = %id), err)]
+    #[instrument(level = "debug", skip(self), fields(id = %id), err)]
     pub async fn get_by_id(&mut self, id: Uuid) -> Result<Option<Connection>> {
-        let row = sqlx::query_as!(ConnectionRow, "SELECT * FROM connections WHERE id = $1 AND deleted_at IS NULL", id,)
+        let row = sqlx::query_as!(ConnectionRow, "SELECT id, user_id, api_key_id, kind, provider, name, config_encrypted, created_at, updated_at, deleted_at FROM connections WHERE id = $1 AND deleted_at IS NULL", id,)
             .fetch_optional(&mut *self.db)
             .await?;
 
@@ -182,7 +182,7 @@ impl<'c> Connections<'c> {
     }
 
     /// Bulk fetch connection names and owners by IDs. Returns a map of id → (name, user_id).
-    #[instrument(skip(self, ids), fields(count = ids.len()), err)]
+    #[instrument(level = "debug", skip(self, ids), fields(count = ids.len()), err)]
     pub async fn get_names_by_ids(&mut self, ids: &[Uuid]) -> Result<std::collections::HashMap<Uuid, (String, Uuid)>> {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -197,12 +197,12 @@ impl<'c> Connections<'c> {
         Ok(rows.into_iter().map(|r| (r.id, (r.name, r.user_id))).collect())
     }
 
-    #[instrument(skip(self), fields(user_id = %user_id), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %user_id), err)]
     pub async fn list_by_user(&mut self, user_id: Uuid, kind: Option<&str>) -> Result<Vec<Connection>> {
         let rows = sqlx::query_as!(
             ConnectionRow,
             r#"
-            SELECT * FROM connections
+            SELECT id, user_id, api_key_id, kind, provider, name, config_encrypted, created_at, updated_at, deleted_at FROM connections
             WHERE user_id = $1
               AND deleted_at IS NULL
               AND ($2::text IS NULL OR kind = $2)
@@ -217,7 +217,7 @@ impl<'c> Connections<'c> {
         Ok(rows.into_iter().map(Connection::from).collect())
     }
 
-    #[instrument(skip(self), fields(id = %id), err)]
+    #[instrument(level = "debug", skip(self), fields(id = %id), err)]
     pub async fn soft_delete(&mut self, id: Uuid) -> Result<bool> {
         // Soft-delete sync tracking data — the files and batches in fusillade
         // remain untouched so users can still access them.
@@ -244,7 +244,7 @@ impl<'c> Connections<'c> {
         Ok(result.rows_affected() > 0)
     }
 
-    #[instrument(skip(self, config_encrypted), fields(id = %id), err)]
+    #[instrument(level = "debug", skip(self, config_encrypted), fields(id = %id), err)]
     pub async fn update(&mut self, id: Uuid, name: Option<&str>, config_encrypted: Option<&[u8]>) -> Result<Connection> {
         let row = sqlx::query_as!(
             ConnectionRow,
@@ -253,7 +253,7 @@ impl<'c> Connections<'c> {
                 name = COALESCE($2, name),
                 config_encrypted = COALESCE($3, config_encrypted)
             WHERE id = $1 AND deleted_at IS NULL
-            RETURNING *
+            RETURNING id, user_id, api_key_id, kind, provider, name, config_encrypted, created_at, updated_at, deleted_at
             "#,
             id,
             name,
@@ -280,7 +280,7 @@ impl<'c> SyncOperations<'c> {
         Self { db }
     }
 
-    #[instrument(skip(self, sync_config, strategy_config), err)]
+    #[instrument(level = "debug", skip(self, sync_config, strategy_config), err)]
     pub async fn create(
         &mut self,
         connection_id: Uuid,
@@ -294,7 +294,7 @@ impl<'c> SyncOperations<'c> {
             r#"
             INSERT INTO sync_operations (connection_id, triggered_by, strategy, strategy_config, sync_config)
             VALUES ($1, $2, $3, $4, $5)
-            RETURNING *
+            RETURNING id, connection_id, status, strategy, strategy_config, files_found, files_skipped, files_ingested, files_failed, batches_created, error_summary, triggered_by, sync_config, started_at, completed_at, created_at
             "#,
             connection_id,
             triggered_by,
@@ -308,11 +308,11 @@ impl<'c> SyncOperations<'c> {
         Ok(SyncOperation::from(row))
     }
 
-    #[instrument(skip(self), fields(id = %id), err)]
+    #[instrument(level = "debug", skip(self), fields(id = %id), err)]
     pub async fn get_by_id(&mut self, id: Uuid) -> Result<Option<SyncOperation>> {
         let row = sqlx::query_as!(
             SyncOperationRow,
-            "SELECT * FROM sync_operations WHERE id = $1 AND status != 'deleted'",
+            "SELECT id, connection_id, status, strategy, strategy_config, files_found, files_skipped, files_ingested, files_failed, batches_created, error_summary, triggered_by, sync_config, started_at, completed_at, created_at FROM sync_operations WHERE id = $1 AND status != 'deleted'",
             id,
         )
         .fetch_optional(&mut *self.db)
@@ -321,11 +321,11 @@ impl<'c> SyncOperations<'c> {
         Ok(row.map(SyncOperation::from))
     }
 
-    #[instrument(skip(self), fields(connection_id = %connection_id), err)]
+    #[instrument(level = "debug", skip(self), fields(connection_id = %connection_id), err)]
     pub async fn list_by_connection(&mut self, connection_id: Uuid) -> Result<Vec<SyncOperation>> {
         let rows = sqlx::query_as!(
             SyncOperationRow,
-            "SELECT * FROM sync_operations WHERE connection_id = $1 AND status != 'deleted' ORDER BY created_at DESC",
+            "SELECT id, connection_id, status, strategy, strategy_config, files_found, files_skipped, files_ingested, files_failed, batches_created, error_summary, triggered_by, sync_config, started_at, completed_at, created_at FROM sync_operations WHERE connection_id = $1 AND status != 'deleted' ORDER BY created_at DESC",
             connection_id,
         )
         .fetch_all(&mut *self.db)
@@ -334,7 +334,7 @@ impl<'c> SyncOperations<'c> {
         Ok(rows.into_iter().map(SyncOperation::from).collect())
     }
 
-    #[instrument(skip(self), fields(id = %id, status = %status), err)]
+    #[instrument(level = "debug", skip(self), fields(id = %id, status = %status), err)]
     pub async fn update_status(&mut self, id: Uuid, status: &str) -> Result<()> {
         let started = if status == "listing" { Some(Utc::now()) } else { None };
         let completed = if matches!(status, "completed" | "failed" | "cancelled") {
@@ -362,7 +362,7 @@ impl<'c> SyncOperations<'c> {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(id = %id), err)]
+    #[instrument(level = "debug", skip(self), fields(id = %id), err)]
     pub async fn update_counters(
         &mut self,
         id: Uuid,
@@ -397,7 +397,7 @@ impl<'c> SyncOperations<'c> {
     }
 
     /// Atomically increment a single counter by 1.
-    #[instrument(skip(self), fields(id = %id, field = %field), err)]
+    #[instrument(level = "debug", skip(self), fields(id = %id, field = %field), err)]
     pub async fn increment_counter(&mut self, id: Uuid, field: &str) -> Result<()> {
         // Use dynamic SQL safely — field is validated against an allowlist.
         let query = match field {
@@ -417,7 +417,7 @@ impl<'c> SyncOperations<'c> {
     /// the sync_operation as completed (or failed if all entries failed).
     ///
     /// Returns true if the sync was marked terminal.
-    #[instrument(skip(self), fields(id = %sync_id), err)]
+    #[instrument(level = "debug", skip(self), fields(id = %sync_id), err)]
     pub async fn try_complete(&mut self, sync_id: Uuid) -> Result<bool> {
         // Count entries by terminal vs non-terminal status in a single query
         let row = sqlx::query!(
@@ -468,7 +468,7 @@ impl<'c> SyncEntries<'c> {
 
     /// Bulk-insert sync entries for discovered files.
     #[allow(clippy::type_complexity)]
-    #[instrument(skip(self, entries), fields(sync_id = %sync_id, count = entries.len()), err)]
+    #[instrument(level = "debug", skip(self, entries), fields(sync_id = %sync_id, count = entries.len()), err)]
     pub async fn bulk_create(
         &mut self,
         sync_id: Uuid,
@@ -489,7 +489,7 @@ impl<'c> SyncEntries<'c> {
             INSERT INTO sync_entries (sync_id, connection_id, external_key, external_last_modified, external_size_bytes)
             SELECT $1, $2, t.key, t.last_modified, t.size_bytes
             FROM unnest($3::text[], $4::timestamptz[], $5::bigint[]) AS t(key, last_modified, size_bytes)
-            RETURNING *
+            RETURNING id, sync_id, connection_id, external_key, external_last_modified, external_size_bytes, status, file_id, batch_id, template_count, error, created_at, updated_at, skipped_lines, validation_errors
             "#,
             sync_id,
             connection_id,
@@ -504,7 +504,7 @@ impl<'c> SyncEntries<'c> {
     }
 
     /// Find previously-synced entries for dedup.
-    #[instrument(skip(self), fields(connection_id = %connection_id), err)]
+    #[instrument(level = "debug", skip(self), fields(connection_id = %connection_id), err)]
     pub async fn find_existing(
         &mut self,
         connection_id: Uuid,
@@ -540,7 +540,7 @@ impl<'c> SyncEntries<'c> {
     /// Get all terminal sync entries for a connection (for UI status display).
     /// Returns (key, last_modified, status) where status is 'activated' or 'failed'.
     /// The frontend uses this to show Synced/Failed/Modified states in the file browser.
-    #[instrument(skip(self), fields(connection_id = %connection_id), err)]
+    #[instrument(level = "debug", skip(self), fields(connection_id = %connection_id), err)]
     #[allow(clippy::type_complexity)]
     pub async fn list_synced_keys(&mut self, connection_id: Uuid) -> Result<Vec<(String, Option<DateTime<Utc>>, String)>> {
         let rows = sqlx::query!(
@@ -563,7 +563,7 @@ impl<'c> SyncEntries<'c> {
     }
 
     /// Returns true if the row was updated, false if it was already deleted.
-    #[instrument(skip(self), fields(id = %id, status = %status), err)]
+    #[instrument(level = "debug", skip(self), fields(id = %id, status = %status), err)]
     pub async fn update_status(&mut self, id: Uuid, status: &str, error: Option<&str>) -> Result<bool> {
         let result = sqlx::query!(
             "UPDATE sync_entries SET status = $2, error = $3 WHERE id = $1 AND status != 'deleted'",
@@ -578,7 +578,7 @@ impl<'c> SyncEntries<'c> {
     }
 
     /// Returns true if the row was updated, false if it was already deleted.
-    #[instrument(skip(self, validation_errors), fields(id = %id), err)]
+    #[instrument(level = "debug", skip(self, validation_errors), fields(id = %id), err)]
     pub async fn set_ingested(
         &mut self,
         id: Uuid,
@@ -606,7 +606,7 @@ impl<'c> SyncEntries<'c> {
         Ok(result.rows_affected() > 0)
     }
 
-    #[instrument(skip(self), fields(id = %id), err)]
+    #[instrument(level = "debug", skip(self), fields(id = %id), err)]
     pub async fn set_activated(&mut self, id: Uuid, batch_id: Uuid) -> Result<()> {
         sqlx::query!(
             "UPDATE sync_entries SET status = 'activated', batch_id = $2 WHERE id = $1 AND status != 'deleted'",
@@ -619,11 +619,11 @@ impl<'c> SyncEntries<'c> {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(sync_id = %sync_id), err)]
+    #[instrument(level = "debug", skip(self), fields(sync_id = %sync_id), err)]
     pub async fn list_by_sync(&mut self, sync_id: Uuid) -> Result<Vec<SyncEntry>> {
         let rows = sqlx::query_as!(
             SyncEntryRow,
-            "SELECT * FROM sync_entries WHERE sync_id = $1 ORDER BY external_key",
+            "SELECT id, sync_id, connection_id, external_key, external_last_modified, external_size_bytes, status, file_id, batch_id, template_count, error, created_at, updated_at, skipped_lines, validation_errors FROM sync_entries WHERE sync_id = $1 ORDER BY external_key",
             sync_id,
         )
         .fetch_all(&mut *self.db)
@@ -633,9 +633,9 @@ impl<'c> SyncEntries<'c> {
     }
 
     /// Get entry by ID.
-    #[instrument(skip(self), fields(id = %id), err)]
+    #[instrument(level = "debug", skip(self), fields(id = %id), err)]
     pub async fn get_by_id(&mut self, id: Uuid) -> Result<Option<SyncEntry>> {
-        let row = sqlx::query_as!(SyncEntryRow, "SELECT * FROM sync_entries WHERE id = $1", id,)
+        let row = sqlx::query_as!(SyncEntryRow, "SELECT id, sync_id, connection_id, external_key, external_last_modified, external_size_bytes, status, file_id, batch_id, template_count, error, created_at, updated_at, skipped_lines, validation_errors FROM sync_entries WHERE id = $1", id,)
             .fetch_optional(&mut *self.db)
             .await?;
 

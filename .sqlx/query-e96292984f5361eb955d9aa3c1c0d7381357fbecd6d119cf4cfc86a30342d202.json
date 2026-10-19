@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE deployed_model_components\n               SET render_kwargs = '{\"thinking_mode\": \"chat\"}'::jsonb\n               WHERE composite_model_id = $1 AND deployed_model_id = $2 AND pool = 'completions'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e96292984f5361eb955d9aa3c1c0d7381357fbecd6d119cf4cfc86a30342d202"
+}

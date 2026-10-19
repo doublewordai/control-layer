@@ -1,0 +1,9 @@
+{
+  "error": {
+    "type": "card_error",
+    "code": "card_declined",
+    "decline_code": "stolen_card",
+    "message": "Your card was declined.",
+    "payment_intent": null
+  }
+}

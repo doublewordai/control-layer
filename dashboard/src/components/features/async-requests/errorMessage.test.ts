@@ -63,4 +63,39 @@ describe("extractErrorMessage", () => {
   it("falls back to a default when nothing is present", () => {
     expect(extractErrorMessage({})).toBe("Request failed");
   });
+
+  it("does not leak the raw FailureReason envelope when details.body is empty", () => {
+    const error = JSON.stringify({
+      type: "NonRetriableHttpStatus",
+      details: { status: 503, body: "" },
+    });
+    const result = extractErrorMessage({ error });
+    expect(result).not.toBe(error);
+    expect(result).not.toContain('"type"');
+    expect(result).not.toContain("NonRetriableHttpStatus");
+  });
+
+  it("synthesizes a status-aware message for an empty-body 503 envelope", () => {
+    const error = JSON.stringify({
+      type: "NonRetriableHttpStatus",
+      details: { status: 503, body: "" },
+    });
+    expect(extractErrorMessage({ error })).toBe("Request failed (503)");
+  });
+
+  it("synthesizes a plain fallback when the envelope has no status", () => {
+    const error = JSON.stringify({
+      type: "NonRetriableHttpStatus",
+      details: { body: "" },
+    });
+    expect(extractErrorMessage({ error })).toBe("Request failed");
+  });
+
+  it("still returns a non-empty upstream body verbatim instead of synthesizing", () => {
+    const error = JSON.stringify({
+      type: "NonRetriableHttpStatus",
+      details: { status: 502, body: "<html>502 Bad Gateway</html>" },
+    });
+    expect(extractErrorMessage({ error })).toBe("<html>502 Bad Gateway</html>");
+  });
 });

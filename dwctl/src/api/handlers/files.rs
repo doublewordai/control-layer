@@ -177,6 +177,7 @@ impl OpenAIBatchRequest {
         api_key: String,
         accessible_models: &HashMap<String, AccessibleBatchModel>,
         allowed_url_paths: &[String],
+        tolerations: Option<&serde_json::Value>,
     ) -> Result<fusillade::RequestTemplateInput> {
         // Validate custom_id is safe for HTTP headers
         validate_custom_id(&self.custom_id)?;
@@ -196,6 +197,13 @@ impl OpenAIBatchRequest {
                 message: "Missing 'model' field in request body".to_string(),
             })?
             .to_string();
+
+        // Batches use deadline scheduling, so all serving-class suffixes
+        // are ignored. Resolve the base model before validating access.
+        let (model, _) = onwards::serving::split_model_suffix(&model).map_err(|error| Error::BadRequest {
+            message: error.to_string(),
+        })?;
+        let model = model.to_string();
 
         // Validate model access
         let accessible_model = accessible_models.get(&model).ok_or_else(|| Error::ModelAccessDenied {
@@ -220,16 +228,18 @@ impl OpenAIBatchRequest {
                 },
             })?;
 
-        // Strip 'priority' key from body if present (users shouldn't control priority)
+        // This is the untrusted batch ingress. Daemon loopback requests skip
+        // realtime ingress, so scrub before storing the template; dispatch adds
+        // its own deadline priority later.
         let mut sanitized_body = self.body.clone();
-        if sanitized_body.is_object()
-            && let Some(obj) = sanitized_body.as_object_mut()
-            && obj.remove("priority").is_some()
-        {
-            tracing::debug!(
-                custom_id = %self.custom_id,
-                "Stripped 'priority' field from request body"
-            );
+        sanitized_body["model"] = model.clone().into();
+        crate::inference::middleware::strip_scheduling_priority(&mut sanitized_body);
+
+        // A preset-pinned account's batch requests carry its preset's fixed
+        // toleration list, exactly as its realtime and flex requests do. Applied
+        // after the strip above so the client can never override it.
+        if let Some(tolerations) = tolerations {
+            crate::inference::middleware::set_routing_tolerations(&mut sanitized_body, tolerations);
         }
 
         // Serialize sanitized body back to string
@@ -295,9 +305,9 @@ struct FileStreamConfig {
     /// Optional DB pool for `image_access` bookkeeping. `None` disables
     /// the bookkeeping (the substitution itself still runs).
     access_pool: Option<sqlx::PgPool>,
-    /// Who to attribute `image_access` rows to: the acting human, plus the
-    /// owning org when the upload is in org context (so org members can view
-    /// it, but personal uploads stay private to the user).
+    /// Who to attribute `image_access` rows to: the principal — the
+    /// organization when the upload is in org context (so org members can use
+    /// the image), else the person (personal uploads stay private).
     access_attribution: Option<crate::api::handlers::images::ImageAttribution>,
 }
 
@@ -348,6 +358,11 @@ enum BatchNormalizeError {
     /// The content store itself failed (GCS unreachable, IAM error).
     /// Surface as "service unavailable".
     StoreFailed(String),
+    /// The image-access database (the grant written for every ingested image,
+    /// which later authorises signing its token) could not be reached. The
+    /// content store already succeeded, so this names the right dependency.
+    /// Retryable.
+    AccessUnavailable,
 }
 
 async fn normalize_template_body_in_place(
@@ -382,18 +397,29 @@ async fn normalize_template_body_in_place(
             match normalizer.ingest(input).await {
                 Ok(ingested) => {
                     if let (Some(pool), Some(attribution)) = (access_pool, access_attribution) {
-                        // Batch ingest is already async (file upload latency dominates),
-                        // so we AWAIT the bookkeeping write rather than fire-and-forget —
-                        // the user's later "view what I submitted" lookup depends on it.
-                        // Records real (mime, bytes_len) captured from the ingest result.
-                        crate::api::handlers::images::record_image_access(
+                        // AWAITED and REQUIRED, not fire-and-forget: this row is what
+                        // authorises signing the token when the daemon dispatches the
+                        // batch (and the user's later "view what I submitted" lookup),
+                        // so a silently-failed write would refuse the customer's own
+                        // image. Fail the upload (retryable) instead. Records real
+                        // (mime, bytes_len) captured from the ingest result.
+                        if let Err(e) = crate::api::handlers::images::try_record_image_access(
                             &pool,
                             attribution,
                             ingested.token,
                             &ingested.mime,
                             ingested.bytes_len,
                         )
-                        .await;
+                        .await
+                        {
+                            tracing::warn!(error = %e, "image_access bookkeeping failed on file upload");
+                            if let Ok(mut g) = err_cell.lock()
+                                && g.is_none()
+                            {
+                                *g = Some(BatchNormalizeError::AccessUnavailable);
+                            }
+                            return Err(());
+                        }
                     }
                     Ok::<String, ()>(ingested.token.to_dw_img_uri())
                 }
@@ -407,6 +433,12 @@ async fn normalize_template_body_in_place(
                         crate::image_normalizer::NormalizeError::NotFound => {
                             BatchNormalizeError::StoreFailed("image token not found in store".to_string())
                         }
+                        // Ingest never authorises tokens (it only produces them), so this
+                        // variant cannot arise here; map it defensively as bad input.
+                        crate::image_normalizer::NormalizeError::Forbidden => {
+                            BatchNormalizeError::BadInput("image token is not accessible to this caller".to_string())
+                        }
+                        crate::image_normalizer::NormalizeError::AccessUnavailable => BatchNormalizeError::AccessUnavailable,
                     };
                     if let Ok(mut g) = err_cell.lock()
                         && g.is_none()
@@ -469,6 +501,9 @@ enum FileUploadError {
     /// Image normaliser content-store backend failed (GCS unreachable,
     /// IAM error). 502/503 territory; not the user's fault.
     ImageStoreFailed { line: u64, message: String },
+    /// The image-access database was unreachable while recording the grant
+    /// for an ingested image. Retryable; distinct from the content store.
+    ImageAccessUnavailable { line: u64 },
     /// A referenced image's origin returned a non-408/429 4xx (forbidden, gated,
     /// missing; 408/429 are transient and surface as `ImageTransient`). The file
     /// references an image the user cannot grant us access to — their bad input,
@@ -498,6 +533,7 @@ fn map_batch_normalize_error(e: BatchNormalizeError, line: u64) -> FileUploadErr
         BatchNormalizeError::FetchFailed(message) => FileUploadError::ImageFetchFailed { line, message },
         BatchNormalizeError::Transient(message) => FileUploadError::ImageTransient { line, message },
         BatchNormalizeError::StoreFailed(message) => FileUploadError::ImageStoreFailed { line, message },
+        BatchNormalizeError::AccessUnavailable => FileUploadError::ImageAccessUnavailable { line },
     }
 }
 
@@ -562,6 +598,9 @@ impl FileUploadError {
             },
             FileUploadError::ImageStoreFailed { line, message } => Error::ServiceUnavailable {
                 message: format!("Line {}: image content store temporarily unavailable: {}", line, message),
+            },
+            FileUploadError::ImageAccessUnavailable { line } => Error::ServiceUnavailable {
+                message: format!("Line {}: image access store temporarily unavailable, please retry", line),
             },
             FileUploadError::ImageUnfetchable { line, message } => Error::UnprocessableEntity {
                 message: format!(
@@ -658,6 +697,11 @@ struct FileRequestContext {
     api_key: String,
     accessible_models: HashMap<String, AccessibleBatchModel>,
     allowed_url_paths: Vec<String>,
+    /// The toleration list the account that owns this upload is pinned to,
+    /// resolved from its preset, or `None` when it is on "Default". Written
+    /// verbatim to `nvext.routing_constraints.tolerations` on every template
+    /// body.
+    tolerations: Option<serde_json::Value>,
 }
 
 struct AccessibleBatchModel {
@@ -697,6 +741,7 @@ fn create_file_stream(
         api_key,
         accessible_models,
         allowed_url_paths,
+        tolerations,
     } = req_ctx;
     let normalizer = config.normalizer.clone();
     let normalizer_mode = config.normalizer_mode;
@@ -896,8 +941,13 @@ fn create_file_stream(
                                     match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
                                         Ok(openai_req) => {
                                             // Transform to internal format (includes model access validation)
-                                            match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models, &allowed_url_paths)
-                                            {
+                                            match openai_req.to_internal(
+                                                &endpoint,
+                                                api_key.clone(),
+                                                &accessible_models,
+                                                &allowed_url_paths,
+                                                tolerations.as_ref(),
+                                            ) {
                                                 Ok(mut template) => {
                                                     // Normalise image URLs in the per-template body
                                                     // before the size cap check, since substitution
@@ -988,7 +1038,13 @@ fn create_file_stream(
 
                             match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
                                 Ok(openai_req) => {
-                                    match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models, &allowed_url_paths) {
+                                    match openai_req.to_internal(
+                                        &endpoint,
+                                        api_key.clone(),
+                                        &accessible_models,
+                                        &allowed_url_paths,
+                                        tolerations.as_ref(),
+                                    ) {
                                         Ok(mut template) => {
                                             // Normalise image URLs in the trailing line as well.
                                             if let Err(e) = normalize_template_body_in_place(
@@ -1138,6 +1194,15 @@ pub async fn upload_file<P: PoolProvider>(
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
     let uploaded_by = Some(target_user_id.to_string());
 
+    // Files exist to feed batches: if an owner has switched the batch API
+    // off for the workspace, refuse the upload before streaming the body.
+    {
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Internal {
+            operation: format!("get db connection for modality check: {}", e),
+        })?;
+        crate::api::handlers::modalities::ensure_batch_enabled(&mut conn, target_user_id).await?;
+    }
+
     // Re-use the AppState-bound normaliser singleton (built once at
     // startup). The dispatcher will JIT-resign any `dw-img://` tokens
     // produced here with a fresh short-lived signed URL before sending
@@ -1158,13 +1223,21 @@ pub async fn upload_file<P: PoolProvider>(
         buffer_size: config.batches.files.upload_buffer_size,
         normalizer,
         normalizer_mode,
-        access_pool: Some(state.db.write().clone()),
+        access_pool: Some(state.db.write().into_inner()),
         // image_access is attributed to the acting human plus, for org-context
         // uploads, the owning org — so org members can view org-key images
         // while a personal upload stays private to the user. This is distinct
         // from file ownership above, which is credited to the org.
+        // The principal, exactly as an API key resolves: the organization when
+        // acting in one, else the person. A batch created from this file under
+        // the same principal (any member acting in the org, or the person)
+        // dispatches with a hidden key carrying that principal, so its token
+        // authorisation matches. Known limitation, accepted as rare: a platform
+        // manager creating a batch from a file uploaded under a DIFFERENT
+        // principal dispatches under their own, and each image line then fails
+        // with `image_token_forbidden`.
         access_attribution: Some(crate::api::handlers::images::ImageAttribution {
-            user_id: current_user.id,
+            user_id: current_user.active_organization.unwrap_or(current_user.id),
             organization_id: current_user.active_organization,
         }),
     };
@@ -1180,6 +1253,29 @@ pub async fn upload_file<P: PoolProvider>(
         .resolve_batch_execution_key(target_user_id, current_user.id, current_user.api_key_id)
         .await
         .map_err(Error::Database)?;
+
+    // The account's resolved scheduling tolerations, if it is pinned to a
+    // preset. The hidden batch key belongs to the account that owns the batch
+    // (`target_user_id` is the org in org context, else the person), so its
+    // per-key policy carries the account's preset. Read it from the same policy
+    // map realtime uses, so batch and realtime agree on the toleration list.
+    //
+    // A just-created hidden key cannot be in the policy map yet: the map is
+    // refreshed asynchronously off the auth_config_changed notification, which
+    // this request's `api_keys` INSERT fires but the LISTEN/NOTIFY loop has not
+    // consumed. Only in that case (the key is absent from the map) read the
+    // account's policy straight off the users row, reusing the connection `conn`
+    // this handler already holds — a cached account on Default is not a miss, so
+    // an ordinary upload never takes a second connection.
+    let tolerations = match state.key_policy_cache.tolerations_if_known(&user_api_key) {
+        Some(resolved) => resolved,
+        None => {
+            let policy = crate::sync::key_policy::load_policy(&mut conn, target_user_id)
+                .await
+                .map_err(|e| Error::Database(e.into()))?;
+            state.key_policy_cache.presets().resolve(policy.toleration_preset.as_deref())
+        }
+    };
 
     // Construct batch execution endpoint (where fusillade will send requests)
     let endpoint = format!("http://{}:{}/ai", config.host, config.port);
@@ -1223,6 +1319,7 @@ pub async fn upload_file<P: PoolProvider>(
             api_key: user_api_key,
             accessible_models,
             allowed_url_paths: config.batches.allowed_url_paths.clone(),
+            tolerations: tolerations.map(|t| (*t).clone()),
         },
         Some(api_key_id),
     );
@@ -1919,13 +2016,26 @@ pub async fn delete_file<P: PoolProvider>(
         });
     }
 
-    // Perform the deletion (hard delete - cascades to batches and requests)
+    // Soft-delete the file: cancels non-terminal batches and unlinks them
+    // (file_id = NULL), NULLs output_file_id/error_file_id, and marks the file
+    // deleted (retained for audit). Existing batch results survive file deletion.
+    //
+    // `delete_file` reports `FileNotFound` when the row is already soft-deleted,
+    // which happens when a duplicate/concurrent DELETE loses the race. That is a
+    // client-visible `404`, not a server fault — matching the `get_file` check
+    // above, which already returns 404 once the row is gone.
     state
         .request_manager
         .delete_file(fusillade::FileId(file_id))
         .await
-        .map_err(|e| Error::Internal {
-            operation: format!("delete file: {}", e),
+        .map_err(|e| match e {
+            fusillade::FusilladeError::FileNotFound(_) => Error::NotFound {
+                resource: "File".to_string(),
+                id: file_id_str.clone(),
+            },
+            other => Error::Internal {
+                operation: format!("delete file: {}", other),
+            },
         })?;
 
     Ok(Json(FileDeleteResponse {
@@ -2068,6 +2178,8 @@ pub async fn get_file_cost_estimate<P: PoolProvider>(
 
     // Use the completion_window from query params, defaulting to "24h"
     let completion_window = query.completion_window.as_deref().unwrap_or("24h");
+    // Operators may inspect another account's file; quote that account's deal.
+    let pricing_account = file.uploaded_by.as_deref().and_then(|owner| Uuid::parse_str(owner).ok());
 
     for (model_alias, (request_count, input_tokens)) in model_stats {
         // Look up the deployment and historical average
@@ -2089,14 +2201,15 @@ pub async fn get_file_cost_estimate<P: PoolProvider>(
         };
 
         let cost = if let Some(deployment) = deployment_opt {
-            // Look up tariff pricing for Batch API key purpose, with fallback to realtime
+            // Resolve the owner's batch price for this exact completion window.
             let pricing_result = tariffs_repo
-                .get_pricing_at_timestamp_with_fallback(
+                .get_effective_pricing_at_timestamp(
                     deployment.id,
-                    Some(&ApiKeyPurpose::Batch),
-                    &ApiKeyPurpose::Realtime,
-                    current_time,
+                    pricing_account,
+                    "batch",
                     Some(completion_window),
+                    Some("standard"),
+                    current_time,
                 )
                 .await
                 .map_err(Error::Database)?;
@@ -2145,6 +2258,7 @@ mod tests {
     use crate::api::models::users::Role;
     use crate::db::models::api_keys::ApiKeyPurpose;
     use crate::test::utils::*;
+    use chrono::Utc;
     use sqlx::PgPool;
     use std::sync::{Arc, Mutex};
     use uuid::Uuid;
@@ -2164,7 +2278,7 @@ mod tests {
             .await
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn validates_reasoning_controls_during_upload(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2235,7 +2349,7 @@ mod tests {
         assert!(missing_budget_limit.text().contains("max_completion_tokens is not set"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_and_download_file_content(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2299,7 +2413,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_missing_model_field(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2327,7 +2441,7 @@ mod tests {
         assert!(error_body.contains("model"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_invalid_purpose_returns_400(pool: PgPool) {
         // Any unsupported purpose must be a 400 — and must NOT write a file.
@@ -2378,7 +2492,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_model_access_denied(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2413,7 +2527,7 @@ mod tests {
         assert!(error_body.contains("has not been configured or is not available to user"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_missing_custom_id(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2442,7 +2556,7 @@ mod tests {
         assert!(error_body.contains("custom_id"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_custom_id_with_control_characters(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2473,7 +2587,7 @@ mod tests {
         assert!(error_body.contains("invalid characters"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_custom_id_too_long(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2508,7 +2622,7 @@ mod tests {
         assert!(error_body.contains("exceeds maximum length"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_invalid_json_body(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2536,7 +2650,7 @@ mod tests {
         assert!(error_body.contains("model"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_malformed_jsonl(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2562,7 +2676,7 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_empty_file(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2588,7 +2702,7 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_with_metadata_after_file_field(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2638,7 +2752,7 @@ mod tests {
         assert_eq!(retrieved_file.purpose, crate::api::models::files::Purpose::Batch);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_file_cost_estimate(pool: PgPool) {
         use rust_decimal::Decimal;
@@ -2672,7 +2786,9 @@ mod tests {
                 output_price_per_token: Decimal::from_str("0.00006").unwrap(), // $0.06 per 1K tokens
                 api_key_purpose: Some(ApiKeyPurpose::Batch),
                 completion_window: Some("24h".to_string()),
-                valid_from: None,
+                // Estimates use the host clock; the database may run in a VM.
+                valid_from: Some(Utc::now() - chrono::Duration::minutes(1)),
+                user_id: None,
             })
             .await
             .unwrap();
@@ -2686,7 +2802,9 @@ mod tests {
                 output_price_per_token: Decimal::from_str("0.000002").unwrap(), // $0.002 per 1K tokens
                 api_key_purpose: Some(ApiKeyPurpose::Batch),
                 completion_window: Some("24h".to_string()),
-                valid_from: None,
+                // Estimates use the host clock; the database may run in a VM.
+                valid_from: Some(Utc::now() - chrono::Duration::minutes(1)),
+                user_id: None,
             })
             .await
             .unwrap();
@@ -2771,7 +2889,7 @@ mod tests {
         assert_eq!(estimate.total_estimated_output_tokens, total_output);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_file_cost_estimate_with_different_slas(pool: PgPool) {
         use rust_decimal::Decimal;
@@ -2802,7 +2920,9 @@ mod tests {
                 output_price_per_token: Decimal::from_str("0.00006").unwrap(), // $0.06 per 1K tokens
                 api_key_purpose: Some(ApiKeyPurpose::Batch),
                 completion_window: Some("24h".to_string()),
-                valid_from: None,
+                // Estimates use the host clock; the database may run in a VM.
+                valid_from: Some(Utc::now() - chrono::Duration::minutes(1)),
+                user_id: None,
             })
             .await
             .unwrap();
@@ -2816,7 +2936,9 @@ mod tests {
                 output_price_per_token: Decimal::from_str("0.00012").unwrap(), // $0.12 per 1K tokens (2x)
                 api_key_purpose: Some(ApiKeyPurpose::Batch),
                 completion_window: Some("1h".to_string()),
-                valid_from: None,
+                // Estimates use the host clock; the database may run in a VM.
+                valid_from: Some(Utc::now() - chrono::Duration::minutes(1)),
+                user_id: None,
             })
             .await
             .unwrap();
@@ -2887,7 +3009,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_invalid_http_method(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2920,7 +3042,7 @@ mod tests {
         assert!(error_body.contains("GET"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_invalid_url_path(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2956,7 +3078,7 @@ mod tests {
         assert!(error_body.contains("/v1/responses"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_accepts_responses_url_path(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2985,7 +3107,7 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_accepts_messages_url_path(pool: PgPool) {
         // The Anthropic Messages ingress (/v1/messages) is an allowed batch URL
@@ -3017,7 +3139,7 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_strips_priority_field(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3029,7 +3151,7 @@ mod tests {
         add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
 
         // Upload file with priority field that user is trying to manipulate
-        let jsonl_content = r#"{"custom_id": "priority-hijack", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8", "messages": [{"role": "user", "content": "urgent"}], "priority": -999999}}"#;
+        let jsonl_content = r#"{"custom_id": "priority-hijack", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8", "messages": [{"role": "user", "content": "urgent"}], "priority": -999999, "nvext": {"router": {"ttft_target": 1, "itl_target": 2, "keep": true}, "agent_hints": {"priority": 999, "keep": true}, "keep": true}}}"#;
 
         let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-priority.jsonl");
 
@@ -3067,6 +3189,13 @@ mod tests {
         let body = downloaded_json.get("body").expect("Should have body field");
         assert!(body.get("priority").is_none(), "Priority field should be stripped from body");
 
+        assert!(body["nvext"]["router"].get("ttft_target").is_none());
+        assert!(body["nvext"]["router"].get("itl_target").is_none());
+        assert!(body["nvext"]["agent_hints"].get("priority").is_none());
+        assert_eq!(body["nvext"]["router"]["keep"], true);
+        assert_eq!(body["nvext"]["agent_hints"]["keep"], true);
+        assert_eq!(body["nvext"]["keep"], true);
+
         // Verify other fields are preserved
         assert_eq!(
             body.get("model").and_then(|v| v.as_str()).unwrap(),
@@ -3076,7 +3205,7 @@ mod tests {
     }
 
     /// Test that X-Incomplete is false for static batch input files (no pagination)
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_x_incomplete_false_for_batch_input_file(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3127,7 +3256,7 @@ mod tests {
     }
 
     /// Test that X-Incomplete is true when pagination indicates more data
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_x_incomplete_true_with_pagination(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3197,7 +3326,7 @@ mod tests {
     }
 
     /// Test that X-Incomplete reflects batch running status for output files
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_x_incomplete_for_batch_output_file_running(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3261,7 +3390,7 @@ mod tests {
     }
 
     /// Test that X-Incomplete is false for output file when batch is complete
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_x_incomplete_false_for_batch_output_file_complete(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3399,7 +3528,7 @@ mod tests {
         let _ = handle.await;
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_with_rate_limiter_configured(pool: PgPool) {
         // Create app with rate limiting enabled
@@ -3437,7 +3566,7 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_rejects_file_exceeding_max_requests(pool: PgPool) {
         // Create app with max_requests_per_file = 2
@@ -3481,7 +3610,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_allows_file_at_max_requests(pool: PgPool) {
         // Create app with max_requests_per_file = 2
@@ -3526,7 +3655,7 @@ mod tests {
     /// 2. Unlimited responses use streaming (no content-length header)
     /// 3. Paginated downloads return correct subset and headers
     /// 4. Each line is valid JSON
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_file_content_streaming(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3904,7 +4033,7 @@ mod tests {
     }
 
     /// Test that Content-Length header triggers early rejection for oversized files
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_content_length_early_rejection(pool: PgPool) {
         // Create app with a small file size limit
@@ -3939,7 +4068,7 @@ mod tests {
     }
 
     /// Test that files exceeding size limit during streaming return 413
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_streaming_size_limit_returns_413(pool: PgPool) {
         // Use a limit large enough for multipart overhead but small enough
@@ -3982,7 +4111,7 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_invalid_utf8(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4037,7 +4166,7 @@ mod tests {
         assert_error::<LengthLimitError>();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_rejects_request_exceeding_max_body_size(pool: PgPool) {
         // Create app with a small per-request body size limit
@@ -4081,7 +4210,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_allows_request_within_max_body_size(pool: PgPool) {
         // Create app with a generous per-request body size limit
@@ -4115,7 +4244,7 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_rejects_embeddings_model_on_chat_endpoint(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4154,7 +4283,7 @@ mod tests {
         assert!(body.contains("/v1/chat/completions"), "Expected endpoint in error, got: {}", body);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_rejects_chat_model_on_embeddings_endpoint(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4194,7 +4323,7 @@ mod tests {
         assert!(body.contains("/v1/embeddings"), "Expected endpoint in error, got: {}", body);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_allows_matching_endpoint_and_model_type(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4246,7 +4375,7 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_skips_validation_for_untyped_models(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4278,7 +4407,7 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_files_member_id_rejected_outside_org_context(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4300,7 +4429,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_files_member_id_no_key_returns_empty(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4321,7 +4450,7 @@ mod tests {
         assert_eq!(body["data"].as_array().unwrap().len(), 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_files_enrichment_in_personal_context(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;

@@ -1,0 +1,49 @@
+-- no-transaction
+--
+-- Candidate lookup for the batch finalizer (COR-649).
+--
+-- Three finalizer arms scan `batches` for work, and all three lead with
+-- `counts_frozen_at IS NULL AND deleted_at IS NULL`:
+--
+--   count_unfrozen_terminal_batches  + terminal-stamp disjunction
+--   finalize_terminal_batches        + cancelling_at IS NULL, total_requests > 0
+--   finalize_cancelled_batches       + cancelled_at IS NOT NULL, grace bound,
+--                                      ORDER BY cancelled_at LIMIT $n
+--
+-- Nothing else indexes `counts_frozen_at`: idx_batches_archivable carries the
+-- inverse (IS NOT NULL), and idx_batches_pending_notification requires
+-- notification_sent_at IS NULL, which these queries do not state — the same
+-- mismatch 20260716000001 documented for the notification poller. Without this
+-- index all three seq-scan the whole table on every finalizer tick
+-- (batch_finalizer_interval_ms, default 10s), which measured ~1.3 full scans
+-- per second in production.
+--
+-- Two properties to preserve if this is ever reshaped:
+--
+--   * The predicate is only the pair all three arms share. Each arm's extra
+--     conditions are left as residual filters deliberately — they discriminate
+--     among single-digit row counts, so narrowing the predicate buys nothing
+--     and costs the other two arms their index.
+--
+--   * `cancelled_at` is the key for finalize_cancelled_batches, the only arm
+--     with an ORDER BY; it satisfies that sort from the index. Changing the key
+--     silently reintroduces the sort.
+--
+-- Size is self-limiting: a row enters when a batch is created and leaves the
+-- moment counts_frozen_at is stamped, so this tracks the unfinalized working
+-- set rather than history, and does not grow with the table.
+--
+-- Built CONCURRENTLY so it cannot hold ACCESS EXCLUSIVE on `batches`, which is
+-- on the claim path — hence the `-- no-transaction` directive above, which must
+-- stay the first bytes of the file (sqlx matches it with `starts_with`). That
+-- also means this file may hold exactly one statement: Postgres wraps a
+-- multi-statement simple query in an implicit transaction, which CONCURRENTLY
+-- rejects. The index's COMMENT is applied by the migration that follows.
+--
+-- If this ever fails part-way it leaves an INVALID index behind, and a retry's
+-- IF NOT EXISTS would skip past it. Check for that before assuming success:
+--   SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_batches_unfrozen_sweep
+  ON batches (cancelled_at)
+  WHERE counts_frozen_at IS NULL AND deleted_at IS NULL;

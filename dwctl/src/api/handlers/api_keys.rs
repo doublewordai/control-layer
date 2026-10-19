@@ -125,12 +125,15 @@ pub async fn create_user_api_key<P: PoolProvider>(
         }
     }
 
-    // Validate purpose: restrict batch/playground to system use only (purpose defaults to Realtime via serde)
+    // Validate purpose: restrict batch/playground/continuation to system use only
+    // (purpose defaults to Realtime via serde)
     match &data.purpose {
-        crate::db::models::api_keys::ApiKeyPurpose::Batch | crate::db::models::api_keys::ApiKeyPurpose::Playground => {
+        crate::db::models::api_keys::ApiKeyPurpose::Batch
+        | crate::db::models::api_keys::ApiKeyPurpose::Playground
+        | crate::db::models::api_keys::ApiKeyPurpose::Continuation => {
             return Err(Error::BadRequest {
                 message:
-                    "Cannot manually create API keys with 'batch' or 'playground' purpose. These are reserved for internal system use."
+                    "Cannot manually create API keys with 'batch', 'playground' or 'continuation' purpose. These are reserved for internal system use."
                         .to_string(),
             });
         }
@@ -200,11 +203,32 @@ pub async fn create_user_api_key<P: PoolProvider>(
         current_user.id
     };
 
-    let mut repo = ApiKeys::new(&mut pool_conn);
+    // The validation reads above used a plain connection; release it before
+    // the write sequence takes its own.
+    drop(pool_conn);
+
     let has_cap = data.spend_limit.is_some();
     let db_request = ApiKeyCreateDBRequest::new(target_user_id, created_by, data);
 
-    let api_key = repo.create(&db_request).await?;
+    // One transaction for the whole create sequence (insert → reveal-pending
+    // flag → cap-scope provisioning): a crash or transient error mid-way
+    // must not leave a half-provisioned key — e.g. an issued key stuck
+    // "born revealed" that its holder can never reveal, or a capped key
+    // whose batch/flex traffic escapes its cap scope.
+    let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
+    let mut repo = ApiKeys::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+
+    let mut api_key = repo.create(&db_request).await?;
+
+    // Issued to a DIFFERENT user (manager issuing to a member, or a PM
+    // creating on a user's behalf): the holder gets a one-off "reveal" of
+    // the secret from their own account (migration 131). The issuer still
+    // receives the secret in this response — that is deliberate (e.g. to
+    // stash it in a vault) and does not count as the reveal.
+    if created_by != current_user.id {
+        repo.mark_secret_reveal_pending(api_key.id).await?;
+        api_key.secret_revealed_at = None;
+    }
 
     // Capped keys need their cap scope provisioned up front: the hidden batch
     // child (so batch/flex traffic executes inside the scope, and is in
@@ -217,9 +241,16 @@ pub async fn create_user_api_key<P: PoolProvider>(
 
     let key_id = api_key.id;
     let spend_states = repo.get_spend_states(&[key_id]).await?;
+    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
+    // NOTE: the api_keys NOTIFY fires at commit, and onwards admits the key
+    // asynchronously after that — a client using a brand-new key immediately
+    // can catch one 401/403 before the cache updates. That eventual
+    // consistency is the CONTRACT (tests must poll for admission, not
+    // assume it); nothing here should be arranged to widen the margin.
+    //
     // api_key.created webhook deliveries are created by the notification poller
-    // via PG LISTEN/NOTIFY on the api_keys table.
+    // via PG LISTEN/NOTIFY on the api_keys table (NOTIFY fires on commit).
 
     Ok((
         StatusCode::CREATED,
@@ -313,11 +344,31 @@ pub async fn list_user_api_keys<P: PoolProvider>(
     // Scope to keys created by this user, unless they have ReadAll (PlatformManager).
     // PM-created keys on behalf of users have created_by = target_user_id, so the target
     // user can always see them. PMs bypass the filter to see all keys for any user.
+    //
+    // ?created_by narrows the list to one holder SERVER-SIDE, so pagination
+    // and total_count cover the filtered set ("all of member X's keys" — an
+    // admin cleaning up after a member must not have keys hiding on other
+    // pages). Only unscoped callers (org managers, PMs) may name another
+    // holder; everyone else is pinned to their own scope regardless.
+    let created_by = if skip_created_by_filter {
+        query.created_by
+    } else {
+        if let Some(requested) = query.created_by
+            && requested != current_user.id
+        {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Allow(Resource::ApiKeys, Operation::ReadAll),
+                action: Operation::ReadAll,
+                resource: format!("API keys held by user {requested}"),
+            });
+        }
+        Some(current_user.id)
+    };
     let filter = ApiKeyFilter {
         skip,
         limit,
         user_id: Some(target_user_id),
-        created_by: if skip_created_by_filter { None } else { Some(current_user.id) },
+        created_by,
     };
 
     // Get total count and list of items
@@ -440,13 +491,13 @@ pub async fn get_user_api_key<P: PoolProvider>(
     Ok(Json(ApiKeyInfoResponse::from(api_key).with_spend_state(spend_states.get(&key_id))))
 }
 
-/// Update a specific API key: metadata, rate limits, and the spending cap.
+/// Update a specific API key: metadata and the spending cap.
 #[utoipa::path(
     patch,
     path = "/users/{user_id}/api-keys/{id}",
     tag = "api_keys",
     summary = "Update API key",
-    description = "Update an API key's name, description, rate limits, or spending cap. \
+    description = "Update an API key's name, description, or spending cap. \
                    Setting a cap where none existed provisions cap-scope batch/flex execution and starts a fresh spend window; \
                    changing the cap interval or passing reset_window also restarts the window; \
                    passing spend_limit: null removes the cap.",
@@ -573,8 +624,8 @@ pub async fn update_user_api_key<P: PoolProvider>(
         });
     }
 
-    // Generic metadata/rate-limit fields via the existing repository update.
-    if data.name.is_some() || data.description.is_some() || data.requests_per_second.is_some() || data.burst_size.is_some() {
+    // Generic metadata fields via the existing repository update.
+    if data.name.is_some() || data.description.is_some() {
         if let Some(name) = &data.name
             && name.trim().is_empty()
         {
@@ -587,8 +638,6 @@ pub async fn update_user_api_key<P: PoolProvider>(
             &ApiKeyUpdateDBRequest {
                 name: data.name.clone(),
                 description: data.description.clone(),
-                requests_per_second: data.requests_per_second,
-                burst_size: data.burst_size,
             },
         )
         .await?;
@@ -740,6 +789,110 @@ pub async fn rotate_user_api_key<P: PoolProvider>(
     Ok(Json(ApiKeySecretResponse { key: new_secret }))
 }
 
+/// One-off reveal of an issued key's secret, by its holder only.
+///
+/// When a manager issues a key to another member, the holder may fetch the
+/// secret exactly once from their own account (migration 131). This is
+/// HOLDER-only by design — org managers and PlatformManagers are refused
+/// even though they can rotate: the reveal is the holder's proof that they,
+/// and only they, synced on the current secret. Once consumed (or for
+/// self-created keys, which are born revealed) the endpoint returns 409 and
+/// rotation is the only way to see a secret.
+#[utoipa::path(
+    post,
+    path = "/users/{user_id}/api-keys/{id}/reveal",
+    tag = "api_keys",
+    summary = "Reveal an issued API key's secret (one-off)",
+    description = "Fetch the secret of a key issued to you, exactly once. Only the key's holder may call this; afterwards (and for self-created keys) the secret is only obtainable by rotation.",
+    params(
+        ("user_id" = String, Path, description = "User ID (UUID) or 'current' for current user"),
+        ("id" = uuid::Uuid, Path, description = "API key ID to reveal"),
+    ),
+    responses(
+        (status = 200, description = "The API key secret", body = ApiKeySecretResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - insufficient permissions"),
+        (status = 404, description = "API key not found (or not held by the current user)"),
+        (status = 409, description = "Conflict - the one-off reveal was already used"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn reveal_user_api_key<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path((user_id, api_key_id)): Path<(UserIdOrCurrent, ApiKeyId)>,
+    current_user: CurrentUser,
+) -> Result<Json<ApiKeySecretResponse>> {
+    let target_user_id = match user_id {
+        UserIdOrCurrent::Current(_) => current_user.id,
+        UserIdOrCurrent::Id(uuid) => uuid,
+    };
+
+    // Same access ladder as rotation (and like rotation, deliberately NOT
+    // gated on the manage_keys grant — reveal IS the issued-key secret
+    // handover for members without self-serve rights).
+    let can_update_all = can_update_all_resources(&current_user, Resource::ApiKeys);
+    let can_update_own = can_update_own_resource(&current_user, Resource::ApiKeys, target_user_id);
+    if !can_update_all && !can_update_own {
+        // Primary pool: this is an authorization decision — a just-removed
+        // member must not pass via a lagging replica.
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let member = is_org_member(&current_user, target_user_id, &mut conn)
+            .await
+            .map_err(Error::Database)?;
+        if !member {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Any(vec![
+                    Permission::Allow(Resource::ApiKeys, Operation::UpdateAll),
+                    Permission::Allow(Resource::ApiKeys, Operation::UpdateOwn),
+                ]),
+                action: Operation::UpdateOwn,
+                resource: format!("API keys for user {target_user_id}"),
+            });
+        }
+    }
+
+    let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
+    let mut repo = ApiKeys::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+    // HOLDER only — no manager/PM bypass here, unlike rotate/delete. A
+    // non-holder (or a key outside the target scope) gets 404, not 403, so
+    // probing can't distinguish "exists but not yours" from "doesn't exist".
+    let api_key = repo
+        .get_by_id(api_key_id)
+        .await?
+        .filter(|key| key.user_id == target_user_id)
+        .filter(|key| key.created_by == current_user.id)
+        .filter(|key| !key.hidden)
+        .filter(|key| key.parent_api_key_id.is_none())
+        .ok_or_else(|| Error::NotFound {
+            resource: "API key".to_string(),
+            id: api_key_id.to_string(),
+        })?;
+
+    // Atomic consume: the IS NULL guard in the UPDATE means exactly one
+    // reveal ever succeeds, even under concurrent requests.
+    let secret = repo.reveal_secret_once(api_key.id).await?.ok_or_else(|| Error::Conflict {
+        message: "This key's one-off reveal has already been used. Rotate the key to get a fresh secret.".to_string(),
+        conflicts: None,
+    })?;
+    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
+
+    tracing::info!(
+        revealed_by = %current_user.id,
+        api_key_id = %api_key.id,
+        key_owner = %api_key.user_id,
+        "api key secret revealed (one-off)"
+    );
+    metrics::counter!("dwctl_api_key_reveals_total").increment(1);
+
+    Ok(Json(ApiKeySecretResponse { key: secret }))
+}
+
 /// Delete a specific API key for the current user or a specified user.
 #[utoipa::path(
     delete,
@@ -875,7 +1028,7 @@ mod tests {
         resp.spend.expect("capped key should carry a spend value")
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_api_key_with_spend_cap(pool: PgPool) {
         use crate::db::handlers::api_keys::ApiKeys;
@@ -926,7 +1079,7 @@ mod tests {
         assert_eq!(Some(resolved), child);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_api_key_cap_validation(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -967,7 +1120,7 @@ mod tests {
         ok.assert_status(axum::http::StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_patch_api_key_spend_cap_matrix(pool: PgPool) {
         use rust_decimal::Decimal;
@@ -1060,7 +1213,7 @@ mod tests {
             .assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_patch_api_key_permissions_and_system_keys(pool: PgPool) {
         use crate::db::handlers::api_keys::ApiKeys;
@@ -1111,10 +1264,9 @@ mod tests {
     /// End-to-end acceptance path: a cap set through the real API, once
     /// exhausted, excludes the whole scope from the onwards key set on the
     /// next reload, and the proxy path answers with the explicit 402.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_capped_key_end_to_end_402(pool: PgPool) {
-        use crate::config::RateLimitTiersConfig;
         use crate::db::handlers::{Credits, Tariffs};
         use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
         use crate::db::models::tariffs::TariffCreateDBRequest;
@@ -1141,9 +1293,13 @@ mod tests {
                 output_price_per_token: rust_decimal::Decimal::new(3, 5),
                 valid_from: None,
                 completion_window: None,
+                user_id: None,
             })
             .await
             .unwrap();
+        // Both purposes need their own price: batch no longer borrows realtime.
+        sqlx::query("INSERT INTO model_tariffs (deployed_model_id,name,api_key_purpose,completion_window,input_price_per_token,output_price_per_token) VALUES ($1,'batch','batch','24h',0.00001,0.00003)")
+            .bind(deployment_id).execute(&mut *conn).await.unwrap();
         Credits::new(&mut conn)
             .create_transaction(&CreditTransactionCreateDBRequest {
                 user_id: user.id,
@@ -1174,16 +1330,15 @@ mod tests {
             .unwrap();
 
         // Under the cap: both scope keys are in the paid pool.
-        let tiers = RateLimitTiersConfig::default();
-        let targets = crate::sync::onwards_config::load_targets_from_db(&pool, &[], false, &tiers)
-            .await
-            .unwrap();
+        let targets = crate::sync::onwards_config::load_targets_from_db(&pool, &[], false).await.unwrap();
         let has_key = |targets: &onwards::target::Targets, secret: &str| {
             let expected = ConstantTimeString::from(secret.to_string());
-            targets
-                .targets
-                .get("cap-e2e-model")
-                .is_some_and(|p| p.value().keys().is_some_and(|keys| keys.iter().any(|c| c == &expected)))
+            targets.targets.get("cap-e2e-model").is_some_and(|p| {
+                p.value()
+                    .default_pool()
+                    .keys()
+                    .is_some_and(|keys| keys.iter().any(|c| c == &expected))
+            })
         };
         assert!(has_key(&targets, &created.key));
         assert!(has_key(&targets, &child_secret));
@@ -1195,9 +1350,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let targets = crate::sync::onwards_config::load_targets_from_db(&pool, &[], false, &tiers)
-            .await
-            .unwrap();
+        let targets = crate::sync::onwards_config::load_targets_from_db(&pool, &[], false).await.unwrap();
         assert!(!has_key(&targets, &created.key), "exhausted root must leave the paid pool");
         assert!(!has_key(&targets, &child_secret), "the child is yanked with its root");
 
@@ -1214,7 +1367,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn_with_state(
-                pool.clone(),
+                sqlx_pool_router::DynPools::new(pool.clone()),
                 crate::error_enrichment::error_enrichment_middleware,
             ));
         let proxy = axum_test::TestServer::new(router).unwrap();
@@ -1228,7 +1381,7 @@ mod tests {
         assert!(body.contains("spend_cap_exceeded"), "expected explicit cap code, got: {body}");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_api_key_for_self(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1256,7 +1409,7 @@ mod tests {
         assert!(api_key.key.starts_with("sk-"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_api_key_for_other_user_as_admin(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1284,7 +1437,7 @@ mod tests {
         assert!(api_key.key.starts_with("sk-"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_api_key_for_other_user_as_non_admin_forbidden(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1307,7 +1460,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_user_api_keys(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1330,7 +1483,7 @@ mod tests {
     }
 
     // Add new pagination test for the handler
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_user_api_keys_with_pagination_query_params(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1393,7 +1546,7 @@ mod tests {
         assert_eq!(paginated.total_count, 5);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_user_api_key_for_self(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1423,7 +1576,7 @@ mod tests {
         assert_eq!(paginated.total_count, 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_rejects_cap_scope_child_key(pool: PgPool) {
         use crate::db::handlers::api_keys::ApiKeys;
@@ -1463,7 +1616,7 @@ mod tests {
         assert!(ApiKeys::new(&mut conn).get_by_id(child_id).await.unwrap().is_none());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_user_api_key_for_other_user_as_admin(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1494,7 +1647,7 @@ mod tests {
         assert_eq!(paginated.total_count, 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_user_api_key_for_other_user_as_non_admin_forbidden(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1525,7 +1678,7 @@ mod tests {
         assert_eq!(paginated.total_count, 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_nonexistent_api_key_returns_not_found(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1543,7 +1696,7 @@ mod tests {
         response.assert_status_not_found();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_api_key_belonging_to_different_user_returns_not_found(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1566,7 +1719,7 @@ mod tests {
         response.assert_status_not_found();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_api_keys_for_other_user_as_admin(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1596,7 +1749,7 @@ mod tests {
         assert!(returned_ids.contains(&api_key2.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_api_keys_for_other_user_as_non_admin_forbidden(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1615,7 +1768,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_api_key_for_other_user_as_admin(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1637,7 +1790,7 @@ mod tests {
         assert_eq!(returned_key.name, api_key.name);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_api_key_for_other_user_as_non_admin_forbidden(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1656,7 +1809,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_request_viewer_api_key_permissions(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1700,7 +1853,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_multi_role_user_api_key_permissions(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1759,7 +1912,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::NO_CONTENT);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_full_api_key_access(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1828,7 +1981,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::NO_CONTENT);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_api_key_isolation_between_users(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1878,7 +2031,7 @@ mod tests {
         response.assert_status_not_found(); // 404 because the key doesn't belong to user1
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_error_messages_are_user_friendly(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1901,7 +2054,7 @@ mod tests {
         assert!(!body.contains("ReadOwn"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_specific_api_key_for_self(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1924,7 +2077,7 @@ mod tests {
         // ApiKeyInfoResponse intentionally does not have a key field (security feature)
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_api_key_creation_returns_key_value_only_once(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1984,7 +2137,7 @@ mod tests {
 
     // ── Organization API key tests ────────────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_org_member_can_create_api_key(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2013,7 +2166,7 @@ mod tests {
         assert!(api_key.key.starts_with("sk-"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_non_member_cannot_create_org_api_key(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2037,7 +2190,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_org_member_list_only_own_keys(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2087,7 +2240,183 @@ mod tests {
         assert_eq!(paginated.data[0].name, "Bob Key");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_org_created_by_filter_server_side(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let carol = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+        add_org_member(&pool, org.id, carol.id, "member").await;
+
+        // Alice (owner) issues two keys to Bob and one to Carol.
+        for (name, member) in [("Bob 1", bob.id), ("Bob 2", bob.id), ("Carol 1", carol.id)] {
+            let response = app
+                .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+                .add_header(&add_auth_headers(&alice)[0].0, &add_auth_headers(&alice)[0].1)
+                .add_header(&add_auth_headers(&alice)[1].0, &add_auth_headers(&alice)[1].1)
+                .json(&json!({"name": name, "purpose": "realtime", "member_id": member}))
+                .await;
+            response.assert_status(axum::http::StatusCode::CREATED);
+        }
+        // Bob also holds a PERSONAL key — it must never surface in org lists.
+        let response = app
+            .post("/admin/api/v1/users/current/api-keys")
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .json(&json!({"name": "Bob personal", "purpose": "realtime"}))
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+
+        // Owner filters by Bob server-side: exactly Bob's two ORG keys, and
+        // total_count covers the filtered set (the admin-cleanup guarantee —
+        // no keys lurking on other pages).
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/api-keys?created_by={}", org.id, bob.id))
+            .add_header(&add_auth_headers(&alice)[0].0, &add_auth_headers(&alice)[0].1)
+            .add_header(&add_auth_headers(&alice)[1].0, &add_auth_headers(&alice)[1].1)
+            .await;
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
+        assert_eq!(paginated.total_count, 2);
+        assert_eq!(paginated.data.len(), 2);
+        assert!(paginated.data.iter().all(|k| k.created_by == bob.id));
+        assert!(paginated.data.iter().all(|k| k.name.starts_with("Bob ")));
+
+        // Pagination applies AFTER the filter: limit=1&skip=1 yields Bob's
+        // other key, not an unrelated org key.
+        let response = app
+            .get(&format!(
+                "/admin/api/v1/users/{}/api-keys?created_by={}&limit=1&skip=1",
+                org.id, bob.id
+            ))
+            .add_header(&add_auth_headers(&alice)[0].0, &add_auth_headers(&alice)[0].1)
+            .add_header(&add_auth_headers(&alice)[1].0, &add_auth_headers(&alice)[1].1)
+            .await;
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
+        assert_eq!(paginated.total_count, 2);
+        assert_eq!(paginated.data.len(), 1);
+        assert_eq!(paginated.data[0].created_by, bob.id);
+
+        // A plain member may name themselves (no-op — already their scope)…
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/api-keys?created_by={}", org.id, carol.id))
+            .add_header(&add_auth_headers(&carol)[0].0, &add_auth_headers(&carol)[0].1)
+            .add_header(&add_auth_headers(&carol)[1].0, &add_auth_headers(&carol)[1].1)
+            .await;
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
+        assert_eq!(paginated.data.len(), 1);
+        assert_eq!(paginated.data[0].name, "Carol 1");
+
+        // …but naming anyone else is forbidden, not silently ignored.
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/api-keys?created_by={}", org.id, bob.id))
+            .add_header(&add_auth_headers(&carol)[0].0, &add_auth_headers(&carol)[0].1)
+            .add_header(&add_auth_headers(&carol)[1].0, &add_auth_headers(&carol)[1].1)
+            .await;
+        response.assert_status_forbidden();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_issued_key_first_reveal_flow(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+
+        // Alice issues a key to Bob. SHE still receives the secret (to stash
+        // in a vault) — but the key is born unrevealed: Bob's one-off reveal
+        // is untouched by the issuer seeing the secret.
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&alice)[0].0, &add_auth_headers(&alice)[0].1)
+            .add_header(&add_auth_headers(&alice)[1].0, &add_auth_headers(&alice)[1].1)
+            .json(&json!({"name": "Issued", "purpose": "realtime", "member_id": bob.id}))
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let issued: ApiKeyResponse = response.json();
+        assert!(issued.key.starts_with("sk-"), "issuer still gets the secret at creation");
+        assert!(issued.secret_revealed_at.is_none(), "issued key must be born unrevealed");
+
+        // Bob sees the pending reveal on his org list.
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .await;
+        response.assert_status_ok();
+        let listed: PaginatedResponse<ApiKeyInfoResponse> = response.json();
+        assert!(listed.data[0].secret_revealed_at.is_none());
+
+        // Reveal is HOLDER-only: the issuing admin gets 404 (not 409 — the
+        // holder filter hides the key before the consumed-check runs).
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys/{}/reveal", org.id, issued.id))
+            .add_header(&add_auth_headers(&alice)[0].0, &add_auth_headers(&alice)[0].1)
+            .add_header(&add_auth_headers(&alice)[1].0, &add_auth_headers(&alice)[1].1)
+            .await;
+        response.assert_status_not_found();
+
+        // Admin rotation does NOT consume the reveal…
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys/{}/rotate", org.id, issued.id))
+            .add_header(&add_auth_headers(&alice)[0].0, &add_auth_headers(&alice)[0].1)
+            .add_header(&add_auth_headers(&alice)[1].0, &add_auth_headers(&alice)[1].1)
+            .await;
+        response.assert_status_ok();
+        let rotated: ApiKeySecretResponse = response.json();
+
+        // …and Bob's reveal returns the CURRENT (post-rotation) secret.
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys/{}/reveal", org.id, issued.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .await;
+        response.assert_status_ok();
+        let revealed: ApiKeySecretResponse = response.json();
+        assert_eq!(revealed.key, rotated.key);
+
+        // The reveal is consumed: stamped on the list, and a second attempt
+        // conflicts.
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .await;
+        let listed: PaginatedResponse<ApiKeyInfoResponse> = response.json();
+        assert!(listed.data[0].secret_revealed_at.is_some());
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys/{}/reveal", org.id, issued.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .await;
+        response.assert_status(axum::http::StatusCode::CONFLICT);
+
+        // Self-created keys are born revealed — no reveal ever exists.
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .json(&json!({"name": "Self", "purpose": "realtime"}))
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let self_key: ApiKeyResponse = response.json();
+        assert!(self_key.secret_revealed_at.is_some());
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys/{}/reveal", org.id, self_key.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .await;
+        response.assert_status(axum::http::StatusCode::CONFLICT);
+    }
+
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_org_key_get_scoping_manager_sees_member_key(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2125,7 +2454,7 @@ mod tests {
         response.assert_status_not_found();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_org_key_delete_scoping(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2163,7 +2492,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::NO_CONTENT);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_org_member_can_delete_own_key(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2201,7 +2530,7 @@ mod tests {
         assert_eq!(paginated.data.len(), 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_sees_all_org_keys(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2240,7 +2569,7 @@ mod tests {
 
     // ── created_by attribution tests ──────────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_org_member_key_created_by_is_member_not_org(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2262,7 +2591,7 @@ mod tests {
         assert_eq!(key.user_id, org.id, "user_id should be the org");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_pm_org_member_key_created_by_is_pm_not_org(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2284,7 +2613,7 @@ mod tests {
         assert_eq!(key.user_id, org.id, "user_id should be the org");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_pm_creates_org_key_with_member_id(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2307,7 +2636,7 @@ mod tests {
         assert_eq!(key.user_id, org.id, "user_id should be the org");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_pm_member_id_rejected_for_non_org_target(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2326,7 +2655,7 @@ mod tests {
         response.assert_status_bad_request();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_pm_member_id_rejected_for_non_member(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2345,7 +2674,7 @@ mod tests {
         response.assert_status_bad_request();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_plain_member_cannot_use_member_id(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2364,7 +2693,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_pm_creates_key_for_individual_user_created_by_is_target(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2404,7 +2733,7 @@ mod tests {
         .unwrap();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_org_manager_creates_key_with_member_id(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2449,7 +2778,7 @@ mod tests {
         assert!(secret.key.starts_with("sk-"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_org_manager_can_update_member_key(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2481,7 +2810,7 @@ mod tests {
         assert_eq!(updated.created_by, bob.id, "managing a key never re-attributes it");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_member_without_manage_keys_cannot_create_keys(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2519,7 +2848,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_issued_keys_are_view_and_rotate_only_without_grant(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2583,7 +2912,7 @@ mod tests {
             .assert_status_ok();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_rotate_api_key(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2686,7 +3015,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_reset_window_fires_onwards_rearm_notify(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;

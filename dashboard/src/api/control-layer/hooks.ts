@@ -1,6 +1,7 @@
 import { useEffect, useMemo } from "react";
 import {
   useQuery,
+  useQueries,
   useMutation,
   useQueryClient,
   keepPreviousData,
@@ -281,6 +282,17 @@ export function useModelCachePricing(
   return useQuery({
     queryKey: queryKeys.models.cachePricing(modelId),
     queryFn: () => dwctlApi.models.cachePricing.get(modelId),
+    enabled: options?.enabled ?? true,
+  });
+}
+
+export function useModelOverlays(
+  modelId: string,
+  options?: { enabled?: boolean },
+) {
+  return useQuery({
+    queryKey: queryKeys.models.overlays(modelId),
+    queryFn: () => dwctlApi.models.overlays.list(modelId),
     enabled: options?.enabled ?? true,
   });
 }
@@ -773,6 +785,29 @@ export function useDeleteApiKey() {
  * running on their execution key — cancel them separately if the old secret
  * was compromised.
  */
+/**
+ * One-off reveal of an issued key's secret (holder only). Invalidate on
+ * success so the row's pending-reveal state flips to rotate.
+ */
+export function useRevealApiKey() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      keyId,
+      userId = "current",
+    }: {
+      keyId: string;
+      userId?: string;
+    }) => dwctlApi.users.apiKeys.reveal(keyId, userId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.apiKeys.all,
+      });
+    },
+  });
+}
+
 export function useRotateApiKey() {
   const queryClient = useQueryClient();
 
@@ -1618,10 +1653,37 @@ export function useOrganizations(
   });
 }
 
-export function useOrganization(id: string) {
+export function useOrganization(
+  id: string,
+  options?: { enabled?: boolean },
+) {
   return useQuery({
     queryKey: queryKeys.organizations.byId(id),
     queryFn: () => dwctlApi.organizations.get(id),
+    staleTime: 30 * 1000,
+    enabled: options?.enabled ?? true,
+  });
+}
+
+// Reuse the organisation-detail cache for price scopes without a serving overlay.
+export function useOrganizationsByIds(ids: string[]) {
+  return useQueries({
+    queries: [...new Set(ids)].map((id) => ({
+      queryKey: queryKeys.organizations.byId(id),
+      queryFn: () => dwctlApi.organizations.get(id),
+      staleTime: 30 * 1000,
+    })),
+  });
+}
+
+export function useOrganizationServing(
+  id: string,
+  options?: { enabled?: boolean },
+) {
+  return useQuery({
+    queryKey: queryKeys.organizations.serving(id),
+    queryFn: () => dwctlApi.organizations.serving(id),
+    enabled: options?.enabled ?? true,
     staleTime: 30 * 1000,
   });
 }

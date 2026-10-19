@@ -1,6 +1,8 @@
 import { useOrganization } from "@/api/control-layer/hooks";
 import { useOrganizationContext } from "@/contexts";
 import { MemberManagement } from "./MemberManagement";
+import { ModalitySettings } from "./ModalitySettings";
+import { PendingEmailChangeBadge } from "./PendingEmailChangeBadge";
 import { NotificationSettings } from "../notifications/NotificationSettings";
 import { Badge } from "@/components/ui/badge";
 import { Building, ShieldCheck } from "lucide-react";
@@ -33,6 +35,7 @@ export function MyOrganization() {
 
   const canManage =
     activeOrganization.role === "owner" || activeOrganization.role === "admin";
+  const isOwner = activeOrganization.role === "owner";
 
   return (
     <div className="p-6 space-y-6">
@@ -42,6 +45,10 @@ export function MyOrganization() {
         </h1>
         <div className="flex items-center gap-3 mt-1 text-sm text-muted-foreground flex-wrap">
           {org?.email && <span>{org.email}</span>}
+          <PendingEmailChangeBadge
+            pending={org?.pending_email_change}
+            currentEmail={org?.email}
+          />
           {org?.email && <span>·</span>}
           <span>{org?.member_count ?? 0} members</span>
           {org?.credit_balance !== undefined && (
@@ -72,6 +79,8 @@ export function MyOrganization() {
         organizationId={activeOrganizationId}
         readOnly={!canManage}
       />
+
+      {org && <ModalitySettings organization={org} canEdit={isOwner} />}
 
       <NotificationSettings
         userId={activeOrganizationId}

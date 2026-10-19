@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO connections (user_id, api_key_id, kind, provider, name, config_encrypted) VALUES ($1, $2, 'source', 'openai', 'conn', '\\x00'::bytea)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f5a08cae8cb5637468c5803c04c03dc591c449a5623f0f44f2167fd65f085220"
+}

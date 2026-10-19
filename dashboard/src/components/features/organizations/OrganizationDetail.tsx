@@ -3,14 +3,19 @@ import { useParams, useNavigate } from "react-router-dom";
 import { useOrganization } from "@/api/control-layer/hooks";
 import { Button } from "@/components/ui/button";
 import { ArrowLeft } from "lucide-react";
+import { useAuthorization } from "@/utils";
 import { MemberManagement } from "./MemberManagement";
 import { EditOrganizationModal } from "./EditOrganizationModal";
+import { OrganizationServingCard } from "./OrganizationServingCard";
+import { PendingEmailChangeBadge } from "./PendingEmailChangeBadge";
 
 export function OrganizationDetail() {
   const { organizationId } = useParams<{ organizationId: string }>();
   const navigate = useNavigate();
   const { data: org, isLoading } = useOrganization(organizationId!);
   const [showEditModal, setShowEditModal] = useState(false);
+  const { hasPermission } = useAuthorization();
+  const isPlatformManager = hasPermission("users-groups");
 
   if (isLoading) {
     return (
@@ -48,6 +53,10 @@ export function OrganizationDetail() {
           </h1>
           <div className="flex items-center gap-3 mt-1 text-sm text-muted-foreground flex-wrap">
             <span>{org.email}</span>
+            <PendingEmailChangeBadge
+              pending={org.pending_email_change}
+              currentEmail={org.email}
+            />
             <span>·</span>
             <span>{org.member_count ?? 0} members</span>
             {org.credit_balance !== undefined && (
@@ -67,10 +76,16 @@ export function OrganizationDetail() {
 
       <MemberManagement organizationId={organizationId!} />
 
+      {isPlatformManager && (
+        <OrganizationServingCard organizationId={organizationId!} />
+      )}
+
       <EditOrganizationModal
         isOpen={showEditModal}
         onClose={() => setShowEditModal(false)}
         organization={org}
+        canEditZdr={isPlatformManager}
+        canEditServing={isPlatformManager}
       />
     </div>
   );

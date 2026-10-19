@@ -104,7 +104,7 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
     state: &crate::AppState<P>,
 ) -> Option<Result<AuthSuccess>> {
     let config = state.current_config();
-    let db: &PgPool = state.db.write();
+    let db: &PgPool = &state.db.write();
     tracing::trace!("Trying proxy header auth, config: {:?}", config.auth.proxy_header);
     // Extract external_user_id from header_name (required)
     let external_user_id = parts
@@ -191,38 +191,67 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
 
                     // Auto-org: join or create organization based on email domain
                     if let Some(domain) = crate::auth::utils::email_domain(&user.email)
-                        && !crate::auth::utils::is_personal_email_domain(domain)
+                        && !config.auth.is_personal_email_domain(&domain)
                     {
                         use crate::db::handlers::Organizations;
-                        use crate::db::models::organizations::OrganizationCreateDBRequest;
 
                         let mut org_repo = Organizations::new(&mut tx);
-                        match org_repo.find_by_domain(domain).await {
+                        match org_repo.find_by_domain(&domain).await {
                             Ok(Some(org)) => {
-                                // Org exists — ask to join rather than joining.
+                                // Org exists. Whether that means anything happens here is
+                                // the organization's call, not ours.
                                 //
                                 // This used to call `add_member` directly, so anyone who
                                 // could receive mail at a company's domain landed inside
                                 // the organization that owns its billing account, with no
-                                // approval and no notice to either side. Now an owner or
-                                // admin decides. Sharing an email domain is evidence that
-                                // someone probably belongs, not that they do.
-                                if let Err(e) = org_repo.create_join_request(org.id, user.id).await {
-                                    tracing::warn!("Failed to record join request for org {}: {e}", domain);
+                                // approval and no notice to either side. #1430 replaced
+                                // that with an automatic join request — which fixed the
+                                // silent membership but kept the silence: a request the
+                                // user never knowingly made, sitting on a queue they
+                                // couldn't read.
+                                //
+                                // Now signup does one of exactly two things:
+                                //
+                                //   auto-join ON  — the organization has said in advance
+                                //     that everyone at its domain belongs, so admit them
+                                //     as a member. Deliberate, and revocable by the org.
+                                //
+                                //   auto-join OFF — do nothing at all. The domain match
+                                //     is surfaced to the user in onboarding
+                                //     (`/users/{id}/onboarding-context`) and *they* decide
+                                //     whether to ask. Filing a request on their behalf,
+                                //     however well-meant, is still acting without them.
+                                match org_repo.auto_join_enabled(org.id).await {
+                                    Ok(true) => {
+                                        if let Err(e) = org_repo.add_member(org.id, user.id, "member").await {
+                                            tracing::warn!("Failed to auto-join user into org for domain {domain}: {e}");
+                                        }
+                                    }
+                                    Ok(false) => {
+                                        tracing::debug!(
+                                            "Organization claims domain {domain} but auto-join is off; leaving the choice to the user"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        // Fail closed: an unreadable setting must not be
+                                        // treated as consent to admit a stranger.
+                                        tracing::warn!("Failed to read auto-join setting for org on domain {domain}: {e}");
+                                    }
                                 }
                             }
                             Ok(None) => {
-                                // No org for this domain — create one with user as owner
-                                let org_request = OrganizationCreateDBRequest {
-                                    name: domain.to_string(),
-                                    email: user.email.clone(),
-                                    display_name: None,
-                                    avatar_url: None,
-                                    created_by: user.id,
-                                };
-                                if let Err(e) = org_repo.create(&org_request, &config.auth.default_user_roles).await {
-                                    tracing::warn!("Failed to auto-create org for domain {domain}: {e}");
-                                }
+                                // Nobody has claimed this domain yet, so there is nothing
+                                // to join and we deliberately don't invent one.
+                                //
+                                // Signing up used to auto-create an organization named
+                                // after the domain, which made the first person through
+                                // the door its owner by accident - typically whichever
+                                // engineer tried the product first, not whoever should
+                                // hold the billing account. The user starts in Personal
+                                // context and claims the domain if and when they create
+                                // a workspace, which is where the name is chosen and the
+                                // ownership is deliberate.
+                                tracing::debug!("No organization claims domain {domain}; leaving user in personal context");
                             }
                             Err(e) => {
                                 tracing::warn!("Failed to look up org by domain {domain}: {e}");
@@ -367,7 +396,7 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
         Some(data) => data,
         None => {
             return Some(Err(Error::Unauthenticated {
-                message: Some("Invalid API key".to_string()),
+                message: Some(crate::errors::INVALID_API_KEY_MESSAGE.to_string()),
             }));
         }
     };
@@ -527,17 +556,23 @@ async fn populate_org_context(user: &mut CurrentUser, parts: &Parts, db: &PgPool
         }
     }
 
-    // Populate organization names by fetching org user records
+    // Populate organization names by fetching org user records.
+    //
+    // The name shown is the display name - what the owner typed - falling back
+    // to the username only for rows old enough to have neither. `username` is
+    // the domain-routing key (`{domain}~{suffix}`, or an opaque `user~{suffix}`
+    // for a workspace with no domain to claim), not a label: rendering it put
+    // "acme.com~a1b2c3d4" in the organization switcher.
     if !user.organizations.is_empty() {
         let org_ids: Vec<uuid::Uuid> = user.organizations.iter().map(|o| o.id).collect();
-        match sqlx::query!(r#"SELECT id, username FROM users WHERE id = ANY($1)"#, &org_ids)
+        match sqlx::query!(r#"SELECT id, username, display_name FROM users WHERE id = ANY($1)"#, &org_ids)
             .fetch_all(&mut *conn)
             .await
         {
             Ok(rows) => {
                 for org in &mut user.organizations {
                     if let Some(row) = rows.iter().find(|r| r.id == org.id) {
-                        org.name = row.username.clone();
+                        org.name = row.display_name.clone().unwrap_or_else(|| row.username.clone());
                     }
                 }
             }
@@ -621,12 +656,12 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
         let mut any_auth_attempted = false;
 
         // Try API key authentication first (most specific)
-        match try_api_key_auth(parts, state.db.read()).await {
+        match try_api_key_auth(parts, &state.db.read()).await {
             Some(Ok((mut user, last_login))) => {
                 debug!("Authentication successful via API key");
                 trace!("Authenticated user: {}", user.id);
-                populate_org_context(&mut user, parts, state.db.read()).await;
-                maybe_update_last_login(user.id, last_login, state.db.write());
+                populate_org_context(&mut user, parts, &state.db.read()).await;
+                maybe_update_last_login(user.id, last_login, &state.db.write());
                 return Ok(user);
             }
             Some(Err(e)) => {
@@ -642,12 +677,12 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
         // Native authentication (JWT sessions)
         let config = state.current_config();
         if config.auth.native.enabled {
-            match try_jwt_session_auth(parts, &config, state.db.read()).await {
+            match try_jwt_session_auth(parts, &config, &state.db.read()).await {
                 Some(Ok((mut user, last_login))) => {
                     debug!("Authentication successful via JWT session");
                     trace!("Authenticated user: {}", user.id);
-                    populate_org_context(&mut user, parts, state.db.read()).await;
-                    maybe_update_last_login(user.id, last_login, state.db.write());
+                    populate_org_context(&mut user, parts, &state.db.read()).await;
+                    maybe_update_last_login(user.id, last_login, &state.db.write());
                     return Ok(user);
                 }
                 Some(Err(e)) => {
@@ -667,8 +702,8 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
                 Some(Ok((mut user, last_login))) => {
                     debug!("Authentication successful via proxy header");
                     trace!("Authenticated user: {}", user.id);
-                    populate_org_context(&mut user, parts, state.db.read()).await;
-                    maybe_update_last_login(user.id, last_login, state.db.write());
+                    populate_org_context(&mut user, parts, &state.db.read()).await;
+                    maybe_update_last_login(user.id, last_login, &state.db.write());
                     return Ok(user);
                 }
                 Some(Err(e)) => {
@@ -690,7 +725,15 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
         } else {
             debug!("Authentication failed: invalid credentials");
             trace!("All authentication attempts failed ({}): {:?}", auth_errors.len(), auth_errors);
-            Err(Error::Unauthenticated { message: None })
+            // Surface the API-key failure copy (the region-aware invalid-key
+            // message) rather than the generic "Authentication required"
+            // fallback. Scoped to the API-key method so the other auth
+            // methods' responses stay byte-identical.
+            let message = auth_errors.iter().find_map(|(method, e)| match e {
+                Error::Unauthenticated { message } if *method == "API key" => message.clone(),
+                _ => None,
+            });
+            Err(Error::Unauthenticated { message })
         }
     }
 }
@@ -722,7 +765,7 @@ mod tests {
         parts
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_existing_user_extraction(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -743,7 +786,7 @@ mod tests {
         assert!(current_user.roles.contains(&Role::StandardUser));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_auto_create_nonexistent_user(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -766,26 +809,18 @@ mod tests {
         assert_eq!(current_user.email, new_email);
         assert_eq!(current_user.username, new_external_id); // Username is set to external_user_id for uniqueness
         assert!(current_user.roles.contains(&Role::StandardUser));
-        assert!(current_user.display_name.is_some(), "Display name should be auto-generated");
+        // Display name defaults to the email prefix (the part before @)
+        assert_eq!(current_user.display_name.as_deref(), Some("newuser"));
 
         // Verify user was actually created in database with display name
         let created_user = users_repo.get_user_by_email(new_email).await.unwrap();
         assert!(created_user.is_some());
         let db_user = created_user.unwrap();
         assert_eq!(db_user.auth_source, "proxy-header");
-        assert!(db_user.display_name.is_some(), "Database user should have display name");
-
-        // Verify display name format (should match pattern: "{adjective} {noun} {4-digit number}")
-        let display_name = db_user.display_name.unwrap();
-        let parts: Vec<&str> = display_name.split_whitespace().collect();
-        assert_eq!(parts.len(), 3, "Display name should have 3 parts");
-        assert!(
-            parts[2].len() == 4 && parts[2].parse::<u32>().is_ok(),
-            "Third part should be a 4-digit number"
-        );
+        assert_eq!(db_user.display_name.as_deref(), Some("newuser"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_missing_header_returns_unauthorized(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -802,7 +837,7 @@ mod tests {
         assert_eq!(error.status_code(), axum::http::StatusCode::UNAUTHORIZED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_backwards_compatibility_single_header(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -837,7 +872,7 @@ mod tests {
         assert_eq!(db_user.external_user_id, Some(email.to_string()));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_multiple_federated_identities_same_email(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -887,7 +922,7 @@ mod tests {
         assert_ne!(user1.id, user2.id, "Should be different users");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_migration_backfill_external_user_id(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -946,7 +981,7 @@ mod tests {
         assert_eq!(db_user.external_user_id, Some(federated_external_id.to_string()));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_backwards_compat_no_backfill(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -1026,7 +1061,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_only_email_header_sent_fails(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -1047,7 +1082,7 @@ mod tests {
         assert_eq!(result.unwrap_err().status_code(), axum::http::StatusCode::UNAUTHORIZED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_auto_create_disabled_existing_user(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.proxy_header.auto_create_users = false;
@@ -1074,7 +1109,7 @@ mod tests {
         assert_eq!(current_user.email, test_user.email);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_auto_create_disabled_new_user_fails(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.proxy_header.auto_create_users = false;
@@ -1097,7 +1132,7 @@ mod tests {
         assert_eq!(result.unwrap_err().status_code(), axum::http::StatusCode::UNAUTHORIZED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_existing_user_email_update(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -1144,7 +1179,7 @@ mod tests {
         assert_eq!(db_user.email, new_email);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_idempotent_logins(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -1176,7 +1211,7 @@ mod tests {
         assert_eq!(db_user.email, email);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_special_characters_in_external_user_id(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -1267,7 +1302,7 @@ mod tests {
         assert_eq!(error.status_code(), axum::http::StatusCode::FORBIDDEN);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_jwt_reflects_current_user_state(pool: PgPool) {
         use crate::auth::session;
 
@@ -1323,6 +1358,10 @@ mod tests {
             auto_topup_threshold: None,
             auto_topup_monthly_limit: None,
             zero_data_retention: None,
+            default_serving_class: None,
+            self_hosted_only: None,
+            granted_serving_classes: Default::default(),
+            toleration_preset: Default::default(),
         };
         users_repo.update(user.id, &update).await.unwrap();
 
@@ -1341,7 +1380,7 @@ mod tests {
         assert!(extracted_user.roles.contains(&Role::PlatformManager));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_jwt_invalidated_when_user_deleted(pool: PgPool) {
         use crate::auth::session;
 
@@ -1400,7 +1439,7 @@ mod tests {
         assert!(matches!(error, Error::Unauthenticated { .. }));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_proxy_header_user_receives_initial_credits(pool: PgPool) {
         use crate::db::handlers::credits::Credits;
         use crate::db::models::credits::CreditTransactionType;
@@ -1459,7 +1498,7 @@ mod tests {
         assert_eq!(balance, rust_decimal::Decimal::new(10000, 2));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_proxy_header_existing_user_no_duplicate_credits(pool: PgPool) {
         use crate::db::handlers::credits::Credits;
 
@@ -1511,7 +1550,7 @@ mod tests {
 
     // ── X-Organization-Id header tests ───────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_org_context_from_header(pool: PgPool) {
         use crate::db::handlers::Organizations;
         use crate::db::models::organizations::OrganizationCreateDBRequest;
@@ -1563,7 +1602,60 @@ mod tests {
         assert!(current_user.organizations.iter().any(|o| o.id == org.id));
     }
 
-    #[sqlx::test]
+    /// The organization switcher reads `organizations[].name`, which must be
+    /// the display name the owner typed - not `users.username`. The username is
+    /// the domain-routing key (`{domain}~{suffix}`, or an opaque `user~{suffix}`
+    /// for a workspace with no domain to claim), so rendering it showed
+    /// "acme.com~a1b2c3d4" where the company name belonged.
+    #[dwctl_test_macros::test]
+    async fn test_org_context_names_the_org_by_display_name(pool: PgPool) {
+        use crate::db::handlers::Organizations;
+        use crate::db::models::organizations::OrganizationCreateDBRequest;
+
+        let config = create_test_config();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let external_user_id = test_user.external_user_id.as_ref().unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let org = Organizations::new(&mut conn)
+            .create(
+                &OrganizationCreateDBRequest {
+                    // The routing key, exactly as `create_organization` writes it.
+                    name: "acme.test~a1b2c3d4".to_string(),
+                    email: "billing@acme.test".to_string(),
+                    display_name: Some("Acme Corporation".to_string()),
+                    avatar_url: None,
+                    created_by: test_user.id,
+                },
+                &[crate::api::models::users::Role::StandardUser],
+            )
+            .await
+            .unwrap();
+        drop(conn);
+
+        let request = axum::http::Request::builder()
+            .uri("http://localhost/test")
+            .header("x-doubleword-user", external_user_id)
+            .header("x-doubleword-email", &test_user.email)
+            .body(())
+            .unwrap();
+        let (mut parts, _body) = request.into_parts();
+
+        let current_user = CurrentUser::from_request_parts(&mut parts, &state).await.unwrap();
+        let listed = current_user
+            .organizations
+            .iter()
+            .find(|o| o.id == org.id)
+            .expect("the owner's organization is listed");
+        assert_eq!(
+            listed.name, "Acme Corporation",
+            "the switcher shows the display name, not the routing key"
+        );
+    }
+
+    #[dwctl_test_macros::test]
     async fn test_org_context_invalid_org_id_ignored(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -1590,7 +1682,7 @@ mod tests {
         assert_eq!(current_user.active_organization, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_org_context_no_header_means_personal(pool: PgPool) {
         use crate::db::handlers::Organizations;
         use crate::db::models::organizations::OrganizationCreateDBRequest;
@@ -1640,7 +1732,7 @@ mod tests {
         assert_eq!(current_user.organizations.len(), 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_org_context_malformed_header_ignored(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -1666,7 +1758,7 @@ mod tests {
         assert_eq!(current_user.active_organization, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_last_login_updated_on_first_auth(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.proxy_header.enabled = true;
@@ -1712,7 +1804,7 @@ mod tests {
         assert!(last_login.is_some(), "Background task should have set last_login");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_last_login_not_updated_when_recent(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.proxy_header.enabled = true;
@@ -1747,52 +1839,81 @@ mod tests {
 
     // ── Auto-org on SSO signup ──────────────────────────────────────────
 
-    #[sqlx::test]
-    async fn test_proxy_header_signup_creates_org_for_business_email(pool: PgPool) {
+    /// Signing up no longer conjures an organization.
+    ///
+    /// It used to create one named after the email domain, which made whoever
+    /// tried the product first its owner by accident - typically an engineer
+    /// evaluating it, not whoever should hold the billing account. The user
+    /// now starts in Personal context and claims the domain deliberately, by
+    /// creating a workspace.
+    #[dwctl_test_macros::test]
+    async fn test_proxy_header_signup_does_not_create_an_org(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.proxy_header.enabled = true;
         config.auth.proxy_header.auto_create_users = true;
 
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
-        let email = "alice@acme.com";
-        let external_id = "auth0|alice-acme";
-        let mut parts = create_test_parts_with_auth(external_id, email);
+        let mut parts = create_test_parts_with_auth("auth0|alice-acme", "alice@acme.com");
+        let current_user = CurrentUser::from_request_parts(&mut parts, &state).await.unwrap();
 
-        let result = CurrentUser::from_request_parts(&mut parts, &state).await;
-        assert!(result.is_ok());
-        let current_user = result.unwrap();
-
-        // Verify an org was created with username = domain
         let mut conn = pool.acquire().await.unwrap();
         let mut org_repo = Organizations::new(&mut conn);
-        let org = org_repo.find_by_domain("acme.com").await.unwrap();
-        assert!(org.is_some(), "Org should have been auto-created for acme.com");
-
-        let org = org.unwrap();
-        assert_eq!(org.username, "acme.com");
-
-        // User should be owner
-        let role = org_repo.get_user_org_role(current_user.id, org.id).await.unwrap();
-        assert_eq!(role, Some("owner".to_string()));
+        assert!(
+            org_repo.find_by_domain("acme.com").await.unwrap().is_none(),
+            "signup must not claim the domain on the user's behalf"
+        );
+        assert!(
+            org_repo.list_user_organizations(current_user.id).await.unwrap().is_empty(),
+            "the user starts in personal context"
+        );
     }
 
-    #[sqlx::test]
-    /// Sharing an email domain gets you a request, not a membership.
+    /// Claim a domain the way creating a workspace does: an organization whose
+    /// username is the domain, owned by `owner`.
+    async fn claim_domain(pool: &PgPool, domain: &str, owner: crate::types::UserId) -> crate::types::UserId {
+        let mut conn = pool.acquire().await.unwrap();
+        let org = Organizations::new(&mut conn)
+            .create(
+                &crate::db::models::organizations::OrganizationCreateDBRequest {
+                    name: domain.to_string(),
+                    email: format!("billing@{domain}"),
+                    display_name: Some(domain.to_string()),
+                    avatar_url: None,
+                    created_by: owner,
+                },
+                &[crate::api::models::users::Role::StandardUser],
+            )
+            .await
+            .unwrap();
+        org.id
+    }
+
+    #[dwctl_test_macros::test]
+    /// Sharing an email domain gets you nothing at all, by default.
     ///
-    /// This used to add the second user straight in as a member. Anyone who
-    /// could receive mail at a company's domain landed inside the organization
-    /// that owns its billing account, with nobody asked and nobody told.
-    async fn test_proxy_header_signup_requests_to_join_existing_org(pool: PgPool) {
+    /// This has now been wrong in two different directions. It used to add the
+    /// second user straight in as a member: anyone who could receive mail at a
+    /// company's domain landed inside the organization that owns its billing
+    /// account, with nobody asked and nobody told. #1430 replaced that with an
+    /// automatic join request, which stopped the silent membership but still
+    /// acted for the user — a request they never made, on a queue they could
+    /// not read.
+    ///
+    /// The default is now to do nothing and let them decide. The absence of
+    /// the request is the assertion that matters here; offering the choice is
+    /// the onboarding-context endpoint's job.
+    async fn test_proxy_header_signup_leaves_domain_match_to_the_user(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.proxy_header.enabled = true;
         config.auth.proxy_header.auto_create_users = true;
 
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
-        // First user still claims the unclaimed domain and owns the org.
+        // Someone has already claimed the domain by creating a workspace.
         let mut parts1 = create_test_parts_with_auth("auth0|first", "first@widgets.io");
         let first = CurrentUser::from_request_parts(&mut parts1, &state).await.unwrap();
+        claim_domain(&pool, "widgets.io", first.id).await;
 
         let mut parts2 = create_test_parts_with_auth("auth0|second", "second@widgets.io");
         let second = CurrentUser::from_request_parts(&mut parts2, &state).await.unwrap();
@@ -1806,30 +1927,78 @@ mod tests {
             Some("owner".to_string())
         );
 
-        // The second user is NOT a member - `get_user_org_role` only counts
-        // active memberships, so this is the check that would have failed
-        // before the change.
+        // Not a member - `get_user_org_role` only counts active memberships.
         assert_eq!(
             org_repo.get_user_org_role(second.id, org.id).await.unwrap(),
             None,
             "sharing a domain must not grant membership"
         );
 
-        // They're waiting in the queue instead.
-        let requests = org_repo.list_join_requests(org.id).await.unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].user_id, Some(second.id));
-        assert_eq!(requests[0].status, "requested");
+        // And not queued either: nothing was filed on their behalf.
+        assert!(
+            org_repo.list_join_requests(org.id).await.unwrap().is_empty(),
+            "signup must not ask to join for the user"
+        );
+        assert!(
+            org_repo.list_user_join_requests(second.id).await.unwrap().is_empty(),
+            "the user has asked for nothing"
+        );
 
-        // And the queue doesn't leak into the members list.
         let members = org_repo.list_members(org.id).await.unwrap();
         assert_eq!(members.len(), 1, "only the owner is a member");
         assert_eq!(members[0].user_id, Some(first.id));
     }
 
-    /// Logging in repeatedly must not pile up duplicate requests.
-    #[sqlx::test]
-    async fn test_proxy_header_repeat_login_does_not_duplicate_join_request(pool: PgPool) {
+    #[dwctl_test_macros::test]
+    /// With auto-join on, the same signup lands inside the organization.
+    ///
+    /// The old behaviour, back as a choice the organization makes for itself
+    /// rather than a rule imposed on everyone. The pairing with the test above
+    /// is the point: identical signup, opposite outcome, and the only
+    /// difference is the setting.
+    async fn test_proxy_header_signup_auto_joins_when_organization_opted_in(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.proxy_header.enabled = true;
+        config.auth.proxy_header.auto_create_users = true;
+
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        let mut parts1 = create_test_parts_with_auth("auth0|first", "first@widgets.io");
+        let first = CurrentUser::from_request_parts(&mut parts1, &state).await.unwrap();
+        let org_id = claim_domain(&pool, "widgets.io", first.id).await;
+
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            let mut org_repo = Organizations::new(&mut conn);
+            assert!(
+                !org_repo.auto_join_enabled(org_id).await.unwrap(),
+                "a new workspace must not admit its domain until asked to"
+            );
+            assert!(org_repo.set_auto_join_enabled(org_id, true).await.unwrap());
+        }
+
+        let mut parts2 = create_test_parts_with_auth("auth0|second", "second@widgets.io");
+        let second = CurrentUser::from_request_parts(&mut parts2, &state).await.unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut org_repo = Organizations::new(&mut conn);
+        assert_eq!(
+            org_repo.get_user_org_role(second.id, org_id).await.unwrap(),
+            Some("member".to_string()),
+            "auto-join admits as a plain member, never an admin"
+        );
+        assert!(
+            org_repo.list_join_requests(org_id).await.unwrap().is_empty(),
+            "there is nobody left to ask once the org has said yes in advance"
+        );
+    }
+
+    /// Logging in repeatedly must not pile up duplicate memberships.
+    ///
+    /// Only the first login runs the domain match at all, but the unique
+    /// constraint is what makes that safe to get wrong, so pin the outcome.
+    #[dwctl_test_macros::test]
+    async fn test_proxy_header_repeat_login_does_not_duplicate_auto_join(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.proxy_header.enabled = true;
         config.auth.proxy_header.auto_create_users = true;
@@ -1837,7 +2006,12 @@ mod tests {
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         let mut owner_parts = create_test_parts_with_auth("auth0|owner", "owner@widgets.io");
-        CurrentUser::from_request_parts(&mut owner_parts, &state).await.unwrap();
+        let owner = CurrentUser::from_request_parts(&mut owner_parts, &state).await.unwrap();
+        let org_id = claim_domain(&pool, "widgets.io", owner.id).await;
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            Organizations::new(&mut conn).set_auto_join_enabled(org_id, true).await.unwrap();
+        }
 
         for i in 0..3 {
             let mut parts = create_test_parts_with_auth("auth0|joiner", "joiner@widgets.io");
@@ -1848,11 +2022,11 @@ mod tests {
 
         let mut conn = pool.acquire().await.unwrap();
         let mut org_repo = Organizations::new(&mut conn);
-        let org = org_repo.find_by_domain("widgets.io").await.unwrap().unwrap();
-        assert_eq!(org_repo.list_join_requests(org.id).await.unwrap().len(), 1);
+        let members = org_repo.list_members(org_id).await.unwrap();
+        assert_eq!(members.len(), 2, "the owner and the joiner, once each");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_proxy_header_signup_skips_personal_email(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.proxy_header.enabled = true;

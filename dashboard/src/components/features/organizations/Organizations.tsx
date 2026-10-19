@@ -2,7 +2,7 @@ import { useState, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 import { useDebounce } from "@/hooks/useDebounce";
 import { useServerPagination } from "@/hooks/useServerPagination";
-import { useOrganizations, useDeleteOrganization } from "@/api/control-layer/hooks";
+import { useOrganizations, useDeleteOrganization, useConfig } from "@/api/control-layer/hooks";
 import { useAuthorization } from "@/utils";
 import type { Organization } from "@/api/control-layer/types";
 import { DataTable } from "@/components/ui/data-table";
@@ -26,6 +26,7 @@ export function Organizations() {
   const navigate = useNavigate();
   const { hasPermission } = useAuthorization();
   const isPlatformManager = hasPermission("users-groups");
+  const { data: config } = useConfig();
 
   const [search, setSearch] = useState("");
   const debouncedSearch = useDebounce(search, 300);
@@ -51,8 +52,9 @@ export function Organizations() {
         onEdit: (org) => setEditingOrg(org),
         onDelete: (org) => setDeletingOrg(org),
         canDelete: isPlatformManager,
+        tolerationPresets: config?.scheduling_toleration_presets,
       }),
-    [navigate, isPlatformManager],
+    [navigate, isPlatformManager, config?.scheduling_toleration_presets],
   );
 
   const handleDelete = async () => {
@@ -113,6 +115,8 @@ export function Organizations() {
         isOpen={!!editingOrg}
         onClose={() => setEditingOrg(null)}
         organization={editingOrg}
+        canEditServing={isPlatformManager}
+        canEditZdr={isPlatformManager}
       />
 
       <Dialog

@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_requests_active_batchless_demand;

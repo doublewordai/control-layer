@@ -9,6 +9,8 @@ use crate::reasoning::ReasoningTranslationOverrides;
 use crate::types::{DeploymentId, InferenceEndpointId, UserId};
 use bon::Builder;
 use chrono::{DateTime, NaiveDate, Utc};
+use onwards::affinity::AffinityConfig as OnwardsAffinityConfig;
+use onwards::aimd::AimdConfig as OnwardsAimdConfig;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_with::rust::double_option;
@@ -337,6 +339,115 @@ fn default_fallback_status_codes() -> Vec<i32> {
     vec![429, 499, 500, 502, 503, 504]
 }
 
+/// Priority-only load-aware routing overrides. Missing/null inherits defaults.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct AimdConfig {
+    pub enabled: bool,
+    pub latency_budget_ms: u64,
+    /// Decrease the preferred-first share when the breach rate exceeds this.
+    pub breach_rate_target: f64,
+    /// Increase the share only while the breach rate is at or below this.
+    pub recovery_breach_rate: f64,
+    pub window_samples: usize,
+    pub min_samples: usize,
+    pub share_step: f64,
+    pub share_decay: f64,
+    pub share_floor: f64,
+    pub dwell_ms: u64,
+    /// Step the share up after this long without enough samples; 0 disables.
+    pub idle_recovery_ms: u64,
+    /// Upstream error statuses from the preferred provider counted as breaches.
+    pub overload_statuses: Vec<u16>,
+}
+impl From<AimdConfig> for OnwardsAimdConfig {
+    fn from(c: AimdConfig) -> Self {
+        Self {
+            enabled: c.enabled,
+            latency_budget_ms: c.latency_budget_ms,
+            breach_rate_target: c.breach_rate_target,
+            recovery_breach_rate: c.recovery_breach_rate,
+            window_samples: c.window_samples,
+            min_samples: c.min_samples,
+            share_step: c.share_step,
+            share_decay: c.share_decay,
+            share_floor: c.share_floor,
+            dwell_ms: c.dwell_ms,
+            idle_recovery_ms: c.idle_recovery_ms,
+            overload_statuses: c.overload_statuses,
+        }
+    }
+}
+
+impl Default for AimdConfig {
+    fn default() -> Self {
+        let c = OnwardsAimdConfig::default();
+        Self {
+            enabled: c.enabled,
+            latency_budget_ms: c.latency_budget_ms,
+            breach_rate_target: c.breach_rate_target,
+            recovery_breach_rate: c.recovery_breach_rate,
+            window_samples: c.window_samples,
+            min_samples: c.min_samples,
+            share_step: c.share_step,
+            share_decay: c.share_decay,
+            share_floor: c.share_floor,
+            dwell_ms: c.dwell_ms,
+            idle_recovery_ms: c.idle_recovery_ms,
+            overload_statuses: c.overload_statuses,
+        }
+    }
+}
+
+/// Priority-only conversation affinity: the preferred provider keeps about
+/// `target_conversations` of the active conversations, decided per
+/// conversation rather than per request. Missing/null keeps per-request
+/// selection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct AffinityConfig {
+    pub enabled: bool,
+    /// Conversations to keep on the preferred provider. Size it to the
+    /// preferred provider's concurrency.
+    pub target_conversations: usize,
+    /// Drift allowed around the target before the share moves; defaults to a
+    /// tenth of the target.
+    pub margin: Option<usize>,
+    /// A conversation stays active this long after its last request.
+    pub active_window_ms: u64,
+    /// The share is recomputed at multiples of this much wall-clock time.
+    pub update_interval_ms: u64,
+    /// Upper bound on conversations tracked per gateway process.
+    pub max_tracked: usize,
+}
+
+impl From<AffinityConfig> for OnwardsAffinityConfig {
+    fn from(c: AffinityConfig) -> Self {
+        Self {
+            enabled: c.enabled,
+            target_conversations: c.target_conversations,
+            margin: c.margin,
+            active_window_ms: c.active_window_ms,
+            update_interval_ms: c.update_interval_ms,
+            max_tracked: c.max_tracked,
+        }
+    }
+}
+
+impl Default for AffinityConfig {
+    fn default() -> Self {
+        let c = OnwardsAffinityConfig::default();
+        Self {
+            enabled: c.enabled,
+            target_conversations: c.target_conversations,
+            margin: c.margin,
+            active_window_ms: c.active_window_ms,
+            update_interval_ms: c.update_interval_ms,
+            max_tracked: c.max_tracked,
+        }
+    }
+}
+
 /// Fallback configuration for composite models
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct FallbackConfig {
@@ -349,6 +460,10 @@ pub struct FallbackConfig {
     /// HTTP status codes that trigger fallback (default: [429, 499, 500, 502, 503, 504])
     #[serde(default = "default_fallback_status_codes")]
     pub on_status: Vec<i32>,
+    /// Extra HTTP status codes that trigger fallback for realtime traffic only
+    /// (default: []). Batch, flex and background requests run their own retries.
+    #[serde(default)]
+    pub realtime_on_status: Vec<i32>,
     /// When true, weighted random failover samples with replacement (default: false)
     #[serde(default)]
     pub with_replacement: bool,
@@ -363,6 +478,12 @@ pub struct FallbackConfig {
     /// Only consulted when `backoff` is Some. None = no budget cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_total_backoff_ms: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_token_timeout_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aimd: Option<AimdConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affinity: Option<AffinityConfig>,
 }
 
 impl FallbackConfig {
@@ -371,10 +492,14 @@ impl FallbackConfig {
             enabled: true,
             on_rate_limit: true,
             on_status: default_fallback_status_codes(),
+            realtime_on_status: Vec::new(),
             with_replacement: false,
             max_attempts: None,
             backoff: None,
             max_total_backoff_ms: None,
+            first_token_timeout_ms: None,
+            aimd: None,
+            affinity: None,
         }
     }
 }
@@ -437,7 +562,18 @@ pub struct DeploymentComponentCreateDBRequest {
     pub weight: i32,
     pub enabled: bool,
     pub sort_order: i32,
+    /// Which of the composite's named pools this membership belongs to
+    /// (`default` | `completions`).
+    pub pool: String,
 }
+
+/// The pool every request class falls back to: the single, interchangeable
+/// member list that existed before named pools. The column default.
+pub const DEFAULT_COMPONENT_POOL: &str = "default";
+
+/// The pool serving `/v1/completions`, including token-id continuation resume
+/// legs. Members here are validated continuation targets.
+pub const COMPLETIONS_COMPONENT_POOL: &str = "completions";
 
 /// Database response for a deployment component (flat structure with joined model info)
 #[derive(Debug, Clone)]
@@ -449,6 +585,9 @@ pub struct DeploymentComponentDBResponse {
     pub weight: i32,
     pub enabled: bool,
     pub sort_order: i32,
+    /// Which of the composite's named pools this membership belongs to
+    /// (`default` | `completions`).
+    pub pool: String,
     pub created_at: DateTime<Utc>,
     // Joined model fields
     pub model_alias: String,
@@ -459,7 +598,6 @@ pub struct DeploymentComponentDBResponse {
     pub endpoint_id: Option<InferenceEndpointId>,
     pub endpoint_name: Option<String>,
     pub model_trusted: bool,
-    pub model_open_responses_adapter: bool,
 }
 
 /// Database request for creating a new deployment
@@ -474,9 +612,7 @@ pub struct DeploymentCreateDBRequest {
     pub capabilities: Option<Vec<String>>,
     /// Inference endpoint for regular models. Must be None for composite models.
     pub hosted_on: Option<InferenceEndpointId>,
-    pub requests_per_second: Option<f32>,
-    pub burst_size: Option<i32>,
-    pub capacity: Option<i32>,
+    pub realtime_inflight_limit: Option<i32>,
     pub batch_capacity: Option<i32>,
     pub throughput: Option<f32>,
     // Provider/downstream pricing
@@ -491,6 +627,7 @@ pub struct DeploymentCreateDBRequest {
     pub fallback_enabled: Option<bool>,
     pub fallback_on_rate_limit: Option<bool>,
     pub fallback_on_status: Option<Vec<i32>>,
+    pub fallback_realtime_on_status: Option<Vec<i32>>,
     pub fallback_with_replacement: Option<bool>,
     pub fallback_max_attempts: Option<i32>,
     /// Inter-attempt backoff flag (defaults to false: legacy zero-delay).
@@ -506,15 +643,15 @@ pub struct DeploymentCreateDBRequest {
     #[builder(default = "full".to_string())]
     pub backoff_jitter: String,
     pub backoff_max_total_ms: Option<i32>,
+    pub first_token_timeout_ms: Option<i64>,
+    pub aimd: Option<AimdConfig>,
+    pub affinity: Option<AffinityConfig>,
     /// Whether to sanitize/filter sensitive data from model responses (defaults to false)
     #[builder(default = false)]
     pub sanitize_responses: bool,
     /// Whether to mark provider as trusted in strict mode (bypasses sanitization)
     #[builder(default = false)]
     pub trusted: bool,
-    /// Whether to enable the open_responses adapter (converts /v1/responses to /v1/chat/completions)
-    #[builder(default = true)]
-    pub open_responses_adapter: bool,
     /// Optional per-model overrides for endpoint reasoning translations.
     pub reasoning_translation_overrides: Option<ReasoningTranslationOverrides>,
     /// Per-model allowed batch completion windows (overrides global config when set)
@@ -548,9 +685,6 @@ impl DeploymentCreateDBRequest {
                     .maybe_model_type(standard.model_type)
                     .maybe_capabilities(standard.capabilities)
                     .hosted_on(standard.hosted_on)
-                    .maybe_requests_per_second(standard.requests_per_second)
-                    .maybe_burst_size(standard.burst_size)
-                    .maybe_capacity(standard.capacity)
                     .maybe_batch_capacity(standard.batch_capacity)
                     .maybe_throughput(standard.throughput)
                     .maybe_provider_pricing(standard.provider_pricing)
@@ -564,9 +698,10 @@ impl DeploymentCreateDBRequest {
                     .backoff_factor(standard.backoff_factor)
                     .backoff_jitter(standard.backoff_jitter.as_db_str().to_string())
                     .maybe_backoff_max_total_ms(standard.backoff_max_total_ms)
+                    .maybe_first_token_timeout_ms(standard.first_token_timeout_ms)
+                    .maybe_aimd(standard.aimd)
                     .sanitize_responses(standard.sanitize_responses.unwrap_or(false))
                     .trusted(standard.trusted.unwrap_or(false))
-                    .open_responses_adapter(standard.open_responses_adapter.unwrap_or(true))
                     .maybe_reasoning_translation_overrides(standard.reasoning_translation_overrides)
                     .maybe_allowed_batch_completion_windows(standard.allowed_batch_completion_windows)
                     .maybe_metadata(standard.metadata)
@@ -580,9 +715,7 @@ impl DeploymentCreateDBRequest {
                 .maybe_description(composite.description)
                 .maybe_model_type(composite.model_type)
                 .maybe_capabilities(composite.capabilities)
-                .maybe_requests_per_second(composite.requests_per_second)
-                .maybe_burst_size(composite.burst_size)
-                .maybe_capacity(composite.capacity)
+                .maybe_realtime_inflight_limit(composite.realtime_inflight_limit)
                 .maybe_batch_capacity(composite.batch_capacity)
                 .maybe_throughput(composite.throughput)
                 .is_composite(true)
@@ -590,6 +723,7 @@ impl DeploymentCreateDBRequest {
                 .fallback_enabled(composite.fallback_enabled)
                 .fallback_on_rate_limit(composite.fallback_on_rate_limit)
                 .fallback_on_status(composite.fallback_on_status)
+                .fallback_realtime_on_status(composite.fallback_realtime_on_status)
                 .fallback_with_replacement(composite.fallback_with_replacement)
                 .maybe_fallback_max_attempts(composite.fallback_max_attempts)
                 .backoff_enabled(composite.backoff_enabled)
@@ -598,9 +732,11 @@ impl DeploymentCreateDBRequest {
                 .backoff_factor(composite.backoff_factor)
                 .backoff_jitter(composite.backoff_jitter.as_db_str().to_string())
                 .maybe_backoff_max_total_ms(composite.backoff_max_total_ms)
+                .maybe_first_token_timeout_ms(composite.first_token_timeout_ms)
+                .maybe_aimd(composite.aimd)
+                .maybe_affinity(composite.affinity)
                 .sanitize_responses(composite.sanitize_responses)
                 .trusted(composite.trusted.unwrap_or(false))
-                .open_responses_adapter(composite.open_responses_adapter.unwrap_or(true))
                 .maybe_allowed_batch_completion_windows(composite.allowed_batch_completion_windows)
                 .maybe_metadata(composite.metadata)
                 .build(),
@@ -620,9 +756,7 @@ pub struct DeploymentUpdateDBRequest {
     pub status: Option<ModelStatus>,
     pub last_sync: Option<Option<DateTime<Utc>>>,
     pub deleted: Option<bool>,
-    pub requests_per_second: Option<Option<f32>>,
-    pub burst_size: Option<Option<i32>>,
-    pub capacity: Option<Option<i32>>,
+    pub realtime_inflight_limit: Option<i32>,
     pub batch_capacity: Option<Option<i32>>,
     pub throughput: Option<Option<f32>>,
     // Provider pricing updates
@@ -632,6 +766,7 @@ pub struct DeploymentUpdateDBRequest {
     pub fallback_enabled: Option<bool>,
     pub fallback_on_rate_limit: Option<bool>,
     pub fallback_on_status: Option<Vec<i32>>,
+    pub fallback_realtime_on_status: Option<Vec<i32>>,
     pub fallback_with_replacement: Option<bool>,
     pub fallback_max_attempts: Option<Option<i32>>,
     /// Toggle inter-attempt backoff (None = no change).
@@ -644,12 +779,13 @@ pub struct DeploymentUpdateDBRequest {
     /// Cumulative inter-attempt sleep budget
     /// (None = no change, Some(None) = clear cap, Some(Some(n)) = set).
     pub backoff_max_total_ms: Option<Option<i32>>,
+    pub first_token_timeout_ms: Option<Option<i64>>,
+    pub aimd: Option<Option<AimdConfig>>,
+    pub affinity: Option<Option<AffinityConfig>>,
     /// Whether to sanitize/filter sensitive data from model responses
     pub sanitize_responses: Option<bool>,
     /// Whether to mark provider as trusted in strict mode (bypasses sanitization)
     pub trusted: Option<bool>,
-    /// Whether to enable the open_responses adapter (converts /v1/responses to /v1/chat/completions)
-    pub open_responses_adapter: Option<bool>,
     /// None leaves overrides unchanged; Some(None) inherits both endpoint defaults.
     pub reasoning_translation_overrides: Option<Option<ReasoningTranslationOverrides>>,
     /// Per-model allowed batch completion windows (None = no change, Some(None) = clear, Some(windows) = set)
@@ -666,9 +802,7 @@ impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
             .maybe_description(update.description)
             .maybe_model_type(update.model_type)
             .maybe_capabilities(update.capabilities)
-            .maybe_requests_per_second(update.requests_per_second)
-            .maybe_burst_size(update.burst_size)
-            .maybe_capacity(update.capacity)
+            .maybe_realtime_inflight_limit(update.realtime_inflight_limit)
             .maybe_batch_capacity(update.batch_capacity)
             .maybe_throughput(update.throughput)
             .maybe_provider_pricing(update.provider_pricing)
@@ -676,6 +810,7 @@ impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
             .maybe_fallback_enabled(update.fallback_enabled)
             .maybe_fallback_on_rate_limit(update.fallback_on_rate_limit)
             .maybe_fallback_on_status(update.fallback_on_status)
+            .maybe_fallback_realtime_on_status(update.fallback_realtime_on_status)
             .maybe_fallback_with_replacement(update.fallback_with_replacement)
             .maybe_fallback_max_attempts(update.fallback_max_attempts)
             .maybe_backoff_enabled(update.backoff_enabled)
@@ -684,9 +819,11 @@ impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
             .maybe_backoff_factor(update.backoff_factor)
             .maybe_backoff_jitter(update.backoff_jitter.map(|j| j.as_db_str().to_string()))
             .maybe_backoff_max_total_ms(update.backoff_max_total_ms)
+            .maybe_first_token_timeout_ms(update.first_token_timeout_ms)
+            .maybe_aimd(update.aimd)
+            .maybe_affinity(update.affinity)
             .maybe_sanitize_responses(update.sanitize_responses)
             .maybe_trusted(update.trusted)
-            .maybe_open_responses_adapter(update.open_responses_adapter)
             .maybe_reasoning_translation_overrides(update.reasoning_translation_overrides)
             .maybe_allowed_batch_completion_windows(update.allowed_batch_completion_windows)
             .maybe_metadata(update.metadata)
@@ -730,9 +867,7 @@ pub struct DeploymentDBResponse {
     pub deleted: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    pub requests_per_second: Option<f32>,
-    pub burst_size: Option<i32>,
-    pub capacity: Option<i32>,
+    pub realtime_inflight_limit: i32,
     pub batch_capacity: Option<i32>,
     /// Throughput in requests/second for batch capacity calculations
     pub throughput: Option<f32>,
@@ -747,6 +882,7 @@ pub struct DeploymentDBResponse {
     pub fallback_enabled: bool,
     pub fallback_on_rate_limit: bool,
     pub fallback_on_status: Vec<i32>,
+    pub fallback_realtime_on_status: Vec<i32>,
     pub fallback_with_replacement: bool,
     pub fallback_max_attempts: Option<i32>,
     /// Inter-attempt backoff fields (mirrored from deployed_models columns).
@@ -757,17 +893,23 @@ pub struct DeploymentDBResponse {
     pub backoff_factor: f64,
     pub backoff_jitter: String,
     pub backoff_max_total_ms: Option<i32>,
+    pub first_token_timeout_ms: Option<i64>,
+    pub aimd: Option<AimdConfig>,
+    pub affinity: Option<AffinityConfig>,
     /// Whether to sanitize/filter sensitive data from model responses
     pub sanitize_responses: bool,
     /// Whether to mark provider as trusted in strict mode (bypasses sanitization)
     pub trusted: bool,
-    /// Whether the open_responses adapter is enabled (converts /v1/responses to /v1/chat/completions)
-    pub open_responses_adapter: bool,
     pub reasoning_translation_overrides: Option<ReasoningTranslationOverrides>,
     /// Per-model allowed batch completion windows (overrides global config when set)
     pub allowed_batch_completion_windows: Option<Vec<String>>,
     /// Catalog metadata (JSONB)
     pub metadata: serde_json::Value,
+    /// Declarative source reapplied during startup, or None for manually managed rows.
+    pub provisioning_source: Option<String>,
+    /// Serving classes this model offers, keyed by class name, each a preset
+    /// of targets (`{ttft_ms, itl_ms, priority}`; migration 149).
+    pub serving_classes: serde_json::Value,
 }
 
 /// DB action for a traffic routing rule (used at the repository layer)
@@ -818,6 +960,7 @@ mod backoff_derivation_tests {
 
         assert_eq!(request.fallback_on_rate_limit, Some(true));
         assert_eq!(request.fallback_on_status, Some(vec![499, 500, 502, 503, 504]));
+        assert_eq!(request.fallback_realtime_on_status, Some(vec![529]));
     }
 
     // Regression guard for the headline invariant: a single-provider model

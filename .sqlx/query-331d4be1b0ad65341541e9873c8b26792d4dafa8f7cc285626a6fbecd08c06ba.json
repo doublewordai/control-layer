@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE deployed_models\n           SET serving_classes = '{\"interactive\": {\"ttft_ms\": 500, \"itl_ms\": 20, \"priority\": 200}, \"throughput\": {\"ttft_ms\": 5000, \"itl_ms\": 100}}'\n           WHERE alias = 'regular-public'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "331d4be1b0ad65341541e9873c8b26792d4dafa8f7cc285626a6fbecd08c06ba"
+}

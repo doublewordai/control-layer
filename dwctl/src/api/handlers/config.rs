@@ -4,6 +4,8 @@ use axum::{Json, extract::State, response::IntoResponse};
 use serde::Serialize;
 use utoipa::ToSchema;
 
+use rust_decimal::prelude::ToPrimitive;
+
 use crate::{AppState, api::models::users::CurrentUser};
 
 /// Batch processing configuration
@@ -35,6 +37,19 @@ pub struct OnwardsConfigResponse {
     pub strict_mode: bool,
 }
 
+/// One scheduling-toleration preset an account may be pinned to, as declared
+/// in `scheduling.toleration_presets`. The dashboard lists these in the
+/// account settings control.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct TolerationPresetResponse {
+    /// Stable slug stored on an account (`users.toleration_preset`).
+    pub id: String,
+    /// Short human label for the control.
+    pub label: String,
+    /// One or two sentences of help text (the dashboard tooltip).
+    pub description: String,
+}
+
 /// Instance configuration and capabilities
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ConfigResponse {
@@ -44,6 +59,14 @@ pub struct ConfigResponse {
     pub organization: Option<String>,
     /// Whether payment processing is enabled
     pub payment_enabled: bool,
+    /// First-payment match promotion ceiling, in dollars: a billing target's
+    /// first ever purchase is matched with bonus credits up to this amount.
+    /// `0` means the promotion is switched off on this instance.
+    ///
+    /// Exposed so clients can both gate the promotional UI on the promotion
+    /// actually being live and render the real figure, rather than hard-coding
+    /// an amount that drifts from `credits.first_payment_match_up_to`.
+    pub first_payment_match_up_to: f64,
     /// URL to JSONL documentation for batch file format, if available
     pub docs_jsonl_url: Option<String>,
     /// URL to the documentation site
@@ -57,6 +80,11 @@ pub struct ConfigResponse {
     pub ai_api_base_url: Option<String>,
     /// Onwards AI proxy configuration
     pub onwards: OnwardsConfigResponse,
+    /// The scheduling-toleration presets an account may be pinned to
+    /// (`scheduling.toleration_presets`). Operators set an account's
+    /// `toleration_preset` to one of these ids; the dashboard renders them in
+    /// the account settings control.
+    pub scheduling_toleration_presets: Vec<TolerationPresetResponse>,
 }
 
 #[utoipa::path(
@@ -96,11 +124,28 @@ pub async fn get_config(State(state): State<AppState>, _user: CurrentUser) -> im
         None
     };
 
+    // Lossy on paper, exact in practice: the ceiling is a whole-dollar marketing
+    // figure, and this value is only ever displayed or compared against zero -
+    // the money itself is matched in Decimal server-side.
+    //
+    // Falling back to 0 turns the promotion off client-side, which is the safe
+    // direction, but 0 is also a legitimate configured value - so a caller
+    // can't tell a disabled promo from a broken conversion. Log it, or an
+    // unrepresentable ceiling silently reads as "no promotion" forever.
+    let match_ceiling = config.credits.first_payment_match_up_to.to_f64().unwrap_or_else(|| {
+        tracing::warn!(
+            configured = %config.credits.first_payment_match_up_to,
+            "credits.first_payment_match_up_to is not representable as f64; reporting the promotion as disabled"
+        );
+        0.0
+    });
+
     let response = ConfigResponse {
         region: metadata.region.clone(),
         organization: metadata.organization.clone(),
         // Compute payment_enabled based on whether payment_processor is configured
         payment_enabled: config.payment.is_some(),
+        first_payment_match_up_to: match_ceiling,
         docs_url: metadata.docs_url.clone(),
         docs_jsonl_url: metadata.docs_jsonl_url.clone(),
         batches: batches_config,
@@ -108,6 +153,16 @@ pub async fn get_config(State(state): State<AppState>, _user: CurrentUser) -> im
         onwards: OnwardsConfigResponse {
             strict_mode: config.onwards.strict_mode,
         },
+        scheduling_toleration_presets: config
+            .scheduling
+            .toleration_presets
+            .iter()
+            .map(|preset| TolerationPresetResponse {
+                id: preset.id.clone(),
+                label: preset.label.clone(),
+                description: preset.description.clone(),
+            })
+            .collect(),
     };
 
     Json(response)
@@ -117,7 +172,7 @@ pub async fn get_config(State(state): State<AppState>, _user: CurrentUser) -> im
 mod tests {
     use crate::Application;
     use crate::api::models::users::Role;
-    use crate::test::utils::{add_auth_headers, create_test_app, create_test_user};
+    use crate::test::utils::{add_auth_headers, create_test_app, create_test_app_with_config, create_test_config, create_test_user};
     use axum::http::StatusCode;
     use serde_json::Value;
     use sqlx::PgPool;
@@ -165,7 +220,7 @@ onwards:
         std::fs::write(path, config).expect("failed to write test config");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_config_returns_metadata(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
@@ -185,7 +240,51 @@ onwards:
         assert!(json.get("organization").is_some());
     }
 
-    #[sqlx::test]
+    /// The promotion ceiling has to reach the client, because the client is what
+    /// decides whether to advertise the promotion at all. Defaulting it off and
+    /// leaving the dashboard to assume a figure is how you end up promising a
+    /// match that `grant_first_payment_match` then declines to pay.
+    #[dwctl_test_macros::test]
+    async fn test_get_config_exposes_the_first_payment_match_ceiling(pool: PgPool) {
+        let mut config = create_test_config();
+        config.credits.first_payment_match_up_to = rust_decimal::Decimal::new(50, 0);
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let headers = add_auth_headers(&user);
+        let response = app
+            .get("/admin/api/v1/config")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+
+        response.assert_status(StatusCode::OK);
+        let json: Value = response.json();
+
+        assert_eq!(json.get("first_payment_match_up_to").and_then(|v| v.as_f64()), Some(50.0));
+    }
+
+    /// Off is the default, and it must be legible as off rather than absent -
+    /// a missing field reads as "old server" to a client, not "promo disabled".
+    #[dwctl_test_macros::test]
+    async fn test_get_config_reports_a_disabled_promotion_as_zero(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let headers = add_auth_headers(&user);
+        let response = app
+            .get("/admin/api/v1/config")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+
+        response.assert_status(StatusCode::OK);
+        let json: Value = response.json();
+
+        assert_eq!(json.get("first_payment_match_up_to").and_then(|v| v.as_f64()), Some(0.0));
+    }
+
+    #[dwctl_test_macros::test]
     async fn test_get_config_requires_authentication(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
 
@@ -194,7 +293,7 @@ onwards:
         response.assert_status(StatusCode::UNAUTHORIZED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_config_includes_batch_slas(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
@@ -230,7 +329,7 @@ onwards:
         assert!(url_paths.iter().any(|v| v.as_str() == Some("/v1/chat/completions")));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_config_reflects_live_config_file_changes(pool: PgPool) {
         let tempdir = tempdir().expect("failed to create tempdir");
         let config_path = tempdir.path().join("config.yaml");

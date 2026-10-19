@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE users SET disabled_modalities = $2, updated_at = NOW()\n            WHERE id = $1 AND user_type = 'organization' AND is_deleted = false\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1504ddd8987e3968a35882de3655ef74e000697a9ffd36228eed008a5b1fd00f"
+}

@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT zero_data_retention, disabled_modalities, toleration_preset\n        FROM users\n        WHERE id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "zero_data_retention",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 1,
+        "name": "disabled_modalities",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 2,
+        "name": "toleration_preset",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "4b00de0aacc0e93888171283d23c1374c1942796f7ee74c3fe932b63007ecf4e"
+}

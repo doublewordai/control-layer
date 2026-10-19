@@ -2,6 +2,7 @@
 
 use crate::{
     AppState,
+    api::handlers::validate_elevated_serving_class,
     api::models::{
         organizations::{
             AddMemberRequest, ApproveJoinRequestRequest, InviteDetailsResponse, InviteMemberRequest, InviteMemberResponse,
@@ -11,7 +12,9 @@ use crate::{
         pagination::PaginatedResponse,
         users::{CurrentUser, UserResponse},
     },
-    auth::permissions::{can_manage_org_resource, can_read_all_resources, can_read_own_resource},
+    auth::permissions::{
+        can_manage_org_resource, can_read_all_resources, can_read_own_resource, can_update_all_resources, can_update_own_resource,
+    },
     db::handlers::{Credits, Organizations, Repository, Users, api_keys::ApiKeys, organizations::OrganizationFilter},
     db::models::organizations::{OrganizationCreateDBRequest, OrganizationUpdateDBRequest},
     email::EmailService,
@@ -31,6 +34,33 @@ use axum::{
 
 /// Maximum number of organizations a user can belong to simultaneously.
 const MAX_ORGS_PER_USER: i64 = 3;
+
+/// How an organization should be named in an email.
+///
+/// `username` carries the claimed domain plus a `~suffix` for the workspaces
+/// that share one (`acme.com~a1b2c3d4`). That suffix is an internal
+/// uniqueness device and means nothing to a reader, so it is stripped when
+/// the username has to stand in for a missing display name.
+fn org_email_name(display_name: Option<&str>, username: &str) -> String {
+    display_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| username.split('~').next().unwrap_or(username).to_string())
+}
+
+/// How a person should be named in an email.
+///
+/// Falls back to the address rather than `username`, which for an individual
+/// is the identity provider's subject (`google-oauth2|1104...`) and is not
+/// something to show anyone.
+fn person_email_name(display_name: Option<&str>, email: &str) -> String {
+    display_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| email.to_string())
+}
 
 /// Hash a token with SHA-256 for deterministic DB lookup.
 /// Since invite tokens are 256 bits of cryptographic randomness,
@@ -235,15 +265,112 @@ pub async fn create_organization<P: PoolProvider>(
         current_user.id
     };
 
+    // The organization's username IS its email domain, which is what makes an
+    // organization findable by the people who belong to it: a later signup from
+    // the same domain is offered a join request instead of a second workspace.
+    // `users.username` is already UNIQUE, so that also enforces one
+    // organization per domain without a separate claim table.
+    //
+    // Derived from the owner's own address rather than the submitted name, so a
+    // caller can't claim a domain they don't have mail at. The name the user
+    // typed becomes the display name.
+    //
+    // Falls back to the submitted name when the owner is on a personal email
+    // domain (gmail and friends) - there's no meaningful domain to claim, and
+    // claiming "gmail.com" would swallow every consumer signup into one org.
+    let owner_email = if owner_id == current_user.id {
+        current_user.email.clone()
+    } else {
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        Users::new(&mut conn)
+            .get_by_id(owner_id)
+            .await?
+            .ok_or(Error::NotFound {
+                resource: "User".to_string(),
+                id: owner_id.to_string(),
+            })?
+            .email
+    };
+    let config = state.current_config();
+    let claimable_domain = crate::auth::utils::email_domain(&owner_email).filter(|d| !config.auth.is_personal_email_domain(d));
+
+    // The contact address has to be one the owner already reaches. Otherwise a
+    // workspace can be created naming a stranger's address, and the low-balance
+    // and batch notifications it generates arrive at someone who never agreed
+    // to any of it.
+    //
+    // Changing the address afterwards is unaffected and is how anything else
+    // gets set: that path mails a token to the new address and waits for it to
+    // come back, which proves control directly. This check is the equivalent
+    // for creation, where there is no token to send yet - so it has to lean on
+    // what the owner's own address already proves.
+    //
+    // The two arms are the same rule seen from either side of a domain claim:
+    //
+    //   claimable domain - anything at the domain the owner receives mail at.
+    //     `billing@acme.com` for an owner at `acme.com` is their own company's
+    //     address, and the claim itself is what establishes they are there.
+    //
+    //   personal domain - the owner's exact address, nothing else. "Same
+    //     domain" is meaningless for gmail.com: it would admit every other
+    //     gmail address, which is the whole problem rather than a fix for it.
+    let contact_domain = crate::auth::utils::email_domain(&email).ok_or_else(|| Error::BadRequest {
+        message: "Contact email must include a domain".to_string(),
+    })?;
+    match claimable_domain.as_deref() {
+        Some(domain) if contact_domain != domain => {
+            return Err(Error::BadRequest {
+                message: format!(
+                    "Contact email must be at {domain}, the owner's email domain. Create the workspace with an address there, then change it afterwards - that sends a confirmation link to the new address."
+                ),
+            });
+        }
+        None if !email.eq_ignore_ascii_case(owner_email.trim()) => {
+            return Err(Error::BadRequest {
+                message: "Contact email must be the owner's own address, because their email domain is a personal one that no workspace can claim. Change it afterwards to use a different address - that sends a confirmation link to it.".to_string(),
+            });
+        }
+        _ => {}
+    }
+
+    // `{domain}~{suffix}`: the domain is what a colleague's signup matches on,
+    // and the suffix keeps `users.username` unique so one company can hold
+    // several workspaces - prod and dev being the obvious pair. `~` can't occur
+    // in a domain, which is what makes the match exact on the way back out.
+    //
+    // When the owner is on a personal email domain there is nothing worth
+    // matching on - "there's nothing worth matching on, and a workspace
+    // claiming gmail.com would catch every consumer signup" (commit 3d75ff05)
+    // - so the workspace is *not* domain-routable. The username is therefore an
+    // opaque `user~{suffix}` rather than the submitted name: anything the user
+    // typed here would flow into the same `username` column that
+    // `find_by_domain`'s `username = $1 OR username LIKE $1 || '~%'` arms match
+    // on, so a personal-email owner typing a third party's non-personal domain
+    // (say `acme.com`) as the name would otherwise be planted as a bare-domain
+    // username that hijacks every future signup at that domain. The name the
+    // user typed still becomes the display name (below); only the routed
+    // username is opaque.
+    // The suffix is truncated for a claimed domain because that namespace is
+    // per-company - a handful of workspaces at most, so eight hex characters
+    // are plenty. The opaque arm cannot do the same: every workspace with no
+    // domain to claim shares the one `user~` namespace, and `users.username`
+    // is UNIQUE, so a birthday collision there is a creation failure the caller
+    // did nothing to deserve. At 32 bits that becomes ~1% likely by 10,000 such
+    // workspaces; the full UUID costs nothing since nobody reads this value.
+    let username = match claimable_domain.as_deref() {
+        Some(domain) => format!("{domain}~{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
+        None => format!("user~{}", uuid::Uuid::new_v4().simple()),
+    };
+
+    let display_name = data.display_name.clone().or_else(|| Some(data.name.clone()));
     let db_request = OrganizationCreateDBRequest {
-        name: data.name,
+        name: username,
         email,
-        display_name: data.display_name,
+        display_name,
         avatar_url: None,
         created_by: owner_id,
     };
 
-    let config = state.current_config();
     let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Organizations::new(&mut pool_conn);
 
@@ -307,7 +434,19 @@ pub async fn list_organizations<P: PoolProvider>(
 
         let data = orgs
             .into_iter()
-            .map(|o| OrganizationResponse::from_user(UserResponse::from(o)))
+            .map(|o| {
+                // The pinned preset is an operator's routing decision, so it is
+                // disclosed on the same gate as the detail GET (UpdateAll), not
+                // the read gate that reaches this branch. Hiding it from a
+                // read-all caller would also clear a pin on any edit made from
+                // the list, which submits the field back as `null`.
+                let toleration_preset = if can_update_all_resources(&current_user, Resource::Organizations) {
+                    o.toleration_preset.clone()
+                } else {
+                    None
+                };
+                OrganizationResponse::from_user(UserResponse::from(o)).with_toleration_preset(toleration_preset)
+            })
             .collect();
 
         Ok(Json(PaginatedResponse {
@@ -377,7 +516,12 @@ pub async fn get_organization<P: PoolProvider>(
 ) -> Result<Json<OrganizationResponse>> {
     let can_all = can_read_all_resources(&current_user, Resource::Organizations);
 
-    let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    // Primary, not the replica: the dashboard PATCHes an owner setting
+    // (`disabled_modalities`, `auto_join_enabled`) and immediately refetches
+    // this endpoint. Off the replica that read can land before the write has
+    // propagated, and the toggle the owner just flipped appears to revert.
+    // Same inter-endpoint consistency rule as `list_user_organizations`.
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
 
     if !can_all {
         let mut repo = Organizations::new(&mut pool_conn);
@@ -412,8 +556,21 @@ pub async fn get_organization<P: PoolProvider>(
     // pool inherit normal replica-lag semantics; the verification row is the
     // source of truth either way.
     let pending_email_change = org_repo.find_pending_email_change_for_org(id).await?;
+    let auto_join_enabled = org_repo.auto_join_enabled(id).await?;
+    let disabled_modalities = org_repo.disabled_modalities(id).await?;
 
-    let mut response = OrganizationResponse::from_user(UserResponse::from(org)).with_member_count(members.len() as i64);
+    // The scheduling-toleration preset is an operator's routing decision, so
+    // only platform managers (UpdateAll on organizations) see it, in the GET as
+    // well as the PATCH. `org` is materialised from `users`, and
+    // `UserResponse::from` deliberately drops the field; we re-attach it here.
+    let can_update_all = crate::auth::permissions::has_permission(&current_user, Resource::Organizations, Operation::UpdateAll);
+    let toleration_preset = if can_update_all { org.toleration_preset.clone() } else { None };
+
+    let mut response = OrganizationResponse::from_user(UserResponse::from(org))
+        .with_member_count(members.len() as i64)
+        .with_auto_join_enabled(auto_join_enabled)
+        .with_disabled_modalities(disabled_modalities)
+        .with_toleration_preset(toleration_preset);
     if let Some(pending) = pending_email_change {
         response = response.with_pending_email_change(PendingEmailChangeResponse::from(pending));
     }
@@ -487,6 +644,60 @@ pub async fn update_organization<P: PoolProvider>(
             required: Permission::Allow(Resource::Organizations, Operation::UpdateOwn),
             action: Operation::UpdateOwn,
             resource: format!("zero data retention for organization {id}"),
+        });
+    }
+    // SECURITY: the serving account settings (granted classes, default class,
+    // routing preference) decide how the organisation's traffic is placed and
+    // prioritised fleet-wide. They are operated by platform managers only,
+    // never by the organisation itself, whatever its role: customers meet
+    // serving classes only as a model suffix. Same rule as the users endpoint.
+    if !can_all
+        && (data.granted_serving_classes.is_some()
+            || data.default_serving_class.is_some()
+            || data.self_hosted_only.is_some()
+            || data.toleration_preset.is_some())
+    {
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Allow(Resource::Organizations, Operation::UpdateAll),
+            action: Operation::UpdateAll,
+            resource: format!("serving settings for organization {id}"),
+        });
+    }
+    // Reject a preset id this deployment does not define, so a typo fails here
+    // rather than silently pinning the workspace to nothing.
+    if let Some(Some(preset)) = &data.toleration_preset {
+        super::validate_toleration_preset(&state, preset)?;
+    }
+    if let Some(Some(class)) = &data.default_serving_class {
+        validate_elevated_serving_class(class)?;
+    }
+    if let Some(classes) = &data.granted_serving_classes {
+        for class in classes {
+            validate_elevated_serving_class(class)?;
+        }
+    }
+
+    // SECURITY: same owner-only gate, for the same kind of reason. Auto-join
+    // decides who gets into the workspace with nobody reviewing them — it is
+    // the one setting that can hand membership to a person no member has ever
+    // seen. An admin able to flip it could admit anyone who can obtain an
+    // address at the domain, without the owner ever being in the loop.
+    if !can_all && data.auto_join_enabled.is_some() && caller_org_role.as_deref() != Some("owner") {
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Allow(Resource::Organizations, Operation::UpdateOwn),
+            action: Operation::UpdateOwn,
+            resource: format!("domain auto-join for organization {id}"),
+        });
+    }
+
+    // SECURITY: owner-only as well. Disabling a modality switches a product
+    // surface off for every key the workspace owns; which products a
+    // workspace uses is the owner's call, not an admin's.
+    if !can_all && data.disabled_modalities.is_some() && caller_org_role.as_deref() != Some("owner") {
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Allow(Resource::Organizations, Operation::UpdateOwn),
+            action: Operation::UpdateOwn,
+            resource: format!("disabled modalities for organization {id}"),
         });
     }
 
@@ -654,6 +865,10 @@ pub async fn update_organization<P: PoolProvider>(
         batch_notifications_enabled: data.batch_notifications_enabled,
         low_balance_threshold: data.low_balance_threshold,
         zero_data_retention: data.zero_data_retention,
+        default_serving_class: data.default_serving_class,
+        self_hosted_only: data.self_hosted_only,
+        granted_serving_classes: data.granted_serving_classes,
+        toleration_preset: data.toleration_preset,
     };
     debug_assert!(
         db_request.email.is_none(),
@@ -662,6 +877,20 @@ pub async fn update_organization<P: PoolProvider>(
 
     let mut repo = Organizations::new(&mut pool_conn);
     let org = repo.update(id, &db_request).await?;
+
+    // Written separately rather than threaded through OrganizationUpdateDBRequest:
+    // the flag lives on `users` but is read in only two places, so it isn't
+    // carried on the materialised user row (see `Organizations::auto_join_enabled`).
+    if let Some(enabled) = data.auto_join_enabled {
+        repo.set_auto_join_enabled(id, enabled).await?;
+    }
+    let auto_join_enabled = repo.auto_join_enabled(id).await?;
+    // Same side-channel: the set is read by the endpoints that enforce it and
+    // by the organization's own settings page, nowhere else.
+    if let Some(disabled) = data.disabled_modalities.as_deref() {
+        repo.set_disabled_modalities(id, disabled).await?;
+    }
+    let disabled_modalities = repo.disabled_modalities(id).await?;
 
     // Surface any pending email-change on EVERY PATCH response — not just
     // the one that created it — so a dashboard mid-verification doesn't lose
@@ -676,7 +905,15 @@ pub async fn update_organization<P: PoolProvider>(
             .map(PendingEmailChangeResponse::from),
     };
 
-    let mut response = OrganizationResponse::from_user(UserResponse::from(org));
+    // Only a platform manager could have set a preset (the UpdateAll gate above
+    // rejects anyone else), so they are the only caller who sees it here, the
+    // same rule the GET endpoint applies.
+    let toleration_preset = if can_all { org.toleration_preset.clone() } else { None };
+
+    let mut response = OrganizationResponse::from_user(UserResponse::from(org))
+        .with_auto_join_enabled(auto_join_enabled)
+        .with_disabled_modalities(disabled_modalities)
+        .with_toleration_preset(toleration_preset);
     if let Some(info) = pending_email_change {
         response = response.with_pending_email_change(info);
     }
@@ -1019,12 +1256,56 @@ pub async fn approve_join_request<P: PoolProvider>(
     check_role_assignment_privilege(&current_user, id, &role, can_all, &mut pool_conn).await?;
 
     let mut repo = Organizations::new(&mut pool_conn);
-    let approved = repo.approve_join_request(id, request_id, &role).await?;
-    if !approved {
+    let Some(approved_user_id) = repo.approve_join_request(id, request_id, &role).await? else {
         return Err(Error::NotFound {
             resource: "Join request".to_string(),
             id: format!("{request_id} in organization {id}"),
         });
+    };
+
+    // Close the loop the intercept screen promised ("we'll let you know when
+    // you're approved"). Nothing else tells them: approval is a status flip
+    // with no channel back to a browser they closed days ago.
+    //
+    // Best-effort throughout. The membership is live whether or not the mail
+    // lands, and surfacing an error here would invite an admin to retry an
+    // approval that already succeeded.
+    let mut users_repo = Users::new(&mut pool_conn);
+    // Swallowing the error would leave the warning below saying only that the
+    // parties could not be loaded, with no hint that the database was the
+    // reason — the difference between "this user vanished" and "the pool is
+    // failing" is the whole diagnosis.
+    let mut load = async |who: &str, user_id: UserId| match users_repo.get_by_id(user_id).await {
+        Ok(found) => found,
+        Err(e) => {
+            tracing::warn!(org_id = %id, "Failed to load the {who} for a join-approval notification: {e}");
+            None
+        }
+    };
+    let org_user = load("organization", id).await;
+    let approved_user = load("approved user", approved_user_id).await;
+
+    match (org_user, approved_user) {
+        (Some(org_user), Some(approved_user)) => {
+            let config = state.current_config();
+            let dashboard_link = config.dashboard_url.trim_end_matches('/').to_string();
+            let org_name = org_email_name(org_user.display_name.as_deref(), &org_user.username);
+
+            match EmailService::new(&config) {
+                Ok(email_service) => {
+                    if let Err(e) = email_service
+                        .send_org_join_approved_email(&approved_user.email, &org_name, &role, &dashboard_link)
+                        .await
+                    {
+                        tracing::warn!(org_id = %id, "Failed to send a join-approval notification: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(org_id = %id, "Email service unavailable, join-approval notification not sent: {e}");
+                }
+            }
+        }
+        _ => tracing::warn!(org_id = %id, "Approved a join request but could not load the parties to notify"),
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -1465,7 +1746,14 @@ pub async fn list_user_organizations<P: PoolProvider>(
         });
     }
 
-    let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    // Primary, not the replica: these summaries carry `verified`, and clients
+    // read it straight after a write that sets it - the card-verification
+    // return path marks the organization verified, then the UI re-reads to drop
+    // its "Verification pending" badge. Off the replica that read can land
+    // before the flag has propagated, so the badge stays up on an account that
+    // has just paid. Same inter-endpoint consistency trap `get_user` already
+    // avoids for the equivalent reason (see CLAUDE.md).
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Organizations::new(&mut pool_conn);
     let memberships = repo.list_user_organizations(target_user_id).await?;
     let manage_keys_orgs = repo.user_manage_keys_org_ids(target_user_id).await?;
@@ -1492,6 +1780,494 @@ pub async fn list_user_organizations<P: PoolProvider>(
         .collect();
 
     Ok(Json(summaries))
+}
+
+/// List the caller's own outstanding join requests.
+///
+/// The requester-side counterpart to `/organizations/{id}/join-requests`. That
+/// endpoint is gated on managing the organization, which a requester by
+/// definition cannot do — they are not a member yet — so without this a user
+/// has no way to learn that a request exists on their behalf. Signup files one
+/// automatically when the caller's email domain matches a claimed organization,
+/// which makes the invisible case the common one.
+///
+/// Answers only "what have *I* asked to join". It deliberately does not answer
+/// "does an organization exist for this domain" in general: that would let
+/// anyone probe for the existence of a company's workspace by signing up.
+///
+/// On authorization, note that "own" is about the *subject* of the query, not
+/// the caller: a platform manager holding ReadAll on Users may read another
+/// user's requests, exactly as they may read that user's organizations via
+/// `/users/{id}/organizations` beside it. An ordinary caller is confined to
+/// their own, and a non-`current` path they don't own is a 403.
+#[utoipa::path(
+    get,
+    path = "/users/{user_id}/join-requests",
+    tag = "organizations",
+    summary = "List user's pending join requests",
+    description = "List organizations the user has asked to join and is awaiting a decision on. Readable by that user, or by a platform manager with read-all on users.",
+    params(
+        ("user_id" = String, Path, description = "User ID (UUID) or 'current' for current user"),
+    ),
+    responses(
+        (status = 200, description = "Pending join requests", body = Vec<crate::api::models::organizations::PendingJoinRequestResponse>),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn list_user_join_requests<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path(user_id): Path<UserIdOrCurrent>,
+    current_user: CurrentUser,
+) -> Result<Json<Vec<crate::api::models::organizations::PendingJoinRequestResponse>>> {
+    let target_user_id = match user_id {
+        UserIdOrCurrent::Current(_) => current_user.id,
+        UserIdOrCurrent::Id(uuid) => uuid,
+    };
+
+    let can_all = can_read_all_resources(&current_user, Resource::Users);
+    let can_own = can_read_own_resource(&current_user, Resource::Users, target_user_id);
+    if !can_all && !can_own {
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Allow(Resource::Users, Operation::ReadOwn),
+            action: Operation::ReadOwn,
+            resource: format!("Join requests for user {target_user_id}"),
+        });
+    }
+
+    // Primary, not the replica: signup records the request during the very
+    // first login, and onboarding reads this immediately afterwards to decide
+    // whether to offer "request to join" instead of "create a workspace". Off
+    // the replica that read can land before the row propagates, and the user
+    // gets the create-workspace screen this endpoint exists to replace. Same
+    // trap `list_user_organizations` above avoids for the same reason.
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut repo = Organizations::new(&mut pool_conn);
+    let requests = repo.list_user_join_requests(target_user_id).await?;
+
+    let org_ids: Vec<UserId> = requests.iter().map(|r| r.organization_id).collect();
+    let mut users_repo = Users::new(&mut pool_conn);
+    let org_map = users_repo.get_bulk(org_ids).await?;
+
+    // `filter_map` cannot silently swallow a live request here: both halves
+    // apply the same `is_deleted = false` filter — `list_user_join_requests`
+    // INNER JOINs it, `get_bulk` has it in its WHERE — so a request that
+    // survived the first query has its organization in `org_map`. The only way
+    // to miss is the organization being deleted between the two, and dropping
+    // it is then the correct answer rather than a lost row: a deleted
+    // organization has nobody left to approve, which is exactly why the query
+    // excludes them in the first place.
+    let responses: Vec<crate::api::models::organizations::PendingJoinRequestResponse> = requests
+        .iter()
+        .filter_map(|r| {
+            org_map
+                .get(&r.organization_id)
+                .map(|o| crate::api::models::organizations::PendingJoinRequestResponse {
+                    id: r.id,
+                    organization_id: o.id,
+                    organization_name: o.display_name.clone().unwrap_or_else(|| o.username.clone()),
+                    requested_at: r.created_at,
+                })
+        })
+        .collect();
+
+    Ok(Json(responses))
+}
+
+/// Everything onboarding needs to pick a screen, in one read.
+///
+/// A user arriving at onboarding is in exactly one of four situations, and
+/// which one decides whether they are shown a workspace-creation form, an
+/// invitation, or a notice that their company already has a workspace. The
+/// client applies this precedence:
+///
+/// 1. **`invitation`** — someone deliberately invited this address. Skip the
+///    workspace screen and let them accept.
+/// 2. **`domain_match` with `auto_join_enabled`** — the workspace has said in
+///    advance that its domain belongs. Complete the join, same destination.
+/// 3. **`domain_match` without it** — offer the choice to ask, and let them
+///    ask or not. `join_request` says whether they already have.
+/// 4. **Neither** — no workspace claims their domain, or they signed up with a
+///    personal address. Ordinary workspace setup.
+///
+/// One endpoint rather than three because the client can render nothing until
+/// it knows all three answers; three round trips would buy a flash of the
+/// wrong screen. That flash is the whole failure this replaces — a user shown
+/// "create a workspace" while their company already has one creates a second
+/// one, which is how a domain ends up with two workspaces nobody meant.
+///
+/// **Disclosure.** The domain is taken from the *subject's* own authenticated
+/// address; there is no parameter to pass an arbitrary one. Learning that
+/// `acme.com` has a workspace therefore requires receiving mail at acme.com,
+/// and even then reveals only that — see [`DomainMatchResponse`].
+///
+/// Subject and caller are the same person except for a platform manager
+/// holding ReadAll on Users, who may name another user and gets *their*
+/// context — the same own-or-privileged split as `/users/{id}/organizations`.
+/// Anyone else naming a user who isn't them gets a 403.
+#[utoipa::path(
+    get,
+    path = "/users/{user_id}/onboarding-context",
+    tag = "organizations",
+    summary = "Onboarding routing context",
+    description = "Pending invitation, matching domain workspace, and outstanding join request for a user — the inputs to the onboarding routing decision.",
+    params(
+        ("user_id" = String, Path, description = "User ID (UUID) or 'current' for current user"),
+    ),
+    responses(
+        (status = 200, description = "Onboarding context", body = crate::api::models::organizations::OnboardingContextResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Not found"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn get_onboarding_context<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path(user_id): Path<UserIdOrCurrent>,
+    current_user: CurrentUser,
+) -> Result<Json<crate::api::models::organizations::OnboardingContextResponse>> {
+    use crate::api::models::organizations::{
+        DomainMatchResponse, OnboardingContextResponse, PendingInvitationResponse, PendingJoinRequestResponse,
+    };
+
+    let target_user_id = match user_id {
+        UserIdOrCurrent::Current(_) => current_user.id,
+        UserIdOrCurrent::Id(uuid) => uuid,
+    };
+
+    let can_all = can_read_all_resources(&current_user, Resource::Users);
+    let can_own = can_read_own_resource(&current_user, Resource::Users, target_user_id);
+    if !can_all && !can_own {
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Allow(Resource::Users, Operation::ReadOwn),
+            action: Operation::ReadOwn,
+            resource: format!("Onboarding context for user {target_user_id}"),
+        });
+    }
+
+    // Primary, not the replica. This is read on the very first page load after
+    // signup, and signup may have just written the membership that auto-join
+    // creates. Off the replica that read can land first, and the user gets the
+    // create-workspace screen this endpoint exists to keep them away from.
+    // Same trap `list_user_organizations` avoids for the same reason (CLAUDE.md).
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+
+    // The target's address, not the caller's: a platform manager reading
+    // someone else's context must get *their* domain match, not their own.
+    let mut users_repo = Users::new(&mut pool_conn);
+    let target = users_repo.get_by_id(target_user_id).await?.ok_or_else(|| Error::NotFound {
+        resource: "User".to_string(),
+        id: target_user_id.to_string(),
+    })?;
+    let target_email = target.email.clone();
+
+    let mut org_repo = Organizations::new(&mut pool_conn);
+
+    // 1. An invitation addressed to this exact mailbox.
+    let invite = org_repo.find_pending_invite_for_email(&target_email).await?;
+    let invitation = match invite {
+        Some(invite) => {
+            let mut users_repo = Users::new(&mut pool_conn);
+            let org = users_repo.get_by_id(invite.organization_id).await?;
+            // An invitation into a workspace that has since been deleted leads
+            // nowhere; the query already excludes those, so this is belt and
+            // braces against the row vanishing between the two reads.
+            match org {
+                Some(org) => {
+                    let inviter_name = match invite.invited_by {
+                        Some(inviter_id) => users_repo
+                            .get_by_id(inviter_id)
+                            .await?
+                            .map(|u| u.display_name.unwrap_or(u.username)),
+                        None => None,
+                    };
+                    Some(PendingInvitationResponse {
+                        id: invite.id,
+                        organization_id: invite.organization_id,
+                        organization_name: org.display_name.unwrap_or(org.username),
+                        role: invite.role.clone(),
+                        inviter_name,
+                        expires_at: invite.expires_at,
+                    })
+                }
+                None => None,
+            }
+        }
+        None => None,
+    };
+
+    // 2. An outstanding request of their own.
+    //
+    // The organization lookups here and above resolve to `None` only if the
+    // row vanished between the two reads, which for these queries means it was
+    // deleted — and a request into a deleted organization is one nobody can
+    // ever approve, so reporting nothing is the intended answer rather than a
+    // dropped row. Same reasoning as `list_user_join_requests`'s own mapping.
+    let mut org_repo = Organizations::new(&mut pool_conn);
+    let requests = org_repo.list_user_join_requests(target_user_id).await?;
+    let join_request = match requests.first() {
+        Some(request) => {
+            let mut users_repo = Users::new(&mut pool_conn);
+            users_repo
+                .get_by_id(request.organization_id)
+                .await?
+                .map(|org| PendingJoinRequestResponse {
+                    id: request.id,
+                    organization_id: org.id,
+                    organization_name: org.display_name.unwrap_or(org.username),
+                    requested_at: request.created_at,
+                })
+        }
+        None => None,
+    };
+
+    // 3. A workspace that has claimed their domain.
+    //
+    // Personal domains are excluded here exactly as they are at signup: a
+    // workspace claiming gmail.com would otherwise match every consumer signup
+    // and tell each of them their "company" already has a workspace.
+    let domain = crate::auth::utils::email_domain(&target_email).filter(|d| !state.current_config().auth.is_personal_email_domain(d));
+    let mut org_repo = Organizations::new(&mut pool_conn);
+    let domain_match = match domain {
+        Some(domain) => match org_repo.find_by_domain(&domain).await? {
+            Some(org) => {
+                // Already inside it: there is no decision left to offer, and
+                // saying "this workspace exists" to a member is noise.
+                let existing_role = org_repo.get_user_org_role(target_user_id, org.id).await?;
+                if existing_role.is_some() {
+                    None
+                } else {
+                    let auto_join_enabled = org_repo.auto_join_enabled(org.id).await?;
+                    Some(DomainMatchResponse {
+                        organization_id: org.id,
+                        domain,
+                        auto_join_enabled,
+                    })
+                }
+            }
+            None => None,
+        },
+        None => None,
+    };
+
+    Ok(Json(OnboardingContextResponse {
+        invitation,
+        domain_match,
+        join_request,
+    }))
+}
+
+/// Act on a domain match: join the workspace, or ask to.
+///
+/// The opt-in half of the intercept. Nothing files a join request on a user's
+/// behalf any more — not signup, not the screen that tells them a workspace
+/// exists. This endpoint runs only because they pressed the button.
+///
+/// The organization is resolved from the **subject's own email domain**, never
+/// from the request body. A caller cannot name the workspace they want into:
+/// that would turn this into a way to spam requests at arbitrary
+/// organizations, and to enumerate which ids are organizations at all.
+///
+/// Ordinarily the subject is the caller. A platform manager holding ReadAll on
+/// Users may file on another user's behalf — they can already `add_member`
+/// outright, so this grants nothing new — and the request is still constrained
+/// to that user's own domain.
+///
+/// Which of the two things happens is the organization's choice, not the
+/// caller's — see [`DomainJoinOutcome`]. Idempotent in both directions:
+/// pressing the button twice returns the same outcome rather than failing, so
+/// a double-click, a retry, or a reloaded page cannot produce a second row or
+/// a spurious error.
+#[utoipa::path(
+    post,
+    path = "/users/{user_id}/join-requests",
+    tag = "organizations",
+    summary = "Request access to the domain-matched workspace",
+    description = "Ask to join the organization that has claimed the user's email domain. Becomes an immediate membership if that organization has auto-join enabled.",
+    params(
+        ("user_id" = String, Path, description = "User ID (UUID) or 'current' for current user"),
+    ),
+    responses(
+        (status = 200, description = "Request filed or membership granted", body = crate::api::models::organizations::DomainJoinResponse),
+        (status = 400, description = "No workspace claims this user's email domain"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn create_user_join_request<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path(user_id): Path<UserIdOrCurrent>,
+    current_user: CurrentUser,
+) -> Result<Json<crate::api::models::organizations::DomainJoinResponse>> {
+    use crate::api::models::organizations::{DomainJoinOutcome, DomainJoinResponse, PendingJoinRequestResponse};
+
+    let target_user_id = match user_id {
+        UserIdOrCurrent::Current(_) => current_user.id,
+        UserIdOrCurrent::Id(uuid) => uuid,
+    };
+
+    // Update, not read: this creates a membership row. Guarding a write with
+    // the read helpers would have let a read-only caller file a request while
+    // the error told them they needed UpdateOwn — the check and its own
+    // explanation disagreeing.
+    let can_all = can_update_all_resources(&current_user, Resource::Users);
+    let can_own = can_update_own_resource(&current_user, Resource::Users, target_user_id);
+    if !can_all && !can_own {
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Allow(Resource::Users, Operation::UpdateOwn),
+            action: Operation::UpdateOwn,
+            resource: format!("Join request for user {target_user_id}"),
+        });
+    }
+
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+
+    let mut users_repo = Users::new(&mut pool_conn);
+    let target = users_repo.get_by_id(target_user_id).await?.ok_or_else(|| Error::NotFound {
+        resource: "User".to_string(),
+        id: target_user_id.to_string(),
+    })?;
+
+    let domain = crate::auth::utils::email_domain(&target.email)
+        .filter(|d| !state.current_config().auth.is_personal_email_domain(d))
+        .ok_or_else(|| Error::BadRequest {
+            message: "No workspace matches this account's email domain".to_string(),
+        })?;
+
+    let mut org_repo = Organizations::new(&mut pool_conn);
+    let org = org_repo.find_by_domain(&domain).await?.ok_or_else(|| Error::BadRequest {
+        message: "No workspace matches this account's email domain".to_string(),
+    })?;
+
+    // Active memberships only — a `requested` row is not one, which is the
+    // case that must fall through to the idempotent insert below.
+    if org_repo.get_user_org_role(target_user_id, org.id).await?.is_some() {
+        return Ok(Json(DomainJoinResponse {
+            outcome: DomainJoinOutcome::AlreadyMember,
+            organization_id: org.id,
+            join_request: None,
+        }));
+    }
+
+    if org_repo.auto_join_enabled(org.id).await? {
+        // The organization has already said yes to everyone at its domain, so
+        // there is nobody left to ask. Normally signup got here first; this
+        // path covers auto-join being switched on after the user signed up.
+        let org_count = org_repo.count_user_organizations(target_user_id).await?;
+        if org_count >= MAX_ORGS_PER_USER {
+            return Err(Error::BadRequest {
+                message: format!("Cannot join: you are already a member of {MAX_ORGS_PER_USER} organizations (maximum)"),
+            });
+        }
+        org_repo.add_member(org.id, target_user_id, "member").await?;
+        return Ok(Json(DomainJoinResponse {
+            outcome: DomainJoinOutcome::Joined,
+            organization_id: org.id,
+            join_request: None,
+        }));
+    }
+
+    let row = org_repo.create_join_request(org.id, target_user_id).await?;
+
+    // The insert is idempotent by colliding on `UNIQUE (user_id, organization_id)`
+    // and handing back whatever row was already there — which is not always a
+    // request. An invitation to someone who already has an account carries
+    // their `user_id` (see `invite_member`), so it occupies the same slot, and
+    // reporting it as `requested` would tell a user to wait for approval they
+    // do not need: they have an invitation they could accept right now. The
+    // `active` case is normally caught by the membership check above, but an
+    // approval landing between that read and this write arrives here instead.
+    //
+    // So the row's own status decides the answer rather than the call site
+    // assuming it got what it asked for.
+    let outcome = match row.status.as_str() {
+        "requested" => DomainJoinOutcome::Requested,
+        "pending" => DomainJoinOutcome::Invited,
+        _ => DomainJoinOutcome::AlreadyMember,
+    };
+
+    // Tell the people who can act on it. Best-effort, and deliberately after
+    // the write: the row is already committed, so failing the call over a mail
+    // error would report "nothing happened" to a user whose request is in fact
+    // filed and waiting. Only a fresh `requested` row is worth a mail — the
+    // other two outcomes mean nobody has a decision to make.
+    if outcome == DomainJoinOutcome::Requested {
+        let recipients = match org_repo.list_admin_emails(org.id).await {
+            Ok(emails) => emails,
+            Err(e) => {
+                tracing::warn!(org_id = %org.id, "Failed to list admins to notify of a join request: {e}");
+                Vec::new()
+            }
+        };
+
+        if recipients.is_empty() {
+            // `find_by_domain` only matches workspaces that still have a live
+            // owner or admin, so an empty list is the last one leaving between
+            // that read and this one — not an ordinary state. Worth saying out
+            // loud, because the requester has been told someone was notified.
+            tracing::warn!(
+                org_id = %org.id,
+                "Join request filed against a workspace with no active owner or admin to notify"
+            );
+        } else {
+            let config = state.current_config();
+            let requests_link = format!("{}/organization", config.dashboard_url.trim_end_matches('/'));
+            let org_name = org_email_name(org.display_name.as_deref(), &org.username);
+            let requester_name = person_email_name(target.display_name.as_deref(), &target.email);
+
+            match EmailService::new(&config) {
+                Ok(email_service) => {
+                    for recipient in &recipients {
+                        // Addresses stay out of the log line; the org id is
+                        // enough to find the workspace whose mail failed.
+                        if let Err(e) = email_service
+                            .send_org_join_request_email(recipient, &org_name, &requester_name, &target.email, &requests_link)
+                            .await
+                        {
+                            tracing::warn!(org_id = %org.id, "Failed to send a join-request notification: {e}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(org_id = %org.id, "Email service unavailable, join-request notification not sent: {e}");
+                }
+            }
+        }
+    }
+
+    Ok(Json(DomainJoinResponse {
+        outcome,
+        organization_id: org.id,
+        // Only ever the caller's own request. Handing back an invitation's id
+        // under `join_request` would be the same conflation in a second place.
+        join_request: match outcome {
+            DomainJoinOutcome::Requested => Some(PendingJoinRequestResponse {
+                id: row.id,
+                organization_id: org.id,
+                organization_name: org.display_name.unwrap_or(org.username),
+                requested_at: row.created_at,
+            }),
+            _ => None,
+        },
+    }))
 }
 
 /// Validate and confirm an active organization context.
@@ -1906,6 +2682,160 @@ pub async fn decline_invite<P: PoolProvider>(
     Ok(Json(serde_json::json!({ "message": "Invite declined" })))
 }
 
+/// Accept an invitation the invitee reached without its link.
+///
+/// The by-id twin of [`accept_invite`]. Both put the same person in the same
+/// organization; they differ only in what proves the mailbox.
+///
+/// On the link path, possession of the token is the proof — anyone holding it
+/// is treated as the addressee. Here there is no token to hold: the invitee
+/// arrived through onboarding because the platform told them an invitation
+/// existed, and invite tokens are stored only as hashes, so the link cannot be
+/// reconstructed to hand back to them. What proves the mailbox instead is the
+/// caller's own authenticated address, which the identity provider vouched
+/// for. **That comparison is the entire authorization for this endpoint** —
+/// without it, an invitation id would be enough to join a stranger's
+/// organization.
+///
+/// Notably this is *not* gated on organization membership, unlike its
+/// neighbours on the same path. The one person entitled to accept an
+/// invitation is by definition not a member yet.
+#[utoipa::path(
+    post,
+    path = "/organizations/{id}/invites/{invite_id}/accept",
+    tag = "organizations",
+    summary = "Accept an invitation by id",
+    description = "Accept a pending invitation addressed to the authenticated user, without its emailed token.",
+    params(
+        ("id" = String, Path, description = "Organization ID (UUID)"),
+        ("invite_id" = String, Path, description = "Invitation ID (UUID)"),
+    ),
+    responses(
+        (status = 200, description = "Invitation accepted"),
+        (status = 400, description = "Bad request - expired, or organization limit reached"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Not found, or not addressed to the caller"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn accept_invite_by_id<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path((id, invite_id)): Path<(UserId, uuid::Uuid)>,
+    current_user: CurrentUser,
+) -> Result<Json<serde_json::Value>> {
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut org_repo = Organizations::new(&mut pool_conn);
+
+    let invite = require_own_invite(&mut org_repo, id, invite_id, &current_user).await?;
+
+    if let Some(expires_at) = invite.expires_at
+        && expires_at < chrono::Utc::now()
+    {
+        return Err(Error::BadRequest {
+            message: "This invite has expired".to_string(),
+        });
+    }
+
+    let org_count = org_repo.count_user_organizations(current_user.id).await?;
+    if org_count >= MAX_ORGS_PER_USER {
+        return Err(Error::BadRequest {
+            message: format!("Cannot accept invite: you are already a member of {MAX_ORGS_PER_USER} organizations (maximum)"),
+        });
+    }
+
+    org_repo.accept_invite(invite.id, current_user.id).await?;
+
+    Ok(Json(serde_json::json!({ "message": "Invite accepted" })))
+}
+
+/// Decline an invitation the invitee reached without its link.
+///
+/// The by-id twin of [`decline_invite`], authorized the same way as
+/// [`accept_invite_by_id`]. Declining deletes the row, so the organization can
+/// invite them again later and onboarding stops offering it.
+///
+/// No expiry check: letting someone clear an invitation that has already
+/// lapsed is strictly helpful, and refusing would leave a dead row offered to
+/// them forever.
+#[utoipa::path(
+    post,
+    path = "/organizations/{id}/invites/{invite_id}/decline",
+    tag = "organizations",
+    summary = "Decline an invitation by id",
+    description = "Decline a pending invitation addressed to the authenticated user, without its emailed token.",
+    params(
+        ("id" = String, Path, description = "Organization ID (UUID)"),
+        ("invite_id" = String, Path, description = "Invitation ID (UUID)"),
+    ),
+    responses(
+        (status = 200, description = "Invitation declined"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Not found, or not addressed to the caller"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn decline_invite_by_id<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path((id, invite_id)): Path<(UserId, uuid::Uuid)>,
+    current_user: CurrentUser,
+) -> Result<Json<serde_json::Value>> {
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut org_repo = Organizations::new(&mut pool_conn);
+
+    let invite = require_own_invite(&mut org_repo, id, invite_id, &current_user).await?;
+    org_repo.cancel_invite(invite.organization_id, invite.id).await?;
+
+    Ok(Json(serde_json::json!({ "message": "Invite declined" })))
+}
+
+/// Load a pending invitation and prove it is addressed to the caller.
+///
+/// Shared by the two by-id endpoints so the address comparison cannot be
+/// present on one and forgotten on the other — it is the only thing standing
+/// between an invitation id and someone else's organization.
+///
+/// A mismatch is reported as a 404 rather than a 403: to a caller the
+/// invitation is not theirs to know about, and distinguishing "wrong person"
+/// from "no such invitation" would confirm that a given id is a live
+/// invitation into a given organization.
+///
+/// An invitation with no `invite_email` cannot be matched against anyone and
+/// is refused rather than waved through.
+async fn require_own_invite(
+    org_repo: &mut Organizations<'_>,
+    org_id: UserId,
+    invite_id: uuid::Uuid,
+    current_user: &CurrentUser,
+) -> Result<crate::db::models::organizations::OrganizationMemberDBResponse> {
+    let not_found = || Error::NotFound {
+        resource: "Invite".to_string(),
+        id: invite_id.to_string(),
+    };
+
+    let invite = org_repo.find_invite_by_id(org_id, invite_id).await?.ok_or_else(not_found)?;
+
+    let addressed_to_caller = invite
+        .invite_email
+        .as_ref()
+        .is_some_and(|email| email.to_lowercase() == current_user.email.to_lowercase());
+
+    if !addressed_to_caller {
+        return Err(not_found());
+    }
+
+    Ok(invite)
+}
+
 /// Cancel a pending invite (by org admin/owner)
 #[utoipa::path(
     delete,
@@ -2048,6 +2978,10 @@ pub async fn confirm_email_change<P: PoolProvider>(
             batch_notifications_enabled: None,
             low_balance_threshold: None,
             zero_data_retention: None,
+            default_serving_class: None,
+            self_hosted_only: None,
+            granted_serving_classes: Default::default(),
+            toleration_preset: Default::default(),
         };
         org_repo.update(pending.organization_id, &update).await?;
         // The `confirm_*_email_side` UPDATE above already locked this row, so
@@ -2132,13 +3066,14 @@ mod tests {
     use crate::api::models::users::Role;
     use crate::test::utils::{
         add_auth_headers, create_test_admin_user, create_test_app, create_test_app_with_config, create_test_config, create_test_user,
+        create_test_user_on_domain,
     };
     use serde_json::json;
     use sqlx::PgPool;
 
     // ── Self-serve org creation ────────────────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_standard_user_can_create_organization(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -2149,14 +3084,392 @@ mod tests {
             .post("/admin/api/v1/organizations")
             .add_header(&user_headers[0].0, &user_headers[0].1)
             .add_header(&user_headers[1].0, &user_headers[1].1)
-            .json(&json!({ "name": "my-org", "email": "contact@my-org.com" }))
+            .json(&json!({ "name": "my-org", "email": "contact@example.com" }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let body = resp.json::<serde_json::Value>();
-        assert_eq!(body["username"].as_str().unwrap(), "my-org");
+        // The username is the owner's email domain plus a suffix - the domain
+        // is what makes the workspace findable by colleagues, the suffix keeps
+        // it unique so they can have more than one. The submitted name becomes
+        // the display name.
+        let username = body["username"].as_str().unwrap();
+        assert!(username.starts_with("example.com~"), "got {username}");
+        assert_eq!(body["display_name"].as_str().unwrap(), "my-org");
     }
 
-    #[sqlx::test]
+    /// A workspace cannot be created naming a contact address its owner does
+    /// not reach - otherwise its notifications land on a stranger.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_contact_email_must_be_at_the_owners_domain(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+        let headers = add_auth_headers(&owner);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({ "name": "Acme", "email": "victim@unrelated.test" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
+
+        // Any address at the domain they demonstrably receive mail at is fine:
+        // that is their own company, and claiming the domain is what shows they
+        // are in it.
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({ "name": "Acme", "email": "billing@acme.test" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+    }
+
+    /// On a personal domain "same domain" would admit every other customer of
+    /// that provider, so the rule tightens to the owner's exact address.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_personal_email_owner_must_use_their_own_address(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user_on_domain(&pool, Role::StandardUser, "gmail.com").await;
+        let headers = add_auth_headers(&owner);
+
+        // Same domain, someone else's mailbox: the case a domain-only check
+        // would have waved through.
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({ "name": "Acme", "email": "someone-else@gmail.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({ "name": "Acme", "email": owner.email.to_uppercase() }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+    }
+
+    /// Domains are case-insensitive; the things we compare them against are
+    /// not. Without normalising, `Alice@Acme.test` claims `Acme.test` and a
+    /// later `bob@acme.test` matches nothing.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_domain_claim_is_case_insensitive(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_on_domain(&pool, Role::StandardUser, "MixedCase.test").await;
+        let headers = add_auth_headers(&user);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({ "name": "Mixed Case Ltd", "email": "billing@mixedcase.test" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let username = resp.json::<serde_json::Value>()["username"].as_str().unwrap().to_string();
+        assert!(
+            username.starts_with("mixedcase.test~"),
+            "claim should be lowercased, got {username}"
+        );
+
+        // A colleague whose address is cased differently still finds it.
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(
+            crate::db::handlers::Organizations::new(&mut conn)
+                .find_by_domain("mixedcase.test")
+                .await
+                .unwrap()
+                .is_some(),
+            "a differently-cased colleague must still match the workspace"
+        );
+    }
+
+    /// A domain can hold several workspaces - prod and dev, say - and a join
+    /// request goes to the oldest surviving one.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_domain_can_hold_several_workspaces(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+        let headers = add_auth_headers(&user);
+
+        let mut ids = Vec::new();
+        for name in ["Acme Prod", "Acme Dev"] {
+            let resp = server
+                .post("/admin/api/v1/organizations")
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .json(&json!({ "name": name, "email": "billing@acme.test" }))
+                .await;
+            resp.assert_status(axum::http::StatusCode::CREATED);
+            let body = resp.json::<serde_json::Value>();
+            assert!(body["username"].as_str().unwrap().starts_with("acme.test~"));
+            ids.push(body["id"].as_str().unwrap().to_string());
+        }
+        assert_ne!(ids[0], ids[1], "both workspaces exist independently");
+
+        // A colleague's join request goes to the first one created.
+        let mut conn = pool.acquire().await.unwrap();
+        let matched = crate::db::handlers::Organizations::new(&mut conn)
+            .find_by_domain("acme.test")
+            .await
+            .unwrap()
+            .expect("a workspace matches the domain");
+        assert_eq!(matched.id.to_string(), ids[0], "the oldest surviving workspace wins");
+    }
+
+    /// A personal-email owner's workspace is not domain-routable, so its
+    /// username must be an opaque `user~{suffix}` rather than the submitted
+    /// name. Otherwise the owner could type a third party's non-personal domain
+    /// (say `acme.test`) as the name, the fallback would store it as the
+    /// username verbatim, and `find_by_domain`'s `username = $1` arm would
+    /// match it on every future signup at that domain - hijacking the domain.
+    /// The name the user typed still becomes the display name.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_personal_email_owner_username_is_opaque(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user_on_domain(&pool, Role::StandardUser, "gmail.com").await;
+        let headers = add_auth_headers(&owner);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({ "name": "acme.test", "email": owner.email }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let body = resp.json::<serde_json::Value>();
+        let username = body["username"].as_str().unwrap();
+        assert!(
+            username.starts_with("user~") && username.len() == "user~".len() + 32,
+            "personal-email fallback must use an opaque user~<uuid> username, got {username}"
+        );
+        assert_ne!(username, "acme.test", "the planted domain must not become the username");
+        assert_eq!(body["display_name"].as_str().unwrap(), "acme.test");
+
+        // The opaque username does not collide with any domain lookup, so the
+        // victim's domain remains unclaimed.
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(
+            crate::db::handlers::Organizations::new(&mut conn)
+                .find_by_domain("acme.test")
+                .await
+                .unwrap()
+                .is_none(),
+            "an opaque username must not match domain routing"
+        );
+    }
+
+    /// The full hijack scenario, inverted: after the fix, a personal-email
+    /// owner cannot pre-register a third party's non-personal domain, enable
+    /// auto-join, and silently enroll a victim who signs up at that domain via
+    /// proxy-header auth. The victim's signup finds no workspace for the
+    /// domain, so no membership is granted and the attacker's member list
+    /// discloses no victim PII.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_personal_email_owner_cannot_hijack_unclaimed_domain(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+
+        // Attacker signs up with a personal email (gmail.com is personal).
+        let attacker = create_test_user_on_domain(&pool, Role::StandardUser, "gmail.com").await;
+        let attacker_headers = add_auth_headers(&attacker);
+
+        // Attacker POSTs /organizations with name = a third party's non-personal
+        // domain. After the fix the username is an opaque `user~<8 hex>`, not
+        // the planted domain, so domain routing never sees it.
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&attacker_headers[0].0, &attacker_headers[0].1)
+            .add_header(&attacker_headers[1].0, &attacker_headers[1].1)
+            .json(&json!({ "name": "acme.test", "email": attacker.email }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let body = resp.json::<serde_json::Value>();
+        let org_id = body["id"].as_str().unwrap().to_string();
+        assert_ne!(
+            body["username"].as_str().unwrap(),
+            "acme.test",
+            "the planted domain must not be stored as the username"
+        );
+
+        // Attacker enables auto-join on their org.
+        set_auto_join(&pool, uuid::Uuid::parse_str(&org_id).unwrap(), true).await;
+
+        // The bare-equality arm no longer matches the attacker's org, so
+        // `find_by_domain("acme.test")` returns None.
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            assert!(
+                crate::db::handlers::Organizations::new(&mut conn)
+                    .find_by_domain("acme.test")
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "the planted workspace must not be reachable by domain routing"
+            );
+        }
+
+        // Victim arrives via proxy-header auth (first-time signup). The auto-org
+        // block in current_user.rs runs inside `if was_created`, calls
+        // find_by_domain("acme.test"), finds nothing, and does not enroll the
+        // victim.
+        let victim_ext = format!("victim{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let victim_email = format!("{victim_ext}@acme.test");
+        let resp = server
+            .get("/admin/api/v1/users/current/onboarding-context")
+            .add_header("x-doubleword-user", victim_ext.as_str())
+            .add_header("x-doubleword-email", victim_email.as_str())
+            .await;
+        resp.assert_status_ok();
+        let ctx = resp.json::<serde_json::Value>();
+        assert!(
+            ctx["domain_match"].is_null(),
+            "the victim must be offered no domain match, got {}",
+            ctx["domain_match"]
+        );
+
+        // The attacker (org owner) lists members and must NOT see the victim.
+        let resp = server
+            .get(&format!("/admin/api/v1/organizations/{org_id}/members"))
+            .add_header(&attacker_headers[0].0, &attacker_headers[0].1)
+            .add_header(&attacker_headers[1].0, &attacker_headers[1].1)
+            .await;
+        resp.assert_status_ok();
+        let members = resp.json::<serde_json::Value>();
+        let serialized = serde_json::to_string(&members).unwrap();
+        assert!(
+            !serialized.contains(&victim_email),
+            "the attacker must not see the victim's email in the member list: {serialized}"
+        );
+        // Only the attacker (owner) is a member.
+        assert_eq!(members.as_array().unwrap().len(), 1, "no victim may be silently enrolled");
+    }
+
+    /// The same plant through `find_by_domain`'s *other* arm. `LIKE $1 || '~%'`
+    /// matches a suffixed username, so an attacker who types
+    /// "acme.test~aaaaaaaa" rather than the bare domain reaches the identical
+    /// hijack. Removing only the bare-equality arm - which the query's own
+    /// comment calls a legacy shape, and which is the tempting minimal fix -
+    /// would leave this open, so the guard has to be that user-supplied text
+    /// never reaches the username at all.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_personal_email_owner_cannot_plant_a_suffixed_domain(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let attacker = create_test_user_on_domain(&pool, Role::StandardUser, "gmail.com").await;
+        let headers = add_auth_headers(&attacker);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({ "name": "acme.test~aaaaaaaa", "email": attacker.email }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(
+            crate::db::handlers::Organizations::new(&mut conn)
+                .find_by_domain("acme.test")
+                .await
+                .unwrap()
+                .is_none(),
+            "a suffixed plant must not match the LIKE arm either"
+        );
+    }
+
+    /// The fix preserves the business-email path: an owner on a non-personal
+    /// domain still claims that domain as `{domain}~{suffix}` and remains
+    /// findable by colleagues. (Regression guard.)
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_business_email_owner_still_claims_domain(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+        let headers = add_auth_headers(&owner);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({ "name": "Acme Corporation", "email": "billing@acme.test" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let body = resp.json::<serde_json::Value>();
+        let username = body["username"].as_str().unwrap();
+        assert!(
+            username.starts_with("acme.test~"),
+            "a business-email owner must still claim their domain, got {username}"
+        );
+        assert_eq!(body["display_name"].as_str().unwrap(), "Acme Corporation");
+
+        let mut conn = pool.acquire().await.unwrap();
+        let matched = crate::db::handlers::Organizations::new(&mut conn)
+            .find_by_domain("acme.test")
+            .await
+            .unwrap()
+            .expect("the business-email claim is still routable");
+        assert_eq!(matched.id.to_string(), body["id"].as_str().unwrap());
+    }
+
+    /// A soft-deleted workspace must never receive join requests - nobody is
+    /// left to approve them.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_deleted_workspace_is_not_matched_by_domain(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let user = create_test_user_on_domain(&pool, Role::StandardUser, "gone.test").await;
+        let headers = add_auth_headers(&user);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({ "name": "Gone Ltd", "email": "billing@gone.test" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
+
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            assert!(
+                crate::db::handlers::Organizations::new(&mut conn)
+                    .find_by_domain("gone.test")
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "matches while it exists"
+            );
+        }
+
+        let resp = server
+            .delete(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .await;
+        assert!(resp.status_code().is_success(), "delete failed: {}", resp.text());
+
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(
+            crate::db::handlers::Organizations::new(&mut conn)
+                .find_by_domain("gone.test")
+                .await
+                .unwrap()
+                .is_none(),
+            "a deleted workspace must not collect join requests"
+        );
+    }
+
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_standard_user_becomes_owner_of_created_org(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -2190,7 +3503,7 @@ mod tests {
     /// Paying as an org admin verifies the organization rather than the human
     /// who clicked, so a client asking "can this workspace pay" has to read the
     /// summary. This pins that the two never get conflated.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_user_organizations_summary_reflects_org_verification(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -2201,7 +3514,7 @@ mod tests {
             .post("/admin/api/v1/organizations")
             .add_header(&user_headers[0].0, &user_headers[0].1)
             .add_header(&user_headers[1].0, &user_headers[1].1)
-            .json(&json!({ "name": "verify-org", "email": "contact@verify-org.com" }))
+            .json(&json!({ "name": "verify-org", "email": "contact@example.com" }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let org_id: uuid::Uuid = resp.json::<serde_json::Value>()["id"].as_str().unwrap().parse().unwrap();
@@ -2245,7 +3558,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_user_organizations_summary_reflects_org_zero_data_retention(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -2259,7 +3572,7 @@ mod tests {
             .post("/admin/api/v1/organizations")
             .add_header(&user_headers[0].0, &user_headers[0].1)
             .add_header(&user_headers[1].0, &user_headers[1].1)
-            .json(&json!({ "name": "zdr-org", "email": "contact@zdr-org.com" }))
+            .json(&json!({ "name": "zdr-org", "email": "contact@example.com" }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
@@ -2297,7 +3610,7 @@ mod tests {
         assert_eq!(orgs[0]["zero_data_retention"].as_bool(), Some(true));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_organization_owner_can_update_zero_data_retention(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -2308,7 +3621,7 @@ mod tests {
             .post("/admin/api/v1/organizations")
             .add_header(&owner_headers[0].0, &owner_headers[0].1)
             .add_header(&owner_headers[1].0, &owner_headers[1].1)
-            .json(&json!({ "name": "owner-zdr-org", "email": "contact@owner-zdr-org.com" }))
+            .json(&json!({ "name": "owner-zdr-org", "email": "contact@example.com" }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
@@ -2323,7 +3636,71 @@ mod tests {
         assert_eq!(resp.json::<serde_json::Value>()["zero_data_retention"].as_bool(), Some(true));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_organization_owners_cannot_touch_serving_settings_only_platform_managers(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "name": "owner-serving-org", "email": "contact@example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
+
+        // Every serving setting is refused to the owner, alone or mixed with
+        // an ordinary field; the ordinary field is not applied either.
+        for body in [
+            json!({ "granted_serving_classes": ["interactive"] }),
+            json!({ "default_serving_class": "throughput" }),
+            json!({ "self_hosted_only": true }),
+            json!({ "display_name": "Renamed", "self_hosted_only": true }),
+        ] {
+            let resp = server
+                .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+                .add_header(&owner_headers[0].0, &owner_headers[0].1)
+                .add_header(&owner_headers[1].0, &owner_headers[1].1)
+                .json(&body)
+                .await;
+            resp.assert_status(axum::http::StatusCode::FORBIDDEN);
+        }
+        let resp = server
+            .get(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        let body = resp.json::<serde_json::Value>();
+        assert_ne!(body["display_name"].as_str(), Some("Renamed"), "a refused patch applies nothing");
+        assert_eq!(body["granted_serving_classes"].as_array().map(Vec::len), Some(0));
+        assert_eq!(body["default_serving_class"], serde_json::Value::Null);
+        assert_eq!(body["self_hosted_only"].as_bool(), Some(false));
+
+        // A platform manager operates all three.
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .json(&json!({
+                "granted_serving_classes": ["interactive", "throughput"],
+                "default_serving_class": "throughput",
+                "self_hosted_only": true
+            }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        let body = resp.json::<serde_json::Value>();
+        assert_eq!(body["granted_serving_classes"], json!(["interactive", "throughput"]));
+        assert_eq!(body["default_serving_class"].as_str(), Some("throughput"));
+        assert_eq!(body["self_hosted_only"].as_bool(), Some(true));
+    }
+
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_organization_non_owners_cannot_update_zero_data_retention(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -2339,7 +3716,7 @@ mod tests {
             .post("/admin/api/v1/organizations")
             .add_header(&other_owner_headers[0].0, &other_owner_headers[0].1)
             .add_header(&other_owner_headers[1].0, &other_owner_headers[1].1)
-            .json(&json!({ "name": "other-owner-org", "email": "contact@other-owner-org.com" }))
+            .json(&json!({ "name": "other-owner-org", "email": "contact@example.com" }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
 
@@ -2349,7 +3726,10 @@ mod tests {
             .add_header(&pm_headers[1].0, &pm_headers[1].1)
             .json(&json!({
                 "name": "non-owner-zdr-org",
-                "email": "contact@non-owner-zdr-org.com",
+                // A platform manager creating on someone's behalf is held to
+                // the same rule, keyed on that owner's domain rather than the
+                // manager's.
+                "email": "contact@example.com",
                 "owner_id": owner.id,
             }))
             .await;
@@ -2386,7 +3766,7 @@ mod tests {
         assert_eq!(resp.json::<serde_json::Value>()["zero_data_retention"].as_bool(), Some(false));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_standard_user_cannot_set_owner_id(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -2405,7 +3785,7 @@ mod tests {
 
     // ── Org membership limit ──────────────────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_cannot_create_org_when_at_limit(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -2435,11 +3815,7 @@ mod tests {
         assert!(body.contains("maximum"));
     }
 
-    // ── Leave organization ────────────────────────────────────────────────
-
-    /// Resending necessarily rotates the token: the original is only stored as
-    /// a hash and can't be recovered, so the old link must stop working.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_resend_invite_rotates_the_token(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -2514,9 +3890,562 @@ mod tests {
         (org.id, request.id)
     }
 
+    /// An organization that has claimed `domain`, the way creating a workspace
+    /// does: the domain is the username, so `find_by_domain` matches it.
+    async fn org_claiming_domain(pool: &PgPool, owner_id: uuid::Uuid, domain: &str) -> uuid::Uuid {
+        let mut conn = pool.acquire().await.unwrap();
+        let org = crate::db::handlers::Organizations::new(&mut conn)
+            .create(
+                &crate::db::models::organizations::OrganizationCreateDBRequest {
+                    name: domain.to_string(),
+                    email: format!("billing@{domain}"),
+                    display_name: Some("Acme Corporation".to_string()),
+                    avatar_url: None,
+                    created_by: owner_id,
+                },
+                &[Role::StandardUser],
+            )
+            .await
+            .unwrap();
+        org.id
+    }
+
+    async fn set_auto_join(pool: &PgPool, org_id: uuid::Uuid, enabled: bool) {
+        let mut conn = pool.acquire().await.unwrap();
+        crate::db::handlers::Organizations::new(&mut conn)
+            .set_auto_join_enabled(org_id, enabled)
+            .await
+            .unwrap();
+    }
+
+    /// Park an invitation addressed to `email`, as the invite endpoint would.
+    async fn invite_email_to_org(pool: &PgPool, org_id: uuid::Uuid, inviter_id: uuid::Uuid, email: &str) -> uuid::Uuid {
+        let mut conn = pool.acquire().await.unwrap();
+        crate::db::handlers::Organizations::new(&mut conn)
+            .create_invite(
+                org_id,
+                None,
+                email,
+                "member",
+                inviter_id,
+                "test-token-hash",
+                chrono::Utc::now() + chrono::Duration::days(7),
+            )
+            .await
+            .unwrap()
+            .id
+    }
+
+    fn onboarding_context(
+        server: &axum_test::TestServer,
+        user: &crate::api::models::users::UserResponse,
+    ) -> impl Future<Output = serde_json::Value> {
+        let headers = add_auth_headers(user);
+        let request = server
+            .get("/admin/api/v1/users/current/onboarding-context")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1);
+        async move {
+            let resp = request.await;
+            resp.assert_status_ok();
+            resp.json::<serde_json::Value>()
+        }
+    }
+
+    /// Scenario 3: the domain matches, auto-join is off, and the user is told
+    /// so and left to decide. Nothing is filed for them — that silent filing
+    /// is precisely what this replaces.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_onboarding_context_offers_the_choice_on_a_domain_match(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+        let org_id = org_claiming_domain(&pool, owner.id, "acme.test").await;
+        let joiner = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+
+        let body = onboarding_context(&server, &joiner).await;
+
+        let matched = &body["domain_match"];
+        assert_eq!(matched["organization_id"].as_str().unwrap(), org_id.to_string());
+        assert_eq!(matched["domain"].as_str().unwrap(), "acme.test");
+        assert_eq!(matched["auto_join_enabled"].as_bool().unwrap(), false);
+        assert!(body["invitation"].is_null());
+        assert!(body["join_request"].is_null(), "nothing may be filed on their behalf");
+
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(
+            crate::db::handlers::Organizations::new(&mut conn)
+                .list_join_requests(org_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "reading the context must not queue anything"
+        );
+    }
+
+    /// The match names the domain and nothing else.
+    ///
+    /// Receiving mail at acme.test earns you "your company has a workspace"
+    /// and no more. Leaking the workspace's display name, size or owner would
+    /// turn every signup into a lookup of what a given company runs.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_domain_match_names_only_the_domain(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+        org_claiming_domain(&pool, owner.id, "acme.test").await;
+        let joiner = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+
+        let body = onboarding_context(&server, &joiner).await;
+        let matched = body["domain_match"].as_object().unwrap();
+
+        // Asserted as an exact key set rather than a list of absences: a field
+        // added to the struct later would slip past `get(..).is_none()` checks,
+        // and this response is a disclosure boundary.
+        let mut keys: Vec<&str> = matched.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["auto_join_enabled", "domain", "organization_id"]);
+        assert!(
+            !serde_json::to_string(&body).unwrap().contains("Acme Corporation"),
+            "the workspace's display name must not reach a non-member"
+        );
+    }
+
+    /// Scenario 4: a personal address matches nothing, even if some workspace
+    /// has claimed gmail.com. Otherwise every consumer signup would be told
+    /// their "company" already has a workspace.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_onboarding_context_ignores_personal_domains(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        org_claiming_domain(&pool, owner.id, "gmail.com").await;
+        let consumer = create_test_user_on_domain(&pool, Role::StandardUser, "gmail.com").await;
+
+        let body = onboarding_context(&server, &consumer).await;
+
+        assert!(body["domain_match"].is_null());
+        assert!(body["invitation"].is_null());
+        assert!(body["join_request"].is_null());
+    }
+
+    /// Scenario 1: an explicit invitation is surfaced, with enough to render
+    /// the accept screen — this one *was* a deliberate human decision, so it
+    /// names the organization.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_onboarding_context_surfaces_an_invitation(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let org_id = org_claiming_domain(&pool, owner.id, "elsewhere.test").await;
+        let invitee = create_test_user_on_domain(&pool, Role::StandardUser, "unrelated.test").await;
+        let invite_id = invite_email_to_org(&pool, org_id, owner.id, &invitee.email).await;
+
+        let body = onboarding_context(&server, &invitee).await;
+
+        let invitation = &body["invitation"];
+        assert_eq!(invitation["id"].as_str().unwrap(), invite_id.to_string());
+        assert_eq!(invitation["organization_id"].as_str().unwrap(), org_id.to_string());
+        assert_eq!(invitation["organization_name"].as_str().unwrap(), "Acme Corporation");
+        assert_eq!(invitation["role"].as_str().unwrap(), "member");
+        assert!(body["domain_match"].is_null(), "their own domain claims nothing");
+    }
+
+    /// Once you're in, there is no decision left to offer.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_onboarding_context_goes_quiet_for_a_member(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+        let org_id = org_claiming_domain(&pool, owner.id, "acme.test").await;
+        let member = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+
+        assert!(
+            !onboarding_context(&server, &member).await["domain_match"].is_null(),
+            "offered before they are in"
+        );
+
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            crate::db::handlers::Organizations::new(&mut conn)
+                .add_member(org_id, member.id, "member")
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            onboarding_context(&server, &member).await["domain_match"].is_null(),
+            "and silent once they are"
+        );
+    }
+
+    /// Asking is a thing the user does, and doing it twice is not an error.
+    ///
+    /// The button is real UI: a double-click, a retry after a flaky network,
+    /// or a reloaded tab must not produce a second row or a spurious failure.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_request_access_is_opt_in_and_idempotent(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+        let org_id = org_claiming_domain(&pool, owner.id, "acme.test").await;
+        let joiner = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+        let headers = add_auth_headers(&joiner);
+
+        let ask = || async {
+            let resp = server
+                .post("/admin/api/v1/users/current/join-requests")
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .await;
+            resp.assert_status_ok();
+            resp.json::<serde_json::Value>()
+        };
+
+        let first = ask().await;
+        assert_eq!(first["outcome"].as_str().unwrap(), "requested");
+        assert_eq!(first["organization_id"].as_str().unwrap(), org_id.to_string());
+        let request_id = first["join_request"]["id"].as_str().unwrap().to_string();
+
+        let second = ask().await;
+        assert_eq!(second["outcome"].as_str().unwrap(), "requested");
+        assert_eq!(
+            second["join_request"]["id"].as_str().unwrap(),
+            request_id,
+            "the same request, not a second one"
+        );
+
+        let mut conn = pool.acquire().await.unwrap();
+        let queued = crate::db::handlers::Organizations::new(&mut conn)
+            .list_join_requests(org_id)
+            .await
+            .unwrap();
+        assert_eq!(queued.len(), 1);
+
+        // And the user can now see it, so onboarding renders the sent state.
+        let body = onboarding_context(&server, &joiner).await;
+        assert_eq!(body["join_request"]["id"].as_str().unwrap(), request_id);
+        assert!(
+            !body["domain_match"].is_null(),
+            "still on the intercept screen, now showing the request as sent"
+        );
+    }
+
+    /// Scenario 2, late: the owner switched auto-join on after this user
+    /// signed up, so there is nobody left to ask and they go straight in.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_request_access_joins_immediately_when_auto_join_is_on(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+        let org_id = org_claiming_domain(&pool, owner.id, "acme.test").await;
+        let joiner = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+        set_auto_join(&pool, org_id, true).await;
+        let headers = add_auth_headers(&joiner);
+
+        assert_eq!(
+            onboarding_context(&server, &joiner).await["domain_match"]["auto_join_enabled"]
+                .as_bool()
+                .unwrap(),
+            true,
+            "the client is told not to bother asking"
+        );
+
+        let resp = server
+            .post("/admin/api/v1/users/current/join-requests")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        resp.assert_status_ok();
+        let body = resp.json::<serde_json::Value>();
+        assert_eq!(body["outcome"].as_str().unwrap(), "joined");
+        assert!(body["join_request"].is_null());
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = crate::db::handlers::Organizations::new(&mut conn);
+        assert_eq!(repo.get_user_org_role(joiner.id, org_id).await.unwrap(), Some("member".to_string()));
+        assert!(
+            repo.list_join_requests(org_id).await.unwrap().is_empty(),
+            "nobody was queued — they were admitted"
+        );
+    }
+
+    /// An outstanding invitation must not come back dressed as a join request.
+    ///
+    /// An invitation to someone who already has an account carries their
+    /// `user_id`, so it occupies the same `UNIQUE (user_id, organization_id)`
+    /// slot the request would. The idempotent insert hands that row back, and
+    /// reporting it as `requested` would tell the user to wait for an approval
+    /// they don't need — they hold an invitation they could accept now.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_request_access_reports_an_outstanding_invitation(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+        let org_id = org_claiming_domain(&pool, owner.id, "acme.test").await;
+        let invitee = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+
+        // Invited by address *and* matched by domain, with the row carrying
+        // their user id the way `invite_member` writes it for a known account.
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            crate::db::handlers::Organizations::new(&mut conn)
+                .create_invite(
+                    org_id,
+                    Some(invitee.id),
+                    &invitee.email,
+                    "member",
+                    owner.id,
+                    "test-token-hash",
+                    chrono::Utc::now() + chrono::Duration::days(7),
+                )
+                .await
+                .unwrap();
+        }
+
+        let headers = add_auth_headers(&invitee);
+        let resp = server
+            .post("/admin/api/v1/users/current/join-requests")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        resp.assert_status_ok();
+        let body = resp.json::<serde_json::Value>();
+
+        assert_eq!(body["outcome"].as_str().unwrap(), "invited");
+        assert!(
+            body["join_request"].is_null(),
+            "an invitation's id must not be handed back as a join request"
+        );
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = crate::db::handlers::Organizations::new(&mut conn);
+        assert!(repo.list_join_requests(org_id).await.unwrap().is_empty(), "nothing was queued");
+        assert!(
+            repo.find_pending_invite_for_email(&invitee.email).await.unwrap().is_some(),
+            "and the invitation survives, still acceptable"
+        );
+    }
+
+    /// The organization is resolved from the caller's own address, so a caller
+    /// with no matching domain has nothing to ask and no way to name a target.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_request_access_needs_a_matching_domain(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+        org_claiming_domain(&pool, owner.id, "acme.test").await;
+        let outsider = create_test_user_on_domain(&pool, Role::StandardUser, "elsewhere.test").await;
+        let headers = add_auth_headers(&outsider);
+
+        let resp = server
+            .post("/admin/api/v1/users/current/join-requests")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// Scenario 1's acceptance path. The invitee never opened the emailed
+    /// link — and could not be handed it, since only its hash is stored — so
+    /// they accept by id, proving the mailbox with their own address instead.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_invitation_can_be_accepted_by_id_without_its_token(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let org_id = org_claiming_domain(&pool, owner.id, "acme.test").await;
+        let invitee = create_test_user_on_domain(&pool, Role::StandardUser, "unrelated.test").await;
+        let invite_id = invite_email_to_org(&pool, org_id, owner.id, &invitee.email).await;
+        let headers = add_auth_headers(&invitee);
+
+        let resp = server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/invites/{invite_id}/accept"))
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        resp.assert_status_ok();
+
+        let mut conn = pool.acquire().await.unwrap();
+        assert_eq!(
+            crate::db::handlers::Organizations::new(&mut conn)
+                .get_user_org_role(invitee.id, org_id)
+                .await
+                .unwrap(),
+            Some("member".to_string())
+        );
+
+        // The invitation is spent, so onboarding stops offering it.
+        assert!(onboarding_context(&server, &invitee).await["invitation"].is_null());
+    }
+
+    /// The address comparison is the whole authorization: without it an
+    /// invitation id would be enough to join a stranger's organization.
+    ///
+    /// Reported as 404 rather than 403 — telling a caller "that invitation is
+    /// real, just not yours" confirms a live invitation into a named org.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_invitation_by_id_is_refused_to_anyone_else(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let org_id = org_claiming_domain(&pool, owner.id, "acme.test").await;
+        let invitee = create_test_user_on_domain(&pool, Role::StandardUser, "unrelated.test").await;
+        let invite_id = invite_email_to_org(&pool, org_id, owner.id, &invitee.email).await;
+
+        let stranger = create_test_user_on_domain(&pool, Role::StandardUser, "stranger.test").await;
+        let headers = add_auth_headers(&stranger);
+
+        for action in ["accept", "decline"] {
+            let resp = server
+                .post(&format!("/admin/api/v1/organizations/{org_id}/invites/{invite_id}/{action}"))
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .await;
+            resp.assert_status(axum::http::StatusCode::NOT_FOUND);
+        }
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = crate::db::handlers::Organizations::new(&mut conn);
+        assert_eq!(repo.get_user_org_role(stranger.id, org_id).await.unwrap(), None);
+        assert!(
+            repo.find_invite_by_id(org_id, invite_id).await.unwrap().is_some(),
+            "the real invitee's invitation must survive the attempt"
+        );
+    }
+
+    /// Declining clears it, so onboarding falls through to ordinary setup.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_invitation_can_be_declined_by_id(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let org_id = org_claiming_domain(&pool, owner.id, "acme.test").await;
+        let invitee = create_test_user_on_domain(&pool, Role::StandardUser, "unrelated.test").await;
+        let invite_id = invite_email_to_org(&pool, org_id, owner.id, &invitee.email).await;
+        let headers = add_auth_headers(&invitee);
+
+        let resp = server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/invites/{invite_id}/decline"))
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        resp.assert_status_ok();
+
+        let body = onboarding_context(&server, &invitee).await;
+        assert!(body["invitation"].is_null());
+
+        let mut conn = pool.acquire().await.unwrap();
+        assert_eq!(
+            crate::db::handlers::Organizations::new(&mut conn)
+                .get_user_org_role(invitee.id, org_id)
+                .await
+                .unwrap(),
+            None,
+            "declining must not admit them"
+        );
+    }
+
+    /// Auto-join decides who gets in with nobody reviewing them, so it sits
+    /// beside zero data retention on the owner-only side of the line.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_auto_join_is_owner_only(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+        let org_id = org_claiming_domain(&pool, owner.id, "acme.test").await;
+        let admin = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            crate::db::handlers::Organizations::new(&mut conn)
+                .add_member(org_id, admin.id, "admin")
+                .await
+                .unwrap();
+        }
+
+        let admin_headers = add_auth_headers(&admin);
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .json(&json!({ "auto_join_enabled": true }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::FORBIDDEN);
+
+        let owner_headers = add_auth_headers(&owner);
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "auto_join_enabled": true }))
+            .await;
+        resp.assert_status_ok();
+        assert_eq!(resp.json::<serde_json::Value>()["auto_join_enabled"].as_bool().unwrap(), true);
+
+        let resp = server
+            .get(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .await;
+        resp.assert_status_ok();
+        assert_eq!(
+            resp.json::<serde_json::Value>()["auto_join_enabled"].as_bool().unwrap(),
+            true,
+            "and it survives the round trip"
+        );
+    }
+
+    /// Off unless someone turns it on — including for every organization that
+    /// existed before the setting did.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_auto_join_defaults_off(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+        let org_id = org_claiming_domain(&pool, owner.id, "acme.test").await;
+        let headers = add_auth_headers(&owner);
+
+        let resp = server
+            .get(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        resp.assert_status_ok();
+        assert_eq!(resp.json::<serde_json::Value>()["auto_join_enabled"].as_bool().unwrap(), false);
+    }
+
+    /// Someone else's onboarding context is not readable.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_onboarding_context_is_not_readable_for_others(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let target = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+        let snooper = create_test_user_on_domain(&pool, Role::StandardUser, "elsewhere.test").await;
+        let headers = add_auth_headers(&snooper);
+
+        for path in [
+            format!("/admin/api/v1/users/{}/onboarding-context", target.id),
+            format!("/admin/api/v1/users/{}/join-requests", target.id),
+        ] {
+            let resp = server
+                .get(&path)
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .await;
+            resp.assert_status(axum::http::StatusCode::FORBIDDEN);
+        }
+
+        let resp = server
+            .post(&format!("/admin/api/v1/users/{}/join-requests", target.id))
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::FORBIDDEN);
+    }
+
     /// The queue names people who share your email domain, so it's gated on
     /// managing the org — being a member of it isn't enough.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_join_requests_hidden_from_ordinary_members(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -2551,7 +4480,82 @@ mod tests {
         assert_eq!(resp.json::<serde_json::Value>().as_array().unwrap().len(), 1);
     }
 
-    #[sqlx::test]
+    /// Who gets told about a join request. Owners and admins can act on one;
+    /// plain members cannot, and a pending or requested row is not a person
+    /// with authority to approve anything.
+    #[dwctl_test_macros::test]
+    async fn test_list_admin_emails_covers_only_those_who_can_decide(pool: PgPool) {
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let admin = create_test_user(&pool, Role::StandardUser).await;
+        let member = create_test_user(&pool, Role::StandardUser).await;
+        let joiner = create_test_user(&pool, Role::StandardUser).await;
+        let (org_id, _request_id) = org_with_join_request(&pool, owner.id, joiner.id).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = crate::db::handlers::Organizations::new(&mut conn);
+        repo.add_member(org_id, admin.id, "admin").await.unwrap();
+        repo.add_member(org_id, member.id, "member").await.unwrap();
+
+        let emails = repo.list_admin_emails(org_id).await.unwrap();
+
+        assert!(emails.contains(&owner.email), "the owner decides");
+        assert!(emails.contains(&admin.email), "admins decide");
+        assert!(!emails.contains(&member.email), "a plain member cannot approve");
+        assert!(
+            !emails.contains(&joiner.email),
+            "the requester is not notified of their own request"
+        );
+        assert_eq!(emails.len(), 2);
+    }
+
+    /// A soft-deleted owner keeps their `users` row and their membership, so
+    /// without the filter the workspace would keep mailing a closed account.
+    #[dwctl_test_macros::test]
+    async fn test_list_admin_emails_skips_deleted_accounts(pool: PgPool) {
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let admin = create_test_user(&pool, Role::StandardUser).await;
+        let joiner = create_test_user(&pool, Role::StandardUser).await;
+        let (org_id, _request_id) = org_with_join_request(&pool, owner.id, joiner.id).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        crate::db::handlers::Organizations::new(&mut conn)
+            .add_member(org_id, admin.id, "admin")
+            .await
+            .unwrap();
+        // `delete` is the soft-delete on the `Repository` trait; the tests
+        // module doesn't `use super::*`, so bring it into scope here.
+        use crate::db::handlers::Repository as _;
+        crate::db::handlers::Users::new(&mut conn).delete(admin.id).await.unwrap();
+
+        let emails = crate::db::handlers::Organizations::new(&mut conn)
+            .list_admin_emails(org_id)
+            .await
+            .unwrap();
+
+        assert_eq!(emails, vec![owner.email], "only the live owner is left to tell");
+    }
+
+    /// The approval hands back who was approved, so exactly one caller can
+    /// mail them. A second, racing approval finds nothing to update and gets
+    /// `None` — otherwise every admin who pressed the button would send a
+    /// duplicate "you're in" email.
+    #[dwctl_test_macros::test]
+    async fn test_approve_join_request_returns_the_approved_user_once(pool: PgPool) {
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let joiner = create_test_user(&pool, Role::StandardUser).await;
+        let (org_id, request_id) = org_with_join_request(&pool, owner.id, joiner.id).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = crate::db::handlers::Organizations::new(&mut conn);
+
+        let approved = repo.approve_join_request(org_id, request_id, "member").await.unwrap();
+        assert_eq!(approved, Some(joiner.id), "the caller learns who to tell");
+
+        let again = repo.approve_join_request(org_id, request_id, "member").await.unwrap();
+        assert_eq!(again, None, "a second approval has nobody new to notify");
+    }
+
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_approve_join_request_makes_an_active_member(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -2594,7 +4598,7 @@ mod tests {
     /// Declining removes the row rather than tombstoning it, so the user can
     /// ask again - a permanent record would silently block them forever via
     /// the unique constraint on (user_id, organization_id).
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_decline_join_request_allows_asking_again(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -2620,7 +4624,7 @@ mod tests {
     }
 
     /// Managing one org must not grant authority over another's queue.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_join_request_decisions_are_scoped_to_their_org(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -2649,7 +4653,128 @@ mod tests {
         assert_eq!(role, None, "the request must still be outstanding");
     }
 
-    #[sqlx::test]
+    /// The requester can't read the organization-scoped queue - that's gated on
+    /// managing the org, which they can't do until they're approved. Without a
+    /// user-scoped view, a request filed on their behalf at signup would be
+    /// invisible to the only person waiting on it.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_user_sees_their_own_pending_join_request(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let joiner = create_test_user(&pool, Role::StandardUser).await;
+        let (org_id, request_id) = org_with_join_request(&pool, owner.id, joiner.id).await;
+        let joiner_headers = add_auth_headers(&joiner);
+
+        // The org-scoped queue stays shut to them.
+        let resp = server
+            .get(&format!("/admin/api/v1/organizations/{org_id}/join-requests"))
+            .add_header(&joiner_headers[0].0, &joiner_headers[0].1)
+            .add_header(&joiner_headers[1].0, &joiner_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::FORBIDDEN);
+
+        let resp = server
+            .get("/admin/api/v1/users/current/join-requests")
+            .add_header(&joiner_headers[0].0, &joiner_headers[0].1)
+            .add_header(&joiner_headers[1].0, &joiner_headers[1].1)
+            .await;
+        resp.assert_status_ok();
+        let body = resp.json::<serde_json::Value>();
+        let items = body.as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["id"].as_str().unwrap(), request_id.to_string());
+        assert_eq!(items[0]["organization_id"].as_str().unwrap(), org_id.to_string());
+        assert!(items[0]["organization_name"].as_str().is_some_and(|n| !n.is_empty()));
+
+        // It carries only the organization's identity - nothing about who else
+        // is in it, or is queued for it.
+        assert!(items[0].get("user").is_none());
+        assert!(items[0].get("member_count").is_none());
+    }
+
+    /// Approval is the end of the request, so the banner it drives must clear
+    /// on its own rather than lingering after the user is already inside.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_own_join_requests_clear_once_decided(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let joiner = create_test_user(&pool, Role::StandardUser).await;
+        let (org_id, request_id) = org_with_join_request(&pool, owner.id, joiner.id).await;
+        let joiner_headers = add_auth_headers(&joiner);
+        let owner_headers = add_auth_headers(&owner);
+
+        let resp = server
+            .get("/admin/api/v1/users/current/join-requests")
+            .add_header(&joiner_headers[0].0, &joiner_headers[0].1)
+            .add_header(&joiner_headers[1].0, &joiner_headers[1].1)
+            .await;
+        resp.assert_status_ok();
+        assert_eq!(
+            resp.json::<serde_json::Value>().as_array().unwrap().len(),
+            1,
+            "outstanding before the decision"
+        );
+
+        let resp = server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/join-requests/{request_id}/approve"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::NO_CONTENT);
+
+        let resp = server
+            .get("/admin/api/v1/users/current/join-requests")
+            .add_header(&joiner_headers[0].0, &joiner_headers[0].1)
+            .add_header(&joiner_headers[1].0, &joiner_headers[1].1)
+            .await;
+        resp.assert_status_ok();
+        assert!(
+            resp.json::<serde_json::Value>().as_array().unwrap().is_empty(),
+            "an approved request is no longer pending"
+        );
+
+        // The membership it became is visible in the place that does list it.
+        let resp = server
+            .get("/admin/api/v1/users/current/organizations")
+            .add_header(&joiner_headers[0].0, &joiner_headers[0].1)
+            .add_header(&joiner_headers[1].0, &joiner_headers[1].1)
+            .await;
+        resp.assert_status_ok();
+        assert_eq!(resp.json::<serde_json::Value>().as_array().unwrap().len(), 1);
+    }
+
+    /// Requests are the caller's own business: one user must not be able to
+    /// enumerate which organizations another has asked to join.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_own_join_requests_are_not_readable_by_other_users(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let joiner = create_test_user(&pool, Role::StandardUser).await;
+        let (_org_id, _) = org_with_join_request(&pool, owner.id, joiner.id).await;
+
+        let snooper = create_test_user(&pool, Role::StandardUser).await;
+        let snooper_headers = add_auth_headers(&snooper);
+        let resp = server
+            .get(&format!("/admin/api/v1/users/{}/join-requests", joiner.id))
+            .add_header(&snooper_headers[0].0, &snooper_headers[0].1)
+            .add_header(&snooper_headers[1].0, &snooper_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::FORBIDDEN);
+
+        // Their own list is unaffected by the attempt, and empty.
+        let resp = server
+            .get("/admin/api/v1/users/current/join-requests")
+            .add_header(&snooper_headers[0].0, &snooper_headers[0].1)
+            .add_header(&snooper_headers[1].0, &snooper_headers[1].1)
+            .await;
+        resp.assert_status_ok();
+        assert!(resp.json::<serde_json::Value>().as_array().unwrap().is_empty());
+    }
+
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_member_can_leave_organization(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -2698,7 +4823,7 @@ mod tests {
         assert_eq!(members.len(), 1); // Only owner remains
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_last_owner_cannot_leave(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -2726,7 +4851,7 @@ mod tests {
         assert!(body.contains("last owner"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_non_member_cannot_leave(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -2758,7 +4883,7 @@ mod tests {
 
     // ── Last-owner guard ─────────────────────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_cannot_remove_last_owner(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -2788,7 +4913,7 @@ mod tests {
         assert!(body.contains("last owner"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_can_remove_owner_when_another_exists(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -2826,7 +4951,7 @@ mod tests {
         resp.assert_status(axum::http::StatusCode::NO_CONTENT);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_cannot_demote_last_owner(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -2859,7 +4984,7 @@ mod tests {
 
     // ── Privilege escalation prevention ──────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_admin_cannot_assign_owner_role(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -2909,7 +5034,7 @@ mod tests {
         resp.assert_status(axum::http::StatusCode::FORBIDDEN);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_admin_cannot_add_member_as_owner(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -2950,7 +5075,7 @@ mod tests {
         resp.assert_status(axum::http::StatusCode::FORBIDDEN);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_owner_can_assign_owner_role(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -2983,7 +5108,7 @@ mod tests {
         assert_eq!(body["role"].as_str().unwrap(), "owner");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_can_assign_owner_role(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3017,7 +5142,7 @@ mod tests {
 
     // ── Validation endpoint ──────────────────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_set_active_organization_validates_membership(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3069,7 +5194,7 @@ mod tests {
         resp.assert_status(axum::http::StatusCode::OK);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_set_active_org_cookie_includes_domain_when_configured(pool: PgPool) {
         let mut config = create_test_config();
@@ -3117,7 +5242,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_set_active_org_cookie_omits_domain_when_not_configured(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3211,7 +5336,7 @@ mod tests {
             .await
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_patch_org_with_invalid_email_rejected(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3243,7 +5368,7 @@ mod tests {
         assert_eq!(body["email"].as_str().unwrap(), "billing@example.com");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_patch_org_email_does_not_apply_immediately(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3273,6 +5398,10 @@ mod tests {
         );
         assert_eq!(body["pending_email_change"]["new_email"].as_str().unwrap(), "attacker@example.com");
         assert!(body["pending_email_change"]["expires_at"].is_string());
+        // Neither side has clicked yet — both confirmation timestamps are
+        // surfaced as explicit nulls so the dashboard can say "waiting on both".
+        assert!(body["pending_email_change"]["new_email_confirmed_at"].is_null());
+        assert!(body["pending_email_change"]["old_email_confirmed_at"].is_null());
 
         // Re-fetch to make sure the field really wasn't written.
         let resp = server
@@ -3285,7 +5414,7 @@ mod tests {
         assert_eq!(body["email"].as_str().unwrap(), "billing@example.com");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_patch_org_display_name_still_applies_when_email_pending(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3309,7 +5438,7 @@ mod tests {
         assert_eq!(body["pending_email_change"]["new_email"].as_str().unwrap(), "new@example.com");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_patch_org_with_same_email_is_noop(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3342,7 +5471,7 @@ mod tests {
         assert_eq!(count, 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_neither_side_alone_applies_email_change(pool: PgPool) {
         // The security claim of double-opt-in: confirming only ONE side
@@ -3387,7 +5516,7 @@ mod tests {
         assert!(row.1.is_none(), "old side should NOT be confirmed");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_both_sides_confirm_applies_change_in_any_order(pool: PgPool) {
         // Two scenarios in one test: click new-then-old, and click old-then-new.
@@ -3451,7 +5580,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_confirm_email_change_invalid_token(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3461,7 +5590,7 @@ mod tests {
         assert!(resp.text().contains("invalid"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_expired_token_returns_not_found(pool: PgPool) {
         // The UPDATE in confirm_*_email_side filters `expires_at > NOW()`, so
@@ -3494,7 +5623,7 @@ mod tests {
         assert_eq!(resp.json::<serde_json::Value>()["email"].as_str().unwrap(), "billing@example.com");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_second_email_change_supersedes_first(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3527,7 +5656,7 @@ mod tests {
         assert_eq!(rows, vec![("two@example.com".to_string(), owner.id)]);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_superseded_tokens_become_inert(pool: PgPool) {
         // After a second PATCH, BOTH of the *first* request's tokens must be
@@ -3569,7 +5698,7 @@ mod tests {
         assert_eq!(resp.json::<serde_json::Value>()["email"].as_str().unwrap(), "billing@example.com");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_confirm_token_cannot_be_replayed(pool: PgPool) {
         // Each side's UPDATE filters on `*_confirmed_at IS NULL`, so replaying
@@ -3594,7 +5723,7 @@ mod tests {
             .assert_status(axum::http::StatusCode::NOT_FOUND);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_org_with_invalid_email_rejected(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3616,7 +5745,7 @@ mod tests {
     // flow. A future refactor of `can_manage_org_resource` that broadens
     // access would be caught here.
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_plain_member_cannot_patch_org_email(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3655,7 +5784,7 @@ mod tests {
         assert_eq!(count, 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_non_member_cannot_patch_org_email(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3683,7 +5812,7 @@ mod tests {
         assert_eq!(count, 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_can_patch_org_email_without_membership(pool: PgPool) {
         // A platform manager who is NOT a member of the org must still be able
@@ -3709,7 +5838,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_token_for_one_org_cannot_affect_another(pool: PgPool) {
         // Per-row tenancy: a token issued for org A must never change org B's
@@ -3749,7 +5878,7 @@ mod tests {
         assert_eq!(resp.json::<serde_json::Value>()["email"].as_str().unwrap(), "b@example.com");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_soft_deleted_org_cannot_have_email_changed_via_token(pool: PgPool) {
         // If an org is soft-deleted between PATCH and click, both tokens must
@@ -3787,7 +5916,7 @@ mod tests {
         assert_eq!(count, 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_patch_writes_both_verification_emails(pool: PgPool) {
         // The file transport in the default test config writes each email to
@@ -3854,7 +5983,7 @@ mod tests {
 
     // ── MX-record deliverability check ─────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_mx_check_rejects_undeliverable_domain(pool: PgPool) {
         // RFC 6761 reserves `.invalid` as a TLD that must always NXDOMAIN.
@@ -3886,7 +6015,7 @@ mod tests {
 
     // ── Pending state visibility ──────────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_org_surfaces_pending_email_change(pool: PgPool) {
         // A dashboard refresh mid-verification should still see the pending
@@ -3925,7 +6054,7 @@ mod tests {
         assert!(body["pending_email_change"]["expires_at"].is_string());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_patch_other_fields_still_reports_pending_email_change(pool: PgPool) {
         // After initiating an email change, a follow-up PATCH that touches
@@ -3967,7 +6096,7 @@ mod tests {
 
     // ── Additive manage_keys org role (per-member key governance) ─────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_member_manage_keys_grant_lifecycle(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3980,7 +6109,7 @@ mod tests {
             .post("/admin/api/v1/organizations")
             .add_header(&owner_headers[0].0, &owner_headers[0].1)
             .add_header(&owner_headers[1].0, &owner_headers[1].1)
-            .json(&json!({ "name": "keyrole-org", "email": "contact@keyrole-org.com" }))
+            .json(&json!({ "name": "keyrole-org", "email": "contact@example.com" }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();

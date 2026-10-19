@@ -56,6 +56,9 @@ export function buildFallbackStatusCodes({
 }
 
 export interface FallbackUpdateInput extends FallbackStatusFlags {
+  originalRealtimeStatuses: readonly number[];
+  /** Fail realtime traffic over when a provider sheds load with 529. */
+  onRealtime529: boolean;
   fallbackEnabled: boolean;
   fallbackOnRateLimit: boolean;
   withReplacement: boolean;
@@ -66,6 +69,7 @@ export interface FallbackUpdatePayload {
   fallback_enabled: boolean;
   fallback_on_rate_limit: boolean;
   fallback_on_status: number[];
+  fallback_realtime_on_status: number[];
   fallback_with_replacement: boolean;
   fallback_max_attempts: number | null;
 }
@@ -79,6 +83,11 @@ export function buildFallbackUpdatePayload(
       ? input.fallbackOnRateLimit
       : false,
     fallback_on_status: buildFallbackStatusCodes(input),
+    fallback_realtime_on_status: reconcileStatus(
+      [...input.originalRealtimeStatuses],
+      529,
+      input.onRealtime529,
+    ),
     fallback_with_replacement: input.fallbackEnabled
       ? input.withReplacement
       : false,

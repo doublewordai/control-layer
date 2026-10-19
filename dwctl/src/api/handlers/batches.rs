@@ -321,6 +321,10 @@ fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&st
         sync_id: raw_metadata.get("dw_sync_id").cloned(),
     };
 
+    // Model label cached on the batch at creation time: surfaced as the typed
+    // `model` field, stripped from caller-visible metadata below.
+    let model = raw_metadata.get("dw_model").cloned();
+
     // Build user-facing metadata: filter out internal dw_* keys.
     // Keep request_source, created_by_email, context_name, context_type for backwards compat.
     let internal_keys = [
@@ -332,6 +336,8 @@ fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&st
         // Recorded for analytics, not for the caller: echoing a client's own User-Agent
         // back at it tells it nothing it didn't just send us.
         "dw_user_agent",
+        // Surfaced as the typed `model` field instead.
+        "dw_model",
     ];
     let mut metadata: HashMap<String, String> = raw_metadata
         .into_iter()
@@ -464,8 +470,21 @@ fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&st
             failed: batch.failed_requests,
         },
         metadata: if metadata.is_empty() { None } else { Some(metadata) },
+        model,
         analytics: None,
         dwext: if dwext.is_empty() { None } else { Some(dwext) },
+    }
+}
+
+/// Collapse the distinct models behind a batch into the single label the
+/// public UI shows per batch: the alias when homogeneous, `"mixed"` otherwise.
+/// Cached on the batch as `dw_model` metadata at creation time so list/get
+/// responses never aggregate over `request_templates`.
+pub(crate) fn batch_model_label(models: &[String]) -> Option<String> {
+    match models {
+        [] => None,
+        [only] => Some(only.clone()),
+        _ => Some("mixed".to_string()),
     }
 }
 
@@ -483,13 +502,14 @@ async fn fetch_creator_email(db: &sqlx::PgPool, batch: &fusillade::Batch) -> Opt
 /// Metadata keys the server owns. A caller-supplied value for any of these is dropped at
 /// creation rather than merged: they are either injected server-side during response
 /// enrichment, or they are provenance, which is worth nothing if the caller can set it.
-const RESERVED_METADATA_KEYS: [&str; 6] = [
+const RESERVED_METADATA_KEYS: [&str; 7] = [
     "created_by_email",
     "context_name",
     "context_type",
     "request_source",
     "created_by",
     "dw_user_agent",
+    "dw_model",
 ];
 
 /// Whether a caller-supplied metadata key collides with a reserved one, comparing the
@@ -574,13 +594,18 @@ pub async fn create_batch<P: PoolProvider>(
         let mut conn = state.db.write().acquire().await.map_err(|e| Error::Internal {
             operation: format!("get db connection for credit check: {}", e),
         })?;
+        // An owner may have switched the batch API off for the workspace.
+        // Checked on the same account the batch bills to, before any work.
+        crate::api::handlers::modalities::ensure_batch_enabled(&mut conn, balance_check_id).await?;
         let balance = Credits::new(&mut conn)
-            .get_user_balance(balance_check_id)
+            .get_balance_for_admission(balance_check_id)
             .await
             .map_err(|e| Error::Internal {
                 operation: format!("check credit balance: {}", e),
             })?;
-        if balance < rust_decimal::Decimal::ZERO {
+        if let Some(balance) = balance
+            && balance < rust_decimal::Decimal::ZERO
+        {
             return Err(Error::InsufficientCredits {
                 current_balance: balance,
                 message: "Account balance too low. Please add credits to continue.".to_string(),
@@ -623,17 +648,19 @@ pub async fn create_batch<P: PoolProvider>(
         && let Ok(file_owner_id) = uuid::Uuid::parse_str(uploaded_by)
     {
         let file_owner_id = crate::types::UserId::from(file_owner_id);
-        if file_owner_id != current_user.id {
+        if file_owner_id != balance_check_id {
             let mut conn = state.db.write().acquire().await.map_err(|e| Error::Internal {
                 operation: format!("get db connection for file owner credit check: {}", e),
             })?;
             let owner_balance = Credits::new(&mut conn)
-                .get_user_balance(file_owner_id)
+                .get_balance_for_admission(file_owner_id)
                 .await
                 .map_err(|e| Error::Internal {
                     operation: format!("check file owner credit balance: {}", e),
                 })?;
-            if owner_balance < rust_decimal::Decimal::ZERO {
+            if let Some(owner_balance) = owner_balance
+                && owner_balance < rust_decimal::Decimal::ZERO
+            {
                 let owner_name = {
                     let mut users_repo = Users::new(&mut conn);
                     users_repo
@@ -785,6 +812,32 @@ pub async fn create_batch<P: PoolProvider>(
             .resolve_batch_execution_key(target_user_id, attribution_user_id, authenticating_key_id)
             .await
             .map_err(Error::Database)?;
+        // A capped authenticating key can resolve to a different billing
+        // account than the active organization. Check the execution key's
+        // owner independently; the organization's opt-in must not cover it.
+        let execution_account_id = ApiKeys::new(&mut conn)
+            .get_by_id(key_id)
+            .await
+            .map_err(Error::Database)?
+            .ok_or_else(|| Error::NotFound {
+                resource: "API key".to_string(),
+                id: key_id.to_string(),
+            })?
+            .user_id;
+        if execution_account_id != balance_check_id {
+            let balance = Credits::new(&mut conn)
+                .get_balance_for_admission(execution_account_id)
+                .await
+                .map_err(Error::Database)?;
+            if let Some(balance) = balance
+                && balance < rust_decimal::Decimal::ZERO
+            {
+                return Err(Error::InsufficientCredits {
+                    current_balance: balance,
+                    message: "Execution key account balance too low. Please add credits to continue.".to_string(),
+                });
+            }
+        }
         // Spending-cap pre-flight, beside the balance gate above: if the
         // execution key's cap scope is already exhausted, reject up front
         // instead of accepting a batch whose every request would be refused
@@ -794,8 +847,8 @@ pub async fn create_batch<P: PoolProvider>(
                 message: "The API key used for this batch has reached its spending cap. Raise or remove the cap, or wait for the cap window to reset, then resubmit.".to_string(),
             });
         }
-        // Resolve the creditor's verified flag on the same connection (the org in
-        // org context, else the user) for the volume cap below — no extra acquire.
+        // Verification and outstanding-volume accounting use the same active
+        // account. Execution-account balance admission is checked separately.
         let verified = Users::new(&mut conn).is_verified(target_user_id).await?;
         (secret, key_id, verified)
     };
@@ -825,6 +878,14 @@ pub async fn create_batch<P: PoolProvider>(
     // `x-fusillade-batch-dw-user-agent` and the batch object doesn't echo it back.
     if let Some(user_agent) = creator_user_agent {
         metadata_map.insert("dw_user_agent".to_string(), user_agent);
+    }
+    // Cache the batch's model label at creation — the template counts are
+    // already loaded for validation, so this costs nothing. Response
+    // enrichment surfaces it as the typed `model` field; list/get never have
+    // to aggregate over request_templates.
+    let model_aliases_for_label: Vec<String> = file_model_counts.keys().cloned().collect();
+    if let Some(label) = batch_model_label(&model_aliases_for_label) {
+        metadata_map.insert("dw_model".to_string(), label);
     }
     let metadata = serde_json::to_value(metadata_map).ok();
 
@@ -934,7 +995,9 @@ pub async fn create_batch<P: PoolProvider>(
     // batch.created webhook deliveries are created by the notification poller
     // which polls fusillade.batches for new records.
 
-    // For create, we have the current user's email directly
+    // For create, we have the current user's email directly. The model label
+    // rides on the batch's stored metadata (`dw_model`, injected above) and is
+    // surfaced by response enrichment.
     Ok((
         StatusCode::CREATED,
         Json(to_batch_response_with_email(batch, Some(&current_user.email))),
@@ -946,8 +1009,8 @@ async fn load_and_validate_batch_models<P: PoolProvider>(
     file_id: Uuid,
 ) -> Result<(HashMap<String, i64>, BatchModelInfo)> {
     let file_model_counts = {
-        let mut templates_conn = state.request_manager.pool().acquire().await.map_err(|e| Error::Internal {
-            operation: format!("get primary Fusillade connection for batch model counts: {e}"),
+        let mut templates_conn = state.request_manager.begin_write().await.map_err(|e| Error::Internal {
+            operation: format!("begin primary Fusillade transaction for batch model counts: {e}"),
         })?;
         BatchTemplates::new(&mut templates_conn)
             .get_model_counts(file_id)
@@ -971,8 +1034,8 @@ async fn load_and_validate_batch_models<P: PoolProvider>(
         (batch_model_info, reasoning_policies)
     };
 
-    let mut templates_conn = state.request_manager.pool().acquire().await.map_err(|e| Error::Internal {
-        operation: format!("get primary Fusillade connection for batch request validation: {e}"),
+    let mut templates_conn = state.request_manager.begin_write().await.map_err(|e| Error::Internal {
+        operation: format!("begin primary Fusillade transaction for batch request validation: {e}"),
     })?;
     let mut templates = BatchTemplates::new(&mut templates_conn);
     let mut stream = templates.stream_reasoning_requests(file_id);
@@ -1044,11 +1107,13 @@ async fn get_model_ids_by_aliases<P: PoolProvider>(state: &AppState<P>, model_al
 /// ## Three-phase pipeline
 ///
 /// ```text
-/// Phase 1 — Reserve   (this fn, ~1 ms)
+/// Phase 1 — Reserve   (this fn)
+///   ├─ read pending request counts      (fusillade write pool, OUTSIDE the lock;
+///   │                                     the expensive read — scales with backlog)
 ///   ├─ BEGIN tx on dwctl write pool
 ///   ├─ pg_advisory_xact_lock per (model_id, window)  ← serialises concurrent reservations
-///   ├─ read active reservations         (dwctl write pool, inside tx)
-///   ├─ read pending request counts      (fusillade write pool, separate connection)
+///   ├─ read reservations                (dwctl write pool, inside tx: active ones plus
+///   │                                     any released since the pending snapshot)
 ///   ├─ check combined capacity
 ///   ├─ INSERT reservation rows
 ///   └─ COMMIT  ← lock released, reservation visible to peers
@@ -1065,32 +1130,38 @@ async fn get_model_ids_by_aliases<P: PoolProvider>(state: &AppState<P>, model_al
 /// can read-check-then-insert at a time. Locks are acquired in deterministic UUID order
 /// to prevent deadlocks when a batch spans multiple models.
 ///
+/// The pending-count read is deliberately kept *outside* the lock. It is the only
+/// expensive step (it reads every active request of the requested models), so holding
+/// the lock across it would head-of-line block every concurrent submission for the same
+/// model+window behind the slowest count — and a count that hit its statement timeout
+/// stalled all of them for the full timeout. Outside the lock, a slow count degrades one
+/// submission instead of blocking all of them.
+///
 /// ## Read ordering and the fail-safe race window
 ///
 /// The two capacity reads come from **different connection pools** (dwctl vs. fusillade),
 /// so they hold independent PostgreSQL snapshots under `READ COMMITTED`. There is an
 /// unavoidable, tiny race window at the exact moment a concurrent batch finishes
 /// `create_batch` and its reservation is released — the "swap point" where requests
-/// transition from a reservation into committed pending rows. A new caller straddling
-/// this swap point could theoretically see inconsistent state across the two reads.
+/// transition from a reservation into committed pending rows.
 ///
-/// The read order here is deliberately chosen to make that race **fail-safe**:
+/// Because pending rows are read **first** (outside the lock) and reservations
+/// **second** (inside it), a batch swapping between the two reads would naively appear
+/// in **neither** — it wasn't committed when the rows were counted, and it was already
+/// released when the reservations were summed. To make the race fail-safe, the
+/// reservation read also counts reservations *released at or after* the instant the
+/// pending snapshot was taken (`released_since`). That instant is read from the dwctl
+/// database, so it shares a clock with `released_at`, and it is read before the pending
+/// snapshot, so any reservation released earlier than it belongs to a batch whose rows
+/// were already committed and therefore counted by the snapshot.
 ///
-/// - Reservations are read **first** (dwctl tx, inside the advisory lock).
-/// - Pending counts are read **second** (fusillade pool, outside the lock).
-///
-/// If the swap point falls between these two reads, the concurrent batch appears in
-/// **both** counts — as a reservation that hasn't been released yet, and as committed
-/// pending requests that have just landed. This double-counts the batch, causing a
-/// conservative over-estimate of load that leads to **under-acceptance** rather than
-/// over-acceptance.
-///
-/// The opposite ordering (pending first, reservations second) produces the dangerous
-/// case: the swap point could cause both reads to return zero, making the system
-/// appear completely idle and over-accepting the incoming batch.
+/// A batch that swaps during the window is then counted via its recently released
+/// reservation — and, if it committed just before the snapshot, possibly by both reads.
+/// That double count is a conservative over-estimate of load that leads to
+/// **under-acceptance** rather than over-acceptance.
 ///
 /// In short: the race is an inherent consequence of reading across two independent
-/// connections, but the read order ensures it always errs on the side of caution.
+/// connections, but the released-since rule ensures it always errs on the side of caution.
 /// Thin wrapper around the shared `reserve_capacity` for the API handler context.
 /// Converts `CapacityError` to the API's `Error` type.
 async fn reserve_capacity_for_batch<P: PoolProvider>(
@@ -1117,7 +1188,7 @@ async fn reserve_capacity_for_batch<P: PoolProvider>(
 
     // Use the write pool for the reservation transaction
     let pool = state.db.write();
-    reserve_capacity(pool, &*state.request_manager, &input).await.map_err(|e| match e {
+    reserve_capacity(&pool, &*state.request_manager, &input).await.map_err(|e| match e {
         CapacityError::InsufficientCapacity { completion_window, models } => Error::TooManyRequests {
             message: format!(
                 "Insufficient capacity for {} completion window. The following models are currently at capacity: {}. Try again later or use a longer completion window.",
@@ -1129,7 +1200,7 @@ async fn reserve_capacity_for_batch<P: PoolProvider>(
 }
 
 async fn release_capacity_reservations<P: PoolProvider>(state: &AppState<P>, reservation_ids: &[Uuid]) -> Result<()> {
-    super::sla_capacity::release_reservations(state.db.write(), reservation_ids)
+    super::sla_capacity::release_reservations(&state.db.write(), reservation_ids)
         .await
         .map_err(|msg| Error::Internal { operation: msg })
 }
@@ -1341,7 +1412,7 @@ pub async fn get_batch_analytics<P: PoolProvider>(
     // hasn't been folded yet (brand new / no completed requests), not that data aged out, so
     // return a zero-valued payload rather than 404. Ownership/existence is already enforced
     // above, and platform managers expect to see metrics for any batch they can access.
-    let analytics = crate::db::handlers::analytics::get_batch_analytics(state.db.read(), &batch_id)
+    let analytics = crate::db::handlers::analytics::get_batch_analytics(&state.db.read(), &batch_id)
         .await
         .map_err(|e| Error::Internal {
             operation: format!("fetch batch analytics: {}", e),
@@ -1364,6 +1435,7 @@ Supports pagination via `limit` and `skip` query parameters, and filtering by `c
     responses(
         (status = 200, description = "Batch results as newline-delimited JSON. Check the `X-Incomplete` header to determine if more results exist.", content_type = "application/x-ndjson"),
         (status = 404, description = "Batch not found or you don't have access to it."),
+        (status = 410, description = "The batch's output or error file has been deleted, so its results are no longer available. Results whose input file was deleted are still returned, with `input_body` set to null."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
@@ -1398,6 +1470,32 @@ pub async fn get_batch_results<P: PoolProvider>(
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str.clone(),
+        });
+    }
+
+    // The output and error files are virtual and created with the batch, so a
+    // missing id can only mean the user deleted that file. Deleting a results
+    // file is the user's statement that those results should be gone, and this
+    // endpoint must not serve them through a side door. Report 410 and say which
+    // file went. (A deleted *input* file is different: the results still exist,
+    // they just come back without input bodies, so that case streams normally.)
+    let deleted_results_files: Vec<&str> = [
+        (batch.output_file_id.is_none(), "output file"),
+        (batch.error_file_id.is_none(), "error file"),
+    ]
+    .into_iter()
+    .filter_map(|(deleted, name)| deleted.then_some(name))
+    .collect();
+    if !deleted_results_files.is_empty() {
+        return Err(Error::Gone {
+            message: format!(
+                "Results for batch {} are no longer available: its {} deleted.",
+                batch_id_str,
+                match deleted_results_files.as_slice() {
+                    [one] => format!("{one} has been"),
+                    _ => "output and error files have been".to_string(),
+                }
+            ),
         });
     }
 
@@ -1582,7 +1680,7 @@ pub async fn cancel_batch<P: PoolProvider>(
     tracing::debug!("Batch {} cancelled", batch_id);
 
     // Fetch creator email for the response
-    let creator_email = fetch_creator_email(state.db.read(), &batch).await;
+    let creator_email = fetch_creator_email(&state.db.read(), &batch).await;
     Ok(Json(to_batch_response_with_email(batch, creator_email.as_deref())))
 }
 
@@ -1735,7 +1833,7 @@ pub async fn retry_failed_batch_requests<P: PoolProvider>(
         })?;
 
     // Fetch creator email for the response
-    let creator_email = fetch_creator_email(state.db.read(), &batch).await;
+    let creator_email = fetch_creator_email(&state.db.read(), &batch).await;
     Ok(Json(to_batch_response_with_email(batch, creator_email.as_deref())))
 }
 
@@ -1810,7 +1908,7 @@ pub async fn retry_specific_requests<P: PoolProvider>(
     // Retry the specified requests
     let results = state
         .request_manager
-        .retry_failed_requests(request_ids.clone())
+        .retry_failed_requests(fusillade::BatchId(batch_id), request_ids.clone())
         .await
         .map_err(|e| Error::Internal {
             operation: format!("retry failed requests: {}", e),
@@ -1849,7 +1947,7 @@ pub async fn retry_specific_requests<P: PoolProvider>(
         })?;
 
     // Fetch creator email for the response
-    let creator_email = fetch_creator_email(state.db.read(), &batch).await;
+    let creator_email = fetch_creator_email(&state.db.read(), &batch).await;
     Ok(Json(to_batch_response_with_email(batch, creator_email.as_deref())))
 }
 
@@ -2066,7 +2164,7 @@ pub async fn list_batches<P: PoolProvider>(
 
     // Fetch analytics in bulk if requested
     let analytics_map: HashMap<Uuid, BatchAnalytics> = if include_analytics && !batches.is_empty() {
-        crate::db::handlers::analytics::get_batches_analytics_bulk(state.db.read(), &batch_ids)
+        crate::db::handlers::analytics::get_batches_analytics_bulk(&state.db.read(), &batch_ids)
             .await
             .map_err(|e| Error::Internal {
                 operation: format!("fetch bulk batch analytics: {}", e),
@@ -2315,7 +2413,7 @@ mod tests {
         ));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn batch_validation_releases_fusillade_before_waiting_for_control(pool: PgPool) {
         let migrated_fusillade_pool = setup_fusillade_pool(&pool).await;
@@ -2363,7 +2461,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn revalidates_reasoning_against_current_mapping_before_batch_creation(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2453,7 +2551,7 @@ mod tests {
         assert_eq!(batch_count, 0, "validation must happen before creating a batch record");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_with_default_24h_sla(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2499,7 +2597,58 @@ mod tests {
         resp.assert_status(StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    /// A file's templates live in the weekly `request_templates_g2` store.
+    /// The per-file model counts feed both the batch-creation validation and
+    /// the cached `dw_model` label, so they must be read through the
+    /// `request_templates_all` view or every batch is created with an empty
+    /// model.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_create_batch_labels_model_when_templates_are_generation_two(pool: PgPool) {
+        let config = create_test_config();
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+        let auth = add_auth_headers(&user);
+
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+            api_key_id: None,
+        };
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+        let batch: serde_json::Value = resp.json();
+        assert_eq!(batch["model"], "gpt-4", "cutover batch must carry its model label: {batch}");
+    }
+
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_in_org_context(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2553,7 +2702,7 @@ mod tests {
         resp.assert_status(StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_with_unsupported_sla(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2607,7 +2756,7 @@ mod tests {
     ///
     /// Also covers the spoof: provenance a caller can set is worthless, so a
     /// `dw_user_agent` in the submitted metadata must be dropped rather than merged.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn batch_creation_stores_the_submitters_user_agent_and_drops_a_supplied_one(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2702,15 +2851,18 @@ mod tests {
             "Dw-User-Agent",
             "request_source",
             "created_by",
+            "dw_model",
+            "dw-model",
+            "DW_MODEL",
         ] {
             assert!(is_reserved_metadata_key(reserved), "{reserved} should be reserved");
         }
-        for allowed in ["team", "dw_user_agent_note", "user_agent", "dwuseragent"] {
+        for allowed in ["team", "dw_user_agent_note", "user_agent", "dwuseragent", "model"] {
             assert!(!is_reserved_metadata_key(allowed), "{allowed} is the caller's to set");
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_with_custom_allowed_sla(pool: PgPool) {
         // Create app with custom config allowing multiple SLAs
@@ -2794,7 +2946,7 @@ mod tests {
         resp2.assert_status(StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_with_responses_endpoint(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2840,7 +2992,7 @@ mod tests {
         resp.assert_status(StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_sla_to_expiry_timestamp_24h(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2911,7 +3063,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_sla_to_expiry_timestamp_custom(pool: PgPool) {
         // Create app with custom config allowing 1h SLA
@@ -2986,7 +3138,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_batches_with_include_analytics(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3064,7 +3216,126 @@ mod tests {
         assert!(analytics["total_tokens"].is_number());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_batch_model_field(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment_a = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment_a.id, group.id, user.id).await;
+        let deployment_b = create_test_deployment(&pool, user.id, "gpt-3half-model", "gpt-3.5").await;
+        add_deployment_to_group(&pool, deployment_b.id, group.id, user.id).await;
+
+        let upload_file = |jsonl_content: &'static str| {
+            let app = &app;
+            let user = &user;
+            async move {
+                let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+                let multipart = axum_test::multipart::MultipartForm::new()
+                    .add_part("file", file_part)
+                    .add_part("purpose", axum_test::multipart::Part::text("batch"));
+                let upload_resp = app
+                    .post("/ai/v1/files")
+                    .multipart(multipart)
+                    .add_header(&add_auth_headers(user)[0].0, &add_auth_headers(user)[0].1)
+                    .add_header(&add_auth_headers(user)[1].0, &add_auth_headers(user)[1].1)
+                    .await;
+                upload_resp.assert_status(StatusCode::CREATED);
+                let file: serde_json::Value = upload_resp.json();
+                file["id"].as_str().unwrap().to_string()
+            }
+        };
+
+        let create_batch = |file_id: String| {
+            let app = &app;
+            let user = &user;
+            async move {
+                let create_req = CreateBatchRequest {
+                    input_file_id: file_id,
+                    endpoint: "/v1/chat/completions".to_string(),
+                    completion_window: "24h".to_string(),
+                    metadata: None,
+                    api_key_id: None,
+                };
+                let create_resp = app
+                    .post("/ai/v1/batches")
+                    .json(&create_req)
+                    .add_header(&add_auth_headers(user)[0].0, &add_auth_headers(user)[0].1)
+                    .add_header(&add_auth_headers(user)[1].0, &add_auth_headers(user)[1].1)
+                    .await;
+                create_resp.assert_status(StatusCode::CREATED);
+                let batch: serde_json::Value = create_resp.json();
+                batch
+            }
+        };
+
+        // Single-model file: the create response labels the batch with the alias
+        let single_file_id = upload_file(
+            r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#,
+        )
+        .await;
+        let single_batch = create_batch(single_file_id).await;
+        assert_eq!(single_batch["model"].as_str(), Some("gpt-4"));
+        // The label is stored as dw_model metadata but must surface only as
+        // the typed field, never in caller-visible metadata.
+        assert!(single_batch["metadata"]["dw_model"].is_null(), "dw_model leaked into metadata");
+        let single_batch_id = single_batch["id"].as_str().unwrap().to_string();
+
+        // Mixed-model file: labeled "mixed"
+        let mixed_file_id = upload_file(
+            "{\"custom_id\":\"request-1\",\"method\":\"POST\",\"url\":\"/v1/chat/completions\",\"body\":{\"model\":\"gpt-4\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}}\n{\"custom_id\":\"request-2\",\"method\":\"POST\",\"url\":\"/v1/chat/completions\",\"body\":{\"model\":\"gpt-3.5\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}}",
+        )
+        .await;
+        let mixed_batch = create_batch(mixed_file_id).await;
+        assert_eq!(mixed_batch["model"].as_str(), Some("mixed"));
+        let mixed_batch_id = mixed_batch["id"].as_str().unwrap().to_string();
+
+        // The list carries the same labels per row
+        let list_resp = app
+            .get("/ai/v1/batches?include=analytics")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        list_resp.assert_status_ok();
+        let list_result: serde_json::Value = list_resp.json();
+        let rows = list_result["data"].as_array().unwrap();
+        let model_of = |id: &str| {
+            rows.iter()
+                .find(|row| row["id"].as_str() == Some(id))
+                .expect("batch should be listed")["model"]
+                .as_str()
+                .map(str::to_string)
+        };
+        assert_eq!(model_of(&single_batch_id), Some("gpt-4".to_string()));
+        assert_eq!(model_of(&mixed_batch_id), Some("mixed".to_string()));
+        for row in rows {
+            assert!(row["metadata"]["dw_model"].is_null(), "dw_model leaked into list metadata");
+        }
+
+        // The detail endpoint carries the label too
+        let get_resp = app
+            .get(&format!("/ai/v1/batches/{single_batch_id}"))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        get_resp.assert_status_ok();
+        let detail: serde_json::Value = get_resp.json();
+        assert_eq!(detail["model"].as_str(), Some("gpt-4"));
+
+        let get_mixed_resp = app
+            .get(&format!("/ai/v1/batches/{mixed_batch_id}"))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        get_mixed_resp.assert_status_ok();
+        let mixed_detail: serde_json::Value = get_mixed_resp.json();
+        assert_eq!(mixed_detail["model"].as_str(), Some("mixed"));
+    }
+
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_errors_hidden_until_sla_expires(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3229,6 +3500,212 @@ mod tests {
         // it was hidden before, so the logic is working.
     }
 
+    /// Give a hand-inserted batch the virtual output and error files that
+    /// create_batch would have made. The results endpoint treats a missing
+    /// output/error file id as "the user deleted it" and answers 410.
+    async fn attach_results_files(pool: &PgPool, batch_id: Uuid) -> (Uuid, Uuid) {
+        let output_file_id = Uuid::new_v4();
+        let error_file_id = Uuid::new_v4();
+        for (id, name) in [(output_file_id, "output.jsonl"), (error_file_id, "error.jsonl")] {
+            sqlx::query(
+                "INSERT INTO fusillade.files (id, name, status, created_at, updated_at) VALUES ($1, $2, 'processed', NOW(), NOW())",
+            )
+            .bind(id)
+            .bind(name)
+            .execute(pool)
+            .await
+            .expect("Failed to create results file");
+        }
+        sqlx::query("UPDATE fusillade.batches SET output_file_id = $2, error_file_id = $3 WHERE id = $1")
+            .bind(batch_id)
+            .bind(output_file_id)
+            .bind(error_file_id)
+            .execute(pool)
+            .await
+            .expect("Failed to attach results files");
+        (output_file_id, error_file_id)
+    }
+
+    /// Deleting a batch's input file unlinks the batch (file_id = NULL) and the
+    /// orphan-purge daemon later removes its templates. The results view used to
+    /// require the file and failed with a 500 ("Batch has no associated file_id").
+    /// Requests are self-contained, so results must still be served: every request
+    /// comes back with `input_body: null`, on both the paginated and the streaming
+    /// paths, and in a stable creation order.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_batch_results_served_after_input_file_deleted(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        let batch_id = Uuid::new_v4();
+        let num_requests = 3;
+        // A batch whose input file has been deleted and whose templates have been
+        // purged: file_id = NULL on the batch, template_id dangling on the requests.
+        sqlx::query(
+            "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at, total_requests, completed_at) VALUES ($1, $2, NULL, '/v1/chat/completions', '24h', NOW() + interval '24 hours', NOW(), $3, NOW())",
+        )
+        .bind(batch_id)
+        .bind(user.id.to_string())
+        .bind(num_requests as i32)
+        .execute(&pool)
+        .await
+        .expect("Failed to create batch");
+        attach_results_files(&pool, batch_id).await;
+
+        for i in 0..num_requests {
+            let (state, response_body, error) = if i == 1 {
+                ("failed", None, Some("upstream said no"))
+            } else {
+                ("completed", Some(format!(r#"{{"id":"chatcmpl-{i}"}}"#)), None)
+            };
+            // completed rows need response_status/body/completed_at; failed rows
+            // need error/failed_at (check constraints on fusillade.requests).
+            sqlx::query(
+                "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, response_status, response_body, error, custom_id, created_at, completed_at, failed_at) \
+                 VALUES ($1, $2, $3, 'test-model', $4, CASE WHEN $4 = 'completed' THEN 200 END, $5, $6, $7, NOW() + ($8 || ' seconds')::interval, \
+                         CASE WHEN $4 = 'completed' THEN NOW() END, CASE WHEN $4 = 'failed' THEN NOW() END)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(batch_id)
+            .bind(Uuid::new_v4())
+            .bind(state)
+            .bind(response_body)
+            .bind(error)
+            .bind(format!("req-{i}"))
+            .bind(i.to_string())
+            .execute(&pool)
+            .await
+            .expect("Failed to create request");
+        }
+
+        let auth = add_auth_headers(&user);
+
+        for path in [
+            format!("/ai/v1/batches/{}/results", batch_id),
+            format!("/ai/v1/batches/{}/results?limit=10", batch_id),
+        ] {
+            let response = app
+                .get(&path)
+                .add_header(&auth[0].0, &auth[0].1)
+                .add_header(&auth[1].0, &auth[1].1)
+                .await;
+
+            response.assert_status(StatusCode::OK);
+            response.assert_header("X-Last-Line", &num_requests.to_string());
+            let lines: Vec<serde_json::Value> = response
+                .text()
+                .lines()
+                .map(|l| serde_json::from_str(l).expect("each line is JSON"))
+                .collect();
+            assert_eq!(lines.len(), num_requests, "{path}: every request is returned");
+            let custom_ids: Vec<&str> = lines.iter().map(|l| l["custom_id"].as_str().unwrap()).collect();
+            assert_eq!(custom_ids, ["req-0", "req-1", "req-2"], "{path}: creation order");
+            for line in &lines {
+                assert!(line["input_body"].is_null(), "{path}: input body is gone with the file");
+            }
+            assert_eq!(lines[0]["status"], "completed");
+            assert_eq!(lines[0]["response_body"]["id"], "chatcmpl-0");
+            assert_eq!(lines[1]["status"], "failed");
+            assert_eq!(lines[1]["error"], "upstream said no");
+        }
+
+        // Filters still apply on this path.
+        let response = app
+            .get(&format!("/ai/v1/batches/{}/results?status=failed", batch_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        response.assert_status(StatusCode::OK);
+        assert_eq!(response.text().lines().count(), 1);
+    }
+
+    /// The output and error files are virtual and exist from batch creation, so a
+    /// missing id means the user deleted that file. Deleting a results file is a
+    /// statement that those results are gone: the results endpoint must answer
+    /// 410 (naming the deleted file) rather than serve the same rows anyway,
+    /// on both the paginated and the streaming paths. The batch itself stays
+    /// readable.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_batch_results_gone_after_results_file_deleted(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let auth = add_auth_headers(&user);
+
+        let cases = [
+            ("output_file_id", "output file has been deleted"),
+            ("error_file_id", "error file has been deleted"),
+        ];
+        for (column, expected) in cases {
+            let batch_id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at, total_requests, completed_at) VALUES ($1, $2, NULL, '/v1/chat/completions', '24h', NOW() + interval '24 hours', NOW(), 1, NOW())",
+            )
+            .bind(batch_id)
+            .bind(user.id.to_string())
+            .execute(&pool)
+            .await
+            .expect("Failed to create batch");
+            attach_results_files(&pool, batch_id).await;
+            // A completed request still exists; the endpoint must not serve it.
+            sqlx::query(
+                "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, response_status, response_body, custom_id, created_at, completed_at) VALUES ($1, $2, $3, 'test-model', 'completed', 200, '{}', 'req-0', NOW(), NOW())",
+            )
+            .bind(Uuid::new_v4())
+            .bind(batch_id)
+            .bind(Uuid::new_v4())
+            .execute(&pool)
+            .await
+            .expect("Failed to create request");
+            // Mirror what delete_file does to the batch for that file.
+            sqlx::query(&format!("UPDATE fusillade.batches SET {column} = NULL WHERE id = $1"))
+                .bind(batch_id)
+                .execute(&pool)
+                .await
+                .expect("Failed to unlink results file");
+
+            for path in [
+                format!("/ai/v1/batches/{}/results", batch_id),
+                format!("/ai/v1/batches/{}/results?limit=10", batch_id),
+            ] {
+                let response = app
+                    .get(&path)
+                    .add_header(&auth[0].0, &auth[0].1)
+                    .add_header(&auth[1].0, &auth[1].1)
+                    .await;
+                response.assert_status(StatusCode::GONE);
+                let body = response.text();
+                assert!(body.contains(expected), "{path}: expected {expected:?} in {body:?}");
+            }
+
+            let response = app
+                .get(&format!("/ai/v1/batches/{}", batch_id))
+                .add_header(&auth[0].0, &auth[0].1)
+                .add_header(&auth[1].0, &auth[1].1)
+                .await;
+            response.assert_status(StatusCode::OK);
+        }
+
+        // Both gone: the message names both.
+        let batch_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at, total_requests, completed_at) VALUES ($1, $2, NULL, '/v1/chat/completions', '24h', NOW() + interval '24 hours', NOW(), 0, NOW())",
+        )
+        .bind(batch_id)
+        .bind(user.id.to_string())
+        .execute(&pool)
+        .await
+        .expect("Failed to create batch");
+        let response = app
+            .get(&format!("/ai/v1/batches/{}/results", batch_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        response.assert_status(StatusCode::GONE);
+        assert!(response.text().contains("output and error files have been deleted"));
+    }
+
     /// Regression test for streaming batch results.
     ///
     /// Previously, get_batch_results collected ALL results into memory before
@@ -3239,7 +3716,7 @@ mod tests {
     /// 3. X-Incomplete reflects batch processing status
     /// 4. X-Last-Line is set correctly
     /// 5. Unlimited responses use streaming (no content-length header)
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_batch_results_streaming(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3273,6 +3750,7 @@ mod tests {
         .execute(&pool)
         .await
         .expect("Failed to create batch");
+        attach_results_files(&pool, batch_id).await;
 
         for i in 0..num_requests {
             let template_id = Uuid::new_v4();
@@ -3284,16 +3762,18 @@ mod tests {
                 "choices": [{"message": {"content": format!("Response {}", i)}}]
             });
 
-            sqlx::query(
-                "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $3, $4, 'POST')",
+            crate::test::utils::insert_fusillade_template(
+                &pool,
+                template_id,
+                Some(file_id),
+                "test-model",
+                "test-key",
+                "http://test",
+                "/v1/chat/completions",
+                &serde_json::to_string(&body).unwrap(),
+                Some(&custom_id),
             )
-            .bind(template_id)
-            .bind(file_id)
-            .bind(serde_json::to_string(&body).unwrap())
-            .bind(&custom_id)
-            .execute(&pool)
-            .await
-            .expect("Failed to create template");
+            .await;
 
             sqlx::query(
                 "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, response_status, response_body, created_at, completed_at) VALUES ($1, $2, $3, 'test-model', 'completed', 200, $4, NOW(), NOW())",
@@ -3375,7 +3855,7 @@ mod tests {
     ///
     /// When a batch still has pending/in-progress requests, X-Incomplete should be
     /// true even on the last page of currently available results (or unlimited download).
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_batch_results_x_incomplete_while_still_processing(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3410,6 +3890,7 @@ mod tests {
         .execute(&pool)
         .await
         .expect("Failed to create batch");
+        attach_results_files(&pool, batch_id).await;
 
         // Create completed requests
         for i in 0..num_completed {
@@ -3422,16 +3903,18 @@ mod tests {
                 "choices": [{"message": {"content": format!("Response {}", i)}}]
             });
 
-            sqlx::query(
-                "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $3, $4, 'POST')",
+            crate::test::utils::insert_fusillade_template(
+                &pool,
+                template_id,
+                Some(file_id),
+                "test-model",
+                "test-key",
+                "http://test",
+                "/v1/chat/completions",
+                &serde_json::to_string(&body).unwrap(),
+                Some(&custom_id),
             )
-            .bind(template_id)
-            .bind(file_id)
-            .bind(serde_json::to_string(&body).unwrap())
-            .bind(&custom_id)
-            .execute(&pool)
-            .await
-            .expect("Failed to create template");
+            .await;
 
             sqlx::query(
                 "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, response_status, response_body, created_at, completed_at) VALUES ($1, $2, $3, 'test-model', 'completed', 200, $4, NOW(), NOW())",
@@ -3452,16 +3935,18 @@ mod tests {
             let custom_id = format!("req-{}", i);
             let body = serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": format!("Test {}", i)}]});
 
-            sqlx::query(
-                "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $3, $4, 'POST')",
+            crate::test::utils::insert_fusillade_template(
+                &pool,
+                template_id,
+                Some(file_id),
+                "test-model",
+                "test-key",
+                "http://test",
+                "/v1/chat/completions",
+                &serde_json::to_string(&body).unwrap(),
+                Some(&custom_id),
             )
-            .bind(template_id)
-            .bind(file_id)
-            .bind(serde_json::to_string(&body).unwrap())
-            .bind(&custom_id)
-            .execute(&pool)
-            .await
-            .expect("Failed to create template");
+            .await;
 
             sqlx::query(
                 "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at) VALUES ($1, $2, $3, 'test-model', 'pending', NOW())",
@@ -3506,7 +3991,7 @@ mod tests {
         assert_eq!(lines.len(), total, "Should return all request results");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_reserve_capacity_for_batch_inserts_and_releases(pool: PgPool) {
         let config = create_test_config();
@@ -3554,7 +4039,7 @@ mod tests {
         assert!(row.released_at.is_some());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_reserve_capacity_for_batch_rejects_over_capacity(pool: PgPool) {
         let mut config = create_test_config();
@@ -3633,7 +4118,7 @@ mod tests {
             .expect("pin pending batch deadline");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_reserve_capacity_for_batch_ignores_pending_counts_when_disabled(pool: PgPool) {
         let mut config = create_test_config();
@@ -3663,7 +4148,7 @@ mod tests {
         assert_eq!(reservation_ids.len(), 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_reserve_capacity_for_batch_rejects_pending_counts_when_enabled(pool: PgPool) {
         let mut config = create_test_config();
@@ -3689,7 +4174,36 @@ mod tests {
         assert!(matches!(err, Error::TooManyRequests { .. }));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_reserve_capacity_for_batch_fails_open_when_pending_counts_query_fails(pool: PgPool) {
+        let mut config = create_test_config();
+        config.batches.pending_capacity_counts_enabled = true;
+        let state = create_test_app_state_with_fusillade(pool.clone(), config).await;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let endpoint_id = create_test_endpoint(&pool, &format!("test-{}", Uuid::new_v4()), user.id).await;
+
+        let alias = format!("alias-{}", Uuid::new_v4());
+        let model_id = create_test_model(&pool, "model-a", &alias, endpoint_id, user.id).await;
+
+        // Break the pending-count query outright: the optional gate must not
+        // turn its own failure into a rejected submission.
+        sqlx::query("DROP TABLE fusillade.requests CASCADE").execute(&pool).await.unwrap();
+
+        let file_model_counts = HashMap::from([(alias.clone(), 1_i64)]);
+        let model_throughputs = HashMap::from([(alias.clone(), 0.001_f32)]);
+        let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
+
+        let reservation_ids =
+            super::reserve_capacity_for_batch(&state, "1h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 1.0)
+                .await
+                .expect("a failing pending-count query must fail open, not reject the submission");
+
+        assert_eq!(reservation_ids.len(), 1);
+    }
+
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_reserve_capacity_for_batch_ignores_flex_pending_counts_when_enabled(pool: PgPool) {
         let mut config = create_test_config();
@@ -3718,7 +4232,7 @@ mod tests {
     }
 
     /// Test that create_batch API accepts "high" priority name
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_with_high_priority(pool: PgPool) {
         // Create app with config allowing 1h window
@@ -3772,7 +4286,7 @@ mod tests {
     }
 
     /// Test that create_batch API accepts "standard" priority name
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_with_standard_priority(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3822,7 +4336,7 @@ mod tests {
     }
 
     /// Test that legacy "1h" format still works (backwards compatibility)
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_with_legacy_1h_format(pool: PgPool) {
         // Create app with config allowing 1h window
@@ -3876,7 +4390,7 @@ mod tests {
     }
 
     /// Test that invalid completion_window values are rejected
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_rejects_invalid_completion_window(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3924,7 +4438,7 @@ mod tests {
     }
 
     /// Test that PlatformManager can use completion windows not in the allowed list
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_can_use_any_completion_window(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3975,7 +4489,7 @@ mod tests {
     }
 
     /// Test that relaxation factor of 0.0 blocks all batches for that window
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_blocked_by_zero_relaxation_factor(pool: PgPool) {
         let mut config = create_test_config();
@@ -4028,7 +4542,7 @@ mod tests {
     }
 
     /// Test that relaxation factor > 1.0 allows accepting more requests than strict capacity
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_reserve_capacity_relaxation_factor_expands_acceptance(pool: PgPool) {
         let mut config = create_test_config();
@@ -4071,7 +4585,7 @@ mod tests {
 
     /// Test that relaxation factors are window-specific — relaxing one window
     /// does not affect another.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_reserve_capacity_relaxation_factor_is_window_specific(pool: PgPool) {
         let mut config = create_test_config();
@@ -4108,7 +4622,7 @@ mod tests {
     }
 
     /// Test that the relaxation_factor from config flows through the full API path
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_relaxation_factor_from_config(pool: PgPool) {
         let mut config = create_test_config();
@@ -4208,7 +4722,7 @@ mod tests {
             .await
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn background_batch_requires_background_inference_role(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4221,7 +4735,7 @@ mod tests {
         assert!(body.contains("BackgroundInferenceUser"), "unexpected response: {body}");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn background_batch_maps_completion_window_and_skips_sla_admission(pool: PgPool) {
         let mut config = create_test_config();
@@ -4264,7 +4778,7 @@ mod tests {
             .assert_status(StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_unverified_volume_limit_rejects_over_cap(pool: PgPool) {
         let mut config = create_test_config();
@@ -4292,7 +4806,7 @@ mod tests {
     /// Spending-cap pre-flight: creating a batch with an API key whose cap
     /// scope is exhausted is rejected up front with the explicit 402, instead
     /// of accepting a batch whose every request the proxy would refuse.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_rejected_when_spend_cap_exhausted(pool: PgPool) {
         use crate::db::handlers::Repository as _;
@@ -4312,8 +4826,6 @@ mod tests {
                 name: "capped-batch-key".to_string(),
                 description: None,
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: Some(rust_decimal::Decimal::from(10)),
                 spend_limit_interval: None,
@@ -4378,7 +4890,7 @@ mod tests {
         resp.assert_status(StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_verified_user_bypasses_volume_limit(pool: PgPool) {
         let mut config = create_test_config();
@@ -4398,7 +4910,7 @@ mod tests {
         submit_one_request_batch(&app, &user, "1h").await.assert_status(StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_unverified_limit_disabled_when_zero(pool: PgPool) {
         let mut config = create_test_config();
@@ -4414,7 +4926,7 @@ mod tests {
         submit_one_request_batch(&app, &user, "1h").await.assert_status(StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_rejected_with_negative_balance(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4470,7 +4982,7 @@ mod tests {
         assert!(body.contains("balance too low"), "Expected balance too low message, got: {}", body);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_allowed_with_zero_balance(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4519,7 +5031,103 @@ mod tests {
         resp.assert_status(StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_create_batch_allowed_with_negative_balance_flag(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create a deployment and add to group so user has access to the model
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', true) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE user_balance_checkpoints SET balance = -100 WHERE user_id = $1")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        submit_one_request_batch(&app, &user, "24h")
+            .await
+            .assert_status(StatusCode::CREATED);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_negative_balance_org_flag_does_not_cover_personal_file(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let org = create_test_org(&pool, user.id).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        add_user_to_group(&pool, org.id, group.id).await;
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+        let auth = add_auth_headers(&user);
+        let org_cookie = format!("dw_active_org={}", org.id);
+
+        // Upload personally: request templates bill the personal account, even
+        // when the batch is subsequently submitted in organization context.
+        let jsonl = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part(
+                "file",
+                axum_test::multipart::Part::bytes(jsonl.as_bytes()).file_name("personal.jsonl"),
+            )
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        upload.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload.json();
+        let request = CreateBatchRequest {
+            input_file_id: file["id"].as_str().unwrap().to_owned(),
+            endpoint: "/v1/chat/completions".to_owned(),
+            completion_window: "24h".to_owned(),
+            metadata: None,
+            api_key_id: None,
+        };
+        sqlx::query("UPDATE user_balance_checkpoints SET balance = -100 WHERE user_id = $1 OR user_id = $2")
+            .bind(user.id)
+            .bind(org.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', true)")
+            .bind(org.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        for enabled in [false, true, false] {
+            sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', $2) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
+                .bind(user.id).bind(enabled).execute(&pool).await.unwrap();
+            let response = app
+                .post("/ai/v1/batches")
+                .json(&request)
+                .add_header(&auth[0].0, &auth[0].1)
+                .add_header(&auth[1].0, &auth[1].1)
+                .add_header("cookie", &org_cookie)
+                .await;
+            response.assert_status(if enabled {
+                StatusCode::CREATED
+            } else {
+                StatusCode::PAYMENT_REQUIRED
+            });
+        }
+    }
+
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_in_org_context_checks_org_balance_not_user(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4605,9 +5213,40 @@ mod tests {
             .await;
 
         resp.assert_status(StatusCode::CREATED);
+        // A personal exemption does not cover the organization's debt.
+        sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', true) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE user_balance_checkpoints SET balance = -100 WHERE user_id = $1")
+            .bind(org.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for enabled in [false, true, false] {
+            sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', $2) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
+                .bind(org.id)
+                .bind(enabled)
+                .execute(&pool)
+                .await
+                .unwrap();
+            let resp = app
+                .post("/ai/v1/batches")
+                .json(&create_req)
+                .add_header(&auth[0].0, &auth[0].1)
+                .add_header(&auth[1].0, &auth[1].1)
+                .add_header("cookie", &org_cookie)
+                .await;
+            resp.assert_status(if enabled {
+                StatusCode::CREATED
+            } else {
+                StatusCode::PAYMENT_REQUIRED
+            });
+        }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_batches_member_id_rejected_outside_org_context(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4629,7 +5268,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_batches_member_id_no_key_returns_empty(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4652,7 +5291,7 @@ mod tests {
         assert_eq!(body["has_more"], false);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_batches_enrichment_in_org_context(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4785,7 +5424,7 @@ mod tests {
 
     /// Test that batch results correctly include reasoning tokens in response bodies
     /// when the upstream model returns thinking/reasoning token usage.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_batch_results_with_reasoning_tokens(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4816,6 +5455,7 @@ mod tests {
         .execute(&pool)
         .await
         .expect("Failed to create batch");
+        attach_results_files(&pool, batch_id).await;
 
         // Three requests with different reasoning token amounts
         let thinking_responses = vec![
@@ -4901,16 +5541,18 @@ mod tests {
             let request_id = Uuid::new_v4();
             let body = serde_json::json!({"model": "thinking-model", "messages": [{"role": "user", "content": "Test"}], "thinking": {"type": "enabled", "budget_tokens": 4096}});
 
-            sqlx::query(
-                "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'thinking-model', 'test-key', 'http://test', '/v1/chat/completions', $3, $4, 'POST')",
+            crate::test::utils::insert_fusillade_template(
+                &pool,
+                template_id,
+                Some(file_id),
+                "thinking-model",
+                "test-key",
+                "http://test",
+                "/v1/chat/completions",
+                &serde_json::to_string(&body).unwrap(),
+                Some(custom_id),
             )
-            .bind(template_id)
-            .bind(file_id)
-            .bind(serde_json::to_string(&body).unwrap())
-            .bind(*custom_id)
-            .execute(&pool)
-            .await
-            .expect("Failed to create template");
+            .await;
 
             sqlx::query(
                 "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, response_status, response_body, created_at, completed_at) VALUES ($1, $2, $3, 'thinking-model', 'completed', 200, $4, NOW(), NOW())",
@@ -4995,7 +5637,7 @@ mod tests {
 
     /// Test that batch analytics surfaces folded reasoning tokens from the batch_aggregates
     /// read model (COR-524) — both on the direct endpoint and via include=analytics.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_batch_analytics_with_reasoning_tokens(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -5123,7 +5765,7 @@ mod tests {
     /// folded) returns 200 with a zero-valued payload from GET /batches/{id}/analytics. The read
     /// model is durable, so a missing row means "nothing folded yet", not "aged out" (COR-524) —
     /// platform managers still see (empty) metrics for any batch they can access.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_batch_analytics_missing_read_model_row_returns_zeros(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -5179,16 +5821,18 @@ mod tests {
             let request_id = Uuid::new_v4();
             let body = serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": format!("Test {}", i)}]});
 
-            sqlx::query(
-                "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $3, $4, 'POST')",
+            crate::test::utils::insert_fusillade_template(
+                pool,
+                template_id,
+                Some(file_id),
+                "test-model",
+                "test-key",
+                "http://test",
+                "/v1/chat/completions",
+                &serde_json::to_string(&body).unwrap(),
+                Some(&format!("req-{i}")),
             )
-            .bind(template_id)
-            .bind(file_id)
-            .bind(serde_json::to_string(&body).unwrap())
-            .bind(format!("req-{i}"))
-            .execute(pool)
-            .await
-            .expect("insert template");
+            .await;
 
             sqlx::query(
                 "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at) VALUES ($1, $2, $3, 'test-model', 'pending', NOW())",
@@ -5212,7 +5856,7 @@ mod tests {
     /// structural and visible in the handler code; testing the actual state
     /// transition avoids the pool-contention issues that background workers
     /// cause in CI's parallel test environment.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_cancel_batch_cascades_state_to_child_requests(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -5256,7 +5900,7 @@ mod tests {
         assert_eq!(canceled_count, 5, "all requests should now be canceled");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_batch_cascades_state_to_child_requests(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -5298,7 +5942,7 @@ mod tests {
     /// the retry re-pends zero rows. Before the `cancelling_at` guard, that
     /// zero count was treated as "nothing to retry" and returned 400 even
     /// though the retry had overturned the cancellation.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_retry_immediately_after_cancel_resumes_batch(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -5364,7 +6008,7 @@ mod tests {
     /// The true no-op retry still fails: nothing failed, nothing canceled,
     /// and the batch is not being cancelled — the `cancelling_at` guard must
     /// not turn every zero-count retry into a success.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_retry_with_nothing_to_retry_returns_400(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -5379,6 +6023,67 @@ mod tests {
             .add_header(&auth[1].0, &auth[1].1)
             .await;
         resp.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    /// `retry-requests` only acts on requests in the path batch: ids from a
+    /// different batch are ignored, leaving that request and its batch as
+    /// they were.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_retry_requests_only_retries_requests_in_path_batch(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let other = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let auth = add_auth_headers(&owner);
+
+        let (owner_batch, owner_requests) = insert_batch_with_pending_requests(&pool, owner.id, 1).await;
+        let (other_batch, other_requests) = insert_batch_with_pending_requests(&pool, other.id, 1).await;
+        sqlx::query("UPDATE fusillade.requests SET state = 'failed', failed_at = NOW(), error = 'test-error' WHERE batch_id = ANY($1)")
+            .bind(vec![owner_batch, other_batch])
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE fusillade.batches SET cancelled_at = NOW() WHERE id = $1")
+            .bind(other_batch)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let state = |id: Uuid| {
+            sqlx::query_scalar::<_, String>("SELECT state FROM fusillade.requests WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+        };
+        assert_eq!(state(other_requests[0]).await.unwrap(), "failed");
+        assert_eq!(state(owner_requests[0]).await.unwrap(), "failed");
+
+        let resp = app
+            .post(&format!("/ai/v1/batches/{owner_batch}/retry-requests"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .json(&serde_json::json!({
+                "request_ids": [other_requests[0].to_string(), owner_requests[0].to_string()]
+            }))
+            .await;
+        resp.assert_status_ok();
+
+        assert_eq!(
+            state(other_requests[0]).await.unwrap(),
+            "failed",
+            "requests outside the path batch must not be retried"
+        );
+        let other_cancelled_at: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT cancelled_at FROM fusillade.batches WHERE id = $1")
+                .bind(other_batch)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(other_cancelled_at.is_some(), "batches other than the path batch must be unchanged");
+        assert_eq!(
+            state(owner_requests[0]).await.unwrap(),
+            "pending",
+            "requests in the path batch must still retry"
+        );
     }
 
     // ── Explicit API key selection for dashboard batch creation ───────────
@@ -5445,7 +6150,51 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_negative_balance_checks_execution_account_in_org_context(pool: PgPool) {
+        let (app, _bg_services, owner, _member, org, file_id) = setup_org_batch_env(&pool).await;
+        let auth = add_auth_headers(&owner);
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", owner.id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .json(&serde_json::json!({"name": "Personal capped key", "purpose": "realtime", "spend_limit": "10"}))
+            .await;
+        response.assert_status(StatusCode::CREATED);
+        let key: serde_json::Value = response.json();
+        let secret = key["key"].as_str().unwrap();
+        sqlx::query("UPDATE user_balance_checkpoints SET balance = -100 WHERE user_id = $1 OR user_id = $2")
+            .bind(owner.id)
+            .bind(org.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', true)")
+            .bind(org.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The org owns the file and permits debt, but the execution key bills
+        // the personal account. Its opt-in must be checked independently.
+        for enabled in [false, true, false] {
+            sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', $2) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
+                .bind(owner.id).bind(enabled).execute(&pool).await.unwrap();
+            app.post("/ai/v1/batches")
+                .json(&batch_req(&file_id, None))
+                .add_header("authorization", &format!("Bearer {secret}"))
+                .add_header("cookie", &format!("dw_active_org={}", org.id))
+                .await
+                .assert_status(if enabled {
+                    StatusCode::CREATED
+                } else {
+                    StatusCode::PAYMENT_REQUIRED
+                });
+        }
+    }
+
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_with_selected_api_key(pool: PgPool) {
         let (app, _bg_services, owner, member, org, file_id) = setup_org_batch_env(&pool).await;
@@ -5562,7 +6311,7 @@ mod tests {
             .assert_status(StatusCode::NOT_FOUND);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_batch_creation_rejects_platform_key_auth(pool: PgPool) {
         let (app, _bg_services, owner, _member, org, file_id) = setup_org_batch_env(&pool).await;
@@ -5600,7 +6349,7 @@ mod tests {
             .assert_status(StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_member_without_manage_keys_must_select_batch_key(pool: PgPool) {
         let (app, _bg_services, owner, member, org, file_id) = setup_org_batch_env(&pool).await;

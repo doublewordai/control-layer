@@ -176,6 +176,150 @@ describe("MyOrganization", () => {
     expect(container.textContent).not.toMatch(/zero data retention/i);
   });
 
+  it("lets an owner switch a modality off and sends the new set", async () => {
+    server.use(userWithOrg("owner"));
+    server.use(orgDetail(false));
+    let sent: unknown = null;
+    server.use(
+      http.patch("/admin/api/v1/organizations/:id", async ({ request }) => {
+        sent = await request.json();
+        return HttpResponse.json({
+          id: ORG_ID,
+          username: "acme-corp",
+          display_name: ORG_NAME,
+          email: "contact@acme.com",
+          created_at: "2025-01-15T10:00:00Z",
+          member_count: 3,
+          zero_data_retention: false,
+          disabled_modalities: ["batch"],
+        });
+      }),
+    );
+    const { container } = render(<MyOrganization />, {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => {
+      expect(
+        within(container).getByRole("heading", { name: ORG_NAME }),
+      ).toBeInTheDocument();
+    });
+
+    const batchSwitch = within(container).getByRole("switch", {
+      name: "Batch API",
+    });
+    expect(batchSwitch).toBeEnabled();
+    expect(batchSwitch).toBeChecked();
+    await userEvent.click(batchSwitch);
+
+    await waitFor(() => {
+      expect(sent).toEqual({ disabled_modalities: ["batch"] });
+    });
+  });
+
+  it("keeps a modality switch where the owner left it after the refetch", async () => {
+    // Uses the demo-mode handlers for both GET and PATCH: the update hook
+    // invalidates and refetches, so the switch only stays put if the mock
+    // persists the change.
+    server.use(userWithOrg("owner"));
+    const { container } = render(<MyOrganization />, {
+      wrapper: createWrapper(),
+    });
+
+    const batchSwitch = await waitFor(() =>
+      within(container).getByRole("switch", { name: "Batch API" }),
+    );
+    expect(batchSwitch).toBeChecked();
+
+    await userEvent.click(batchSwitch);
+    await waitFor(() => {
+      expect(
+        within(container).getByRole("switch", { name: "Batch API" }),
+      ).not.toBeChecked();
+    });
+
+    // Turn it back on, which also restores the shared fixture for other tests.
+    await userEvent.click(
+      within(container).getByRole("switch", { name: "Batch API" }),
+    );
+    await waitFor(() => {
+      expect(
+        within(container).getByRole("switch", { name: "Batch API" }),
+      ).toBeChecked();
+    });
+  });
+
+  it("shows modalities read-only to non-owners", async () => {
+    server.use(userWithOrg("admin"));
+    server.use(
+      http.get("/admin/api/v1/organizations/:id", () =>
+        HttpResponse.json({
+          id: ORG_ID,
+          username: "acme-corp",
+          display_name: ORG_NAME,
+          email: "contact@acme.com",
+          created_at: "2025-01-15T10:00:00Z",
+          member_count: 3,
+          zero_data_retention: false,
+          disabled_modalities: ["realtime"],
+        }),
+      ),
+    );
+    const { container } = render(<MyOrganization />, {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => {
+      expect(
+        within(container).getByRole("heading", { name: ORG_NAME }),
+      ).toBeInTheDocument();
+    });
+
+    const realtimeSwitch = within(container).getByRole("switch", {
+      name: "Realtime inference",
+    });
+    expect(realtimeSwitch).not.toBeChecked();
+    expect(realtimeSwitch).toBeDisabled();
+    expect(
+      within(container).getByRole("switch", { name: "Batch API" }),
+    ).toBeDisabled();
+  });
+
+  it("flags a pending email change on the org header", async () => {
+    server.use(userWithOrg("owner"));
+    server.use(
+      http.get("/admin/api/v1/organizations/:id", () =>
+        HttpResponse.json({
+          id: ORG_ID,
+          username: "acme-corp",
+          display_name: ORG_NAME,
+          email: "contact@acme.com",
+          created_at: "2025-01-15T10:00:00Z",
+          member_count: 3,
+          zero_data_retention: false,
+          pending_email_change: {
+            new_email: "new-contact@acme.com",
+            expires_at: "2025-06-02T12:00:00Z",
+          },
+        }),
+      ),
+    );
+    const { container } = render(<MyOrganization />, {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => {
+      expect(
+        within(container).getByRole("heading", { name: ORG_NAME }),
+      ).toBeInTheDocument();
+    });
+
+    expect(container.textContent).toMatch(/contact@acme.com/);
+    expect(container.textContent).toMatch(
+      /pending change to new-contact@acme.com · waiting on both contact@acme.com and new-contact@acme.com/i,
+    );
+  });
+
   const CURRENT_USER_ID = "550e8400-e29b-41d4-a716-446655440001";
 
   const sarahUser = {

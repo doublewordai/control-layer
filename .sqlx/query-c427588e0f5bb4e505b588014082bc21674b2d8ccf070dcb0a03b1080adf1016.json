@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE deployed_models SET serving_classes = '{\"throughput\": {\"ttft_ms\": 5000, \"itl_ms\": 100}}' WHERE alias = 'composite-priority'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "c427588e0f5bb4e505b588014082bc21674b2d8ccf070dcb0a03b1080adf1016"
+}

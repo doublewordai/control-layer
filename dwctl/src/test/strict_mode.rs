@@ -10,8 +10,51 @@ use crate::api::models::users::Role;
 use crate::test::utils::{add_auth_headers, create_test_admin_user, create_test_config, create_test_user};
 use sqlx::PgPool;
 
+/// Reject before inference parsing, logging, or daemon-header bypasses, with
+/// cache pricing disabled so enforcement cannot depend on its inner reader.
+#[dwctl_test_macros::test]
+async fn test_inference_body_limit_precedes_processing_in_all_modes(pool: PgPool) {
+    for strict_mode in [true, false] {
+        let mut config = create_test_config();
+        config.onwards.strict_mode = strict_mode;
+        config.cache.enabled = false;
+        config.limits.requests.max_body_size = 64;
+        let app = crate::Application::new_with_pool(config.clone(), Some(pool.clone()), None)
+            .await
+            .expect("Failed to create application");
+        // The downstream router limits are fixed at startup. Reloading a larger
+        // cap must not permit oversized bodies to reach the outer parsers.
+        config.limits.requests.max_body_size = 1000;
+        app.app_state.config.store(config);
+        let (server, _services) = app.into_test_server();
+
+        for path in ["chat/completions", "completions", "responses", "messages", "embeddings"] {
+            // Invalid JSON would produce a 400 if the inference parser ran first.
+            let response = server.post(&format!("/ai/v1/{path}")).bytes(vec![b'x'; 65].into()).await;
+            response.assert_status(axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+            let body: serde_json::Value = response.json();
+            assert_eq!(body["error"]["type"], "request_too_large");
+            if path == "messages" {
+                assert_eq!(body["type"], "error");
+            }
+
+            let response = server
+                .post(&format!("/ai/v1/{path}"))
+                .add_header("x-fusillade-request-id", uuid::Uuid::new_v4().to_string())
+                .bytes(vec![b'x'; 65].into())
+                .await;
+            response.assert_status(axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        }
+
+        // File uploads have their own larger cap and must not inherit the
+        // inference limit. This unauthenticated upload is rejected by auth.
+        let response = server.post("/ai/v1/files").bytes(vec![b'x'; 65].into()).await;
+        response.assert_status(axum::http::StatusCode::UNAUTHORIZED);
+    }
+}
+
 /// Test that strict mode rejects unknown endpoints with 404
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_strict_mode_rejects_unknown_endpoints(pool: PgPool) {
     // Setup wiremock server (won't be reached for unknown endpoints)
@@ -79,7 +122,7 @@ async fn test_strict_mode_rejects_unknown_endpoints(pool: PgPool) {
 }
 
 /// Test that strict mode allows GET /v1/models endpoint
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_strict_mode_allows_models_endpoint(pool: PgPool) {
     // Create test app with strict mode enabled
@@ -157,7 +200,7 @@ async fn test_strict_mode_allows_models_endpoint(pool: PgPool) {
 }
 
 /// Test that strict mode allows POST /v1/chat/completions with valid request
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_strict_mode_allows_chat_completions(pool: PgPool) {
     // Setup wiremock server to mock inference endpoint
@@ -314,22 +357,42 @@ async fn test_strict_mode_allows_chat_completions(pool: PgPool) {
     }
     assert!(model_available, "Model gpt-4 should be available in onwards within 3 seconds");
 
-    // Make chat completion request
-    let chat_response = server
-        .post("/ai/v1/chat/completions")
-        .add_header("Authorization", &format!("Bearer {}", api_key))
-        .add_header("Content-Type", "application/json")
-        .json(&serde_json::json!({
-            "model": "gpt-4",
-            "messages": [{
-                "role": "user",
-                "content": "Hello, test strict mode"
-            }]
-        }))
-        .await;
+    // Make the chat completion request.
+    //
+    // The `/ai/v1/models` poll above is NOT a sufficient guard on its own:
+    // dwctl answers model discovery from the control-layer DB, so it flips to
+    // 200 as soon as the row is committed, whereas `/chat/completions` routes
+    // through onwards' asynchronously-synced caches. Two distinct startup races
+    // can still bite right after discovery reports the model:
+    //   - 404 `model_not_found` until onwards' config cache catches up, and
+    //   - 403 until onwards' key cache has processed the admission NOTIFY
+    //     (strict mode rejects a not-yet-admitted key).
+    // Poll through both and assert the terminal state.
+    let chat_request = serde_json::json!({
+        "model": "gpt-4",
+        "messages": [{
+            "role": "user",
+            "content": "Hello, test strict mode"
+        }]
+    });
+    let send_chat = async |body: &serde_json::Value| {
+        server
+            .post("/ai/v1/chat/completions")
+            .add_header("Authorization", &format!("Bearer {}", api_key))
+            .add_header("Content-Type", "application/json")
+            .json(body)
+            .await
+    };
 
-    let status = chat_response.status_code();
-    let body_text = chat_response.text();
+    let start = std::time::Instant::now();
+    let (status, body_text) = loop {
+        let chat_response = send_chat(&chat_request).await;
+        let status = chat_response.status_code();
+        if (status != 403 && status != 404) || start.elapsed() > std::time::Duration::from_secs(5) {
+            break (status, chat_response.text());
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+    };
     assert_eq!(
         status, 200,
         "Expected 200 for chat completions in strict mode. Got {}: {}",
@@ -350,7 +413,7 @@ async fn test_strict_mode_allows_chat_completions(pool: PgPool) {
 /// Test that strict mode enforces the configured request body limit rather
 /// than Axum's 2 MB default: a 3 MB body (over the old default) is accepted,
 /// while a body over the configured limit is rejected with 413.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_strict_mode_body_limit_uses_configured_max_body_size(pool: PgPool) {
     // Setup wiremock server to mock inference endpoint
@@ -562,7 +625,7 @@ async fn test_strict_mode_body_limit_uses_configured_max_body_size(pool: PgPool)
 }
 
 /// Test that strict mode allows POST /v1/completions (legacy completions endpoint)
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_strict_mode_allows_completions(pool: PgPool) {
     // Setup wiremock server to mock inference endpoint
@@ -732,7 +795,8 @@ async fn test_strict_mode_allows_completions(pool: PgPool) {
 
     // Verify response structure
     let body: serde_json::Value = serde_json::from_str(&body_text).expect("Response body should be valid JSON");
-    assert_eq!(body["id"].as_str(), Some("cmpl-strict-test"));
+    let id = body["id"].as_str().unwrap();
+    assert!(id.starts_with("resp_"), "the gateway's id replaces the upstream's, got {id}");
     assert_eq!(body["object"].as_str(), Some("text_completion"));
     assert_eq!(body["model"].as_str(), Some("gpt-4"));
     assert!(body["choices"].is_array());
@@ -740,7 +804,7 @@ async fn test_strict_mode_allows_completions(pool: PgPool) {
 }
 
 /// Test that strict mode allows POST /v1/embeddings with valid request
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_strict_mode_allows_embeddings(pool: PgPool) {
     // Setup wiremock server to mock inference endpoint
@@ -899,7 +963,7 @@ async fn test_strict_mode_allows_embeddings(pool: PgPool) {
 }
 
 /// Test that strict mode rejects malformed requests
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_strict_mode_rejects_malformed_requests(pool: PgPool) {
     let mut config = create_test_config();
@@ -973,7 +1037,7 @@ async fn test_strict_mode_rejects_malformed_requests(pool: PgPool) {
 // in this file.
 
 /// Test that errors from non-trusted providers are sanitized in strict mode
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_strict_mode_sanitizes_provider_errors(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -1134,10 +1198,10 @@ async fn test_strict_mode_sanitizes_provider_errors(pool: PgPool) {
     assert!(body["error"].is_object(), "Should have error object");
 }
 
-/// Test that trusted providers bypass sanitization in strict mode
-#[sqlx::test]
+/// Upstream 429s keep their status and use the public message, even for trusted providers.
+#[dwctl_test_macros::test]
 #[test_log::test]
-async fn test_strict_mode_trusted_flag_bypasses_sanitization(pool: PgPool) {
+async fn test_strict_mode_upstream_rate_limit_uses_custom_message(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
 
     // Mock provider returns error with internal details
@@ -1162,7 +1226,11 @@ async fn test_strict_mode_trusted_flag_bypasses_sanitization(pool: PgPool) {
         .await;
 
     let mut config = create_test_config();
-    config.onwards.strict_mode = true;
+    config.onwards = serde_json::from_value(serde_json::json!({
+        "strict_mode": true,
+        "upstream_rate_limit_message": "Please contact our team for dedicated capacity."
+    }))
+    .expect("Custom upstream rate-limit message should deserialize");
     config.background_services.onwards_sync.enabled = true;
 
     let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
@@ -1280,29 +1348,15 @@ async fn test_strict_mode_trusted_flag_bypasses_sanitization(pool: PgPool) {
     let body_text = response.text();
     let body: serde_json::Value = serde_json::from_str(&body_text).expect("Response should be valid JSON");
 
-    // Trusted provider errors should pass through unsanitized
-    assert_eq!(response.status_code(), 429, "Should receive 429 from trusted provider");
-
-    // Verify all details are present (not sanitized)
-    assert_eq!(
-        body["error"]["message"].as_str(),
-        Some("Rate limit exceeded for organization org-123"),
-        "Trusted provider error message should pass through"
-    );
-    assert_eq!(
-        body["error"]["details"]["organization_id"].as_str(),
-        Some("org-123"),
-        "Trusted provider should include organization details"
-    );
-    assert_eq!(
-        body["error"]["details"]["current_usage"].as_i64(),
-        Some(1000),
-        "Trusted provider should include usage details"
-    );
+    assert_eq!(response.status_code(), 429, "Should preserve the upstream rate limit");
+    assert_eq!(body["error"]["message"], "Please contact our team for dedicated capacity.");
+    assert_eq!(body["error"]["type"], "rate_limit_error");
+    assert_eq!(body["error"]["code"], "upstream_rate_limit");
+    assert!(body["error"].get("details").is_none(), "Provider details should remain private");
 }
 
 /// Test various upstream error scenarios are handled correctly
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_strict_mode_handles_various_provider_errors(pool: PgPool) {
     // Test different error responses

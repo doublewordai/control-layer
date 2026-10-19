@@ -21,6 +21,8 @@
 //!   spare capacity with no deadline.
 
 use std::sync::Arc;
+use tracing::Instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use axum::{
     Json,
@@ -33,7 +35,8 @@ use axum::{
 use fusillade_arsenal::PostgresRequestManager;
 use sqlx_pool_router::PoolProvider;
 
-use super::image_normalizer_middleware::{normalize_error_response, normalize_value_to_tokens};
+use super::image_normalizer_middleware::{normalize_error_response, normalize_value_to_tokens, refuse_normalize_error};
+use super::rejections;
 use super::store::{self as response_store, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
 use super::streaming::{ReplayFrame, flex_stream_response};
 use crate::db::{errors::DbError, handlers::api_keys::ApiKeys, models::api_keys::ApiKeyPurpose};
@@ -49,15 +52,11 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     /// responses→chat completions conversion.
     pub loopback_base_url: String,
     /// dwctl database pool for model access validation.
-    pub dwctl_pool: sqlx::PgPool,
-    /// Multi-step warm-path streaming pieces. When the user sends
-    /// `stream: true` (and not `background: true`) on `/v1/responses`,
-    /// the middleware routes the request through
-    /// [`super::streaming::run_inline_streaming`] using these.
+    /// Live provider (not a pinned pool): survives runtime pool swaps.
+    pub dwctl_pool: sqlx_pool_router::DynPools,
+    /// Fusillade-backed response store. Used by the control plane here for
+    /// `previous_response_id` hydration, and by `GET /v1/responses/{id}`.
     pub response_store: Arc<super::store::FusilladeResponseStore<P>>,
-    pub multi_step_tool_executor: Arc<crate::inference::tools::HttpToolExecutor>,
-    pub multi_step_http_client: Arc<fusillade::ReqwestHttpClient>,
-    pub loop_config: onwards_fusillade::LoopConfig,
     /// Image-input normaliser (content-addressed store). On the **Flex**
     /// path the request is persisted and dispatched later by the daemon, so
     /// images are normalised to `dw-img://` tokens here (when enabled) — the
@@ -78,10 +77,13 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     /// Encrypted key custody for ZDR flex bodies. `None` disables ZDR.
     pub keystore: Option<crate::keystore::Keystore>,
     /// Per-key ZDR policy map (api key secret to the owning account's
-    /// `zero_data_retention` flag), kept fresh by [`crate::sync::zdr_keys`].
+    /// `zero_data_retention` flag), kept fresh by [`crate::sync::key_policy`].
     /// Read by [`super::zdr::is_zdr_request`] on the submit path. Defaults to
     /// empty (every key reads as non-ZDR) when the sync is not wired.
-    pub zdr_key_cache: crate::sync::zdr_keys::ZdrKeyCache,
+    pub key_policy_cache: crate::sync::key_policy::KeyPolicyCache,
+    /// Pending-byte limit for an unfinished SSE event (`onwards.sse_buffer_limit`),
+    /// used when applying the client's usage choice to a realtime stream.
+    pub sse_buffer_limit: usize,
 }
 
 /// Middleware that routes inference requests based on service_tier and background.
@@ -91,13 +93,28 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     req: Request<Body>,
     next: Next,
 ) -> Response {
+    // Routing, cache identity and billing must all use the body's model.
+    // Model-Override is a standalone Onwards feature, not a Control Layer API.
+    if req.headers().contains_key("model-override") {
+        return invalid_request(
+            &req,
+            None,
+            "Model-Override is not supported; select the model in the request body",
+            "unsupported_header",
+            "Model-Override",
+        );
+    }
+
     // Only intercept POST requests to inference endpoints.
     if !should_intercept(req.method(), req.uri().path()) {
         return next.run(req).await;
     }
 
     // Skip if this is a fusillade daemon request (already tracked)
-    if req.headers().get("x-fusillade-request-id").is_some() {
+    if let Some(request_id) = req.headers().get("x-fusillade-request-id") {
+        if let Some(request_id) = request_id.to_str().ok().and_then(|s| s.parse::<uuid::Uuid>().ok()) {
+            tracing::Span::current().set_attribute("doubleword.request_id", request_id.to_string());
+        }
         return next.run(req).await;
     }
 
@@ -107,28 +124,52 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::error!(error = %e, "Failed to read request body in inference middleware");
-            return Response::builder().status(StatusCode::BAD_REQUEST).body(Body::empty()).unwrap();
+            let response = Response::builder().status(StatusCode::BAD_REQUEST).body(Body::empty()).unwrap();
+            return rejections::refuse(&parts, response, "body_read_failed", None, None);
         }
     };
 
     let mut request_value: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
-            tracing::error!(error = %e, "Failed to parse request body in inference middleware");
-            return Response::builder().status(StatusCode::BAD_REQUEST).body(Body::empty()).unwrap();
+            // Only the category: serde's message can quote the body's values.
+            let category = match e.classify() {
+                serde_json::error::Category::Io => "io",
+                serde_json::error::Category::Syntax => "syntax",
+                serde_json::error::Category::Data => "data",
+                serde_json::error::Category::Eof => "eof",
+            };
+            tracing::error!(category, "Failed to parse request body in inference middleware");
+            let response = Response::builder().status(StatusCode::BAD_REQUEST).body(Body::empty()).unwrap();
+            return rejections::refuse(&parts, response, "invalid_json", None, None);
         }
     };
 
-    let model = request_value["model"].as_str().unwrap_or("unknown").to_string();
-    let model = model.as_str();
     let nested_path = parts.uri.path();
     let is_responses_api = nested_path.ends_with("/responses");
     let is_chat_completions_api = nested_path.ends_with("/chat/completions");
-    // The router is nested at /ai/v1, so the path here is e.g. "/responses".
-    // Prepend /v1 for the full API path used by the loopback and fusillade templates.
-    let endpoint = format!("/v1{nested_path}");
+    let requested_tier = resolve_service_tier(request_value["service_tier"].as_str());
+    let service_tier = if matches!(requested_tier, ServiceTier::Flex) && !is_responses_api && !is_chat_completions_api {
+        tracing::warn!(endpoint = %nested_path, "service_tier:'flex' is not yet supported on this endpoint; falling back to realtime.");
+        ServiceTier::Realtime
+    } else {
+        requested_tier
+    };
+    let is_daemon_processed = matches!(service_tier, ServiceTier::Flex | ServiceTier::Background);
 
-    // Extract bearer token for auth check and batch attribution
+    // Strip client-supplied completion/response id fields before the request is
+    // re-serialised and forwarded. dwctl owns the single parse-and-shape now, so
+    // onwards forwards the bytes verbatim (COR-522); this preserves the guarantee
+    // from onwards PR #240 that these ids never reach upstream. Exact-key removal:
+    // extension fields and a legitimate `previous_response_id` are left intact.
+    let scrubbed_ids = scrub_request_id_fields(&mut request_value);
+
+    let scrubbed_scheduling = strip_scheduling_priority(&mut request_value);
+
+    // The bearer token is needed below for ZDR, modality and toleration
+    // decisions. Read it now (it was earlier only parsed after the body was
+    // re-serialised) so the tolerations can be applied to `request_value`
+    // before the bytes are rebuilt.
     let api_key = parts
         .headers
         .get("authorization")
@@ -136,32 +177,183 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(|s| s.to_string());
 
-    // Inject server-side resolved tools into the request body so the
-    // multi-step path's transition function (which reads `body["tools"]`
-    // and forwards them to upstream model_call payloads) sees them.
-    // Without this, tools registered in the dwctl tool registry never
-    // reach the model — it can't issue real tool_calls and the loop
-    // runs as a single model_call.
-    //
-    // The single-step (onwards-routed) path injects tools via the
-    // strict-mode handlers; the multi-step path bypasses onwards for
-    // model_calls so we have to do it here. Skipped if the user
-    // already supplied tools (their list takes precedence).
-    //
-    // The cross-cutting `tool_injection_middleware` runs *inside* this
-    // layer (axum applies later-added layers as outer wrappers, so
-    // when inference_middleware fires, tool_injection hasn't yet
-    // populated request.extensions::<ResolvedTools>). We do the same
-    // DB resolve directly here.
-    if request_value.get("tools").is_none()
-        && is_responses_api
-        && let Some(key) = api_key.as_deref()
-        && let Ok(Some(resolved)) = crate::inference::tools::resolve_tools_for_request(&state.dwctl_pool, key, Some(model)).await
-    {
-        let openai_tools = resolved.to_openai_tools_array();
-        if !openai_tools.is_empty() {
-            request_value["tools"] = serde_json::Value::Array(openai_tools);
+    // An operator can pin an account to a scheduling-toleration preset: every
+    // request from the account then carries exactly the preset's list at
+    // `nvext.routing_constraints.tolerations`, replacing anything the client
+    // sent (stripped by `strip_scheduling_priority` above). The preset id is
+    // resolved against config through the per-key policy map, so this covers
+    // realtime, flex and background alike; batch JSONL files are scrubbed and
+    // stamped at ingest. The "Default" setting and every unpinned account are
+    // unchanged.
+    let scrubbed_pinned = match pinned_tolerations(&state.key_policy_cache, api_key.as_deref()) {
+        Some(tolerations) => set_routing_tolerations(&mut request_value, &tolerations),
+        None => false,
+    };
+
+    // A serving-class suffix (`alias:interactive`) is a request for a class,
+    // not part of the model's identity: strip it here, at the outermost layer,
+    // so analytics, the prompt cache and billing all key on the bare alias,
+    // and hand the class to onwards as a request extension. An unknown class
+    // is a 400 (a typo must not silently change how a request is served).
+    let (requested_class, scrubbed_class) = match strip_serving_class_suffix(&mut request_value, is_daemon_processed) {
+        Ok(result) => result,
+        Err(err) => {
+            let response = Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"error": {"message": err.to_string(), "type": "invalid_request_error", "param": "model"}})
+                        .to_string(),
+                ))
+                .unwrap();
+            let model = request_value["model"].as_str();
+            return rejections::refuse(&parts, response, "invalid_serving_class", Some("model"), model);
         }
+    };
+
+    // The realtime path forwards `body_bytes` verbatim and onwards forwards the
+    // bytes it receives (COR-522), so anything a scrubber removed from
+    // `request_value` only stays removed if the bytes are rebuilt from it.
+    // Every scrubber reports whether it changed something; the common case
+    // (nothing to scrub, no suffix, no pin) keeps the caller's bytes untouched.
+    let mut body_bytes = if scrubbed_class || scrubbed_ids || scrubbed_scheduling || scrubbed_pinned {
+        bytes::Bytes::from(request_value.to_string())
+    } else {
+        body_bytes
+    };
+
+    let model = request_value["model"].as_str().unwrap_or("unknown").to_string();
+    let model = model.as_str();
+    // Refusals from here on, attributed to this request and its model.
+    let refuse =
+        |response: Response, code: &'static str, param: Option<&str>| rejections::refuse(&parts, response, code, param, Some(model));
+    let invalid = |message: &str, code: &'static str, param: &'static str| invalid_request(&parts, Some(model), message, code, param);
+    // The router is nested at /ai/v1, so the path here is e.g. "/responses".
+    // Prepend /v1 for the full API path used by the loopback and fusillade templates.
+    let endpoint = format!("/v1{nested_path}");
+
+    // Stateful continuation requires the prior response body. Realtime ZDR
+    // deliberately never retains that body, while queued ZDR crypto-shreds it,
+    // so reject the contract before touching the response store. Besides being
+    // clearer for callers, this avoids turning an unavailable/minimal stored
+    // object into a hydration 5xx.
+    let zdr = crate::inference::zdr::is_zdr_request(&state.key_policy_cache, api_key.as_deref());
+
+    // An organization owner may have switched realtime inference off for
+    // every key the organization owns. Every service tier arrives on these
+    // endpoints, so one switch covers realtime, flex and background alike;
+    // batch execution re-enters with `x-fusillade-request-id` and was skipped
+    // above. Answered from the per-key policy map: no DB round-trip, and a
+    // key auth will reject anyway reads as nothing disabled.
+    if let Some(key) = api_key.as_deref()
+        && state
+            .key_policy_cache
+            .disabled_modalities(key)
+            .contains(crate::modalities::Modality::Realtime)
+    {
+        return refuse(
+            modality_disabled_response(crate::modalities::Modality::Realtime),
+            "modality_disabled",
+            None,
+        );
+    }
+    if is_responses_api {
+        if let Some(include) = request_value.get("include")
+            && !include.is_null()
+        {
+            let Ok(_) = serde_json::from_value::<Vec<crate::inference::translation::responses::types::Include>>(include.clone()) else {
+                return invalid(
+                    "include must contain only supported Responses API projection values",
+                    "invalid_parameter",
+                    "include",
+                );
+            };
+            // Accept reasoning.encrypted_content as a compatibility no-op. The
+            // Responses translator only projects logprobs and emits no encrypted
+            // state; clients may request this option without replaying any state.
+        }
+
+        let has_encrypted_reasoning_replay = request_value
+            .get("input")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    item.get("type").and_then(serde_json::Value::as_str) == Some("reasoning")
+                        && item.get("encrypted_content").is_some_and(|value| !value.is_null())
+                })
+            });
+        if has_encrypted_reasoning_replay {
+            return invalid(
+                "encrypted reasoning item replay is not supported by this Responses API implementation",
+                "unsupported_parameter",
+                "input",
+            );
+        }
+    }
+    if is_responses_api && zdr && request_value.get("previous_response_id").is_some_and(|id| !id.is_null()) {
+        return invalid(
+            "previous_response_id is not supported when zero-data retention is enabled",
+            "zdr_state_not_supported",
+            "previous_response_id",
+        );
+    }
+
+    // `previous_response_id` hydration (Responses control plane). Inline the prior
+    // turn's output items ahead of the current input, in the Responses domain,
+    // BEFORE the edge translation (one layer inside this one) converts the request
+    // to Chat Completions. Runs here rather than in the translator so the pure
+    // translator stays stateless. Gated on the field's presence so the common path
+    // pays nothing. The hydrated body flows to every downstream path because it is
+    // re-serialised from `request_value` below.
+    if is_responses_api && request_value.get("previous_response_id").is_some() {
+        use crate::inference::translation::responses::hydrate::{HydrationError, hydrate_previous_response};
+        // The prior turn is only ever the caller's own: resolve the key's
+        // owner first, and treat an unresolvable key as "no such response".
+        let owner: Option<String> = match api_key.as_deref() {
+            Some(secret) => {
+                sqlx::query_scalar("SELECT user_id::text FROM public.api_keys WHERE secret = $1 AND is_deleted = false LIMIT 1")
+                    .bind(secret)
+                    .fetch_optional(&state.dwctl_pool)
+                    .await
+                    .unwrap_or(None)
+            }
+            None => None,
+        };
+        let hydration = match owner.as_deref() {
+            Some(owner) => hydrate_previous_response(&*state.response_store, owner, &mut request_value).await,
+            None => Err(HydrationError::NotFound(
+                request_value["previous_response_id"].as_str().unwrap_or_default().to_string(),
+            )),
+        };
+        if let Err(e) = hydration {
+            let (status, message) = match e {
+                HydrationError::NotFound(id) => (StatusCode::BAD_REQUEST, format!("previous response not found: {id}")),
+                HydrationError::Internal(msg) => {
+                    tracing::error!(error = %msg, "responses hydration failed");
+                    (StatusCode::INTERNAL_SERVER_ERROR, "failed to load previous response".to_string())
+                }
+            };
+            let err_type = if status == StatusCode::BAD_REQUEST {
+                "invalid_request_error"
+            } else {
+                "server_error"
+            };
+            let response = Response::builder()
+                .status(status)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"error": {"message": message, "type": err_type}}).to_string(),
+                ))
+                .unwrap();
+            if status.is_client_error() {
+                return refuse(response, "previous_response_not_found", Some("previous_response_id"));
+            }
+            return response;
+        }
+        // Realtime dispatch otherwise forwards the original caller bytes. The
+        // hydrated request must become the body sent through translation as
+        // well as the body retained for a later continuation.
+        body_bytes = bytes::Bytes::from(request_value.to_string());
     }
 
     // Parse `service_tier` and `background` from the body.
@@ -188,95 +380,26 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // `detail_to_response_object` path is wrong for it. Flex on
     // embeddings is silently downgraded to realtime with a warning so
     // the fallback is at least observable.
-    let requested_tier = resolve_service_tier(request_value["service_tier"].as_str());
     let background = if is_responses_api {
         request_value["background"].as_bool().unwrap_or(false)
     } else {
         false
     };
-    let service_tier = if matches!(requested_tier, ServiceTier::Flex) && !is_responses_api && !is_chat_completions_api {
-        tracing::warn!(
-            endpoint = %nested_path,
-            "service_tier:'flex' is not yet supported on this endpoint; falling back to realtime."
-        );
-        ServiceTier::Realtime
-    } else {
-        requested_tier
-    };
+    // Upstream Background-tier request-contract validation + the daemon-processed
+    // flag (Flex | Background). The multi-step warm-path loop that used to sit here
+    // (has_tools / warm_path_branch / try_warm_path_*) was removed on this branch, so
+    // only the tier validation survives.
     if let Some(message) = background_contract_error(service_tier, is_responses_api, background) {
-        return Response::builder()
+        let response = Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::json!({"error": {"message": message, "type": "invalid_request_error"}}).to_string(),
             ))
             .unwrap();
+        let param = if is_responses_api { "background" } else { "service_tier" };
+        return refuse(response, "invalid_parameter", Some(param));
     }
-    let is_daemon_processed = matches!(service_tier, ServiceTier::Flex | ServiceTier::Background);
-
-    // The warm path / multi-step loop only earns its keep when the
-    // request actually has tools to dispatch. Tool-free `/v1/responses`
-    // can be served by onwards' native single-step proxying (which
-    // rewrites /v1/responses → /v1/chat/completions on the wire and
-    // back), producing one tracking row via the standard outlet path
-    // instead of going through `record_step` / `response_steps` /
-    // `finalize_head_request`. We compute `has_tools` after tool
-    // injection so server-side-resolved tools also count.
-    let has_tools = request_value.get("tools").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty());
-
-    // Multi-step warm-path dispatch. Engages for tool-using
-    // `/v1/responses` realtime requests (priority / default / auto) so
-    // tool calls actually dispatch — single-step onwards proxying
-    // would forward server-side tools to the upstream model but never
-    // run them. Tool-free requests don't need this and fall through to
-    // `handle_realtime` like chat-completions.
-    // Flex requests skip the warm path entirely so they can reach
-    // `handle_flex` and be queued for the daemon (1h SLA, batch
-    // pricing). The daemon's `DwctlRequestProcessor` runs the same
-    // multi-step loop async when tools are present.
-    //
-    //   stream=true,  background=false, !flex, tools → SSE response, loop runs inline
-    //   stream=false, background=false, !flex, tools → JSON response, loop runs inline
-    //   stream=*,     background=true,  !flex, tools → 202 + spawned loop, GET /v1/responses/{id} polls
-    //   no tools, !flex                              → falls through to handle_realtime below
-    //   any flex                                     → falls through to handle_flex below
-    let stream_requested = is_responses_api && !background && request_value["stream"].as_bool().unwrap_or(false);
-
-    // ZDR + server-side tools (responses API) runs the multi-step tool loop —
-    // inline on the realtime warm path, async in the flex daemon — which
-    // scatters plaintext into response_steps / sub-request rows / per-step
-    // outlet logs that ZDR cannot cover. Reject at submit for both tiers, keyed
-    // on per-key policy alone (a keystore is irrelevant to whether we can
-    // safely serve the request).
-    if is_responses_api && has_tools && crate::inference::zdr::is_zdr_request(&state.zdr_key_cache, api_key.as_deref()) {
-        return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::json!({"error": {"message": "Zero-data-retention is not supported for requests that use server-side tools.", "type": "invalid_request_error"}}).to_string(),
-            ))
-            .unwrap();
-    }
-
-    match warm_path_branch(is_responses_api, is_daemon_processed, background, stream_requested, has_tools) {
-        WarmPathBranch::Stream => {
-            if let Some(resp) = try_warm_path_stream(&state, &request_value, api_key.as_deref(), model).await {
-                return resp;
-            }
-        }
-        WarmPathBranch::Blocking => {
-            if let Some(resp) = try_warm_path_blocking(&state, &request_value, api_key.as_deref(), model).await {
-                return resp;
-            }
-        }
-        WarmPathBranch::Background => {
-            if let Some(resp) = try_warm_path_background(&state, &request_value, api_key.as_deref(), model).await {
-                return resp;
-            }
-        }
-        WarmPathBranch::FallThrough => {}
-    }
-
     tracing::debug!(
         model = %model,
         service_tier = %service_tier,
@@ -289,6 +412,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // proxying. Used as `x-fusillade-request-id` on the proxied request so
     // the outlet handler can locate the row to update.
     let request_id = uuid::Uuid::new_v4();
+    tracing::Span::current().set_attribute("doubleword.request_id", request_id.to_string());
     let resp_id = format!("resp_{request_id}");
 
     // Validate API keys for daemon-processed requests (realtime is validated
@@ -297,33 +421,37 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     if is_daemon_processed {
         match api_key.as_deref() {
             None => {
-                return Response::builder()
+                let response = Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({"error": {"message": "API key required", "type": "invalid_request_error"}}).to_string(),
                     ))
                     .unwrap();
+                return refuse(response, "unauthenticated", None);
             }
             Some(key) => {
-                if let Err(msg) = crate::error_enrichment::validate_api_key_model_access(state.dwctl_pool.clone(), key, model).await {
-                    return Response::builder()
+                if let Err(msg) =
+                    crate::error_enrichment::validate_api_key_model_access(state.dwctl_pool.write().into_inner(), key, model).await
+                {
+                    let response = Response::builder()
                         .status(StatusCode::FORBIDDEN)
                         .header("content-type", "application/json")
                         .body(Body::from(
                             serde_json::json!({"error": {"message": msg, "type": "invalid_request_error"}}).to_string(),
                         ))
                         .unwrap();
+                    return refuse(response, "forbidden", None);
                 }
             }
         }
     }
 
     if matches!(service_tier, ServiceTier::Background) {
-        match api_key_creator_can_run_background(&state.dwctl_pool, api_key.as_deref()).await {
+        match api_key_creator_can_run_background(&state.dwctl_pool.write(), api_key.as_deref()).await {
             Ok(Some(true)) => {}
             Ok(Some(false)) => {
-                return Response::builder()
+                let response = Response::builder()
                     .status(StatusCode::FORBIDDEN)
                     .header("content-type", "application/json")
                     .body(Body::from(
@@ -336,15 +464,17 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                         .to_string(),
                     ))
                     .unwrap();
+                return refuse(response, "forbidden", None);
             }
             Ok(None) => {
-                return Response::builder()
+                let response = Response::builder()
                     .status(StatusCode::FORBIDDEN)
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({"error": {"message": "Invalid API key", "type": "invalid_request_error"}}).to_string(),
                     ))
                     .unwrap();
+                return refuse(response, "invalid_api_key", None);
             }
             Err(e) => {
                 tracing::error!(error = %e, "Failed to resolve background-inference role");
@@ -363,22 +493,23 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // exist before returning 202). Flex uses the key owner's hidden batch key
     // below, so resolving it there also supplies the attribution target.
     let created_by = if background && matches!(service_tier, ServiceTier::Realtime) {
-        response_store::lookup_created_by(&state.dwctl_pool, api_key.as_deref()).await
+        response_store::lookup_created_by(&state.dwctl_pool.write(), api_key.as_deref()).await
     } else {
         None
     };
     let queued_batch_key = if is_daemon_processed {
-        match resolve_flex_batch_api_key(&state.dwctl_pool, api_key.as_deref()).await {
+        match resolve_flex_batch_api_key(&state.dwctl_pool.write(), api_key.as_deref()).await {
             Ok(Some(key)) => Some(key),
             Ok(None) => {
                 tracing::warn!(service_tier = %service_tier, "Queued API key disappeared before hidden batch-key resolution");
-                return Response::builder()
+                let response = Response::builder()
                     .status(StatusCode::FORBIDDEN)
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({"error": {"message": "Invalid API key", "type": "invalid_request_error"}}).to_string(),
                     ))
                     .unwrap();
+                return refuse(response, "invalid_api_key", None);
             }
             Err(e) => {
                 tracing::error!(error = %e, service_tier = %service_tier, "Failed to resolve queued hidden batch key");
@@ -424,13 +555,17 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         )
         .await
     {
-        return Response::builder()
+        let response = Response::builder()
             .status(err.status_code())
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::json!({"error": {"message": err.user_message(), "type": "invalid_request_error"}}).to_string(),
             ))
             .unwrap();
+        if response.status().is_client_error() {
+            return refuse(response, "unverified_volume_limit", None);
+        }
+        return response;
     }
 
     match service_tier {
@@ -438,7 +573,6 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             // Realtime ZDR is non-persistence (no encryption): decided per-key
             // from the same policy map as flex, but without a keystore since we
             // suppress the stored copies rather than encrypt them.
-            let zdr = crate::inference::zdr::is_zdr_request(&state.zdr_key_cache, api_key.as_deref());
             let realtime_input = fusillade::CreateRealtimeInput {
                 request_id,
                 // ZDR: never persist the request body to `request_templates`
@@ -452,7 +586,27 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 api_key: api_key.clone().unwrap_or_default(),
                 created_by: created_by.unwrap_or_default(),
             };
-            handle_realtime(&state, realtime_input, &resp_id, model, background, zdr, parts, body_bytes, next).await
+            let client_usage = super::stream_usage::requested_usage(&endpoint, &request_value);
+            // The parsed JSON is no longer needed on the realtime path. Release
+            // its strings before the upstream request is held open.
+            drop(request_value);
+            let response = handle_realtime(
+                &state,
+                realtime_input,
+                &resp_id,
+                model,
+                background,
+                zdr,
+                requested_class,
+                parts,
+                body_bytes,
+                next,
+            )
+            .await;
+            match client_usage {
+                Some(usage) => super::stream_usage::apply(response, usage, state.sse_buffer_limit),
+                None => response,
+            }
         }
         ServiceTier::Flex | ServiceTier::Background => {
             let is_background_tier = matches!(service_tier, ServiceTier::Background);
@@ -460,7 +614,6 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             // retrieve key off the stored body's sentinel instead of re-checking.
             // The tool-using case is already rejected above, before the warm-path
             // branch, for both tiers.
-            let zdr = crate::inference::zdr::is_zdr_request(&state.zdr_key_cache, api_key.as_deref());
             // Flex encrypts the body at rest, which requires a configured
             // keystore. A ZDR account whose request cannot be encrypted must fail
             // loudly - never silently fall back to plaintext, and bail before we
@@ -476,23 +629,45 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                     ))
                     .unwrap();
             }
+            // ZDR keys exist before anything is stored: the request key seals
+            // the request's images on their way into the object store below, as
+            // well as the body further down, so no ZDR image is ever written in
+            // plaintext and shredding the key shreds the images with the body.
+            let zdr_keys = zdr.then(crate::inference::zdr::FlexKeys::generate);
             // Flex is persisted now and dispatched later by the daemon, so —
-            // unlike realtime — it does NOT pass through the image-normaliser
-            // layer. Normalise image inputs to `dw-img://` tokens here so the
-            // daemon's dispatch-time JIT signing hands the provider a signed
-            // URL rather than the raw image/URL (closing the same exposure the
-            // realtime and `/v1/files` paths already close). No-op when the
-            // feature is disabled.
-            if state.image_normalizer_enabled {
-                // Attribute the image to the acting human + owning org (for org
-                // keys), mirroring how CurrentUser is derived, so the console's
-                // org-scoped image-view authorization lines up.
+            // unlike realtime — this leg does NOT pass through the
+            // image-normaliser layer. Normalise image inputs to `dw-img://`
+            // tokens here; the daemon's dispatch loops back through the edge,
+            // where the normaliser layer signs the tokens (below the
+            // prompt-cache layer, so the cache keys on the stable token) and
+            // hands the provider a signed URL rather than the raw image/URL —
+            // closing the same exposure the realtime and `/v1/files` paths
+            // already close. No-op when the feature is disabled.
+            // Only bodies that actually carry an image pay for the caller
+            // lookup (and can fail on it); text-only flex traffic is untouched.
+            if state.image_normalizer_enabled
+                && crate::image_normalizer::walker::has_inputs(&request_value, crate::image_normalizer::Mode::All)
+            {
+                // Attribute the image to the PRINCIPAL behind the key (the
+                // person, or the organization for an org key), the same
+                // principal the daemon's hidden batch key carries at dispatch.
+                // The attribution row written here is what authorises signing
+                // the tokens at dispatch (and on a later client re-send), so a
+                // lookup failure fails the submission (retryable) instead of
+                // silently persisting tokens without it.
                 let attribution = match api_key.as_deref() {
-                    Some(key) => crate::api::handlers::images::resolve_image_attribution(&state.dwctl_pool, key).await,
+                    Some(key) => match crate::api::handlers::images::try_resolve_caller(&state.dwctl_pool.write(), key).await {
+                        Ok(caller) => caller.map(|c| c.attribution),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Image attribution lookup failed on flex enqueue");
+                            return normalize_error_response(crate::image_normalizer::NormalizeError::AccessUnavailable);
+                        }
+                    },
                     None => None,
                 };
-                let access_pool = Some(state.dwctl_pool.clone());
-                match normalize_value_to_tokens(&mut request_value, &state.image_normalizer, access_pool, attribution).await {
+                let access_pool = Some(state.dwctl_pool.write().into_inner());
+                let seal_key = zdr_keys.as_ref().map(|keys| &keys.request[..]);
+                match normalize_value_to_tokens(&mut request_value, &state.image_normalizer, access_pool, attribution, seal_key).await {
                     Ok(n) => {
                         if n > 0 {
                             tracing::debug!(substituted = n, service_tier = %service_tier, "Queued image normalisation replaced image inputs with tokens");
@@ -500,7 +675,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, service_tier = %service_tier, "Queued image normalisation failed");
-                        return normalize_error_response(e);
+                        return refuse_normalize_error(&parts, e, Some(model));
                     }
                 }
             }
@@ -528,13 +703,13 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             let flex_stream_include_usage =
                 flex_stream && is_chat_completions_api && request_value["stream_options"]["include_usage"].as_bool().unwrap_or(false);
             if flex_stream && let Some(obj) = request_value.as_object_mut() {
-                obj.remove("stream");
-                obj.remove("stream_options");
+                obj.shift_remove("stream");
+                obj.shift_remove("stream_options");
             }
 
             // For ZDR, encrypt the body and store the per-request keys; any
             // failure fails the request rather than falling back to plaintext.
-            let flex_body = if zdr {
+            let flex_body = if let Some(keys) = zdr_keys.as_ref() {
                 let zdr_store_error = || {
                     Response::builder()
                         .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -548,7 +723,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                     tracing::error!("ZDR enabled but keystore missing; refusing to store plaintext");
                     return zdr_store_error();
                 };
-                match crate::inference::zdr::prepare_flex_submit(keystore, &request_id, &mut request_value).await {
+                match crate::inference::zdr::prepare_flex_submit(keystore, &request_id, keys, &mut request_value).await {
                     Ok(body) => body,
                     Err(e) => {
                         tracing::error!(error = %e, "ZDR submit failed; refusing to store plaintext");
@@ -596,6 +771,16 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 return handle_background(&state, background_input, &resp_id, model).await;
             }
 
+            // INVARIANT: the daemon dispatches this job back through the loopback
+            // (`endpoint` = `.../ai`), so it re-enters the FULL dwctl stack,
+            // including the edge translation layer. That is load-bearing for
+            // Responses: this middleware runs OUTER to translation, so `flex_body`
+            // and `path` are still the RAW `/responses` request here (untranslated).
+            // Translation converts it on the daemon's loopback in both directions
+            // (request -> chat for the model call, chat -> Responses for the stored
+            // result), which is what lets `GET /v1/responses/{id}` return a
+            // Responses object. Do not "optimise" the loopback to hit onwards
+            // directly - that would bypass translation and break Responses flex.
             let flex_input = fusillade::CreateFlexInput {
                 request_id,
                 body: flex_body,
@@ -777,59 +962,6 @@ fn background_contract_error(service_tier: ServiceTier, is_responses_api: bool, 
     None
 }
 
-/// Which warm-path branch (if any) should handle a request, given
-/// the orthogonal flags `(is_responses_api, is_flex, background,
-/// stream_requested)`. `FallThrough` means the request continues to
-/// the realtime / flex dispatch below — that's how flex
-/// `/v1/responses` reaches `handle_flex` and how chat completions /
-/// embeddings always reach `handle_realtime`.
-///
-/// Extracted as a pure function so the routing decision is testable
-/// without standing up the full middleware state.
-///
-/// Check order matters for readability rather than correctness — both
-/// short-circuits return `FallThrough`, so reordering them produces
-/// the same answer — but reading flex-first makes the bug-this-PR-
-/// fixes connection explicit: flex must never reach the warm path.
-/// `is_responses_api` second documents that warm path is exclusive
-/// to `/v1/responses`. Stream/background tail dispatch is the only
-/// real branching.
-#[derive(Debug, PartialEq, Eq)]
-enum WarmPathBranch {
-    Stream,
-    Blocking,
-    Background,
-    FallThrough,
-}
-
-fn warm_path_branch(is_responses_api: bool, is_flex: bool, background: bool, stream_requested: bool, has_tools: bool) -> WarmPathBranch {
-    // Flex must reach `handle_flex` to land in fusillade-pending
-    // state for the daemon. Engaging warm-path for flex would defeat
-    // the tier (the loop runs inline, billed as realtime).
-    if is_flex {
-        return WarmPathBranch::FallThrough;
-    }
-    // Warm path is /v1/responses-only — chat completions and
-    // embeddings stay on the single-step proxy path.
-    if !is_responses_api {
-        return WarmPathBranch::FallThrough;
-    }
-    // Tool-free /v1/responses doesn't need the multi-step loop —
-    // there are no tool_calls to dispatch. Fall through so onwards'
-    // single-step /v1/responses → /v1/chat/completions proxy handles
-    // it, producing one tracking row via the standard outlet path.
-    if !has_tools {
-        return WarmPathBranch::FallThrough;
-    }
-    if stream_requested {
-        WarmPathBranch::Stream
-    } else if background {
-        WarmPathBranch::Background
-    } else {
-        WarmPathBranch::Blocking
-    }
-}
-
 /// Handle a realtime request (priority/default/auto).
 ///
 /// For `background=true`: creates the request row synchronously so the client
@@ -848,6 +980,7 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     model: &str,
     background: bool,
     zdr: bool,
+    requested_class: Option<onwards::ServingClass>,
     parts: axum::http::request::Parts,
     body_bytes: bytes::Bytes,
     next: Next,
@@ -876,6 +1009,9 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     // Strip the "resp_" prefix — onwards re-adds it.
     let raw_id = resp_id.strip_prefix("resp_").unwrap_or(resp_id);
     let mut req = Request::from_parts(parts, Body::from(body_bytes));
+    if let Some(class) = requested_class {
+        req.extensions_mut().insert(onwards::RequestedServingClass(class));
+    }
     req.headers_mut()
         .insert("x-fusillade-request-id", raw_id.parse().expect("response_id is valid header value"));
     req.headers_mut().insert(
@@ -912,11 +1048,16 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
             "output": [],
         });
 
-        tokio::spawn(async move {
-            let response = next.run(req).await;
-            let (_parts, body) = response.into_parts();
-            let _ = axum::body::to_bytes(body, usize::MAX).await;
-        });
+        // Spawned tasks do not inherit the current span; keep the background
+        // dispatch under the gateway span so its provider attempts stay in the trace.
+        tokio::spawn(
+            async move {
+                let response = next.run(req).await;
+                let (_parts, body) = response.into_parts();
+                let _ = axum::body::to_bytes(body, usize::MAX).await;
+            }
+            .in_current_span(),
+        );
 
         (StatusCode::ACCEPTED, Json(response_body)).into_response()
     } else {
@@ -1220,238 +1361,358 @@ async fn handle_responses_flex_streaming<P: PoolProvider + Clone + Send + Sync +
 }
 
 /// Check if a request should be intercepted by this middleware.
+///
+/// `/messages` is included because this middleware now runs OUTER to the edge
+/// translation (so it sees the raw foreign path). Anthropic `/messages` still
+/// needs a tracking row and realtime/flex routing, exactly like `/chat/completions`
+/// it would otherwise be translated into; translation happens on the layer just
+/// inside this one.
 pub(crate) fn should_intercept(method: &axum::http::Method, path: &str) -> bool {
+    // `/completions` (which `/chat/completions` also ends with) is included so
+    // native completions traffic passes through `strip_scheduling_priority`:
+    // it is the one POST inference path where a typed `priority` field exists
+    // in onwards' strict schema, so leaving it un-intercepted would let any
+    // external key steer the dynamo scheduler queue.
     method == axum::http::Method::POST
-        && (path.ends_with("/responses") || path.ends_with("/chat/completions") || path.ends_with("/embeddings"))
+        && (path.ends_with("/responses") || path.ends_with("/completions") || path.ends_with("/messages") || path.ends_with("/embeddings"))
 }
 
-/// Attempt to dispatch a `/v1/responses` request through the warm-path
-/// streaming handler. Returns `Some(response)` if the dispatch
-/// succeeded; `None` if the request can't be served via the warm path
-/// (no API key, missing tool resolution, etc.) and should fall through
-/// to the standard single-step / daemon paths.
-async fn try_warm_path_stream<P: PoolProvider + Clone + Send + Sync + 'static>(
-    state: &InferenceMiddlewareState<P>,
-    request_value: &serde_json::Value,
-    api_key: Option<&str>,
-    model: &str,
-) -> Option<Response> {
-    let api_key = api_key?;
-    let (head_step_uuid, resolved, upstream) = warm_path_setup(state, request_value, api_key, model).await?;
-
-    let sse = super::streaming::run_inline_streaming(
-        state.response_store.clone(),
-        state.multi_step_tool_executor.clone(),
-        resolved,
-        state.multi_step_http_client.clone(),
-        upstream,
-        state.loop_config,
-        head_step_uuid.to_string(),
-        model.to_string(),
-    );
-    Some(sse.into_response())
+/// 403 for a product surface an organization owner has switched off. Same
+/// shape as the daemon-tier refusals above; `code` lets clients tell it apart
+/// from a permission problem on the key itself.
+fn modality_disabled_response(modality: crate::modalities::Modality) -> Response {
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "error": {
+                    "message": modality.disabled_message(),
+                    "type": "invalid_request_error",
+                    "code": "modality_disabled",
+                    "param": null
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap()
 }
 
-/// Warm-path blocking handler for `/v1/responses` with
-/// `stream:false, background:false`. Same multi-step machinery as
-/// `try_warm_path_stream`, but accumulates the loop's output and
-/// returns a single JSON response instead of an SSE stream — so tools
-/// dispatch correctly even when the user opted out of streaming.
-async fn try_warm_path_blocking<P: PoolProvider + Clone + Send + Sync + 'static>(
-    state: &InferenceMiddlewareState<P>,
-    request_value: &serde_json::Value,
-    api_key: Option<&str>,
-    model: &str,
-) -> Option<Response> {
-    let api_key = api_key?;
-    let (request_id, resolved, upstream) = match warm_path_setup(state, request_value, api_key, model).await {
-        Some(s) => s,
-        None => return None,
-    };
-
-    let result = super::streaming::run_inline_blocking(
-        state.response_store.clone(),
-        state.multi_step_tool_executor.clone(),
-        resolved,
-        state.multi_step_http_client.clone(),
-        upstream,
-        state.loop_config,
-        request_id.to_string(),
-        model.to_string(),
-    )
-    .await;
-
-    let (status, body) = match result {
-        Ok(json) => (StatusCode::OK, json),
-        Err(err_payload) => (StatusCode::BAD_GATEWAY, serde_json::json!({"error": err_payload})),
-    };
-    Some((status, Json(body)).into_response())
+/// A 400 naming `param`, counted as refused for `code`.
+fn invalid_request<'a>(
+    origin: impl Into<rejections::Origin<'a>>,
+    model: Option<&str>,
+    message: &str,
+    code: &'static str,
+    param: &'static str,
+) -> Response {
+    rejections::refuse(origin, invalid_request_response(message, code, param), code, Some(param), model)
 }
 
-/// Warm-path background handler for `/v1/responses` with
-/// `background:true`. Spawns the multi-step loop in a background
-/// task and returns a 202 with the in_progress response shape — the
-/// caller polls `GET /v1/responses/{id}` for the terminal state.
-async fn try_warm_path_background<P: PoolProvider + Clone + Send + Sync + 'static>(
-    state: &InferenceMiddlewareState<P>,
-    request_value: &serde_json::Value,
-    api_key: Option<&str>,
-    model: &str,
-) -> Option<Response> {
-    let api_key = api_key?;
-    let (request_id, resolved, upstream) = match warm_path_setup(state, request_value, api_key, model).await {
-        Some(s) => s,
-        None => return None,
-    };
-
-    let resp_id = format!("resp_{request_id}");
-    let response_body = serde_json::json!({
-        "id": resp_id,
-        "object": "response",
-        "status": "in_progress",
-        "model": model,
-        "background": true,
-        "output": [],
-    });
-
-    let response_store = state.response_store.clone();
-    let tool_executor = state.multi_step_tool_executor.clone();
-    let http_client = state.multi_step_http_client.clone();
-    let loop_config = state.loop_config;
-    let model_str = model.to_string();
-    let request_id_str = request_id.to_string();
-    tokio::spawn(async move {
-        let _ = super::streaming::run_inline_blocking(
-            response_store,
-            tool_executor,
-            resolved,
-            http_client,
-            upstream,
-            loop_config,
-            request_id_str,
-            model_str,
-        )
-        .await;
-    });
-
-    Some((StatusCode::ACCEPTED, Json(response_body)).into_response())
+fn invalid_request_response(message: &str, code: &str, param: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "error": {
+                    "message": message,
+                    "type": "invalid_request_error",
+                    "code": code,
+                    "param": param,
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap()
 }
 
-/// Shared setup for the three warm paths: register the per-response
-/// context in the side-channel so the bridge's `next_action_for` /
-/// `record_step` can re-parse the original body and stamp api_key /
-/// created_by / base_url on per-step sub-request rows; resolve
-/// per-request tools; build the upstream target.
+/// Client-supplied completion/response id keys to strip from a request body
+/// before forwarding upstream (ported from onwards PR #240). Not legitimate
+/// request fields, so removing them never drops real input.
+const SCRUB_ID_KEYS: [&str; 5] = ["id", "completion_id", "completionId", "response_id", "responseId"];
+
+/// Remove the [`SCRUB_ID_KEYS`] from a request body's top-level object, in place.
 ///
-/// Returns the head-step UUID — the caller surfaces it to the user as
-/// `resp_<id>` and threads its string form into `run_response_loop` as
-/// the loop's `request_id` parameter.
-///
-/// A single `/v1/responses` fusillade row is created up front via
-/// `create_realtime` (state=`processing`, id=`head_step_uuid`). That
-/// row is the response: `record_step`'s head branch reuses it instead
-/// of inserting another, and `finalize_head_request` completes it when
-/// the loop terminates. Descendant model_call steps still mint their
-/// own sub-request rows. The asymmetry with the daemon-driven flex
-/// path (which uses `handle_flex` to create the same shape of row in
-/// `pending` state) is just state at insert: warm path doesn't go
-/// through the daemon's claim cycle.
-async fn warm_path_setup<P: PoolProvider + Clone + Send + Sync + 'static>(
-    state: &InferenceMiddlewareState<P>,
-    request_value: &serde_json::Value,
-    api_key: &str,
-    model: &str,
-) -> Option<(
-    uuid::Uuid,
-    Arc<crate::inference::tools::ResolvedToolSet>,
-    onwards_fusillade::UpstreamTarget,
-)> {
-    let created_by = response_store::lookup_created_by(&state.dwctl_pool, Some(api_key)).await;
-
-    let resolved = match crate::inference::tools::resolve_tools_for_request(&state.dwctl_pool, api_key, Some(model)).await {
-        Ok(Some(set)) => Arc::new(set),
-        Ok(None) => Arc::new(crate::inference::tools::ResolvedToolSet::new(
-            std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
-        )),
-        Err(e) => {
-            tracing::warn!(error = %e, "warm-path: tool resolution failed; running with no tools");
-            Arc::new(crate::inference::tools::ResolvedToolSet::new(
-                std::collections::HashMap::new(),
-                std::collections::HashMap::new(),
-            ))
+/// Exact-key removal only: every other extension field is preserved, and a
+/// legitimate `previous_response_id` (a different key) is untouched. Returns
+/// whether anything was removed, so the caller knows to re-serialise.
+fn scrub_request_id_fields(value: &mut serde_json::Value) -> bool {
+    let mut scrubbed = false;
+    if let Some(obj) = value.as_object_mut() {
+        for key in SCRUB_ID_KEYS {
+            scrubbed |= obj.shift_remove(key).is_some();
         }
-    };
-
-    // The transition function uses these names to decide which
-    // tool_calls returned by the model can be auto-dispatched and
-    // which must be passed through to the client as `function_call`
-    // output items. Any tool the user supplies in their request body
-    // that isn't registered in `tool_sources` ends up outside this set
-    // and gets the client-side passthrough treatment — without this,
-    // HttpToolExecutor would try to dispatch the unknown name and the
-    // step would fail with `Tool not found`.
-    let resolved_tool_names = resolved.tools.keys().cloned().collect();
-
-    // Allocate the head step UUID up front so the side-channel entry
-    // and the fusillade row share the same id — `record_step`'s head
-    // branch reuses this row instead of creating a separate sub-request.
-    let head_step_uuid = uuid::Uuid::new_v4();
-
-    let pending = response_store::PendingResponseInput {
-        body: request_value.to_string(),
-        api_key: Some(api_key.to_string()),
-        created_by: created_by.clone(),
-        base_url: state.loopback_base_url.clone(),
-        resolved_tool_names,
-    };
-    if let Err(e) = state.response_store.register_pending_with_id(head_step_uuid, pending) {
-        tracing::error!(
-            error = %e,
-            request_id = %head_step_uuid,
-            "warm-path: failed to register pending input — aborting warm path",
-        );
-        return None;
     }
+    scrubbed
+}
 
-    // Create the /v1/responses row up front in `processing` state so
-    // it's not claimable by the daemon (warm path owns its lifecycle)
-    // and so `record_step`'s head branch can attach to it via id.
-    let realtime_input = fusillade::CreateRealtimeInput {
-        request_id: head_step_uuid,
-        body: request_value.to_string(),
-        model: model.to_string(),
-        endpoint: state.loopback_base_url.clone(),
-        method: "POST".to_string(),
-        path: "/v1/responses".to_string(),
-        api_key: api_key.to_string(),
-        created_by: created_by.unwrap_or_default(),
-    };
-    if let Err(e) = fusillade::Storage::create_realtime(&*state.request_manager, realtime_input).await {
-        tracing::error!(
-            error = %e,
-            request_id = %head_step_uuid,
-            "warm-path: failed to create /v1/responses tracking row — aborting warm path",
-        );
-        state.response_store.unregister_pending(&head_step_uuid.to_string());
-        return None;
+/// Remove a caller-supplied scheduling `priority` from a request body, in place.
+///
+/// The dynamo scheduler orders its queue by this field, so an external caller
+/// who could set it would jump ahead of everyone else's realtime work. The two
+/// legitimate senders never reach this middleware: fusillade daemon requests
+/// (deadline-derived batch priority) take the `x-fusillade-request-id` early
+/// return, and continuation resume legs enter the stack below it. Everything
+/// parsed here is external traffic, which onwards sends to a dynamo member at
+/// realtime's priority 0.
+///
+/// NOTE: the `x-fusillade-request-id` early return is only safe because the
+/// sso-stack ingress strips all `x-fusillade-*` headers from external requests
+/// (shared-locations.conf.gotmpl, "dont allow fusillade header spoofing") — a
+/// dwctl reachable without traversing that proxy would let a client set the
+/// header and skip this strip. Defense-in-depth here depends on that perimeter.
+///
+/// Also removes the serving router targets (`nvext.router.{ttft_target,
+/// itl_target}`): those are the resolver's to set (onwards writes them after
+/// resolution), never the caller's.
+///
+/// Returns whether anything was removed. Onwards validates and then forwards
+/// the ORIGINAL bytes (COR-522), so a removal only takes effect if the caller
+/// re-serialises the body from the scrubbed value.
+pub(crate) fn strip_scheduling_priority(value: &mut serde_json::Value) -> bool {
+    let mut scrubbed = false;
+    if let Some(obj) = value.as_object_mut() {
+        scrubbed |= obj.shift_remove("priority").is_some();
+        // The carrier the dynamo frontend ACTUALLY honours is
+        // `nvext.agent_hints.priority` (a top-level `priority` is rejected by
+        // its validation) — remove exactly that key so an external caller
+        // cannot steer the scheduler through the vendor extension, while the
+        // rest of a caller's `nvext` (e.g. cache_control) passes through.
+        if let Some(nvext) = obj.get_mut("nvext").and_then(|n| n.as_object_mut()) {
+            scrubbed |= onwards::serving::scrub_router_targets(nvext);
+            if let Some(hints) = nvext.get_mut("agent_hints").and_then(|h| h.as_object_mut()) {
+                scrubbed |= hints.shift_remove("priority").is_some();
+            }
+            // Scheduling tolerations are the operator's to pin, never the
+            // caller's: strip any client-supplied list the same way priority
+            // is stripped. A pinned account's preset list is written back
+            // afterwards by `set_routing_tolerations`, so the only surviving
+            // value is the operator's.
+            if let Some(routing) = nvext.get_mut("routing_constraints").and_then(|r| r.as_object_mut()) {
+                scrubbed |= routing.shift_remove("tolerations").is_some();
+            }
+        }
     }
+    scrubbed
+}
 
-    // Endpoint + path are split (not pre-concatenated) so fusillade
-    // can match `/v1/chat/completions` against its streamable_endpoints
-    // list and pick the streaming branch when the user requested SSE.
-    let upstream = onwards_fusillade::UpstreamTarget {
-        endpoint: state.loopback_base_url.clone(),
-        path: "/v1/chat/completions".to_string(),
-        api_key: Some(api_key.to_string()),
+/// The toleration list an account is pinned to, resolved through the per-key
+/// policy map, or `None` when the account is on "Default". Hot-path safe.
+pub(crate) fn pinned_tolerations(
+    cache: &crate::sync::key_policy::KeyPolicyCache,
+    api_key: Option<&str>,
+) -> Option<std::sync::Arc<serde_json::Value>> {
+    api_key.and_then(|secret| cache.tolerations(secret))
+}
+
+/// Write `tolerations` to `nvext.routing_constraints.tolerations`, in place,
+/// returning whether the body changed. Creates `nvext` and
+/// `routing_constraints` when absent, and leaves any other key (including
+/// other `routing_constraints` siblings) untouched. An existing identical
+/// value is a no-op so the common path keeps the caller's bytes.
+pub(crate) fn set_routing_tolerations(value: &mut serde_json::Value, tolerations: &serde_json::Value) -> bool {
+    let Some(obj) = value.as_object_mut() else {
+        return false;
     };
+    let nvext = obj.entry("nvext").or_insert_with(|| serde_json::json!({}));
+    if !nvext.is_object() {
+        *nvext = serde_json::json!({});
+    }
+    let Some(nvext) = nvext.as_object_mut() else {
+        return false;
+    };
+    let routing = nvext.entry("routing_constraints").or_insert_with(|| serde_json::json!({}));
+    if !routing.is_object() {
+        *routing = serde_json::json!({});
+    }
+    let Some(routing) = routing.as_object_mut() else {
+        return false;
+    };
+    if routing.get("tolerations") == Some(tolerations) {
+        return false;
+    }
+    routing.insert("tolerations".to_string(), tolerations.clone());
+    true
+}
 
-    Some((head_step_uuid, resolved, upstream))
+fn strip_serving_class_suffix(
+    value: &mut serde_json::Value,
+    asynchronous: bool,
+) -> Result<(Option<onwards::ServingClass>, bool), onwards::serving::InvalidModelSelector> {
+    let Some(model) = value.get("model").and_then(|m| m.as_str()) else {
+        return Ok((None, false));
+    };
+    let (alias, suffix) = onwards::serving::split_model_suffix(model)?;
+    let class = if asynchronous {
+        None
+    } else {
+        onwards::serving::split_class_suffix(model)?.1
+    };
+    let changed = suffix.is_some();
+    if changed {
+        let alias = alias.to_string();
+        value["model"] = serde_json::Value::String(alias);
+    }
+    Ok((class, changed))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_routing_tolerations_writes_the_preset_list_and_preserves_the_rest() {
+        // The preset replaces a client's nvext wholesale-safely: it is written
+        // verbatim into routing_constraints.tolerations, and every sibling
+        // (other nvext keys, other routing_constraints keys) survives.
+        let mut body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "nvext": {
+                "agent_hints": {"max_batch_size": 8},
+                "routing_constraints": {"region": "eu", "tolerations": [{"operator": "Exists"}]}
+            }
+        });
+        let empty = serde_json::json!([]);
+        assert!(set_routing_tolerations(&mut body, &empty), "a changed value rebuilds the body");
+        assert_eq!(body["nvext"]["routing_constraints"]["tolerations"], empty);
+        assert_eq!(body["nvext"]["routing_constraints"]["region"], "eu");
+        assert_eq!(body["nvext"]["agent_hints"]["max_batch_size"], 8);
+
+        // Writing the same value again is a no-op, so the common path keeps the
+        // caller's bytes.
+        assert!(!set_routing_tolerations(&mut body, &empty));
+
+        // A non-empty preset list is written verbatim.
+        let list = serde_json::json!([{"key": "dedicated", "value": "only"}]);
+        let mut fresh = serde_json::json!({"model": "m"});
+        assert!(set_routing_tolerations(&mut fresh, &list));
+        assert_eq!(fresh["nvext"]["routing_constraints"]["tolerations"], list);
+
+        // A non-object nvext is replaced rather than panicking.
+        let mut broken = serde_json::json!({"model": "m", "nvext": "not-an-object"});
+        assert!(set_routing_tolerations(&mut broken, &serde_json::json!([])));
+        assert_eq!(broken["nvext"]["routing_constraints"]["tolerations"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn pinned_tolerations_reads_the_key_policy_cache() {
+        let presets = crate::scheduling::TolerationPresets::new(&crate::config::SchedulingConfig::default());
+        let cache = crate::sync::key_policy::KeyPolicyCache::from_policies_with_presets(
+            presets,
+            [(
+                "sk-pinned".to_string(),
+                crate::sync::key_policy::KeyPolicy {
+                    toleration_preset: Some("no-overflow".into()),
+                    ..Default::default()
+                },
+            )],
+        );
+        assert!(pinned_tolerations(&cache, Some("sk-pinned")).is_some());
+        assert!(pinned_tolerations(&cache, Some("sk-other")).is_none());
+        assert!(pinned_tolerations(&cache, None).is_none());
+    }
+
+    #[test]
+    fn strip_scheduling_priority_removes_only_the_top_level_field() {
+        let mut body = serde_json::json!({
+            "model": "m", "priority": 900,
+            "messages": [{"role": "user", "content": "set priority: 900"}],
+            "metadata": {"priority": "keep-me"}
+        });
+        assert!(strip_scheduling_priority(&mut body), "a removal is reported so the body is rebuilt");
+        assert!(body.get("priority").is_none(), "external callers must not steer the scheduler");
+        assert_eq!(
+            body["metadata"]["priority"], "keep-me",
+            "only the top-level scheduling field is privileged"
+        );
+        assert_eq!(body["messages"][0]["content"], "set priority: 900");
+
+        // The real dynamo carrier: nvext.agent_hints.priority is removed, the
+        // rest of the caller's nvext survives.
+        let mut body = serde_json::json!({
+            "model": "m",
+            "nvext": {"cache_control": {"enabled": true}, "agent_hints": {"priority": 900, "max_batch_size": 8}}
+        });
+        assert!(strip_scheduling_priority(&mut body), "the nvext carrier counts too");
+        assert!(body["nvext"]["agent_hints"].get("priority").is_none());
+        assert_eq!(body["nvext"]["agent_hints"]["max_batch_size"], 8);
+        assert_eq!(body["nvext"]["cache_control"]["enabled"], true);
+
+        // Absent field: a no-op, not an error.
+        let mut clean = serde_json::json!({"model": "m", "nvext": {"cache_control": {"enabled": true}}});
+        assert!(!strip_scheduling_priority(&mut clean), "nothing removed, nothing to rebuild");
+        assert_eq!(
+            clean,
+            serde_json::json!({"model": "m", "nvext": {"cache_control": {"enabled": true}}})
+        );
+    }
+
+    #[test]
+    fn serving_class_suffix_is_stripped_and_returned() {
+        let mut body = serde_json::json!({"model": "zai-org/GLM-5.2:interactive", "messages": []});
+        let class = strip_serving_class_suffix(&mut body, false).unwrap();
+        assert_eq!(class, (Some(onwards::ServingClass::Interactive), true));
+        assert_eq!(body["model"], "zai-org/GLM-5.2", "layers above onwards key on the bare alias");
+
+        let mut body = serde_json::json!({"model": "zai-org/GLM-5.2", "messages": []});
+        assert_eq!(strip_serving_class_suffix(&mut body, false).unwrap(), (None, false));
+        assert_eq!(body["model"], "zai-org/GLM-5.2");
+
+        let mut body = serde_json::json!({"model": "zai-org/GLM-5.2:fast"});
+        let err = strip_serving_class_suffix(&mut body, false).unwrap_err();
+        assert!(err.to_string().contains("'fast'"));
+        assert_eq!(body["model"], "zai-org/GLM-5.2:fast", "an invalid request is left as sent");
+
+        // No model at all (Model-Override header path): nothing to do.
+        let mut body = serde_json::json!({"messages": []});
+        assert_eq!(strip_serving_class_suffix(&mut body, false).unwrap(), (None, false));
+    }
+
+    #[test]
+    fn async_suffixes_are_discarded_without_class_validation() {
+        let mut body = serde_json::json!({"model":"m:x-fast"});
+        assert_eq!(strip_serving_class_suffix(&mut body, true).unwrap(), (None, true));
+        assert_eq!(body["model"], "m");
+        let mut body = serde_json::json!({"model":"m:throughput:interactive"});
+        assert!(strip_serving_class_suffix(&mut body, true).is_err());
+    }
+
+    #[test]
+    fn strip_scheduling_priority_also_scrubs_the_router_targets() {
+        let mut body = serde_json::json!({
+            "model": "m",
+            "nvext": {"router": {"ttft_target": 1, "itl_target": 1}, "cache_control": {"enabled": true}, "agent_hints": {"priority": 5}}
+        });
+        assert!(strip_scheduling_priority(&mut body), "the targets were present and removed");
+        assert!(body["nvext"].get("router").is_none());
+        assert!(body["nvext"]["agent_hints"].get("priority").is_none());
+        assert_eq!(body["nvext"]["cache_control"]["enabled"], true);
+
+        let mut body = serde_json::json!({"model": "m", "nvext": {"cache_control": {"enabled": true}}});
+        assert!(!strip_scheduling_priority(&mut body), "nothing to re-serialise for");
+    }
+
+    #[test]
+    fn strip_scheduling_priority_also_scrubs_client_tolerations() {
+        // A caller's toleration list is the operator's to pin, never theirs:
+        // it is removed like priority, and other nvext keys survive.
+        let mut body = serde_json::json!({
+            "model": "m",
+            "nvext": {
+                "routing_constraints": {"tolerations": [{"operator": "Exists"}], "region": "eu"},
+                "cache_control": {"enabled": true}
+            }
+        });
+        assert!(strip_scheduling_priority(&mut body), "the tolerations were present and removed");
+        assert!(body["nvext"]["routing_constraints"].get("tolerations").is_none());
+        assert_eq!(body["nvext"]["routing_constraints"]["region"], "eu", "siblings survive");
+        assert_eq!(body["nvext"]["cache_control"]["enabled"], true);
+
+        let mut clean = serde_json::json!({"model": "m", "nvext": {"routing_constraints": {"region": "eu"}}});
+        assert!(!strip_scheduling_priority(&mut clean), "nothing removed, nothing to rebuild");
+    }
 
     #[test]
     fn test_should_intercept_responses() {
@@ -1467,6 +1728,16 @@ mod tests {
     #[test]
     fn test_should_intercept_embeddings() {
         assert!(should_intercept(&axum::http::Method::POST, "/v1/embeddings"));
+    }
+
+    /// Native completions must be intercepted: it is the one POST inference
+    /// path with a typed `priority` in onwards' strict schema (which forwards
+    /// the field verbatim), so skipping it would let any external key
+    /// queue-jump the dynamo scheduler via `/v1/completions`.
+    #[test]
+    fn test_should_intercept_completions() {
+        assert!(should_intercept(&axum::http::Method::POST, "/v1/completions"));
+        assert!(should_intercept(&axum::http::Method::POST, "/completions"));
     }
 
     #[test]
@@ -1488,6 +1759,31 @@ mod tests {
     #[test]
     fn test_should_not_intercept_files() {
         assert!(!should_intercept(&axum::http::Method::POST, "/v1/files"));
+    }
+
+    #[test]
+    fn scrub_strips_id_keys_and_preserves_extensions_and_previous_response_id() {
+        let mut v = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "id": "gone",
+            "completion_id": "gone",
+            "completionId": "gone",
+            "response_id": "gone",
+            "responseId": "gone",
+            "previous_response_id": "resp_keep",
+            "x_custom_extension": "keep",
+        });
+        assert!(scrub_request_id_fields(&mut v), "a removal is reported so the body is rebuilt");
+        assert!(!scrub_request_id_fields(&mut v), "idempotent: nothing left to remove");
+        let obj = v.as_object().unwrap();
+        for k in super::SCRUB_ID_KEYS {
+            assert!(!obj.contains_key(k), "{k} should have been scrubbed");
+        }
+        // previous_response_id (a superstring of a scrub key) and other extensions survive.
+        assert_eq!(obj["previous_response_id"], "resp_keep");
+        assert_eq!(obj["x_custom_extension"], "keep");
+        assert_eq!(obj["model"], "gpt-4o");
     }
 
     #[test]
@@ -1556,7 +1852,7 @@ mod tests {
         assert_eq!(background_contract_error(ServiceTier::Realtime, false, false), None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn resolve_flex_batch_key_uses_hidden_batch_key_for_key_owner(pool: sqlx::PgPool) {
         use crate::api::models::{api_keys::ApiKeyCreate, users::Role};
         use crate::db::{
@@ -1576,8 +1872,6 @@ mod tests {
                     name: "Org realtime key".to_string(),
                     description: None,
                     purpose: ApiKeyPurpose::Realtime,
-                    requests_per_second: None,
-                    burst_size: None,
                     member_id: None,
                     spend_limit: None,
                     spend_limit_interval: None,
@@ -1619,7 +1913,7 @@ mod tests {
         assert!(row_hidden);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn background_role_is_resolved_from_organization_key_creator(pool: sqlx::PgPool) {
         use crate::api::models::{api_keys::ApiKeyCreate, users::Role};
         use crate::db::{
@@ -1639,8 +1933,6 @@ mod tests {
                         name: "Org background key".to_string(),
                         description: None,
                         purpose: ApiKeyPurpose::Realtime,
-                        requests_per_second: None,
-                        burst_size: None,
                         member_id: None,
                         spend_limit: None,
                         spend_limit_interval: None,
@@ -1670,7 +1962,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn background_role_rejects_api_key_creator_without_capability(pool: sqlx::PgPool) {
         use crate::api::models::{api_keys::ApiKeyCreate, users::Role};
         use crate::db::{
@@ -1689,8 +1981,6 @@ mod tests {
                         name: "Foreground-only key".to_string(),
                         description: None,
                         purpose: ApiKeyPurpose::Realtime,
-                        requests_per_second: None,
-                        burst_size: None,
                         member_id: None,
                         spend_limit: None,
                         spend_limit_interval: None,
@@ -1713,68 +2003,5 @@ mod tests {
                 .expect("resolve unknown key"),
             None
         );
-    }
-
-    // Routing-decision tests for `warm_path_branch`. The whole point
-    // of this PR is that flex `/v1/responses` must skip the warm
-    // path and fall through to `handle_flex`; these tests pin that
-    // contract so a future refactor that re-engages warm-path for
-    // flex can't silently regress the routing back to the bug.
-
-    #[test]
-    fn warm_path_branch_flex_responses_falls_through_to_handle_flex() {
-        // The bug being fixed: flex /v1/responses used to engage warm
-        // path regardless of tier and run the loop inline at realtime
-        // cost. After the fix, every flex case must fall through.
-        for &background in &[false, true] {
-            for &stream in &[false, true] {
-                for &has_tools in &[false, true] {
-                    assert_eq!(
-                        warm_path_branch(true, true, background, stream, has_tools),
-                        WarmPathBranch::FallThrough,
-                        "flex /v1/responses must fall through (background={background}, stream={stream}, has_tools={has_tools})"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn warm_path_branch_realtime_responses_with_tools_picks_correct_warm_branch() {
-        // Realtime /v1/responses with tools keeps the existing
-        // warm-path behavior: stream → SSE, background → spawned
-        // task, neither → blocking JSON.
-        assert_eq!(warm_path_branch(true, false, false, true, true), WarmPathBranch::Stream);
-        assert_eq!(warm_path_branch(true, false, true, false, true), WarmPathBranch::Background);
-        assert_eq!(warm_path_branch(true, false, false, false, true), WarmPathBranch::Blocking);
-    }
-
-    #[test]
-    fn warm_path_branch_realtime_responses_without_tools_falls_through() {
-        // Without tools the multi-step loop has nothing to dispatch.
-        // Fall through so onwards' single-step /v1/responses proxy
-        // handles it — produces one tracking row via the standard
-        // outlet path instead of record_step / response_steps.
-        for &background in &[false, true] {
-            for &stream in &[false, true] {
-                assert_eq!(
-                    warm_path_branch(true, false, background, stream, false),
-                    WarmPathBranch::FallThrough,
-                    "tool-free realtime /v1/responses must fall through (background={background}, stream={stream})"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn warm_path_branch_chat_completions_always_falls_through() {
-        // Warm path is /v1/responses-only. Chat completions and
-        // embeddings never engage it regardless of tier — they go
-        // through the single-step proxy.
-        for &has_tools in &[false, true] {
-            assert_eq!(warm_path_branch(false, false, false, false, has_tools), WarmPathBranch::FallThrough);
-            assert_eq!(warm_path_branch(false, true, false, false, has_tools), WarmPathBranch::FallThrough);
-            assert_eq!(warm_path_branch(false, false, false, true, has_tools), WarmPathBranch::FallThrough);
-        }
     }
 }

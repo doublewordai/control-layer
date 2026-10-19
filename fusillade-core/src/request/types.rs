@@ -21,6 +21,9 @@ pub struct HttpResponse {
     pub status: u16,
     /// Response body as a string.
     pub body: String,
+    /// `X-Request-ID` the server returned, if any. Used to correlate batch
+    /// attempts with server-side logs; never sent back to the server.
+    pub x_request_id: Option<String>,
 }
 
 /// Database state for filtering and querying requests.
@@ -145,8 +148,8 @@ impl RequestState for Pending {}
 
 /// Leaky-bucket stamp for a request claimed via Source B (the not-live,
 /// before-ramp trickle). Carried on [`Claimed`] as `Some` iff the row was
-/// leaked; the daemon stamps `next_token_at = now + window_secs /
-/// leaks_per_window` for the `(created_by, window_class, model)` bucket. `None`
+/// leaked; the daemon stamps the next token using its configured interval
+/// for the `(created_by, window_class, model)` bucket. `None`
 /// for full-capacity (Source A) claims, which consume no token. The model is
 /// read from the request itself, so it is not carried on the stamp.
 #[derive(Debug, Clone, Serialize)]
@@ -154,8 +157,8 @@ pub struct LeakStamp {
     /// The bucket's window-class (a batch's `completion_window`, or a batchless
     /// row's `service_tier` defaulting to `'default'`).
     pub window_class: String,
-    /// The request's completion-window length in seconds (`W`); the daemon
-    /// divides it by `leaks_per_window` to get the leak interval.
+    /// The request's completion-window length in seconds (`W`), retained for
+    /// async/flex claims using the `leaks_per_window` policy.
     pub window_secs: f64,
 }
 
@@ -213,6 +216,33 @@ pub struct Completed {
 
 impl RequestState for Completed {}
 
+/// Body code the gateway's onwards layer sends when it refuses a batch
+/// request because the model's global in-flight cap is reached. It is a 529
+/// (`overloaded_error`), not a per-key 429, so the dispatcher reduces its
+/// adaptive concurrency instead of treating it as a rate limit. Because the
+/// refusal is admission control rather than a failure, a failure carrying it
+/// reschedules without spending a retry attempt.
+pub const BATCH_CAPACITY_EXCEEDED_CODE: &str = "batch_capacity_exceeded";
+
+/// True when an HTTP `status`/`body` is the gateway's per-model batch
+/// admission-control refusal: a 529 whose body carries
+/// [`BATCH_CAPACITY_EXCEEDED_CODE`].
+pub fn is_batch_capacity_exceeded_response(status: u16, body: &str) -> bool {
+    if status != 529 {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")?
+                .get("code")?
+                .as_str()
+                .map(|code| code == BATCH_CAPACITY_EXCEEDED_CODE)
+        })
+        .unwrap_or(false)
+}
+
 /// Reason why a request failed.
 ///
 /// This enum distinguishes between different types of failures to determine
@@ -261,6 +291,21 @@ impl FailureReason {
             FailureReason::TaskTerminated => true,
             FailureReason::RequestBuilderError { .. } => false,
             FailureReason::BatchTerminated => false,
+        }
+    }
+
+    /// True when the failure is the gateway's admission-control refusal for the
+    /// per-model batch in-flight cap: a 529 whose body carries
+    /// [`BATCH_CAPACITY_EXCEEDED_CODE`]. This is not a failure of the request —
+    /// the batch simply has to wait for a slot — so it reschedules without
+    /// spending a retry attempt.
+    pub fn is_batch_capacity_exceeded(&self) -> bool {
+        match self {
+            FailureReason::RetriableHttpStatus { status, body }
+            | FailureReason::NonRetriableHttpStatus { status, body } => {
+                is_batch_capacity_exceeded_response(*status, body)
+            }
+            _ => false,
         }
     }
 
@@ -330,6 +375,10 @@ impl FailureReason {
 pub struct Failed {
     pub reason: FailureReason,
     pub failed_at: DateTime<Utc>,
+    /// Claim-generation fence for daemon-owned failures. System-generated
+    /// failures which never entered `claimed`/`processing` leave this unset.
+    #[serde(skip)]
+    pub claimed_at: Option<DateTime<Utc>>,
     /// Number of times this request has been attempted when it failed
     pub retry_attempt: u32,
     /// When the batch expires (carried over from Processing). `None` for background.
@@ -344,6 +393,10 @@ impl RequestState for Failed {}
 #[derive(Debug, Clone, Serialize)]
 pub struct Canceled {
     pub canceled_at: DateTime<Utc>,
+    /// Claim-generation fence for daemon-owned cancellation. Pending requests
+    /// have no owner and leave this unset.
+    #[serde(skip)]
+    pub claimed_at: Option<DateTime<Utc>>,
 }
 
 impl RequestState for Canceled {}
@@ -377,8 +430,8 @@ pub struct RequestId(pub Uuid);
 
 impl std::fmt::Display for RequestId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Display only first 8 characters for readability in logs
-        write!(f, "{}", &self.0.to_string()[..8])
+        // Full UUID so log lines can be joined with database rows and traces.
+        write!(f, "{}", self.0)
     }
 }
 
@@ -402,8 +455,8 @@ pub struct DaemonId(pub Uuid);
 
 impl std::fmt::Display for DaemonId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Display only first 8 characters for readability in logs
-        write!(f, "{}", &self.0.to_string()[..8])
+        // Full UUID so log lines can be joined with database rows and traces.
+        write!(f, "{}", self.0)
     }
 }
 

@@ -1,64 +1,59 @@
-//! Analytics batching system for efficient database writes.
+//! Durable analytics outbox writer and batched projector.
 //!
-//! This module provides [`AnalyticsBatcher`] which accumulates analytics records
-//! and writes them to the database in batches, significantly reducing per-request
-//! database overhead.
+//! Completed captures are inserted into PostgreSQL immediately. [`AnalyticsBatcher`]
+//! then enriches and projects already-durable rows in batches.
 //!
 //! # Architecture
 //!
 //! ```text
-//! Request → AnalyticsHandler (extract only) → Channel → AnalyticsBatcher
-//!                                                            ↓
-//!                                                 [Accumulate in buffer]
-//!                                                            ↓
-//!                                              [Flush immediately (write-through)]
-//!                                                            ↓
-//!                                              Phase 1: Batch enrich
-//!                                                - Token → user_id lookup
-//!                                                - Model → pricing lookup
-//!                                                            ↓
-//!                                              Phase 2: Batch write (transaction)
+//! Request → AnalyticsHandler → INSERT analytics_outbox
+//!                                      ↓
+//!                              claim + project (transaction)
+//!                                - Key ID → user lookup
+//!                                - Model → pricing lookup
 //!                                                - INSERT http_analytics
 //!                                                - INSERT credit_transactions
-//!                                                            ↓
-//!                                              Phase 3: Record metrics
+//!                                                - DELETE analytics_outbox
 //! ```
 //!
 //! # Key Design Decisions
 //!
-//! - **All DB work in batcher**: The handler sends unenriched `RawAnalyticsRecord`s.
-//!   Enrichment (user lookup, pricing lookup) happens in the batcher via batch queries.
-//! - **Transactional writes**: Analytics and credit inserts happen in a single transaction.
-//!   Either both succeed or both roll back.
-//! - **Batch enrichment**: User and pricing lookups are batched using `IN` clauses,
-//!   reducing from O(N) queries to O(1) per batch.
+//! - **Durable first hand-off**: The handler writes an unenriched, content-free
+//!   `RawAnalyticsRecord` directly to PostgreSQL. Bearer tokens are excluded.
+//!   The projector also accepts the enriched payload written by release 11.12.0
+//!   so rolling upgrades can drain rows created by either version.
+//! - **Batch enrichment**: Key and pricing lookups happen only after the row is durable.
+//! - **Transactional projection**: Analytics, credit inserts and outbox deletion happen in
+//!   a single transaction. Either all succeed or the durable row remains for retry.
 
-use crate::config::{CachePricingConfig, Config, ONWARDS_CONFIG_CHANGED_CHANNEL};
+use crate::config::{Config, ONWARDS_CONFIG_CHANGED_CHANNEL};
 
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::metrics::MetricsRecorder;
 use crate::metrics::errors::component::ANALYTICS_BATCHER;
-use crate::request_logging::serializers::HttpAnalyticsRow;
+use crate::pricing::{
+    CacheTariffRow, ModelInfo, TariffInfo, TokenCounts, charged_cost, clamp_implicit_read_multiplier, find_best_tariff, list_price,
+    resolve_cache_multipliers,
+};
+use crate::request_logging::serializers::{HttpAnalyticsRow, RequestParams};
 use chrono::{DateTime, Utc};
 use metrics::{counter, histogram};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
-use sqlx::PgPool;
+use serde::{Deserialize, Serialize};
+use sqlx::{PgPool, Row};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, debug, error, info, info_span, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
-/// Channel buffer size - how many records can be queued before backpressure
-const CHANNEL_BUFFER_SIZE: usize = 10_000;
-
-/// Raw analytics record sent through the channel (unenriched).
+/// Raw analytics record durably written to the outbox before enrichment.
 ///
 /// This contains only data that can be extracted from the request/response
 /// without any database lookups. Enrichment happens in the batcher.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawAnalyticsRecord {
     // === Core metrics (from request/response) ===
     pub instance_id: Uuid,
@@ -86,8 +81,7 @@ pub struct RawAnalyticsRecord {
     pub response_type: String,
     /// Why the model stopped — `stop`, `length`, `tool_calls`, ... `None` when the
     /// response shape has no such concept (embeddings, the Responses API) or it could not
-    /// be read. `tool_calls` is what makes CLIENT-side tool loops visible; server-side
-    /// loops are counted separately by `tool_iterations` / `tool_call_analytics`.
+    /// be read. `tool_calls` is what makes CLIENT-side tool loops visible.
     ///
     /// Extracted by `serializers::extract_finish_reason`, like every other field on this
     /// struct that comes off the payload. The batcher deliberately never sees a request or
@@ -101,15 +95,40 @@ pub struct RawAnalyticsRecord {
     /// CLI, curl, own code), as opposed to `uri` (which protocol) and `request_origin`
     /// (which dispatch path). Read straight off the request headers, not the payload.
     pub user_agent: Option<String>,
+    /// The upstream's own cached-prompt count (`usage.prompt_tokens_details.cached_tokens`).
+    /// Observational: distinct from `cache_read_input_tokens`, which is dwctl's cache layer
+    /// and is what gets priced. See `serializers::extract_engine_cached_tokens`.
+    pub engine_cached_tokens: Option<i64>,
+    /// Provenance of the billed cache read: "module" (dwctl's classifier) or "engine"
+    /// (upstream hit passed through as an implicit discount). `None` when the billed read
+    /// is zero. See `serializers::extract_cache_read_source`.
+    pub cache_read_source: Option<String>,
+    /// Content-free request parameters (stream, max_tokens, sampling, message and tool
+    /// counts). See `serializers::RequestParams`.
+    pub request_params: RequestParams,
     pub server_address: String,
     pub server_port: u16,
     /// URL of the upstream that served the request (onwards `ServedBy`
     /// extension) — per-component attribution for composite models.
     pub served_by: Option<String>,
+    /// The model name onwards sent upstream (onwards `ServedBy::onwards_model`),
+    /// so billing can be attributed to the component model that served it.
+    /// Defaulted so outbox rows written before this field existed still
+    /// deserialise after a deploy.
+    #[serde(default)]
+    pub served_model: Option<String>,
+    /// Serving class the request asked for / was served under (onwards
+    /// `ServingClassOutcome` extension). See `serializers::UsageMetrics`.
+    /// Defaulted so outbox rows written before these fields existed still
+    /// deserialise after a deploy.
+    #[serde(default)]
+    pub requested_serving_class: Option<String>,
+    #[serde(default)]
+    pub resolved_serving_class: Option<String>,
 
-    // === Auth (unresolved - just the token) ===
-    /// The bearer token from the Authorization header (not yet resolved to user_id)
-    pub bearer_token: Option<String>,
+    // === Auth ===
+    /// Stable key identity attached by Onwards after successful authentication.
+    pub api_key_id: Option<Uuid>,
 
     // === Fusillade batch metadata (from headers) ===
     pub fusillade_batch_id: Option<Uuid>,
@@ -126,10 +145,14 @@ pub struct RawAnalyticsRecord {
     // === Tracing ===
     /// OpenTelemetry trace ID for correlation with Tempo
     pub trace_id: Option<String>,
+    /// Gateway span captured by Outlet; pair with `trace_id` to locate the request's trace subtree.
+    pub gateway_span_id: Option<String>,
+    /// Request ID dwctl minted and returned as `X-Request-ID`.
+    pub x_request_id: Option<Uuid>,
 }
 
 /// Enriched data resolved during batch processing
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct EnrichedRecord {
     raw: RawAnalyticsRecord,
     user_id: Option<Uuid>,
@@ -161,7 +184,7 @@ struct EnrichedRecord {
     cap_scope_root: Option<Uuid>,
 }
 
-/// Per-bearer-token lookup result used during enrichment.
+/// Per-key lookup result used during enrichment.
 struct KeyLookup {
     user_id: Uuid,
     api_key_id: Uuid,
@@ -170,201 +193,116 @@ struct KeyLookup {
     cap_scope_root: Option<Uuid>,
 }
 
-/// A `model_cache_tariffs` row (per model, per tier), with its validity window so batch
-/// requests can be priced as of their creation time (mirrors `model_tariffs` handling).
-/// One `model_cache_tariffs` version: all three tiers in a single row, plus the validity
-/// window so a batch request prices as of its creation time. Completeness is guaranteed by
-/// the schema (every multiplier is NOT NULL), so there is no missing-tier case to default.
-#[derive(Clone)]
-struct CacheTariffRow {
-    write_multiplier_5m: Decimal,
-    write_multiplier_1h: Decimal,
-    write_multiplier_24h: Decimal,
-    read_multiplier: Decimal,
-    valid_from: DateTime<Utc>,
-    valid_until: Option<DateTime<Utc>>,
-}
-
-/// The cache multipliers resolved for one request at a point in time.
-#[derive(Clone, Copy)]
-struct CacheMultipliers {
-    read: Decimal,
-    write_5m: Decimal,
-    write_1h: Decimal,
-    write_24h: Decimal,
-}
-
-impl CacheMultipliers {
-    /// The operator-configured defaults ([`CachePricingConfig`]) — the same values a freshly
-    /// enabled tariff would get. Used as the fallback when a request carries cache tokens with
-    /// no tariff valid at its time (unreachable in practice — classify gates on an active row,
-    /// and the call site emits a `cache_tariff_missing` background error if it ever happens).
-    fn from_config(c: &CachePricingConfig) -> Self {
+/// The price-relevant token counts for a record, in the shape [`crate::pricing`] works in.
+///
+/// `prompt_tokens` is the TOTAL input including the cached share — see
+/// [`crate::pricing::TokenCounts`] for why that invariant matters.
+impl From<&RawAnalyticsRecord> for TokenCounts {
+    fn from(raw: &RawAnalyticsRecord) -> Self {
         Self {
-            read: c.default_read_multiplier,
-            write_5m: c.default_write_multiplier_5m,
-            write_1h: c.default_write_multiplier_1h,
-            write_24h: c.default_write_multiplier_24h,
+            prompt: raw.prompt_tokens,
+            completion: raw.completion_tokens,
+            cache_read: raw.cache_read_input_tokens,
+            cache_creation_5m: raw.cache_creation_5m_input_tokens,
+            cache_creation_1h: raw.cache_creation_1h_input_tokens,
+            cache_creation_24h: raw.cache_creation_24h_input_tokens,
         }
     }
 }
 
-impl Default for CacheMultipliers {
-    /// Mirrors the shipped [`CachePricingConfig`] defaults (read 0.1, writes 1.25/2.0/2.5) so
-    /// the hardcoded default and the config defaults can't drift. Production reads the live
-    /// config via [`CacheMultipliers::from_config`]; this is for tests/standalone callers.
-    fn default() -> Self {
-        Self::from_config(&CachePricingConfig::default())
-    }
-}
-
-/// Resolve the multipliers from the model's cache-tariff row valid at `timestamp` — the
-/// most-recently-effective version still in its window. One row carries all tiers, so
-/// there is no per-tier resolution or gap. `None` when no version was valid at `timestamp`
-/// (so the caller can distinguish "no tariff" from a real row and fall back deliberately).
-fn resolve_cache_multipliers(rows: &[CacheTariffRow], timestamp: DateTime<Utc>) -> Option<CacheMultipliers> {
-    rows.iter()
-        .filter(|r| r.valid_from <= timestamp && r.valid_until.is_none_or(|u| u > timestamp))
-        .max_by_key(|r| r.valid_from)
-        .map(|r| CacheMultipliers {
-            read: r.read_multiplier,
-            write_5m: r.write_multiplier_5m,
-            write_1h: r.write_multiplier_1h,
-            write_24h: r.write_multiplier_24h,
-        })
-}
-
-/// The charged cost for a record, gating the cache discount on dwctl enablement: when a
-/// tariff was valid at inference (`cache_mults` is `Some`) apply the cache-adjusted pricing;
-/// otherwise bill the full input at list price. The `None` case deliberately ignores any
-/// cache_* tokens in the response — without an active tariff those are the upstream
-/// provider's own caching, not dwctl's, and must not earn dwctl's discount.
-fn charged_cost(
-    raw: &RawAnalyticsRecord,
-    input_price: Option<Decimal>,
-    output_price: Option<Decimal>,
-    cache_mults: Option<CacheMultipliers>,
-) -> Option<Decimal> {
-    match cache_mults {
-        Some(m) => compute_total_cost(raw, input_price, output_price, &m),
-        None => compute_list_price(raw, input_price, output_price),
-    }
-}
-
-/// The cache-adjusted request cost. Reduces to the plain
-/// `prompt × input + completion × output` when there are no cache tokens, so non-cache
-/// requests are unaffected. `None` when the model has no pricing at all (→ no ledger row),
-/// matching the old generated `total_cost`'s NULL.
-fn compute_total_cost(
-    raw: &RawAnalyticsRecord,
-    input_price: Option<Decimal>,
-    output_price: Option<Decimal>,
-    m: &CacheMultipliers,
-) -> Option<Decimal> {
-    if input_price.is_none() && output_price.is_none() {
-        return None;
-    }
-    let inp = input_price.unwrap_or(Decimal::ZERO);
-    let outp = output_price.unwrap_or(Decimal::ZERO);
-
-    let mut read = Decimal::from(raw.cache_read_input_tokens.max(0));
-    let c5 = Decimal::from(raw.cache_creation_5m_input_tokens.max(0));
-    let c1 = Decimal::from(raw.cache_creation_1h_input_tokens.max(0));
-    let c24 = Decimal::from(raw.cache_creation_24h_input_tokens.max(0));
-    let prompt = Decimal::from(raw.prompt_tokens.max(0));
-    let creations = c5 + c1 + c24;
-
-    // Billing safety, two tiers. The classifier's tokenizer counts the request CONTENT
-    // while the engine's prompt_tokens counts its chat-template rendering, so the two
-    // legitimately disagree by a small margin — on fully-marked prompts (agent traffic)
-    // the classifier's sum routinely lands a percent or so ABOVE prompt_tokens. That is
-    // drift, not corruption: CAP the split to the prompt by removing the excess from the
-    // read count (the cheapest-rate bucket — deterministic and audit-simple; keeping the
-    // premium-billed write buckets intact means the reduction lands where it lowers the
-    // bill the least, so the cap is conservative: it slightly favors the house, never the
-    // reverse).
-    //
-    // Only when the WRITE counts alone exceed the whole prompt is the split genuinely
-    // corrupt (writes bill at a premium, so trusting them could overcharge): distrust it
-    // entirely and bill the input at base rate, loudly.
-    if creations > prompt {
-        crate::background_error!(
-            ANALYTICS_BATCHER,
-            "cache_split_exceeds_prompt",
-            Warning,
-            model = raw.request_model.as_deref().unwrap_or("?"),
-            prompt_tokens = raw.prompt_tokens,
-            "cache write counts alone exceed prompt_tokens; ignoring the split and billing at base rate"
-        );
-        return list_price(raw.prompt_tokens, raw.completion_tokens, input_price, output_price);
-    }
-    if read + creations > prompt {
-        metrics::counter!("dwctl_cache_split_capped_total").increment(1);
-        tracing::debug!(
-            model = raw.request_model.as_deref().unwrap_or("?"),
-            prompt_tokens = raw.prompt_tokens,
-            overrun = %(read + creations - prompt),
-            "cached token split exceeds prompt_tokens; capping the read count to fit"
-        );
-        read = prompt - creations;
-    }
-    let cached_total = read + creations;
-
-    // Uncached = full input minus the cached portion, floored at zero (our tokenizer and
-    // the provider's can differ; never let the cached count drive uncached negative).
-    let uncached = (prompt - cached_total).max(Decimal::ZERO);
-
-    let input_cost = uncached * inp + read * inp * m.read + c5 * inp * m.write_5m + c1 * inp * m.write_1h + c24 * inp * m.write_24h;
-    let output_cost = Decimal::from(raw.completion_tokens.max(0)) * outp;
-    Some(input_cost + output_cost)
-}
-
-/// List price for raw token counts: `prompt·input + completion·output`, or `None` when the
-/// model has no pricing at all. The single source of the base-cost arithmetic — used by the
-/// no-cache `total_cost` path ([`charged_cost`]) and by `uncached_cost`, and exposed so test
-/// fixtures derive their cost the same way production does instead of re-implementing it.
-pub(crate) fn list_price(
-    prompt_tokens: i64,
-    completion_tokens: i64,
-    input_price: Option<Decimal>,
-    output_price: Option<Decimal>,
-) -> Option<Decimal> {
-    if input_price.is_none() && output_price.is_none() {
-        return None;
-    }
-    let inp = input_price.unwrap_or(Decimal::ZERO);
-    let outp = output_price.unwrap_or(Decimal::ZERO);
-    Some(Decimal::from(prompt_tokens.max(0)) * inp + Decimal::from(completion_tokens.max(0)) * outp)
-}
-
 /// The un-discounted list price (`http_analytics.uncached_cost`): the full input + output
 /// at base rates, ignoring any cache split. `None` under the same no-pricing condition as
-/// [`compute_total_cost`], so the two columns are NULL in lockstep. Equals `total_cost`
-/// whenever the request cached nothing.
+/// [`crate::pricing::compute_total_cost`], so the two columns are NULL in lockstep. Equals
+/// `total_cost` whenever the request cached nothing.
 fn compute_list_price(raw: &RawAnalyticsRecord, input_price: Option<Decimal>, output_price: Option<Decimal>) -> Option<Decimal> {
     list_price(raw.prompt_tokens, raw.completion_tokens, input_price, output_price)
 }
 
-/// Sender handle for submitting analytics records to the batcher
-pub type AnalyticsSender = mpsc::Sender<RawAnalyticsRecord>;
+/// Direct writer for the durable analytics handoff. Each completed capture is
+/// inserted immediately; enrichment and final writes remain batched later.
+#[derive(Clone)]
+pub struct AnalyticsOutboxWriter {
+    destination: AnalyticsOutboxDestination,
+}
 
-/// Analytics batcher that accumulates records and writes them in batches.
+#[derive(Clone)]
+enum AnalyticsOutboxDestination {
+    Database {
+        pool: sqlx_pool_router::DynPools,
+        projector_notify: Arc<Notify>,
+    },
+    #[cfg(test)]
+    Channel(tokio::sync::mpsc::Sender<RawAnalyticsRecord>),
+}
+
+impl AnalyticsOutboxWriter {
+    pub async fn publish(&self, record: RawAnalyticsRecord) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let AnalyticsOutboxDestination::Channel(sender) = &self.destination {
+            sender.send(record).await?;
+            return Ok(());
+        }
+
+        let (pool, projector_notify) = match &self.destination {
+            AnalyticsOutboxDestination::Database { pool, projector_notify } => (pool, projector_notify),
+            #[cfg(test)]
+            AnalyticsOutboxDestination::Channel(_) => unreachable!("test channel is handled above"),
+        };
+        let payload = serde_json::to_value(&record)?;
+        sqlx::query(
+            r#"
+            INSERT INTO analytics_outbox (instance_id, correlation_id, payload)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (instance_id, correlation_id)
+            DO UPDATE SET payload = EXCLUDED.payload
+            "#,
+        )
+        .bind(record.instance_id)
+        .bind(record.correlation_id)
+        .bind(payload)
+        .execute(&pool.write())
+        .await?;
+
+        counter!("dwctl_analytics_outbox_published_total").increment(1);
+        projector_notify.notify_one();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(sender: tokio::sync::mpsc::Sender<RawAnalyticsRecord>) -> Self {
+        Self {
+            destination: AnalyticsOutboxDestination::Channel(sender),
+        }
+    }
+}
+
+/// Reads the outbox backlog as (depth, age in seconds of the oldest row).
 ///
-/// This significantly reduces database overhead by:
-/// 1. Batching enrichment queries (user lookup, pricing lookup)
-/// 2. Batching INSERT operations (analytics, credits)
-/// 3. Using a single transaction for consistency
-/// 4. Retrying failed batches with exponential backoff
+/// Depth is the statistics system's live-row estimate. An exact `COUNT(*)` has to
+/// visit every dead row a backlog leaves behind, so it gets slowest exactly when the
+/// gauge matters. The oldest age is exact: `MIN(created_at)` reads one end of an index.
+async fn read_outbox_observation(pool: &PgPool) -> sqlx::Result<(i64, f64)> {
+    sqlx::query_as(
+        r#"
+        SELECT
+            COALESCE((SELECT n_live_tup FROM pg_stat_user_tables WHERE relid = 'analytics_outbox'::regclass), 0)::bigint,
+            COALESCE(EXTRACT(EPOCH FROM (NOW() - (SELECT MIN(created_at) FROM analytics_outbox))), 0)::float8
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+}
+
+/// Background projector for already-durable analytics rows.
 pub struct AnalyticsBatcher<M = crate::metrics::GenAiMetrics>
 where
     M: MetricsRecorder + Clone + Send + Sync + 'static,
 {
-    pool: PgPool,
+    /// Live provider (not a pinned pool): survives runtime pool swaps.
+    pool: sqlx_pool_router::DynPools,
     metrics_recorder: Option<M>,
-    receiver: mpsc::Receiver<RawAnalyticsRecord>,
     batch_size: usize,
-    max_retries: u32,
-    retry_base_delay: std::time::Duration,
+    projector_notify: Arc<Notify>,
     /// In-process wake signal for the usage-refresh daemon. Nudged after every
     /// successful batch write so the daemon folds the just-written rows into
     /// `user_model_usage_daily`. `None` disables the nudge (tests, refresh daemon off).
@@ -375,7 +313,7 @@ impl<M> AnalyticsBatcher<M>
 where
     M: MetricsRecorder + Clone + Send + Sync + 'static,
 {
-    /// Creates a new analytics batcher and returns the batcher along with a sender.
+    /// Creates the durable writer and its background projector.
     ///
     /// # Arguments
     ///
@@ -385,26 +323,26 @@ where
     ///
     /// # Returns
     ///
-    /// A tuple of (batcher, sender) where the sender is used by AnalyticsHandler
-    /// to submit records.
-    pub fn new(pool: PgPool, config: Config, metrics_recorder: Option<M>) -> (Self, AnalyticsSender) {
-        let (sender, receiver) = mpsc::channel(CHANNEL_BUFFER_SIZE);
-
-        let batch_size = config.analytics.batch_size;
-        let max_retries = config.analytics.max_retries;
-        let retry_base_delay = std::time::Duration::from_millis(config.analytics.retry_base_delay_ms);
+    /// A tuple of (projector, writer) where the writer is used by AnalyticsHandler.
+    pub fn new(pool: impl sqlx_pool_router::PoolProvider, config: Config, metrics_recorder: Option<M>) -> (Self, AnalyticsOutboxWriter) {
+        let pool = sqlx_pool_router::DynPools::new(pool);
+        // A zero limit would leave every durable row unprojected forever.
+        let batch_size = config.analytics.batch_size.max(1);
+        let projector_notify = Arc::new(Notify::new());
 
         let batcher = Self {
-            pool,
+            pool: pool.clone(),
             metrics_recorder,
-            receiver,
             batch_size,
-            max_retries,
-            retry_base_delay,
+            projector_notify: projector_notify.clone(),
             usage_refresh_notify: None,
         };
 
-        (batcher, sender)
+        let writer = AnalyticsOutboxWriter {
+            destination: AnalyticsOutboxDestination::Database { pool, projector_notify },
+        };
+
+        (batcher, writer)
     }
 
     /// Attach the usage-refresh daemon's wake signal. After each successful batch
@@ -416,207 +354,188 @@ where
         self
     }
 
-    /// Runs the batcher's background write loop.
-    ///
-    /// This should be spawned as a tokio task. The strategy is:
-    /// 1. Block until at least one record arrives
-    /// 2. Non-blocking drain of all available records in the channel
-    /// 3. Write the batch immediately
-    /// 4. Repeat
-    ///
-    /// This minimizes latency at low load (single record → immediate write) while
-    /// getting batching efficiency at high load (records queue while writing → bigger batch).
-    pub async fn run(mut self, shutdown_token: CancellationToken) {
-        info!(
-            max_batch_size = self.batch_size,
-            max_retries = self.max_retries,
-            retry_base_delay_ms = self.retry_base_delay.as_millis() as u64,
-            "Analytics batcher started (write-through mode with retry)"
-        );
+    /// Projects durable rows and reports the outbox backlog until shutdown.
+    pub async fn run(self, shutdown_token: CancellationToken) {
+        tokio::join!(self.project(&shutdown_token), self.observe_outbox_periodically(&shutdown_token));
+    }
 
-        let mut buffer: Vec<RawAnalyticsRecord> = Vec::with_capacity(self.batch_size);
+    /// Projects durable rows immediately after publication. The periodic wake
+    /// also recovers rows left behind by a process restart or another instance.
+    async fn project(&self, shutdown_token: &CancellationToken) {
+        info!(max_batch_size = self.batch_size, "Analytics outbox projector started");
+        let mut outbox_tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        outbox_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            // Step 1: Wait for at least one record OR shutdown
             tokio::select! {
-                biased; // Check shutdown first
-
                 _ = shutdown_token.cancelled() => {
-                    info!("Shutdown signal received, draining analytics channel");
-                    self.receiver.close();
-                    // Drain remaining records in batches to avoid OOM with large backlogs
-                    while let Some(record) = self.receiver.recv().await {
-                        buffer.push(record);
-                        if buffer.len() >= self.batch_size {
-                            self.flush_batch(&mut buffer).await;
+                    let drained = loop {
+                        match self.project_outbox_batch().await {
+                            Ok(0) => break true,
+                            Ok(_) => {}
+                            Err(error) => {
+                                crate::background_error!(
+                                    ANALYTICS_BATCHER,
+                                    "outbox_project",
+                                    Error,
+                                    error = %error,
+                                    "Failed to drain analytics outbox during shutdown; rows remain durable"
+                                );
+                                counter!("dwctl_analytics_outbox_projection_total", "result" => "error").increment(1);
+                                break false;
+                            }
                         }
-                    }
-                    if !buffer.is_empty() {
-                        self.flush_batch(&mut buffer).await;
-                    }
-                    info!("Analytics batcher shutdown complete");
+                    };
+                    info!(drained, "Analytics outbox projector shutdown complete");
                     break;
                 }
+                _ = outbox_tick.tick() => {}
+                _ = self.projector_notify.notified() => {}
+            }
 
-                maybe_record = self.receiver.recv() => {
-                    match maybe_record {
-                        Some(record) => buffer.push(record),
-                        None => {
-                            // Channel closed (all senders dropped)
-                            info!("Analytics channel closed, shutting down batcher");
-                            if !buffer.is_empty() {
-                                self.flush_batch(&mut buffer).await;
-                            }
-                            break;
-                        }
+            loop {
+                match self.project_outbox_batch().await {
+                    Ok(0) => break,
+                    Ok(projected) if projected < self.batch_size => break,
+                    Ok(_) => tokio::task::yield_now().await,
+                    Err(error) => {
+                        crate::background_error!(
+                            ANALYTICS_BATCHER,
+                            "outbox_project",
+                            Error,
+                            error = %error,
+                            "Failed to project analytics outbox batch; rows remain durable"
+                        );
+                        counter!("dwctl_analytics_outbox_projection_total", "result" => "error").increment(1);
+                        break;
                     }
                 }
             }
-
-            // Step 2: Non-blocking drain of all available records (up to batch_size)
-            while buffer.len() < self.batch_size {
-                match self.receiver.try_recv() {
-                    Ok(record) => buffer.push(record),
-                    Err(_) => break, // Channel empty or closed
-                }
-            }
-
-            // Step 3: Write immediately
-            self.flush_batch(&mut buffer).await;
         }
     }
 
-    /// Flushes the buffer to the database with retry on failure.
+    /// Claim, apply and delete one durable batch. The row locks, analytics and
+    /// credit writes, and deletion all share the same transaction; a crash or
+    /// error rolls everything back and makes the outbox rows claimable again.
+    async fn project_outbox_batch(&self) -> anyhow::Result<usize> {
+        let mut tx = self.pool.write().begin().await?;
+        let rows = sqlx::query(
+            r#"
+            SELECT id, payload, created_at
+            FROM analytics_outbox
+            ORDER BY id
+            LIMIT $1
+            FOR UPDATE SKIP LOCKED
+            "#,
+        )
+        .bind(i64::try_from(self.batch_size).unwrap_or(i64::MAX))
+        .fetch_all(&mut *tx)
+        .await?;
+
+        if rows.is_empty() {
+            tx.commit().await?;
+            return Ok(0);
+        }
+
+        let mut ids = Vec::with_capacity(rows.len());
+        let mut raw_records = Vec::with_capacity(rows.len());
+        let mut records = Vec::with_capacity(rows.len());
+        let mut oldest = Utc::now();
+        for row in rows {
+            ids.push(row.try_get::<i64, _>("id")?);
+            let mut payload = row.try_get::<serde_json::Value, _>("payload")?;
+            if payload.get("raw").is_some() {
+                // Release 11.12.0 wrote EnrichedRecord. Its nested raw record
+                // predates api_key_id, so copy the already-resolved top-level
+                // value into the new field before deserializing it.
+                let api_key_id = payload.get("api_key_id").cloned().unwrap_or(serde_json::Value::Null);
+                if let Some(raw) = payload.get_mut("raw").and_then(serde_json::Value::as_object_mut) {
+                    raw.entry("api_key_id").or_insert(api_key_id);
+                }
+                records.push(serde_json::from_value::<EnrichedRecord>(payload)?);
+            } else {
+                raw_records.push(serde_json::from_value::<RawAnalyticsRecord>(payload)?);
+            }
+            oldest = oldest.min(row.try_get::<DateTime<Utc>, _>("created_at")?);
+        }
+
+        records.extend(self.enrich_batch(&mut tx, &raw_records).await?);
+
+        self.write_batch_in_transaction(&mut tx, &records).await?;
+        sqlx::query("DELETE FROM analytics_outbox WHERE id = ANY($1)")
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        if let Some(notify) = &self.usage_refresh_notify {
+            notify.notify_one();
+        }
+
+        let now = Utc::now();
+        for record in &records {
+            let total_ms = now.signed_duration_since(record.raw.timestamp).num_milliseconds();
+            let lag_ms = total_ms - record.raw.duration_ms;
+            histogram!("dwctl_analytics_lag_seconds").record(lag_ms as f64 / 1000.0);
+            if let Some(ref recorder) = self.metrics_recorder {
+                let row = self.enriched_to_row(record);
+                recorder.record_from_analytics(&row).await;
+            }
+        }
+
+        let projected = records.len();
+        counter!("dwctl_analytics_outbox_projection_total", "result" => "success").increment(projected as u64);
+        histogram!("dwctl_analytics_outbox_oldest_projected_age_seconds")
+            .record(now.signed_duration_since(oldest).num_milliseconds().max(0) as f64 / 1000.0);
+        Ok(projected)
+    }
+
+    /// Refreshes the outbox depth and oldest-age gauges every 30 seconds.
     ///
-    /// This performs:
-    /// 1. Batch enrichment (user lookup, pricing lookup) - no retry, data issues won't fix themselves
-    /// 2. Transactional write (analytics + credits) - retried with exponential backoff
-    /// 3. Metrics recording
-    async fn flush_batch(&self, buffer: &mut Vec<RawAnalyticsRecord>) {
-        if buffer.is_empty() {
-            return;
+    /// Runs beside the projector rather than between its drains: under a sustained
+    /// backlog every claim returns a full batch, the projector never goes idle, and
+    /// a gauge refreshed only between drains would freeze exactly when it matters.
+    async fn observe_outbox_periodically(&self, shutdown_token: &CancellationToken) {
+        let mut observe_tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        observe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                _ = shutdown_token.cancelled() => break,
+                _ = observe_tick.tick() => self.observe_outbox().await,
+            }
         }
+    }
 
-        let batch_size = buffer.len();
-        let span = info_span!("dwctl.flush_analytics_batch", batch_size = batch_size);
-
-        async {
-            let start = std::time::Instant::now();
-
-            // Collect correlation IDs for log correlation
-            let correlation_ids: Vec<i64> = buffer.iter().map(|r| r.correlation_id).collect();
-
-            // Phase 1: Batch enrich (no retry - enrichment failures are usually data issues)
-            let enriched = match self.enrich_batch(buffer).await {
-                Ok(enriched) => enriched,
-                Err(e) => {
-                    crate::background_error!(ANALYTICS_BATCHER, "enrich", Error, error = %e, batch_size = batch_size, ?correlation_ids, "Failed to enrich analytics batch");
-                    buffer.clear();
-                    return;
-                }
-            };
-
-            // Phase 2: Transactional write with retry
-            let mut last_error = None;
-            for attempt in 0..=self.max_retries {
-                match self.write_batch_transactional(&enriched).await {
-                    Ok(()) => {
-                        if attempt > 0 {
-                            debug!(
-                                attempt = attempt,
-                                batch_size = batch_size,
-                                ?correlation_ids,
-                                "Batch write succeeded after retry"
-                            );
-                            counter!("dwctl_analytics_batch_retries_total", "outcome" => "success").increment(1);
-                        }
-                        last_error = None;
-                        break;
-                    }
-                    Err(e) => {
-                        last_error = Some(e);
-                        if attempt < self.max_retries {
-                            let delay = self.retry_base_delay * 2u32.pow(attempt);
-                            warn!(
-                                error = %last_error.as_ref().unwrap(),
-                                attempt = attempt + 1,
-                                max_retries = self.max_retries,
-                                delay_ms = delay.as_millis() as u64,
-                                batch_size = batch_size,
-                                ?correlation_ids,
-                                "Batch write failed, retrying"
-                            );
-                            counter!("dwctl_analytics_batch_retries_total", "outcome" => "retry").increment(1);
-                            tokio::time::sleep(delay).await;
-                        }
-                    }
-                }
+    async fn observe_outbox(&self) {
+        // The outbox is writer-owned mutable state. Reading it from a replica
+        // could report stale depth/age and create a false stalled-outbox alert.
+        match read_outbox_observation(&self.pool.write()).await {
+            Ok((depth, age)) => {
+                metrics::gauge!("dwctl_analytics_outbox_depth").set(depth as f64);
+                metrics::gauge!("dwctl_analytics_outbox_oldest_age_seconds").set(age);
             }
-
-            if let Some(e) = last_error {
-                crate::background_error!(
-                    ANALYTICS_BATCHER, "write_drop", Critical,
-                    error = %e,
-                    batch_size = batch_size,
-                    attempts = self.max_retries + 1,
-                    ?correlation_ids,
-                    "Failed to write analytics batch after all retries, dropping batch"
-                );
-                buffer.clear();
-                return;
+            Err(error) => {
+                debug!(%error, "Failed to observe analytics outbox");
             }
-
-            // Write succeeded: nudge the usage-refresh daemon so the just-written rows
-            // get folded into user_model_usage_daily. In-memory and essentially free;
-            // the daemon coalesces bursts and rate-limits itself.
-            if let Some(notify) = &self.usage_refresh_notify {
-                notify.notify_one();
-            }
-
-            // Phase 3: Record per-record metrics
-            let now = chrono::Utc::now();
-            for record in &enriched {
-                // Record analytics lag (time from response to now)
-                let total_ms = now.signed_duration_since(record.raw.timestamp).num_milliseconds();
-                let lag_ms = total_ms - record.raw.duration_ms;
-                histogram!("dwctl_analytics_lag_seconds").record(lag_ms as f64 / 1000.0);
-
-                // Record GenAI metrics
-                if let Some(ref recorder) = self.metrics_recorder {
-                    let row = self.enriched_to_row(record);
-                    recorder.record_from_analytics(&row).await;
-                }
-            }
-
-            let duration = start.elapsed();
-            histogram!("dwctl_analytics_batch_duration_seconds").record(duration.as_secs_f64());
-            counter!("dwctl_analytics_batched_records_total").increment(batch_size as u64);
-
-            debug!(
-                batch_size = batch_size,
-                duration_ms = duration.as_millis() as u64,
-                ?correlation_ids,
-                "Flushed analytics batch"
-            );
-
-            buffer.clear();
         }
-        .instrument(span)
-        .await;
     }
 
     /// Batch enrich raw records with user info and pricing.
     ///
-    /// Performs two batch queries:
-    /// 1. Token → (user_id, purpose) lookup
+    /// Performs batched queries inside the projector transaction:
+    /// 1. API-key ID → (user_id, purpose) lookup
     /// 2. Model alias → (model_id, provider, tariffs) lookup
     #[tracing::instrument(skip_all)]
-    async fn enrich_batch(&self, buffer: &[RawAnalyticsRecord]) -> Result<Vec<EnrichedRecord>, sqlx::Error> {
-        // Collect unique bearer tokens
-        let tokens: Vec<&str> = buffer
+    async fn enrich_batch(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        buffer: &[RawAnalyticsRecord],
+    ) -> Result<Vec<EnrichedRecord>, sqlx::Error> {
+        let key_ids: Vec<Uuid> = buffer
             .iter()
-            .filter_map(|r| r.bearer_token.as_deref())
-            .collect::<std::collections::HashSet<_>>()
+            .filter_map(|r| r.api_key_id)
+            .collect::<HashSet<_>>()
             .into_iter()
             .collect();
 
@@ -628,23 +547,31 @@ where
             .into_iter()
             .collect();
 
-        // Batch lookup: token → (user_id, purpose)
-        let user_map = if !tokens.is_empty() {
-            self.batch_lookup_users(&tokens).await?
+        let key_map = if !key_ids.is_empty() {
+            self.batch_lookup_users_by_ids(tx, &key_ids).await?
         } else {
             HashMap::new()
         };
 
+        // Only these key owners can be billed by this batch. Keep general prices
+        // but avoid loading every other customer's historical deals.
+        let accounts: Vec<Uuid> = key_map
+            .values()
+            .map(|key| key.user_id)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+
         // Batch lookup: model alias → (model_id, provider_name, tariffs)
         let model_map = if !models.is_empty() {
-            self.batch_lookup_models_with_tariffs(&models).await?
+            self.batch_lookup_models_with_tariffs(tx, &models, &accounts).await?
         } else {
             HashMap::new()
         };
 
         // Batch lookup: model alias → cache tariffs (per tier), for the cache multipliers.
         let cache_tariff_map = if !models.is_empty() {
-            self.batch_lookup_cache_tariffs(&models).await?
+            self.batch_lookup_cache_tariffs(tx, &models, &accounts).await?
         } else {
             HashMap::new()
         };
@@ -652,18 +579,17 @@ where
         // Enrich each record
         let mut enriched = Vec::with_capacity(buffer.len());
         for raw in buffer.iter().cloned() {
-            let (user_id, api_key_id, access_source, api_key_purpose, cap_scope_root) = if let Some(ref token) = raw.bearer_token {
-                if let Some(key) = user_map.get(token) {
-                    (
-                        Some(key.user_id),
-                        Some(key.api_key_id),
-                        "api_key".to_string(),
-                        Some(key.purpose.clone()),
-                        key.cap_scope_root,
-                    )
-                } else {
-                    (None, None, "unknown_api_key".to_string(), None, None)
-                }
+            let key = raw.api_key_id.and_then(|id| key_map.get(&id));
+            let (user_id, api_key_id, access_source, api_key_purpose, cap_scope_root) = if let Some(key) = key {
+                (
+                    Some(key.user_id),
+                    Some(key.api_key_id),
+                    "api_key".to_string(),
+                    Some(key.purpose.clone()),
+                    key.cap_scope_root,
+                )
+            } else if raw.api_key_id.is_some() {
+                (None, raw.api_key_id, "unknown_api_key".to_string(), None, None)
             } else {
                 (None, None, "unauthenticated".to_string(), None, None)
             };
@@ -685,11 +611,14 @@ where
             let (provider_name, input_price, output_price) = if let Some(ref model_alias) = raw.request_model {
                 if let Some(model_info) = model_map.get(model_alias) {
                     // Find best matching tariff
-                    let (input, output) = self.find_best_tariff(
+                    // The billed account's own tariffs (an organisation's deal) come first.
+                    let (input, output) = find_best_tariff(
                         &model_info.tariffs,
                         api_key_purpose.as_ref(),
                         raw.batch_completion_window.as_deref(),
                         pricing_timestamp,
+                        user_id,
+                        raw.resolved_serving_class.as_deref(),
                     );
 
                     (Some(model_info.provider_name.clone()), input, output)
@@ -709,7 +638,7 @@ where
                 .request_model
                 .as_deref()
                 .and_then(|alias| cache_tariff_map.get(alias))
-                .and_then(|rows| resolve_cache_multipliers(rows, pricing_timestamp));
+                .and_then(|rows| resolve_cache_multipliers(rows, pricing_timestamp, user_id, raw.resolved_serving_class.as_deref()));
 
             // dwctl only injects cache tokens when a tariff is active, so if no tariff was valid
             // at inference yet the response still carries cache_* tokens, those are the upstream
@@ -728,8 +657,23 @@ where
                     "response carried cache tokens but the model is not dwctl-cache-enabled; ignoring them and billing at list price"
                 );
             }
-            let total_cost = charged_cost(&raw, input_price, output_price, cache_mults_resolved);
-            let uncached_cost = compute_list_price(&raw, input_price, output_price);
+            let cache_mults_resolved = clamp_implicit_read_multiplier(cache_mults_resolved, raw.cache_read_source.as_deref());
+            let billable = (200..=299).contains(&raw.status_code);
+            let (total_cost, uncached_cost) = if billable {
+                (
+                    charged_cost(
+                        &TokenCounts::from(&raw),
+                        raw.request_model.as_deref(),
+                        input_price,
+                        output_price,
+                        cache_mults_resolved,
+                        ANALYTICS_BATCHER,
+                    ),
+                    compute_list_price(&raw, input_price, output_price),
+                )
+            } else {
+                (None, None)
+            };
 
             enriched.push(EnrichedRecord {
                 raw,
@@ -749,18 +693,14 @@ where
         Ok(enriched)
     }
 
-    /// Batch lookup user info by bearer tokens.
-    ///
-    /// `cap_scope_root` is the spending-cap scope for the key (see
-    /// `EnrichedRecord::cap_scope_root`): the root of `COALESCE(parent, id)`
-    /// when that root currently has a cap, else `None`. Resolved here (PK
-    /// self-join) so the fold in `batch_insert_credits` needs no extra query.
     #[tracing::instrument(skip_all)]
-    async fn batch_lookup_users(&self, tokens: &[&str]) -> Result<HashMap<String, KeyLookup>, sqlx::Error> {
-        let tokens_vec: Vec<String> = tokens.iter().map(|s| s.to_string()).collect();
-
+    async fn batch_lookup_users_by_ids(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        key_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, KeyLookup>, sqlx::Error> {
+        #[derive(sqlx::FromRow)]
         struct UserRow {
-            secret: String,
             user_id: Uuid,
             api_key_id: Uuid,
             purpose: String,
@@ -770,55 +710,60 @@ where
         let rows: Vec<UserRow> = sqlx::query_as!(
             UserRow,
             r#"
-            SELECT ak.secret, ak.user_id, ak.id as api_key_id, ak.purpose,
-                   CASE WHEN root.spend_limit IS NOT NULL THEN root.id END AS cap_scope_root
+            SELECT ak.user_id, ak.id as api_key_id, ak.purpose,
+                   CASE WHEN root.spend_limit IS NOT NULL THEN root.id END AS "cap_scope_root?"
             FROM api_keys ak
             JOIN api_keys root ON root.id = COALESCE(ak.parent_api_key_id, ak.id)
-            WHERE ak.secret = ANY($1) AND ak.is_deleted = false
+            WHERE ak.id = ANY($1)
             "#,
-            &tokens_vec
+            key_ids
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut **tx)
         .await?;
 
         let mut map = HashMap::with_capacity(rows.len());
         for row in rows {
-            let purpose = parse_api_key_purpose(&row.purpose);
             map.insert(
-                row.secret,
+                row.api_key_id,
                 KeyLookup {
                     user_id: row.user_id,
                     api_key_id: row.api_key_id,
-                    purpose,
+                    purpose: parse_api_key_purpose(&row.purpose),
                     cap_scope_root: row.cap_scope_root,
                 },
             );
         }
-
-        trace!(count = map.len(), "Batch lookup users completed");
         Ok(map)
     }
 
     /// Batch lookup model info with tariffs.
     ///
-    /// Fetches ALL tariffs (including expired ones) to support historical pricing
-    /// for batch requests that may have been created in the past.
+    /// Fetches general tariffs and the billed accounts' tariffs, including expired
+    /// versions for batch requests that may have been created in the past.
     #[tracing::instrument(skip_all)]
-    async fn batch_lookup_models_with_tariffs(&self, aliases: &[&str]) -> Result<HashMap<String, ModelInfo>, sqlx::Error> {
+    async fn batch_lookup_models_with_tariffs(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        aliases: &[&str],
+        accounts: &[Uuid],
+    ) -> Result<HashMap<String, ModelInfo>, sqlx::Error> {
         let aliases_vec: Vec<String> = aliases.iter().map(|s| s.to_string()).collect();
 
         struct ModelRow {
             alias: String,
             provider_name: Option<String>,
+            tariff_id: Option<Uuid>,
             tariff_purpose: Option<String>,
             tariff_valid_from: Option<DateTime<Utc>>,
             tariff_valid_until: Option<DateTime<Utc>>,
             tariff_input_price: Option<Decimal>,
             tariff_output_price: Option<Decimal>,
             tariff_completion_window: Option<String>,
+            tariff_account: Option<Uuid>,
+            tariff_class: Option<String>,
         }
 
-        // Query models with ALL their tariffs (including expired) for historical pricing
+        // Keep all historical versions within the requested account scopes.
         // Note: Column aliases use "?" suffix to force nullable for LEFT JOIN columns
         let rows: Vec<ModelRow> = sqlx::query_as!(
             ModelRow,
@@ -826,21 +771,27 @@ where
             SELECT
                 dm.alias,
                 ie.name as "provider_name?",
+                mt.id as "tariff_id?",
                 mt.api_key_purpose as "tariff_purpose?",
                 mt.valid_from as "tariff_valid_from?",
                 mt.valid_until as "tariff_valid_until?",
                 mt.input_price_per_token as "tariff_input_price?",
                 mt.output_price_per_token as "tariff_output_price?",
-                mt.completion_window as "tariff_completion_window?"
+                mt.completion_window as "tariff_completion_window?",
+                mt.user_id as "tariff_account?",
+                mt.serving_class as "tariff_class?"
             FROM deployed_models dm
             LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id
             LEFT JOIN model_tariffs mt ON mt.deployed_model_id = dm.id
+                AND (mt.user_id IS NULL OR mt.user_id = ANY($2))
+                AND (mt.user_id IS NOT NULL OR mt.serving_class IS NULL)
             WHERE dm.alias = ANY($1)
             ORDER BY dm.alias, mt.valid_from DESC
             "#,
-            &aliases_vec
+            &aliases_vec,
+            accounts
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut **tx)
         .await?;
 
         // Group by alias
@@ -852,19 +803,23 @@ where
             });
 
             // Add tariff if present
-            if let (Some(purpose), Some(valid_from), Some(input_price), Some(output_price)) = (
+            if let (Some(id), Some(purpose), Some(valid_from), Some(input_price), Some(output_price)) = (
+                row.tariff_id,
                 row.tariff_purpose,
                 row.tariff_valid_from,
                 row.tariff_input_price,
                 row.tariff_output_price,
             ) {
                 entry.tariffs.push(TariffInfo {
+                    id,
+                    serving_class: row.tariff_class,
                     purpose: parse_api_key_purpose(&purpose),
                     effective_from: valid_from,
                     valid_until: row.tariff_valid_until,
                     input_price_per_token: input_price,
                     output_price_per_token: output_price,
                     completion_window: row.tariff_completion_window,
+                    account: row.tariff_account,
                 });
             }
         }
@@ -875,139 +830,49 @@ where
 
     /// Batch lookup cache tariffs (per model, per tier) for the given aliases.
     ///
-    /// Fetches ALL rows (including expired) so batch requests price as of their creation
-    /// time, exactly like `batch_lookup_models_with_tariffs`. Models without cache tariffs
+    /// Fetches general and billed-account rows (including expired) so requests price as
+    /// of their creation time, like `batch_lookup_models_with_tariffs`. Models without cache tariffs
     /// simply don't appear (the resolver then falls back to safe defaults).
     #[tracing::instrument(skip_all)]
-    async fn batch_lookup_cache_tariffs(&self, aliases: &[&str]) -> Result<HashMap<String, Vec<CacheTariffRow>>, sqlx::Error> {
+    async fn batch_lookup_cache_tariffs(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        aliases: &[&str],
+        accounts: &[Uuid],
+    ) -> Result<HashMap<String, Vec<CacheTariffRow>>, sqlx::Error> {
         let aliases_vec: Vec<String> = aliases.iter().map(|s| s.to_string()).collect();
-
-        struct Row {
-            alias: String,
-            write_multiplier_5m: Decimal,
-            write_multiplier_1h: Decimal,
-            write_multiplier_24h: Decimal,
-            read_multiplier: Decimal,
-            valid_from: DateTime<Utc>,
-            valid_until: Option<DateTime<Utc>>,
-        }
-
-        let rows: Vec<Row> = sqlx::query_as!(
-            Row,
-            r#"
-            SELECT
-                dm.alias,
-                mct.write_multiplier_5m,
-                mct.write_multiplier_1h,
-                mct.write_multiplier_24h,
-                mct.read_multiplier,
-                mct.valid_from,
-                mct.valid_until
-            FROM deployed_models dm
-            JOIN model_cache_tariffs mct ON mct.deployed_model_id = dm.id
-            WHERE dm.alias = ANY($1)
-            ORDER BY dm.alias, mct.valid_from DESC
-            "#,
-            &aliases_vec
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut map: HashMap<String, Vec<CacheTariffRow>> = HashMap::new();
-        for row in rows {
-            map.entry(row.alias).or_default().push(CacheTariffRow {
-                write_multiplier_5m: row.write_multiplier_5m,
-                write_multiplier_1h: row.write_multiplier_1h,
-                write_multiplier_24h: row.write_multiplier_24h,
-                read_multiplier: row.read_multiplier,
-                valid_from: row.valid_from,
-                valid_until: row.valid_until,
-            });
-        }
-
+        let map = crate::pricing::lookup_cache_tariffs(&mut **tx, &aliases_vec, accounts).await?;
         trace!(count = map.len(), "Batch lookup cache tariffs completed");
         Ok(map)
     }
 
-    /// Find the best matching tariff for a record.
-    ///
-    /// Implements fallback logic:
-    /// 1. Try exact match (purpose + completion_window + timestamp)
-    /// 2. Fall back to generic tariff for that purpose (completion_window = None)
-    /// 3. Fall back to realtime purpose (generic)
-    fn find_best_tariff(
-        &self,
-        tariffs: &[TariffInfo],
-        api_key_purpose: Option<&ApiKeyPurpose>,
-        completion_window: Option<&str>,
-        timestamp: DateTime<Utc>,
-    ) -> (Option<Decimal>, Option<Decimal>) {
-        let purpose = api_key_purpose.unwrap_or(&ApiKeyPurpose::Realtime);
-
-        // Filter tariffs valid at timestamp:
-        // effective_from <= timestamp AND (valid_until IS NULL OR valid_until > timestamp)
-        let valid_tariffs: Vec<_> = tariffs
-            .iter()
-            .filter(|t| t.effective_from <= timestamp && t.valid_until.is_none_or(|valid_until| valid_until > timestamp))
-            .collect();
-
-        // Try exact match with completion_window (for batch tariffs with specific priority)
-        if let Some(cw) = completion_window
-            && let Some(tariff) = valid_tariffs
-                .iter()
-                .find(|t| &t.purpose == purpose && t.completion_window.as_deref() == Some(cw))
-        {
-            return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
-        }
-
-        // Try generic tariff for this purpose (completion_window = None)
-        // This ensures we don't accidentally match a different priority tier
-        if let Some(tariff) = valid_tariffs
-            .iter()
-            .find(|t| &t.purpose == purpose && t.completion_window.is_none())
-        {
-            return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
-        }
-
-        // Fall back to generic realtime tariff
-        if purpose != &ApiKeyPurpose::Realtime
-            && let Some(tariff) = valid_tariffs
-                .iter()
-                .find(|t| t.purpose == ApiKeyPurpose::Realtime && t.completion_window.is_none())
-        {
-            return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
-        }
-
-        (None, None)
-    }
-
-    /// Write enriched records to the database in a single transaction.
+    /// Write enriched records using the caller's outbox transaction.
     #[tracing::instrument(skip_all)]
-    async fn write_batch_transactional(&self, records: &[EnrichedRecord]) -> Result<(), sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
-
+    async fn write_batch_in_transaction(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        records: &[EnrichedRecord],
+    ) -> Result<(), sqlx::Error> {
         // Phase 1: Batch INSERT http_analytics
-        let (analytics_ids, newly_inserted) = self.batch_insert_analytics(&mut tx, records).await?;
+        let (analytics_ids, newly_inserted) = self.batch_insert_analytics(tx, records).await?;
 
         // Phase 2: Batch INSERT credit_transactions (+ fold batch_aggregates)
-        let duplicates = self.batch_insert_credits(&mut tx, records, &analytics_ids, &newly_inserted).await?;
+        let duplicates = self.batch_insert_credits(tx, records, &analytics_ids, &newly_inserted).await?;
         if duplicates > 0 {
             warn!(duplicates = duplicates, "Some credit transactions were duplicates");
             counter!("dwctl_credits_duplicates_total").increment(duplicates);
         }
-
-        tx.commit().await?;
         Ok(())
     }
 
     /// Batch INSERT http_analytics records within a transaction.
     ///
-    /// Returns `(id_map, newly_inserted)`: the analytics id for each
-    /// `(instance_id, correlation_id)`, and the subset of those ids that were freshly
-    /// INSERTed this call (`xmax = 0`) rather than updated on conflict. The batch-analytics
-    /// fold in `batch_insert_credits` uses `newly_inserted` as its idempotency anchor so that
-    /// free / zero-priced batched requests (which never produce a credit row to ride) are
-    /// still folded exactly once under retries.
+    /// Returns the analytics ids inserted by this call. A repeated physical
+    /// receipt, and (once the logical-request unique index is deployed) a
+    /// second successful attempt for the same Fusillade request, returns no
+    /// row and therefore cannot proceed to billing or aggregation. The
+    /// batch-analytics fold uses the same returned ids as its idempotency
+    /// anchor, including for free requests that have no credit row.
     async fn batch_insert_analytics(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -1045,6 +910,8 @@ where
 
         let mut api_key_ids: Vec<Option<Uuid>> = Vec::with_capacity(records.len());
         let mut trace_ids: Vec<Option<String>> = Vec::with_capacity(records.len());
+        let mut gateway_span_ids: Vec<Option<String>> = Vec::with_capacity(records.len());
+        let mut x_request_ids: Vec<Option<Uuid>> = Vec::with_capacity(records.len());
         let mut cache_read_vec: Vec<i64> = Vec::with_capacity(records.len());
         let mut cache_creation_total_vec: Vec<i64> = Vec::with_capacity(records.len());
         let mut cache_5m_vec: Vec<i64> = Vec::with_capacity(records.len());
@@ -1053,8 +920,20 @@ where
         let mut total_cost_vec: Vec<Option<Decimal>> = Vec::with_capacity(records.len());
         let mut uncached_cost_vec: Vec<Option<Decimal>> = Vec::with_capacity(records.len());
         let mut served_by_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
+        let mut requested_class_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
+        let mut resolved_class_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
         let mut finish_reason_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
         let mut user_agent_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
+        let mut submitted_at_vec: Vec<Option<DateTime<Utc>>> = Vec::with_capacity(records.len());
+        let mut engine_cached_vec: Vec<Option<i64>> = Vec::with_capacity(records.len());
+        let mut cache_read_source_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
+        let mut stream_vec: Vec<Option<bool>> = Vec::with_capacity(records.len());
+        let mut max_tokens_vec: Vec<Option<i64>> = Vec::with_capacity(records.len());
+        let mut temperature_vec: Vec<Option<f32>> = Vec::with_capacity(records.len());
+        let mut top_p_vec: Vec<Option<f32>> = Vec::with_capacity(records.len());
+        let mut n_vec: Vec<Option<i32>> = Vec::with_capacity(records.len());
+        let mut tool_count_vec: Vec<Option<i32>> = Vec::with_capacity(records.len());
+        let mut message_count_vec: Vec<Option<i32>> = Vec::with_capacity(records.len());
 
         for record in records {
             instance_ids.push(record.raw.instance_id);
@@ -1087,6 +966,8 @@ where
 
             api_key_ids.push(record.api_key_id);
             trace_ids.push(record.raw.trace_id.clone());
+            gateway_span_ids.push(record.raw.gateway_span_id.clone());
+            x_request_ids.push(record.raw.x_request_id);
 
             let c5 = record.raw.cache_creation_5m_input_tokens;
             let c1 = record.raw.cache_creation_1h_input_tokens;
@@ -1100,8 +981,23 @@ where
             total_cost_vec.push(record.total_cost);
             uncached_cost_vec.push(record.uncached_cost);
             served_by_vec.push(record.raw.served_by.clone());
+            requested_class_vec.push(record.raw.requested_serving_class.clone());
+            resolved_class_vec.push(record.raw.resolved_serving_class.clone());
             finish_reason_vec.push(record.raw.finish_reason.clone());
             user_agent_vec.push(record.raw.user_agent.clone());
+            // Already carried for batch-creation pricing; now also persisted, so the
+            // queue delay (timestamp - submitted_at) survives past this process.
+            submitted_at_vec.push(record.raw.batch_created_at);
+            engine_cached_vec.push(record.raw.engine_cached_tokens);
+            cache_read_source_vec.push(record.raw.cache_read_source.clone());
+            let p = &record.raw.request_params;
+            stream_vec.push(p.stream);
+            max_tokens_vec.push(p.max_tokens);
+            temperature_vec.push(p.temperature);
+            top_p_vec.push(p.top_p);
+            n_vec.push(p.n);
+            tool_count_vec.push(p.tool_count);
+            message_count_vec.push(p.message_count);
         }
 
         let rows = sqlx::query!(
@@ -1114,7 +1010,10 @@ where
                 request_origin, batch_sla, batch_request_source, api_key_id, trace_id,
                 cache_read_input_tokens, cache_creation_input_tokens,
                 cache_creation_5m_input_tokens, cache_creation_1h_input_tokens, cache_creation_24h_input_tokens,
-                total_cost, uncached_cost, served_by, finish_reason, user_agent
+                total_cost, uncached_cost, served_by, finish_reason, user_agent, submitted_at,
+                engine_cached_tokens, stream, max_tokens, temperature, top_p, n, tool_count, message_count,
+                cache_read_source, requested_serving_class, resolved_serving_class, gateway_span_id,
+                x_request_id
             )
             SELECT * FROM UNNEST(
                 $1::uuid[], $2::bigint[], $3::timestamptz[], $4::text[], $5::text[], $6::text[],
@@ -1124,41 +1023,13 @@ where
                 $22::text[], $23::text[], $24::text[], $25::uuid[], $26::text[],
                 $27::bigint[], $28::bigint[],
                 $29::bigint[], $30::bigint[], $31::bigint[],
-                $32::numeric[], $33::numeric[], $34::text[], $35::text[], $36::text[]
+                $32::numeric[], $33::numeric[], $34::text[], $35::text[], $36::text[],
+                $37::timestamptz[],
+                $38::bigint[], $39::boolean[], $40::bigint[], $41::real[], $42::real[], $43::int[], $44::int[], $45::int[],
+                $46::text[], $47::text[], $48::text[], $49::text[], $50::uuid[]
             )
-            ON CONFLICT (instance_id, correlation_id)
-            DO UPDATE SET
-                status_code = EXCLUDED.status_code,
-                duration_ms = EXCLUDED.duration_ms,
-                duration_to_first_byte_ms = EXCLUDED.duration_to_first_byte_ms,
-                prompt_tokens = EXCLUDED.prompt_tokens,
-                completion_tokens = EXCLUDED.completion_tokens,
-                reasoning_tokens = EXCLUDED.reasoning_tokens,
-                total_tokens = EXCLUDED.total_tokens,
-                response_type = EXCLUDED.response_type,
-                user_id = EXCLUDED.user_id,
-                access_source = EXCLUDED.access_source,
-                input_price_per_token = EXCLUDED.input_price_per_token,
-                output_price_per_token = EXCLUDED.output_price_per_token,
-                fusillade_batch_id = EXCLUDED.fusillade_batch_id,
-                fusillade_request_id = EXCLUDED.fusillade_request_id,
-                custom_id = EXCLUDED.custom_id,
-                request_origin = EXCLUDED.request_origin,
-                batch_sla = EXCLUDED.batch_sla,
-                batch_request_source = EXCLUDED.batch_request_source,
-                api_key_id = EXCLUDED.api_key_id,
-                trace_id = EXCLUDED.trace_id,
-                cache_read_input_tokens = EXCLUDED.cache_read_input_tokens,
-                cache_creation_input_tokens = EXCLUDED.cache_creation_input_tokens,
-                cache_creation_5m_input_tokens = EXCLUDED.cache_creation_5m_input_tokens,
-                cache_creation_1h_input_tokens = EXCLUDED.cache_creation_1h_input_tokens,
-                cache_creation_24h_input_tokens = EXCLUDED.cache_creation_24h_input_tokens,
-                total_cost = EXCLUDED.total_cost,
-                uncached_cost = EXCLUDED.uncached_cost,
-                served_by = EXCLUDED.served_by,
-                finish_reason = EXCLUDED.finish_reason,
-                user_agent = EXCLUDED.user_agent
-            RETURNING id, instance_id, correlation_id, (xmax = 0) AS "newly_inserted!"
+            ON CONFLICT DO NOTHING
+            RETURNING id, instance_id, correlation_id
             "#,
             &instance_ids,
             &correlation_ids,
@@ -1196,22 +1067,40 @@ where
             &served_by_vec as &[Option<String>],
             &finish_reason_vec as &[Option<String>],
             &user_agent_vec as &[Option<String>],
+            &submitted_at_vec as &[Option<DateTime<Utc>>],
+            &engine_cached_vec as &[Option<i64>],
+            &stream_vec as &[Option<bool>],
+            &max_tokens_vec as &[Option<i64>],
+            &temperature_vec as &[Option<f32>],
+            &top_p_vec as &[Option<f32>],
+            &n_vec as &[Option<i32>],
+            &tool_count_vec as &[Option<i32>],
+            &message_count_vec as &[Option<i32>],
+            &cache_read_source_vec as &[Option<String>],
+            &requested_class_vec as &[Option<String>],
+            &resolved_class_vec as &[Option<String>],
+            &gateway_span_ids as &[Option<String>],
+            &x_request_ids as &[Option<Uuid>],
         )
         .fetch_all(&mut **tx)
         .await?;
 
         let mut id_map = HashMap::with_capacity(rows.len());
-        let mut newly_inserted: HashSet<i64> = HashSet::new();
+        let mut newly_inserted: HashSet<i64> = HashSet::with_capacity(rows.len());
         for row in rows {
             id_map.insert((row.instance_id, row.correlation_id), row.id);
-            if row.newly_inserted {
-                newly_inserted.insert(row.id);
-            }
+            newly_inserted.insert(row.id);
+        }
+
+        let duplicate_receipts = records.len().saturating_sub(id_map.len());
+        if duplicate_receipts > 0 {
+            counter!("dwctl_analytics_duplicate_receipts_total").increment(duplicate_receipts as u64);
         }
 
         trace!(
             count = id_map.len(),
-            newly = newly_inserted.len(),
+            inserted = newly_inserted.len(),
+            duplicates = duplicate_receipts,
             "Batch inserted analytics records"
         );
         Ok((id_map, newly_inserted))
@@ -1240,6 +1129,7 @@ where
         let mut fusillade_batch_ids: Vec<Option<Uuid>> = Vec::new();
         let mut models: Vec<String> = Vec::new();
         let mut served_bys: Vec<String> = Vec::new();
+        let mut served_models: Vec<String> = Vec::new();
         let mut api_key_ids_credit: Vec<Option<Uuid>> = Vec::new();
         // Service tier, computed in memory from the fusillade metadata, so the
         // transactions list can label each row (realtime / flex / async / batch)
@@ -1252,8 +1142,33 @@ where
         // Spending-cap scope root per billed row (None for the uncapped
         // majority); parallel to the vecs above, consumed by the cap fold below.
         let mut cap_scope_roots: Vec<Option<Uuid>> = Vec::new();
+        let mut processed_analytics_ids: HashSet<i64> = HashSet::new();
 
         for record in records {
+            // Only a row returned by the analytics INSERT may have downstream
+            // effects. If the same physical identity appeared twice in one
+            // flush, process the first input row (the one INSERT considered
+            // first) exactly once.
+            let Some(&analytics_id) = analytics_ids.get(&(record.raw.instance_id, record.raw.correlation_id)) else {
+                trace!(
+                    instance_id = %record.raw.instance_id,
+                    correlation_id = record.raw.correlation_id,
+                    fusillade_request_id = ?record.raw.fusillade_request_id,
+                    "Skipping billing for an analytics receipt rejected by a uniqueness constraint"
+                );
+                continue;
+            };
+            if !processed_analytics_ids.insert(analytics_id) {
+                continue;
+            }
+
+            // Billing eligibility is the shared effective HTTP outcome. Failed
+            // requests remain in analytics, but never create a debit even when
+            // the provider reported usage and a non-zero price.
+            if !(200..=299).contains(&record.raw.status_code) {
+                continue;
+            }
+
             // Skip if no user or no pricing
             let Some(user_id) = record.user_id else { continue };
 
@@ -1270,17 +1185,6 @@ where
                 continue;
             }
 
-            // Get analytics_id
-            let Some(&analytics_id) = analytics_ids.get(&(record.raw.instance_id, record.raw.correlation_id)) else {
-                crate::background_error!(
-                    ANALYTICS_BATCHER, "analytics_id_missing", Warning,
-                    instance_id = %record.raw.instance_id,
-                    correlation_id = record.raw.correlation_id,
-                    "Analytics ID not found for credit transaction"
-                );
-                continue;
-            };
-
             let model = record.raw.request_model.clone().unwrap_or_default();
 
             user_ids.push(user_id);
@@ -1293,6 +1197,7 @@ where
             fusillade_batch_ids.push(record.raw.fusillade_batch_id);
             models.push(model);
             served_bys.push(crate::metrics::served_by_host(record.raw.served_by.as_deref()));
+            served_models.push(record.raw.served_model.clone().unwrap_or_default());
             api_key_ids_credit.push(record.api_key_id);
             service_tiers
                 .push(compute_billing_tier(record.raw.fusillade_batch_id, record.raw.batch_completion_window.as_deref()).to_string());
@@ -1306,11 +1211,24 @@ where
 
         let expected_count = user_ids.len() as u64;
 
-        // Build a map from source_id to (index, user_id, amount, model, served_by) for metric recording
-        let source_id_to_record: HashMap<String, (usize, Uuid, Decimal, String, String)> = source_ids
+        // Build a map from source_id to (index, user_id, amount, model, served_by, served_model) for metric recording
+        type CreditMetricRecord = (usize, Uuid, Decimal, String, String, String);
+        let source_id_to_record: HashMap<String, CreditMetricRecord> = source_ids
             .iter()
             .enumerate()
-            .map(|(i, sid)| (sid.clone(), (i, user_ids[i], amounts[i], models[i].clone(), served_bys[i].clone())))
+            .map(|(i, sid)| {
+                (
+                    sid.clone(),
+                    (
+                        i,
+                        user_ids[i],
+                        amounts[i],
+                        models[i].clone(),
+                        served_bys[i].clone(),
+                        served_models[i].clone(),
+                    ),
+                )
+            })
             .collect();
 
         // Batch INSERT, folding into the read model in the same transaction.
@@ -1358,7 +1276,7 @@ where
 
         // Billing fold: total_amount / transaction_count per batch, over the *billed* rows
         // (the credit set). The per-batch analytics aggregates (tokens/latency/cost) are folded
-        // separately below over ALL 2xx requests, so free-model batches are counted too.
+        // separately below over ALL newly inserted 2xx requests, so free-model batches are counted too.
         struct BatchFold {
             user_id: Uuid,
             total: Decimal,
@@ -1635,8 +1553,8 @@ where
         // rides the credit set and so excludes free / zero-priced requests — this covers ALL
         // 2xx batched requests, matching get_batch_analytics's historical "status 2xx" set, so
         // free-model batches still report tokens/latency/cost. Idempotency rides the
-        // http_analytics upsert's newly-inserted flag (`xmax = 0`): a retried flush re-folds
-        // nothing. count_duration_ms / count_ttfb_ms count only requests that reported the
+        // http_analytics INSERT's returned rows: a conflicting receipt returns nothing and
+        // is not folded. count_duration_ms / count_ttfb_ms count only requests that reported the
         // metric so the endpoint's AVG (which ignores NULLs) is reproduced; total_requests is
         // the plain 2xx count (distinct from transaction_count, the billed-row count).
         struct AnalyticsFold {
@@ -1655,7 +1573,15 @@ where
             list_cost: Decimal,
         }
         let mut analytics_folds: HashMap<Uuid, AnalyticsFold> = HashMap::new();
+        let mut folded_analytics_ids: HashSet<i64> = HashSet::new();
         for record in records {
+            let Some(&analytics_id) = analytics_ids.get(&(record.raw.instance_id, record.raw.correlation_id)) else {
+                continue;
+            };
+            if !newly_inserted.contains(&analytics_id) || !folded_analytics_ids.insert(analytics_id) {
+                continue;
+            }
+
             let Some(batch_id) = record.raw.fusillade_batch_id else { continue };
             if !(200..=299).contains(&record.raw.status_code) {
                 continue;
@@ -1664,16 +1590,6 @@ where
             if user_id == Uuid::nil() {
                 continue;
             }
-            // Idempotency anchor: only rows this flush actually INSERTed (xmax = 0) contribute,
-            // so a retried flush re-folds nothing even for free requests (which have no credit
-            // row to ride the ON CONFLICT DO NOTHING dedup).
-            let Some(&analytics_id) = analytics_ids.get(&(record.raw.instance_id, record.raw.correlation_id)) else {
-                continue;
-            };
-            if !newly_inserted.contains(&analytics_id) {
-                continue;
-            }
-
             let af = analytics_folds.entry(batch_id).or_insert_with(|| AnalyticsFold {
                 user_id,
                 service_tier: compute_billing_tier(record.raw.fusillade_batch_id, record.raw.batch_completion_window.as_deref())
@@ -1779,7 +1695,7 @@ where
 
         // Record metrics only for successfully inserted credit transactions
         for row in &inserted_rows {
-            if let Some((_, user_id, amount, model, served_by)) = source_id_to_record.get(&row.source_id) {
+            if let Some((_, user_id, amount, model, served_by, served_model)) = source_id_to_record.get(&row.source_id) {
                 // Nanocredits (1 credit = 1e9). Tariffs price tokens at
                 // DECIMAL(12,8), so a single token can cost 1e-8 credits; nano
                 // is the coarsest power of ten that represents every
@@ -1792,7 +1708,8 @@ where
                     "dwctl_credits_deducted_nanocredits_total",
                     "user_id" => user_id.to_string(),
                     "model" => model.clone(),
-                    "served_by" => served_by.clone()
+                    "served_by" => served_by.clone(),
+                    "served_model" => served_model.clone()
                 )
                 .increment(nanocredits);
             }
@@ -1842,30 +1759,13 @@ where
     }
 }
 
-/// Model info with tariffs
-#[derive(Debug)]
-struct ModelInfo {
-    provider_name: String,
-    tariffs: Vec<TariffInfo>,
-}
-
-/// Tariff info for pricing lookup
-#[derive(Debug)]
-struct TariffInfo {
-    purpose: ApiKeyPurpose,
-    effective_from: DateTime<Utc>,
-    valid_until: Option<DateTime<Utc>>,
-    input_price_per_token: Decimal,
-    output_price_per_token: Decimal,
-    completion_window: Option<String>,
-}
-
 /// Parse API key purpose from string
 fn parse_api_key_purpose(s: &str) -> ApiKeyPurpose {
     match s {
         "platform" => ApiKeyPurpose::Platform,
         "batch" => ApiKeyPurpose::Batch,
         "playground" => ApiKeyPurpose::Playground,
+        "continuation" => ApiKeyPurpose::Continuation,
         _ => ApiKeyPurpose::Realtime,
     }
 }
@@ -1928,8 +1828,12 @@ mod tests {
 
     #[test]
     fn test_raw_analytics_record_creation() {
+        let api_key_id = Uuid::new_v4();
         let record = RawAnalyticsRecord {
             served_by: None,
+            served_model: None,
+            requested_serving_class: None,
+            resolved_serving_class: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 123,
             timestamp: chrono::Utc::now(),
@@ -1951,9 +1855,12 @@ mod tests {
             response_type: "chat_completion".to_string(),
             finish_reason: None,
             user_agent: None,
+            engine_cached_tokens: None,
+            cache_read_source: None,
+            request_params: RequestParams::default(),
             server_address: "localhost".to_string(),
             server_port: 8080,
-            bearer_token: Some("test-token".to_string()),
+            api_key_id: Some(api_key_id),
             fusillade_batch_id: None,
             fusillade_request_id: None,
             custom_id: None,
@@ -1961,10 +1868,31 @@ mod tests {
             batch_created_at: None,
             batch_request_source: "".to_string(),
             trace_id: None,
+            gateway_span_id: None,
+            x_request_id: None,
         };
 
         assert_eq!(record.correlation_id, 123);
-        assert_eq!(record.bearer_token, Some("test-token".to_string()));
+
+        let payload = serde_json::to_value(&record).unwrap();
+        let restored: RawAnalyticsRecord = serde_json::from_value(payload).unwrap();
+        assert_eq!(restored.api_key_id, Some(api_key_id));
+    }
+
+    #[test]
+    fn outbox_payload_without_x_request_id_deserializes() {
+        let mut payload = serde_json::to_value(cost_record(10, 20, 0, 0, 0, 0)).unwrap();
+        payload.as_object_mut().unwrap().remove("x_request_id");
+        let record: RawAnalyticsRecord = serde_json::from_value(payload).unwrap();
+        assert_eq!(record.x_request_id, None);
+    }
+
+    #[test]
+    fn outbox_payload_without_gateway_span_id_deserializes() {
+        let mut payload = serde_json::to_value(cost_record(10, 20, 0, 0, 0, 0)).unwrap();
+        payload.as_object_mut().unwrap().remove("gateway_span_id");
+        let record: RawAnalyticsRecord = serde_json::from_value(payload).unwrap();
+        assert_eq!(record.gateway_span_id, None);
     }
 
     #[test]
@@ -1980,6 +1908,9 @@ mod tests {
     fn cost_record(prompt: i64, completion: i64, read: i64, c5: i64, c1: i64, c24: i64) -> RawAnalyticsRecord {
         RawAnalyticsRecord {
             served_by: None,
+            served_model: None,
+            requested_serving_class: None,
+            resolved_serving_class: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 1,
             timestamp: chrono::Utc::now(),
@@ -2001,9 +1932,12 @@ mod tests {
             response_type: "chat_completion".to_string(),
             finish_reason: None,
             user_agent: None,
+            engine_cached_tokens: None,
+            cache_read_source: None,
+            request_params: RequestParams::default(),
             server_address: "x".to_string(),
             server_port: 1,
-            bearer_token: None,
+            api_key_id: None,
             fusillade_batch_id: None,
             fusillade_request_id: None,
             custom_id: None,
@@ -2011,6 +1945,8 @@ mod tests {
             batch_created_at: None,
             batch_request_source: String::new(),
             trace_id: None,
+            gateway_span_id: None,
+            x_request_id: None,
         }
     }
 
@@ -2022,109 +1958,20 @@ mod tests {
         Decimal::new(2, 3)
     }
 
+    /// The mapping the batcher owns: a `RawAnalyticsRecord`'s token fields into the shape
+    /// `crate::pricing` prices. The arithmetic itself is tested in `crate::pricing`; what
+    /// matters here is that every field lands in the right slot — a transposed cache tier
+    /// would silently bill reads at a write multiplier.
     #[test]
-    fn cost_without_cache_is_plain_arithmetic() {
-        // No cache tokens → identical to the old prompt×input + completion×output.
-        let r = cost_record(1000, 100, 0, 0, 0, 0);
-        let cost = compute_total_cost(&r, Some(inp()), Some(outp()), &CacheMultipliers::default()).unwrap();
-        assert_eq!(cost, Decimal::new(12, 1)); // 1000*0.001 + 100*0.002 = 1.2
-    }
-
-    #[test]
-    fn cost_with_cache_applies_per_tier_multipliers() {
-        // 2000 input: 1000 read + 500 1h-creation + 500 uncached; completion 100.
-        let r = cost_record(2000, 100, 1000, 0, 500, 0);
-        let m = CacheMultipliers {
-            read: Decimal::new(1, 1), // 0.1
-            write_5m: Decimal::ONE,
-            write_1h: Decimal::from(2), // 2.0
-            write_24h: Decimal::ONE,
-        };
-        let cost = compute_total_cost(&r, Some(inp()), Some(outp()), &m).unwrap();
-        // 500*0.001 (uncached) + 1000*0.001*0.1 (read) + 500*0.001*2.0 (1h write) + 100*0.002 (out)
-        // = 0.5 + 0.1 + 1.0 + 0.2 = 1.8
-        assert_eq!(cost, Decimal::new(18, 1));
-    }
-
-    #[test]
-    fn cost_none_when_no_pricing() {
-        let r = cost_record(1000, 100, 0, 0, 0, 0);
-        assert!(compute_total_cost(&r, None, None, &CacheMultipliers::default()).is_none());
-    }
-
-    #[test]
-    fn corrupt_writes_exceeding_prompt_bill_at_base_rate() {
-        // WRITE counts alone (150) exceed the prompt (100) — impossible, corrupt. The
-        // split is distrusted and the whole input is billed at base rate (the list
-        // price), never at the cache write premium that would overcharge on a mistake.
-        let r = cost_record(100, 5, 0, 150, 0, 0);
-        let cost = compute_total_cost(&r, Some(inp()), Some(outp()), &CacheMultipliers::default()).unwrap();
-        // list price = 100*0.001 + 5*0.002 = 0.11
-        assert_eq!(cost, Decimal::new(11, 2));
-        // No savings shown for a distrusted split: total == un-discounted list price.
-        assert_eq!(cost, compute_list_price(&r, Some(inp()), Some(outp())).unwrap());
-    }
-
-    #[test]
-    fn drifted_split_is_capped_by_reducing_read_not_discarded() {
-        // The tokenizer-drift shape (detail.dev, 2026-07): markers cover the whole prompt
-        // and the classifier's count lands ~1% above the engine's prompt_tokens
-        // (10_000 read + 200 write vs 10_100 prompt = 100-token overrun). The overrun
-        // comes off the READ count; the discount survives.
-        let m = CacheMultipliers::default(); // read 0.1, write_5m 1.25
-        let r = cost_record(10_100, 5, 10_000, 200, 0, 0);
-        let cost = compute_total_cost(&r, Some(inp()), Some(outp()), &m).unwrap();
-        // capped read = 10_100 - 200 = 9_900; uncached = 0
-        // input = 9_900*0.001*0.1 + 200*0.001*1.25 = 0.99 + 0.25 = 1.24; output = 5*0.002 = 0.01
-        assert_eq!(cost, Decimal::new(125, 2));
-        // The whole point: massively cheaper than the discarded-split list price.
-        assert!(cost < compute_list_price(&r, Some(inp()), Some(outp())).unwrap());
-    }
-
-    #[test]
-    fn split_exactly_at_prompt_is_untouched() {
-        // cached_total == prompt: no cap, no distrust — billed exactly as reported.
-        let m = CacheMultipliers::default();
-        let r = cost_record(10_000, 0, 9_800, 200, 0, 0);
-        let cost = compute_total_cost(&r, Some(inp()), Some(outp()), &m).unwrap();
-        // 9_800*0.001*0.1 + 200*0.001*1.25 = 0.98 + 0.25
-        assert_eq!(cost, Decimal::new(123, 2));
-    }
-
-    #[test]
-    fn cap_can_consume_the_entire_read() {
-        // Writes fill the whole prompt and read overruns entirely: read caps to zero and
-        // the writes bill at their premium — still a trusted, capped split (writes alone
-        // do NOT exceed the prompt, so this is drift, not corruption).
-        let m = CacheMultipliers::default();
-        let r = cost_record(1_000, 0, 50, 1_000, 0, 0);
-        let cost = compute_total_cost(&r, Some(inp()), Some(outp()), &m).unwrap();
-        // read capped to 0; 1_000*0.001*1.25 = 1.25
-        assert_eq!(cost, Decimal::new(125, 2));
-    }
-
-    #[test]
-    fn charged_cost_gates_discount_on_enablement() {
-        // 600 cache-read tokens reported on the response.
-        let r = cost_record(1000, 100, 600, 0, 0, 0);
-
-        // Not dwctl-cache-enabled (no tariff → None): the provider's cache tokens are ignored
-        // and the full input is billed at list price — no read discount.
-        let not_enabled = charged_cost(&r, Some(inp()), Some(outp()), None).unwrap();
-        assert_eq!(not_enabled, compute_list_price(&r, Some(inp()), Some(outp())).unwrap());
-        assert_eq!(not_enabled, Decimal::new(12, 1)); // 1000*0.001 + 100*0.002
-
-        // Cache-enabled (Some): the read discount applies, so it costs strictly less.
-        let m = CacheMultipliers {
-            read: Decimal::new(1, 1), // 0.1
-            write_5m: Decimal::ONE,
-            write_1h: Decimal::ONE,
-            write_24h: Decimal::ONE,
-        };
-        let enabled = charged_cost(&r, Some(inp()), Some(outp()), Some(m)).unwrap();
-        // 400 uncached*0.001 + 600 read*0.001*0.1 + 100*0.002 = 0.66
-        assert_eq!(enabled, Decimal::new(66, 2));
-        assert!(enabled < not_enabled, "the discount must make the enabled case cheaper");
+    fn token_counts_from_raw_record_maps_every_field() {
+        let r = cost_record(1000, 100, 500, 1, 2, 3);
+        let c = TokenCounts::from(&r);
+        assert_eq!(c.prompt, 1000);
+        assert_eq!(c.completion, 100);
+        assert_eq!(c.cache_read, 500);
+        assert_eq!(c.cache_creation_5m, 1);
+        assert_eq!(c.cache_creation_1h, 2);
+        assert_eq!(c.cache_creation_24h, 3);
     }
 
     #[test]
@@ -2134,50 +1981,6 @@ mod tests {
         let list = compute_list_price(&r, Some(inp()), Some(outp())).unwrap();
         assert_eq!(list, Decimal::new(12, 1)); // 1000*0.001 + 100*0.002 = 1.2
         assert!(compute_list_price(&r, None, None).is_none(), "no pricing → NULL list price");
-    }
-
-    fn tariff_row(write_1h: Decimal, from_hrs: i64, valid_until: Option<DateTime<Utc>>) -> CacheTariffRow {
-        CacheTariffRow {
-            write_multiplier_5m: Decimal::new(125, 2), // 1.25
-            write_multiplier_1h: write_1h,
-            write_multiplier_24h: Decimal::new(25, 1), // 2.5
-            read_multiplier: Decimal::new(1, 1),       // 0.1
-            valid_from: chrono::Utc::now() - chrono::Duration::hours(from_hrs),
-            valid_until,
-        }
-    }
-
-    #[test]
-    fn resolve_multipliers_picks_latest_valid_version() {
-        let now = chrono::Utc::now();
-        // Two versions; the newer (valid_from 1h ago) wins over the older (5h ago).
-        let rows = vec![tariff_row(Decimal::from(2), 1, None), tariff_row(Decimal::from(3), 5, None)];
-        let m = resolve_cache_multipliers(&rows, now).expect("a valid version exists");
-        assert_eq!(m.write_1h, Decimal::from(2), "latest valid version wins");
-        assert_eq!(m.write_5m, Decimal::new(125, 2), "all tiers come from that one row");
-        assert_eq!(m.write_24h, Decimal::new(25, 1));
-        assert_eq!(m.read, Decimal::new(1, 1));
-    }
-
-    #[test]
-    fn resolve_multipliers_none_when_empty_or_expired() {
-        let now = chrono::Utc::now();
-        // empty → no version valid → None (the caller falls back to defaults deliberately).
-        assert!(resolve_cache_multipliers(&[], now).is_none(), "no rows → None");
-        // expired version ignored → None.
-        let expired = vec![tariff_row(Decimal::from(5), 2, Some(now - chrono::Duration::hours(1)))];
-        assert!(resolve_cache_multipliers(&expired, now).is_none(), "expired version ignored → None");
-    }
-
-    #[test]
-    fn default_multipliers_mirror_config_pricing_defaults() {
-        // Default delegates to CachePricingConfig::default() so the two can't drift.
-        let m = CacheMultipliers::default();
-        let c = CachePricingConfig::default();
-        assert_eq!(m.read, c.default_read_multiplier, "read = config default (0.1)");
-        assert_eq!(m.write_5m, c.default_write_multiplier_5m, "5m = config default (1.25)");
-        assert_eq!(m.write_1h, c.default_write_multiplier_1h, "1h = config default (2.0)");
-        assert_eq!(m.write_24h, c.default_write_multiplier_24h, "24h = config default (2.5)");
     }
 
     #[test]
@@ -2203,302 +2006,6 @@ mod tests {
         assert_eq!(compute_request_origin(Some(&ApiKeyPurpose::Realtime), None), "api");
         assert_eq!(compute_request_origin(Some(&ApiKeyPurpose::Platform), None), "api");
     }
-
-    /// Helper to create test tariffs
-    fn make_tariff(
-        purpose: ApiKeyPurpose,
-        effective_from: DateTime<Utc>,
-        valid_until: Option<DateTime<Utc>>,
-        input_price: &str,
-        output_price: &str,
-        completion_window: Option<&str>,
-    ) -> TariffInfo {
-        TariffInfo {
-            purpose,
-            effective_from,
-            valid_until,
-            input_price_per_token: Decimal::from_str(input_price).unwrap(),
-            output_price_per_token: Decimal::from_str(output_price).unwrap(),
-            completion_window: completion_window.map(|s| s.to_string()),
-        }
-    }
-
-    /// Helper to call find_best_tariff without needing a full batcher
-    fn find_tariff(
-        tariffs: &[TariffInfo],
-        api_key_purpose: Option<&ApiKeyPurpose>,
-        completion_window: Option<&str>,
-        timestamp: DateTime<Utc>,
-    ) -> (Option<Decimal>, Option<Decimal>) {
-        let purpose = api_key_purpose.unwrap_or(&ApiKeyPurpose::Realtime);
-
-        let valid_tariffs: Vec<_> = tariffs
-            .iter()
-            .filter(|t| t.effective_from <= timestamp && t.valid_until.is_none_or(|valid_until| valid_until > timestamp))
-            .collect();
-
-        if let Some(cw) = completion_window
-            && let Some(tariff) = valid_tariffs
-                .iter()
-                .find(|t| &t.purpose == purpose && t.completion_window.as_deref() == Some(cw))
-        {
-            return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
-        }
-
-        if let Some(tariff) = valid_tariffs
-            .iter()
-            .find(|t| &t.purpose == purpose && t.completion_window.is_none())
-        {
-            return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
-        }
-
-        if purpose != &ApiKeyPurpose::Realtime
-            && let Some(tariff) = valid_tariffs
-                .iter()
-                .find(|t| t.purpose == ApiKeyPurpose::Realtime && t.completion_window.is_none())
-        {
-            return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
-        }
-
-        (None, None)
-    }
-
-    #[test]
-    fn test_find_best_tariff_exact_match() {
-        let now = chrono::Utc::now();
-        let tariffs = vec![make_tariff(
-            ApiKeyPurpose::Realtime,
-            now - chrono::Duration::days(1),
-            None,
-            "0.00010",
-            "0.00020",
-            None,
-        )];
-
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
-        assert_eq!(input, Some(Decimal::from_str("0.00010").unwrap()));
-        assert_eq!(output, Some(Decimal::from_str("0.00020").unwrap()));
-    }
-
-    #[test]
-    fn test_find_best_tariff_batch_vs_realtime() {
-        let now = chrono::Utc::now();
-        let tariffs = vec![
-            make_tariff(
-                ApiKeyPurpose::Realtime,
-                now - chrono::Duration::days(1),
-                None,
-                "0.00010",
-                "0.00020",
-                None,
-            ),
-            make_tariff(
-                ApiKeyPurpose::Batch,
-                now - chrono::Duration::days(1),
-                None,
-                "0.00005",
-                "0.00010",
-                None,
-            ),
-        ];
-
-        // Batch purpose should get batch pricing
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), None, now);
-        assert_eq!(input, Some(Decimal::from_str("0.00005").unwrap()));
-        assert_eq!(output, Some(Decimal::from_str("0.00010").unwrap()));
-
-        // Realtime purpose should get realtime pricing
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
-        assert_eq!(input, Some(Decimal::from_str("0.00010").unwrap()));
-        assert_eq!(output, Some(Decimal::from_str("0.00020").unwrap()));
-    }
-
-    #[test]
-    fn test_find_best_tariff_fallback_to_realtime() {
-        // When batch tariff is missing, should fall back to realtime
-        let now = chrono::Utc::now();
-        let tariffs = vec![make_tariff(
-            ApiKeyPurpose::Realtime,
-            now - chrono::Duration::days(1),
-            None,
-            "0.00015",
-            "0.00030",
-            None,
-        )];
-
-        // Batch purpose with no batch tariff should fall back to realtime
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), None, now);
-        assert_eq!(input, Some(Decimal::from_str("0.00015").unwrap()));
-        assert_eq!(output, Some(Decimal::from_str("0.00030").unwrap()));
-    }
-
-    #[test]
-    fn test_find_best_tariff_historical_pricing() {
-        // Test that expired tariffs are not selected for current requests
-        // but ARE selected for historical timestamps
-        let now = chrono::Utc::now();
-        let old_tariff_start = now - chrono::Duration::days(30);
-        let old_tariff_end = now - chrono::Duration::days(10);
-        let new_tariff_start = now - chrono::Duration::days(10);
-
-        let tariffs = vec![
-            // Old tariff: valid from 30 days ago until 10 days ago
-            make_tariff(
-                ApiKeyPurpose::Realtime,
-                old_tariff_start,
-                Some(old_tariff_end),
-                "0.00020", // Old higher price
-                "0.00040",
-                None,
-            ),
-            // New tariff: valid from 10 days ago, still active
-            make_tariff(
-                ApiKeyPurpose::Realtime,
-                new_tariff_start,
-                None,
-                "0.00010", // New lower price
-                "0.00020",
-                None,
-            ),
-        ];
-
-        // Current request should use new pricing
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
-        assert_eq!(
-            input,
-            Some(Decimal::from_str("0.00010").unwrap()),
-            "Current request should use new pricing"
-        );
-        assert_eq!(output, Some(Decimal::from_str("0.00020").unwrap()));
-
-        // Historical request (20 days ago) should use old pricing
-        let historical_time = now - chrono::Duration::days(20);
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, historical_time);
-        assert_eq!(
-            input,
-            Some(Decimal::from_str("0.00020").unwrap()),
-            "Historical request should use old pricing"
-        );
-        assert_eq!(output, Some(Decimal::from_str("0.00040").unwrap()));
-    }
-
-    #[test]
-    fn test_find_best_tariff_completion_window_exact_match() {
-        // Test that completion_window-specific tariffs are matched correctly
-        let now = chrono::Utc::now();
-        let tariffs = vec![
-            // Generic batch tariff (no completion_window)
-            make_tariff(
-                ApiKeyPurpose::Batch,
-                now - chrono::Duration::days(1),
-                None,
-                "0.00010",
-                "0.00020",
-                None,
-            ),
-            // Priority-specific batch tariff for 24h window
-            make_tariff(
-                ApiKeyPurpose::Batch,
-                now - chrono::Duration::days(1),
-                None,
-                "0.00005", // Cheaper for 24h priority
-                "0.00010",
-                Some("24h"),
-            ),
-        ];
-
-        // Request with 24h completion window should get the priority-specific pricing
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), Some("24h"), now);
-        assert_eq!(
-            input,
-            Some(Decimal::from_str("0.00005").unwrap()),
-            "24h priority should get specific pricing"
-        );
-        assert_eq!(output, Some(Decimal::from_str("0.00010").unwrap()));
-
-        // Request without completion window should get generic batch pricing
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), None, now);
-        assert_eq!(
-            input,
-            Some(Decimal::from_str("0.00010").unwrap()),
-            "No priority should get generic pricing"
-        );
-        assert_eq!(output, Some(Decimal::from_str("0.00020").unwrap()));
-    }
-
-    #[test]
-    fn test_find_best_tariff_completion_window_fallback_to_generic() {
-        // Test that unknown completion_window falls back to generic tariff, not another priority
-        let now = chrono::Utc::now();
-        let tariffs = vec![
-            // Generic batch tariff
-            make_tariff(
-                ApiKeyPurpose::Batch,
-                now - chrono::Duration::days(1),
-                None,
-                "0.00010",
-                "0.00020",
-                None,
-            ),
-            // 24h priority tariff
-            make_tariff(
-                ApiKeyPurpose::Batch,
-                now - chrono::Duration::days(1),
-                None,
-                "0.00005",
-                "0.00010",
-                Some("24h"),
-            ),
-            // 7d priority tariff
-            make_tariff(
-                ApiKeyPurpose::Batch,
-                now - chrono::Duration::days(1),
-                None,
-                "0.00003",
-                "0.00006",
-                Some("7d"),
-            ),
-        ];
-
-        // Request with unknown "1h" priority should fall back to generic, NOT to 24h or 7d
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), Some("1h"), now);
-        assert_eq!(
-            input,
-            Some(Decimal::from_str("0.00010").unwrap()),
-            "Unknown priority should fall back to generic, not another priority"
-        );
-        assert_eq!(output, Some(Decimal::from_str("0.00020").unwrap()));
-    }
-
-    #[test]
-    fn test_find_best_tariff_no_matching_tariff() {
-        let now = chrono::Utc::now();
-        let tariffs = vec![];
-
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
-        assert_eq!(input, None);
-        assert_eq!(output, None);
-    }
-
-    #[test]
-    fn test_find_best_tariff_future_tariff_not_used() {
-        // Tariff that starts in the future should not be selected
-        let now = chrono::Utc::now();
-        let tariffs = vec![make_tariff(
-            ApiKeyPurpose::Realtime,
-            now + chrono::Duration::days(1), // Starts tomorrow
-            None,
-            "0.00010",
-            "0.00020",
-            None,
-        )];
-
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
-        assert_eq!(input, None, "Future tariff should not be selected");
-        assert_eq!(output, None);
-    }
-
-    use rust_decimal::prelude::FromStr;
 }
 
 /// Integration tests for the batcher that require database access
@@ -2510,12 +2017,12 @@ mod integration_tests {
     use crate::db::handlers::Repository;
     use crate::db::handlers::credits::Credits;
     use crate::db::models::credits::CreditTransactionType;
+    use crate::pricing::CacheMultipliers;
     use crate::test::utils::create_test_user;
     use rust_decimal::prelude::FromStr;
-    use sqlx::PgPool;
 
     /// Helper: Create a test model with endpoint
-    async fn create_test_model(pool: &PgPool, model_name: &str) -> crate::types::DeploymentId {
+    async fn create_test_model(pool: &sqlx::PgPool, model_name: &str) -> crate::types::DeploymentId {
         use crate::db::handlers::{Deployments, InferenceEndpoints};
         use crate::db::models::{deployments::DeploymentCreateDBRequest, inference_endpoints::InferenceEndpointCreateDBRequest};
         use std::str::FromStr as _;
@@ -2536,6 +2043,8 @@ mod integration_tests {
                 auth_header_name: Some("Authorization".to_string()),
                 auth_header_prefix: Some("Bearer ".to_string()),
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
+                kind: Default::default(),
             })
             .await
             .unwrap();
@@ -2553,9 +2062,7 @@ mod integration_tests {
                 model_type: None,
                 capabilities: None,
                 hosted_on: Some(endpoint.id),
-                requests_per_second: None,
-                burst_size: None,
-                capacity: None,
+                realtime_inflight_limit: None,
                 batch_capacity: None,
                 throughput: None,
                 provider_pricing: None,
@@ -2564,6 +2071,7 @@ mod integration_tests {
                 fallback_enabled: None,
                 fallback_on_rate_limit: None,
                 fallback_on_status: None,
+                fallback_realtime_on_status: None,
                 fallback_with_replacement: None,
                 fallback_max_attempts: None,
                 backoff_enabled: false,
@@ -2572,9 +2080,11 @@ mod integration_tests {
                 backoff_factor: 2.0,
                 backoff_jitter: "full".to_string(),
                 backoff_max_total_ms: None,
+                first_token_timeout_ms: None,
+                aimd: None,
+                affinity: None,
                 sanitize_responses: true,
                 trusted: false,
-                open_responses_adapter: true,
                 reasoning_translation_overrides: None,
                 allowed_batch_completion_windows: None,
                 metadata: None,
@@ -2588,24 +2098,41 @@ mod integration_tests {
     /// Helper: Setup a tariff for a model
     /// Note: Batch tariffs require a completion_window per database constraint
     async fn setup_tariff(
-        pool: &PgPool,
+        pool: &sqlx::PgPool,
         deployed_model_id: crate::types::DeploymentId,
         input_price: Decimal,
         output_price: Decimal,
         api_key_purpose: ApiKeyPurpose,
+    ) {
+        let completion_window = if api_key_purpose == ApiKeyPurpose::Batch {
+            Some("24h")
+        } else {
+            None
+        };
+        setup_tariff_with_window(
+            pool,
+            deployed_model_id,
+            input_price,
+            output_price,
+            api_key_purpose,
+            completion_window,
+        )
+        .await;
+    }
+
+    async fn setup_tariff_with_window(
+        pool: &sqlx::PgPool,
+        deployed_model_id: crate::types::DeploymentId,
+        input_price: Decimal,
+        output_price: Decimal,
+        api_key_purpose: ApiKeyPurpose,
+        completion_window: Option<&str>,
     ) {
         use crate::db::handlers::Tariffs;
         use crate::db::models::tariffs::TariffCreateDBRequest;
 
         let mut conn = pool.acquire().await.unwrap();
         let mut tariffs_repo = Tariffs::new(&mut conn);
-
-        // Batch tariffs require a completion_window
-        let completion_window = if api_key_purpose == ApiKeyPurpose::Batch {
-            Some("24h".to_string())
-        } else {
-            None
-        };
 
         tariffs_repo
             .create(&TariffCreateDBRequest {
@@ -2614,15 +2141,17 @@ mod integration_tests {
                 api_key_purpose: Some(api_key_purpose),
                 input_price_per_token: input_price,
                 output_price_per_token: output_price,
-                valid_from: None,
-                completion_window,
+                // Capture timestamps use the host clock; PostgreSQL may run in a VM.
+                valid_from: Some(Utc::now() - chrono::Duration::minutes(1)),
+                completion_window: completion_window.map(str::to_string),
+                user_id: None,
             })
             .await
             .unwrap();
     }
 
     /// Helper: Create a user with initial balance
-    async fn setup_user_with_balance(pool: &PgPool, balance: Decimal) -> Uuid {
+    async fn setup_user_with_balance(pool: &sqlx::PgPool, balance: Decimal) -> Uuid {
         use crate::db::handlers::credits::Credits;
         use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
 
@@ -2649,7 +2178,7 @@ mod integration_tests {
     }
 
     /// Helper: Create an API key for a user
-    async fn create_api_key_for_user(pool: &PgPool, user_id: Uuid, purpose: ApiKeyPurpose) -> String {
+    async fn create_api_key_for_user(pool: &sqlx::PgPool, user_id: Uuid, purpose: ApiKeyPurpose) -> Uuid {
         use crate::db::handlers::api_keys::ApiKeys;
         use crate::db::models::api_keys::ApiKeyCreateDBRequest;
 
@@ -2661,8 +2190,6 @@ mod integration_tests {
                 name: format!("test-key-{}", Uuid::new_v4()),
                 description: None,
                 purpose,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user_id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -2670,13 +2197,16 @@ mod integration_tests {
             .await
             .unwrap();
 
-        api_key.secret
+        api_key.id
     }
 
     /// Helper: Create a raw analytics record for testing
-    fn create_raw_record(model: &str, bearer_token: Option<String>, prompt_tokens: i64, completion_tokens: i64) -> RawAnalyticsRecord {
+    fn create_raw_record(model: &str, api_key_id: Option<Uuid>, prompt_tokens: i64, completion_tokens: i64) -> RawAnalyticsRecord {
         RawAnalyticsRecord {
             served_by: None,
+            served_model: None,
+            requested_serving_class: None,
+            resolved_serving_class: None,
             instance_id: Uuid::new_v4(),
             correlation_id: rand::random::<i64>().abs(),
             timestamp: chrono::Utc::now(),
@@ -2698,9 +2228,12 @@ mod integration_tests {
             response_type: "chat_completion".to_string(),
             finish_reason: None,
             user_agent: None,
+            engine_cached_tokens: None,
+            cache_read_source: None,
+            request_params: RequestParams::default(),
             server_address: "api.test.com".to_string(),
             server_port: 443,
-            bearer_token,
+            api_key_id,
             fusillade_batch_id: None,
             fusillade_request_id: None,
             custom_id: None,
@@ -2708,30 +2241,310 @@ mod integration_tests {
             batch_created_at: None,
             batch_request_source: String::new(),
             trace_id: None,
+            gateway_span_id: None,
+            x_request_id: None,
         }
     }
 
     /// Run the batcher with given records and wait for completion
-    async fn run_batcher_with_records(pool: &PgPool, records: Vec<RawAnalyticsRecord>) {
+    async fn run_batcher_with_records(pool: &sqlx::PgPool, records: Vec<RawAnalyticsRecord>) {
         let config = crate::test::utils::create_test_config();
-        let (batcher, sender) = AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
+        let (batcher, writer) = AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
 
-        // Send all records
         for record in records {
-            sender.send(record).await.unwrap();
+            writer.publish(record).await.unwrap();
         }
 
-        // Drop sender to close channel
-        drop(sender);
-
-        // Run batcher until channel is drained
-        let shutdown = CancellationToken::new();
-        batcher.run(shutdown).await;
+        while batcher.project_outbox_batch().await.unwrap() > 0 {}
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
+    async fn tariff_lookups_scope_accounts_without_losing_history_or_unpriced_models(pool: sqlx::PgPool) {
+        let model = create_test_model(&pool, "scoped-history").await;
+        let private_only = create_test_model(&pool, "other-account-only").await;
+        let a = create_test_user(&pool, Role::StandardUser).await.id;
+        let b = create_test_user(&pool, Role::StandardUser).await.id;
+        let other = create_test_user(&pool, Role::StandardUser).await.id;
+        let now = Utc::now();
+        let boundary = now - chrono::Duration::days(1);
+        let historical = now - chrono::Duration::days(2);
+
+        // Both expired and current versions, including bespoke class prices and
+        // an unrelated customer's deals on the same models.
+        for (account, class, cents, read) in [
+            (None, None, 1, 5),
+            (Some(a), None, 2, 4),
+            (Some(a), Some("interactive"), 3, 2),
+            (Some(b), Some("throughput"), 4, 3),
+            (Some(other), Some("interactive"), 9, 9),
+        ] {
+            for (start, end, factor) in [(now - chrono::Duration::days(3), Some(boundary), 1), (boundary, None, 10)] {
+                sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,api_key_purpose,input_price_per_token,output_price_per_token,valid_from,valid_until) VALUES ($1,$2,$3,'history','realtime',$4,$4,$5,$6)")
+                    .bind(model).bind(account).bind(class).bind(Decimal::new(cents * factor, 2)).bind(start).bind(end)
+                    .execute(&pool).await.unwrap();
+                sqlx::query("INSERT INTO model_cache_tariffs (deployed_model_id,user_id,serving_class,write_multiplier_5m,write_multiplier_1h,write_multiplier_24h,read_multiplier,min_prefix_tokens,valid_from,valid_until) VALUES ($1,$2,$3,1.25,2,2.5,$4,1,$5,$6)")
+                    .bind(model).bind(account).bind(class).bind(Decimal::new(read, 1)).bind(start).bind(end)
+                    .execute(&pool).await.unwrap();
+            }
+        }
+        sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,name,api_key_purpose,input_price_per_token,output_price_per_token) VALUES ($1,$2,'private','realtime',1,1)")
+            .bind(private_only).bind(other).execute(&pool).await.unwrap();
+
+        let config = crate::test::utils::create_test_config();
+        let (batcher, _writer) = AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
+        let mut tx = pool.begin().await.unwrap();
+        for (accounts, count) in [(vec![], 2), (vec![a], 6), (vec![a, b], 8)] {
+            let models = batcher
+                .batch_lookup_models_with_tariffs(&mut tx, &["scoped-history", "other-account-only"], &accounts)
+                .await
+                .unwrap();
+            assert_eq!(models["scoped-history"].tariffs.len(), count);
+            assert!(
+                models["scoped-history"]
+                    .tariffs
+                    .iter()
+                    .all(|t| t.account.is_none_or(|id| accounts.contains(&id)))
+            );
+            assert!(
+                models["other-account-only"].tariffs.is_empty(),
+                "LEFT JOIN must retain models with no applicable price"
+            );
+            let cache = batcher
+                .batch_lookup_cache_tariffs(&mut tx, &["scoped-history"], &accounts)
+                .await
+                .unwrap();
+            assert_eq!(cache["scoped-history"].len(), count);
+            assert!(
+                cache["scoped-history"]
+                    .iter()
+                    .all(|t| t.account.is_none_or(|id| accounts.contains(&id)))
+            );
+        }
+
+        // Exercise the real key-owner extraction, including a batch-purpose key,
+        // multiple accounts and an unknown key that must use general prices.
+        // The batch-purpose key needs an explicit price for its SLA, with the
+        // same historical versions so owner extraction is exercised for both.
+        for (start, end, rate) in [
+            (now - chrono::Duration::days(3), Some(boundary), Decimal::new(2, 2)),
+            (boundary, None, Decimal::new(2, 1)),
+        ] {
+            sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,name,api_key_purpose,completion_window,input_price_per_token,output_price_per_token,valid_from,valid_until) VALUES ($1,$2,'batch-history','batch','24h',$3,$3,$4,$5)")
+                .bind(model).bind(a).bind(rate).bind(start).bind(end).execute(&mut *tx).await.unwrap();
+        }
+        let a_key = create_api_key_for_user(&pool, a, ApiKeyPurpose::Realtime).await;
+        let a_batch_key = create_api_key_for_user(&pool, a, ApiKeyPurpose::Batch).await;
+        let b_key = create_api_key_for_user(&pool, b, ApiKeyPurpose::Realtime).await;
+        let cases = [
+            (Some(a_key), "interactive", Some(a), Decimal::new(18, 1)),
+            (Some(a_batch_key), "standard", Some(a), Decimal::new(14, 1)),
+            (Some(b_key), "throughput", Some(b), Decimal::new(26, 1)),
+            (Some(Uuid::new_v4()), "standard", None, Decimal::new(75, 2)),
+            (None, "standard", None, Decimal::new(75, 2)),
+        ];
+        for (timestamp, factor) in [(historical, Decimal::ONE), (now, Decimal::TEN)] {
+            let records: Vec<_> = cases
+                .iter()
+                .map(|(key, class, _, _)| {
+                    let mut record = create_raw_record("scoped-history", *key, 100, 0);
+                    if *key == Some(a_batch_key) {
+                        record.batch_completion_window = Some("24h".to_string());
+                    }
+                    record.batch_created_at = Some(timestamp);
+                    record.resolved_serving_class = Some((*class).to_string());
+                    record.cache_read_input_tokens = 50;
+                    record
+                })
+                .collect();
+            let priced = batcher.enrich_batch(&mut tx, &records).await.unwrap();
+            for (record, (_, _, account, expected)) in priced.iter().zip(cases) {
+                assert_eq!(record.user_id, account);
+                assert_eq!(record.total_cost, Some(expected * factor));
+            }
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    async fn projector_writes_x_request_id(pool: sqlx::PgPool) {
+        create_test_model(&pool, "cor935").await;
+        let config = crate::test::utils::create_test_config();
+        let (batcher, writer) = AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
+        let mut record = create_raw_record("cor935", None, 10, 5);
+        record.x_request_id = Some(Uuid::now_v7());
+        writer.publish(record.clone()).await.unwrap();
+
+        assert_eq!(batcher.project_outbox_batch().await.unwrap(), 1);
+
+        let stored: Option<Uuid> = sqlx::query_scalar("SELECT x_request_id FROM http_analytics")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, record.x_request_id);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn projector_writes_gateway_span_id(pool: sqlx::PgPool) {
+        create_test_model(&pool, "cor678").await;
+        let config = crate::test::utils::create_test_config();
+        let (batcher, writer) = AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
+        let mut record = create_raw_record("cor678", None, 10, 5);
+        record.trace_id = Some("11111111111111111111111111111111".into());
+        record.gateway_span_id = Some("2222222222222222".into());
+        record.requested_serving_class = Some("interactive".into());
+        record.resolved_serving_class = Some("standard".into());
+        writer.publish(record.clone()).await.unwrap();
+
+        assert_eq!(batcher.project_outbox_batch().await.unwrap(), 1);
+
+        let stored: (Option<String>, Option<String>, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT trace_id, gateway_span_id, requested_serving_class, resolved_serving_class FROM http_analytics")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored,
+            (
+                record.trace_id,
+                record.gateway_span_id,
+                record.requested_serving_class,
+                record.resolved_serving_class
+            )
+        );
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_writer_checkpoints_raw_record_before_enrichment(pool: sqlx::PgPool) {
+        let config = crate::test::utils::create_test_config();
+        let (_projector, writer) = AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
+        let api_key_id = Uuid::new_v4();
+        let record = create_raw_record("checkpoint-test", Some(api_key_id), 10, 5);
+        let instance_id = record.instance_id;
+        let correlation_id = record.correlation_id;
+
+        writer.publish(record).await.unwrap();
+
+        let payload: serde_json::Value =
+            sqlx::query_scalar("SELECT payload FROM analytics_outbox WHERE instance_id = $1 AND correlation_id = $2")
+                .bind(instance_id)
+                .bind(correlation_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        assert_eq!(payload["api_key_id"], api_key_id.to_string());
+        assert!(payload.get("user_id").is_none());
+        assert!(payload.get("total_cost").is_none());
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_outbox_observation_reports_backlog(pool: sqlx::PgPool) {
+        assert_eq!(read_outbox_observation(&pool).await.unwrap(), (0, 0.0));
+
+        let mut conn = pool.acquire().await.unwrap();
+        for correlation_id in 0..3i64 {
+            sqlx::query(
+                "INSERT INTO analytics_outbox (instance_id, correlation_id, payload, created_at) \
+                 VALUES ($1, $2, '{}', NOW() - INTERVAL '10 minutes')",
+            )
+            .bind(Uuid::new_v4())
+            .bind(correlation_id)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        }
+        // Live-row counts reach the statistics system when the inserting session goes idle.
+        sqlx::query("SELECT pg_stat_force_next_flush()").execute(&mut *conn).await.unwrap();
+        drop(conn);
+
+        let mut observation = read_outbox_observation(&pool).await.unwrap();
+        for _ in 0..100 {
+            if observation.0 == 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            observation = read_outbox_observation(&pool).await.unwrap();
+        }
+        let (depth, oldest_age_seconds) = observation;
+        assert_eq!(depth, 3);
+        assert!(
+            oldest_age_seconds >= 600.0,
+            "oldest row is ten minutes old, got {oldest_age_seconds}s"
+        );
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_projector_accepts_deployed_and_raw_outbox_payloads(pool: sqlx::PgPool) {
+        let model_id = create_test_model(&pool, "mixed-outbox-payload-test").await;
+        setup_tariff(
+            &pool,
+            model_id,
+            Decimal::from_str("0.00001").unwrap(),
+            Decimal::from_str("0.00003").unwrap(),
+            ApiKeyPurpose::Realtime,
+        )
+        .await;
+        let user_id = setup_user_with_balance(&pool, Decimal::from(10)).await;
+        let api_key_id = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Realtime).await;
+
+        let config = crate::test::utils::create_test_config();
+        let (batcher, writer) = AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
+
+        let deployed_raw = create_raw_record("mixed-outbox-payload-test", Some(api_key_id), 10, 5);
+        let mut tx = pool.begin().await.unwrap();
+        let deployed_enriched = batcher
+            .enrich_batch(&mut tx, std::slice::from_ref(&deployed_raw))
+            .await
+            .unwrap()
+            .remove(0);
+        tx.rollback().await.unwrap();
+
+        // Match the payload emitted by release 11.12.0: EnrichedRecord at the
+        // top level and no api_key_id field inside its nested raw record.
+        let mut deployed_payload = serde_json::to_value(deployed_enriched).unwrap();
+        deployed_payload
+            .get_mut("raw")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .remove("api_key_id");
+        sqlx::query("INSERT INTO analytics_outbox (instance_id, correlation_id, payload) VALUES ($1, $2, $3)")
+            .bind(deployed_raw.instance_id)
+            .bind(deployed_raw.correlation_id)
+            .bind(deployed_payload)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let raw = create_raw_record("mixed-outbox-payload-test", Some(api_key_id), 20, 10);
+        writer.publish(raw).await.unwrap();
+
+        assert_eq!(batcher.project_outbox_batch().await.unwrap(), 2);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM analytics_outbox")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM http_analytics WHERE model = 'mixed-outbox-payload-test'",)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM credits_transactions WHERE transaction_type = 'usage' AND api_key_id = $1",)
+                .bind(api_key_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn test_batcher_credit_deduction_successful(pool: PgPool) {
+    async fn test_batcher_credit_deduction_successful(pool: sqlx::PgPool) {
         // Setup: Create model with tariff
         let model_id = create_test_model(&pool, "gpt-4-test").await;
         let input_price = Decimal::from_str("0.00001").unwrap();
@@ -2769,9 +2582,89 @@ mod integration_tests {
         assert_eq!(usage_tx.unwrap().amount, expected_cost);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
+    async fn credit_metric_names_the_model_that_served_the_request(pool: sqlx::PgPool) {
+        let model_id = create_test_model(&pool, "composite-alias").await;
+        setup_tariff(
+            &pool,
+            model_id,
+            Decimal::from_str("0.00001").unwrap(),
+            Decimal::from_str("0.00003").unwrap(),
+            ApiKeyPurpose::Realtime,
+        )
+        .await;
+        let user_id = setup_user_with_balance(&pool, Decimal::from_str("10.00").unwrap()).await;
+        let api_key = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Realtime).await;
+        let mut record = create_raw_record("composite-alias", Some(api_key), 1000, 500);
+        record.served_by = Some("http://inference.internal:3000/v1".to_string());
+        record.served_model = Some("component-model".to_string());
+
+        // The test macro runs this body on one thread, so a thread-local
+        // recorder sees the deduction.
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        run_batcher_with_records(&pool, vec![record]).await;
+
+        let rendered = handle.render();
+        let line = rendered
+            .lines()
+            .find(|l| l.starts_with("dwctl_credits_deducted_nanocredits_total{"))
+            .expect("the deduction is counted");
+        assert!(line.contains(r#"model="composite-alias""#), "{line}");
+        assert!(line.contains(r#"served_by="inference.internal""#), "{line}");
+        assert!(line.contains(r#"served_model="component-model""#), "{line}");
+        // (1000 * 0.00001) + (500 * 0.00003) = 0.025 credits.
+        assert!(line.ends_with(" 25000000"), "{line}");
+    }
+
+    #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn test_batcher_cache_discount_applied(pool: PgPool) {
+    async fn failed_response_is_analytic_but_not_billed(pool: sqlx::PgPool) {
+        let model_id = create_test_model(&pool, "failed-response-test").await;
+        setup_tariff(
+            &pool,
+            model_id,
+            Decimal::from_str("0.00001").unwrap(),
+            Decimal::from_str("0.00003").unwrap(),
+            ApiKeyPurpose::Realtime,
+        )
+        .await;
+
+        let initial_balance = Decimal::from_str("10.00").unwrap();
+        let user_id = setup_user_with_balance(&pool, initial_balance).await;
+        let api_key = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Realtime).await;
+        let mut record = create_raw_record("failed-response-test", Some(api_key), 1000, 500);
+        record.status_code = 502;
+        run_batcher_with_records(&pool, vec![record]).await;
+
+        let (analytics_status, total_cost): (i32, Option<Decimal>) =
+            sqlx::query_as("SELECT status_code, total_cost FROM http_analytics WHERE model = 'failed-response-test'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(analytics_status, 502);
+        assert_eq!(total_cost, None);
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+        assert_eq!(credits.get_user_balance(user_id).await.unwrap(), initial_balance);
+        let transactions = credits
+            .list_user_transactions(user_id, 0, 10, &TransactionFilters::default())
+            .await
+            .unwrap();
+        assert!(transactions.iter().all(|tx| tx.transaction_type != CreditTransactionType::Usage));
+
+        let outbox_depth: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM analytics_outbox")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(outbox_depth, 0, "projection must delete the durable row after committing analytics");
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_batcher_cache_discount_applied(pool: sqlx::PgPool) {
         // Model with a base tariff + a cache tariff (presence = enabled): 1h write ×2.0,
         // read ×0.1. The other tiers are set but unused by this request.
         let model_id = create_test_model(&pool, "cache-bill-test").await;
@@ -2787,6 +2680,14 @@ mod integration_tests {
         .execute(&pool)
         .await
         .unwrap();
+
+        // Host-clock capture timestamps must fall inside the tariff's validity window.
+        sqlx::query("UPDATE model_cache_tariffs SET valid_from=$1 WHERE deployed_model_id=$2")
+            .bind(Utc::now() - chrono::Duration::minutes(1))
+            .bind(model_id)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let initial_balance = Decimal::from_str("10.00").unwrap();
         let user_id = setup_user_with_balance(&pool, initial_balance).await;
@@ -2831,9 +2732,9 @@ mod integration_tests {
         assert_eq!(row.uncached_cost.unwrap(), expected_list, "uncached_cost = list price");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn test_batcher_different_tariffs_for_batch_and_realtime(pool: PgPool) {
+    async fn test_batcher_different_tariffs_for_batch_and_realtime(pool: sqlx::PgPool) {
         // Setup: Create model with different tariffs for batch and realtime
         let model_id = create_test_model(&pool, "gpt-4-turbo-test").await;
 
@@ -2902,9 +2803,9 @@ mod integration_tests {
         assert!(amounts.contains(&expected_realtime_cost), "Should have realtime cost transaction");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn test_batcher_folds_batch_analytics_into_aggregates(pool: PgPool) {
+    async fn test_batcher_folds_batch_analytics_into_aggregates(pool: sqlx::PgPool) {
         // Three requests of one batch fold their tokens / latency / list-cost into
         // batch_aggregates (COR-524), so get_batch_analytics can read the row instead of
         // scanning http_analytics. The third is on an UNPRICED model (free): it is not billed
@@ -2985,9 +2886,9 @@ mod integration_tests {
         assert!(agg.analytics_backfilled_at.is_none(), "live fold leaves the backfill marker null");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn test_batcher_denormalizes_fusillade_request_id_onto_credits(pool: PgPool) {
+    async fn test_batcher_denormalizes_fusillade_request_id_onto_credits(pool: sqlx::PgPool) {
         // A batched request's credit row carries its fusillade_request_id (migration 120), so the
         // responses view can read per-request cost off the ledger durably instead of joining
         // http_analytics (COR-524 follow-up / Usage E).
@@ -3024,9 +2925,340 @@ mod integration_tests {
         assert_eq!(row.amount, Decimal::from_str("0.10").unwrap(), "1000*5e-5 + 500*1e-4");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn test_batcher_fallback_to_realtime_when_batch_tariff_missing(pool: PgPool) {
+    async fn test_fusillade_success_index_gates_billing_and_aggregation(pool: sqlx::PgPool) {
+        let model_id = create_test_model(&pool, "fusillade-billing-idempotency").await;
+        setup_tariff(
+            &pool,
+            model_id,
+            Decimal::from_str("0.00005").unwrap(),
+            Decimal::from_str("0.00010").unwrap(),
+            ApiKeyPurpose::Batch,
+        )
+        .await;
+        let user_id = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
+        let batch_key = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Batch).await;
+        let batch_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+
+        // Failed attempts remain observable, but must not become the canonical
+        // usage row or prevent a later success from being billed.
+        let mut failed = create_raw_record("fusillade-billing-idempotency", Some(batch_key.clone()), 1000, 500);
+        failed.status_code = 500;
+        failed.batch_completion_window = Some("24h".to_string());
+        failed.fusillade_batch_id = Some(batch_id);
+        failed.fusillade_request_id = Some(request_id);
+
+        let mut first = create_raw_record("fusillade-billing-idempotency", Some(batch_key.clone()), 1000, 500);
+        first.batch_completion_window = Some("24h".to_string());
+        first.fusillade_batch_id = Some(batch_id);
+        first.fusillade_request_id = Some(request_id);
+        first.trace_id = Some("11111111111111111111111111111111".into());
+        first.gateway_span_id = Some("2222222222222222".into());
+        let expected_anchor = (first.trace_id.clone(), first.gateway_span_id.clone());
+
+        // A second successful physical attempt has a different gateway
+        // identity but the same logical Fusillade request identity.
+        let mut duplicate = create_raw_record("fusillade-billing-idempotency", Some(batch_key), 1000, 500);
+        duplicate.batch_completion_window = Some("24h".to_string());
+        duplicate.fusillade_batch_id = Some(batch_id);
+        duplicate.fusillade_request_id = Some(request_id);
+        duplicate.trace_id = Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into());
+        duplicate.gateway_span_id = Some("bbbbbbbbbbbbbbbb".into());
+
+        run_batcher_with_records(&pool, vec![failed]).await;
+        run_batcher_with_records(&pool, vec![first, duplicate]).await;
+
+        let anchor: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT trace_id, gateway_span_id FROM http_analytics WHERE fusillade_request_id=$1 AND status_code BETWEEN 200 AND 299",
+        )
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(anchor, expected_anchor, "the retained success keeps its own context");
+
+        let analytics_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM http_analytics WHERE fusillade_request_id = $1")
+            .bind(request_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let charge_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM credits_transactions \
+             WHERE fusillade_request_id = $1 AND transaction_type = 'usage'",
+        )
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let successful_analytics_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM http_analytics \
+             WHERE fusillade_request_id = $1 AND status_code BETWEEN 200 AND 299",
+        )
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(analytics_count, 2, "the failed attempt and one canonical success remain observable");
+        assert_eq!(successful_analytics_count, 1, "only one success may contribute usage");
+        assert_eq!(charge_count, 1, "one Fusillade request must produce one debit");
+        let aggregate = sqlx::query!(
+            "SELECT total_requests, total_prompt_tokens, total_completion_tokens, total_amount \
+             FROM batch_aggregates WHERE fusillade_batch_id = $1",
+            batch_id,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            aggregate.total_requests, 1,
+            "customer-visible usage must count the logical request once"
+        );
+        assert_eq!(aggregate.total_prompt_tokens, 1000);
+        assert_eq!(aggregate.total_completion_tokens, 500);
+        assert_eq!(aggregate.total_amount, Decimal::from_str("0.10").unwrap());
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_batchless_flex_success_index_gates_billing(pool: sqlx::PgPool) {
+        let model_id = create_test_model(&pool, "flex-billing-idempotency").await;
+        setup_tariff_with_window(
+            &pool,
+            model_id,
+            Decimal::from_str("0.00005").unwrap(),
+            Decimal::from_str("0.00010").unwrap(),
+            ApiKeyPurpose::Batch,
+            Some("1h"),
+        )
+        .await;
+        let user_id = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
+        let batch_key = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Batch).await;
+        let request_id = Uuid::new_v4();
+
+        let mut first = create_raw_record("flex-billing-idempotency", Some(batch_key.clone()), 1000, 500);
+        first.batch_completion_window = Some("1h".to_string());
+        first.fusillade_request_id = Some(request_id);
+
+        let mut duplicate = create_raw_record("flex-billing-idempotency", Some(batch_key), 1000, 500);
+        duplicate.batch_completion_window = Some("1h".to_string());
+        duplicate.fusillade_request_id = Some(request_id);
+
+        run_batcher_with_records(&pool, vec![first, duplicate]).await;
+
+        let analytics_rows = sqlx::query!(
+            "SELECT request_origin FROM http_analytics \
+             WHERE fusillade_request_id = $1 AND status_code BETWEEN 200 AND 299",
+            request_id,
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let charges: Vec<Decimal> = sqlx::query_scalar(
+            "SELECT amount FROM credits_transactions \
+             WHERE fusillade_request_id = $1 AND transaction_type = 'usage'",
+        )
+        .bind(request_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(analytics_rows.len(), 1, "batchless flex must retain one canonical success");
+        assert_eq!(analytics_rows[0].request_origin, "fusillade");
+        assert_eq!(
+            charges,
+            vec![Decimal::from_str("0.10").unwrap()],
+            "batchless flex must produce exactly one correctly priced debit"
+        );
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_legacy_fusillade_duplicates_remain_reconcilable_during_rollout(pool: sqlx::PgPool) {
+        let user_id = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
+        let batch_key_id = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Batch).await;
+        let batch_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+
+        // A pre-change binary supplies fusillade_request_id but uses a
+        // per-attempt analytics source_id. Both writes remain visible during
+        // the rollout window so the separate reconciliation can find them.
+        let insert_legacy = |source_id: &'static str| {
+            sqlx::query(
+                r#"
+                INSERT INTO credits_transactions (
+                    user_id, transaction_type, amount, source_id, description,
+                    fusillade_batch_id, api_key_id, service_tier, fusillade_request_id
+                )
+                VALUES ($1, 'usage', $2, $3, 'legacy Fusillade usage', $4, $5, 'batch', $6)
+                ON CONFLICT (source_id) DO NOTHING
+                "#,
+            )
+            .bind(user_id)
+            .bind(Decimal::from_str("0.10").unwrap())
+            .bind(source_id)
+            .bind(batch_id)
+            .bind(batch_key_id)
+            .bind(request_id)
+            .execute(&pool)
+        };
+
+        let (first, second) = tokio::join!(insert_legacy("legacy-attempt-a"), insert_legacy("legacy-attempt-b"));
+        first.unwrap();
+        second.unwrap();
+
+        let rows = sqlx::query!(
+            "SELECT source_id, fusillade_request_id \
+             FROM credits_transactions WHERE fusillade_request_id = $1",
+            request_id,
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2, "rollout-window duplicates must remain available for reconciliation");
+        assert!(rows.iter().all(|row| row.fusillade_request_id == Some(request_id)));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_shared_fusillade_id_does_not_suppress_realtime_billing(pool: sqlx::PgPool) {
+        let model_id = create_test_model(&pool, "spoofed-fusillade-id").await;
+        setup_tariff(
+            &pool,
+            model_id,
+            Decimal::from_str("0.00005").unwrap(),
+            Decimal::from_str("0.00010").unwrap(),
+            ApiKeyPurpose::Realtime,
+        )
+        .await;
+        let first_user = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
+        let second_user = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
+        let first_key = create_api_key_for_user(&pool, first_user, ApiKeyPurpose::Realtime).await;
+        let second_key = create_api_key_for_user(&pool, second_user, ApiKeyPurpose::Realtime).await;
+        let spoofed_request_id = Uuid::new_v4();
+
+        let mut first = create_raw_record("spoofed-fusillade-id", Some(first_key), 1000, 500);
+        first.fusillade_request_id = Some(spoofed_request_id);
+        let mut second = create_raw_record("spoofed-fusillade-id", Some(second_key), 1000, 500);
+        second.fusillade_request_id = Some(spoofed_request_id);
+
+        run_batcher_with_records(&pool, vec![first, second]).await;
+
+        let rows = sqlx::query!(
+            "SELECT user_id, fusillade_request_id FROM credits_transactions \
+             WHERE user_id = ANY($1) AND transaction_type = 'usage'",
+            &[first_user, second_user],
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2, "an untrusted request-id header must not deduplicate billing");
+        assert!(
+            rows.iter().all(|row| row.fusillade_request_id == Some(spoofed_request_id)),
+            "the shared realtime correlation id is retained without suppressing either charge"
+        );
+    }
+
+    #[dwctl_test_macros::test]
+    async fn playground_customer_fallback_matches_quotes_and_actual_charges(pool: sqlx::PgPool) {
+        use crate::db::handlers::Tariffs;
+        for (alias, class, rate, org_playground) in [
+            ("playground-org", None, 5, false),
+            ("playground-class", Some("interactive"), 2, true),
+            ("playground-free", None, 0, false),
+        ] {
+            let model = create_test_model(&pool, alias).await;
+            setup_tariff(&pool, model, Decimal::new(20, 6), Decimal::new(40, 6), ApiKeyPurpose::Playground).await;
+            let account = setup_user_with_balance(&pool, Decimal::from(100)).await;
+            let input = Decimal::new(rate, 6);
+            let output = input * Decimal::from(2);
+            sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,api_key_purpose,input_price_per_token,output_price_per_token,valid_from) VALUES ($1,$2,$3,'customer','realtime',$4,$5,NOW()-INTERVAL '1 hour')")
+                .bind(model).bind(account).bind(class).bind(input).bind(output).execute(&pool).await.unwrap();
+            if org_playground {
+                sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,name,api_key_purpose,input_price_per_token,output_price_per_token,valid_from) VALUES ($1,$2,'org-playground','playground',0.000009,0.000018,NOW()-INTERVAL '1 hour')")
+                    .bind(model).bind(account).execute(&pool).await.unwrap();
+            }
+            let key = create_api_key_for_user(&pool, account, ApiKeyPurpose::Playground).await;
+            let mut record = create_raw_record(alias, Some(key), 1000, 500);
+            record.resolved_serving_class = Some("interactive".to_string());
+            run_batcher_with_records(&pool, vec![record]).await;
+            let expected = input * Decimal::from(1000) + output * Decimal::from(500);
+            let mut conn = pool.acquire().await.unwrap();
+            assert_eq!(
+                Credits::new(&mut conn).get_user_balance(account).await.unwrap(),
+                Decimal::from(100) - expected,
+                "{alias}"
+            );
+            let cost: Option<Decimal> = sqlx::query_scalar("SELECT total_cost FROM http_analytics WHERE api_key_id=$1")
+                .bind(key)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(cost, Some(expected), "zero is a price, not unresolved: {alias}");
+            let mut repo = Tariffs::new(&mut conn);
+            assert_eq!(
+                repo.get_effective_pricing_at_timestamp(model, Some(account), "playground", None, Some("interactive"), Utc::now())
+                    .await
+                    .unwrap(),
+                Some((input, output))
+            );
+            let quotes = repo.list_effective_for_account(&[model], account).await.unwrap();
+            assert!(
+                quotes.iter().all(|q| q.user_id == Some(account)),
+                "general playground must not bypass an account deal"
+            );
+            assert!(quotes.iter().all(|q| q.serving_class.is_none()));
+            if class.is_none() {
+                assert!(
+                    quotes
+                        .iter()
+                        .any(|q| q.api_key_purpose == Some(ApiKeyPurpose::Realtime) && q.input_price_per_token == input)
+                );
+            } else {
+                assert!(
+                    quotes.iter().all(|q| q.input_price_per_token != input),
+                    "class billing is intentionally absent from catalogue quotes"
+                );
+            }
+            let paid: bool = sqlx::query_scalar("SELECT model_has_effective_paid_tariff($1,$2,'playground')")
+                .bind(model)
+                .bind(account)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(
+                paid,
+                rate > 0,
+                "price helper must respect a zero all-class customer fallback: {alias}"
+            );
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    async fn realtime_org_deal_leaves_batch_charges_at_the_model_batch_price(pool: sqlx::PgPool) {
+        let model = create_test_model(&pool, "purpose-isolation").await;
+        setup_tariff(&pool, model, Decimal::new(10, 6), Decimal::new(20, 6), ApiKeyPurpose::Realtime).await;
+        setup_tariff(&pool, model, Decimal::new(1, 6), Decimal::new(2, 6), ApiKeyPurpose::Batch).await;
+        let account = setup_user_with_balance(&pool, Decimal::from(100)).await;
+        sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,name,api_key_purpose,input_price_per_token,output_price_per_token) VALUES ($1,$2,'deal','realtime',0.000005,0.000010)").bind(model).bind(account).execute(&pool).await.unwrap();
+        let key = create_api_key_for_user(&pool, account, ApiKeyPurpose::Batch).await;
+        let mut record = create_raw_record("purpose-isolation", Some(key), 1000, 500);
+        record.batch_completion_window = Some("24h".to_string());
+        run_batcher_with_records(&pool, vec![record]).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let balance = Credits::new(&mut conn).get_user_balance(account).await.unwrap();
+        assert_eq!(
+            balance,
+            Decimal::from(100) - Decimal::new(2, 3),
+            "charge the model's 24h batch rate, not the customer's realtime rate"
+        );
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_batcher_charges_realtime_when_all_batch_scopes_are_missing(pool: sqlx::PgPool) {
         // Setup: Create model with ONLY realtime tariff
         let model_id = create_test_model(&pool, "gpt-4-fallback-test").await;
         let realtime_input = Decimal::from_str("0.00015").unwrap();
@@ -3043,24 +3275,23 @@ mod integration_tests {
         // Run batcher
         run_batcher_with_records(&pool, vec![record]).await;
 
-        // Expected: Should fall back to realtime pricing
-        // Cost: (1000 * 0.00015) + (500 * 0.00030) = 0.15 + 0.15 = 0.30
-        let expected_cost = Decimal::from_str("0.30").unwrap();
-
-        // Verify
         let mut conn = pool.acquire().await.unwrap();
         let mut credits = Credits::new(&mut conn);
-        let final_balance = credits.get_user_balance(user_id).await.unwrap();
-        let expected_balance = Decimal::from_str("100.00").unwrap() - expected_cost;
         assert_eq!(
-            final_balance, expected_balance,
-            "Batch request should fall back to realtime pricing"
+            credits.get_user_balance(user_id).await.unwrap(),
+            Decimal::from(100) - Decimal::new(3, 1),
+            "Missing batch pricing uses the final realtime safety net"
         );
+        let cost: Option<Decimal> = sqlx::query_scalar("SELECT total_cost FROM http_analytics WHERE model='gpt-4-fallback-test'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(cost, Some(Decimal::new(3, 1)), "analytics and balance use the same fallback charge");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn test_batcher_skip_deduction_when_no_pricing(pool: PgPool) {
+    async fn test_batcher_skip_deduction_when_no_pricing(pool: sqlx::PgPool) {
         // Setup: Create model WITHOUT any tariff
         let _model_id = create_test_model(&pool, "gpt-4-no-tariff").await;
 
@@ -3101,9 +3332,9 @@ mod integration_tests {
     /// forwarding the key on claim, emitting the header, reading it back off the request —
     /// is worth nothing if the column ends up empty, and this is the column every dashboard
     /// reads.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn batcher_persists_the_user_agent_to_http_analytics(pool: PgPool) {
+    async fn batcher_persists_the_user_agent_to_http_analytics(pool: sqlx::PgPool) {
         create_test_model(&pool, "ua-persist-test").await;
 
         let mut record = create_raw_record("ua-persist-test", None, 10, 5);
@@ -3117,9 +3348,122 @@ mod integration_tests {
         assert_eq!(stored.as_deref(), Some("claude-cli/1.2.3"));
     }
 
-    #[sqlx::test]
+    /// The same last hop for `submitted_at`. The value already reached this struct — it
+    /// has been read for batch-creation pricing for as long as the header has existed —
+    /// so the only thing that can break is the write, and a dropped bind would leave the
+    /// column silently NULL on every row.
+    ///
+    /// Worth testing rather than assuming, because NULL here does not necessarily stay
+    /// NULL for downstream consumers — a missing value can surface as the Unix epoch, and
+    /// any duration computed from it then reads as decades of queue delay.
+    #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn test_batcher_skip_deduction_for_unauthenticated_requests(pool: PgPool) {
+    async fn batcher_persists_the_submitted_at_to_http_analytics(pool: sqlx::PgPool) {
+        create_test_model(&pool, "submitted-at-test").await;
+
+        let submitted = Utc::now() - chrono::Duration::minutes(90);
+        let mut record = create_raw_record("submitted-at-test", None, 10, 5);
+        record.batch_created_at = Some(submitted);
+        run_batcher_with_records(&pool, vec![record]).await;
+
+        let stored: Option<DateTime<Utc>> = sqlx::query_scalar("SELECT submitted_at FROM http_analytics WHERE model = 'submitted-at-test'")
+            .fetch_one(&pool)
+            .await
+            .expect("the analytics row should exist");
+
+        let stored = stored.expect("submitted_at should be persisted, not NULL");
+        assert!(
+            (stored - submitted).num_seconds().abs() < 1,
+            "expected {submitted}, stored {stored}"
+        );
+    }
+
+    #[test]
+    fn implicit_reads_clamp_the_read_multiplier_to_list_price() {
+        let mults = CacheMultipliers {
+            read: Decimal::new(15, 1), // 1.5 — misconfigured surcharge
+            write_5m: Decimal::new(125, 2),
+            write_1h: Decimal::TWO,
+            write_24h: Decimal::new(25, 1),
+        };
+        // Engine-sourced read: clamped to 1 (never above list price).
+        let clamped = clamp_implicit_read_multiplier(Some(mults), Some("engine")).unwrap();
+        assert_eq!(clamped.read, Decimal::ONE);
+        assert_eq!(clamped.write_1h, Decimal::TWO, "write premiums untouched");
+        // Module-sourced (explicit) read: configured multiplier stands.
+        assert_eq!(
+            clamp_implicit_read_multiplier(Some(mults), Some("module")).unwrap().read,
+            Decimal::new(15, 1)
+        );
+        // Sane multipliers pass through unchanged for both sources.
+        let sane = CacheMultipliers {
+            read: Decimal::new(1, 1),
+            ..mults
+        };
+        assert_eq!(
+            clamp_implicit_read_multiplier(Some(sane), Some("engine")).unwrap().read,
+            Decimal::new(1, 1)
+        );
+        assert!(clamp_implicit_read_multiplier(None, Some("engine")).is_none());
+    }
+
+    /// The same last hop for `cache_read_source`: the value rides the `CacheBilling`
+    /// extension into this struct upstream, so the only thing that can break is the
+    /// write — a dropped bind or a misordered UNNEST array would leave the column
+    /// silently NULL (or misaligned) on every row.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn batcher_persists_the_cache_read_source_to_http_analytics(pool: sqlx::PgPool) {
+        create_test_model(&pool, "cache-source-test").await;
+
+        let mut record = create_raw_record("cache-source-test", None, 10, 5);
+        record.cache_read_source = Some("engine".to_string());
+        run_batcher_with_records(&pool, vec![record.clone()]).await;
+
+        let stored: Option<String> = sqlx::query_scalar("SELECT cache_read_source FROM http_analytics WHERE model = 'cache-source-test'")
+            .fetch_one(&pool)
+            .await
+            .expect("the analytics row should exist");
+        assert_eq!(stored.as_deref(), Some("engine"));
+
+        // A second receipt for the same physical attempt is ignored. Analytics
+        // records are complete when enqueued, so a replay must not rewrite the
+        // canonical row or repeat any downstream usage effects.
+        record.cache_read_source = Some("module".to_string());
+        run_batcher_with_records(&pool, vec![record]).await;
+        let rows: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT cache_read_source FROM http_analytics WHERE model = 'cache-source-test'")
+                .fetch_all(&pool)
+                .await
+                .expect("query should succeed");
+        assert_eq!(rows.len(), 1, "the duplicate receipt must not create another row");
+        assert_eq!(rows[0].as_deref(), Some("engine"), "the first complete receipt remains canonical");
+    }
+
+    /// Realtime work is not submitted ahead of time, so there is no distinct submission
+    /// moment and the column must stay NULL rather than being backfilled from `timestamp`.
+    /// Writing one would invent a zero-length queue for a request that never queued, and
+    /// "no submitted_at" is how a consumer tells deferred work from immediate.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn realtime_rows_have_no_submitted_at(pool: sqlx::PgPool) {
+        create_test_model(&pool, "realtime-no-submit").await;
+
+        let record = create_raw_record("realtime-no-submit", None, 10, 5);
+        assert!(record.batch_created_at.is_none(), "fixture should be realtime");
+        run_batcher_with_records(&pool, vec![record]).await;
+
+        let stored: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT submitted_at FROM http_analytics WHERE model = 'realtime-no-submit'")
+                .fetch_one(&pool)
+                .await
+                .expect("the analytics row should exist");
+        assert!(stored.is_none(), "realtime should leave submitted_at NULL, got {stored:?}");
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_batcher_skip_deduction_for_unauthenticated_requests(pool: sqlx::PgPool) {
         // Setup: Create model with tariff
         let model_id = create_test_model(&pool, "gpt-4-unauth-test").await;
         setup_tariff(
@@ -3153,9 +3497,9 @@ mod integration_tests {
     }
 
     /// Test that the batcher sends pg_notify when a user's balance is depleted (crosses zero downward)
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn test_batcher_balance_depleted_notification(pool: PgPool) {
+    async fn test_batcher_balance_depleted_notification(pool: sqlx::PgPool) {
         use sqlx::postgres::PgListener;
         use std::time::Duration;
         use tokio::time::timeout;
@@ -3231,13 +3575,71 @@ mod integration_tests {
         }
     }
 
+    #[dwctl_test_macros::test]
+    async fn organization_class_charges_fold_into_the_owning_keys_cap(pool: sqlx::PgPool) {
+        use crate::db::handlers::api_keys::ApiKeys;
+        let model = create_test_model(&pool, "org-class-cap").await;
+        setup_tariff(&pool, model, Decimal::new(10, 6), Decimal::new(20, 6), ApiKeyPurpose::Realtime).await;
+        setup_tariff(&pool, model, Decimal::new(1, 6), Decimal::new(2, 6), ApiKeyPurpose::Batch).await;
+        let account = setup_user_with_balance(&pool, Decimal::from(100)).await;
+        sqlx::query("UPDATE users SET user_type='organization' WHERE id=$1")
+            .bind(account)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let creator = setup_user_with_balance(&pool, Decimal::from(100)).await;
+        let parent = create_api_key_for_user(&pool, account, ApiKeyPurpose::Realtime).await;
+        sqlx::query("UPDATE api_keys SET created_by=$2,spend_limit=0.02 WHERE id=$1")
+            .bind(parent)
+            .bind(creator)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Capture timestamps use the host clock; PostgreSQL may run in a VM.
+        let valid_from = Utc::now() - chrono::Duration::minutes(1);
+        for (class, price) in [(None, Decimal::new(2, 6)), (Some("interactive"), Decimal::new(9, 6))] {
+            sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,input_price_per_token,output_price_per_token,api_key_purpose,valid_from) VALUES ($1,$2,$3,'org-price',$4,$4,'realtime',$5)").bind(model).bind(account).bind(class).bind(price).bind(valid_from).execute(&pool).await.unwrap();
+        }
+        let child = {
+            let mut conn = pool.acquire().await.unwrap();
+            ApiKeys::new(&mut conn).get_or_create_child_hidden_key(parent).await.unwrap().1
+        };
+        let mut realtime = create_raw_record("org-class-cap", Some(parent), 1000, 500);
+        realtime.resolved_serving_class = Some("interactive".into());
+        let mut batch = create_raw_record("org-class-cap", Some(child), 1000, 500);
+        batch.batch_completion_window = Some("24h".into());
+        batch.resolved_serving_class = Some("standard".into());
+        run_batcher_with_records(&pool, vec![realtime, batch]).await;
+        // Class realtime: .0135; model batch: .002. Display's all-class .003
+        // realtime amount must never be substituted in billing or cap accounting.
+        let expected = Decimal::new(155, 4);
+        let mut conn = pool.acquire().await.unwrap();
+        assert_eq!(
+            Credits::new(&mut conn).get_user_balance(account).await.unwrap(),
+            Decimal::from(100) - expected
+        );
+        assert_eq!(Credits::new(&mut conn).get_user_balance(creator).await.unwrap(), Decimal::from(100));
+        let rows: Vec<(Uuid, Decimal, Decimal)> =
+            sqlx::query_as("SELECT api_key_id,total_spend,window_spend FROM api_key_spend_checkpoints")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, vec![(parent, expected, expected)]);
+        let billed_accounts: Vec<Uuid> =
+            sqlx::query_scalar("SELECT DISTINCT user_id FROM credits_transactions WHERE transaction_type='usage'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(billed_accounts, vec![account]);
+    }
+
     /// Mixed flush across a cap scope: the parent's realtime row and the
     /// child's batch row fold into ONE checkpoint row keyed by the scope root,
     /// uncapped keys produce no row, the crossing NOTIFY fires exactly once
     /// (edge-triggered), and further over-cap flushes fold silently.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn test_batcher_folds_cap_scope_and_notifies_on_crossing(pool: PgPool) {
+    async fn test_batcher_folds_cap_scope_and_notifies_on_crossing(pool: sqlx::PgPool) {
         use crate::db::handlers::api_keys::ApiKeys;
         use sqlx::postgres::PgListener;
         use std::time::Duration;
@@ -3251,24 +3653,19 @@ mod integration_tests {
 
         // Wealthy user so no balance crossing interferes with the assertions.
         let user_id = setup_user_with_balance(&pool, Decimal::from_str("100").unwrap()).await;
-        let parent_secret = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Realtime).await;
-        let uncapped_secret = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Realtime).await;
+        let parent_id = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Realtime).await;
+        let uncapped_id = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Realtime).await;
 
         // Cap the parent at $0.04 (each request below costs $0.025) and mint its child.
-        sqlx::query("UPDATE api_keys SET spend_limit = 0.04 WHERE secret = $1")
-            .bind(&parent_secret)
+        sqlx::query("UPDATE api_keys SET spend_limit = 0.04 WHERE id = $1")
+            .bind(parent_id)
             .execute(&pool)
             .await
             .unwrap();
-        let parent_id: Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE secret = $1")
-            .bind(&parent_secret)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        let child_secret = {
+        let child_id = {
             let mut conn = pool.acquire().await.unwrap();
-            let (secret, _) = ApiKeys::new(&mut conn).get_or_create_child_hidden_key(parent_id).await.unwrap();
-            secret
+            let (_, id) = ApiKeys::new(&mut conn).get_or_create_child_hidden_key(parent_id).await.unwrap();
+            id
         };
 
         let mut listener = PgListener::connect_with(&pool).await.expect("Failed to create listener");
@@ -3277,12 +3674,12 @@ mod integration_tests {
 
         // Parent realtime + child batch + uncapped key, one flush. Each row
         // costs $0.025; the scope total 0.05 crosses the 0.04 cap.
-        let mut child_record = create_raw_record("gpt-4-cap-fold-test", Some(child_secret), 1000, 500);
+        let mut child_record = create_raw_record("gpt-4-cap-fold-test", Some(child_id), 1000, 500);
         child_record.batch_completion_window = Some("24h".to_string());
         let records = vec![
-            create_raw_record("gpt-4-cap-fold-test", Some(parent_secret.clone()), 1000, 500),
+            create_raw_record("gpt-4-cap-fold-test", Some(parent_id), 1000, 500),
             child_record,
-            create_raw_record("gpt-4-cap-fold-test", Some(uncapped_secret), 1000, 500),
+            create_raw_record("gpt-4-cap-fold-test", Some(uncapped_id), 1000, 500),
         ];
         run_batcher_with_records(&pool, records).await;
 
@@ -3307,11 +3704,7 @@ mod integration_tests {
         assert_eq!(rows[0].window_spend, Decimal::from_str("0.05").unwrap());
 
         // Edge-trigger: a further over-cap flush folds but does not re-notify.
-        run_batcher_with_records(
-            &pool,
-            vec![create_raw_record("gpt-4-cap-fold-test", Some(parent_secret), 1000, 500)],
-        )
-        .await;
+        run_batcher_with_records(&pool, vec![create_raw_record("gpt-4-cap-fold-test", Some(parent_id), 1000, 500)]).await;
         assert_no_cap_notification(&mut listener).await;
         let window_spend: Decimal = sqlx::query_scalar!(
             r#"SELECT window_spend AS "window_spend!" FROM api_key_spend_checkpoints WHERE api_key_id = $1"#,
@@ -3327,9 +3720,9 @@ mod integration_tests {
     /// REPLACES window_spend instead of accumulating, advances
     /// window_started_at, keeps total_spend monotonic, and does not fire a
     /// crossing NOTIFY when the fresh window is under the cap.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn test_batcher_cap_window_rollover(pool: PgPool) {
+    async fn test_batcher_cap_window_rollover(pool: sqlx::PgPool) {
         use sqlx::postgres::PgListener;
         use std::time::Duration;
         use tokio::time::timeout;
@@ -3344,16 +3737,11 @@ mod integration_tests {
         )
         .await;
         let user_id = setup_user_with_balance(&pool, Decimal::from_str("100").unwrap()).await;
-        let secret = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Realtime).await;
+        let key_id = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Realtime).await;
 
-        sqlx::query("UPDATE api_keys SET spend_limit = 10, spend_limit_interval = 'daily' WHERE secret = $1")
-            .bind(&secret)
+        sqlx::query("UPDATE api_keys SET spend_limit = 10, spend_limit_interval = 'daily' WHERE id = $1")
+            .bind(key_id)
             .execute(&pool)
-            .await
-            .unwrap();
-        let key_id: Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE secret = $1")
-            .bind(&secret)
-            .fetch_one(&pool)
             .await
             .unwrap();
 
@@ -3371,7 +3759,7 @@ mod integration_tests {
         listener.listen(ONWARDS_CONFIG_CHANGED_CHANNEL).await.expect("Failed to listen");
         while timeout(Duration::from_millis(10), listener.try_recv()).await.is_ok() {}
 
-        run_batcher_with_records(&pool, vec![create_raw_record("gpt-4-cap-rollover-test", Some(secret), 1000, 500)]).await;
+        run_batcher_with_records(&pool, vec![create_raw_record("gpt-4-cap-rollover-test", Some(key_id), 1000, 500)]).await;
 
         let row = sqlx::query!(
             r#"SELECT total_spend AS "total_spend!", window_spend AS "window_spend!",
@@ -3401,9 +3789,9 @@ mod integration_tests {
         assert_no_cap_notification(&mut listener).await;
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn test_flush_emits_single_notification_for_multiple_depletions(pool: PgPool) {
+    async fn test_flush_emits_single_notification_for_multiple_depletions(pool: sqlx::PgPool) {
         use sqlx::postgres::PgListener;
         use std::time::Duration;
         use tokio::time::timeout;

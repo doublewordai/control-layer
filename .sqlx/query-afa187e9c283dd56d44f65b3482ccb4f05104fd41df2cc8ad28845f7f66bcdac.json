@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO http_analytics (instance_id, correlation_id, timestamp, method, uri, model,\n                status_code, user_id, prompt_tokens, completion_tokens, total_cost)\n             VALUES ($1,1,NOW(),'POST','/chat/completions','m',200,$2,10,5,0.0001)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "afa187e9c283dd56d44f65b3482ccb4f05104fd41df2cc8ad28845f7f66bcdac"
+}

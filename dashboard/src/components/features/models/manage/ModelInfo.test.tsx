@@ -45,11 +45,11 @@ vi.mock("../../../modals", () => ({
 }));
 
 vi.mock("../../../ui/card", () => ({
-  Card: ({ children }: { children: ReactNode }) => <section>{children}</section>,
-  CardContent: ({ children }: { children: ReactNode }) => <div>{children}</div>,
-  CardDescription: ({ children }: { children: ReactNode }) => (
-    <p>{children}</p>
+  Card: ({ children }: { children: ReactNode }) => (
+    <section>{children}</section>
   ),
+  CardContent: ({ children }: { children: ReactNode }) => <div>{children}</div>,
+  CardDescription: ({ children }: { children: ReactNode }) => <p>{children}</p>,
   CardHeader: ({ children }: { children: ReactNode }) => (
     <header>{children}</header>
   ),
@@ -143,4 +143,120 @@ describe("ModelInfo", () => {
     const request = updateModel.mock.calls[0][0];
     expect(request.data).not.toHaveProperty("reasoning_translation_overrides");
   });
+
+  it("asks for a limit instead of saving when the in-flight limit is cleared", async () => {
+    vi.mocked(useModel).mockReturnValue({
+      data: { ...virtualModel, realtime_inflight_limit: 14 },
+      isLoading: false,
+      error: null,
+    } as ReturnType<typeof useModel>);
+    const user = userEvent.setup();
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const { container } = render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={["/models/manage/virtual-model-id"]}>
+          <Routes>
+            <Route path="/models/manage/:modelId" element={<ModelInfo />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const detailsHeading = within(container).getByRole("heading", {
+      name: "Model Details",
+    });
+    await user.click(within(detailsHeading.parentElement!).getByRole("button"));
+    await user.clear(
+      within(container).getByRole("spinbutton", {
+        name: "Realtime In-Flight Limit",
+      }),
+    );
+    await user.click(
+      within(container).getByRole("button", { name: "Save Changes" }),
+    );
+
+    expect(
+      within(container).getByText("Enter a realtime in-flight limit of 1 or more."),
+    ).toBeInTheDocument();
+    expect(updateModel).not.toHaveBeenCalled();
+  });
+
+  it("warns when the model is managed by startup provisioning", () => {
+    vi.mocked(useModel).mockReturnValue({
+      data: {
+        ...virtualModel,
+        provisioning_source: "model-catalog:zai-org--GLM-5.2-FP8.yaml",
+      },
+      isLoading: false,
+      error: null,
+    } as ReturnType<typeof useModel>);
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const { container } = render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={["/models/manage/virtual-model-id"]}>
+          <Routes>
+            <Route path="/models/manage/:modelId" element={<ModelInfo />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(
+      within(container).getByText(
+        "This model is provisioned from model-catalog:zai-org--GLM-5.2-FP8.yaml. Changes made here, other than enabling or disabling a hosted model, will be overwritten when the server restarts.",
+      ),
+    ).toBeInTheDocument();
+  });
+  it.each([false, true])(
+    "guards organisation price details independently of fetched data: %s",
+    (manager) => {
+      vi.mocked(useAuthorization).mockReturnValue({
+        hasPermission: vi.fn(() => manager),
+      } as unknown as ReturnType<typeof useAuthorization>);
+      vi.mocked(useModel).mockReturnValue({
+        data: {
+          ...virtualModel,
+          tariffs: [
+            {
+              id: "deal",
+              deployed_model_id: virtualModel.id,
+              name: "deal",
+              api_key_purpose: "realtime",
+              input_price_per_token: "0.000001",
+              output_price_per_token: "0.000002",
+              valid_from: "2026-01-01T00:00:00Z",
+              valid_until: null,
+              is_active: true,
+              organization_id: "org-test",
+              serving_class: "interactive",
+            },
+          ],
+        },
+        isLoading: false,
+        error: null,
+      } as ReturnType<typeof useModel>);
+      const queryClient = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      });
+      const { container } = render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/models/manage/virtual-model-id"]}>
+            <Routes>
+              <Route path="/models/manage/:modelId" element={<ModelInfo />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+      expect(
+        within(container).queryByRole("combobox", { name: "Pricing for" }) !==
+          null,
+      ).toBe(manager);
+      expect(within(container).queryByText("$1.00")).toBeNull();
+    },
+  );
 });

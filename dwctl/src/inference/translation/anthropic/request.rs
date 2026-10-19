@@ -2,7 +2,7 @@
 
 use serde_json::{Value, json};
 
-use super::model::{Content, ContentBlock, ImageSource, InputMessage, MessagesRequest, System, Tool, ToolResultContent};
+use super::model::{Content, ContentBlock, ImageSource, InputMessage, MessagesRequest, Tool, ToolResultContent};
 use crate::inference::translation::TranslationError;
 
 /// Translate an Anthropic Messages request into a Chat Completions request body. `cache_enabled`
@@ -55,7 +55,7 @@ pub fn to_chat_completions(req: MessagesRequest, cache_enabled: bool) -> Result<
     {
         out.insert("tool_choice".into(), v);
     }
-    if let Some(effort) = thinking_to_reasoning_effort(req.thinking.as_ref()) {
+    if let Some(effort) = reasoning_effort(req.thinking.as_ref(), req.output_config.as_ref())? {
         out.insert("reasoning_effort".into(), json!(effort));
     }
     // Only forward `service_tier` to engage dwctl's flex tier. Anthropic's
@@ -101,24 +101,24 @@ pub fn to_chat_completions(req: MessagesRequest, cache_enabled: bool) -> Result<
 /// caller data such as a tool call's `function.arguments`. Mirrors the sites in
 /// [`crate::prompt_cache::inject`]'s outbound sanitiser.
 fn strip_cache_control_markers(out: &mut serde_json::Map<String, Value>) {
-    out.remove("cache_control");
+    out.shift_remove("cache_control");
     if let Some(messages) = out.get_mut("messages").and_then(Value::as_array_mut) {
         for msg in messages.iter_mut() {
             if let Some(obj) = msg.as_object_mut() {
-                obj.remove("cache_control");
+                obj.shift_remove("cache_control");
             }
             // Array-form content only; string content carries no marker.
             if let Some(content) = msg.get_mut("content").and_then(Value::as_array_mut) {
                 for part in content.iter_mut() {
                     if let Some(part_obj) = part.as_object_mut() {
-                        part_obj.remove("cache_control");
+                        part_obj.shift_remove("cache_control");
                     }
                 }
             }
             if let Some(tool_calls) = msg.get_mut("tool_calls").and_then(Value::as_array_mut) {
                 for call in tool_calls.iter_mut() {
                     if let Some(call_obj) = call.as_object_mut() {
-                        call_obj.remove("cache_control");
+                        call_obj.shift_remove("cache_control");
                     }
                 }
             }
@@ -127,36 +127,82 @@ fn strip_cache_control_markers(out: &mut serde_json::Map<String, Value>) {
     if let Some(tools) = out.get_mut("tools").and_then(Value::as_array_mut) {
         for tool in tools.iter_mut() {
             if let Some(tool_obj) = tool.as_object_mut() {
-                tool_obj.remove("cache_control");
+                tool_obj.shift_remove("cache_control");
             }
         }
     }
 }
 
-/// Anthropic `thinking` config -> OpenAI `reasoning_effort` bucket. Only enabled
-/// thinking maps; absent or disabled leaves the backend at its default.
-fn thinking_to_reasoning_effort(thinking: Option<&Value>) -> Option<&'static str> {
-    let t = thinking?;
-    if t.get("type").and_then(Value::as_str) != Some("enabled") {
-        return None;
+/// Effort levels Anthropic accepts in `output_config.effort`; each has the same
+/// name as an OpenAI `reasoning_effort` value.
+const ANTHROPIC_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// Anthropic `thinking` and `output_config.effort` -> OpenAI `reasoning_effort`.
+///
+/// `disabled` is `none` whatever the effort. So is `between_tools`, although
+/// Anthropic's models still think between tool calls under it: none of ours has
+/// that mode, and `none` is the closest we can serve. Otherwise
+/// `output_config.effort` wins, then a `budget_tokens` bucket for `enabled`;
+/// with neither, the model's default applies. The effort is validated first,
+/// so a malformed one is refused even when thinking is off.
+fn reasoning_effort(thinking: Option<&Value>, output_config: Option<&Value>) -> Result<Option<&'static str>, TranslationError> {
+    if let Some(config) = output_config
+        && !config.is_object()
+    {
+        return Err(TranslationError::InvalidParameter {
+            param: "output_config",
+            message: format!("output_config: expected an object, got {config}"),
+        });
     }
-    let budget = t.get("budget_tokens").and_then(Value::as_u64).unwrap_or(0);
-    Some(if budget <= 2048 {
-        "low"
-    } else if budget <= 8192 {
-        "medium"
-    } else {
-        "high"
-    })
+    let effort = match output_config.and_then(|config| config.get("effort")).filter(|v| !v.is_null()) {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .and_then(|effort| ANTHROPIC_EFFORTS.into_iter().find(|known| *known == effort))
+                .ok_or_else(|| TranslationError::InvalidParameter {
+                    param: "output_config.effort",
+                    message: format!(
+                        "output_config.effort: expected one of {}, got {value}",
+                        ANTHROPIC_EFFORTS.join(", ")
+                    ),
+                })?,
+        ),
+    };
+    let Some(thinking) = thinking else {
+        return Ok(effort);
+    };
+    match thinking.get("type").and_then(Value::as_str) {
+        Some("disabled" | "between_tools") => Ok(Some("none")),
+        Some("adaptive") => Ok(effort),
+        Some("enabled") => Ok(Some(effort.unwrap_or_else(|| {
+            let budget = thinking.get("budget_tokens").and_then(Value::as_u64).unwrap_or(0);
+            if budget <= 2048 {
+                "low"
+            } else if budget <= 8192 {
+                "medium"
+            } else {
+                "high"
+            }
+        }))),
+        _ => Err(TranslationError::InvalidParameter {
+            param: "thinking.type",
+            message: format!(
+                "thinking.type: expected one of enabled, adaptive, disabled, between_tools, got {}",
+                thinking.get("type").unwrap_or(&Value::Null)
+            ),
+        }),
+    }
 }
 
-/// Anthropic top-level `system` -> a leading OpenAI system message. Text blocks
-/// keep `cache_control` by emitting array-form content parts.
-fn system_to_message(system: &System) -> Option<Value> {
+/// System content (the top-level `system` field, or a `role: "system"` entry in
+/// `messages`) -> an OpenAI system message. Text blocks keep `cache_control` by
+/// emitting array-form content parts.
+fn system_to_message(system: &Content) -> Option<Value> {
     match system {
-        System::Text(t) if !t.is_empty() => Some(json!({ "role": "system", "content": t })),
-        System::Text(_) => None,
-        System::Blocks(blocks) => {
+        Content::Text(t) if !t.is_empty() => Some(json!({ "role": "system", "content": t })),
+        Content::Text(_) => None,
+        Content::Blocks(blocks) => {
             let parts: Vec<Value> = blocks.iter().filter_map(text_block_to_part).collect();
             if parts.is_empty() {
                 None
@@ -171,7 +217,16 @@ fn convert_message(m: &InputMessage, out: &mut Vec<Value>) -> Result<(), Transla
     match m.role.as_str() {
         "assistant" => out.push(convert_assistant(&m.content)),
         "user" => convert_user(&m.content, out),
-        other => return Err(TranslationError::BadRequest(format!("unsupported message role: {other}"))),
+        // Anthropic accepts mid-conversation `role: "system"` entries in `messages`
+        // (Claude Code injects harness reminders this way); keep them in place as
+        // OpenAI system messages.
+        "system" => out.extend(system_to_message(&m.content)),
+        other => {
+            return Err(TranslationError::InvalidParameter {
+                param: "messages[].role",
+                message: format!("messages[].role: expected one of user, assistant, system, got {other}"),
+            });
+        }
     }
     Ok(())
 }
@@ -394,6 +449,17 @@ mod tests {
     }
 
     #[test]
+    fn tool_input_schema_keeps_key_order() {
+        let schema = r#"{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"string"}},"required":["zeta","alpha"]}"#;
+        let req: MessagesRequest = serde_json::from_str(&format!(
+            r#"{{"model":"m","max_tokens":16,"messages":[{{"role":"user","content":"hi"}}],"tools":[{{"name":"lookup","input_schema":{schema}}}]}}"#
+        ))
+        .unwrap();
+        let out = serde_json::to_string(&to_chat_completions(req, true).unwrap()).unwrap();
+        assert!(out.contains(&format!(r#""parameters":{schema}"#)), "{out}");
+    }
+
+    #[test]
     fn top_level_cache_control_forwarded_for_automatic_caching() {
         // With caching enabled, the automatic-caching marker must survive translation onto the Chat
         // Completions body so the cache layer (which reads it) can synthesize a last-block breakpoint.
@@ -592,5 +658,120 @@ mod tests {
             out["messages"][0]["tool_calls"][0].get("cache_control").is_none(),
             "no marker → clean tool_call"
         );
+    }
+
+    #[test]
+    fn system_role_in_messages_kept_in_place() {
+        // Anthropic accepts mid-conversation `role: "system"` entries (Claude Code injects harness
+        // reminders this way). They must translate in place, not 400.
+        let out = translate(json!({
+            "model": "m", "max_tokens": 16,
+            "system": "top-level system",
+            "messages": [
+                { "role": "user", "content": "hi" },
+                { "role": "system", "content": [
+                    { "type": "text", "text": "reminder", "cache_control": { "type": "ephemeral" } }
+                ]},
+                { "role": "user", "content": "go" }
+            ]
+        }));
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs[0], json!({ "role": "system", "content": "top-level system" }));
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[2]["role"], "system");
+        assert_eq!(
+            msgs[2]["content"],
+            json!([{ "type": "text", "text": "reminder", "cache_control": { "type": "ephemeral" } }]),
+            "block-form system entry keeps its cache_control part"
+        );
+        assert_eq!(msgs[3]["role"], "user");
+    }
+
+    #[test]
+    fn unknown_role_in_messages_still_rejected() {
+        let req = serde_json::from_value::<MessagesRequest>(json!({
+            "model": "m", "max_tokens": 16,
+            "messages": [{ "role": "developer", "content": "hi" }]
+        }))
+        .unwrap();
+        let err = to_chat_completions(req, true).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslationError::InvalidParameter { param: "messages[].role", message } if message.contains("developer")
+        ));
+    }
+
+    fn effort_for(extra: Value) -> Result<Option<Value>, TranslationError> {
+        let mut body = json!({"model": "m", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}]});
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let out = to_chat_completions(serde_json::from_value::<MessagesRequest>(body).unwrap(), true)?;
+        Ok(out.get("reasoning_effort").cloned())
+    }
+
+    #[test]
+    fn thinking_off_maps_to_effort_none_whatever_the_effort() {
+        for kind in ["disabled", "between_tools"] {
+            for extra in [
+                json!({"thinking": {"type": kind}}),
+                json!({"thinking": {"type": kind}, "output_config": {"effort": "high"}}),
+            ] {
+                assert_eq!(effort_for(extra.clone()).unwrap(), Some(json!("none")), "{extra}");
+            }
+        }
+    }
+
+    #[test]
+    fn output_config_effort_maps_by_name() {
+        for effort in ["low", "medium", "high", "xhigh", "max"] {
+            for extra in [
+                json!({"output_config": {"effort": effort}}),
+                json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": effort}}),
+                json!({"thinking": {"type": "enabled", "budget_tokens": 32000}, "output_config": {"effort": effort}}),
+            ] {
+                assert_eq!(effort_for(extra.clone()).unwrap(), Some(json!(effort)), "{extra}");
+            }
+        }
+    }
+
+    #[test]
+    fn adaptive_thinking_without_effort_leaves_the_model_default() {
+        assert_eq!(
+            effort_for(json!({"thinking": {"type": "adaptive", "display": "summarized"}})).unwrap(),
+            None
+        );
+        assert_eq!(
+            effort_for(json!({"thinking": null, "output_config": {"format": {}}})).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn enabled_thinking_without_effort_buckets_the_budget() {
+        for (budget, effort) in [(1024, "low"), (4096, "medium"), (32000, "high")] {
+            let extra = json!({"thinking": {"type": "enabled", "budget_tokens": budget}});
+            assert_eq!(effort_for(extra).unwrap(), Some(json!(effort)), "{budget}");
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_thinking_types_and_effort_values() {
+        for (extra, field) in [
+            (json!({"thinking": {"type": "sometimes"}}), "thinking.type"),
+            (json!({"thinking": {}}), "thinking.type"),
+            (json!({"output_config": {"effort": "none"}}), "output_config.effort"),
+            (json!({"output_config": {"effort": 3}}), "output_config.effort"),
+            (
+                json!({"thinking": {"type": "disabled"}, "output_config": {"effort": "turbo"}}),
+                "output_config.effort",
+            ),
+            (json!({"output_config": "high"}), "output_config"),
+            (json!({"output_config": ["high"]}), "output_config"),
+        ] {
+            let err = effort_for(extra.clone()).unwrap_err();
+            assert!(
+                matches!(&err, TranslationError::InvalidParameter { param, message } if *param == field && message.contains(field)),
+                "{extra}: {err}"
+            );
+        }
     }
 }

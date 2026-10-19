@@ -2,9 +2,9 @@
 
 use async_trait::async_trait;
 use rust_decimal::Decimal;
-use sqlx::PgPool;
+use sqlx::{Connection, PgPool};
 use std::collections::HashMap;
-use stripe::{ApiErrorsCode, Client};
+use stripe::{ApiErrorsCode, Client, ClientBuilder};
 use stripe_billing::billing_portal_session::CreateBillingPortalSession;
 use stripe_checkout::checkout_session::{
     CreateCheckoutSessionConsentCollection, CreateCheckoutSessionConsentCollectionPaymentMethodReuseAgreement,
@@ -96,17 +96,66 @@ pub struct StripeProvider {
 
 impl From<crate::config::StripeConfig> for StripeProvider {
     fn from(config: crate::config::StripeConfig) -> Self {
-        let client = Client::new(&config.api_key);
+        let mut builder = ClientBuilder::new(&config.api_key);
+        // `Config::validate` rejects a bad base URL at startup.
+        if let Some(api_base) = config.api_base().expect("Stripe api_base_url is validated at config load") {
+            builder = builder.url(api_base);
+        }
+        let client = builder.build().expect("invalid Stripe API key or base URL");
         Self { config, client }
     }
 }
 
+/// What a setup-mode Checkout is for. Recorded on the SetupIntent as
+/// `metadata.purpose` so the completed session can be told apart again:
+/// `checkout.session.completed` arrives for both kinds. Both claim the saved
+/// instrument when it has a fingerprint; only verification reports an
+/// instrument another account already holds (auto top-up enrolment then
+/// succeeds without verifying).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SetupPurpose {
+    Verification,
+    AutoTopup,
+}
+
+impl SetupPurpose {
+    const METADATA_KEY: &'static str = "purpose";
+
+    fn as_str(self) -> &'static str {
+        match self {
+            SetupPurpose::Verification => "verification",
+            SetupPurpose::AutoTopup => "auto_topup",
+        }
+    }
+
+    /// Sessions created before the purpose was recorded carry no metadata;
+    /// treat those as verification, the stricter reading.
+    fn from_metadata(metadata: Option<&HashMap<String, String>>) -> Self {
+        match metadata.and_then(|m| m.get(Self::METADATA_KEY)).map(String::as_str) {
+            Some("auto_topup") => SetupPurpose::AutoTopup,
+            _ => SetupPurpose::Verification,
+        }
+    }
+}
+
+/// Stripe's fingerprint of a saved payment method: the same card or bank
+/// account yields the same value on every customer, which is what the
+/// one-instrument-one-account rule keys on. `None` for types without one
+/// (Link, wallets), which therefore cannot verify an account.
+fn instrument_fingerprint(pm: &stripe_shared::PaymentMethod) -> Option<String> {
+    pm.card
+        .as_ref()
+        .and_then(|card| card.fingerprint.clone())
+        .or_else(|| pm.sepa_debit.as_ref().and_then(|sepa| sepa.fingerprint.clone()))
+}
+
 /// The only things that differ between our two setup-mode checkouts.
 ///
-/// Both save a card for later off-session use and are otherwise identical
-/// (hosted page, tax id + business name collection, ToS + reuse consent, the
-/// same payment method types, the same customer handling), so the shape of the
-/// session lives in `create_setup_mode_session` and only the wording varies.
+/// Both save a payment method for later off-session use and are otherwise
+/// identical (hosted page, tax id + business name collection, ToS + reuse
+/// consent, the same customer handling), so the shape of the session lives in
+/// `create_setup_mode_session`; the wording, the purpose and the payment
+/// method types offered vary.
 struct SetupSessionCopy<'a> {
     /// Custom terms-of-service acceptance text. `None` shows no ToS copy.
     terms_of_service_text: Option<&'a str>,
@@ -114,6 +163,14 @@ struct SetupSessionCopy<'a> {
     submit_label: &'a str,
     /// Description recorded on the SetupIntent, for reconciliation in Stripe.
     setup_intent_description: &'a str,
+    purpose: SetupPurpose,
+    /// Payment method types Checkout offers. Verification is cards only: a
+    /// SEPA mandate needs nothing but an IBAN, and in September 2026 one IBAN
+    /// verified 178 bot accounts; a Link payment method carries no
+    /// fingerprint, so the one-instrument-one-account rule could not be
+    /// applied to it. Auto top-up keeps Link and SEPA because a verified
+    /// customer may genuinely want to pay that way.
+    payment_method_types: Vec<CreateCheckoutSessionPaymentMethodTypes>,
 }
 
 impl StripeProvider {
@@ -157,14 +214,13 @@ impl StripeProvider {
                 after_submit: None,
                 shipping_address: None,
             })
-            .payment_method_types(vec![
-                CreateCheckoutSessionPaymentMethodTypes::Card,
-                CreateCheckoutSessionPaymentMethodTypes::Link,
-                CreateCheckoutSessionPaymentMethodTypes::SepaDebit,
-            ])
+            .payment_method_types(copy.payment_method_types.clone())
             .setup_intent_data(CreateCheckoutSessionSetupIntentData {
                 description: Some(copy.setup_intent_description.to_string()),
-                metadata: None,
+                metadata: Some(HashMap::from([(
+                    SetupPurpose::METADATA_KEY.to_string(),
+                    copy.purpose.as_str().to_string(),
+                )])),
                 on_behalf_of: None,
             });
 
@@ -306,8 +362,14 @@ impl StripeProvider {
             })
     }
 
-    /// Fulfil a completed `setup`-mode session: save the verified card, mark the
-    /// billing target verified, and pay out signup credits.
+    /// Fulfil a completed `setup`-mode session: save the payment method as the
+    /// customer's default, then, if it carries a fingerprint that no other
+    /// account has verified with, mark the billing target verified and pay out
+    /// signup credits.
+    ///
+    /// When the instrument is held by another account (or has no fingerprint),
+    /// a verification session fails and an auto top-up enrolment returns `Ok`
+    /// with only the payment method saved.
     ///
     /// No money moved, so there is no purchase to record - the only ledger entry
     /// is the (optional, once-per-target) verification grant.
@@ -400,11 +462,70 @@ impl StripeProvider {
             {
                 tracing::debug!("Saved newly created stripe ID {} for user ID {}", provider_id, target_id);
             }
-
-            // A verified card clears the unverified rate-limit tier in onwards,
-            // same as a completed purchase does.
-            users.set_verified(target_id).await?;
         }
+
+        // One instrument verifies one account. Stripe's fingerprint identifies
+        // the card or bank account across customers, and is only present on
+        // the expanded payment method (`get_setup_session` requests it). The
+        // first account to complete a setup session with an instrument claims
+        // it; any other account presenting the same instrument is not verified
+        // and gets no credits, whatever the session was for. The instrument
+        // itself stays attached to their customer and can pay for top-ups.
+        let purpose = SetupPurpose::from_metadata(setup_intent.metadata.as_ref());
+        let instrument_fingerprint = setup_intent
+            .payment_method
+            .as_ref()
+            .and_then(|pm| pm.as_object())
+            .and_then(instrument_fingerprint);
+        // No fingerprint means the claim cannot be made, so verification
+        // cannot be granted: fail closed. The verification Checkout only
+        // offers cards, which always carry one, so this is a malformed or
+        // unexpanded session (or an auto top-up enrolment with Link or SEPA,
+        // which is saved but does not verify).
+        let Some(fingerprint) = instrument_fingerprint.as_deref() else {
+            tracing::warn!(
+                session_id,
+                target_id = %target_id,
+                purpose = purpose.as_str(),
+                "Setup session payment method has no fingerprint; not verifying"
+            );
+            return match purpose {
+                SetupPurpose::Verification => Err(PaymentError::InvalidData(
+                    "Payment method has no fingerprint; verification requires a card".to_string(),
+                )),
+                SetupPurpose::AutoTopup => Ok(()),
+            };
+        };
+        // The claim and the verified flag land together: a claim without the
+        // flag would leave the account holding an instrument it was never
+        // verified by, and a concurrent second claimant waits on this commit
+        // rather than on a bare insert. A losing claim is rolled back, though
+        // there is nothing of ours to undo in that case.
+        let mut tx = conn.begin().await?;
+        let owner = Credits::new(&mut tx).claim_verification_instrument(fingerprint, target_id).await?;
+        let claimed_by_other = (owner != target_id).then_some(owner);
+        if let Some(owner) = claimed_by_other {
+            tx.rollback().await?;
+            tracing::warn!(
+                session_id,
+                target_id = %target_id,
+                owner = %owner,
+                purpose = purpose.as_str(),
+                "Payment instrument has already verified another account; not verifying this one"
+            );
+            return match purpose {
+                // The user asked to be verified and was not: tell them.
+                SetupPurpose::Verification => Err(PaymentError::InstrumentAlreadyUsed),
+                // Enrolment succeeded (the instrument is saved and default);
+                // only the verification side effects are withheld.
+                SetupPurpose::AutoTopup => Ok(()),
+            };
+        }
+
+        // A verified card clears the unverified rate-limit tier in onwards,
+        // same as a completed purchase does.
+        crate::db::handlers::users::Users::new(&mut tx).set_verified(target_id).await?;
+        tx.commit().await?;
 
         // Signup credits. Best-effort by the same reasoning as the first-payment
         // match: verification is the thing that must stick, and a failed freebie
@@ -636,14 +757,35 @@ impl PaymentProvider for StripeProvider {
         let description = {
             let mut users = crate::db::handlers::users::Users::new(&mut conn);
 
-            // Verify creditor user exists before proceeding
+            // Bail if either party is unknown to this plane.
+            //
+            // With one Stripe account serving both regional planes, every plane
+            // receives every plane's events, so unknown users are the *expected*
+            // shape of a foreign region's session rather than a rarity.
+            //
+            // The creditee is checked first because it is the one that gets
+            // written: the credit insert below uses it as user_id, and a row
+            // that does not exist fails the foreign key. Today that surfaces as
+            // DbError -> InvalidData, which the webhook's catch-all already
+            // turns into a 200 while logging at ERROR — so the present symptom
+            // is a misleading error-level log and a wasted Stripe round trip
+            // rather than a retry storm. Relying on that is still wrong: it
+            // depends on a constraint rather than a decision, it would credit a
+            // nonexistent user if the constraint were ever relaxed, and it
+            // buries a routine multi-region event in the error stream.
+            //
+            // The creditor is checked too, because it is read for the
+            // description and written by set_verified further down.
+            //
+            // A genuinely orphaned local session is indistinguishable from here
+            // and gets the same treatment; the webhook handler's log line is
+            // what keeps it visible.
+            if users.get_by_id(payment_session.creditee_id).await?.is_none() {
+                return Err(PaymentError::UnknownReference(payment_session.creditee_id.to_string()));
+            }
             let creditor_user = users.get_by_id(payment_session.creditor_id).await?;
             if creditor_user.is_none() {
-                tracing::error!(
-                    "Creditor user {} not found for payment session {}. This indicates a data integrity issue.",
-                    payment_session.creditor_id,
-                    session_id
-                );
+                return Err(PaymentError::UnknownReference(payment_session.creditor_id.to_string()));
             }
 
             // Build description with payer information
@@ -806,6 +948,8 @@ impl PaymentProvider for StripeProvider {
                     .or(self.config.auto_topup_terms_of_service_text.as_deref()),
                 submit_label: "Verify payment method",
                 setup_intent_description: "Payment method verification",
+                purpose: SetupPurpose::Verification,
+                payment_method_types: vec![CreateCheckoutSessionPaymentMethodTypes::Card],
             },
         )
         .await
@@ -820,6 +964,12 @@ impl PaymentProvider for StripeProvider {
                 terms_of_service_text: self.config.auto_topup_terms_of_service_text.as_deref(),
                 submit_label: "Set up auto top-up",
                 setup_intent_description: "Auto top-up setup",
+                purpose: SetupPurpose::AutoTopup,
+                payment_method_types: vec![
+                    CreateCheckoutSessionPaymentMethodTypes::Card,
+                    CreateCheckoutSessionPaymentMethodTypes::Link,
+                    CreateCheckoutSessionPaymentMethodTypes::SepaDebit,
+                ],
             },
         )
         .await
@@ -873,6 +1023,41 @@ impl PaymentProvider for StripeProvider {
             customer_id,
             user_id: session.client_reference_id,
         })
+    }
+
+    async fn accrue_invoice_item(&self, amount_cents: i64, customer_id: &str, description: &str, idempotency_key: &str) -> Result<String> {
+        use stripe::{IdempotencyKey, RequestStrategy, StripeRequest};
+        use stripe_billing::invoice_item::CreateInvoiceItem;
+
+        let idem = IdempotencyKey::new(idempotency_key).map_err(|e| PaymentError::InvalidData(format!("Invalid idempotency key: {e}")))?;
+
+        // Deliberately a *pending* invoice item: no `invoice` field, so Stripe
+        // parks it on the customer and sweeps it onto their next invoice rather
+        // than billing it now. Raising one invoice per top-up would put an
+        // invoice per auto-top-up through the customer's AP department, which
+        // is the exact thing monthly invoicing exists to avoid.
+        let item = CreateInvoiceItem::new()
+            .customer(customer_id)
+            .amount(amount_cents)
+            .currency(Currency::USD)
+            .description(description)
+            .customize()
+            .request_strategy(RequestStrategy::Idempotent(idem))
+            .send(&self.client)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to create Stripe invoice item: {:?}", e);
+                PaymentError::ProviderApi(e.to_string())
+            })?;
+
+        tracing::info!(
+            invoice_item_id = %item.id,
+            customer_id,
+            amount_cents,
+            "Accrued charge onto the customer's next invoice"
+        );
+
+        Ok(item.id.to_string())
     }
 
     async fn charge_auto_topup(
@@ -987,6 +1172,9 @@ impl PaymentProvider for StripeProvider {
 }
 
 #[cfg(test)]
+mod mock_api_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rust_decimal::Decimal;
@@ -1026,6 +1214,58 @@ mod tests {
         )
     }
 
+    /// A Stripe PaymentMethod as the API returns it, expanded on a SetupIntent.
+    /// Only the fields the type requires plus the one under test.
+    fn payment_method_json(type_: &str, details: &str) -> stripe_shared::PaymentMethod {
+        let json = format!(
+            r#"{{"id":"pm_test","object":"payment_method","billing_details":{{}},"created":1700000000,"livemode":false,"type":"{type_}",{details}}}"#
+        );
+        miniserde::json::from_str(&json).expect("payment method json")
+    }
+
+    #[test]
+    fn test_instrument_fingerprint_reads_card_and_sepa_and_nothing_else() {
+        let card = payment_method_json(
+            "card",
+            r#""card":{"brand":"visa","exp_month":1,"exp_year":2030,"funding":"credit","last4":"4242","fingerprint":"fp_card"}"#,
+        );
+        assert_eq!(instrument_fingerprint(&card).as_deref(), Some("fp_card"));
+
+        let sepa = payment_method_json(
+            "sepa_debit",
+            r#""sepa_debit":{"bank_code":"ABNA","branch_code":"","country":"NL","last4":"0000","fingerprint":"fp_iban"}"#,
+        );
+        assert_eq!(instrument_fingerprint(&sepa).as_deref(), Some("fp_iban"));
+
+        // Link carries no fingerprint, so it can never claim an instrument.
+        let link = payment_method_json("link", r#""link":{"email":"someone@example.com"}"#);
+        assert_eq!(instrument_fingerprint(&link), None);
+
+        // A card the API returned without a fingerprint is treated as none.
+        let bare = payment_method_json(
+            "card",
+            r#""card":{"brand":"visa","exp_month":1,"exp_year":2030,"funding":"credit","last4":"4242"}"#,
+        );
+        assert_eq!(instrument_fingerprint(&bare), None);
+    }
+
+    #[test]
+    fn test_instrument_already_used_is_a_conflict_for_direct_callers() {
+        // The front-channel caller must learn that this card cannot verify
+        // them; the webhook acks it separately so Stripe stops redelivering.
+        let status: axum::http::StatusCode = PaymentError::InstrumentAlreadyUsed.into();
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn test_setup_purpose_round_trips_and_defaults_to_verification() {
+        let meta = HashMap::from([(SetupPurpose::METADATA_KEY.to_string(), "auto_topup".to_string())]);
+        assert_eq!(SetupPurpose::from_metadata(Some(&meta)), SetupPurpose::AutoTopup);
+        let meta = HashMap::from([(SetupPurpose::METADATA_KEY.to_string(), "verification".to_string())]);
+        assert_eq!(SetupPurpose::from_metadata(Some(&meta)), SetupPurpose::Verification);
+        assert_eq!(SetupPurpose::from_metadata(None), SetupPurpose::Verification);
+    }
+
     #[test]
     fn test_idempotency_key_in_use_maps_to_already_processed() {
         // Another replica is mid-charge on the same key: a no-op, not a failure.
@@ -1034,6 +1274,37 @@ mod tests {
             stripe::ApiErrorsType::InvalidRequestError,
         ));
         assert!(matches!(err, PaymentError::AlreadyProcessed), "got {err:?}");
+    }
+
+    // The whole point of COR-594: a foreign region's event must not be retried
+    // forever. Stripe fans account-level events out to every endpoint, so with
+    // one account and two planes each sees the other's sessions; anything but a
+    // 2xx here is an infinite retry loop, because retrying cannot make a user
+    // this plane does not own appear.
+    #[test]
+    fn test_unknown_reference_is_not_found_for_direct_callers() {
+        // The webhook acks these explicitly in its own arm. This mapping serves
+        // the front-channel PATCH /payments/{id}, where claiming success for a
+        // session we cannot process would mislead the caller.
+        let status: axum::http::StatusCode = PaymentError::UnknownReference("some-user-id".to_string()).into();
+        assert_eq!(
+            status,
+            axum::http::StatusCode::NOT_FOUND,
+            "direct callers must be told the session is not ours"
+        );
+    }
+
+    // The other half of the same guarantee. Widening the ack to cover genuine
+    // database failures would silently drop real payments, so the distinction
+    // between "not ours" and "we could not process it" has to hold.
+    #[test]
+    fn test_database_errors_are_still_retried() {
+        let status: axum::http::StatusCode = PaymentError::Database(sqlx::Error::PoolClosed).into();
+        assert_eq!(
+            status,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "transient database failures must keep asking Stripe to retry"
+        );
     }
 
     #[test]
@@ -1056,6 +1327,7 @@ mod tests {
             auto_topup_terms_of_service_text: None,
             setup_terms_of_service_text: None,
             tax_code: None,
+            api_base_url: None,
         };
         let provider = StripeProvider::from(config);
 
@@ -1075,6 +1347,7 @@ mod tests {
             auto_topup_terms_of_service_text: None,
             setup_terms_of_service_text: None,
             tax_code: None,
+            api_base_url: None,
         };
         let provider = StripeProvider::from(config);
 
@@ -1111,7 +1384,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_stripe_idempotency_fast_path(pool: PgPool) {
         // Test the fast path: transaction already exists in DB
         let user_id = create_test_user(&pool).await;
@@ -1141,6 +1414,7 @@ mod tests {
             auto_topup_terms_of_service_text: None,
             setup_terms_of_service_text: None,
             tax_code: None,
+            api_base_url: None,
         };
         let provider = StripeProvider::from(config);
 
@@ -1238,7 +1512,7 @@ mod tests {
         assert_eq!(event.session_id, Some("cs_test_123".to_string()));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_payment_description_self(pool: PgPool) {
         // Test that when a user pays for themselves, description is just "Stripe payment"
         let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
@@ -1277,7 +1551,7 @@ mod tests {
         assert_eq!(description, "Stripe payment", "Self-payment should not include 'from' attribution");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_payment_description_other(pool: PgPool) {
         // Test that when a user pays for someone else, description includes "from {name}"
         let payer = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;

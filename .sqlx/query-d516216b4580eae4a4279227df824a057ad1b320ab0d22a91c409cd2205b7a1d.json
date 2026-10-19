@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                            UPDATE requests SET\n                                state = 'processing',\n                                retry_attempt = $2,\n                                daemon_id = $3,\n                                claimed_at = $4,\n                                started_at = clock_timestamp()\n                            WHERE id = $1\n                              AND state = 'claimed'\n                              AND daemon_id = $3\n                              AND claimed_at = $4\n                            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d516216b4580eae4a4279227df824a057ad1b320ab0d22a91c409cd2205b7a1d"
+}
