@@ -1,5 +1,23 @@
 # Changelog
 
+## [14.3.1](https://github.com/doublewordai/control-layer/compare/v14.3.0...v14.3.1) (2026-10-19)
+
+
+### Bug Fixes
+
+* **analytics:** restore custom ID index ([#2011](https://github.com/doublewordai/control-layer/issues/2011)) ([81a9465](https://github.com/doublewordai/control-layer/commit/81a9465bb291c9bc2121e5092b69de6bab836068))
+* **connections:** release API key on deletion ([#2015](https://github.com/doublewordai/control-layer/issues/2015)) ([c13638b](https://github.com/doublewordai/control-layer/commit/c13638ba42594906937a2a54d12817c980f9acb1))
+* **control-layer:** keep response writer supervised while draining ([#2014](https://github.com/doublewordai/control-layer/issues/2014)) ([1be1dcd](https://github.com/doublewordai/control-layer/commit/1be1dcdaa43d0f049d7a4373311f3cc07afa489e))
+
+
+### Miscellaneous
+
+* **deps:** bump requests from 2.32.5 to 2.33.0 in /scripts/tests/pooled ([#1720](https://github.com/doublewordai/control-layer/issues/1720)) ([96de52b](https://github.com/doublewordai/control-layer/commit/96de52b60817d088e0103f63a76ce743d794ae40))
+* **deps:** split Renovate updates by ecosystem ([#2006](https://github.com/doublewordai/control-layer/issues/2006)) ([f619cf7](https://github.com/doublewordai/control-layer/commit/f619cf700a72055bb16bdc02e9e2611d0bc7f67f))
+* **deps:** update actions/setup-python action to v7 ([#2003](https://github.com/doublewordai/control-layer/issues/2003)) ([c09267d](https://github.com/doublewordai/control-layer/commit/c09267dae4065e8434081dc0a82ea012120aabad))
+* **deps:** update actions/upload-pages-artifact action to v5 ([#2004](https://github.com/doublewordai/control-layer/issues/2004)) ([5f73f1c](https://github.com/doublewordai/control-layer/commit/5f73f1c0adb6984965e4ba54c6ef048d9812a2e0))
+* **deps:** update zerob13/mock-openai-api docker digest to 9c9fdcf ([#1147](https://github.com/doublewordai/control-layer/issues/1147)) ([72ad884](https://github.com/doublewordai/control-layer/commit/72ad884d95f73269be401d0f6fd674b7323d2a5d))
+
 ## [14.3.0](https://github.com/doublewordai/control-layer/compare/v14.2.0...v14.3.0) (2026-10-19)
 
 
