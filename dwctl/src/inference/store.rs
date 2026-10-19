@@ -548,10 +548,11 @@ pub fn detail_to_response_object(detail: &fusillade::RequestDetail) -> serde_jso
 
 /// Convert a terminal `RequestDetail` into an HTTP status + chat-completions body.
 ///
-/// On success the upstream `chat.completion` body is returned verbatim — flex requests
-/// are drop-in compatible with non-flex chat completions. On failure the OpenAI error
-/// envelope is returned with the upstream HTTP status surfaced in both the response
-/// status and the `error.code` field.
+/// On success the upstream `chat.completion` body is returned with the platform's
+/// recorded serving tier restored. Flex strips the control-plane field before dispatch,
+/// so the upstream cannot report the tier that actually served the customer request.
+/// On failure the OpenAI error envelope is returned with the upstream HTTP status
+/// surfaced in both the response status and the `error.code` field.
 pub fn detail_to_chat_completion_object(detail: &fusillade::RequestDetail) -> (u16, serde_json::Value) {
     match detail.status.as_str() {
         "completed" => {
@@ -585,7 +586,14 @@ pub fn detail_to_chat_completion_object(detail: &fusillade::RequestDetail) -> (u
                     // always returns 200 in practice but the helper is
                     // pass-through by design — a 201/204/3xx from upstream
                     // should propagate, not get rewritten to 200.
-                    Some(parsed) => (response_status, parsed),
+                    Some(mut parsed) => {
+                        if let Some(service_tier) = detail.service_tier.as_deref()
+                            && let Some(object) = parsed.as_object_mut()
+                        {
+                            object.insert("service_tier".to_string(), serde_json::Value::String(service_tier.to_string()));
+                        }
+                        (response_status, parsed)
+                    }
                     None => (
                         500,
                         serde_json::json!({
@@ -668,6 +676,7 @@ pub fn chat_completion_to_stream_chunks(completion: &serde_json::Value, include_
     let created = completion.get("created").cloned().unwrap_or(serde_json::Value::Null);
     let model = completion.get("model").cloned().unwrap_or(serde_json::Value::Null);
     let system_fingerprint = completion.get("system_fingerprint").cloned();
+    let service_tier = completion.get("service_tier").cloned();
 
     let base_chunk = |delta: serde_json::Value, index: i64, finish_reason: serde_json::Value| {
         let mut choice = serde_json::json!({
@@ -686,6 +695,9 @@ pub fn chat_completion_to_stream_chunks(completion: &serde_json::Value, include_
         });
         if let Some(fp) = system_fingerprint.clone() {
             chunk["system_fingerprint"] = fp;
+        }
+        if let Some(tier) = service_tier.clone() {
+            chunk["service_tier"] = tier;
         }
         if include_usage {
             chunk["usage"] = serde_json::Value::Null;
@@ -751,6 +763,9 @@ pub fn chat_completion_to_stream_chunks(completion: &serde_json::Value, include_
         });
         if let Some(fp) = system_fingerprint {
             chunk["system_fingerprint"] = fp;
+        }
+        if let Some(tier) = service_tier {
+            chunk["service_tier"] = tier;
         }
         chunks.push(chunk);
     }
@@ -981,6 +996,26 @@ mod tests {
         let chunks = chat_completion_to_stream_chunks(&completion, false);
         assert_eq!(chunks.len(), 3);
         assert!(chunks.iter().all(|chunk| chunk.get("usage").is_none()));
+    }
+
+    #[test]
+    fn test_chat_completion_to_stream_chunks_preserves_service_tier() {
+        let completion = serde_json::json!({
+            "id": "chatcmpl-flex",
+            "model": "gpt-test",
+            "service_tier": "flex",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "hi" },
+                "finish_reason": "stop",
+            }],
+            "usage": { "total_tokens": 7 },
+        });
+
+        let chunks = chat_completion_to_stream_chunks(&completion, true);
+
+        assert!(!chunks.is_empty());
+        assert!(chunks.iter().all(|chunk| chunk["service_tier"] == "flex"));
     }
 
     #[test]
@@ -1333,6 +1368,18 @@ mod tests {
         assert_eq!(value["id"], "chatcmpl-abc");
         assert_eq!(value["object"], "chat.completion");
         assert!(value.get("error").is_none());
+    }
+
+    #[test]
+    fn test_detail_to_chat_completion_completed_reports_recorded_service_tier() {
+        let body = r#"{"id":"chatcmpl-flex","object":"chat.completion","service_tier":"default","choices":[]}"#;
+        let mut detail = make_detail("completed", Some(200), Some(body), None);
+        detail.service_tier = Some("flex".to_string());
+
+        let (status, value) = detail_to_chat_completion_object(&detail);
+
+        assert_eq!(status, 200);
+        assert_eq!(value["service_tier"], "flex");
     }
 
     #[test]
