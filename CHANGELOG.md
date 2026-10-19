@@ -1,5 +1,38 @@
 # Changelog
 
+## [14.3.0](https://github.com/doublewordai/control-layer/compare/v14.2.0...v14.3.0) (2026-10-19)
+
+
+### Features
+
+* **dwctl:** record where a translated body fails its schema, without its content (DW-951) ([#1991](https://github.com/doublewordai/control-layer/issues/1991)) ([53b07dc](https://github.com/doublewordai/control-layer/commit/53b07dc2bf5932cc3c037f803095eb46e90b161f))
+* **onwards:** check legacy completions for unsupported parameters (DW-855) ([#1996](https://github.com/doublewordai/control-layer/issues/1996)) ([500873b](https://github.com/doublewordai/control-layer/commit/500873b76a678ff2d2983d04c5e797121a285111))
+* **onwards:** record where a body fails the strict schema, without its content (DW-951) ([#1990](https://github.com/doublewordai/control-layer/issues/1990)) ([e1cb85a](https://github.com/doublewordai/control-layer/commit/e1cb85a5a525bb360edaf0ab2005fed0db6b680e))
+
+
+### Bug Fixes
+
+* **analytics:** use indexed exact custom id lookup ([#1998](https://github.com/doublewordai/control-layer/issues/1998)) ([a40d0ed](https://github.com/doublewordai/control-layer/commit/a40d0edbcbdbfe1f04fb131de5d4c4a31fcfabf2))
+* **batch:** delete generated files with batch ([#1997](https://github.com/doublewordai/control-layer/issues/1997)) ([45aeaa1](https://github.com/doublewordai/control-layer/commit/45aeaa1676427f26768c7a4cd06ac37bec137221))
+* **dwctl:** export the request span as a server span (DW-954) ([#1993](https://github.com/doublewordai/control-layer/issues/1993)) ([57ded54](https://github.com/doublewordai/control-layer/commit/57ded542e15168eb22818bb7e82cbac6e0e4d833))
+* **inference:** preserve flex chat service tier ([#1995](https://github.com/doublewordai/control-layer/issues/1995)) ([a8a7d74](https://github.com/doublewordai/control-layer/commit/a8a7d745a020c1532cdea3cbb054adc01d99dba7))
+
+
+### Build System
+
+* **deps:** bump hickory-resolver from 0.26.1 to 0.26.3 ([#1921](https://github.com/doublewordai/control-layer/issues/1921)) ([d91050e](https://github.com/doublewordai/control-layer/commit/d91050ef3427456168df95aacc0abfccebf2d4d5))
+* **deps:** bump rustls from 0.23.40 to 0.23.45 ([#1920](https://github.com/doublewordai/control-layer/issues/1920)) ([2a0c05b](https://github.com/doublewordai/control-layer/commit/2a0c05bf48ae73a478017bef2d8a2d0a470d8e3d))
+
+
+### Miscellaneous
+
+* **deps:** bump cmov from 0.5.3 to 0.5.4 ([#1228](https://github.com/doublewordai/control-layer/issues/1228)) ([4f328f6](https://github.com/doublewordai/control-layer/commit/4f328f616c9171216a63da9d308a1aaf28a69bed))
+* **deps:** update actions/checkout action to v7 ([#1182](https://github.com/doublewordai/control-layer/issues/1182)) ([8e49bd5](https://github.com/doublewordai/control-layer/commit/8e49bd549a5c721a4ef904dca059a5a3ef781fe6))
+* **deps:** update actions/deploy-pages action to v5 ([#1549](https://github.com/doublewordai/control-layer/issues/1549)) ([1288494](https://github.com/doublewordai/control-layer/commit/1288494b427596d19d4d11e29368c6da2e492c49))
+* **deps:** update googleapis/release-please-action action to v5 ([#1019](https://github.com/doublewordai/control-layer/issues/1019)) ([4878fe9](https://github.com/doublewordai/control-layer/commit/4878fe9ff74d219d0fcbbffd756013062a0e9210))
+* **deps:** update pnpm/action-setup action to v6 ([#977](https://github.com/doublewordai/control-layer/issues/977)) ([867cfbc](https://github.com/doublewordai/control-layer/commit/867cfbcef201613b9b279d88a3446a91797df7fb))
+* **deps:** update rust crate rustls to v0.23.45 [security] ([#1923](https://github.com/doublewordai/control-layer/issues/1923)) ([27f8503](https://github.com/doublewordai/control-layer/commit/27f8503e8c0358fdba9defa6e7cab55401bb3436))
+
 ## [14.2.0](https://github.com/doublewordai/control-layer/compare/v14.1.0...v14.2.0) (2026-10-15)
 
 

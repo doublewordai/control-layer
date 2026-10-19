@@ -2849,9 +2849,10 @@ mod batch_results_stream {
     }
 
     #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
-    async fn test_output_file_streamable_after_batch_deleted(pool: sqlx::PgPool) {
-        // Test: Output files can still be streamed after the batch is soft-deleted
-        // This ensures users can download completed results even if the batch is deleted
+    async fn test_generated_files_unavailable_after_batch_deleted(pool: sqlx::PgPool) {
+        // Generated output and error files are part of the batch's associated
+        // data. They must become unavailable as soon as the batch is deleted,
+        // while the backing request rows can be purged asynchronously.
         let http_client = Arc::new(MockHttpClient::new());
         http_client.add_response(
             "POST /v1/test",
@@ -2923,13 +2924,25 @@ mod batch_results_stream {
         }
         shutdown_token.cancel();
 
-        // Get the output file ID
+        // Get the generated file IDs.
         let batch = manager.get_batch(batch.id).await.expect("get_batch failed");
         let output_file_id = batch
             .output_file_id
             .expect("Batch should have output_file_id");
+        let error_file_id = batch
+            .error_file_id
+            .expect("Batch should have error_file_id");
 
-        // Verify we can get output file content before deletion
+        // Both generated files are available before deletion. The error file
+        // is expected to be empty because the request completed successfully.
+        manager
+            .get_file(output_file_id)
+            .await
+            .expect("Output file should exist before deletion");
+        manager
+            .get_file(error_file_id)
+            .await
+            .expect("Error file should exist before deletion");
         let results_before = manager
             .get_file_content(output_file_id)
             .await
@@ -2939,7 +2952,13 @@ mod batch_results_stream {
             "Output file should have content before deletion"
         );
 
-        // Soft-delete the batch
+        manager
+            .get_file_content(error_file_id)
+            .await
+            .expect("Should be able to read error file content before deletion");
+
+        // Soft-delete the batch and its generated file metadata. Physical
+        // request-row deletion remains the purge worker's responsibility.
         manager
             .delete_batch(batch.id)
             .await
@@ -2952,15 +2971,11 @@ mod batch_results_stream {
             "Batch should not be found after deletion"
         );
 
-        // Verify we can STILL get the output file content after batch deletion
-        let results_after = manager
-            .get_file_content(output_file_id)
-            .await
-            .expect("Should still be able to get output file content after batch deletion");
-        assert!(
-            !results_after.is_empty(),
-            "Output file should still have content after batch deletion"
-        );
+        // Generated file metadata and content become unavailable immediately.
+        assert!(manager.get_file(output_file_id).await.is_err());
+        assert!(manager.get_file(error_file_id).await.is_err());
+        assert!(manager.get_file_content(output_file_id).await.is_err());
+        assert!(manager.get_file_content(error_file_id).await.is_err());
     }
 
     #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
