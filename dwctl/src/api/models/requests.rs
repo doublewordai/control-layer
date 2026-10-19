@@ -124,7 +124,7 @@ pub struct ListRequestsQuery {
     /// Filter by fusillade batch ID
     pub fusillade_batch_id: Option<uuid::Uuid>,
 
-    /// Filter by custom_id (case-insensitive search)
+    /// Filter by exact custom_id
     pub custom_id: Option<String>,
 }
 
@@ -193,7 +193,7 @@ pub struct HttpAnalyticsFilter {
     pub model: Option<String>,
     /// Filter by fusillade batch ID
     pub fusillade_batch_id: Option<uuid::Uuid>,
-    /// Filter by custom_id (case-insensitive search)
+    /// Filter by exact custom_id
     pub custom_id: Option<String>,
 }
 

@@ -3,7 +3,7 @@
 use chrono::{DateTime, Duration, Timelike, Utc};
 use moka::future::Cache;
 use once_cell::sync::Lazy;
-use sqlx::{FromRow, PgPool, Postgres, Transaction};
+use sqlx::{FromRow, PgPool, Postgres, QueryBuilder, Transaction};
 use std::collections::HashMap;
 use tracing::instrument;
 
@@ -1003,11 +1003,11 @@ pub async fn list_http_analytics(
     order_desc: bool,
     filters: HttpAnalyticsFilter,
 ) -> Result<Vec<AnalyticsEntry>> {
-    // Wrap custom_id in wildcards for ILIKE substring matching
-    let custom_id_pattern = filters.custom_id.as_ref().map(|s| format!("%{}%", s));
-
-    let rows = sqlx::query_as!(
-        HttpAnalyticsRow,
+    // Build only the predicates the caller supplied. Besides avoiding nullable
+    // OR expressions in a reusable prepared statement, exact custom_id matching
+    // lets PostgreSQL use idx_analytics_custom_id. custom_id is an opaque caller
+    // identifier, not a free-text search field.
+    let mut query = QueryBuilder::<Postgres>::new(
         r#"
         SELECT
             id,
@@ -1027,44 +1027,57 @@ pub async fn list_http_analytics(
             output_price_per_token,
             custom_id
         FROM http_analytics
-        WHERE
-            ($1::timestamptz IS NULL OR timestamp >= $1)
-            AND ($2::timestamptz IS NULL OR timestamp <= $2)
-            AND ($3::text IS NULL OR model = $3)
-            AND ($4::uuid IS NULL OR fusillade_batch_id = $4)
-            AND ($5::text IS NULL OR method = $5)
-            AND ($6::text IS NULL OR uri LIKE $6)
-            AND ($7::int IS NULL OR status_code = $7)
-            AND ($8::int IS NULL OR status_code >= $8)
-            AND ($9::int IS NULL OR status_code <= $9)
-            AND ($10::bigint IS NULL OR duration_ms >= $10)
-            AND ($11::bigint IS NULL OR duration_ms <= $11)
-            AND ($12::text IS NULL OR custom_id ILIKE $12)
-        ORDER BY timestamp DESC
-        LIMIT $13
-        OFFSET $14
+        WHERE TRUE
         "#,
-        filters.timestamp_after,
-        filters.timestamp_before,
-        filters.model,
-        filters.fusillade_batch_id,
-        filters.method,
-        filters.uri_pattern,
-        filters.status_code,
-        filters.status_code_min,
-        filters.status_code_max,
-        filters.min_duration_ms,
-        filters.max_duration_ms,
-        custom_id_pattern,
-        limit,
-        skip,
-    )
-    .fetch_all(pool)
-    .await?;
+    );
 
-    // Note: The ORDER BY is hardcoded to DESC in the query above.
-    // If we need dynamic ordering, we'd need to use query_as with raw SQL
-    // or have two separate queries. For now, we'll handle ASC by reversing.
+    if let Some(value) = filters.timestamp_after {
+        query.push(" AND timestamp >= ").push_bind(value);
+    }
+    if let Some(value) = filters.timestamp_before {
+        query.push(" AND timestamp <= ").push_bind(value);
+    }
+    if let Some(value) = filters.model {
+        query.push(" AND model = ").push_bind(value);
+    }
+    if let Some(value) = filters.fusillade_batch_id {
+        query.push(" AND fusillade_batch_id = ").push_bind(value);
+    }
+    if let Some(value) = filters.method {
+        query.push(" AND method = ").push_bind(value);
+    }
+    if let Some(value) = filters.uri_pattern {
+        query.push(" AND uri LIKE ").push_bind(value);
+    }
+    if let Some(value) = filters.status_code {
+        query.push(" AND status_code = ").push_bind(value);
+    }
+    if let Some(value) = filters.status_code_min {
+        query.push(" AND status_code >= ").push_bind(value);
+    }
+    if let Some(value) = filters.status_code_max {
+        query.push(" AND status_code <= ").push_bind(value);
+    }
+    if let Some(value) = filters.min_duration_ms {
+        query.push(" AND duration_ms >= ").push_bind(value);
+    }
+    if let Some(value) = filters.max_duration_ms {
+        query.push(" AND duration_ms <= ").push_bind(value);
+    }
+    if let Some(value) = filters.custom_id {
+        query.push(" AND custom_id = ").push_bind(value);
+    }
+
+    query
+        .push(" ORDER BY timestamp DESC LIMIT ")
+        .push_bind(limit)
+        .push(" OFFSET ")
+        .push_bind(skip);
+
+    let rows = query.build_query_as::<HttpAnalyticsRow>().fetch_all(pool).await?;
+
+    // Preserve the existing pagination contract: select the newest page, then
+    // return that page in ascending order when requested.
     let mut entries: Vec<AnalyticsEntry> = rows
         .into_iter()
         .map(|row| AnalyticsEntry {
@@ -1384,6 +1397,46 @@ mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
     use sqlx::PgPool;
+
+    #[dwctl_test_macros::test]
+    async fn list_http_analytics_matches_custom_id_exactly(pool: PgPool) {
+        let target = "platform-tests-analytics-run-123";
+        for (custom_id, timestamp) in [
+            (target, Utc::now()),
+            ("prefix-platform-tests-analytics-run-123-suffix", Utc::now() - Duration::seconds(1)),
+            ("PLATFORM-TESTS-ANALYTICS-RUN-123", Utc::now() - Duration::seconds(2)),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO http_analytics (
+                    instance_id, correlation_id, timestamp, uri, method, custom_id
+                ) VALUES ($1, 1, $2, '/ai/v1/chat/completions', 'POST', $3)
+                "#,
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(timestamp)
+            .bind(custom_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let entries = list_http_analytics(
+            &pool,
+            0,
+            100,
+            true,
+            HttpAnalyticsFilter {
+                custom_id: Some(target.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].custom_id.as_deref(), Some(target));
+    }
 
     #[test]
     fn test_fill_missing_intervals_empty_input() {
