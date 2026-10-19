@@ -1,5 +1,5 @@
 # Dependency planner stage
-FROM lukemathwalker/cargo-chef:latest-rust-1.93.0-slim AS chef
+FROM lukemathwalker/cargo-chef:latest-rust-1.94.0-slim AS chef
 WORKDIR /app
 
 FROM chef AS planner
