@@ -1230,3 +1230,6 @@ mod tariff_indexes_tests;
 
 #[cfg(test)]
 mod public_class_tests;
+
+#[cfg(test)]
+mod analytics_indexes_tests;
