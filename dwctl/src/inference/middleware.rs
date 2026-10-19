@@ -291,9 +291,9 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         }
 
         // The edge translation refuses provider-native thinking fields, but
-        // flex and background requests are queued before it runs. Refuse them
-        // here so the caller gets the 400 instead of a failed response later.
-        if is_daemon_processed && let Err(error) = onwards::reasoning::validate_canonical_reasoning(nested_path, &request_value) {
+        // queued and background requests are accepted before it runs. Refuse
+        // them here so the caller gets the 400 instead of a failed response later.
+        if let Err(error) = onwards::reasoning::validate_canonical_reasoning(nested_path, &request_value) {
             let param = error.param().unwrap_or_default();
             return refuse(
                 invalid_request_response(error.message(), error.code(), param),
@@ -2018,7 +2018,7 @@ mod tests {
     }
 
     #[dwctl_test_macros::test]
-    async fn queued_responses_refuse_native_thinking_fields(pool: sqlx::PgPool) {
+    async fn responses_refuse_native_thinking_fields_before_acceptance(pool: sqlx::PgPool) {
         use crate::api::models::users::Role;
         use crate::test::utils::{create_test_api_key_for_user, create_test_app, create_test_user};
 
@@ -2026,20 +2026,32 @@ mod tests {
         let user = create_test_user(&pool, Role::StandardUser).await;
         let key = create_test_api_key_for_user(&pool, user.id).await;
 
-        for (tier, background) in [("flex", false), ("flex", true), ("background", true)] {
+        // Realtime with `background: true` is accepted with a 202 before translation too.
+        let tiers = [
+            (Some("flex"), false),
+            (Some("flex"), true),
+            (Some("background"), true),
+            (None, true),
+            (Some("auto"), true),
+            (Some("priority"), true),
+        ];
+        for (tier, background) in tiers {
+            let mut request = serde_json::json!({
+                "model": "gpt-4",
+                "input": "hi",
+                "background": background,
+                "chat_template_kwargs": {"enable_thinking": false}
+            });
+            if let Some(tier) = tier {
+                request["service_tier"] = tier.into();
+            }
             let response = server
                 .post("/ai/v1/responses")
                 .add_header("Authorization", &format!("Bearer {}", key.secret))
-                .json(&serde_json::json!({
-                    "model": "gpt-4",
-                    "input": "hi",
-                    "service_tier": tier,
-                    "background": background,
-                    "chat_template_kwargs": {"enable_thinking": false}
-                }))
+                .json(&request)
                 .await;
 
-            assert_eq!(response.status_code().as_u16(), 400, "{tier}/{background}: {}", response.text());
+            assert_eq!(response.status_code().as_u16(), 400, "{tier:?}/{background}: {}", response.text());
             let body: serde_json::Value = response.json();
             assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
             assert_eq!(body["error"]["code"], "unsupported_parameter", "{body}");
