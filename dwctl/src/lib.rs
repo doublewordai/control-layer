@@ -2985,8 +2985,58 @@ async fn record_provider_request_id(request: axum::extract::Request, next: middl
 /// # Graceful Shutdown
 ///
 /// The struct provides a [`shutdown`](BackgroundServices::shutdown) method to gracefully
-/// stop all background tasks. When dropped, the `drop_guard` will automatically cancel
-/// the shutdown token, signaling all tasks to stop.
+/// stop all background tasks. Most tasks share an eager token that fires when HTTP
+/// draining begins. The responses writer has a later token so accepted requests can
+/// persist their completion before the writer flushes and exits.
+#[derive(Clone)]
+struct BackgroundShutdownTokens {
+    /// Stops daemons and other background work as soon as HTTP draining begins.
+    services: tokio_util::sync::CancellationToken,
+    /// Stops the responses writer only after accepted HTTP requests have drained.
+    responses_writer: tokio_util::sync::CancellationToken,
+}
+
+const RESPONSES_WRITER_TASK_NAME: &str = "responses-writer";
+
+impl BackgroundShutdownTokens {
+    fn new(services: tokio_util::sync::CancellationToken) -> Self {
+        Self {
+            services,
+            responses_writer: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    fn services(&self) -> tokio_util::sync::CancellationToken {
+        self.services.clone()
+    }
+
+    fn responses_writer(&self) -> tokio_util::sync::CancellationToken {
+        self.responses_writer.clone()
+    }
+
+    /// Stop new background work while the HTTP server drains accepted requests.
+    fn begin_http_drain(&self) {
+        self.services.cancel();
+    }
+
+    /// Stop and flush the responses writer after every accepted request has finished.
+    fn finish_http_drain(&self) {
+        self.services.cancel();
+        self.responses_writer.cancel();
+    }
+
+    /// Whether a task's own shutdown phase has begun. The responses writer
+    /// remains supervised while HTTP requests drain because it is still
+    /// responsible for persisting their completion records.
+    fn task_is_shutting_down(&self, task_name: &str) -> bool {
+        if task_name == RESPONSES_WRITER_TASK_NAME {
+            self.responses_writer.is_cancelled()
+        } else {
+            self.services.is_cancelled()
+        }
+    }
+}
+
 pub struct BackgroundServices {
     request_manager: Arc<fusillade_arsenal::PostgresRequestManager<DbPools>>,
     /// The onwards-instance daemon id registered in the `daemons` table
@@ -3023,7 +3073,7 @@ pub struct BackgroundServices {
     background_tasks: tokio::task::JoinSet<anyhow::Result<()>>,
     // Map task IDs to names for logging
     task_names: std::collections::HashMap<tokio::task::Id, &'static str>,
-    shutdown_token: tokio_util::sync::CancellationToken,
+    shutdown_tokens: BackgroundShutdownTokens,
     // Pub so that we can disarm it if we want to
     pub drop_guard: Option<tokio_util::sync::DropGuard>,
     /// Connections encryption key, derived once at startup.
@@ -3041,6 +3091,11 @@ impl BackgroundServices {
         self.task_names.insert(abort_handle.id(), name);
     }
 
+    fn task_is_shutting_down(&self, task_id: tokio::task::Id) -> bool {
+        let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
+        self.shutdown_tokens.task_is_shutting_down(task_name)
+    }
+
     /// Wait for any background task to complete (indicating a failure)
     /// This method is cancel-safe - can be used in tokio::select! without losing tasks
     /// Returns an error with details about which task failed
@@ -3052,7 +3107,7 @@ impl BackgroundServices {
                     futures::future::pending::<()>().await;
                     unreachable!()
                 }
-                Some(Ok((task_id, Ok(())))) if self.shutdown_token.is_cancelled() => {
+                Some(Ok((task_id, Ok(())))) if self.task_is_shutting_down(task_id) => {
                     let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
                     tracing::debug!(task = task_name, "Background task completed during shutdown");
                 }
@@ -3067,7 +3122,7 @@ impl BackgroundServices {
                     );
                     anyhow::bail!("Background task '{}' completed early", task_name)
                 }
-                Some(Ok((task_id, Err(e)))) if self.shutdown_token.is_cancelled() => {
+                Some(Ok((task_id, Err(e)))) if self.task_is_shutting_down(task_id) => {
                     let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
                     tracing::debug!(task = task_name, error = %e, "Background task exited with error during shutdown");
                 }
@@ -3076,7 +3131,7 @@ impl BackgroundServices {
                     crate::background_error!(SUPERVISOR, "task_failed", Error, task = task_name, error = %e, "Background task failed");
                     anyhow::bail!("Background task '{}' failed: {}", task_name, e)
                 }
-                Some(Err(e)) if self.shutdown_token.is_cancelled() => {
+                Some(Err(e)) if self.task_is_shutting_down(e.id()) => {
                     let task_id = e.id();
                     let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
                     tracing::debug!(task = task_name, error = %e, "Background task panicked during shutdown");
@@ -3091,9 +3146,9 @@ impl BackgroundServices {
         }
     }
 
-    /// Get a clone of the shutdown token for coordinating early cancellation
+    /// Get the eager shutdown token used by services that stop during HTTP drain.
     pub fn shutdown_token(&self) -> tokio_util::sync::CancellationToken {
-        self.shutdown_token.clone()
+        self.shutdown_tokens.services()
     }
 
     /// Gracefully shutdown all background tasks.
@@ -3101,12 +3156,16 @@ impl BackgroundServices {
     /// Implements the SIGTERM drain protocol from
     /// `fusillade/docs/plans/2026-04-28-multi-step-responses.md`:
     ///
-    /// 1. Signal all in-process tasks to stop accepting new work
-    ///    (`shutdown_token.cancel()`). The fusillade batch daemon stops
+    /// 1. Signal all in-process tasks to stop accepting new work. The eager
+    ///    token normally fires when HTTP draining begins; cancellation here is
+    ///    idempotent. The fusillade batch daemon stops
     ///    claiming and waits for in-flight workers to finish their
     ///    current loop iteration; it then marks its own daemon row Dead
     ///    via the `Running -> Dead` typestate transition.
-    /// 2. Drain the **onwards-instance daemon** registration: this row
+    /// 2. Now that accepted HTTP requests have finished, stop the responses
+    ///    writer so it closes the channel, drains queued completion records,
+    ///    and flushes them to fusillade.
+    /// 3. Drain the **onwards-instance daemon** registration: this row
     ///    is created manually for realtime/inline-loop attribution and
     ///    is not managed by fusillade's daemon lifecycle, so we mark it
     ///    Dead explicitly + release any rows it owns back to pending.
@@ -3118,8 +3177,10 @@ impl BackgroundServices {
     /// shutdown — a slow/missing drain falls back to time-based
     /// reclaim, which is correct just slower.
     pub async fn shutdown(mut self) {
-        // Signal all background tasks to shutdown
-        self.shutdown_token.cancel();
+        // The HTTP server has finished draining, so no response handler can
+        // enqueue another completion. Stop the remaining background tasks and
+        // let the responses writer close its receiver and flush its buffer.
+        self.shutdown_tokens.finish_http_drain();
 
         // Drain the onwards-instance daemon registration before joining
         // tasks: this is the SIGTERM drain that gives the next pod
@@ -3512,6 +3573,13 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         metrics_recorder,
         keystore,
     } = input;
+
+    // Most background work stops as soon as HTTP draining begins. The
+    // responses writer is deliberately independent: accepted streaming
+    // requests can still finish and enqueue completion records until Axum's
+    // graceful shutdown returns.
+    let shutdown_tokens = BackgroundShutdownTokens::new(shutdown_token);
+    let shutdown_token = shutdown_tokens.services();
 
     let db_pools = pools.main.pooled.clone();
     let fusillade_pools = pools.fusillade.pooled.clone();
@@ -4083,8 +4151,8 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
             request_manager.clone(),
             config.background_services.task_workers.response_writer_batch_size,
         );
-        let writer_shutdown = shutdown_token.clone();
-        background_tasks.spawn("responses-writer", async move {
+        let writer_shutdown = shutdown_tokens.responses_writer();
+        background_tasks.spawn(RESPONSES_WRITER_TASK_NAME, async move {
             writer.run(writer_shutdown).await;
             Ok(())
         });
@@ -4138,7 +4206,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         requests_writer_sender,
         background_tasks,
         task_names,
-        shutdown_token,
+        shutdown_tokens,
         drop_guard: Some(drop_guard),
         connections_encryption_key: encryption_key.clone(),
         keystore,
@@ -4637,10 +4705,10 @@ impl Application {
         // for in-flight connections to close. This lets background services (e.g.,
         // fusillade daemon) abort in-flight HTTP tasks immediately, allowing
         // proxy connections to close and axum's graceful shutdown to complete.
-        let shutdown_token = self.bg_services.shutdown_token();
+        let shutdown_tokens = self.bg_services.shutdown_tokens.clone();
         let shutdown = async move {
             shutdown.await;
-            shutdown_token.cancel();
+            shutdown_tokens.begin_http_drain();
         };
 
         // Streamed responses are many small writes; send each one immediately
