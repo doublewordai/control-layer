@@ -5325,9 +5325,59 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
     }
 
     async fn delete_batch(&self, batch_id: BatchId) -> Result<()> {
-        // Soft-delete the batch by setting deleted_at
-        // Also cancel it if not already in a terminal state
-        // Requests are excluded from active_requests view via the JOIN on batches.deleted_at
+        let mut tx = self
+            .begin_write()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
+
+        // Read the generated-file ids without taking the batch lock yet. File
+        // deletion locks files before dependent batches, so batch deletion
+        // must use the same order to avoid a delete-file/delete-batch
+        // deadlock. The batch row is rechecked by the guarded UPDATE below.
+        let generated_files = sqlx::query!(
+            r#"
+            SELECT output_file_id, error_file_id
+            FROM batches
+            WHERE id = $1
+              AND deleted_at IS NULL
+            "#,
+            *batch_id as Uuid,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch for deletion: {}", e)))?
+        .ok_or_else(|| FusilladeError::Other(anyhow!("Batch not found")))?;
+
+        let mut generated_file_ids = [
+            generated_files.output_file_id,
+            generated_files.error_file_id,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        generated_file_ids.sort_unstable();
+        generated_file_ids.dedup();
+
+        if !generated_file_ids.is_empty() {
+            sqlx::query_scalar::<_, Uuid>(
+                r#"
+                SELECT id
+                FROM files
+                WHERE id = ANY($1)
+                ORDER BY id
+                FOR UPDATE
+                "#,
+            )
+            .bind(&generated_file_ids)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to lock batch result files: {}", e))
+            })?;
+        }
+
+        // Soft-delete the batch and cancel it if it is not already terminal.
+        // Requests are excluded from active_requests via batches.deleted_at.
         let rows_affected = sqlx::query!(
             r#"
             UPDATE batches
@@ -5347,7 +5397,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             "#,
             *batch_id as Uuid,
         )
-        .execute(self.write_executor())
+        .execute(&mut *tx)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to soft-delete batch: {}", e)))?
         .rows_affected();
@@ -5355,6 +5405,30 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         if rows_affected == 0 {
             return Err(FusilladeError::Other(anyhow!("Batch not found")));
         }
+
+        // Output and error files are created by the batch and are part of its
+        // associated data. The uploaded input file is deliberately excluded.
+        if !generated_file_ids.is_empty() {
+            sqlx::query!(
+                r#"
+                UPDATE files
+                SET deleted_at = NOW(),
+                    status = 'deleted'
+                WHERE id = ANY($1)
+                  AND deleted_at IS NULL
+                "#,
+                &generated_file_ids,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to soft-delete batch result files: {}", e))
+            })?;
+        }
+
+        tx.commit().await.map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to commit batch deletion: {}", e))
+        })?;
 
         Ok(())
     }
@@ -16840,10 +16914,20 @@ mod tests {
             })
             .await
             .unwrap();
+        let output_file_id = batch
+            .output_file_id
+            .expect("batch should have an output file");
+        let error_file_id = batch
+            .error_file_id
+            .expect("batch should have an error file");
 
         // Verify batch exists
         let batch_before = manager.get_batch(batch.id).await;
         assert!(batch_before.is_ok());
+
+        // Generated result files exist for the lifetime of the batch.
+        assert!(manager.get_file(output_file_id).await.is_ok());
+        assert!(manager.get_file(error_file_id).await.is_ok());
 
         // Verify requests exist
         let requests_before = manager.get_batch_requests(batch.id).await.unwrap();
@@ -16863,6 +16947,11 @@ mod tests {
         // Verify file still exists (should NOT be cascade deleted)
         let file_after = manager.get_file(file_id).await;
         assert!(file_after.is_ok());
+
+        // Generated output and error files are associated batch data and must
+        // no longer be retrievable after the batch is deleted.
+        assert!(manager.get_file(output_file_id).await.is_err());
+        assert!(manager.get_file(error_file_id).await.is_err());
 
         // Verify deleting non-existent batch returns error
         let delete_result = manager.delete_batch(batch.id).await;
