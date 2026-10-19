@@ -444,8 +444,8 @@ jsonpath "$.endpoint" == "/v1/chat/completions"
 jsonpath "$.output_file_id" != null
 jsonpath "$.error_file_id" != null
 
-# Poll until the worker populates the batch and leaves validation. A one-request
-# batch may complete entirely between polls, so both successful states are valid.
+# Poll until the worker populates the batch and transitions out of validating.
+# A fast worker may complete the batch before this request observes in_progress.
 GET http://localhost:3001/ai/v1/batches/{{user1_batch_id}}
 [Options]
 retry: 10
