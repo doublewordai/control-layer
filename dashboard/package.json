@@ -84,6 +84,7 @@
     "globals": "^17.0.0",
     "jsdom": "^29.0.0",
     "msw": "^2.10.5",
+    "rollup": "npm:@rollup/wasm-node@^4.64.0",
     "rollup-plugin-visualizer": "^7.0.0",
     "tailwindcss": "^4.1.12",
     "typescript": "~5.9.2",
