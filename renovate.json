@@ -3,6 +3,9 @@
   "extends": [
     "config:recommended"
   ],
+  "constraints": {
+    "pnpm": "10.34.7"
+  },
   "packageRules": [
     {
       "description": "Group Cargo patch updates without mixing in breaking minor updates",
