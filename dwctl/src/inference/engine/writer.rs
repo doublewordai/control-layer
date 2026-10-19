@@ -683,16 +683,19 @@ fn response_write_error_class(error: &fusillade::FusilladeError) -> &'static str
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::io::Write;
+    use std::time::Duration;
+
     use fusillade::RequestId;
     use fusillade::ReqwestHttpClient;
     use fusillade_arsenal::PostgresRequestManager;
     use sqlx_pool_router::TestDbPools;
-    use std::io::Write;
-    use std::time::Duration;
     use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
+
+    use super::*;
+    use crate::{BackgroundShutdownTokens, RESPONSES_WRITER_TASK_NAME};
 
     #[derive(Clone)]
     struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
@@ -1116,6 +1119,39 @@ mod tests {
             !logs.contains(&request_id.to_string()),
             "request identity leaked into tracing output"
         );
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_writer_accepts_completion_while_http_server_drains(pool: sqlx::PgPool) {
+        let (writer, sender, manager) = build_writer(pool).await;
+        let shutdown = BackgroundShutdownTokens::new(CancellationToken::new());
+        let writer_shutdown = shutdown.responses_writer();
+        let handle = tokio::spawn(writer.run(writer_shutdown.clone()));
+
+        // SIGTERM stops the other background services immediately, but Axum
+        // can still be serving an accepted response. The writer must remain
+        // available until that HTTP drain completes.
+        shutdown.begin_http_drain();
+        assert!(shutdown.task_is_shutting_down("ordinary-background-service"));
+        assert!(!writer_shutdown.is_cancelled());
+        assert!(!shutdown.task_is_shutting_down(RESPONSES_WRITER_TASK_NAME));
+
+        let request_id = Uuid::new_v4();
+        sender
+            .send(test_record(request_id))
+            .await
+            .expect("completion should be accepted during HTTP drain");
+
+        let detail = wait_until_completed(&manager, request_id, 5).await;
+        assert_eq!(detail.status, "completed");
+
+        shutdown.finish_http_drain();
+        assert!(shutdown.task_is_shutting_down(RESPONSES_WRITER_TASK_NAME));
+        timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("writer should shut down after HTTP drain")
+            .expect("writer task should not panic");
+        assert_accounting_zero(&sender.accounting);
     }
 
     #[dwctl_test_macros::test]
