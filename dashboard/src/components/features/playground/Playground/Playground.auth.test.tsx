@@ -6,9 +6,9 @@ describe("Playground OpenAI Client Authentication", () => {
   let originalFetch: typeof fetch;
 
   beforeEach(() => {
-    originalFetch = global.fetch;
+    originalFetch = globalThis.fetch;
     fetchSpy = vi
-      .spyOn(global, "fetch")
+      .spyOn(globalThis, "fetch")
       .mockImplementation(async (url, _init) => {
         // Return a mock streaming response for OpenAI API calls
         if (url.toString().includes("/chat/completions")) {
@@ -41,7 +41,7 @@ describe("Playground OpenAI Client Authentication", () => {
 
   afterEach(() => {
     fetchSpy.mockRestore();
-    global.fetch = originalFetch;
+    globalThis.fetch = originalFetch;
   });
 
   it("does not send Authorization header when defaultHeaders overrides it", async () => {
@@ -49,7 +49,7 @@ describe("Playground OpenAI Client Authentication", () => {
     // (like in Playground component)
     const openai = new OpenAI({
       baseURL: "http://localhost:3000/admin/api/v1/ai/v1",
-      apiKey: "", // SDK requires this
+      apiKey: "test-api-key", // SDK requires a non-empty value
       dangerouslyAllowBrowser: true,
       defaultHeaders: {
         // Override Authorization header to prevent it from being sent

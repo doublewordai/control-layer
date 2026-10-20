@@ -37,7 +37,7 @@ class MockResizeObserver {
   disconnect() {}
 }
 
-global.ResizeObserver = MockResizeObserver;
+globalThis.ResizeObserver = MockResizeObserver;
 
 // Add missing MSW handlers for requests analytics
 const requestsAnalyticsHandler = http.get(
