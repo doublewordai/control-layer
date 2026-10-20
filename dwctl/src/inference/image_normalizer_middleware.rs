@@ -80,7 +80,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
 
-use crate::image_normalizer::{ImageInput, ImageNormalizer, ImageToken, Mode, NormalizeError, TokenParseError, sealed, walker};
+use crate::image_normalizer::{
+    ImageInput, ImageNormalizer, ImageToken, Mode, NormalizeError, TokenParseError, image_label, sealed, walker,
+};
 use crate::inference::rejections;
 use sqlx::PgPool;
 
@@ -264,75 +266,84 @@ pub async fn image_normalizer_middleware(
     };
 
     let pool_for_access = state.pool.clone();
+    // The walker visits images one at a time in request order, so counting
+    // calls gives each image's position for error messages.
+    let mut position = 0usize;
     let substitute = move |url: String| {
+        position += 1;
+        let label = image_label(position, &url);
         let normalizer = normalizer.clone();
         let pool_for_access = pool_for_access.clone();
         let grants = grants.clone();
         let zdr_request_key = zdr_request_key.clone();
         let is_data_uri = url.starts_with("data:");
         async move {
-            // `dw-img://` token: sign it, no ingest — the bytes are already in
-            // the store — if the principal holds a grant for it (see `grants`).
-            if ImageToken::looks_like_token(&url) {
-                let token: ImageToken = url
-                    .parse()
-                    .map_err(|e: TokenParseError| NormalizeError::BadInput(format!("invalid dw-img token: {e}")))?;
-                match grants {
-                    Err(()) => return Err(NormalizeError::AccessUnavailable),
-                    Ok(set) if !set.contains(&token) => return Err(NormalizeError::Forbidden),
-                    Ok(_) => {}
+            let result = async move {
+                // `dw-img://` token: sign it, no ingest — the bytes are already in
+                // the store — if the principal holds a grant for it (see `grants`).
+                if ImageToken::looks_like_token(&url) {
+                    let token: ImageToken = url
+                        .parse()
+                        .map_err(|e: TokenParseError| NormalizeError::BadInput(format!("invalid dw-img token: {e}")))?;
+                    match grants {
+                        Err(()) => return Err(NormalizeError::AccessUnavailable),
+                        Ok(set) if !set.contains(&token) => return Err(NormalizeError::Forbidden),
+                        Ok(_) => {}
+                    }
+                    // A ZDR dispatch's sealed image: decrypt with the request key
+                    // and inline it. Signing it would hand the provider ciphertext.
+                    if zdr_dispatch_id.is_some()
+                        && let Some(blob) = normalizer.read_sealed(token).await?
+                    {
+                        return open_sealed_as_data_uri(&zdr_request_key, &blob);
+                    }
+                    // The bearer only decides the TTL: a dispatch must outlive one
+                    // full processing attempt; a client request is realtime.
+                    let signed = normalizer.sign(token, sign_ttl).await?;
+                    return Ok::<String, NormalizeError>(signed.url);
                 }
-                // A ZDR dispatch's sealed image: decrypt with the request key
-                // and inline it. Signing it would hand the provider ciphertext.
-                if zdr_dispatch_id.is_some()
-                    && let Some(blob) = normalizer.read_sealed(token).await?
-                {
-                    return open_sealed_as_data_uri(&zdr_request_key, &blob);
+                // Pass through URLs that already point at our own normalised
+                // store (a client echoing back a URL we signed). Re-ingesting
+                // and re-signing would waste a round-trip re-fetching an image we
+                // already host and clobber the original TTL with the realtime one.
+                //
+                // Not for ZDR: a ZDR request never hands the provider a URL into
+                // our store, so an echoed one is fetched and inlined below.
+                if !is_data_uri && !zdr && normalizer.owns_url(&url) {
+                    return Ok::<String, NormalizeError>(url);
                 }
-                // The bearer only decides the TTL: a dispatch must outlive one
-                // full processing attempt; a client request is realtime.
-                let signed = normalizer.sign(token, sign_ttl).await?;
-                return Ok::<String, NormalizeError>(signed.url);
+                let input = if is_data_uri {
+                    ImageInput::DataUri(url)
+                } else {
+                    ImageInput::HttpUrl(url)
+                };
+                // ZDR: fetch and validate, but never store — inline the bytes.
+                if zdr {
+                    let (mime, bytes) = normalizer.load(input).await?;
+                    return Ok(sealed::to_data_uri(&mime, &bytes));
+                }
+                let ingested = normalizer.ingest(input).await?;
+                // Same TTL rule as for tokens: a daemon loopback (a synced record
+                // keeps its raw image URLs until dispatch) must outlive one full
+                // processing attempt; a client request is realtime.
+                let signed = normalizer.sign(ingested.token, sign_ttl).await?;
+                // Best-effort image_access bookkeeping: fire-and-forget so
+                // the realtime request path isn't blocked. Records real
+                // (mime, bytes_len) captured from the ingest result rather
+                // than empty placeholders — useful for any future
+                // dedup-stats or storage-accounting query.
+                if let (Some(pool), Some(attribution)) = (pool_for_access, attribution_for_access) {
+                    let mime = ingested.mime.clone();
+                    let bytes_len = ingested.bytes_len;
+                    let token = ingested.token;
+                    tokio::spawn(async move {
+                        crate::api::handlers::images::record_image_access(&pool.write(), attribution, token, &mime, bytes_len).await;
+                    });
+                }
+                Ok::<String, NormalizeError>(signed.url)
             }
-            // Pass through URLs that already point at our own normalised
-            // store (a client echoing back a URL we signed). Re-ingesting
-            // and re-signing would waste a round-trip re-fetching an image we
-            // already host and clobber the original TTL with the realtime one.
-            //
-            // Not for ZDR: a ZDR request never hands the provider a URL into
-            // our store, so an echoed one is fetched and inlined below.
-            if !is_data_uri && !zdr && normalizer.owns_url(&url) {
-                return Ok::<String, NormalizeError>(url);
-            }
-            let input = if is_data_uri {
-                ImageInput::DataUri(url)
-            } else {
-                ImageInput::HttpUrl(url)
-            };
-            // ZDR: fetch and validate, but never store — inline the bytes.
-            if zdr {
-                let (mime, bytes) = normalizer.load(input).await?;
-                return Ok(sealed::to_data_uri(&mime, &bytes));
-            }
-            let ingested = normalizer.ingest(input).await?;
-            // Same TTL rule as for tokens: a daemon loopback (a synced record
-            // keeps its raw image URLs until dispatch) must outlive one full
-            // processing attempt; a client request is realtime.
-            let signed = normalizer.sign(ingested.token, sign_ttl).await?;
-            // Best-effort image_access bookkeeping: fire-and-forget so
-            // the realtime request path isn't blocked. Records real
-            // (mime, bytes_len) captured from the ingest result rather
-            // than empty placeholders — useful for any future
-            // dedup-stats or storage-accounting query.
-            if let (Some(pool), Some(attribution)) = (pool_for_access, attribution_for_access) {
-                let mime = ingested.mime.clone();
-                let bytes_len = ingested.bytes_len;
-                let token = ingested.token;
-                tokio::spawn(async move {
-                    crate::api::handlers::images::record_image_access(&pool.write(), attribution, token, &mime, bytes_len).await;
-                });
-            }
-            Ok::<String, NormalizeError>(signed.url)
+            .await;
+            result.map_err(|e| e.for_image(&label))
         }
     };
 
@@ -430,46 +441,53 @@ pub(crate) async fn normalize_value_to_tokens(
 ) -> Result<usize, NormalizeError> {
     let normalizer = normalizer.clone();
     let seal_key: Option<Arc<[u8]>> = seal_key.map(Arc::from);
+    let mut position = 0usize;
     let substitute = move |url: String| {
+        position += 1;
+        let label = image_label(position, &url);
         let normalizer = normalizer.clone();
         let access_pool = access_pool.clone();
         let seal_key = seal_key.clone();
         let is_data_uri = url.starts_with("data:");
         async move {
-            let input = if is_data_uri {
-                ImageInput::DataUri(url)
-            } else {
-                ImageInput::HttpUrl(url)
-            };
-            let ingested = match seal_key {
-                Some(key) => normalizer.ingest_sealed(input, &key).await?,
-                None => normalizer.ingest(input).await?,
-            };
-            // AWAITED and REQUIRED, not fire-and-forget: this row is what
-            // authorises signing the token — for the daemon's dispatch of this
-            // request (which can follow within the claim interval) and for the
-            // customer re-sending it later alike. A submission
-            // whose bookkeeping cannot be written — or whose caller cannot be
-            // attributed, which a just-authenticated key never is — fails
-            // retryably (503) rather than persisting tokens nobody may re-send.
-            if let Some(pool) = access_pool {
-                let Some(attribution) = attribution else {
-                    return Err(NormalizeError::AccessUnavailable);
+            let result = async move {
+                let input = if is_data_uri {
+                    ImageInput::DataUri(url)
+                } else {
+                    ImageInput::HttpUrl(url)
                 };
-                crate::api::handlers::images::try_record_image_access(
-                    &pool,
-                    attribution,
-                    ingested.token,
-                    &ingested.mime,
-                    ingested.bytes_len,
-                )
-                .await
-                .map_err(|e| {
-                    warn!(error = %e, "image_access bookkeeping failed on flex enqueue");
-                    NormalizeError::AccessUnavailable
-                })?;
+                let ingested = match seal_key {
+                    Some(key) => normalizer.ingest_sealed(input, &key).await?,
+                    None => normalizer.ingest(input).await?,
+                };
+                // AWAITED and REQUIRED, not fire-and-forget: this row is what
+                // authorises signing the token — for the daemon's dispatch of this
+                // request (which can follow within the claim interval) and for the
+                // customer re-sending it later alike. A submission
+                // whose bookkeeping cannot be written — or whose caller cannot be
+                // attributed, which a just-authenticated key never is — fails
+                // retryably (503) rather than persisting tokens nobody may re-send.
+                if let Some(pool) = access_pool {
+                    let Some(attribution) = attribution else {
+                        return Err(NormalizeError::AccessUnavailable);
+                    };
+                    crate::api::handlers::images::try_record_image_access(
+                        &pool,
+                        attribution,
+                        ingested.token,
+                        &ingested.mime,
+                        ingested.bytes_len,
+                    )
+                    .await
+                    .map_err(|e| {
+                        warn!(error = %e, "image_access bookkeeping failed on flex enqueue");
+                        NormalizeError::AccessUnavailable
+                    })?;
+                }
+                Ok::<String, NormalizeError>(ingested.token.to_dw_img_uri())
             }
-            Ok::<String, NormalizeError>(ingested.token.to_dw_img_uri())
+            .await;
+            result.map_err(|e| e.for_image(&label))
         }
     };
     walker::substitute_with(body, Mode::All, substitute).await

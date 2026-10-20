@@ -82,6 +82,8 @@ pub struct RawAnalyticsRecord {
     /// Why the model stopped — `stop`, `length`, `tool_calls`, ... `None` when the
     /// response shape has no such concept (embeddings, the Responses API) or it could not
     /// be read. `tool_calls` is what makes CLIENT-side tool loops visible.
+    /// `client_disconnected` (not an OpenAI value) marks a response the client
+    /// dropped before any finish reason arrived.
     ///
     /// Extracted by `serializers::extract_finish_reason`, like every other field on this
     /// struct that comes off the payload. The batcher deliberately never sees a request or
