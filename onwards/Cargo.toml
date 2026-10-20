@@ -23,6 +23,7 @@ flate2 = "1"
 clap = { version = "4.5.40", features = ["derive", "env"] }
 dashmap = "6.1.0"
 futures-util = "0.3"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 hyper = "1.0"
 hyper-util = { version = "0.1.0", features = [
   "client",
@@ -65,6 +66,7 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 axum-test = "18.0.0"
 futures-util = "0.3"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 rstest = "0.26.1"
 tower = "0.5"
 wiremock = "0.6"

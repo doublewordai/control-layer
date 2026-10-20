@@ -1,6 +1,6 @@
-//! Span attributes for the requests onwards rejects itself, and for those
-//! using parameters not every worker supports, using an in-memory span
-//! exporter.
+//! Span attributes for the requests onwards rejects itself, for those using
+//! parameters not every worker supports, and for the upstream request, using
+//! an in-memory span exporter.
 
 use std::sync::{Arc, Mutex};
 
@@ -246,4 +246,20 @@ async fn forwarded_unsupported_params_are_recorded_on_the_request_span() {
     );
     assert_eq!(attribute(request, "error.type"), None);
     assert_caller(request);
+}
+
+#[tokio::test]
+async fn upstream_request_span_names_the_server_host() {
+    let (status, spans) = send(
+        "/chat/completions",
+        json!({"model": ALIAS, "messages": [{"role": "user", "content": "Hello"}]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let upstream = span(&spans, "onwards.upstream_request");
+    assert_eq!(
+        attribute(upstream, "server.address"),
+        Some(AttributeValue::from("upstream.example.com"))
+    );
 }
