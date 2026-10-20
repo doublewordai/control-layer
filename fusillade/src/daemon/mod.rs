@@ -349,6 +349,22 @@ fn renewed_heartbeat_lease_anchor(
     (completed_at < current_anchor + lease_duration).then_some(heartbeat_started_at)
 }
 
+fn scoped_daemon_shutdown_token(
+    parent: &tokio_util::sync::CancellationToken,
+) -> tokio_util::sync::CancellationToken {
+    parent.child_token()
+}
+
+fn daemon_shutdown_result(heartbeat_lease_lost: bool) -> Result<()> {
+    if heartbeat_lease_lost {
+        Err(FusilladeError::Other(anyhow::anyhow!(
+            "heartbeat lease expired; daemon process must restart"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 /// Run maintenance work only while the daemon remains live. Dropping the
 /// future cancels an in-flight SQLx operation and its transaction.
 async fn until_shutdown<T>(
@@ -1808,7 +1824,10 @@ where
             claim_mutex: Arc::new(tokio::sync::Mutex::new(())),
             requests_processed: Arc::new(AtomicU64::new(0)),
             requests_failed: Arc::new(AtomicU64::new(0)),
-            shutdown_token,
+            // The daemon may self-fence by cancelling its own work. Keep that
+            // cancellation below the caller's process-wide token so the
+            // supervisor can distinguish lease loss from operator shutdown.
+            shutdown_token: scoped_daemon_shutdown_token(&shutdown_token),
             cancellation_tokens: Arc::new(dashmap::DashMap::new()),
         }
     }
@@ -3050,9 +3069,7 @@ where
         // run_with_mode exists so split-fleet binaries override the config,
         // and per-role labels are what let one role's exit never zero
         // another's signal. Dashboards: `min by (pod) (fusillade_daemon_up)`
-        // catches any dead role. A hard process abort can still skip the
-        // final scrape, so alerting pairs this with heartbeat-rate
-        // (FusilladeDaemonDown family).
+        // catches any dead role while the process is still scrapeable.
         struct LivenessGaugeGuard {
             mode_label: &'static str,
         }
@@ -3084,12 +3101,15 @@ where
         );
         let heartbeat_lease_duration = Duration::from_millis(self.config.stale_daemon_threshold_ms);
         let shutdown_signal = self.shutdown_token.clone();
+        let heartbeat_lease_lost = Arc::new(AtomicBool::new(false));
+        let heartbeat_lease_lost_signal = heartbeat_lease_lost.clone();
 
         let heartbeat_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(heartbeat_interval_ms));
             let mut daemon_record = running_record;
             let mut lease_anchor = std::time::Instant::now();
             let handle_lease_loss = || {
+                heartbeat_lease_lost_signal.store(true, Ordering::Release);
                 counter!("fusillade_heartbeat_lease_lost_total").increment(1);
                 crate::background_error!(
                     "heartbeat_lease_lost", Error,
@@ -3798,7 +3818,7 @@ where
                 biased;
                 _ = self.shutdown_token.cancelled() => {
                     tracing::info!("Shutdown signal received, stopping daemon");
-                    break Ok(());
+                    break daemon_shutdown_result(heartbeat_lease_lost.load(Ordering::Acquire));
                 }
                 child_result = supervise_next_daemon_child(&mut daemon_children), if !daemon_children.is_empty() => {
                     self.shutdown_token.cancel();
@@ -5936,6 +5956,36 @@ mod tests {
             None,
             "a write completing at the old deadline must not renew ownership"
         );
+    }
+
+    #[test]
+    fn daemon_self_fence_does_not_cancel_its_caller() {
+        let caller_shutdown = tokio_util::sync::CancellationToken::new();
+        let daemon_shutdown = scoped_daemon_shutdown_token(&caller_shutdown);
+
+        daemon_shutdown.cancel();
+
+        assert!(daemon_shutdown.is_cancelled());
+        assert!(
+            !caller_shutdown.is_cancelled(),
+            "self-fencing one daemon must not disguise the failure as process shutdown"
+        );
+
+        let replacement_daemon_shutdown = scoped_daemon_shutdown_token(&caller_shutdown);
+        caller_shutdown.cancel();
+        assert!(
+            replacement_daemon_shutdown.is_cancelled(),
+            "operator shutdown must still propagate into the daemon"
+        );
+    }
+
+    #[test]
+    fn heartbeat_lease_loss_is_a_daemon_failure() {
+        assert!(daemon_shutdown_result(false).is_ok());
+
+        let error = daemon_shutdown_result(true)
+            .expect_err("lease loss must reach the process supervisor as a failure");
+        assert!(error.to_string().contains("heartbeat lease expired"));
     }
 
     #[tokio::test]
