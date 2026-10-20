@@ -3389,6 +3389,10 @@ fn supervise_elected_fusillade_daemon(
     daemon_handle: tokio::task::JoinHandle<fusillade::Result<()>>,
     failure_sender: tokio::sync::mpsc::UnboundedSender<String>,
 ) -> tokio::task::JoinHandle<fusillade::Result<()>> {
+    // The leadership-loss timeout aborts this outer task. Make ownership of
+    // the inner daemon task cancellation-safe so aborting or dropping the
+    // wrapper cannot detach a still-running daemon.
+    let daemon_handle = tokio_util::task::AbortOnDropHandle::new(daemon_handle);
     tokio::spawn(async move {
         match daemon_handle.await {
             Ok(Ok(())) => Ok(()),
@@ -3502,28 +3506,35 @@ mod leadership_shutdown_tests {
     }
 
     #[tokio::test]
-    async fn leadership_loss_aborts_and_awaits_after_explicit_grace() {
-        struct DropFlag(Arc<AtomicBool>);
-        impl Drop for DropFlag {
+    async fn leadership_loss_abort_propagates_through_supervisor_wrapper() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for DropSignal {
             fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
             }
         }
 
         let token_slot = tokio::sync::Mutex::new(Some(tokio_util::sync::CancellationToken::new()));
         let handle_slot = tokio::sync::Mutex::new(None);
-        let dropped = Arc::new(AtomicBool::new(false));
-        let guard = DropFlag(dropped.clone());
-        let handle = tokio::spawn(async move {
+        let (dropped_sender, dropped_receiver) = tokio::sync::oneshot::channel();
+        let guard = DropSignal(Some(dropped_sender));
+        let daemon_handle = tokio::spawn(async move {
             let _guard = guard;
             std::future::pending::<fusillade::Result<()>>().await
         });
+        let (failure_sender, _failure_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let handle = supervise_elected_fusillade_daemon(daemon_handle, failure_sender);
         *handle_slot.lock().await = Some(handle);
         tokio::task::yield_now().await;
 
         stop_leader_fusillade_daemon(&token_slot, &handle_slot, Duration::from_millis(1)).await;
 
-        assert!(dropped.load(Ordering::SeqCst));
+        tokio::time::timeout(Duration::from_secs(1), dropped_receiver)
+            .await
+            .expect("inner daemon should be aborted promptly when its wrapper is aborted")
+            .expect("inner daemon drop signal should be delivered");
         assert!(handle_slot.lock().await.is_none());
     }
 
