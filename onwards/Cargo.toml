@@ -65,6 +65,7 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 axum-test = "18.0.0"
 futures-util = "0.3"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 rstest = "0.26.1"
 tower = "0.5"
 wiremock = "0.6"

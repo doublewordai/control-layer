@@ -4458,6 +4458,7 @@ dependencies = [
  "hyper-tls",
  "hyper-util",
  "metrics",
+ "metrics-exporter-prometheus",
  "notify",
  "opentelemetry 0.32.0",
  "opentelemetry-otlp",
