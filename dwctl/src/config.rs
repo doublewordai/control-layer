@@ -176,6 +176,9 @@ pub struct Config {
     pub analytics: AnalyticsConfig,
     /// Enable OpenTelemetry OTLP export for distributed tracing
     pub enable_otel_export: bool,
+    /// Log output format: `compact` (human-readable lines) or `json` (one
+    /// JSON object per event, for log aggregators)
+    pub log_format: LogFormat,
     /// Credit system configuration
     pub credits: CreditsConfig,
     /// Sample file generation configuration for new users
@@ -2042,6 +2045,19 @@ impl BatchConfig {
     }
 }
 
+/// How log events are written to stdout.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LogFormat {
+    /// One human-readable line per event.
+    #[default]
+    Compact,
+    /// One JSON object per event, with the event's fields at the top level
+    /// and the spans it occurred in under `span` and `spans`. Panics are
+    /// written in the same shape.
+    Json,
+}
+
 /// Which fusillade claim loops should run inside this daemon process.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -3463,6 +3479,7 @@ impl Default for Config {
             enable_analytics: true,
             analytics: AnalyticsConfig::default(),
             enable_otel_export: false,
+            log_format: LogFormat::default(),
             credits: CreditsConfig::default(),
             sample_files: SampleFilesConfig::default(),
             limits: LimitsConfig::default(),

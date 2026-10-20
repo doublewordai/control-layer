@@ -264,8 +264,8 @@ impl RequestHandler for AnalyticsHandler {
                     correlation_id = correlation_id,
                     uri = %request_data.uri,
                     response_type = %metrics.response_type,
-                    request_model = ?metrics.request_model,
-                    response_model = ?metrics.response_model,
+                    request_model = metrics.request_model.as_deref(),
+                    response_model = metrics.response_model.as_deref(),
                     "Successful generative response recorded zero tokens"
                 );
             }

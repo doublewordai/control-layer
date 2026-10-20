@@ -121,20 +121,34 @@ async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let args = cli.args;
 
-    // Load configuration
-    let config = Config::load(&args)?;
+    // Load configuration. A config that fails to load still says how to log
+    // the failure, when `log_format` itself can be read from it.
+    let config = match Config::load(&args) {
+        Ok(config) => config,
+        Err(error) => {
+            let log_format = Config::figment(&args).extract_inner("log_format").unwrap_or_default();
+            if telemetry::init_telemetry(false, log_format).is_ok() {
+                tracing::error!(error = %error, "Failed to load configuration");
+            }
+            return Err(error.into());
+        }
+    };
+
+    // Initialize telemetry (tracing + optional OpenTelemetry) before anything
+    // logs: events emitted earlier have no subscriber and are discarded.
+    let tracer_provider = telemetry::init_telemetry(config.enable_otel_export, config.log_format)?;
 
     // Validate config consistency
     config.batches.validate();
 
     // If --validate flag is set, exit successfully after config validation
     if args.validate {
+        if let Some(provider) = tracer_provider {
+            let _ = provider.shutdown();
+        }
         println!("Configuration is valid.");
         return Ok(());
     }
-
-    // Initialize telemetry (tracing + optional OpenTelemetry)
-    let tracer_provider = telemetry::init_telemetry(config.enable_otel_export)?;
 
     tracing::debug!("{:?}", args);
 
@@ -157,8 +171,15 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Run the application with graceful shutdown on SIGTERM/Ctrl+C
     let shutdown = shutdown_signal();
-    Application::new_with_config_path(config, Some(args.config.clone()), tracer_provider)
-        .await?
-        .serve(shutdown)
-        .await
+    let result = async {
+        Application::new_with_config_path(config, Some(args.config.clone()), tracer_provider)
+            .await?
+            .serve(shutdown)
+            .await
+    }
+    .await;
+    if let Err(error) = &result {
+        tracing::error!(error = format!("{error:#}"), "dwctl exited with an error");
+    }
+    result
 }

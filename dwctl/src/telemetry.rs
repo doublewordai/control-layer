@@ -12,6 +12,13 @@
 //! - `OTEL_EXPORTER_OTLP_HEADERS` - Headers as comma-separated key=value pairs. The values can have their spaces encoded URL style - i.e. replace %20 with space.
 //! - `OTEL_SERVICE_NAME` - Service name for resource identification
 //!
+//! # Log format
+//!
+//! `log_format` in the config (`DWCTL_LOG_FORMAT`) selects `compact` lines,
+//! the default, or `json`: one object per event, for log aggregators. Alert
+//! queries that read log lines depend on the JSON field names described on
+//! [`fmt_layer`], and in JSON mode panics are written in the same shape.
+//!
 //! # What gets exported
 //!
 //! Logs and traces are filtered separately. `RUST_LOG` decides what reaches the
@@ -93,14 +100,20 @@
 //! ```
 
 use axum::{extract::Request, middleware::Next, response::Response};
+use chrono::{SecondsFormat, Utc};
 use onwards::{ErrorOrigin, RequestIdentity, ServedBy};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
 pub use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::trace::Tracer;
+use serde_json::json;
+use std::backtrace::{Backtrace, BacktraceStatus};
 use std::collections::HashMap;
+use std::io::Write;
+use std::panic::PanicHookInfo;
 use tracing::{Subscriber, info};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
+use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -114,6 +127,7 @@ pub const OTEL_TRACES_FILTER: &str = "OTEL_TRACES_FILTER";
 /// and events, no repository spans or debug lines.
 pub const DEFAULT_OTEL_TRACES_FILTER: &str = "info";
 
+use crate::config::LogFormat;
 use crate::inference::rejections::RejectionCode;
 
 /// Longest account name recorded on a span. Display names are free text, and
@@ -204,40 +218,107 @@ pub fn record_ai_response_attributes<B>(response: &axum::http::Response<B>, span
 /// Initialize tracing with optional OpenTelemetry support
 ///
 /// This function sets up tracing-subscriber with:
-/// - Console output (fmt layer)
+/// - Log output on stdout, in `log_format` (see [`fmt_layer`])
 /// - OpenTelemetry OTLP export (only if `enable_otel_export` is true and configured via environment variables)
+///
+/// With [`LogFormat::Json`] it also replaces the panic hook, so a panic is
+/// written as a JSON error line rather than as plain text (see
+/// [`write_panic_as_json`]).
 ///
 /// Parameters:
 /// - `enable_otel_export`: If true, attempts to configure OTLP export using environment variables
+/// - `log_format`: How log events are written
 ///
 /// Returns the tracer provider if OTLP export was successfully enabled. The caller should
 /// store this and call `provider.shutdown()` before application exit to flush pending spans.
-pub fn init_telemetry(enable_otel_export: bool) -> anyhow::Result<Option<SdkTracerProvider>> {
+pub fn init_telemetry(enable_otel_export: bool, log_format: LogFormat) -> anyhow::Result<Option<SdkTracerProvider>> {
     let env_filter = EnvFilter::new(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()));
 
-    if enable_otel_export {
+    let (otel, provider, traces_filter) = if enable_otel_export {
         let (tracer, provider) = create_otlp_tracer()?;
         let traces_filter = std::env::var(OTEL_TRACES_FILTER).unwrap_or_else(|_| DEFAULT_OTEL_TRACES_FILTER.to_string());
-
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(tracing_subscriber::fmt::layer().compact())
-            .with(otel_layer(tracer, &traces_filter))
-            .try_init()?;
-
-        info!(traces_filter, "Telemetry initialized with OTLP export enabled");
-        return Ok(Some(provider));
+        (Some(otel_layer(tracer, &traces_filter)), Some(provider), Some(traces_filter))
     } else {
-        // OTLP export disabled - use only console logging
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(tracing_subscriber::fmt::layer().compact())
-            .try_init()?;
+        (None, None, None)
+    };
 
-        info!("Telemetry initialized (OTLP export disabled)");
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt_layer(log_format, std::io::stdout))
+        .with(otel)
+        .try_init()?;
+
+    if log_format == LogFormat::Json {
+        std::panic::set_hook(Box::new(write_panic_as_json));
     }
 
-    Ok(None)
+    match traces_filter {
+        Some(traces_filter) => info!(traces_filter, ?log_format, "Telemetry initialized with OTLP export enabled"),
+        None => info!(?log_format, "Telemetry initialized (OTLP export disabled)"),
+    }
+
+    Ok(provider)
+}
+
+/// The log output layer, writing to `writer` in `format`.
+///
+/// JSON events carry their fields at the top level (`message`, `error`,
+/// `request_model`, ...) beside `timestamp`, `level` and `target`, the
+/// innermost span under `span` and the full span list, root first, under
+/// `spans`. Loki derives `detected_level` from `level`.
+fn fmt_layer<S, W>(format: LogFormat, writer: W) -> Box<dyn Layer<S> + Send + Sync>
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+    W: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
+{
+    let layer = tracing_subscriber::fmt::layer().with_writer(writer);
+    match format {
+        LogFormat::Compact => layer.compact().boxed(),
+        LogFormat::Json => layer.json().flatten_event(true).boxed(),
+    }
+}
+
+/// Panic hook for JSON logging: writes the panic to stderr as one JSON error
+/// line, in the shape [`fmt_layer`] gives events.
+///
+/// It writes the line itself rather than emitting a tracing event, because an
+/// event can be lost exactly when it matters: `RUST_LOG` directives that don't
+/// cover the `panic` target filter it out, and a panic raised while the
+/// subscriber is handling an event is dispatched to no subscriber at all.
+fn write_panic_as_json(info: &PanicHookInfo<'_>) {
+    let line = panic_line(info, &Backtrace::capture());
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
+}
+
+/// The JSON line [`write_panic_as_json`] writes. The message reads like
+/// Rust's default panic output, so searches for `panicked at` still match.
+/// The backtrace is included when `RUST_BACKTRACE` enables capturing one.
+fn panic_line(info: &PanicHookInfo<'_>, backtrace: &Backtrace) -> serde_json::Value {
+    let payload = info
+        .payload()
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("Box<dyn Any>");
+    let thread = std::thread::current();
+    let thread = thread.name().unwrap_or("<unnamed>");
+    let location = info.location().map(ToString::to_string);
+    let message = match &location {
+        Some(location) => format!("thread '{thread}' panicked at {location}: {payload}"),
+        None => format!("thread '{thread}' panicked: {payload}"),
+    };
+    let mut line = json!({
+        "timestamp": Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true),
+        "level": "ERROR",
+        "message": message,
+        "thread": thread,
+        "location": location,
+        "target": "panic",
+    });
+    if backtrace.status() == BacktraceStatus::Captured {
+        line["backtrace"] = backtrace.to_string().into();
+    }
+    line
 }
 
 /// The span export layer: `tracer` behind its own `directives` filter, without
@@ -451,6 +532,69 @@ mod tests {
             result.is_ok(),
             "reqwest cannot make HTTPS requests — TLS not configured: {}",
             result.unwrap_err()
+        );
+    }
+
+    /// Run by [`json_logging_writes_every_error_as_one_json_line`] in a child
+    /// process, which owns the global subscriber and panic hook. Does nothing
+    /// in a normal test run.
+    #[test]
+    fn json_logging_child() {
+        if std::env::var_os(JSON_LOGGING_CHILD).is_none() {
+            return;
+        }
+        init_telemetry(false, LogFormat::Json).unwrap();
+        tracing::info_span!("request").in_scope(|| {
+            tracing::error!(error = "first line\nsecond line", request_model = Some("model-a"), "tracing error");
+        });
+        log::error!("log crate error");
+        let _ = std::thread::spawn(|| panic!("worker panic")).join();
+    }
+
+    const JSON_LOGGING_CHILD: &str = "DWCTL_JSON_LOGGING_TEST_CHILD";
+
+    /// With `log_format: json`, a tracing error (multi-line message included),
+    /// a `log`-crate error from a dependency and a panic each reach the output
+    /// as a single JSON line at level `ERROR`. Runs the real initialization in
+    /// a child process, since it installs the global subscriber and panic hook.
+    #[test]
+    fn json_logging_writes_every_error_as_one_json_line() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "telemetry::tests::json_logging_child", "--nocapture"])
+            .env(JSON_LOGGING_CHILD, "1")
+            .env("RUST_LOG", "info")
+            .output()
+            .expect("start json logging child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "json logging child failed:\n{stdout}\n{stderr}");
+
+        let lines: Vec<serde_json::Value> = stdout
+            .lines()
+            .chain(stderr.lines())
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let find = |message: &str| {
+            lines
+                .iter()
+                .find(|line| line["message"].as_str().is_some_and(|m| m.contains(message)))
+                .unwrap_or_else(|| panic!("no JSON line for {message:?}:\n{stdout}\n{stderr}"))
+        };
+
+        let tracing_error = find("tracing error");
+        assert_eq!(tracing_error["level"], "ERROR");
+        assert_eq!(tracing_error["error"], "first line\nsecond line");
+        assert_eq!(tracing_error["request_model"], "model-a");
+        assert_eq!(tracing_error["spans"][0]["name"], "request");
+
+        assert_eq!(find("log crate error")["level"], "ERROR");
+
+        let panic = find("worker panic");
+        assert_eq!(panic["level"], "ERROR");
+        assert_eq!(panic["target"], "panic");
+        assert!(
+            panic["message"].as_str().unwrap().contains("panicked at"),
+            "panic message keeps the default wording: {panic}"
         );
     }
 }

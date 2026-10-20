@@ -339,6 +339,9 @@ credits:
 # Optional feature toggles
 enable_metrics: true # Enable Prometheus metrics endpoint
 enable_request_logging: true # Enable request/response logging to database
+# Log output format: compact (human-readable lines) or json (one JSON object
+# per event, for log aggregators). Override with DWCTL_LOG_FORMAT.
+log_format: compact
 
 # Opt-in heap profile listener (GET /debug/pprof/heap, gzip pprof). Profiles exist
 # only if the process also starts with jemalloc sampling on, e.g.

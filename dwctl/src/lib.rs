@@ -99,7 +99,7 @@
 //!     let config = Config::load(&args)?;
 //!
 //!     // Initialize telemetry (structured logging and optional OpenTelemetry)
-//!     let tracer_provider = dwctl::telemetry::init_telemetry(config.enable_otel_export)?;
+//!     let tracer_provider = dwctl::telemetry::init_telemetry(config.enable_otel_export, config.log_format)?;
 //!
 //!     // Create and start the application
 //!     let app = Application::new(config, tracer_provider).await?;
