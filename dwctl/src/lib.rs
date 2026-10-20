@@ -3385,6 +3385,27 @@ struct BackgroundTaskBuilder {
 
 const FUSILLADE_LEADERSHIP_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
+fn supervise_elected_fusillade_daemon(
+    daemon_handle: tokio::task::JoinHandle<fusillade::Result<()>>,
+    failure_sender: tokio::sync::mpsc::UnboundedSender<String>,
+) -> tokio::task::JoinHandle<fusillade::Result<()>> {
+    tokio::spawn(async move {
+        match daemon_handle.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                let message = format!("Fusillade daemon error: {error}");
+                let _ = failure_sender.send(message);
+                Err(error)
+            }
+            Err(error) => {
+                let message = format!("Fusillade daemon panic: {error}");
+                let _ = failure_sender.send(message.clone());
+                Err(fusillade::FusilladeError::Other(anyhow::anyhow!(message)))
+            }
+        }
+    })
+}
+
 async fn stop_leader_fusillade_daemon(
     leadership_shutdown: &tokio::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
     daemon_handle: &tokio::sync::Mutex<Option<tokio::task::JoinHandle<fusillade::Result<()>>>>,
@@ -3452,7 +3473,7 @@ async fn stop_leader_fusillade_daemon(
 
 #[cfg(test)]
 mod leadership_shutdown_tests {
-    use super::stop_leader_fusillade_daemon;
+    use super::{stop_leader_fusillade_daemon, supervise_elected_fusillade_daemon};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
@@ -3504,6 +3525,36 @@ mod leadership_shutdown_tests {
 
         assert!(dropped.load(Ordering::SeqCst));
         assert!(handle_slot.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn elected_daemon_failure_is_forwarded_to_process_supervisor() {
+        let daemon_handle = tokio::spawn(async { Err(fusillade::FusilladeError::Other(anyhow::anyhow!("heartbeat lease expired"))) });
+        let (failure_sender, mut failure_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let supervised = supervise_elected_fusillade_daemon(daemon_handle, failure_sender);
+
+        let error = supervised
+            .await
+            .expect("supervisor wrapper should not panic")
+            .expect_err("daemon failure must be preserved for leadership-loss cleanup");
+        assert!(error.to_string().contains("heartbeat lease expired"));
+        assert_eq!(
+            failure_receiver.recv().await.as_deref(),
+            Some("Fusillade daemon error: heartbeat lease expired")
+        );
+    }
+
+    #[tokio::test]
+    async fn elected_daemon_clean_shutdown_is_not_forwarded_as_failure() {
+        let daemon_handle = tokio::spawn(async { Ok(()) });
+        let (failure_sender, mut failure_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let supervised = supervise_elected_fusillade_daemon(daemon_handle, failure_sender);
+
+        supervised
+            .await
+            .expect("supervisor wrapper should not panic")
+            .expect("clean daemon shutdown should remain clean");
+        assert!(failure_receiver.recv().await.is_none());
     }
 }
 
@@ -3842,6 +3893,18 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         let leadership_shutdown_gain = leadership_shutdown.clone();
         let leadership_shutdown_lose = leadership_shutdown.clone();
 
+        // Elected daemons also need to participate in the process-level
+        // background supervisor. Keep a wrapper handle in the leadership
+        // slot for cooperative cleanup, while forwarding any unexpected
+        // daemon error or panic through this channel so the pod exits.
+        let (leader_daemon_failure_sender, mut leader_daemon_failure_receiver) = tokio::sync::mpsc::unbounded_channel::<String>();
+        background_tasks.spawn("leader-fusillade-daemon", async move {
+            match leader_daemon_failure_receiver.recv().await {
+                Some(message) => anyhow::bail!(message),
+                None => Ok(()),
+            }
+        });
+
         let leader_election_shutdown = shutdown_token.clone();
         background_tasks.spawn("leader-election", async move {
             leader_election::leader_election_task(
@@ -3859,6 +3922,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
                     let postgres_daemon = leader_election_postgres_daemon_gain.clone();
                     let daemon_handle = daemon_handle_gain.clone();
                     let leadership_shutdown = leadership_shutdown_gain.clone();
+                    let leader_daemon_failure_sender = leader_daemon_failure_sender.clone();
                     async move {
                         // Wait for the server to be fully up before starting probes
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -3894,6 +3958,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
                                 let handle = postgres_daemon
                                     .run(session_token.clone())
                                     .map_err(|e| anyhow::anyhow!("Failed to start fusillade daemon: {}", e))?;
+                                let handle = supervise_elected_fusillade_daemon(handle, leader_daemon_failure_sender);
 
                                 // Store the handle so we can abort it when losing leadership
                                 *daemon_handle.lock().await = Some(handle);
