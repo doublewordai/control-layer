@@ -1,9 +1,11 @@
+pub mod ai_models;
 pub mod anthropic;
 pub mod batch_trace_attributes;
 pub mod cache_classifier;
 pub mod databases;
 pub mod modalities;
 pub mod rejections;
+pub mod request_log_credentials;
 pub mod responses;
 pub mod serving_classes;
 pub mod sigterm_drain;

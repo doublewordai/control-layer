@@ -28,7 +28,7 @@ fusillade = { path = "../fusillade" }
 fusillade-arsenal = { path = "../fusillade-arsenal" }
 tokio = { version = "1.0", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["rt"] }
 notify = "8.2.0"
 sqlx = { version = "0.8", features = [
   "runtime-tokio-rustls",
@@ -143,6 +143,7 @@ postgresql_embedded = { version = "0.20", optional = true, default-features = fa
 rust-embed = { version = "8.5", features = ["debug-embed"] }
 mime_guess = "2.0"
 futures = "0.3.31"
+http-body = "1"
 http-body-util = "0.1"
 dashmap = { version = "6.1.0", features = ["serde"] }
 moka = { version = "0.12", features = ["future"] }
