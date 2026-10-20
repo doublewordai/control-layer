@@ -814,13 +814,16 @@ unavailable spans, and older analytics records may have no gateway span ID.
 log_format: compact
 ```
 
-`compact` writes one human-readable line per event. `json` writes one JSON
-object per event, for log aggregators: `timestamp`, `level`, `message` and
-`target`, the event's own fields at the top level, the innermost span under
-`span` and every enclosing span, root first, under `spans`. A multi-line error
-stays on one line. In `json` mode panics are written to stderr in the same
-shape, with `target` set to `panic` and a message that starts like Rust's
-default panic output (`thread '…' panicked at …`).
+`compact` writes human-readable text for each event; a multi-line message or
+error spans several lines. `json` writes one JSON object per event, for log
+aggregators: `timestamp`, `level`, `message` and `target`, the event's own
+fields at the top level, the innermost span under `span` and every enclosing
+span, root first, under `spans`. A multi-line error stays on one line. In
+`json` mode panics are written to stderr in the same shape, including the
+spans the panic happened in, with `target` set to `panic` and a message that
+starts like Rust's default panic output (`thread '…' panicked at …`). The
+error `dwctl` exits with, including a configuration that fails to load, is
+logged once as `dwctl exited with an error`.
 
 Queries and alerts that match text in compact lines need updating when you
 switch, since the same event reads differently in each format.

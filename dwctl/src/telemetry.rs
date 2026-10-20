@@ -106,16 +106,17 @@ use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
 pub use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::trace::Tracer;
-use serde_json::json;
+use serde_json::{Map, Value, json};
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::collections::HashMap;
 use std::io::Write;
 use std::panic::PanicHookInfo;
 use tracing::{Subscriber, info};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::fmt::format::JsonFields;
+use tracing_subscriber::fmt::{FormattedFields, MakeWriter};
 use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::registry::{LookupSpan, Registry, SpanRef};
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
@@ -231,15 +232,17 @@ pub fn record_ai_response_attributes<B>(response: &axum::http::Response<B>, span
 ///
 /// Returns the tracer provider if OTLP export was successfully enabled. The caller should
 /// store this and call `provider.shutdown()` before application exit to flush pending spans.
+///
+/// If OTLP export fails to set up, logging is still installed (without
+/// export) before the error is returned, so the caller can log the error in
+/// `log_format`.
 pub fn init_telemetry(enable_otel_export: bool, log_format: LogFormat) -> anyhow::Result<Option<SdkTracerProvider>> {
     let env_filter = EnvFilter::new(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()));
-
-    let (otel, provider, traces_filter) = if enable_otel_export {
-        let (tracer, provider) = create_otlp_tracer()?;
-        let traces_filter = std::env::var(OTEL_TRACES_FILTER).unwrap_or_else(|_| DEFAULT_OTEL_TRACES_FILTER.to_string());
-        (Some(otel_layer(tracer, &traces_filter)), Some(provider), Some(traces_filter))
-    } else {
-        (None, None, None)
+    let traces_filter = std::env::var(OTEL_TRACES_FILTER).unwrap_or_else(|_| DEFAULT_OTEL_TRACES_FILTER.to_string());
+    let (otel, provider, otlp_settings, otlp_error) = match enable_otel_export.then(create_otlp_tracer) {
+        Some(Ok((tracer, provider, settings))) => (Some(otel_layer(tracer, &traces_filter)), Some(provider), Some(settings), None),
+        Some(Err(error)) => (None, None, None, Some(error)),
+        None => (None, None, None, None),
     };
 
     tracing_subscriber::registry()
@@ -252,8 +255,18 @@ pub fn init_telemetry(enable_otel_export: bool, log_format: LogFormat) -> anyhow
         std::panic::set_hook(Box::new(write_panic_as_json));
     }
 
-    match traces_filter {
-        Some(traces_filter) => info!(traces_filter, ?log_format, "Telemetry initialized with OTLP export enabled"),
+    if let Some(error) = otlp_error {
+        return Err(error.context("Failed to set up OTLP export"));
+    }
+    match otlp_settings {
+        Some(settings) => info!(
+            service_name = settings.service_name,
+            endpoint = settings.endpoint,
+            custom_headers = settings.header_count,
+            traces_filter,
+            ?log_format,
+            "Telemetry initialized with OTLP export enabled"
+        ),
         None => info!(?log_format, "Telemetry initialized (OTLP export disabled)"),
     }
 
@@ -286,14 +299,40 @@ where
 /// cover the `panic` target filter it out, and a panic raised while the
 /// subscriber is handling an event is dispatched to no subscriber at all.
 fn write_panic_as_json(info: &PanicHookInfo<'_>) {
-    let line = panic_line(info, &Backtrace::capture());
+    let line = panic_line(info, &Backtrace::capture(), current_spans());
     let _ = writeln!(std::io::stderr().lock(), "{line}");
+}
+
+/// The span the panicking thread is in and its scope, root first, shaped
+/// like the `span` and `spans` of a JSON event. The hook runs on that thread
+/// before unwinding, so this is the span of the request or task that
+/// panicked. `None` outside any span, or when the panic happened inside the
+/// subscriber, which then dispatches to no subscriber.
+fn current_spans() -> Option<(Value, Vec<Value>)> {
+    tracing::dispatcher::get_default(|dispatch| {
+        let registry = dispatch.downcast_ref::<Registry>()?;
+        let id = dispatch.current_span().id()?.clone();
+        let span = registry.span(&id)?;
+        let spans = span.scope().from_root().map(|span| span_json(&span)).collect();
+        Some((span_json(&span), spans))
+    })
+}
+
+/// A span as the JSON layer writes it: its fields, then its `name`.
+fn span_json(span: &SpanRef<'_, Registry>) -> Value {
+    let mut object = span
+        .extensions()
+        .get::<FormattedFields<JsonFields>>()
+        .and_then(|fields| serde_json::from_str::<Map<String, Value>>(fields).ok())
+        .unwrap_or_default();
+    object.insert("name".to_string(), span.name().into());
+    Value::Object(object)
 }
 
 /// The JSON line [`write_panic_as_json`] writes. The message reads like
 /// Rust's default panic output, so searches for `panicked at` still match.
 /// The backtrace is included when `RUST_BACKTRACE` enables capturing one.
-fn panic_line(info: &PanicHookInfo<'_>, backtrace: &Backtrace) -> serde_json::Value {
+fn panic_line(info: &PanicHookInfo<'_>, backtrace: &Backtrace, spans: Option<(Value, Vec<Value>)>) -> Value {
     let payload = info
         .payload()
         .downcast_ref::<&str>()
@@ -315,6 +354,10 @@ fn panic_line(info: &PanicHookInfo<'_>, backtrace: &Backtrace) -> serde_json::Va
         "location": location,
         "target": "panic",
     });
+    if let Some((span, spans)) = spans {
+        line["span"] = span;
+        line["spans"] = spans.into();
+    }
     if backtrace.status() == BacktraceStatus::Captured {
         line["backtrace"] = backtrace.to_string().into();
     }
@@ -350,7 +393,7 @@ where
 /// - OTEL_SERVICE_NAME
 ///
 /// Returns both the tracer and provider. The provider must be retained for shutdown.
-fn create_otlp_tracer() -> anyhow::Result<(Tracer, SdkTracerProvider)> {
+fn create_otlp_tracer() -> anyhow::Result<(Tracer, SdkTracerProvider, OtlpSettings)> {
     // Get service name from env or use default
     let service_name = std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "dwctl".to_string());
 
@@ -363,9 +406,6 @@ fn create_otlp_tracer() -> anyhow::Result<(Tracer, SdkTracerProvider)> {
         format!("{}/v1/traces", base.trim_end_matches('/'))
     };
 
-    eprintln!("[OTLP] Initializing OTLP tracer with the following configuration:");
-    eprintln!("[OTLP] Service Name: {}", service_name);
-    eprintln!("[OTLP] Endpoint: {}", endpoint);
     // Parse headers from environment variable
     let mut headers = HashMap::new();
     if let Ok(headers_str) = std::env::var("OTEL_EXPORTER_OTLP_HEADERS") {
@@ -381,8 +421,9 @@ fn create_otlp_tracer() -> anyhow::Result<(Tracer, SdkTracerProvider)> {
                 headers.insert(key, value);
             }
         }
-        eprintln!("[OTLP] Custom headers, length: {}", headers.len());
     }
+
+    let headers_len = headers.len();
 
     // Determine protocol
     let protocol = match std::env::var("OTEL_EXPORTER_OTLP_PROTOCOL").as_deref().unwrap_or("http/protobuf") {
@@ -409,9 +450,21 @@ fn create_otlp_tracer() -> anyhow::Result<(Tracer, SdkTracerProvider)> {
         .with_resource(resource)
         .build();
 
-    let tracer = tracer_provider.tracer(service_name);
+    let tracer = tracer_provider.tracer(service_name.clone());
+    let settings = OtlpSettings {
+        service_name,
+        endpoint,
+        header_count: headers_len,
+    };
 
-    Ok((tracer, tracer_provider))
+    Ok((tracer, tracer_provider, settings))
+}
+
+/// What [`create_otlp_tracer`] configured, logged once logging is up.
+struct OtlpSettings {
+    service_name: String,
+    endpoint: String,
+    header_count: usize,
 }
 
 #[cfg(test)]
@@ -514,7 +567,7 @@ mod tests {
 
     #[test]
     fn otlp_tracer_builds_with_http_client() {
-        let (_, provider) = create_otlp_tracer().expect(
+        let (_, provider, _) = create_otlp_tracer().expect(
             "OTLP tracer failed to build - likely a feature flag conflict \
              (reqwest-client vs reqwest-blocking-client)",
         );
@@ -543,26 +596,36 @@ mod tests {
         if std::env::var_os(JSON_LOGGING_CHILD).is_none() {
             return;
         }
-        init_telemetry(false, LogFormat::Json).unwrap();
+        // Nothing listens on the endpoint; setting up export doesn't connect.
+        let provider = init_telemetry(true, LogFormat::Json).unwrap();
+        assert!(provider.is_some());
         tracing::info_span!("request").in_scope(|| {
             tracing::error!(error = "first line\nsecond line", request_model = Some("model-a"), "tracing error");
         });
         log::error!("log crate error");
-        let _ = std::thread::spawn(|| panic!("worker panic")).join();
+        let _ = std::thread::spawn(|| {
+            tracing::info_span!("request", request_id = 7).in_scope(|| {
+                tracing::info_span!("worker").in_scope(|| panic!("worker panic"));
+            });
+        })
+        .join();
     }
 
     const JSON_LOGGING_CHILD: &str = "DWCTL_JSON_LOGGING_TEST_CHILD";
 
     /// With `log_format: json`, a tracing error (multi-line message included),
     /// a `log`-crate error from a dependency and a panic each reach the output
-    /// as a single JSON line at level `ERROR`. Runs the real initialization in
-    /// a child process, since it installs the global subscriber and panic hook.
+    /// as a single JSON line at level `ERROR`, the panic with the spans it
+    /// happened in, and setting up OTLP export prints nothing outside the log.
+    /// Runs the real initialization in a child process, since it installs the
+    /// global subscriber and panic hook.
     #[test]
     fn json_logging_writes_every_error_as_one_json_line() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "telemetry::tests::json_logging_child", "--nocapture"])
             .env(JSON_LOGGING_CHILD, "1")
             .env("RUST_LOG", "info")
+            .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:9")
             .output()
             .expect("start json logging child");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -595,6 +658,17 @@ mod tests {
         assert!(
             panic["message"].as_str().unwrap().contains("panicked at"),
             "panic message keeps the default wording: {panic}"
+        );
+        assert_eq!(panic["span"]["name"], "worker");
+        assert_eq!(panic["spans"][0]["name"], "request");
+        assert_eq!(panic["spans"][0]["request_id"], 7);
+        assert_eq!(panic["spans"][1]["name"], "worker");
+
+        let initialized = find("OTLP export enabled");
+        assert_eq!(initialized["endpoint"], "http://127.0.0.1:9/v1/traces");
+        assert!(
+            !stdout.contains("[OTLP]") && !stderr.contains("[OTLP]"),
+            "OTLP setup is logged as an event, not printed: {stderr}"
         );
     }
 }
