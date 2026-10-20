@@ -333,6 +333,10 @@ where
     /// path reads an account's resolved tolerations from here (its hidden batch
     /// key belongs to that account) so batch matches realtime.
     pub key_policy_cache: crate::sync::key_policy::KeyPolicyCache,
+    /// The live onwards targets, which dwctl's own inference rejections are
+    /// labelled from (see [`crate::inference::rejections`]). `None` labels them
+    /// with neither model nor account.
+    pub onwards_targets: Option<onwards::target::Targets>,
 }
 
 impl<P> AppState<P>
@@ -1628,7 +1632,12 @@ async fn setup_database(
 /// configuration. Origin/credential handling differs by mode — see [`apply_cors`].
 fn create_cors_layer(cors: &CorsConfig) -> anyhow::Result<CorsLayer> {
     // Parse exposed headers as HeaderName
-    let exposed: Vec<http::HeaderName> = cors.exposed_headers.iter().filter_map(|h| h.parse().ok()).collect();
+    let mut exposed: Vec<http::HeaderName> = cors.exposed_headers.iter().filter_map(|h| h.parse().ok()).collect();
+    // Always let browsers read the request ID so users can quote it in support requests.
+    let request_id_header = http::HeaderName::from_static(REQUEST_ID_HEADER);
+    if !exposed.contains(&request_id_header) {
+        exposed.push(request_id_header);
+    }
 
     let mut cors_layer = CorsLayer::new()
         .allow_methods([
@@ -2607,6 +2616,16 @@ pub async fn build_router(
         crate::inference::body_limit::limit_inference_body,
     ));
 
+    // The root span records a batch request's completion window once the
+    // response names a batch key.
+    let onwards_router = onwards_router.layer(middleware::from_fn(crate::telemetry::carry_batch_completion_window));
+
+    // Outermost, so every layer above can count the requests it refuses
+    // alongside onwards' own (`onwards_rejections_total`).
+    let onwards_router = onwards_router.layer(axum::Extension(crate::inference::rejections::Recorder::new(
+        state.onwards_targets.clone().unwrap_or_default(),
+    )));
+
     // Build the app with admin API and onwards proxy nested. serve the (restricted) openai spec.
     // Strict mode requires different nesting:
     // - Batches routes (no /v1 prefix) need to be at /ai/v1/files, /ai/v1/batches
@@ -2757,10 +2776,16 @@ pub async fn build_router(
     }
 
     // Add tracing layer with OTel-compatible span names and HTTP semantic conventions.
-    // Only trace_id and otel.name are tracing span fields (visible in fmt log output).
-    // All other attributes are set via OpenTelemetrySpanExt::set_attribute() so they're
-    // exported to the trace backend but don't clutter log lines.
+    // Tracing span fields appear on every fmt log line in the request, so only the
+    // correlation keys are fields: trace_id, otel.name, x_request_id,
+    // edge_request_id and provider_request_id (the request IDs are what
+    // `|= "x_request_id=<id>"` log queries match on), plus otel.kind, which the
+    // tracing-opentelemetry layer only reads from a field (as a raw attribute it
+    // is ignored and the span exports as `internal`). All other attributes are
+    // set via OpenTelemetrySpanExt::set_attribute() so they're exported to the
+    // trace backend but don't clutter log lines.
     // Reference: https://opentelemetry.io/docs/specs/semconv/http/http-spans/
+    let router = router.layer(middleware::from_fn(record_provider_request_id));
     let router = router.layer(middleware::from_fn(inject_trace_id)).layer(
         TraceLayer::new_for_http()
             .make_span_with(|request: &http::Request<_>| {
@@ -2784,8 +2809,24 @@ pub async fn build_router(
                 let span = tracing::info_span!(
                     "request",
                     trace_id = tracing::field::Empty,
+                    x_request_id = tracing::field::Empty,
+                    edge_request_id = tracing::field::Empty,
+                    provider_request_id = tracing::field::Empty,
                     otel.name = %span_name,
+                    otel.kind = "server",
                 );
+
+                // IDs minted by `assign_request_id`, which runs outside this layer.
+                // Declared span fields are exported as OTel attributes by the
+                // tracing-opentelemetry layer, so no separate set_attribute is needed.
+                // Recorded with `display` so log lines read `x_request_id=<id>`
+                // unquoted, matching `trace_id` and the line filters we document.
+                if let Some(ids) = request.extensions().get::<RequestIds>() {
+                    span.record("x_request_id", tracing::field::display(&ids.x_request_id));
+                    if let Some(edge) = &ids.edge_request_id {
+                        span.record("edge_request_id", tracing::field::display(edge));
+                    }
+                }
 
                 // W3C Trace Context propagation (https://www.w3.org/TR/trace-context/)
                 //
@@ -2810,7 +2851,6 @@ pub async fn build_router(
                     let _ = span.set_parent(parent);
                 }
 
-                span.set_attribute("otel.kind", "Server");
                 span.set_attribute("api.type", api_type.to_string());
                 span.set_attribute("http.request.method", request.method().to_string());
                 span.set_attribute("http.route", route.unwrap_or_default());
@@ -2822,11 +2862,19 @@ pub async fn build_router(
             .on_response(|response: &http::Response<_>, latency: std::time::Duration, span: &tracing::Span| {
                 let status = response.status().as_u16();
                 span.set_attribute("http.response.status_code", i64::from(status));
+                crate::telemetry::record_ai_response_attributes(response, span, status);
                 if status >= 500 {
                     span.set_attribute("otel.status_code", "ERROR");
                     span.set_attribute("error.type", status.to_string());
                 } else if status >= 400 {
-                    span.set_attribute("error.type", status.to_string());
+                    // A dwctl layer that refused the request reports its
+                    // rejection code instead of the bare status, and has
+                    // already set it when it recorded on this span.
+                    match response.extensions().get::<crate::inference::rejections::RejectionCode>() {
+                        Some(rejection) if rejection.recorded_on(span) => {}
+                        Some(rejection) => span.set_attribute("error.type", rejection.code()),
+                        None => span.set_attribute("error.type", status.to_string()),
+                    }
                 }
                 tracing::info!(
                     http.response.status_code = status,
@@ -2850,6 +2898,51 @@ pub async fn build_router(
     Ok(router)
 }
 
+/// Header carrying the request ID, both on responses and towards providers.
+const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// Longest foreign `X-Request-ID` we keep (`edge_request_id`, `provider_request_id`).
+const MAX_INBOUND_REQUEST_ID_LEN: usize = 128;
+
+/// Request IDs attached to the request extensions by [`assign_request_id`].
+#[derive(Debug, Clone)]
+struct RequestIds {
+    /// Freshly minted UUIDv7; the only ID we log as `x_request_id`.
+    x_request_id: String,
+    /// Sanitised inbound `X-Request-ID` (e.g. set by an ingress), kept for correlation only.
+    edge_request_id: Option<String>,
+}
+
+/// Keep a request ID we did not mint (from the edge or a provider) only if it
+/// is short, visible ASCII.
+fn sanitise_inbound_request_id(value: &http::HeaderValue) -> Option<String> {
+    let s = value.to_str().ok()?;
+    (!s.is_empty() && s.len() <= MAX_INBOUND_REQUEST_ID_LEN && s.bytes().all(|b| b.is_ascii_graphic())).then(|| s.to_owned())
+}
+
+/// Middleware that mints a unique request ID for every request.
+///
+/// An inbound `X-Request-ID` is never trusted as our ID (clients and ingresses
+/// can set it, so it is not guaranteed unique). It is preserved as
+/// `edge_request_id` and overwritten with our own value, so that onwards
+/// forwards our ID to providers. The ID is echoed on every response.
+///
+/// Applied outside every other layer, including the admin AI proxy
+/// middleware, by [`Application::serve_with_listener`] and the test server.
+async fn assign_request_id(mut request: axum::extract::Request, next: middleware::Next) -> axum::response::Response {
+    let x_request_id = Uuid::now_v7().to_string();
+    let edge_request_id = request.headers().get(REQUEST_ID_HEADER).and_then(sanitise_inbound_request_id);
+    let value = http::HeaderValue::from_str(&x_request_id).expect("UUID is a valid header value");
+    request.headers_mut().insert(REQUEST_ID_HEADER, value.clone());
+    request.extensions_mut().insert(RequestIds {
+        x_request_id,
+        edge_request_id,
+    });
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(REQUEST_ID_HEADER, value);
+    response
+}
+
 /// Middleware that records the OpenTelemetry trace ID on the current span,
 /// making it visible in fmt log output for Loki → Tempo correlation.
 ///
@@ -2870,6 +2963,22 @@ async fn inject_trace_id(mut request: axum::extract::Request, next: middleware::
     next.run(request).await
 }
 
+/// Records a provider's own `X-Request-ID`, which onwards passes through on
+/// proxied responses, as `provider_request_id` on the request span.
+///
+/// `assign_request_id` replaces the response header with our ID on the way
+/// out, so this is the only place the provider's value is kept. It is
+/// recorded even when the provider echoes back the ID we sent, so queries can
+/// rely on the field being present whenever the provider returned one.
+async fn record_provider_request_id(request: axum::extract::Request, next: middleware::Next) -> axum::response::Response {
+    let span = tracing::Span::current();
+    let response = next.run(request).await;
+    if let Some(provider) = response.headers().get(REQUEST_ID_HEADER).and_then(sanitise_inbound_request_id) {
+        span.record("provider_request_id", tracing::field::display(provider));
+    }
+    response
+}
+
 /// Container for background services and their lifecycle management.
 ///
 /// This struct encapsulates all background tasks that run alongside the HTTP server,
@@ -2882,8 +2991,58 @@ async fn inject_trace_id(mut request: axum::extract::Request, next: middleware::
 /// # Graceful Shutdown
 ///
 /// The struct provides a [`shutdown`](BackgroundServices::shutdown) method to gracefully
-/// stop all background tasks. When dropped, the `drop_guard` will automatically cancel
-/// the shutdown token, signaling all tasks to stop.
+/// stop all background tasks. Most tasks share an eager token that fires when HTTP
+/// draining begins. The responses writer has a later token so accepted requests can
+/// persist their completion before the writer flushes and exits.
+#[derive(Clone)]
+struct BackgroundShutdownTokens {
+    /// Stops daemons and other background work as soon as HTTP draining begins.
+    services: tokio_util::sync::CancellationToken,
+    /// Stops the responses writer only after accepted HTTP requests have drained.
+    responses_writer: tokio_util::sync::CancellationToken,
+}
+
+const RESPONSES_WRITER_TASK_NAME: &str = "responses-writer";
+
+impl BackgroundShutdownTokens {
+    fn new(services: tokio_util::sync::CancellationToken) -> Self {
+        Self {
+            services,
+            responses_writer: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    fn services(&self) -> tokio_util::sync::CancellationToken {
+        self.services.clone()
+    }
+
+    fn responses_writer(&self) -> tokio_util::sync::CancellationToken {
+        self.responses_writer.clone()
+    }
+
+    /// Stop new background work while the HTTP server drains accepted requests.
+    fn begin_http_drain(&self) {
+        self.services.cancel();
+    }
+
+    /// Stop and flush the responses writer after every accepted request has finished.
+    fn finish_http_drain(&self) {
+        self.services.cancel();
+        self.responses_writer.cancel();
+    }
+
+    /// Whether a task's own shutdown phase has begun. The responses writer
+    /// remains supervised while HTTP requests drain because it is still
+    /// responsible for persisting their completion records.
+    fn task_is_shutting_down(&self, task_name: &str) -> bool {
+        if task_name == RESPONSES_WRITER_TASK_NAME {
+            self.responses_writer.is_cancelled()
+        } else {
+            self.services.is_cancelled()
+        }
+    }
+}
+
 pub struct BackgroundServices {
     request_manager: Arc<fusillade_arsenal::PostgresRequestManager<DbPools>>,
     /// The onwards-instance daemon id registered in the `daemons` table
@@ -2920,7 +3079,7 @@ pub struct BackgroundServices {
     background_tasks: tokio::task::JoinSet<anyhow::Result<()>>,
     // Map task IDs to names for logging
     task_names: std::collections::HashMap<tokio::task::Id, &'static str>,
-    shutdown_token: tokio_util::sync::CancellationToken,
+    shutdown_tokens: BackgroundShutdownTokens,
     // Pub so that we can disarm it if we want to
     pub drop_guard: Option<tokio_util::sync::DropGuard>,
     /// Connections encryption key, derived once at startup.
@@ -2938,6 +3097,11 @@ impl BackgroundServices {
         self.task_names.insert(abort_handle.id(), name);
     }
 
+    fn task_is_shutting_down(&self, task_id: tokio::task::Id) -> bool {
+        let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
+        self.shutdown_tokens.task_is_shutting_down(task_name)
+    }
+
     /// Wait for any background task to complete (indicating a failure)
     /// This method is cancel-safe - can be used in tokio::select! without losing tasks
     /// Returns an error with details about which task failed
@@ -2949,7 +3113,7 @@ impl BackgroundServices {
                     futures::future::pending::<()>().await;
                     unreachable!()
                 }
-                Some(Ok((task_id, Ok(())))) if self.shutdown_token.is_cancelled() => {
+                Some(Ok((task_id, Ok(())))) if self.task_is_shutting_down(task_id) => {
                     let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
                     tracing::debug!(task = task_name, "Background task completed during shutdown");
                 }
@@ -2964,7 +3128,7 @@ impl BackgroundServices {
                     );
                     anyhow::bail!("Background task '{}' completed early", task_name)
                 }
-                Some(Ok((task_id, Err(e)))) if self.shutdown_token.is_cancelled() => {
+                Some(Ok((task_id, Err(e)))) if self.task_is_shutting_down(task_id) => {
                     let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
                     tracing::debug!(task = task_name, error = %e, "Background task exited with error during shutdown");
                 }
@@ -2973,7 +3137,7 @@ impl BackgroundServices {
                     crate::background_error!(SUPERVISOR, "task_failed", Error, task = task_name, error = %e, "Background task failed");
                     anyhow::bail!("Background task '{}' failed: {}", task_name, e)
                 }
-                Some(Err(e)) if self.shutdown_token.is_cancelled() => {
+                Some(Err(e)) if self.task_is_shutting_down(e.id()) => {
                     let task_id = e.id();
                     let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
                     tracing::debug!(task = task_name, error = %e, "Background task panicked during shutdown");
@@ -2988,9 +3152,9 @@ impl BackgroundServices {
         }
     }
 
-    /// Get a clone of the shutdown token for coordinating early cancellation
+    /// Get the eager shutdown token used by services that stop during HTTP drain.
     pub fn shutdown_token(&self) -> tokio_util::sync::CancellationToken {
-        self.shutdown_token.clone()
+        self.shutdown_tokens.services()
     }
 
     /// Gracefully shutdown all background tasks.
@@ -2998,12 +3162,16 @@ impl BackgroundServices {
     /// Implements the SIGTERM drain protocol from
     /// `fusillade/docs/plans/2026-04-28-multi-step-responses.md`:
     ///
-    /// 1. Signal all in-process tasks to stop accepting new work
-    ///    (`shutdown_token.cancel()`). The fusillade batch daemon stops
+    /// 1. Signal all in-process tasks to stop accepting new work. The eager
+    ///    token normally fires when HTTP draining begins; cancellation here is
+    ///    idempotent. The fusillade batch daemon stops
     ///    claiming and waits for in-flight workers to finish their
     ///    current loop iteration; it then marks its own daemon row Dead
     ///    via the `Running -> Dead` typestate transition.
-    /// 2. Drain the **onwards-instance daemon** registration: this row
+    /// 2. Now that accepted HTTP requests have finished, stop the responses
+    ///    writer so it closes the channel, drains queued completion records,
+    ///    and flushes them to fusillade.
+    /// 3. Drain the **onwards-instance daemon** registration: this row
     ///    is created manually for realtime/inline-loop attribution and
     ///    is not managed by fusillade's daemon lifecycle, so we mark it
     ///    Dead explicitly + release any rows it owns back to pending.
@@ -3015,8 +3183,10 @@ impl BackgroundServices {
     /// shutdown — a slow/missing drain falls back to time-based
     /// reclaim, which is correct just slower.
     pub async fn shutdown(mut self) {
-        // Signal all background tasks to shutdown
-        self.shutdown_token.cancel();
+        // The HTTP server has finished draining, so no response handler can
+        // enqueue another completion. Stop the remaining background tasks and
+        // let the responses writer close its receiver and flush its buffer.
+        self.shutdown_tokens.finish_http_drain();
 
         // Drain the onwards-instance daemon registration before joining
         // tasks: this is the SIGTERM drain that gives the next pod
@@ -3409,6 +3579,13 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         metrics_recorder,
         keystore,
     } = input;
+
+    // Most background work stops as soon as HTTP draining begins. The
+    // responses writer is deliberately independent: accepted streaming
+    // requests can still finish and enqueue completion records until Axum's
+    // graceful shutdown returns.
+    let shutdown_tokens = BackgroundShutdownTokens::new(shutdown_token);
+    let shutdown_token = shutdown_tokens.services();
 
     let db_pools = pools.main.pooled.clone();
     let fusillade_pools = pools.fusillade.pooled.clone();
@@ -3980,8 +4157,8 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
             request_manager.clone(),
             config.background_services.task_workers.response_writer_batch_size,
         );
-        let writer_shutdown = shutdown_token.clone();
-        background_tasks.spawn("responses-writer", async move {
+        let writer_shutdown = shutdown_tokens.responses_writer();
+        background_tasks.spawn(RESPONSES_WRITER_TASK_NAME, async move {
             writer.run(writer_shutdown).await;
             Ok(())
         });
@@ -4035,7 +4212,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         requests_writer_sender,
         background_tasks,
         task_names,
-        shutdown_token,
+        shutdown_tokens,
         drop_guard: Some(drop_guard),
         connections_encryption_key: encryption_key.clone(),
         keystore,
@@ -4370,6 +4547,7 @@ impl Application {
             flex_completion_window: config.batches.async_requests.completion_window.clone(),
             keystore: bg_services.keystore.clone(),
             key_policy_cache: bg_services.key_policy_cache.clone(),
+            sse_buffer_limit: config.onwards.sse_buffer_limit,
         };
 
         // Build onwards router from targets with body transform + response sanitization.
@@ -4404,7 +4582,7 @@ impl Application {
             // Realtime traffic never carries it (the realtime path only adds
             // `x-fusillade-request-id`), so it exempts exactly the daemon
             // traffic, which tolerates latency and runs its own retries.
-            .with_first_token_timeout_exempt_header("x-fusillade-batch-created-at")
+            .with_first_token_timeout_exempt_header(crate::inference::rejections::DISPATCHED_HEADER)
             .with_inflight_limiter(Arc::new(crate::realtime_inflight::RealtimeInflightLimiter::from_parts(
                 "realtime",
                 config.limits.realtime_inflight.enforce,
@@ -4450,6 +4628,7 @@ impl Application {
             .maybe_keystore(bg_services.keystore.clone())
             .response_store(response_store)
             .image_normalizer(image_normalizer)
+            .onwards_targets(bg_services.onwards_targets.clone())
             .build();
 
         if let Some(config_path) = config_path {
@@ -4494,7 +4673,9 @@ impl Application {
     pub fn into_test_server(self) -> (axum_test::TestServer, BackgroundServices) {
         // Apply middleware before path matching for tests
         let middleware = middleware::from_fn_with_state(self.app_state, admin_ai_proxy_middleware);
-        let service = middleware.layer(self.router).into_make_service();
+        let service = middleware::from_fn(assign_request_id)
+            .layer(middleware.layer(self.router))
+            .into_make_service();
         let server = axum_test::TestServer::new(service).expect("Failed to create test server");
         (server, self.bg_services)
     }
@@ -4521,18 +4702,19 @@ impl Application {
             self.config.port
         );
 
-        // Apply middleware before path matching
+        // Apply middleware before path matching. The request ID is outermost so
+        // that responses from the admin AI proxy middleware carry it too.
         let middleware = middleware::from_fn_with_state(self.app_state, admin_ai_proxy_middleware);
-        let service = middleware.layer(self.router);
+        let service = middleware::from_fn(assign_request_id).layer(middleware.layer(self.router));
 
         // Cancel shutdown token when SIGTERM arrives, BEFORE axum starts waiting
         // for in-flight connections to close. This lets background services (e.g.,
         // fusillade daemon) abort in-flight HTTP tasks immediately, allowing
         // proxy connections to close and axum's graceful shutdown to complete.
-        let shutdown_token = self.bg_services.shutdown_token();
+        let shutdown_tokens = self.bg_services.shutdown_tokens.clone();
         let shutdown = async move {
             shutdown.await;
-            shutdown_token.cancel();
+            shutdown_tokens.begin_http_drain();
         };
 
         // Streamed responses are many small writes; send each one immediately

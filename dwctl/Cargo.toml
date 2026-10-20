@@ -1,6 +1,6 @@
 [package]
 name = "dwctl"
-version = "14.0.0" # x-release-please-version
+version = "14.3.1" # x-release-please-version
 edition = "2024"
 publish = false
 description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
@@ -48,7 +48,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 serde_yaml = "0.9"
 schemars = "1.2"
-uuid = { version = "1.0", features = ["v4", "serde"] }
+uuid = { version = "1.0", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1.0"
 arc-swap = "1.7"
@@ -115,7 +115,7 @@ lettre = { version = "0.11", features = [
 ], default-features = false }
 # DNS resolver for verifying that the recipient domain of a new
 # organization contact email has at least one MX (or implicit A) record.
-hickory-resolver = { version = "0.26", default-features = false, features = [
+hickory-resolver = { version = "0.26.3", default-features = false, features = [
   "system-config",
   "tokio",
 ] }

@@ -41,7 +41,7 @@ impl<'c> ProviderDisplayConfigs<'c> {
         Self { db }
     }
 
-    #[instrument(skip(self, request), fields(provider_key = %request.provider_key), err)]
+    #[instrument(level = "debug", skip(self, request), fields(provider_key = %request.provider_key), err)]
     pub async fn create(&mut self, request: &ProviderDisplayConfigCreateDBRequest) -> Result<ProviderDisplayConfigDBResponse> {
         let row = sqlx::query_as::<_, ProviderDisplayConfig>(
             r#"
@@ -60,7 +60,7 @@ impl<'c> ProviderDisplayConfigs<'c> {
         Ok(row.into())
     }
 
-    #[instrument(skip(self), fields(provider_key = %provider_key), err)]
+    #[instrument(level = "debug", skip(self), fields(provider_key = %provider_key), err)]
     pub async fn get_by_key(&mut self, provider_key: &str) -> Result<Option<ProviderDisplayConfigDBResponse>> {
         let row = sqlx::query_as::<_, ProviderDisplayConfig>(
             r#"
@@ -76,7 +76,7 @@ impl<'c> ProviderDisplayConfigs<'c> {
         Ok(row.map(Into::into))
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn list(&mut self) -> Result<Vec<ProviderDisplayConfigDBResponse>> {
         let rows = sqlx::query_as::<_, ProviderDisplayConfig>(
             r#"
@@ -91,7 +91,7 @@ impl<'c> ProviderDisplayConfigs<'c> {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    #[instrument(skip(self, request), fields(provider_key = %provider_key), err)]
+    #[instrument(level = "debug", skip(self, request), fields(provider_key = %provider_key), err)]
     pub async fn update(
         &mut self,
         provider_key: &str,
@@ -119,7 +119,7 @@ impl<'c> ProviderDisplayConfigs<'c> {
         Ok(row.into())
     }
 
-    #[instrument(skip(self), fields(provider_key = %provider_key), err)]
+    #[instrument(level = "debug", skip(self), fields(provider_key = %provider_key), err)]
     pub async fn delete(&mut self, provider_key: &str) -> Result<bool> {
         let result = sqlx::query("DELETE FROM provider_display_configs WHERE provider_key = $1")
             .bind(provider_key)
@@ -129,7 +129,7 @@ impl<'c> ProviderDisplayConfigs<'c> {
         Ok(result.rows_affected() > 0)
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn list_known_providers(&mut self) -> Result<Vec<KnownProviderDBResponse>> {
         let rows = sqlx::query!(
             r#"

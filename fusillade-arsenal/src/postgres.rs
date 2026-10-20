@@ -39,9 +39,10 @@ use crate::daemon::{
 };
 use crate::error::{FusilladeError, Result};
 use crate::manager::{
-    RetainedResponseArchiveCutoffs, RetainedResponseArchiveOutcome,
-    RetainedResponsePartitionRunway, RetainedResponseRetirementOutcome, RetainedResponseWriteError,
-    RetentionPolicy, TrailingDemandCount,
+    FileExpiryCursor, FileExpiryStep, RetainedResponseArchiveCutoffs,
+    RetainedResponseArchiveOutcome, RetainedResponsePartitionRunway,
+    RetainedResponseRetirementOutcome, RetainedResponseWriteError, RetentionPolicy,
+    TrailingDemandCount,
 };
 use crate::request::{
     Canceled, CascadeTargetState, Claimed, Completed, CreateBackgroundInput, CreateFlexInput,
@@ -67,6 +68,29 @@ use super::utils::{
     calculate_error_message_size, calculate_response_body_size, estimate_error_file_size,
     estimate_output_file_size,
 };
+
+/// A bounded, content-free class for a stored failure: `http_<status>` when a
+/// status is known (from the stored response or the serialized
+/// [`FailureReason`]), else the failure's type tag, else `unknown`.
+fn failure_class(response_status: Option<i16>, error: Option<&str>) -> String {
+    if let Some(status) = response_status {
+        return format!("http_{status}");
+    }
+    let Some(reason) = error.and_then(|e| serde_json::from_str::<FailureReason>(e).ok()) else {
+        return "unknown".to_string();
+    };
+    match reason {
+        FailureReason::RetriableHttpStatus { status, .. }
+        | FailureReason::NonRetriableHttpStatus { status, .. } => {
+            format!("http_{status}")
+        }
+        FailureReason::NetworkError { .. } => "network_error".to_string(),
+        FailureReason::Timeout { .. } => "timeout".to_string(),
+        FailureReason::TaskTerminated => "task_terminated".to_string(),
+        FailureReason::RequestBuilderError { .. } => "request_builder_error".to_string(),
+        FailureReason::BatchTerminated => "batch_terminated".to_string(),
+    }
+}
 
 /// Strip fusillade-routing-only fields from a request body before storing it
 /// in the request template store. The daemon sends the stored body verbatim, so this
@@ -1301,7 +1325,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     ///
     /// Returns the number of requests that were unclaimed. Limited by `unclaim_batch_size`
     /// to prevent unbounded database load when many requests become stale simultaneously.
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn unclaim_stale_requests(&self) -> Result<usize> {
         let claim_timeout_ms = self.config.claim_timeout_ms as i64;
         let processing_timeout_ms = self.config.processing_timeout_ms as i64;
@@ -2390,7 +2414,11 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Ok(result)
     }
 
-    #[tracing::instrument(skip(self, available_capacity, user_active_counts), fields(limit))]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, available_capacity, user_active_counts),
+        fields(limit)
+    )]
     async fn claim_batchless_requests(
         &self,
         limit: usize,
@@ -2723,6 +2751,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
     }
 
     #[tracing::instrument(
+        level = "debug",
         skip(self, available_capacity, user_active_counts),
         fields(limit, batch_limit)
     )]
@@ -2766,6 +2795,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
     }
 
     #[tracing::instrument(
+        level = "debug",
         skip(self, available_capacity, user_active_counts),
         fields(limit, batch_limit)
     )]
@@ -3662,7 +3692,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         outcome
     }
 
-    #[tracing::instrument(skip(self, ids), fields(count = ids.len()))]
+    #[tracing::instrument(level = "debug", skip(self, ids), fields(count = ids.len()))]
     async fn get_requests(&self, ids: Vec<RequestId>) -> Result<Vec<Result<AnyRequest>>> {
         let uuid_ids: Vec<Uuid> = ids.iter().map(|id| **id).collect();
 
@@ -3912,7 +3942,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
     // File and Batch Management
     // ===================================================================
 
-    #[tracing::instrument(skip(self, templates), fields(name = %name, template_count = templates.len()))]
+    #[tracing::instrument(level = "debug", skip(self, templates), fields(name = %name, template_count = templates.len()))]
     async fn create_file(
         &self,
         name: String,
@@ -3941,7 +3971,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         }
     }
 
-    #[tracing::instrument(skip(self, stream))]
+    #[tracing::instrument(level = "debug", skip(self, stream))]
     async fn create_file_stream<S: Stream<Item = FileStreamItem> + Send + Unpin>(
         &self,
         mut stream: S,
@@ -3953,6 +3983,12 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             .begin_write()
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
+
+        // Ensure this week's partition before writing `files`. Creating a partition holds
+        // the week's partition lock while attaching the parent's `files` foreign key, which
+        // waits for open `files` writes; writing `files` first can deadlock with the
+        // daemon extending the partition runway.
+        template_store::ensure_current_week_partition(&mut tx).await?;
 
         // Accumulate metadata as we encounter it
         let mut metadata = FileMetadata::default();
@@ -4176,7 +4212,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Ok(FileStreamResult::Success(FileId(fid)))
     }
 
-    #[tracing::instrument(skip(self), fields(file_id = %file_id))]
+    #[tracing::instrument(level = "debug", skip(self), fields(file_id = %file_id))]
     async fn get_file(&self, file_id: FileId) -> Result<File> {
         self.retry_db_operation(|| async {
             let mut file = self
@@ -4194,7 +4230,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         .await
     }
 
-    #[tracing::instrument(skip(self), fields(file_id = %file_id))]
+    #[tracing::instrument(level = "debug", skip(self), fields(file_id = %file_id))]
     async fn get_file_from_primary_pool(&self, file_id: FileId) -> Result<File> {
         self.retry_db_operation(|| async {
             let mut file = self
@@ -4223,7 +4259,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Ok(items)
     }
 
-    #[tracing::instrument(skip(self), fields(file_id = %file_id))]
+    #[tracing::instrument(level = "debug", skip(self), fields(file_id = %file_id))]
     async fn get_file_template_stats(
         &self,
         file_id: FileId,
@@ -4257,7 +4293,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             .collect())
     }
 
-    #[tracing::instrument(skip(self), fields(file_id = %file_id, search = ?search))]
+    #[tracing::instrument(level = "debug", skip(self), fields(file_id = %file_id, search = ?search))]
     fn get_file_content_stream(
         &self,
         file_id: FileId,
@@ -4346,7 +4382,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Box::pin(ReceiverStream::new(rx))
     }
 
-    #[tracing::instrument(skip(self, filter), fields(uploaded_by = ?filter.uploaded_by, status = ?filter.status, purpose = ?filter.purpose, after = ?filter.after, limit = ?filter.limit))]
+    #[tracing::instrument(level = "debug", skip(self, filter), fields(uploaded_by = ?filter.uploaded_by, status = ?filter.status, purpose = ?filter.purpose, after = ?filter.after, limit = ?filter.limit))]
     async fn list_files(&self, filter: crate::batch::FileFilter) -> Result<Vec<File>> {
         use sqlx::QueryBuilder;
 
@@ -4570,7 +4606,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Ok(files)
     }
 
-    #[tracing::instrument(skip(self), fields(file_id = %file_id))]
+    #[tracing::instrument(level = "debug", skip(self), fields(file_id = %file_id))]
     async fn delete_file(&self, file_id: FileId) -> Result<()> {
         // Use a transaction to ensure atomicity
         let mut tx = self
@@ -5077,7 +5113,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         }
     }
 
-    #[tracing::instrument(skip(self), fields(created_by = ?filter.created_by, limit = filter.limit))]
+    #[tracing::instrument(level = "debug", skip(self), fields(created_by = ?filter.created_by, limit = filter.limit))]
     async fn list_batches(&self, filter: ListBatchesFilter) -> Result<Vec<Batch>> {
         // Resolve the cursor batch's sort keys with one primary-key lookup. A
         // missing cursor batch falls back to the first page. The priority
@@ -5202,7 +5238,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Ok(rows.into_iter().map(BatchId::from).collect())
     }
 
-    #[tracing::instrument(skip(self), fields(batch_id = %batch_id))]
+    #[tracing::instrument(level = "debug", skip(self), fields(batch_id = %batch_id))]
     async fn cancel_batch(&self, batch_id: BatchId) -> Result<()> {
         let now = Utc::now();
 
@@ -5231,7 +5267,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), fields(batch_id = %batch_id, target_state = target_state.as_str()))]
+    #[tracing::instrument(level = "debug", skip(self), fields(batch_id = %batch_id, target_state = target_state.as_str()))]
     async fn cascade_batch_state_to_requests(
         &self,
         batch_id: BatchId,
@@ -5289,9 +5325,59 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
     }
 
     async fn delete_batch(&self, batch_id: BatchId) -> Result<()> {
-        // Soft-delete the batch by setting deleted_at
-        // Also cancel it if not already in a terminal state
-        // Requests are excluded from active_requests view via the JOIN on batches.deleted_at
+        let mut tx = self
+            .begin_write()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
+
+        // Read the generated-file ids without taking the batch lock yet. File
+        // deletion locks files before dependent batches, so batch deletion
+        // must use the same order to avoid a delete-file/delete-batch
+        // deadlock. The batch row is rechecked by the guarded UPDATE below.
+        let generated_files = sqlx::query!(
+            r#"
+            SELECT output_file_id, error_file_id
+            FROM batches
+            WHERE id = $1
+              AND deleted_at IS NULL
+            "#,
+            *batch_id as Uuid,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch for deletion: {}", e)))?
+        .ok_or_else(|| FusilladeError::Other(anyhow!("Batch not found")))?;
+
+        let mut generated_file_ids = [
+            generated_files.output_file_id,
+            generated_files.error_file_id,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        generated_file_ids.sort_unstable();
+        generated_file_ids.dedup();
+
+        if !generated_file_ids.is_empty() {
+            sqlx::query_scalar::<_, Uuid>(
+                r#"
+                SELECT id
+                FROM files
+                WHERE id = ANY($1)
+                ORDER BY id
+                FOR UPDATE
+                "#,
+            )
+            .bind(&generated_file_ids)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to lock batch result files: {}", e))
+            })?;
+        }
+
+        // Soft-delete the batch and cancel it if it is not already terminal.
+        // Requests are excluded from active_requests via batches.deleted_at.
         let rows_affected = sqlx::query!(
             r#"
             UPDATE batches
@@ -5311,7 +5397,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             "#,
             *batch_id as Uuid,
         )
-        .execute(self.write_executor())
+        .execute(&mut *tx)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to soft-delete batch: {}", e)))?
         .rows_affected();
@@ -5319,6 +5405,30 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         if rows_affected == 0 {
             return Err(FusilladeError::Other(anyhow!("Batch not found")));
         }
+
+        // Output and error files are created by the batch and are part of its
+        // associated data. The uploaded input file is deliberately excluded.
+        if !generated_file_ids.is_empty() {
+            sqlx::query!(
+                r#"
+                UPDATE files
+                SET deleted_at = NOW(),
+                    status = 'deleted'
+                WHERE id = ANY($1)
+                  AND deleted_at IS NULL
+                "#,
+                &generated_file_ids,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to soft-delete batch result files: {}", e))
+            })?;
+        }
+
+        tx.commit().await.map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to commit batch deletion: {}", e))
+        })?;
 
         Ok(())
     }
@@ -6079,7 +6189,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Ok(count)
     }
 
-    #[tracing::instrument(skip(self), fields(batch_id = %batch_id))]
+    #[tracing::instrument(level = "debug", skip(self), fields(batch_id = %batch_id))]
     async fn get_batch_requests(&self, batch_id: BatchId) -> Result<Vec<AnyRequest>> {
         let rows = sqlx::query!(
             r#"
@@ -6314,7 +6424,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Ok(results)
     }
 
-    #[tracing::instrument(skip(self), fields(batch_id = %batch_id, search = ?search, status = ?status))]
+    #[tracing::instrument(level = "debug", skip(self), fields(batch_id = %batch_id, search = ?search, status = ?status))]
     fn get_batch_results_stream(
         &self,
         batch_id: BatchId,
@@ -6345,7 +6455,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Box::pin(ReceiverStream::new(rx))
     }
 
-    #[tracing::instrument(skip(self, filter))]
+    #[tracing::instrument(level = "debug", skip(self, filter))]
     async fn list_requests(
         &self,
         filter: crate::request::ListRequestsFilter,
@@ -6353,7 +6463,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         retained_response::list_requests(self, filter).await
     }
 
-    #[tracing::instrument(skip(self, request_id))]
+    #[tracing::instrument(level = "debug", skip(self, request_id))]
     async fn get_request_detail(
         &self,
         request_id: crate::request::RequestId,
@@ -7606,8 +7716,70 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             .collect())
     }
 
+    /// One failure class per batch, for batches that have at least one failed
+    /// request: `http_<status>` for an HTTP failure, otherwise the failure
+    /// type (`network_error`, `timeout`, ...) or `unknown`. Batches without
+    /// failed requests are absent from the map.
+    ///
+    /// Meant for labelling telemetry about fully failed batches, so only the
+    /// class is derived from the stored failure; error text and response
+    /// bodies, which can echo request content, never leave this function.
+    /// Frozen batches may already have been archived, so the archive is
+    /// consulted when the live table has no failed row.
+    pub async fn failed_batch_sample_classes(
+        &self,
+        batch_ids: &[BatchId],
+    ) -> Result<std::collections::HashMap<BatchId, String>> {
+        if batch_ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let ids: Vec<Uuid> = batch_ids.iter().map(|id| **id).collect();
+        let rows = sqlx::query(
+            r#"
+            SELECT t.id AS batch_id,
+                   COALESCE(l.response_status, a.response_status) AS response_status,
+                   COALESCE(l.error, a.error) AS error
+            FROM batches t
+            LEFT JOIN LATERAL (
+                SELECT true AS found, r.response_status, r.error
+                FROM requests r
+                WHERE r.batch_id = t.id AND r.state = 'failed'
+                LIMIT 1
+            ) l ON true
+            LEFT JOIN LATERAL (
+                SELECT true AS found, x.response_status, x.error
+                FROM batch_requests_archive x
+                WHERE l.found IS NULL
+                  AND x.archive_bucket = t.archive_bucket
+                  AND x.batch_id = t.id
+                  AND x.state = 'failed'
+                LIMIT 1
+            ) a ON true
+            WHERE t.id = ANY($1)
+              AND COALESCE(l.found, a.found, false)
+            "#,
+        )
+        .bind(&ids)
+        .fetch_all(self.read_executor())
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to sample batch failures: {}", e)))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let status = row.get::<Option<i16>, _>("response_status");
+                let error = row.get::<Option<String>, _>("error");
+                (
+                    BatchId(row.get::<Uuid, _>("batch_id")),
+                    failure_class(status, error.as_deref()),
+                )
+            })
+            .collect())
+    }
+
     /// Insert a batch of templates using PostgreSQL UNNEST for bulk insertion.
     /// This is significantly faster than individual INSERTs for large template counts.
+    /// The caller must have ensured this week's partition in `tx`.
     async fn insert_template_batch(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         file_id: Uuid,
@@ -7638,7 +7810,6 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         let line_numbers: Vec<i32> = templates.iter().map(|(_, line)| *line).collect();
         let body_byte_sizes: Vec<i64> = stored_bodies.iter().map(|b| b.len() as i64).collect();
 
-        template_store::ensure_current_week_partition(tx).await?;
         sqlx::query(
             r#"
             WITH inserted AS (
@@ -8542,8 +8713,13 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             .await
     }
 
-    async fn expire_file_content(&self, retention_days: i32, batch_size: i64) -> Result<u64> {
-        template_retirement::expire_file_content(self, retention_days, batch_size).await
+    async fn expire_file_content(
+        &self,
+        retention_days: i32,
+        scan_limit: i64,
+        after: Option<FileExpiryCursor>,
+    ) -> Result<FileExpiryStep> {
+        template_retirement::expire_file_content(self, retention_days, scan_limit, after).await
     }
 
     async fn cleanup_retired_template_routes(&self, limit: i64) -> Result<u64> {
@@ -9669,6 +9845,22 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
     }
 
     async fn ensure_request_template_partitions(&self, weeks_ahead: i32) -> Result<(i64, i64)> {
+        let map_err = |e: sqlx::Error| {
+            FusilladeError::Other(anyhow!(
+                "Failed to ensure request template partitions: {}",
+                e
+            ))
+        };
+        let mut tx = self.begin_maintenance_write().await.map_err(map_err)?;
+        // Attaching a partition clones request_templates_g2's foreign key to
+        // `files`, which needs a lock that waits for every open transaction
+        // that has written `files`. While it waits, every new write to `files`
+        // (uploads, batch creation) queues behind it. Give up quickly instead:
+        // the runway is weeks long, so a later daily tick can retry.
+        sqlx::query("SET LOCAL lock_timeout = '1s'")
+            .execute(&mut *tx)
+            .await
+            .map_err(map_err)?;
         let (created, ahead): (i32, i64) = sqlx::query_as(
             r#"
             SELECT ensure_request_template_partitions(
@@ -9684,11 +9876,10 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             "#,
         )
         .bind(weeks_ahead)
-        .fetch_one(self.write_executor())
+        .fetch_one(&mut *tx)
         .await
-        .map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to ensure request template partitions: {}", e))
-        })?;
+        .map_err(map_err)?;
+        tx.commit().await.map_err(map_err)?;
         Ok((i64::from(created), ahead))
     }
 
@@ -10246,6 +10437,89 @@ mod tests {
     // BATCH INSERT STRATEGY TESTS
     // =========================================================================
     // Tests for the batched UNNEST upload mechanism
+
+    #[sqlx::test]
+    async fn create_file_does_not_deadlock_with_partition_creation(pool: sqlx::PgPool) {
+        // The daemon creates this week's template partition while an upload that needs it
+        // is starting: hold the week's partition lock as the creator does, let the upload
+        // queue behind it, then create and attach the partition.
+        let no_partitions: bool =
+            sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM request_template_buckets)")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            no_partitions,
+            "the upload must need to create its partition"
+        );
+        let mut creator = pool.begin().await.unwrap();
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtextextended(
+                 'request_templates_g2.partition:' || current_schema() || ':'
+                     || to_char(date_trunc('week', now() AT TIME ZONE 'UTC')::date, 'YYYYMMDD'),
+                 0))",
+        )
+        .execute(&mut *creator)
+        .await
+        .unwrap();
+
+        let manager = Arc::new(PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        ));
+        let upload = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .create_file(
+                        "upload".to_string(),
+                        None,
+                        vec![RequestTemplateInput {
+                            custom_id: None,
+                            endpoint: "https://api.example.com".to_string(),
+                            method: "POST".to_string(),
+                            path: "/v1/completions".to_string(),
+                            body: "{}".to_string(),
+                            model: "test-model".to_string(),
+                            api_key: "key".to_string(),
+                        }],
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM pg_stat_activity
+                         WHERE datname = current_database()
+                           AND wait_event_type = 'Lock' AND wait_event = 'advisory')",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                if waiting {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("upload never queued behind the partition lock");
+
+        sqlx::query(
+            "SELECT ensure_request_template_partition(
+                 date_trunc('week', now() AT TIME ZONE 'UTC')::date, NULL)",
+        )
+        .execute(&mut *creator)
+        .await
+        .expect("partition creation must not deadlock with the upload");
+        creator.commit().await.unwrap();
+        upload
+            .await
+            .unwrap()
+            .expect("upload must not deadlock with partition creation");
+    }
 
     #[sqlx::test]
     async fn test_batched_insert_small_file(pool: sqlx::PgPool) {
@@ -14876,6 +15150,86 @@ mod tests {
         assert!(frozen_at(&pool, batch_id).await.is_none());
     }
 
+    /// The failure sample classifies a failed request without exposing its
+    /// error text, and leaves out batches whose requests all succeeded.
+    #[sqlx::test]
+    async fn test_failed_batch_sample_classes(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let failed = setup_freeze_test_batch(&manager, "sample-failed", 2).await;
+        let ok = setup_freeze_test_batch(&manager, "sample-ok", 2).await;
+        let reason = serde_json::to_string(&FailureReason::NonRetriableHttpStatus {
+            status: 422,
+            body: "secret detail".to_string(),
+        })
+        .unwrap();
+        sqlx::query!(
+            "UPDATE requests SET state = 'failed', failed_at = NOW(), error = $2 WHERE batch_id = $1",
+            *failed as Uuid,
+            reason
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query!(
+            "UPDATE requests SET state = 'completed', completed_at = NOW(), response_status = 200, response_body = '{}' WHERE batch_id = $1",
+            *ok as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            manager
+                .failed_batch_sample_classes(&[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let samples = manager
+            .failed_batch_sample_classes(&[failed, ok])
+            .await
+            .unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[&failed], "http_422");
+
+        let reason = serde_json::to_string(&FailureReason::Timeout {
+            error: "secret".to_string(),
+        })
+        .unwrap();
+        sqlx::query!(
+            "UPDATE requests SET error = $2 WHERE batch_id = $1",
+            *failed as Uuid,
+            reason
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let samples = manager
+            .failed_batch_sample_classes(&[failed])
+            .await
+            .unwrap();
+        assert_eq!(samples[&failed], "timeout");
+
+        // Once the frozen batch's rows move to the archive, they are sampled
+        // from there.
+        manager.get_batch(failed).await.unwrap(); // freeze-on-read
+        assert_eq!(
+            manager.archive_batch(failed).await.unwrap(),
+            ArchiveOutcome::Archived { rows: 2 }
+        );
+        let (_, _, live, archived) = archive_state(&pool, failed).await;
+        assert_eq!((live, archived), (0, 2));
+        let samples = manager
+            .failed_batch_sample_classes(&[failed, ok])
+            .await
+            .unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[&failed], "timeout");
+    }
+
     #[sqlx::test]
     async fn test_poller_returns_background_batch_without_sla_fields(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
@@ -16560,10 +16914,20 @@ mod tests {
             })
             .await
             .unwrap();
+        let output_file_id = batch
+            .output_file_id
+            .expect("batch should have an output file");
+        let error_file_id = batch
+            .error_file_id
+            .expect("batch should have an error file");
 
         // Verify batch exists
         let batch_before = manager.get_batch(batch.id).await;
         assert!(batch_before.is_ok());
+
+        // Generated result files exist for the lifetime of the batch.
+        assert!(manager.get_file(output_file_id).await.is_ok());
+        assert!(manager.get_file(error_file_id).await.is_ok());
 
         // Verify requests exist
         let requests_before = manager.get_batch_requests(batch.id).await.unwrap();
@@ -16583,6 +16947,11 @@ mod tests {
         // Verify file still exists (should NOT be cascade deleted)
         let file_after = manager.get_file(file_id).await;
         assert!(file_after.is_ok());
+
+        // Generated output and error files are associated batch data and must
+        // no longer be retrievable after the batch is deleted.
+        assert!(manager.get_file(output_file_id).await.is_err());
+        assert!(manager.get_file(error_file_id).await.is_err());
 
         // Verify deleting non-existent batch returns error
         let delete_result = manager.delete_batch(batch.id).await;
@@ -19173,6 +19542,7 @@ mod tests {
         let trigger1 = http_client.add_response_with_trigger(
             "POST /test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: "ok".to_string(),
             }),
@@ -19180,6 +19550,7 @@ mod tests {
         let _trigger2 = http_client.add_response_with_trigger(
             "POST /test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: "ok".to_string(),
             }),

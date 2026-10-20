@@ -41,11 +41,13 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures::StreamExt;
 use http_body_util::BodyExt;
+use onwards::strict::stream_end::interrupted_event;
 use serde_json::Value;
 use tracing::{debug, warn};
 
 use crate::config::ContinuationConfig;
 use crate::db::models::api_keys::ApiKeyPurpose;
+use crate::inference::rejections;
 use crate::inference::store::ONWARDS_RESPONSE_ID_HEADER;
 use crate::prompt_cache::sse::SseBufferedStream;
 
@@ -296,7 +298,8 @@ pub async fn continuation_middleware(State(state): State<ContinuationState>, req
                     "code": "body_read_failed",
                 }
             });
-            return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
+            let response = (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
+            return rejections::refuse(&parts, response, "body_read_failed", None, None);
         }
     };
 
@@ -445,6 +448,14 @@ fn frame_payload(event: &[u8]) -> Option<&str> {
         let rest = line.strip_prefix(b"data:")?;
         std::str::from_utf8(rest).ok().map(str::trim)
     })
+}
+
+/// What a stream that cannot be resumed ends with: the death frame the client
+/// would have received without this layer, or, when the death left no frame
+/// (a transport error, a truncated body or a stall), onwards' interruption
+/// event, so the stream never ends looking complete.
+fn surfaced_death(first_death: &mut Option<Bytes>) -> Bytes {
+    first_death.take().unwrap_or_else(interrupted_event)
 }
 
 /// Wrap the response body in the tee + resume loop.
@@ -701,18 +712,14 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                     // inside reasoning/tool syntax). Surface the death as
                     // today; v2's forward parser lifts this per model.
                     if !acc.plain_resume_ok() {
-                        if let Some(frame) = first_death.take() {
-                            yield Ok(frame);
-                        }
+                        yield Ok(surfaced_death(&mut first_death));
                         outcome.record("failed", "needs_forward_parser");
                         break 'chain;
                     }
                     let Some(text) = acc.continuation_text() else {
                         // Disarmed, or nothing generated yet: resume-from-zero is
                         // a plain retry, which is not this feature's job.
-                        if let Some(frame) = first_death.take() {
-                            yield Ok(frame);
-                        }
+                        yield Ok(surfaced_death(&mut first_death));
                         outcome.record("failed", "not_reconstructable");
                         break 'chain;
                     };
@@ -732,9 +739,7 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                             None => {
                                 // An incident is already saturating this model's
                                 // resume budget; surface the death as today.
-                                if let Some(frame) = first_death.take() {
-                                    yield Ok(frame);
-                                }
+                                yield Ok(surfaced_death(&mut first_death));
                                 outcome.record("failed", "throttled");
                                 break 'chain;
                             }
@@ -790,9 +795,7 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                         None => {
                             // Out of attempts: the client sees exactly what an
                             // unresumed death would have given them.
-                            if let Some(frame) = first_death.take() {
-                                yield Ok(frame);
-                            }
+                            yield Ok(surfaced_death(&mut first_death));
                             outcome.record("failed", last_failure);
                             break 'chain;
                         }

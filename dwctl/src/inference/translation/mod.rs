@@ -49,17 +49,46 @@ pub mod responses;
 
 use axum::http::{HeaderMap, StatusCode, Uri, request::Parts};
 use bytes::Bytes;
+use onwards::strict::schema_mismatch::{SchemaMismatch, locate_declared};
+use serde::de::DeserializeOwned;
 use std::sync::Arc;
 
 /// Error raised while translating a request or response.
 #[derive(Debug, thiserror::Error)]
 pub enum TranslationError {
-    /// The inbound foreign request was malformed (maps to a 400).
+    /// The inbound foreign request isn't JSON at all (maps to a 400).
     #[error("{0}")]
-    BadRequest(String),
+    InvalidJson(String),
+    /// The inbound foreign request is JSON but doesn't match the protocol's
+    /// request type (maps to a 400 naming where it stopped matching, when
+    /// that could be found).
+    #[error("{message}")]
+    SchemaMismatch { mismatch: Option<SchemaMismatch>, message: String },
+    /// A field of the inbound request has a value we can't accept (maps to a
+    /// 400 naming the field).
+    #[error("{message}")]
+    InvalidParameter { param: &'static str, message: String },
     /// Something went wrong on our side translating (maps to a 5xx).
     #[error("{0}")]
     Internal(String),
+}
+
+/// Parses a foreign request body as `T`. A body that is JSON but doesn't match
+/// `T` is a [`TranslationError::SchemaMismatch`] located with `declared`, the
+/// sorted field names `T`'s schema declares; see [`locate_declared`]. The
+/// message, which can quote the body, goes only to the client.
+pub(crate) fn parse_request<T: DeserializeOwned>(body: &[u8], declared: &[&str], protocol: &str) -> Result<T, TranslationError> {
+    serde_json::from_slice(body).map_err(|e| {
+        let message = format!("invalid {protocol} request: {e}");
+        if e.is_data() {
+            TranslationError::SchemaMismatch {
+                mismatch: locate_declared::<T>(body, declared),
+                message,
+            }
+        } else {
+            TranslationError::InvalidJson(message)
+        }
+    })
 }
 
 /// The result of translating a foreign request into canonical Chat Completions.
@@ -131,6 +160,12 @@ pub trait ProtocolTranslator: Send + Sync {
     /// failures detected at the edge (e.g. a malformed inbound request) before
     /// there is any downstream body to reshape.
     fn error_from_message(&self, status: StatusCode, message: &str) -> (StatusCode, Bytes);
+
+    /// As [`error_from_message`](Self::error_from_message), naming the request
+    /// field at fault where the protocol's error shape has a place for it.
+    fn error_for_param(&self, status: StatusCode, message: &str, _param: Option<&str>) -> (StatusCode, Bytes) {
+        self.error_from_message(status, message)
+    }
 
     /// Create a fresh, stateful reframer for one streaming (SSE) response. The
     /// middleware feeds it each upstream Chat Completions chunk and forwards the

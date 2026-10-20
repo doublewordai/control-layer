@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { EditUserModal } from "./EditUserModal";
@@ -7,7 +7,10 @@ const { mutateAsync } = vi.hoisted(() => ({ mutateAsync: vi.fn() }));
 vi.mock("../../../api/control-layer", () => ({
   useUpdateUser: () => ({ mutateAsync, isPending: false }),
   useConfig: () => ({
-    data: { scheduling_toleration_presets: [], onwards: { strict_mode: false } },
+    data: {
+      scheduling_toleration_presets: [],
+      onwards: { strict_mode: false },
+    },
   }),
 }));
 
@@ -59,4 +62,32 @@ describe("EditUserModal serving payload permissions", () => {
       }
     },
   );
+});
+
+describe("EditUserModal layout", () => {
+  it("scrolls the form body while the actions stay outside it", () => {
+    render(
+      <EditUserModal
+        isOpen
+        onClose={vi.fn()}
+        onSuccess={vi.fn()}
+        userId="user-test"
+        canEditServing
+        canEditZdr
+        currentUser={{
+          name: "Test",
+          email: "test@example.com",
+          username: "test",
+          roles: ["StandardUser"],
+          zero_data_retention: false,
+        }}
+      />,
+    );
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.className).toContain("max-h-[90vh]");
+    const body = within(dialog).getByTestId("edit-user-form-body");
+    expect(body.className).toContain("overflow-y-auto");
+    const save = within(dialog).getByRole("button", { name: "Save Changes" });
+    expect(body.contains(save)).toBe(false);
+  });
 });

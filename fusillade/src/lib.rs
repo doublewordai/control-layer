@@ -33,5 +33,7 @@ pub use manager::{
     RetainedResponsePartitionRunway, RetainedResponseRetirementOutcome, RetainedResponseWriteError,
     RetentionPolicy, Storage, TrailingDemandCount,
 };
-pub use processor::{CancellationFuture, DefaultRequestProcessor, RequestProcessor, ShouldRetry};
+pub use processor::{
+    CancellationFuture, DefaultRequestProcessor, ProcessContext, RequestProcessor, ShouldRetry,
+};
 pub use transform::ResponseTransformer;

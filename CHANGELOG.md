@@ -1,5 +1,112 @@
 # Changelog
 
+## [14.3.1](https://github.com/doublewordai/control-layer/compare/v14.3.0...v14.3.1) (2026-10-19)
+
+
+### Bug Fixes
+
+* **analytics:** restore custom ID index ([#2011](https://github.com/doublewordai/control-layer/issues/2011)) ([81a9465](https://github.com/doublewordai/control-layer/commit/81a9465bb291c9bc2121e5092b69de6bab836068))
+* **connections:** release API key on deletion ([#2015](https://github.com/doublewordai/control-layer/issues/2015)) ([c13638b](https://github.com/doublewordai/control-layer/commit/c13638ba42594906937a2a54d12817c980f9acb1))
+* **control-layer:** keep response writer supervised while draining ([#2014](https://github.com/doublewordai/control-layer/issues/2014)) ([1be1dcd](https://github.com/doublewordai/control-layer/commit/1be1dcdaa43d0f049d7a4373311f3cc07afa489e))
+
+
+### Miscellaneous
+
+* **deps:** bump requests from 2.32.5 to 2.33.0 in /scripts/tests/pooled ([#1720](https://github.com/doublewordai/control-layer/issues/1720)) ([96de52b](https://github.com/doublewordai/control-layer/commit/96de52b60817d088e0103f63a76ce743d794ae40))
+* **deps:** split Renovate updates by ecosystem ([#2006](https://github.com/doublewordai/control-layer/issues/2006)) ([f619cf7](https://github.com/doublewordai/control-layer/commit/f619cf700a72055bb16bdc02e9e2611d0bc7f67f))
+* **deps:** update actions/setup-python action to v7 ([#2003](https://github.com/doublewordai/control-layer/issues/2003)) ([c09267d](https://github.com/doublewordai/control-layer/commit/c09267dae4065e8434081dc0a82ea012120aabad))
+* **deps:** update actions/upload-pages-artifact action to v5 ([#2004](https://github.com/doublewordai/control-layer/issues/2004)) ([5f73f1c](https://github.com/doublewordai/control-layer/commit/5f73f1c0adb6984965e4ba54c6ef048d9812a2e0))
+* **deps:** update zerob13/mock-openai-api docker digest to 9c9fdcf ([#1147](https://github.com/doublewordai/control-layer/issues/1147)) ([72ad884](https://github.com/doublewordai/control-layer/commit/72ad884d95f73269be401d0f6fd674b7323d2a5d))
+
+## [14.3.0](https://github.com/doublewordai/control-layer/compare/v14.2.0...v14.3.0) (2026-10-19)
+
+
+### Features
+
+* **dwctl:** record where a translated body fails its schema, without its content (DW-951) ([#1991](https://github.com/doublewordai/control-layer/issues/1991)) ([53b07dc](https://github.com/doublewordai/control-layer/commit/53b07dc2bf5932cc3c037f803095eb46e90b161f))
+* **onwards:** check legacy completions for unsupported parameters (DW-855) ([#1996](https://github.com/doublewordai/control-layer/issues/1996)) ([500873b](https://github.com/doublewordai/control-layer/commit/500873b76a678ff2d2983d04c5e797121a285111))
+* **onwards:** record where a body fails the strict schema, without its content (DW-951) ([#1990](https://github.com/doublewordai/control-layer/issues/1990)) ([e1cb85a](https://github.com/doublewordai/control-layer/commit/e1cb85a5a525bb360edaf0ab2005fed0db6b680e))
+
+
+### Bug Fixes
+
+* **analytics:** use indexed exact custom id lookup ([#1998](https://github.com/doublewordai/control-layer/issues/1998)) ([a40d0ed](https://github.com/doublewordai/control-layer/commit/a40d0edbcbdbfe1f04fb131de5d4c4a31fcfabf2))
+* **batch:** delete generated files with batch ([#1997](https://github.com/doublewordai/control-layer/issues/1997)) ([45aeaa1](https://github.com/doublewordai/control-layer/commit/45aeaa1676427f26768c7a4cd06ac37bec137221))
+* **dwctl:** export the request span as a server span (DW-954) ([#1993](https://github.com/doublewordai/control-layer/issues/1993)) ([57ded54](https://github.com/doublewordai/control-layer/commit/57ded542e15168eb22818bb7e82cbac6e0e4d833))
+* **inference:** preserve flex chat service tier ([#1995](https://github.com/doublewordai/control-layer/issues/1995)) ([a8a7d74](https://github.com/doublewordai/control-layer/commit/a8a7d745a020c1532cdea3cbb054adc01d99dba7))
+
+
+### Build System
+
+* **deps:** bump hickory-resolver from 0.26.1 to 0.26.3 ([#1921](https://github.com/doublewordai/control-layer/issues/1921)) ([d91050e](https://github.com/doublewordai/control-layer/commit/d91050ef3427456168df95aacc0abfccebf2d4d5))
+* **deps:** bump rustls from 0.23.40 to 0.23.45 ([#1920](https://github.com/doublewordai/control-layer/issues/1920)) ([2a0c05b](https://github.com/doublewordai/control-layer/commit/2a0c05bf48ae73a478017bef2d8a2d0a470d8e3d))
+
+
+### Miscellaneous
+
+* **deps:** bump cmov from 0.5.3 to 0.5.4 ([#1228](https://github.com/doublewordai/control-layer/issues/1228)) ([4f328f6](https://github.com/doublewordai/control-layer/commit/4f328f616c9171216a63da9d308a1aaf28a69bed))
+* **deps:** update actions/checkout action to v7 ([#1182](https://github.com/doublewordai/control-layer/issues/1182)) ([8e49bd5](https://github.com/doublewordai/control-layer/commit/8e49bd549a5c721a4ef904dca059a5a3ef781fe6))
+* **deps:** update actions/deploy-pages action to v5 ([#1549](https://github.com/doublewordai/control-layer/issues/1549)) ([1288494](https://github.com/doublewordai/control-layer/commit/1288494b427596d19d4d11e29368c6da2e492c49))
+* **deps:** update googleapis/release-please-action action to v5 ([#1019](https://github.com/doublewordai/control-layer/issues/1019)) ([4878fe9](https://github.com/doublewordai/control-layer/commit/4878fe9ff74d219d0fcbbffd756013062a0e9210))
+* **deps:** update pnpm/action-setup action to v6 ([#977](https://github.com/doublewordai/control-layer/issues/977)) ([867cfbc](https://github.com/doublewordai/control-layer/commit/867cfbcef201613b9b279d88a3446a91797df7fb))
+* **deps:** update rust crate rustls to v0.23.45 [security] ([#1923](https://github.com/doublewordai/control-layer/issues/1923)) ([27f8503](https://github.com/doublewordai/control-layer/commit/27f8503e8c0358fdba9defa6e7cab55401bb3436))
+
+## [14.2.0](https://github.com/doublewordai/control-layer/compare/v14.1.0...v14.2.0) (2026-10-15)
+
+
+### Features
+
+* **metrics:** the credits metric names the model that served each request ([#1987](https://github.com/doublewordai/control-layer/issues/1987)) ([589a262](https://github.com/doublewordai/control-layer/commit/589a26284dd77d8b00cc9a5ff3f138bd44121ff8))
+* **tracing:** customer attributes on request and batch spans ([#1972](https://github.com/doublewordai/control-layer/issues/1972)) ([60db3ec](https://github.com/doublewordai/control-layer/commit/60db3ec246429061cc153b9b5bfea07abc218ca2))
+
+
+### Bug Fixes
+
+* **fusillade:** stop daemon maintenance from stalling writes to files ([#1986](https://github.com/doublewordai/control-layer/issues/1986)) ([fc5b7f7](https://github.com/doublewordai/control-layer/commit/fc5b7f7f6b3e74c0a208243641307442ae0f9c5a))
+
+
+### Performance Improvements
+
+* **tracing:** filter and slim the spans sent to the trace backend (DW-931) ([#1984](https://github.com/doublewordai/control-layer/issues/1984)) ([4a07bb1](https://github.com/doublewordai/control-layer/commit/4a07bb1199d8aaf25cec7a6c19f3815d63b5a3b7))
+
+## [14.1.0](https://github.com/doublewordai/control-layer/compare/v14.0.1...v14.1.0) (2026-10-15)
+
+
+### Features
+
+* correlate requests end to end with x_request_id ([#1970](https://github.com/doublewordai/control-layer/issues/1970)) ([f61e00f](https://github.com/doublewordai/control-layer/commit/f61e00fe5c898b4bf3fda97eef2f34578e059c23))
+* count the inference requests dwctl's own layers refuse (DW-851) ([#1978](https://github.com/doublewordai/control-layer/issues/1978)) ([b822bd0](https://github.com/doublewordai/control-layer/commit/b822bd0bae2731a1db94679479ae86e5b304e6e2))
+* make auto-top-up retry delay configurable ([#1966](https://github.com/doublewordai/control-layer/issues/1966)) ([d1f96b3](https://github.com/doublewordai/control-layer/commit/d1f96b3bb22b2cc978c1b84f3329ed67bbf39e62))
+
+
+### Bug Fixes
+
+* **dashboard:** keep the edit user and organization dialogs within the viewport ([#1975](https://github.com/doublewordai/control-layer/issues/1975)) ([3f0c3cf](https://github.com/doublewordai/control-layer/commit/3f0c3cf13d96b24a6d3d78069e8010ba434beb2d))
+* **dwctl:** map Anthropic thinking types and output_config.effort to reasoning_effort ([#1981](https://github.com/doublewordai/control-layer/issues/1981)) ([87362dd](https://github.com/doublewordai/control-layer/commit/87362dd857fd2ad174cc6070a48f65dd6b650500))
+* end interrupted streams with an error event (DW-851) ([#1979](https://github.com/doublewordai/control-layer/issues/1979)) ([843f421](https://github.com/doublewordai/control-layer/commit/843f421ef04ec8d4ca29c762f01aae9be1dc7206))
+* give every response the gateway id and send streamed usage only on request ([#1973](https://github.com/doublewordai/control-layer/issues/1973)) ([ccb3919](https://github.com/doublewordai/control-layer/commit/ccb3919682884ea2fb963eb48d55b690d6bd6877))
+* **onwards:** give trusted providers' errors the OpenAI envelope ([#1977](https://github.com/doublewordai/control-layer/issues/1977)) ([8d2960e](https://github.com/doublewordai/control-layer/commit/8d2960e1734b6a9efc38f321757811ea64b5171e))
+* remove two lock races behind flaky CI tests ([#1982](https://github.com/doublewordai/control-layer/issues/1982)) ([2163e35](https://github.com/doublewordai/control-layer/commit/2163e3541137332aeb22c167a78355aeb6a53b32))
+
+
+### Tests
+
+* **stripe:** cover the Stripe provider against a mock Stripe API ([#1971](https://github.com/doublewordai/control-layer/issues/1971)) ([cd42cbc](https://github.com/doublewordai/control-layer/commit/cd42cbc420a72ade25c8faa3060272ec7ce8455e))
+* **sync:** keep the reconnect test from killing other tests' listeners ([#1983](https://github.com/doublewordai/control-layer/issues/1983)) ([ad8bd06](https://github.com/doublewordai/control-layer/commit/ad8bd065287dd3f826ec31091816be3c5ad2fc17))
+
+## [14.0.1](https://github.com/doublewordai/control-layer/compare/v14.0.0...v14.0.1) (2026-10-13)
+
+
+### Bug Fixes
+
+* **fusillade:** index batches that finished after their deadline ([#1969](https://github.com/doublewordai/control-layer/issues/1969)) ([04beeb4](https://github.com/doublewordai/control-layer/commit/04beeb4760a6cca460091c67ac9119ea598100e7))
+* **responses:** preserve prior input in continuations ([#1964](https://github.com/doublewordai/control-layer/issues/1964)) ([e299065](https://github.com/doublewordai/control-layer/commit/e29906525eeff70544ab7e0c5b755f30d58174cf))
+
+
+### Tests
+
+* **pricing:** stamp fixture tariffs with the host clock ([#1967](https://github.com/doublewordai/control-layer/issues/1967)) ([86cc1d9](https://github.com/doublewordai/control-layer/commit/86cc1d9f9d4bb50de025973f5b5452e643ea3371))
+
 ## [14.0.0](https://github.com/doublewordai/control-layer/compare/v13.7.0...v14.0.0) (2026-10-12)
 
 

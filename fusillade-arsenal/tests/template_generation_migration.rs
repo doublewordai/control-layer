@@ -374,8 +374,9 @@ async fn file_content_expiry_tombstones_only_released_files(pool: PgPool) {
     let young = aged_file(&pool, 5).await;
 
     let manager = retirement_manager(&pool).await;
-    let expired = manager.expire_file_content(365, 100).await.unwrap();
-    assert_eq!(expired, 1, "only the released aged file may expire");
+    let step = manager.expire_file_content(365, 100, None).await.unwrap();
+    assert_eq!(step.expired, 1, "only the released aged file may expire");
+    assert_eq!(step.next, None, "one short slice covers every due file");
 
     let rows: Vec<(Uuid, Option<String>, bool, bool)> = sqlx::query_as(
         "SELECT id, name, deleted_at IS NOT NULL, retention_expired_at IS NOT NULL \
@@ -400,8 +401,22 @@ async fn file_content_expiry_tombstones_only_released_files(pool: PgPool) {
         .execute(&pool)
         .await
         .unwrap();
-    assert_eq!(manager.expire_file_content(365, 100).await.unwrap(), 1);
-    assert_eq!(manager.expire_file_content(365, 100).await.unwrap(), 0);
+    assert_eq!(
+        manager
+            .expire_file_content(365, 100, None)
+            .await
+            .unwrap()
+            .expired,
+        1
+    );
+    assert_eq!(
+        manager
+            .expire_file_content(365, 100, None)
+            .await
+            .unwrap()
+            .expired,
+        0
+    );
 }
 
 #[sqlx::test]
@@ -429,7 +444,14 @@ async fn template_week_retires_only_after_every_file_releases(pool: PgPool) {
     );
 
     // File-content expiry releases the window (no batches reference it).
-    assert_eq!(manager.expire_file_content(365, 100).await.unwrap(), 1);
+    assert_eq!(
+        manager
+            .expire_file_content(365, 100, None)
+            .await
+            .unwrap()
+            .expired,
+        1
+    );
     let retired = manager
         .retire_expired_template_partition(true, 365)
         .await

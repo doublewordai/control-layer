@@ -58,7 +58,7 @@ pub mod inflight;
 pub mod load_balancer;
 pub mod models;
 pub mod reasoning;
-mod rejections;
+pub mod rejections;
 pub mod response_id;
 pub mod response_sanitizer;
 pub mod serving;
@@ -69,9 +69,11 @@ pub mod telemetry;
 pub mod unsupported_params;
 
 use client::{HttpClient, HyperClient};
+pub use errors::ErrorOrigin;
 pub use handlers::{AuthenticatedApiKeyId, HeaderExtractor, ServedBy};
 use handlers::{models as models_handler, target_message_handler};
 use models::ExtractedModel;
+pub use rejections::RequestIdentity;
 pub use serving::{
     AccountServing, ProviderKind, RequestedServingClass, ServingClass, ServingClassOutcome,
     ServingOverlay, ServingPresets, ServingTargets,
@@ -146,12 +148,13 @@ pub struct AppState<T: HttpClient> {
     pub response_transform_fn: Option<ResponseTransformFn>,
     /// Optional public message for upstream 429 responses; local limits are unaffected.
     pub upstream_rate_limit_message: Option<String>,
-    /// Header name whose value overrides the generated `id` in Responses API
-    /// responses. When set, the handler reads this header from the incoming
-    /// request and uses its value (prefixed with `resp_` if not already) as the
-    /// response object's `id` field. This lets callers (e.g. dwctl, fusillade)
-    /// correlate responses with pre-created tracking records without needing to
-    /// patch the response body after the fact.
+    /// Header name whose value overrides the upstream's `id` in Responses,
+    /// chat completions and legacy completions responses. When set, the handler
+    /// reads this header from the incoming request and uses its value (prefixed
+    /// with `resp_` if not already) as the response object's `id` field, and in
+    /// strict mode as the `id` of every streamed chunk. This lets callers (e.g.
+    /// dwctl, fusillade) correlate responses with pre-created tracking records
+    /// without needing to patch the response body after the fact.
     pub response_id_header: Option<String>,
     /// Maximum request body size in bytes, enforced by both routers. Without
     /// this, the strict router's `Json` extractors fall back to Axum's 2 MB
@@ -273,7 +276,7 @@ impl<T: HttpClient> AppState<T> {
         self
     }
 
-    /// Set the header name whose value overrides the Responses API `id` field.
+    /// Set the header name whose value overrides the response `id` field.
     pub fn with_response_id_header(mut self, header: impl Into<String>) -> Self {
         self.response_id_header = Some(header.into());
         self
@@ -677,6 +680,47 @@ pub mod test_utils {
     use async_trait::async_trait;
     use axum::http::StatusCode;
     use std::sync::{Arc, Mutex};
+
+    /// Every field name and serde rename declared outside the tests of a
+    /// schema source file, for tests that keep a list of declared fields (see
+    /// [`crate::strict::schema_mismatch::locate_declared`]) in step with it. A
+    /// line scan rather than a parser: it may find a few names that aren't
+    /// JSON keys, which only widens the list.
+    pub fn declared_field_names(source: &str) -> Vec<String> {
+        let source = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let mut names = Vec::new();
+        for line in source.lines().map(str::trim) {
+            for marker in ["rename = \"", "alias = \""] {
+                let mut rest = line;
+                while let Some(start) = rest.find(marker) {
+                    rest = &rest[start + marker.len()..];
+                    if let Some(end) = rest.find('"') {
+                        names.push(rest[..end].to_string());
+                    }
+                }
+            }
+            if line.starts_with("//") || line.starts_with("let ") {
+                continue;
+            }
+            let field = line
+                .strip_prefix("pub(crate) ")
+                .or_else(|| line.strip_prefix("pub "))
+                .unwrap_or(line);
+            let field = field.strip_prefix("r#").unwrap_or(field);
+            let len = field
+                .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+                .unwrap_or(field.len());
+            let after = field[len..].trim_start();
+            if len > 0
+                && field.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+                && after.starts_with(':')
+                && !after.starts_with("::")
+            {
+                names.push(field[..len].to_string());
+            }
+        }
+        names
+    }
 
     pub struct MockHttpClient {
         pub requests: Arc<Mutex<Vec<MockRequest>>>,
@@ -1420,6 +1464,122 @@ mod tests {
                 .get::<crate::AuthenticatedApiKeyId>(),
             Some(&crate::AuthenticatedApiKeyId(api_key_id))
         );
+    }
+
+    #[tokio::test]
+    async fn test_strict_refusals_before_forwarding_keep_the_caller_and_code() {
+        use std::collections::HashMap;
+        use tower::ServiceExt;
+
+        let refusal = |body: String, body_limit: usize| async move {
+            let targets = fallback_targets("gpt-4", 1, vec![]);
+            targets.key_labels.insert(
+                "sk-acct".to_string(),
+                HashMap::from([(serving::ACCOUNT_LABEL.to_string(), "acct-1".to_string())]),
+            );
+            let state = AppState::with_client(targets, MockHttpClient::new(StatusCode::OK, "{}"))
+                .with_body_limit(body_limit);
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-acct")
+                .body(axum::body::Body::from(body))
+                .unwrap();
+            let response = crate::strict::build_strict_router(state)
+                .oneshot(request)
+                .await
+                .unwrap();
+            let account = response
+                .extensions()
+                .get::<crate::RequestIdentity>()
+                .and_then(|identity| identity.account_id.clone());
+            (
+                response.status().as_u16(),
+                account,
+                response.extensions().get::<crate::ErrorOrigin>().cloned(),
+            )
+        };
+        let expected = |status, code: &str| {
+            (
+                status,
+                Some("acct-1".to_string()),
+                Some(crate::ErrorOrigin::Gateway {
+                    code: code.to_string(),
+                }),
+            )
+        };
+
+        // Valid JSON in the wrong shape.
+        let wrong_shape = json!({"model": "gpt-4", "messages": "hello"}).to_string();
+        assert_eq!(
+            refusal(wrong_shape, 1024).await,
+            expected(422, "schema_mismatch")
+        );
+        assert_eq!(
+            refusal("{not json".to_string(), 1024).await,
+            expected(400, "invalid_json")
+        );
+        let chat = json!({"model": "gpt-4", "messages": [{"role": "user", "content": "Hello"}]});
+        assert_eq!(
+            refusal(chat.to_string(), 8).await,
+            expected(413, "payload_too_large")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_strict_sanitized_errors_keep_the_caller_and_name_the_provider() {
+        use std::collections::HashMap;
+        use tower::ServiceExt;
+
+        let attribution = |mock: MockHttpClient| async move {
+            let targets = fallback_targets("gpt-4", 1, vec![]);
+            targets.key_labels.insert(
+                "sk-acct".to_string(),
+                HashMap::from([(serving::ACCOUNT_LABEL.to_string(), "acct-1".to_string())]),
+            );
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-acct")
+                .body(axum::body::Body::from(
+                    json!({"model": "gpt-4", "messages": [{"role": "user", "content": "Hello"}]})
+                        .to_string(),
+                ))
+                .unwrap();
+            let response = crate::strict::build_strict_router(AppState::with_client(targets, mock))
+                .oneshot(request)
+                .await
+                .unwrap();
+            let account = response
+                .extensions()
+                .get::<crate::RequestIdentity>()
+                .and_then(|identity| identity.account_id.clone());
+            (
+                response.status().as_u16(),
+                account,
+                response.extensions().get::<crate::ErrorOrigin>().cloned(),
+            )
+        };
+        let expected = |status| {
+            (
+                status,
+                Some("acct-1".to_string()),
+                Some(crate::ErrorOrigin::Provider),
+            )
+        };
+
+        // A success body that is not a chat completion becomes a fresh 502.
+        let malformed = MockHttpClient::new(StatusCode::OK, "not a completion");
+        assert_eq!(attribution(malformed).await, expected(502));
+
+        // An untrusted provider's error is replaced by a standard one.
+        let rejected = MockHttpClient::new(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"provider detail"}}"#,
+        );
+        assert_eq!(attribution(rejected).await, expected(400));
     }
 
     /// Strict-mode `Targets` with one alias backed by a fallback pool of `n`
@@ -2438,6 +2598,67 @@ mod tests {
             mock.get_requests().len(),
             2,
             "empty unary body must trigger a retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_errors_standing_in_for_an_upstream_are_attributed_to_the_provider() {
+        use tower::ServiceExt;
+
+        let origin = |mock: MockHttpClient, targets: target::Targets, model: &'static str| async move {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    json!({"model": model, "messages": [{"role": "user", "content": "Hello"}]})
+                        .to_string(),
+                ))
+                .unwrap();
+            let response = build_router(AppState::with_client(targets, mock))
+                .oneshot(request)
+                .await
+                .unwrap();
+            (
+                response.status().as_u16(),
+                response.extensions().get::<crate::ErrorOrigin>().cloned(),
+            )
+        };
+
+        // An embedded server error, not retried: collapsed to a 503 that
+        // reports the provider's failure.
+        let body = json!({"error": {"code": 500, "message": "upstream failure"}}).to_string();
+        let embedded = MockHttpClient::new(StatusCode::OK, &body);
+        assert_eq!(
+            origin(embedded, embedded_error_targets("gpt-4", 1), "gpt-4").await,
+            (503, Some(crate::ErrorOrigin::Provider))
+        );
+
+        // An embedded capacity refusal: a 529 that is the provider's, too.
+        let body = json!({"error": {"code": 503, "message": "no room"}}).to_string();
+        let embedded = MockHttpClient::new(StatusCode::OK, &body);
+        assert_eq!(
+            origin(embedded, embedded_error_targets("gpt-4", 1), "gpt-4").await,
+            (529, Some(crate::ErrorOrigin::Provider))
+        );
+
+        // Every provider answered with an empty body.
+        let empty = MockHttpClient::new(StatusCode::OK, "");
+        assert_eq!(
+            origin(empty, fallback_targets("gpt-4", 2, vec![502]), "gpt-4").await,
+            (503, Some(crate::ErrorOrigin::Provider))
+        );
+
+        // An unknown model is onwards' own decision.
+        let unused = MockHttpClient::new(StatusCode::OK, "");
+        assert_eq!(
+            origin(unused, embedded_error_targets("gpt-4", 1), "no-such-model").await,
+            (
+                404,
+                Some(crate::ErrorOrigin::Gateway {
+                    code: "model_not_found".to_string()
+                })
+            )
         );
     }
 

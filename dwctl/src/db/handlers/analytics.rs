@@ -3,7 +3,7 @@
 use chrono::{DateTime, Duration, Timelike, Utc};
 use moka::future::Cache;
 use once_cell::sync::Lazy;
-use sqlx::{FromRow, PgPool, Postgres, Transaction};
+use sqlx::{FromRow, PgPool, Postgres, QueryBuilder, Transaction};
 use std::collections::HashMap;
 use tracing::instrument;
 
@@ -110,7 +110,7 @@ struct BulkTimeSeriesRow {
 }
 
 /// Get total request count
-#[instrument(skip(db), err)]
+#[instrument(level = "debug", skip(db), err)]
 async fn get_total_requests(
     db: &PgPool,
     time_range_start: DateTime<Utc>,
@@ -148,7 +148,7 @@ async fn get_total_requests(
 }
 
 /// Get time series data with configurable granularity
-#[instrument(skip(db), err)]
+#[instrument(level = "debug", skip(db), err)]
 async fn get_time_series(
     db: &PgPool,
     time_range_start: DateTime<Utc>,
@@ -163,7 +163,7 @@ async fn get_time_series(
 }
 
 /// Get time series data with hourly granularity (existing implementation)
-#[instrument(skip(db), err)]
+#[instrument(level = "debug", skip(db), err)]
 async fn get_time_series_hourly(
     db: &PgPool,
     time_range_start: DateTime<Utc>,
@@ -243,7 +243,7 @@ async fn get_time_series_hourly(
 }
 
 /// Get time series data with 10-minute granularity
-#[instrument(skip(db), err)]
+#[instrument(level = "debug", skip(db), err)]
 async fn get_time_series_ten_minutes(
     db: &PgPool,
     time_range_start: DateTime<Utc>,
@@ -455,7 +455,7 @@ fn fill_missing_intervals_for_sparklines(
 }
 
 /// Get status code breakdown (raw counts, percentages calculated later)
-#[instrument(skip(db), err)]
+#[instrument(level = "debug", skip(db), err)]
 async fn get_status_codes(
     db: &PgPool,
     time_range_start: DateTime<Utc>,
@@ -490,7 +490,7 @@ async fn get_status_codes(
 }
 
 /// Get model usage data (raw counts, percentages calculated later)
-#[instrument(skip(db), err)]
+#[instrument(level = "debug", skip(db), err)]
 async fn get_model_usage(db: &PgPool, time_range_start: DateTime<Utc>, time_range_end: DateTime<Utc>) -> Result<Vec<ModelUsageRow>> {
     let mut tx = begin_dashboard_read(db).await?;
     let rows = sqlx::query_as!(
@@ -508,7 +508,7 @@ async fn get_model_usage(db: &PgPool, time_range_start: DateTime<Utc>, time_rang
 }
 
 /// Get aggregated analytics data for HTTP requests
-#[instrument(skip(db), err)]
+#[instrument(level = "debug", skip(db), err)]
 pub async fn get_requests_aggregate(
     db: &PgPool,
     time_range_start: DateTime<Utc>,
@@ -585,7 +585,7 @@ pub async fn get_requests_aggregate(
 }
 
 /// Get aggregated metrics for one or more models (with 60s cache)
-#[instrument(skip(db), err)]
+#[instrument(level = "debug", skip(db), err)]
 pub async fn get_model_metrics(db: &PgPool, mut model_aliases: Vec<String>) -> Result<HashMap<String, ModelMetrics>> {
     if model_aliases.is_empty() {
         return Ok(HashMap::new());
@@ -741,7 +741,7 @@ struct UserUsageRow {
 /// requests don't inflate the counts. Because it is keyed by UTC `usage_date`,
 /// the range is whole-UTC-day and `last_active_at` is day-granular
 /// (`MAX(usage_date)`), not the exact last-request timestamp.
-#[instrument(skip(db), err)]
+#[instrument(level = "debug", skip(db), err)]
 pub async fn get_model_user_usage(
     db: &PgPool,
     model_alias: &str,
@@ -833,7 +833,7 @@ pub async fn get_model_user_usage(
 /// means the batch predates the read model and its raw analytics have aged out — the caller
 /// surfaces this as a 404 ("analytics no longer available") rather than a misleading all-zero
 /// result. (It also covers a batch that never had a foldable request, e.g. all-non-2xx.)
-#[instrument(skip(pool))]
+#[instrument(level = "debug", skip(pool))]
 pub async fn get_batch_analytics(pool: &PgPool, batch_id: &Uuid) -> Result<Option<BatchAnalytics>> {
     let row = sqlx::query!(
         r#"
@@ -912,7 +912,7 @@ fn batch_analytics_from_row(
 }
 
 /// Get aggregated analytics metrics for multiple batches in a single query
-#[instrument(skip(pool))]
+#[instrument(level = "debug", skip(pool))]
 pub async fn get_batches_analytics_bulk(pool: &PgPool, batch_ids: &[Uuid]) -> Result<HashMap<Uuid, BatchAnalytics>> {
     if batch_ids.is_empty() {
         return Ok(HashMap::new());
@@ -995,7 +995,7 @@ struct HttpAnalyticsRow {
 }
 
 /// List HTTP analytics entries with filtering and pagination
-#[instrument(skip(pool), err)]
+#[instrument(level = "debug", skip(pool), err)]
 pub async fn list_http_analytics(
     pool: &PgPool,
     skip: i64,
@@ -1003,11 +1003,11 @@ pub async fn list_http_analytics(
     order_desc: bool,
     filters: HttpAnalyticsFilter,
 ) -> Result<Vec<AnalyticsEntry>> {
-    // Wrap custom_id in wildcards for ILIKE substring matching
-    let custom_id_pattern = filters.custom_id.as_ref().map(|s| format!("%{}%", s));
-
-    let rows = sqlx::query_as!(
-        HttpAnalyticsRow,
+    // Build only the predicates the caller supplied. Besides avoiding nullable
+    // OR expressions in a reusable prepared statement, exact custom_id matching
+    // lets PostgreSQL use idx_analytics_custom_id. custom_id is an opaque caller
+    // identifier, not a free-text search field.
+    let mut query = QueryBuilder::<Postgres>::new(
         r#"
         SELECT
             id,
@@ -1027,44 +1027,57 @@ pub async fn list_http_analytics(
             output_price_per_token,
             custom_id
         FROM http_analytics
-        WHERE
-            ($1::timestamptz IS NULL OR timestamp >= $1)
-            AND ($2::timestamptz IS NULL OR timestamp <= $2)
-            AND ($3::text IS NULL OR model = $3)
-            AND ($4::uuid IS NULL OR fusillade_batch_id = $4)
-            AND ($5::text IS NULL OR method = $5)
-            AND ($6::text IS NULL OR uri LIKE $6)
-            AND ($7::int IS NULL OR status_code = $7)
-            AND ($8::int IS NULL OR status_code >= $8)
-            AND ($9::int IS NULL OR status_code <= $9)
-            AND ($10::bigint IS NULL OR duration_ms >= $10)
-            AND ($11::bigint IS NULL OR duration_ms <= $11)
-            AND ($12::text IS NULL OR custom_id ILIKE $12)
-        ORDER BY timestamp DESC
-        LIMIT $13
-        OFFSET $14
+        WHERE TRUE
         "#,
-        filters.timestamp_after,
-        filters.timestamp_before,
-        filters.model,
-        filters.fusillade_batch_id,
-        filters.method,
-        filters.uri_pattern,
-        filters.status_code,
-        filters.status_code_min,
-        filters.status_code_max,
-        filters.min_duration_ms,
-        filters.max_duration_ms,
-        custom_id_pattern,
-        limit,
-        skip,
-    )
-    .fetch_all(pool)
-    .await?;
+    );
 
-    // Note: The ORDER BY is hardcoded to DESC in the query above.
-    // If we need dynamic ordering, we'd need to use query_as with raw SQL
-    // or have two separate queries. For now, we'll handle ASC by reversing.
+    if let Some(value) = filters.timestamp_after {
+        query.push(" AND timestamp >= ").push_bind(value);
+    }
+    if let Some(value) = filters.timestamp_before {
+        query.push(" AND timestamp <= ").push_bind(value);
+    }
+    if let Some(value) = filters.model {
+        query.push(" AND model = ").push_bind(value);
+    }
+    if let Some(value) = filters.fusillade_batch_id {
+        query.push(" AND fusillade_batch_id = ").push_bind(value);
+    }
+    if let Some(value) = filters.method {
+        query.push(" AND method = ").push_bind(value);
+    }
+    if let Some(value) = filters.uri_pattern {
+        query.push(" AND uri LIKE ").push_bind(value);
+    }
+    if let Some(value) = filters.status_code {
+        query.push(" AND status_code = ").push_bind(value);
+    }
+    if let Some(value) = filters.status_code_min {
+        query.push(" AND status_code >= ").push_bind(value);
+    }
+    if let Some(value) = filters.status_code_max {
+        query.push(" AND status_code <= ").push_bind(value);
+    }
+    if let Some(value) = filters.min_duration_ms {
+        query.push(" AND duration_ms >= ").push_bind(value);
+    }
+    if let Some(value) = filters.max_duration_ms {
+        query.push(" AND duration_ms <= ").push_bind(value);
+    }
+    if let Some(value) = filters.custom_id {
+        query.push(" AND custom_id = ").push_bind(value);
+    }
+
+    query
+        .push(" ORDER BY timestamp DESC LIMIT ")
+        .push_bind(limit)
+        .push(" OFFSET ")
+        .push_bind(skip);
+
+    let rows = query.build_query_as::<HttpAnalyticsRow>().fetch_all(pool).await?;
+
+    // Preserve the existing pagination contract: select the newest page, then
+    // return that page in ascending order when requested.
     let mut entries: Vec<AnalyticsEntry> = rows
         .into_iter()
         .map(|row| AnalyticsEntry {
@@ -1121,7 +1134,7 @@ struct ModelBreakdownRow {
 /// Returns (batch_count, avg_requests_per_batch, total_cost).
 /// Batch count and avg can't be derived from per-model breakdown
 /// (batches may span multiple models). Cost is already aggregated here.
-#[instrument(skip(pool), err)]
+#[instrument(level = "debug", skip(pool), err)]
 pub async fn get_user_batch_counts(pool: &PgPool, user_id: Uuid) -> Result<(i64, f64, String)> {
     let row = sqlx::query_as!(
         BatchCountRow,
@@ -1162,7 +1175,7 @@ const USAGE_DAILY_REFRESH_LOCK: i64 = 0x4457_4354_5553_4744;
 /// The `WHERE id > last_processed_id` scan is disjoint from the one-off backfill's
 /// `WHERE id <= backfill_watermark`, so the two can run concurrently without double
 /// counting (a day straddling the boundary gets each side summed via the additive upsert).
-#[instrument(skip(pool), err)]
+#[instrument(level = "debug", skip(pool), err)]
 pub async fn refresh_user_model_usage_daily(pool: &PgPool) -> Result<()> {
     let mut tx = pool.begin().await?;
 
@@ -1239,7 +1252,7 @@ pub async fn refresh_user_model_usage_daily(pool: &PgPool) -> Result<()> {
 /// Load current realtime tariff rates keyed by model alias.
 /// Returns a map of model alias → (input_price_per_token, output_price_per_token).
 /// Only resolve models present in this usage response, including retired models.
-#[instrument(skip(pool), err)]
+#[instrument(level = "debug", skip(pool), err)]
 pub async fn get_realtime_tariffs(pool: &PgPool, account: Uuid, models: &[String]) -> Result<HashMap<String, (Decimal, Decimal)>> {
     let rows = sqlx::query!(
         r#"
@@ -1273,7 +1286,7 @@ pub async fn get_realtime_tariffs(pool: &PgPool, account: Uuid, models: &[String
 /// Get all-time per-model breakdown from the pre-aggregated `user_model_usage_daily`
 /// rollup, summed across every day. Totals (tokens, cost, request count) are derived from
 /// these results by the handler.
-#[instrument(skip(pool), err)]
+#[instrument(level = "debug", skip(pool), err)]
 pub async fn get_user_model_breakdown(pool: &PgPool, user_id: Uuid) -> Result<Vec<ModelBreakdownEntry>> {
     let rows = sqlx::query_as!(
         ModelBreakdownRow,
@@ -1314,7 +1327,7 @@ pub async fn get_user_model_breakdown(pool: &PgPool, user_id: Uuid) -> Result<Ve
 /// The rollup is keyed by UTC `usage_date`, so the range is matched at **day** granularity:
 /// the start/end timestamps are truncated to their UTC date. Sub-day ranges therefore
 /// collapse to whole days — callers (and the UI) present usage at day granularity.
-#[instrument(skip(pool), err)]
+#[instrument(level = "debug", skip(pool), err)]
 pub async fn get_user_model_breakdown_for_range(
     pool: &PgPool,
     user_id: Uuid,
@@ -1360,7 +1373,7 @@ pub async fn get_user_model_breakdown_for_range(
 /// Get distinct batch count for a date range from `batch_aggregates` (one row per batch,
 /// filtered by `created_at`). Batch counts are not summable across day boundaries, so they
 /// come from `batch_aggregates` rather than the daily rollup.
-#[instrument(skip(pool), err)]
+#[instrument(level = "debug", skip(pool), err)]
 pub async fn get_user_batch_count_for_range(pool: &PgPool, user_id: Uuid, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<i64> {
     let row = sqlx::query_scalar!(
         r#"
@@ -1384,6 +1397,46 @@ mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
     use sqlx::PgPool;
+
+    #[dwctl_test_macros::test]
+    async fn list_http_analytics_matches_custom_id_exactly(pool: PgPool) {
+        let target = "platform-tests-analytics-run-123";
+        for (custom_id, timestamp) in [
+            (target, Utc::now()),
+            ("prefix-platform-tests-analytics-run-123-suffix", Utc::now() - Duration::seconds(1)),
+            ("PLATFORM-TESTS-ANALYTICS-RUN-123", Utc::now() - Duration::seconds(2)),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO http_analytics (
+                    instance_id, correlation_id, timestamp, uri, method, custom_id
+                ) VALUES ($1, 1, $2, '/ai/v1/chat/completions', 'POST', $3)
+                "#,
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(timestamp)
+            .bind(custom_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let entries = list_http_analytics(
+            &pool,
+            0,
+            100,
+            true,
+            HttpAnalyticsFilter {
+                custom_id: Some(target.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].custom_id.as_deref(), Some(target));
+    }
 
     #[test]
     fn test_fill_missing_intervals_empty_input() {

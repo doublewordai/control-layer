@@ -1,7 +1,9 @@
 pub mod anthropic;
+pub mod batch_trace_attributes;
 pub mod cache_classifier;
 pub mod databases;
 pub mod modalities;
+pub mod rejections;
 pub mod request_log_credentials;
 pub mod responses;
 pub mod serving_classes;
@@ -44,6 +46,7 @@ async fn setup_streaming_fixture(pool: &PgPool, mock_endpoint_url: String, model
     let mut config = crate::test::utils::create_test_config();
     config.background_services.onwards_sync.enabled = true;
     config.enable_request_logging = true;
+    config.onwards.strict_mode = true;
     // Batch traffic to these paths is forced to stream and reassembled on the way
     // back, which is what these fixtures exercise.
     config.background_services.batch_daemon.streamable_endpoints = vec!["/v1/chat/completions".to_string(), "/v1/completions".to_string()];
@@ -714,6 +717,95 @@ async fn test_e2e_ai_proxy_client_stream_is_not_reassembled(pool: PgPool) {
     cleanup_fixture(fixture).await;
 }
 
+/// A client's stream follows OpenAI's `include_usage` contract and carries the
+/// gateway's id, while billing still reads the usage the gateway forced on.
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_e2e_ai_proxy_client_stream_usage_and_ids(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    let sse_response = concat!(
+        "data: {\"id\":\"chatcmpl-upstream\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello!\"}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"chatcmpl-upstream\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+        "data: {\"id\":\"chatcmpl-upstream\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo\",\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":12,\"total_tokens\":21}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    // The gateway always asks upstream for usage, whatever the client sent.
+    wiremock::Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(serde_json::json!({
+            "stream": true,
+            "stream_options": { "include_usage": true }
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse_response, "text/event-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo", "test-model").await;
+
+    // Missing first: billing must still see the usage the client never asked for.
+    for stream_options in [None, Some(false), Some(true)] {
+        let mut body = serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello from E2E test"}],
+            "stream": true
+        });
+        if let Some(include_usage) = stream_options {
+            body["stream_options"] = serde_json::json!({ "include_usage": include_usage });
+        }
+        let response = fixture
+            .server
+            .post("/ai/v1/chat/completions")
+            .add_header("authorization", format!("Bearer {}", fixture.api_key))
+            .json(&body)
+            .await;
+        assert_eq!(response.status_code().as_u16(), 200, "{stream_options:?}");
+
+        let text = response.text();
+        assert!(text.ends_with("data: [DONE]\n\n"), "{stream_options:?}: {text}");
+        let chunks: Vec<serde_json::Value> = text
+            .split("\n\n")
+            .filter_map(|event| event.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect();
+
+        let id = chunks[0]["id"].as_str().unwrap();
+        assert!(id.starts_with("resp_"), "{stream_options:?}: {id}");
+        assert!(chunks.iter().all(|chunk| chunk["id"] == id), "{stream_options:?}: {text}");
+
+        if stream_options == Some(true) {
+            assert_eq!(chunks.len(), 3, "{text}");
+            assert!(
+                chunks[..2].iter().all(|chunk| chunk.get("usage") == Some(&serde_json::Value::Null)),
+                "{text}"
+            );
+            assert_eq!(chunks[2]["choices"], serde_json::json!([]));
+            assert_eq!(chunks[2]["usage"]["total_tokens"], 21);
+        } else {
+            assert_eq!(chunks.len(), 2, "{stream_options:?}: {text}");
+            assert!(
+                chunks.iter().all(|chunk| chunk.get("usage").is_none()),
+                "{stream_options:?}: {text}"
+            );
+            assert!(
+                chunks.iter().all(|chunk| chunk["choices"][0].is_object()),
+                "{stream_options:?}: {text}"
+            );
+        }
+
+        if stream_options.is_none() {
+            assert_usage_recorded(&fixture, "http://localhost/chat/completions", 9, 12).await;
+        }
+    }
+
+    cleanup_fixture(fixture).await;
+}
+
 #[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_e2e_ai_proxy_streaming_chat_completions_with_fusillade_header(pool: PgPool) {
@@ -737,6 +829,7 @@ async fn test_e2e_ai_proxy_streaming_chat_completions_with_fusillade_header(pool
 
     let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo", "test-model").await;
 
+    let request_id = uuid::Uuid::new_v4();
     let inference_response = fixture
         .server
         .post("/ai/v1/chat/completions")
@@ -745,7 +838,7 @@ async fn test_e2e_ai_proxy_streaming_chat_completions_with_fusillade_header(pool
         // sets for itself, and the correlation id the edge takes an early return
         // on so a dispatch does not create a second row.
         .add_header(crate::inference::outbound_request::STREAM_MARKER_HEADER, "1")
-        .add_header("x-fusillade-request-id", uuid::Uuid::new_v4().to_string())
+        .add_header("x-fusillade-request-id", request_id.to_string())
         .json(&serde_json::json!({
             "model": "test-model",
             "messages": [{"role": "user", "content": "Hello from E2E test"}]
@@ -754,6 +847,11 @@ async fn test_e2e_ai_proxy_streaming_chat_completions_with_fusillade_header(pool
 
     assert_eq!(inference_response.status_code().as_u16(), 200);
     let assembled: serde_json::Value = inference_response.json();
+    assert_eq!(
+        assembled["id"],
+        format!("resp_{request_id}"),
+        "the batch result carries the request's id"
+    );
     assert_eq!(assembled["choices"][0]["message"]["content"], "Hello! How can I help you today?");
     assert_eq!(assembled["usage"]["total_tokens"], 21);
     assert_usage_recorded(&fixture, "http://localhost/chat/completions", 9, 12).await;
@@ -783,6 +881,7 @@ async fn test_e2e_ai_proxy_streaming_completions_with_fusillade_header(pool: PgP
 
     let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo-instruct", "test-model").await;
 
+    let request_id = uuid::Uuid::new_v4();
     let inference_response = fixture
         .server
         .post("/ai/v1/completions")
@@ -791,7 +890,7 @@ async fn test_e2e_ai_proxy_streaming_completions_with_fusillade_header(pool: PgP
         // sets for itself, and the correlation id the edge takes an early return
         // on so a dispatch does not create a second row.
         .add_header(crate::inference::outbound_request::STREAM_MARKER_HEADER, "1")
-        .add_header("x-fusillade-request-id", uuid::Uuid::new_v4().to_string())
+        .add_header("x-fusillade-request-id", request_id.to_string())
         .json(&serde_json::json!({
             "model": "test-model",
             "prompt": "Hello from E2E test"
@@ -800,6 +899,11 @@ async fn test_e2e_ai_proxy_streaming_completions_with_fusillade_header(pool: PgP
 
     assert_eq!(inference_response.status_code().as_u16(), 200);
     let assembled: serde_json::Value = inference_response.json();
+    assert_eq!(
+        assembled["id"],
+        format!("resp_{request_id}"),
+        "the batch result carries the request's id"
+    );
     assert_eq!(assembled["usage"]["total_tokens"], 20);
     assert_usage_recorded(&fixture, "http://localhost/completions", 8, 12).await;
     cleanup_fixture(fixture).await;

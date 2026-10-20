@@ -5902,12 +5902,18 @@ mod tests {
 
     #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn test_delete_batch_cascades_state_to_child_requests(pool: PgPool) {
+    async fn test_delete_batch_removes_generated_files_and_cascades_state(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser, Role::PlatformManager]).await;
         let auth = add_auth_headers(&user);
 
         let (batch_id, request_ids) = insert_batch_with_pending_requests(&pool, user.id, 5).await;
+        let (output_file_id, error_file_id) = attach_results_files(&pool, batch_id).await;
+        let input_file_id: Uuid = sqlx::query_scalar("SELECT file_id FROM fusillade.batches WHERE id = $1")
+            .bind(batch_id)
+            .fetch_one(&pool)
+            .await
+            .expect("batch should retain its input file");
 
         // Delete the batch via the API (enqueues the cascade job)
         let resp = app
@@ -5916,6 +5922,22 @@ mod tests {
             .add_header(&auth[1].0, &auth[1].1)
             .await;
         resp.assert_status(StatusCode::NO_CONTENT);
+
+        for generated_file_id in [output_file_id, error_file_id] {
+            let response = app
+                .get(&format!("/ai/v1/files/{generated_file_id}"))
+                .add_header(&auth[0].0, &auth[0].1)
+                .add_header(&auth[1].0, &auth[1].1)
+                .await;
+            response.assert_status(StatusCode::NOT_FOUND);
+        }
+
+        let input_response = app
+            .get(&format!("/ai/v1/files/{input_file_id}"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        input_response.assert_status(StatusCode::OK);
 
         // Simulate what the background worker does
         let updated = _bg_services

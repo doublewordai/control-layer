@@ -92,7 +92,7 @@ impl<'c> Organizations<'c> {
     }
 
     /// Returns `true` if a non-deleted organization with the given ID exists.
-    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(org_id = %abbrev_uuid(&id)), err)]
     pub async fn exists(&mut self, id: UserId) -> Result<bool> {
         let exists = sqlx::query_scalar!(
             "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND user_type = 'organization' AND is_deleted = false) as \"exists!\"",
@@ -105,7 +105,7 @@ impl<'c> Organizations<'c> {
 
     /// Find an organization by its domain (stored as username).
     /// Returns `None` if no active (non-deleted) organization exists with that domain.
-    #[instrument(skip(self), fields(domain = %domain), err)]
+    #[instrument(level = "debug", skip(self), fields(domain = %domain), err)]
     /// The organization a join request for `domain` should go to.
     ///
     /// Organization usernames are `{domain}~{suffix}`, so one company can hold
@@ -235,7 +235,7 @@ impl<'c> Organizations<'c> {
     ///
     /// Returns `false` for a row that doesn't exist or isn't an organization,
     /// which is the safe direction: unknown means "do not admit".
-    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
     pub async fn auto_join_enabled(&mut self, org_id: UserId) -> Result<bool> {
         let enabled = sqlx::query_scalar!(
             r#"
@@ -258,7 +258,7 @@ impl<'c> Organizations<'c> {
     /// the empty default. Unknown rows read as nothing disabled; the endpoint
     /// has already authenticated the caller, so an unknown id is not an
     /// authorization question here.
-    #[instrument(skip(self), fields(account_id = %abbrev_uuid(&account_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(account_id = %abbrev_uuid(&account_id)), err)]
     pub async fn disabled_modalities(&mut self, account_id: UserId) -> Result<crate::modalities::ModalitySet> {
         let values = sqlx::query_scalar!(
             r#"
@@ -277,7 +277,7 @@ impl<'c> Organizations<'c> {
     /// Replace the organization's disabled modalities. Returns false if there
     /// is no such organization to change. Fires the column's NOTIFY trigger so
     /// the per-key policy cache picks the change up.
-    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), ?disabled), err)]
+    #[instrument(level = "debug", skip(self), fields(org_id = %abbrev_uuid(&org_id), ?disabled), err)]
     pub async fn set_disabled_modalities(&mut self, org_id: UserId, disabled: &[crate::modalities::Modality]) -> Result<bool> {
         let values: Vec<String> = disabled.iter().map(|m| m.as_str().to_string()).collect();
         let result = sqlx::query!(
@@ -296,7 +296,7 @@ impl<'c> Organizations<'c> {
 
     /// Turn domain auto-join on or off. Returns false if there is no such
     /// organization to change.
-    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), enabled), err)]
+    #[instrument(level = "debug", skip(self), fields(org_id = %abbrev_uuid(&org_id), enabled), err)]
     pub async fn set_auto_join_enabled(&mut self, org_id: UserId, enabled: bool) -> Result<bool> {
         let result = sqlx::query!(
             r#"
@@ -317,7 +317,7 @@ impl<'c> Organizations<'c> {
     /// `default_roles` specifies which roles to assign to the org user entity.
     /// These roles determine what API keys scoped to the org can do (e.g. BatchAPIUser
     /// for file/batch operations). StandardUser is always included.
-    #[instrument(skip(self, request, default_roles), fields(name = %request.name), err)]
+    #[instrument(level = "debug", skip(self, request, default_roles), fields(name = %request.name), err)]
     pub async fn create(&mut self, request: &OrganizationCreateDBRequest, default_roles: &[Role]) -> Result<UserDBResponse> {
         let org_id = Uuid::new_v4();
         let mut tx = self.db.begin().await?;
@@ -402,7 +402,7 @@ impl<'c> Organizations<'c> {
 
     /// List organizations with pagination and optional search.
     /// Delegates to [`Users::list`] with `user_type = 'organization'`.
-    #[instrument(skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
+    #[instrument(level = "debug", skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
     pub async fn list(&mut self, filter: &OrganizationFilter) -> Result<Vec<UserDBResponse>> {
         use crate::db::handlers::repository::Repository;
         Users::new(self.db).list(&filter.to_user_filter()).await
@@ -410,13 +410,13 @@ impl<'c> Organizations<'c> {
 
     /// Count organizations matching the filter.
     /// Delegates to [`Users::count`] with `user_type = 'organization'`.
-    #[instrument(skip(self, filter), fields(search = filter.search), err)]
+    #[instrument(level = "debug", skip(self, filter), fields(search = filter.search), err)]
     pub async fn count(&mut self, filter: &OrganizationFilter) -> Result<i64> {
         Users::new(self.db).count(&filter.to_user_filter()).await
     }
 
     /// Update an organization's details
-    #[instrument(skip(self, request), fields(org_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self, request), fields(org_id = %abbrev_uuid(&id)), err)]
     pub async fn update(&mut self, id: UserId, request: &OrganizationUpdateDBRequest) -> Result<UserDBResponse> {
         let row = sqlx::query!(
             r#"
@@ -510,7 +510,7 @@ impl<'c> Organizations<'c> {
     }
 
     /// Soft-delete an organization
-    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(org_id = %abbrev_uuid(&id)), err)]
     pub async fn delete(&mut self, id: UserId) -> Result<bool> {
         let scrubbed_email = format!("deleted-{}@deleted.local", id);
         let scrubbed_username = format!("deleted-{}", id);
@@ -545,7 +545,7 @@ impl<'c> Organizations<'c> {
     /// promoted to owner between the read and the delete can still be closed by
     /// that transaction, and a caller narrowing to owners here would never learn
     /// it needed cleaning up.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn list_member_organization_ids(&mut self, user_id: UserId) -> Result<Vec<UserId>> {
         Ok(sqlx::query_scalar!(
             r#"SELECT organization_id FROM user_organizations WHERE user_id = $1 AND status = 'active'"#,
@@ -556,7 +556,7 @@ impl<'c> Organizations<'c> {
     }
 
     /// Add a member to an organization (active status)
-    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(org_id = %abbrev_uuid(&org_id), user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn add_member(&mut self, org_id: UserId, user_id: UserId, role: &str) -> Result<OrganizationMemberDBResponse> {
         let row = sqlx::query_as!(
             MemberRow,
@@ -579,7 +579,7 @@ impl<'c> Organizations<'c> {
     /// Grant or revoke the additive 'manage_keys' org role on a membership
     /// row (organization_member_roles). Only meaningful for base role
     /// 'member' — owners/admins hold the capability implicitly.
-    #[instrument(skip(self), fields(membership_id = %abbrev_uuid(&membership_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(membership_id = %abbrev_uuid(&membership_id)), err)]
     pub async fn set_membership_manage_keys(&mut self, membership_id: Uuid, granted: bool) -> Result<()> {
         if granted {
             sqlx::query!(
@@ -600,7 +600,7 @@ impl<'c> Organizations<'c> {
     }
 
     /// Does this membership row carry the 'manage_keys' org role?
-    #[instrument(skip(self), fields(membership_id = %abbrev_uuid(&membership_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(membership_id = %abbrev_uuid(&membership_id)), err)]
     pub async fn membership_has_manage_keys(&mut self, membership_id: Uuid) -> Result<bool> {
         let exists = sqlx::query_scalar!(
             r#"SELECT EXISTS(SELECT 1 FROM organization_member_roles WHERE user_organization_id = $1 AND role = 'manage_keys') AS "exists!""#,
@@ -613,7 +613,7 @@ impl<'c> Organizations<'c> {
 
     /// Membership row ids in this org that carry the 'manage_keys' role
     /// (one query for member-list rendering).
-    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
     pub async fn list_manage_keys_membership_ids(&mut self, org_id: UserId) -> Result<std::collections::HashSet<Uuid>> {
         let ids = sqlx::query_scalar!(
             r#"
@@ -631,7 +631,7 @@ impl<'c> Organizations<'c> {
 
     /// Org ids where this user's membership carries the 'manage_keys' role
     /// (one query for the session's org-context capabilities).
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn user_manage_keys_org_ids(&mut self, user_id: UserId) -> Result<std::collections::HashSet<UserId>> {
         let ids = sqlx::query_scalar!(
             r#"
@@ -648,7 +648,7 @@ impl<'c> Organizations<'c> {
     }
 
     /// Remove a member from an organization
-    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(org_id = %abbrev_uuid(&org_id), user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn remove_member(&mut self, org_id: UserId, user_id: UserId) -> Result<bool> {
         let result = sqlx::query!(
             "DELETE FROM user_organizations WHERE user_id = $1 AND organization_id = $2",
@@ -662,7 +662,7 @@ impl<'c> Organizations<'c> {
     }
 
     /// Update a member's role in an organization
-    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(org_id = %abbrev_uuid(&org_id), user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn update_member_role(&mut self, org_id: UserId, user_id: UserId, role: &str) -> Result<OrganizationMemberDBResponse> {
         let row = sqlx::query_as!(
             MemberRow,
@@ -684,7 +684,7 @@ impl<'c> Organizations<'c> {
     }
 
     /// List members of an organization (includes both active and pending)
-    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
     pub async fn list_members(&mut self, org_id: UserId) -> Result<Vec<OrganizationMemberDBResponse>> {
         let rows = sqlx::query_as!(
             MemberRow,
@@ -718,7 +718,7 @@ impl<'c> Organizations<'c> {
     /// cases apart: `requested` is "you already asked", `active` is "you are
     /// already in", `pending` is "you were invited and haven't accepted".
     /// Every one of those is a state the caller must describe, not a failure.
-    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(org_id = %abbrev_uuid(&org_id), user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn create_join_request(&mut self, org_id: UserId, user_id: UserId) -> Result<OrganizationMemberDBResponse> {
         let inserted = sqlx::query_as!(
             MemberRow,
@@ -767,7 +767,7 @@ impl<'c> Organizations<'c> {
     /// Deleted organizations are excluded for the same reason they don't match
     /// on signup: nobody is left to approve the request, so surfacing it would
     /// promise an outcome that can never arrive.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn list_user_join_requests(&mut self, user_id: UserId) -> Result<Vec<OrganizationMemberDBResponse>> {
         let rows = sqlx::query_as!(
             MemberRow,
@@ -790,7 +790,7 @@ impl<'c> Organizations<'c> {
     }
 
     /// Outstanding join requests for an organization, oldest first.
-    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
     pub async fn list_join_requests(&mut self, org_id: UserId) -> Result<Vec<OrganizationMemberDBResponse>> {
         let rows = sqlx::query_as!(
             MemberRow,
@@ -822,7 +822,7 @@ impl<'c> Organizations<'c> {
     /// The approved user's id comes back so the caller can tell them — only
     /// the winner of a concurrent approval gets a `Some`, so the requester is
     /// mailed once rather than once per racing admin.
-    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), request_id = %abbrev_uuid(&request_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(org_id = %abbrev_uuid(&org_id), join_request_id = %abbrev_uuid(&request_id)), err)]
     pub async fn approve_join_request(&mut self, org_id: UserId, request_id: Uuid, role: &str) -> Result<Option<UserId>> {
         let approved = sqlx::query_scalar!(
             r#"
@@ -851,7 +851,7 @@ impl<'c> Organizations<'c> {
     /// a soft-deleted user keeps their row in `users`, and mailing them a
     /// workspace's join requests would be a live notification to a closed
     /// account.
-    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
     pub async fn list_admin_emails(&mut self, org_id: UserId) -> Result<Vec<String>> {
         let emails = sqlx::query_scalar!(
             r#"
@@ -877,7 +877,7 @@ impl<'c> Organizations<'c> {
     /// Deleted rather than kept in a `declined` state so the user can ask again
     /// later - a permanent tombstone would silently block them forever via the
     /// unique constraint.
-    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), request_id = %abbrev_uuid(&request_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(org_id = %abbrev_uuid(&org_id), join_request_id = %abbrev_uuid(&request_id)), err)]
     pub async fn decline_join_request(&mut self, org_id: UserId, request_id: Uuid) -> Result<bool> {
         let result = sqlx::query!(
             "DELETE FROM user_organizations WHERE id = $1 AND organization_id = $2 AND status = 'requested'",
@@ -891,7 +891,7 @@ impl<'c> Organizations<'c> {
     }
 
     /// List organizations a user belongs to (active memberships only)
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn list_user_organizations(&mut self, user_id: UserId) -> Result<Vec<OrganizationMemberDBResponse>> {
         let rows = sqlx::query_as!(
             MemberRow,
@@ -912,7 +912,7 @@ impl<'c> Organizations<'c> {
     }
 
     /// Count the number of active organizations a user belongs to.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn count_user_organizations(&mut self, user_id: UserId) -> Result<i64> {
         let count = sqlx::query_scalar!(
             r#"
@@ -930,7 +930,7 @@ impl<'c> Organizations<'c> {
     }
 
     /// Get a user's role in an organization (active memberships only, None if not a member)
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id), org_id = %abbrev_uuid(&org_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id), org_id = %abbrev_uuid(&org_id)), err)]
     pub async fn get_user_org_role(&mut self, user_id: UserId, org_id: UserId) -> Result<Option<String>> {
         let row = sqlx::query_scalar!(
             "SELECT role FROM user_organizations WHERE user_id = $1 AND organization_id = $2 AND status = 'active'",
@@ -945,7 +945,7 @@ impl<'c> Organizations<'c> {
 
     /// Create a pending invite
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(self, token_hash), fields(org_id = %abbrev_uuid(&org_id), invite_email = %invite_email), err)]
+    #[instrument(level = "debug", skip(self, token_hash), fields(org_id = %abbrev_uuid(&org_id), invite_email = %invite_email), err)]
     pub async fn create_invite(
         &mut self,
         org_id: UserId,
@@ -994,7 +994,7 @@ impl<'c> Organizations<'c> {
     ///
     /// Expired invites and invites into deleted organizations are excluded:
     /// both would offer the user a door that cannot open.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn find_pending_invite_for_email(&mut self, email: &str) -> Result<Option<OrganizationMemberDBResponse>> {
         let row = sqlx::query_as!(
             MemberRow,
@@ -1025,7 +1025,7 @@ impl<'c> Organizations<'c> {
     /// the emailed link. Possession of the token is what proves the mailbox on
     /// the link path; here the caller's own authenticated address does, so
     /// callers MUST compare `invite_email` against it before acting.
-    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), invite_id = %abbrev_uuid(&invite_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(org_id = %abbrev_uuid(&org_id), invite_id = %abbrev_uuid(&invite_id)), err)]
     pub async fn find_invite_by_id(&mut self, org_id: UserId, invite_id: Uuid) -> Result<Option<OrganizationMemberDBResponse>> {
         let row = sqlx::query_as!(
             MemberRow,
@@ -1045,7 +1045,7 @@ impl<'c> Organizations<'c> {
     }
 
     /// Find a pending invite by token hash
-    #[instrument(skip(self, token_hash), err)]
+    #[instrument(level = "debug", skip(self, token_hash), err)]
     pub async fn find_invite_by_token_hash(&mut self, token_hash: &str) -> Result<Option<OrganizationMemberDBResponse>> {
         let row = sqlx::query_as!(
             MemberRow,
@@ -1068,7 +1068,7 @@ impl<'c> Organizations<'c> {
     /// Errors here are expected client conditions (UniqueViolation means already a member,
     /// a 409; NotFound means invite not pending, a 404), so log at warn rather than error. A
     /// genuine server error still pages via the 5xx route metric regardless of this log level.
-    #[instrument(skip(self), fields(invite_id = %abbrev_uuid(&invite_id), user_id = %abbrev_uuid(&user_id)), err(level = "warn"))]
+    #[instrument(level = "debug", skip(self), fields(invite_id = %abbrev_uuid(&invite_id), user_id = %abbrev_uuid(&user_id)), err(level = "warn"))]
     pub async fn accept_invite(&mut self, invite_id: UserId, user_id: UserId) -> Result<OrganizationMemberDBResponse> {
         let row = sqlx::query_as!(
             MemberRow,
@@ -1098,7 +1098,7 @@ impl<'c> Organizations<'c> {
     ///
     /// Returns the invite's email and role so the caller can send the mail,
     /// or None if there's no pending invite by that id in this organization.
-    #[instrument(skip(self, token_hash), fields(org_id = %abbrev_uuid(&org_id), invite_id = %abbrev_uuid(&invite_id)), err)]
+    #[instrument(level = "debug", skip(self, token_hash), fields(org_id = %abbrev_uuid(&org_id), invite_id = %abbrev_uuid(&invite_id)), err)]
     pub async fn refresh_invite_token(
         &mut self,
         org_id: UserId,
@@ -1125,7 +1125,7 @@ impl<'c> Organizations<'c> {
     }
 
     /// Cancel (delete) a pending invite by row ID
-    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), invite_id = %abbrev_uuid(&invite_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(org_id = %abbrev_uuid(&org_id), invite_id = %abbrev_uuid(&invite_id)), err)]
     pub async fn cancel_invite(&mut self, org_id: UserId, invite_id: UserId) -> Result<bool> {
         let result = sqlx::query!(
             "DELETE FROM user_organizations WHERE id = $1 AND organization_id = $2 AND status = 'pending'",
@@ -1139,7 +1139,7 @@ impl<'c> Organizations<'c> {
     }
 
     /// Count active members of an organization (for member_count in list responses)
-    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
     pub async fn count_members(&mut self, org_id: UserId) -> Result<i64> {
         let count = sqlx::query_scalar!(
             "SELECT COUNT(*) FROM user_organizations WHERE organization_id = $1 AND status = 'active'",
@@ -1156,7 +1156,7 @@ impl<'c> Organizations<'c> {
     /// Intended for audit-logging just before [`Self::upsert_pending_email_change`]
     /// supersedes the row — callers can capture the prior `requested_by` and
     /// `new_email` for the audit trail, since the UPSERT will overwrite them.
-    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
     pub async fn find_pending_email_change_for_org(&mut self, org_id: UserId) -> Result<Option<PendingOrgEmailChangeDBResponse>> {
         let row = sqlx::query!(
             r#"
@@ -1194,6 +1194,7 @@ impl<'c> Organizations<'c> {
     /// confirmation that was recorded against the previous (now-replaced)
     /// row.
     #[instrument(
+        level = "debug",
         skip(self, new_email_token_hash, old_email_token_hash),
         fields(org_id = %abbrev_uuid(&org_id)),
         err,
@@ -1254,7 +1255,7 @@ impl<'c> Organizations<'c> {
     /// already-confirmed and expired tokens. Returns the freshly-updated row
     /// (including both `*_confirmed_at` timestamps so the caller can check
     /// if the change is now ready to apply), or `None` if no row matched.
-    #[instrument(skip(self, token_hash), err)]
+    #[instrument(level = "debug", skip(self, token_hash), err)]
     pub async fn confirm_new_email_side(&mut self, token_hash: &str) -> Result<Option<PendingOrgEmailChangeDBResponse>> {
         let row = sqlx::query!(
             r#"
@@ -1289,7 +1290,7 @@ impl<'c> Organizations<'c> {
 
     /// Mark the old-email side of the pending change as confirmed.
     /// Symmetric to [`Self::confirm_new_email_side`].
-    #[instrument(skip(self, token_hash), err)]
+    #[instrument(level = "debug", skip(self, token_hash), err)]
     pub async fn confirm_old_email_side(&mut self, token_hash: &str) -> Result<Option<PendingOrgEmailChangeDBResponse>> {
         let row = sqlx::query!(
             r#"
@@ -1326,7 +1327,7 @@ impl<'c> Organizations<'c> {
     /// handler once both sides are confirmed and the change has been
     /// applied to `users.email` — both operations must run inside the
     /// same transaction so a failure in either rolls back the other.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn delete_pending_email_change(&mut self, id: Uuid) -> Result<bool> {
         let result = sqlx::query!("DELETE FROM pending_org_email_changes WHERE id = $1", id)
             .execute(&mut *self.db)

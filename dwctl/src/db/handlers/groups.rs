@@ -69,7 +69,7 @@ impl<'c> Repository for Groups<'c> {
     type Id = GroupId;
     type Filter = GroupFilter;
 
-    #[instrument(skip(self, request), fields(name = %request.name), err)]
+    #[instrument(level = "debug", skip(self, request), fields(name = %request.name), err)]
     async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
         // all groups created via handler/api are native, sso groups use the sync function instead
         // created_at and updated_at use database DEFAULT NOW() for consistency
@@ -90,7 +90,7 @@ impl<'c> Repository for Groups<'c> {
         Ok(GroupDBResponse::from(group))
     }
 
-    #[instrument(skip(self), fields(group_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(group_id = %abbrev_uuid(&id)), err)]
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let group = sqlx::query_as!(
             Group,
@@ -111,7 +111,7 @@ impl<'c> Repository for Groups<'c> {
         }))
     }
 
-    #[instrument(skip(self), fields(group_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(group_id = %abbrev_uuid(&id)), err)]
     async fn delete(&mut self, id: Self::Id) -> Result<bool> {
         // Prevent deletion of the Everyone group
         if id == uuid::Uuid::nil() {
@@ -128,7 +128,7 @@ impl<'c> Repository for Groups<'c> {
         Ok(result.rows_affected() > 0)
     }
 
-    #[instrument(skip(self, request), fields(group_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self, request), fields(group_id = %abbrev_uuid(&id)), err)]
     async fn update(&mut self, id: Self::Id, request: &Self::UpdateRequest) -> Result<Self::Response> {
         // Prevent updating of the Everyone group
         if id == uuid::Uuid::nil() {
@@ -162,7 +162,7 @@ impl<'c> Repository for Groups<'c> {
         Ok(GroupDBResponse::from(group))
     }
 
-    #[instrument(skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
+    #[instrument(level = "debug", skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
         use sqlx::QueryBuilder;
 
@@ -196,7 +196,7 @@ impl<'c> Repository for Groups<'c> {
         Ok(groups.into_iter().map(GroupDBResponse::from).collect())
     }
 
-    #[instrument(skip(self, ids), fields(count = ids.len()), err)]
+    #[instrument(level = "debug", skip(self, ids), fields(count = ids.len()), err)]
     async fn get_bulk(&mut self, ids: Vec<GroupId>) -> Result<std::collections::HashMap<GroupId, GroupDBResponse>> {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -225,7 +225,7 @@ impl<'c> Groups<'c> {
         Self { db }
     }
 
-    #[instrument(skip(self, filter), err)]
+    #[instrument(level = "debug", skip(self, filter), err)]
     pub async fn count(&mut self, filter: &GroupFilter) -> Result<i64> {
         use sqlx::QueryBuilder;
 
@@ -246,7 +246,7 @@ impl<'c> Groups<'c> {
         Ok(count)
     }
 
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id), group_id = %abbrev_uuid(&group_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id), group_id = %abbrev_uuid(&group_id)), err)]
     pub async fn add_user_to_group(&mut self, user_id: UserId, group_id: GroupId) -> Result<()> {
         match sqlx::query!(
             "INSERT INTO user_groups (user_id, group_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
@@ -265,7 +265,7 @@ impl<'c> Groups<'c> {
         }
     }
 
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id), group_id = %abbrev_uuid(&group_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id), group_id = %abbrev_uuid(&group_id)), err)]
     pub async fn remove_user_from_group(&mut self, user_id: UserId, group_id: GroupId) -> Result<()> {
         let result = sqlx::query!("DELETE FROM user_groups WHERE user_id = $1 AND group_id = $2", user_id, group_id)
             .execute(&mut *self.db)
@@ -277,7 +277,7 @@ impl<'c> Groups<'c> {
         }
     }
 
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn get_user_groups(&mut self, user_id: UserId) -> Result<Vec<GroupDBResponse>> {
         let mut groups = sqlx::query_as!(
             Group,
@@ -302,7 +302,7 @@ impl<'c> Groups<'c> {
         Ok(groups.into_iter().map(GroupDBResponse::from).collect())
     }
 
-    #[instrument(skip(self), fields(group_id = %abbrev_uuid(&group_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(group_id = %abbrev_uuid(&group_id)), err)]
     pub async fn get_group_users(&mut self, group_id: GroupId) -> Result<Vec<UserId>> {
         if group_id == Uuid::nil() {
             // Everyone group - return all users (excluding system user)
@@ -321,7 +321,7 @@ impl<'c> Groups<'c> {
 
     // Deployment-group management methods
 
-    #[instrument(skip(self), fields(deployment_id = %abbrev_uuid(&deployment_id), group_id = %abbrev_uuid(&group_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(deployment_id = %abbrev_uuid(&deployment_id), group_id = %abbrev_uuid(&group_id)), err)]
     pub async fn add_deployment_to_group(&mut self, deployment_id: DeploymentId, group_id: GroupId, granted_by: UserId) -> Result<()> {
         match sqlx::query!(
             "INSERT INTO deployment_groups (deployment_id, group_id, granted_by) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
@@ -341,7 +341,7 @@ impl<'c> Groups<'c> {
         }
     }
 
-    #[instrument(skip(self), fields(deployment_id = %abbrev_uuid(&deployment_id), group_id = %abbrev_uuid(&group_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(deployment_id = %abbrev_uuid(&deployment_id), group_id = %abbrev_uuid(&group_id)), err)]
     pub async fn remove_deployment_from_group(&mut self, deployment_id: DeploymentId, group_id: GroupId) -> Result<()> {
         let result = sqlx::query!(
             "DELETE FROM deployment_groups WHERE deployment_id = $1 AND group_id = $2",
@@ -357,7 +357,7 @@ impl<'c> Groups<'c> {
         }
     }
 
-    #[instrument(skip(self), fields(group_id = %abbrev_uuid(&group_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(group_id = %abbrev_uuid(&group_id)), err)]
     pub async fn get_group_deployments(&mut self, group_id: GroupId) -> Result<Vec<DeploymentId>> {
         let deployments = sqlx::query!(
             "SELECT dg.deployment_id FROM deployment_groups dg
@@ -370,7 +370,7 @@ impl<'c> Groups<'c> {
         Ok(deployments.into_iter().map(|r| r.deployment_id).collect())
     }
 
-    #[instrument(skip(self), fields(deployment_id = %abbrev_uuid(&deployment_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(deployment_id = %abbrev_uuid(&deployment_id)), err)]
     pub async fn get_deployment_groups(&mut self, deployment_id: DeploymentId) -> Result<Vec<GroupId>> {
         let groups = sqlx::query!("SELECT group_id FROM deployment_groups WHERE deployment_id = $1", deployment_id)
             .fetch_all(&mut *self.db)
@@ -380,7 +380,7 @@ impl<'c> Groups<'c> {
 
     // Bulk relationship fetching methods to avoid N+1 queries
 
-    #[instrument(skip(self, deployment_ids), fields(count = deployment_ids.len()), err)]
+    #[instrument(level = "debug", skip(self, deployment_ids), fields(count = deployment_ids.len()), err)]
     pub async fn get_deployments_groups_bulk(
         &mut self,
         deployment_ids: &[DeploymentId],
@@ -404,7 +404,7 @@ impl<'c> Groups<'c> {
         Ok(result)
     }
 
-    #[instrument(skip(self, group_ids), fields(count = group_ids.len()), err)]
+    #[instrument(level = "debug", skip(self, group_ids), fields(count = group_ids.len()), err)]
     pub async fn get_groups_users_bulk(&mut self, group_ids: &[GroupId]) -> Result<std::collections::HashMap<GroupId, Vec<UserId>>> {
         if group_ids.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -444,7 +444,7 @@ impl<'c> Groups<'c> {
         Ok(result)
     }
 
-    #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
+    #[instrument(level = "debug", skip(self, user_ids), fields(count = user_ids.len()), err)]
     pub async fn get_users_groups_bulk(&mut self, user_ids: &[UserId]) -> Result<std::collections::HashMap<UserId, Vec<GroupId>>> {
         if user_ids.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -474,7 +474,7 @@ impl<'c> Groups<'c> {
         Ok(result)
     }
 
-    #[instrument(skip(self, group_ids), fields(count = group_ids.len()), err)]
+    #[instrument(level = "debug", skip(self, group_ids), fields(count = group_ids.len()), err)]
     pub async fn get_groups_deployments_bulk(
         &mut self,
         group_ids: &[GroupId],
@@ -498,7 +498,7 @@ impl<'c> Groups<'c> {
         Ok(result)
     }
 
-    #[instrument(skip(self, group_names, source, description), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self, group_names, source, description), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn sync_groups_with_sso(
         &mut self,
         user_id: UserId,

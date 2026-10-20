@@ -59,6 +59,7 @@ use super::parse::{ParseError, validate_markers};
 use super::query::{self, Inject, InvalidBreakpointValue};
 use super::sse::SseBufferedStream;
 use super::stats::CacheBilling;
+use crate::inference::rejections;
 
 /// Bound on the index commit (off the response path). A slow/hung DB can't leak the
 /// spawned task or hold a pool connection indefinitely; a miss just drops the write
@@ -213,7 +214,8 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
                     "code": "body_read_failed",
                 }
             });
-            return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
+            let response = (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
+            return rejections::refuse(&parts, response, "body_read_failed", None, None);
         }
     };
 
@@ -267,7 +269,17 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
                 };
                 cache_metrics::record_query_breakpoint(outcome);
             }
-            Err(e) => return query_rejection_response(&e),
+            Err(e) => {
+                let model = parsed_body.as_ref().and_then(|body| body["model"].as_str());
+                let response = query_rejection_response(&e);
+                return rejections::refuse(
+                    &parts,
+                    response,
+                    "invalid_cache_breakpoint",
+                    Some(query::CACHE_BREAKPOINT_PARAM),
+                    model,
+                );
+            }
         }
     }
 
@@ -277,7 +289,14 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     if let Some(body) = &parsed_body
         && let Err(e) = validate_markers(body, state.classifier.tier_policy(), state.classifier.telemetry_policy())
     {
-        return marker_rejection_response(&e, state.classifier.tier_policy());
+        let response = marker_rejection_response(&e, state.classifier.tier_policy());
+        return rejections::refuse(
+            &parts,
+            response,
+            "invalid_cache_control",
+            Some("cache_control"),
+            body["model"].as_str(),
+        );
     }
 
     let virtual_model = parsed_body
@@ -1907,6 +1926,65 @@ mod tests {
         let v: serde_json::Value = r.json();
         assert_eq!(v["echo"]["query"], "foo=bar", "param stripped, others preserved");
         assert_eq!(v["echo"]["body_has_cache_control"], false, "injected marker stripped from the body");
+    }
+
+    /// Both refusals go through `rejections::refuse`, which counts them.
+    #[dwctl_test_macros::test]
+    async fn cache_refusals_are_counted_as_rejections(pool: PgPool) {
+        use tower::ServiceExt;
+        let classifier = Classifier::new(
+            PrincipalResolver::new(pool.clone()),
+            ModelConfigResolver::new(pool.clone()),
+            TokenizerClient::new("http://127.0.0.1:1"),
+            Arc::new(PostgresIndex::new(pool.clone(), 1)),
+            TierPolicy::from_config(&["5m".to_string()], "5m"),
+            TelemetryPolicy::default(),
+            false,
+        );
+        let app = Router::new()
+            .route("/v1/chat/completions", post(mock_upstream)) // must NOT be reached
+            .layer(from_fn_with_state(
+                CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
+                cache_middleware,
+            ))
+            .layer(rejections::test_support::layer(ALIAS));
+        // The test macro runs this body on one thread, so a thread-local
+        // recorder sees every refusal.
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let marker = serde_json::json!({
+            "model": ALIAS,
+            "messages": [{"role": "system", "content": [
+                {"type": "text", "text": "x", "cache_control": {"type": "ephemeral", "ttl": "24h"}}
+            ]}]
+        });
+        for (uri, body, code) in [
+            ("/v1/chat/completions", marker, "invalid_cache_control"),
+            (
+                "/v1/chat/completions?cacheBreakpoint=typo",
+                body_unmarked(),
+                "invalid_cache_breakpoint",
+            ),
+        ] {
+            let request = axum::http::Request::post(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let rejection = response.extensions().get::<rejections::RejectionCode>().map(|r| r.code());
+            assert_eq!(rejection, Some(code));
+        }
+        let rendered = metrics.render();
+        for code in ["invalid_cache_control", "invalid_cache_breakpoint"] {
+            assert!(
+                rendered
+                    .lines()
+                    .any(|line| line.starts_with("onwards_rejections_total{") && line.contains(&format!("code=\"{code}\""))),
+                "{code} not counted:\n{rendered}"
+            );
+        }
     }
 
     #[dwctl_test_macros::test]

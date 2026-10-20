@@ -155,8 +155,74 @@ async fn early_strict_rejections_are_recorded_on_the_enclosing_span() {
         attribute(gateway, "error.type"),
         Some(AttributeValue::from("schema_mismatch"))
     );
-    assert_eq!(attribute(gateway, "onwards.rejection.param"), None);
+    assert_eq!(
+        attribute(gateway, "onwards.rejection.param"),
+        Some(AttributeValue::from("messages"))
+    );
+    assert_eq!(
+        attribute(gateway, "onwards.rejection.reason"),
+        Some(AttributeValue::from("invalid_type"))
+    );
     assert_caller(gateway);
+}
+
+#[tokio::test]
+async fn schema_mismatches_record_where_but_never_what() {
+    const SECRET: &str = "private-value-7f3a";
+    for (path, body, param) in [
+        (
+            "/chat/completions",
+            json!({
+                "model": ALIAS,
+                "messages": [
+                    {"role": "user", "content": "Hello"},
+                    {"role": "assistant", "tool_calls": [
+                        {"id": "call_1", "type": "function",
+                         "function": {"name": "f", "arguments": {SECRET: SECRET}}}
+                    ]}
+                ],
+                "metadata": {SECRET: SECRET}
+            }),
+            "messages[].tool_calls[].function.arguments",
+        ),
+        (
+            "/responses",
+            json!({"model": ALIAS, "input": "Hello", "max_output_tokens": SECRET}),
+            "max_output_tokens",
+        ),
+        (
+            // A free-form object that fails beneath a client key: with
+            // serde_json's `raw_value` feature this key must hold a string.
+            "/chat/completions",
+            json!({
+                "model": ALIAS,
+                "messages": [],
+                "logit_bias": {SECRET: {"$serde_json::private::RawValue": 1}}
+            }),
+            "logit_bias",
+        ),
+    ] {
+        let (_, spans) = send(path, body).await;
+
+        let gateway = span(&spans, "gateway_request");
+        assert_eq!(
+            attribute(gateway, "error.type"),
+            Some(AttributeValue::from("schema_mismatch")),
+            "{path}"
+        );
+        assert_eq!(
+            attribute(gateway, "onwards.rejection.param"),
+            Some(AttributeValue::from(param)),
+            "{path}"
+        );
+        assert_eq!(
+            attribute(gateway, "onwards.rejection.reason"),
+            Some(AttributeValue::from("invalid_type")),
+            "{path}"
+        );
+        let recorded = format!("{spans:?}");
+        assert!(!recorded.contains(SECRET), "{path}: {recorded}");
+    }
 }
 
 #[tokio::test]

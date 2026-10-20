@@ -753,11 +753,55 @@ enable_otel_export: false
 
 Exports traces via OTLP. Configure the exporter endpoint with standard OpenTelemetry environment variables (`OTEL_EXPORTER_OTLP_ENDPOINT`, etc.).
 
+Logs and traces are filtered separately. `RUST_LOG` controls the log output.
+`OTEL_TRACES_FILTER` (a dwctl variable, not an OpenTelemetry standard one)
+uses the same directive syntax and controls what the exporter sends; it
+defaults to `info`, which exports the request, routing and provider spans and
+their info-and-above events but not repository spans or debug lines. `RUST_LOG`
+applies first, so the exporter never sees more than the logs do. For example,
+`RUST_LOG=debug` with the default exporter filter gives verbose logs and
+compact traces; `OTEL_TRACES_FILTER=debug,sqlx=warn` additionally exports
+repository spans without sqlx's per-query statement events.
+
+Exported spans omit the source location (`code.*`), thread and
+`busy_ns`/`idle_ns` attributes.
+
 When request analytics and tracing are enabled, the pair `http_analytics.trace_id`
 and `gateway_span_id` identifies the gateway span for a captured request. Follow
 its descendant `onwards.provider_attempt` spans to the downstream serving spans.
 The gateway span's `doubleword.request_id` attribute holds the logical request
 UUID for reverse lookup in request records.
+
+#### Customer attributes on spans
+
+Spans carry the account, model and error class so alerts and dashboards can be
+built from traces. Attribute names are a contract. `gen_ai.*`, `http.*` and
+`error.type` follow OpenTelemetry semantic conventions; the rest, including
+`doubleword.*`, `onwards.*`, `batch.*` and the unprefixed batch attributes,
+are our own.
+
+| Span | Attributes |
+|---|---|
+| `request` (root, AI requests) | `doubleword.account_id`, `doubleword.account_name`, `doubleword.api_key_id`, `doubleword.key_purpose`, `gen_ai.request.model`, `doubleword.traffic` (`batch` for a batch key, otherwise `realtime`), `doubleword.batch.completion_window` (batch only), `http.response.status_code`, and for 4xx/5xx `error.type`, plus `doubleword.error.source` (`gateway` or `provider`) and `doubleword.rejection.code` (gateway errors) when onwards or a dwctl inference layer produced or relayed the error |
+| `onwards.request` | `onwards.account`, `onwards.account_name`, `onwards.api_key_id`, `onwards.key_purpose`, `gen_ai.request.model`, `http.response.status_code`, and for gateway rejections `error.type` (the rejection code), `onwards.rejection.param` (when the error names one) and `onwards.rejection.reason` (for `schema_mismatch`). Strict mode refuses body errors before this span exists, so their attributes are on the enclosing gateway request span |
+| `fusillade.process_request` | `doubleword.account_id`, `completion_window`, `custom_id` (first 128 characters), `model`, `outcome` |
+| `fusillade.batch_finalized` | `batch_id`, `doubleword.account_id`, `doubleword.account_name`, `gen_ai.request.model` (every model the batch used, joined with `, `, for display), `batch.models` (the same models as a string array, for filtering), `completion_window`, `batch.total_requests`, `batch.completed_requests`, `batch.failed_requests`, `batch.canceled_requests`, `batch.outcome` (`completed`, `partially_completed` or `failed`), `batch.sample_error` (failed batches: `http_<status>`, the failure type such as `timeout`, `canceled` when every request was cancelled, or `unknown` when the failure cannot be classified), `batch.finalized_at` (when the batch finished) |
+
+The account, key and traffic attributes are recorded once the key is
+recognised, whether the request succeeds or onwards, a dwctl inference layer or
+the provider refuses it, so a request with an unknown key has none. On request
+spans, `gen_ai.request.model` is only ever a configured model alias, never
+arbitrary client input. `doubleword.account_name` is the account's display
+name, falling back to its username when it has none or it is blank, and cut to
+128 characters.
+`fusillade.batch_finalized` is a root span emitted once per batch by the batch
+notification poller when it claims the finished batch, so it appears whether
+or not email or webhooks are configured, as long as the poller runs. The span
+starts when the batch is claimed; `batch.finalized_at` records when the batch
+itself finished. Batches cancelled as a whole are not claimed and emit no span.
+Cancelled requests count against the outcome like failed ones: a batch none of
+whose requests completed is `failed`. Filter on one model with
+`{ span.batch.models = "<alias>" }`, which matches any element of the array.
 
 Trace context must be propagated on every required forwarding hop. Propagation
 does not itself enable span export: correlation also depends on the connecting

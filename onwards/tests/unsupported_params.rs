@@ -19,6 +19,8 @@ static METRICS: LazyLock<PrometheusHandle> = LazyLock::new(|| {
     handle
 });
 
+const LEGACY_COMPLETION: &str = r#"{"id":"cmpl-1","object":"text_completion","created":1,"model":"m","choices":[{"index":0,"text":"Hi","finish_reason":"stop"}]}"#;
+
 const COMPLETION: &str = r#"{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"Hi"},"finish_reason":"stop"}]}"#;
 
 fn targets(alias: &str) -> Targets {
@@ -212,6 +214,46 @@ async fn messages_route_is_checked() {
     response.assert_status(StatusCode::BAD_REQUEST);
     assert!(mock.get_requests().is_empty());
     assert_eq!(count(alias, "n", "rejected"), Some(1.0));
+}
+
+#[tokio::test]
+async fn legacy_completions_requests_are_checked() {
+    let alias = "legacy-completions-model";
+    let mock = MockHttpClient::new(StatusCode::OK, LEGACY_COMPLETION);
+    let server = server(alias, mock.clone(), &["n", "logprobs"]);
+    let body = json!({"model": alias, "prompt": "Hello", "n": 2, "best_of": 4, "logprobs": 0});
+
+    let response = server.post("/completions").json(&body).await;
+
+    response.assert_status(StatusCode::BAD_REQUEST);
+    let error = response.json::<Value>()["error"].clone();
+    assert_eq!(
+        error["message"],
+        "Unsupported parameter(s): `n`, `logprobs`"
+    );
+    assert_eq!(error["param"], "n");
+    assert_eq!(error["code"], "unsupported_parameter");
+    assert!(mock.get_requests().is_empty());
+    assert_eq!(count(alias, "n", "rejected"), Some(1.0));
+    assert_eq!(count(alias, "best_of", "logged"), Some(1.0));
+    assert_eq!(count(alias, "logprobs", "rejected"), Some(1.0));
+}
+
+#[tokio::test]
+async fn legacy_completions_with_single_samples_are_forwarded_uncounted() {
+    let alias = "legacy-completions-neutral-model";
+    let mock = MockHttpClient::new(StatusCode::OK, LEGACY_COMPLETION);
+    let server = server(alias, mock.clone(), &["n", "best_of", "logprobs"]);
+    let body = json!({"model": alias, "prompt": "Hello", "n": 1, "best_of": 1, "logprobs": null});
+
+    server
+        .post("/completions")
+        .json(&body)
+        .await
+        .assert_status_ok();
+
+    assert_eq!(mock.get_requests().len(), 1);
+    assert!(!counted(alias));
 }
 
 /// dwctl translates a Responses request into Chat Completions and normalises

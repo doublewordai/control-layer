@@ -331,6 +331,10 @@ credits:
   # target, and idempotent across the webhook/front-channel race.
   # Example: 25 gives a newly verified user 25 credits.
   verification_credits: 0
+  # Delay after a transient provider failure or first soft card decline before
+  # another automatic charge is eligible. Keep the 24h production default;
+  # staging can shorten this to exercise the complete decline lifecycle.
+  auto_topup_retry_delay: 24h
 
 # Optional feature toggles
 enable_metrics: true # Enable Prometheus metrics endpoint
@@ -601,7 +605,8 @@ onwards:
   # Priority composites with fallback enabled use AIMD by default in strict mode.
   # Override through the model API's aimd object, or set aimd.enabled=false to opt out.
   # See onwards/docs/src/load-aware-failover.md for coverage and tuning.
-  # Strict-mode chat parameters refused with a 400 instead of forwarded.
+  # Strict-mode chat and legacy completions parameters refused with a 400
+  # instead of forwarded.
   # Onwards counts and traces every parameter not every worker can serve
   # (onwards_unsupported_params_total); only the ones listed here are refused.
   # Names come from onwards::unsupported_params::params(), e.g. [n, logprobs].

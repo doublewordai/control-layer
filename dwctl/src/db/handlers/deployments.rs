@@ -289,7 +289,7 @@ impl<'c> Repository for Deployments<'c> {
     type Id = DeploymentId;
     type Filter = DeploymentFilter;
 
-    #[instrument(skip(self, request), fields(model_name = %request.model_name, alias = %request.alias), err)]
+    #[instrument(level = "debug", skip(self, request), fields(model_name = %request.model_name, alias = %request.alias), err)]
     async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
         let mut tx = self.db.begin().await?;
         lock_model_names(&mut tx).await?;
@@ -419,7 +419,7 @@ impl<'c> Repository for Deployments<'c> {
         Ok(DeploymentDBResponse::from((model_type, model)))
     }
 
-    #[instrument(skip(self), fields(deployment_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(deployment_id = %abbrev_uuid(&id)), err)]
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let model = sqlx::query_as::<_, DeployedModel>(
             "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, realtime_inflight_limit, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_realtime_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, first_token_timeout_ms, aimd, affinity, sanitize_responses, trusted, allowed_batch_completion_windows, metadata, reasoning_translation_overrides, provisioning_source, serving_classes FROM deployed_models WHERE id = $1",
@@ -440,7 +440,7 @@ impl<'c> Repository for Deployments<'c> {
         Ok(model.map(|m| DeploymentDBResponse::from((model_type, m))))
     }
 
-    #[instrument(skip(self, ids), fields(count = ids.len()), err)]
+    #[instrument(level = "debug", skip(self, ids), fields(count = ids.len()), err)]
     async fn get_bulk(&mut self, ids: Vec<Self::Id>) -> Result<std::collections::HashMap<Self::Id, DeploymentDBResponse>> {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -468,7 +468,7 @@ impl<'c> Repository for Deployments<'c> {
         Ok(result)
     }
 
-    #[instrument(skip(self), fields(deployment_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(deployment_id = %abbrev_uuid(&id)), err)]
     async fn delete(&mut self, id: Self::Id) -> Result<bool> {
         let result = sqlx::query!("DELETE FROM deployed_models WHERE id = $1", id)
             .execute(&mut *self.db)
@@ -477,7 +477,7 @@ impl<'c> Repository for Deployments<'c> {
         Ok(result.rows_affected() > 0)
     }
 
-    #[instrument(skip(self, request), fields(deployment_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self, request), fields(deployment_id = %abbrev_uuid(&id)), err)]
     async fn update(&mut self, id: Self::Id, request: &Self::UpdateRequest) -> Result<Self::Response> {
         let mut tx = self.db.begin().await?;
         if let Some(alias) = &request.alias {
@@ -725,7 +725,7 @@ impl<'c> Repository for Deployments<'c> {
         Ok(DeploymentDBResponse::from((model_type, model)))
     }
 
-    #[instrument(skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
+    #[instrument(level = "debug", skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
         // Explicit results keep prepared statements compatible with additive migrations,
         // including server statements retained by a transaction pooler across clients.
@@ -960,7 +960,7 @@ impl<'c> Deployments<'c> {
 
     /// Check if a user has access to a deployment through group membership
     /// Returns deployment info and system API key if access is granted
-    #[instrument(skip(self), fields(deployment_alias = %deployment_alias, user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(deployment_alias = %deployment_alias, user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn check_user_access(&mut self, deployment_alias: &str, user_id: UserId) -> Result<Option<DeploymentAccessInfo>> {
         let result = sqlx::query_as!(
             DeploymentAccessInfo,
@@ -991,7 +991,7 @@ impl<'c> Deployments<'c> {
     }
 
     /// Count deployments matching the given filter (without pagination)
-    #[instrument(skip(self, filter), err)]
+    #[instrument(level = "debug", skip(self, filter), err)]
     pub async fn count(&mut self, filter: &DeploymentFilter) -> Result<i64> {
         // Use LEFT JOIN with inference_endpoints to enable searching by endpoint name
         let mut query =
@@ -1006,7 +1006,7 @@ impl<'c> Deployments<'c> {
     // ===== Composite Model Component Management =====
 
     /// Add a component to a composite model
-    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&request.composite_model_id), deployed_id = %abbrev_uuid(&request.deployed_model_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&request.composite_model_id), deployed_id = %abbrev_uuid(&request.deployed_model_id)), err)]
     pub async fn add_component(&mut self, request: &DeploymentComponentCreateDBRequest) -> Result<DeploymentComponentDBResponse> {
         let result = sqlx::query!(
             r#"
@@ -1065,7 +1065,7 @@ impl<'c> Deployments<'c> {
     }
 
     /// Remove a component from a composite model
-    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), deployed_id = %abbrev_uuid(&deployed_model_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), deployed_id = %abbrev_uuid(&deployed_model_id)), err)]
     pub async fn remove_component(
         &mut self,
         composite_model_id: DeploymentId,
@@ -1086,7 +1086,7 @@ impl<'c> Deployments<'c> {
     }
 
     /// Get all components of a composite model
-    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
     pub async fn get_components(&mut self, composite_model_id: DeploymentId) -> Result<Vec<DeploymentComponentDBResponse>> {
         let results = sqlx::query!(
             r#"
@@ -1140,7 +1140,7 @@ impl<'c> Deployments<'c> {
     }
 
     /// Get components for multiple composite models in bulk
-    #[instrument(skip(self, composite_model_ids), fields(count = composite_model_ids.len()), err)]
+    #[instrument(level = "debug", skip(self, composite_model_ids), fields(count = composite_model_ids.len()), err)]
     pub async fn get_components_bulk(
         &mut self,
         composite_model_ids: Vec<DeploymentId>,
@@ -1205,7 +1205,7 @@ impl<'c> Deployments<'c> {
 
     /// Set all components of a composite model (replace existing)
     /// Tuple is (deployed_model_id, weight, enabled, sort_order)
-    #[instrument(skip(self, components), fields(composite_id = %abbrev_uuid(&composite_model_id), count = components.len()), err)]
+    #[instrument(level = "debug", skip(self, components), fields(composite_id = %abbrev_uuid(&composite_model_id), count = components.len()), err)]
     pub async fn set_components(
         &mut self,
         composite_model_id: DeploymentId,
@@ -1246,7 +1246,7 @@ impl<'c> Deployments<'c> {
     /// duplicate positions (there is no DB unique constraint on the pair). Must
     /// run inside the same transaction as the mutation it guards. Returns `false`
     /// if the composite does not exist.
-    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
     pub async fn lock_composite(&mut self, composite_model_id: DeploymentId) -> Result<bool> {
         let locked = sqlx::query_scalar!(
             "SELECT id FROM deployed_models WHERE id = $1 AND is_composite = TRUE FOR UPDATE",
@@ -1264,7 +1264,7 @@ impl<'c> Deployments<'c> {
     ///
     /// Ordering is per pool: each pool is its own failover list, so position 0
     /// means "tried first in this pool", not "tried first in the composite".
-    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), pool), err)]
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), pool), err)]
     pub async fn compact_component_sort_order(&mut self, composite_model_id: DeploymentId, pool: &str) -> Result<()> {
         sqlx::query!(
             r#"
@@ -1295,7 +1295,7 @@ impl<'c> Deployments<'c> {
     /// observe the same maximum. With removals compacting the sequence
     /// ([`Self::compact_component_sort_order`]) there are no gaps, so this is also
     /// the next dense index.
-    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), pool), err)]
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), pool), err)]
     pub async fn next_component_sort_order(&mut self, composite_model_id: DeploymentId, pool: &str) -> Result<i32> {
         let next = sqlx::query_scalar!(
             "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM deployed_model_components
@@ -1314,7 +1314,7 @@ impl<'c> Deployments<'c> {
     /// 0..n-1 sequence per pool. Used when a composite switches to the `priority` strategy so the
     /// previous weighting determines the failover order instead of leaving every
     /// component at the default sort_order = 0.
-    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
     pub async fn renumber_components_by_weight(&mut self, composite_model_id: DeploymentId) -> Result<()> {
         sqlx::query!(
             r#"
@@ -1343,7 +1343,7 @@ impl<'c> Deployments<'c> {
     /// is clamped into range. Run inside a transaction so the multi-row rewrite is
     /// atomic. This is what keeps two components from ever sharing a sort_order via
     /// the reorder path.
-    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), deployed_id = %abbrev_uuid(&deployed_model_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), deployed_id = %abbrev_uuid(&deployed_model_id)), err)]
     async fn move_component_to_position(
         &mut self,
         composite_model_id: DeploymentId,
@@ -1388,7 +1388,7 @@ impl<'c> Deployments<'c> {
     }
 
     /// Fetch a single component (with joined model/endpoint info) by its ids.
-    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), deployed_id = %abbrev_uuid(&deployed_model_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), deployed_id = %abbrev_uuid(&deployed_model_id)), err)]
     pub async fn get_component(
         &mut self,
         composite_model_id: DeploymentId,
@@ -1453,7 +1453,7 @@ impl<'c> Deployments<'c> {
     ///
     /// Must run on a transaction connection: a position change rewrites multiple
     /// rows and the caller commits them together.
-    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), deployed_id = %abbrev_uuid(&deployed_model_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), deployed_id = %abbrev_uuid(&deployed_model_id)), err)]
     pub async fn update_component(
         &mut self,
         composite_model_id: DeploymentId,
@@ -1495,7 +1495,7 @@ impl<'c> Deployments<'c> {
     /// Get throughput values for the given model aliases
     /// Returns a map of alias -> throughput for models that have throughput configured
     /// Get batch-relevant model info (throughput + allowed completion windows) in a single query.
-    #[instrument(skip(self, aliases), fields(count = aliases.len()), err)]
+    #[instrument(level = "debug", skip(self, aliases), fields(count = aliases.len()), err)]
     pub async fn get_batch_model_info(&mut self, aliases: &[String]) -> Result<BatchModelInfo> {
         if aliases.is_empty() {
             return Ok(BatchModelInfo::default());
@@ -1527,7 +1527,7 @@ impl<'c> Deployments<'c> {
 
     /// Load effective reasoning mappings for every configured provider behind
     /// each requested model alias, including disabled components.
-    #[instrument(skip(self, aliases), fields(count = aliases.len()), err)]
+    #[instrument(level = "debug", skip(self, aliases), fields(count = aliases.len()), err)]
     pub async fn get_reasoning_policies(&mut self, aliases: &[String]) -> Result<HashMap<String, ModelReasoningPolicy>> {
         if aliases.is_empty() {
             return Ok(HashMap::new());
@@ -1584,7 +1584,7 @@ impl<'c> Deployments<'c> {
     }
 
     /// Resolve a model alias to its deployment ID. Returns None if not found or deleted.
-    #[instrument(skip(self), fields(alias = %alias), err)]
+    #[instrument(level = "debug", skip(self), fields(alias = %alias), err)]
     pub async fn resolve_alias_to_id(&mut self, alias: &str) -> Result<Option<DeploymentId>> {
         let id = sqlx::query_scalar!(
             r#"
@@ -1599,7 +1599,7 @@ impl<'c> Deployments<'c> {
     }
 
     /// Set traffic routing rules for a model (replace-all pattern).
-    #[instrument(skip(self, rules), fields(deployment_id = %abbrev_uuid(&deployed_model_id), count = rules.len()), err)]
+    #[instrument(level = "debug", skip(self, rules), fields(deployment_id = %abbrev_uuid(&deployed_model_id), count = rules.len()), err)]
     pub async fn set_traffic_rules(&mut self, deployed_model_id: DeploymentId, rules: &[(ApiKeyPurpose, TrafficRuleAction)]) -> Result<()> {
         // Delete existing rules
         sqlx::query!("DELETE FROM model_traffic_rules WHERE deployed_model_id = $1", deployed_model_id)
@@ -1635,7 +1635,7 @@ impl<'c> Deployments<'c> {
     }
 
     /// Get traffic routing rules for a single model.
-    #[instrument(skip(self), fields(deployment_id = %abbrev_uuid(&deployed_model_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(deployment_id = %abbrev_uuid(&deployed_model_id)), err)]
     pub async fn get_traffic_rules(&mut self, deployed_model_id: DeploymentId) -> Result<Vec<TrafficRuleDBRow>> {
         let rows = sqlx::query!(
             r#"
@@ -1667,7 +1667,7 @@ impl<'c> Deployments<'c> {
     }
 
     /// Get traffic routing rules for multiple models in bulk.
-    #[instrument(skip(self, deployment_ids), fields(count = deployment_ids.len()), err)]
+    #[instrument(level = "debug", skip(self, deployment_ids), fields(count = deployment_ids.len()), err)]
     pub async fn get_traffic_rules_bulk(
         &mut self,
         deployment_ids: &[DeploymentId],
@@ -1720,7 +1720,7 @@ impl<'c> Deployments<'c> {
     /// Get model UUIDs keyed by alias for the given aliases.
     /// Aliases are enforced to be unique, so this should be a one to one mapping
     /// Only returns rows where `deleted = false`.
-    #[instrument(skip(self, aliases), fields(count = aliases.len()), err)]
+    #[instrument(level = "debug", skip(self, aliases), fields(count = aliases.len()), err)]
     pub async fn get_model_ids_by_aliases(&mut self, aliases: &[String]) -> Result<std::collections::HashMap<String, uuid::Uuid>> {
         if aliases.is_empty() {
             return Ok(std::collections::HashMap::new());

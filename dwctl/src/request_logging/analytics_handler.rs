@@ -316,6 +316,7 @@ impl RequestHandler for AnalyticsHandler {
                 server_address: metrics.server_address,
                 server_port: metrics.server_port,
                 served_by: metrics.served_by,
+                served_model: metrics.served_model,
                 requested_serving_class: metrics.requested_serving_class,
                 resolved_serving_class: metrics.resolved_serving_class,
                 api_key_id,
@@ -327,6 +328,7 @@ impl RequestHandler for AnalyticsHandler {
                 batch_request_source,
                 trace_id: request_data.trace_id.clone(),
                 gateway_span_id: request_data.span_id.clone(),
+                x_request_id: extract_header_as_uuid(&request_data, "x-request-id"),
             };
 
             // The first handoff is durable: write the raw record directly to

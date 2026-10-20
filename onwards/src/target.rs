@@ -1262,7 +1262,7 @@ pub struct ConfigFile {
 }
 
 /// The live-updating collection of targets.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Targets {
     /// Map of alias names to their named pools (supports load balancing, and
     /// per-request-class pools — see [`TargetPools`])
@@ -1518,6 +1518,16 @@ fn build_pool(
 }
 
 impl Targets {
+    /// The configured alias `model` selects, with any serving-class suffix
+    /// removed. `None` when it names no configured alias, so a caller can label
+    /// by model without taking arbitrary client input.
+    pub fn configured_alias<'m>(&self, model: &'m str) -> Option<&'m str> {
+        crate::serving::split_class_suffix(model)
+            .ok()
+            .map(|(alias, _)| alias)
+            .filter(|alias| self.targets.contains_key(*alias))
+    }
+
     pub async fn from_config_file(config_path: &PathBuf) -> Result<Self, anyhow::Error> {
         let contents = tokio::fs::read_to_string(config_path).await.map_err(|e| {
             anyhow!(

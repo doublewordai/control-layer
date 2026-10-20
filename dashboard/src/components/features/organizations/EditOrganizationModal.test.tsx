@@ -311,3 +311,19 @@ describe("serving setting authorization and cancellation", () => {
     expect(within(screen.getByRole("dialog")).getByRole("checkbox", { name: "Grant interactive" })).not.toBeChecked();
   });
 });
+
+describe("layout", () => {
+  it("scrolls the form body while the actions stay outside it", () => {
+    render(
+      <EditOrganizationModal isOpen onClose={vi.fn()} organization={mockOrg} canEditServing canEditZdr />,
+      { wrapper: createWrapper() },
+    );
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.className).toContain("max-h-[90vh]");
+    const body = within(dialog).getByTestId("edit-organization-form-body");
+    expect(body.className).toContain("overflow-y-auto");
+    const save = within(dialog).getByRole("button", { name: /save/i });
+    expect(body.contains(save)).toBe(false);
+    expect(save).toHaveAttribute("form", "edit-organization-form");
+  });
+});

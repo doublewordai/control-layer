@@ -830,16 +830,11 @@ pub async fn target_message_handler<T: HttpClient>(
         None
     };
 
-    // Chat parameters not every worker can serve. Each is counted and recorded
-    // on the request span; the configured ones are refused here.
+    // Parameters not every worker can serve. Each is counted and recorded on
+    // the request span; the configured ones are refused here.
     let flagged_params = match body_json.as_ref() {
-        Some(body)
-            if state.targets.strict_mode
-                && canonical_request_path
-                    .trim_end_matches('/')
-                    .ends_with("/chat/completions") =>
-        {
-            crate::unsupported_params::chat_request_params(body)
+        Some(body) if state.targets.strict_mode => {
+            crate::unsupported_params::request_params(&canonical_request_path, body)
         }
         _ => Vec::new(),
     };
@@ -1961,16 +1956,16 @@ pub async fn target_message_handler<T: HttpClient>(
                     let error = if embedded == 429 {
                         OnwardsErrorResponse::upstream_rate_limited(state.upstream_rate_limit_message.as_deref())
                     } else if is_capacity_refusal(embedded) {
-                        OnwardsErrorResponse::overloaded()
+                        OnwardsErrorResponse::overloaded().reported_by_upstream()
                     } else {
-                        OnwardsErrorResponse::service_unavailable()
+                        OnwardsErrorResponse::service_unavailable().reported_by_upstream()
                     };
                     return LoopAction::Continue(Some(error));
                 }
 
                 if is_capacity_refusal(embedded) {
                     record_response_status(529);
-                    return LoopAction::Done(Err(OnwardsErrorResponse::overloaded()));
+                    return LoopAction::Done(Err(OnwardsErrorResponse::overloaded().reported_by_upstream()));
                 }
                 record_response_status(embedded);
                 // Keep upstream details private while preserving rate-limit semantics.
@@ -1982,7 +1977,7 @@ pub async fn target_message_handler<T: HttpClient>(
                 let err = if embedded == 429 {
                     OnwardsErrorResponse::upstream_rate_limited(state.upstream_rate_limit_message.as_deref())
                 } else if embedded >= 500 {
-                    OnwardsErrorResponse::service_unavailable()
+                    OnwardsErrorResponse::service_unavailable().reported_by_upstream()
                 } else {
                     OnwardsErrorResponse::builder()
                         .body(ErrorResponseBody {
@@ -2025,13 +2020,13 @@ pub async fn target_message_handler<T: HttpClient>(
                     tracing::Span::current().record("onwards.fallback", "empty_body");
                     // Retry internally; on exhaustion the loop's final-error handling
                     // surfaces the sanitized 503 carried below.
-                    return LoopAction::Continue(Some(OnwardsErrorResponse::service_unavailable()));
+                    return LoopAction::Continue(Some(OnwardsErrorResponse::service_unavailable().reported_by_upstream()));
                 }
 
                 // Not configured to retry 502s: collapse the anomalous empty 200 to a
                 // generic 503 rather than forwarding a bodyless success to the client.
                 record_response_status(503);
-                return LoopAction::Done(Err(OnwardsErrorResponse::service_unavailable()));
+                return LoopAction::Done(Err(OnwardsErrorResponse::service_unavailable().reported_by_upstream()));
             }
             Scan2xx::Clean => {}
         }
@@ -2175,9 +2170,10 @@ pub async fn target_message_handler<T: HttpClient>(
             }
         }
 
-        // Override the response `id` field for /responses and /chat/completions
-        // requests when the caller supplied a response ID via the configured
-        // header. Both response bodies expose a top-level `id` we can rewrite.
+        // Override the response `id` field for /responses, /chat/completions and
+        // /completions requests when the caller supplied a response ID via the
+        // configured header. All three bodies expose a top-level `id` we can
+        // rewrite; strict mode does the same for streamed chunks.
         if let Some(ref header_name) = state.response_id_header
             && crate::response_id::path_supports_id_override(&path_and_query)
             && (200..300).contains(&status)
@@ -2384,7 +2380,33 @@ pub async fn target_message_handler<T: HttpClient>(
     if let Err(error) = &result {
         rejection.record_error(error);
     }
+    // Every authenticated request, whatever its outcome, names its caller on
+    // this span and on the response, so an embedding gateway can attribute
+    // provider errors and successes the same way as refusals.
+    rejection.record_identity();
+    let identity = rejection.identity();
+    // The status the caller receives, on this span. Upstream responses record
+    // theirs from inside a provider-attempt span, so it is set here too.
+    let final_status = match &result {
+        Ok(response) => response.status().as_u16(),
+        Err(error) => error.status.as_u16(),
+    };
+    record_response_status(final_status);
     result
+        .map(|mut response| {
+            if let Some(identity) = identity.clone() {
+                response.extensions_mut().insert(identity);
+            }
+            // An error status on a response (rather than an `Err`) reports
+            // what an upstream answered, even when its body was sanitized.
+            if response.status().as_u16() >= 400
+                && response.extensions().get::<crate::ErrorOrigin>().is_none()
+            {
+                response.extensions_mut().insert(crate::ErrorOrigin::Provider);
+            }
+            response
+        })
+        .map_err(|error| error.with_identity(identity))
     }
     .instrument(span)
     .await

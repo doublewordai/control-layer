@@ -15,7 +15,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 2
 
@@ -59,15 +59,15 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v5
+        uses: pnpm/action-setup@v6
         with:
-          version: 10
+          version: 10.34.7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
           cache: "pnpm"
@@ -78,9 +78,9 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Install just
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
         with:
-          just-version: "1.46.0"
+          just-version: "1.59.0"
 
       - name: Run frontend CI pipeline
         id: ci-step
@@ -162,7 +162,7 @@ jobs:
     # checkpoints are cheap without fsync and slower than `WAL_LOG` with it.
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Start Postgres
         run: |
@@ -194,9 +194,9 @@ jobs:
           cache-on-failure: true
 
       - name: Install just
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
         with:
-          just-version: "1.46.0"
+          just-version: "1.59.0"
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
@@ -315,7 +315,7 @@ jobs:
 
       - name: Checkout code
         if: env.RUN_CI == 'true'
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Start Postgres
         if: env.RUN_CI == 'true' && matrix.database
@@ -347,9 +347,9 @@ jobs:
 
       - name: Install just
         if: env.RUN_CI == 'true'
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
         with:
-          just-version: "1.46.0"
+          just-version: "1.59.0"
 
       - name: Install sqlx-cli and cargo-llvm-cov
         if: env.RUN_CI == 'true'
@@ -397,7 +397,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Start Postgres
         run: |
@@ -428,9 +428,9 @@ jobs:
           shared-key: backend-lint
 
       - name: Install just
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
         with:
-          just-version: "1.46.0"
+          just-version: "1.59.0"
 
       - name: Install sqlx-cli
         run: cargo install sqlx-cli --version '^0.8' --no-default-features --features native-tls,postgres --locked
@@ -462,7 +462,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Validate preview workflow contract
         run: ruby scripts/tests/preview_workflow_test.rb
@@ -568,7 +568,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
@@ -602,7 +602,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
@@ -1016,7 +1016,7 @@ jobs:
 
       - name: Checkout code
         if: env.RUN_COMPLIANCE == 'true'
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install Rust
         if: env.RUN_COMPLIANCE == 'true' && matrix.surface == 'onwards-passthrough'
@@ -1265,7 +1265,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
@@ -1342,22 +1342,22 @@ jobs:
       # The image is built from the PR head, so mount config and run tests
       # from that same revision rather than GitHub's synthetic merge commit.
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
       - name: Install just
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
         with:
-          just-version: "1.46.0"
+          just-version: "1.59.0"
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v5
+        uses: pnpm/action-setup@v6
         with:
-          version: 10
+          version: 10.34.7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
           cache: "pnpm"
@@ -1442,10 +1442,10 @@ jobs:
           --health-retries 10
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
