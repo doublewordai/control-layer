@@ -120,16 +120,20 @@ require_block_line "$merge_group_trigger" '    types: [checks_requested]' 'only 
 onwards_image_job="$(extract_job onwards-pr-image)"
 dwctl_image_job="$(extract_job build)"
 crate_test_job="$(extract_job backend-crate-test)"
+changes_job="$(extract_job changes)"
 
 if grep -Fq -- '- package: dwctl' <<< "$crate_test_job"; then
   echo "dwctl must run in its partition matrix, not the generic crate matrix" >&2
   exit 1
 fi
 
-require_block_line "$crate_test_job" '    if: always()' 'expand the crate matrix for release-only changes'
-require_block_line "$crate_test_job" "      RUN_CI: \${{ needs.changes.outputs.run-ci }}" 'expose the release-only decision to crate test steps'
-crate_skip_step="$(extract_step "$crate_test_job" 'Skip crate tests for release-only changes')"
-require_block_line "$crate_skip_step" "        if: env.RUN_CI != 'true'" 'declare the no-op crate test path'
+require_block_line "$changes_job" '      run-backend: ${{ steps.classify.outputs.run-backend }}' 'publish the backend change decision'
+require_text "! grep -Evq '^dashboard/'" 'limit the fast path to pure dashboard changes'
+require_text '[[ "$HEAD_REF" != preview/* ]]' 'retain full image builds for preview branches'
+require_block_line "$crate_test_job" '    if: always()' 'expand the crate matrix when backend checks are not required'
+require_block_line "$crate_test_job" "      RUN_BACKEND: \${{ needs.changes.outputs.run-backend }}" 'expose the backend change decision to crate test steps'
+crate_skip_step="$(extract_step "$crate_test_job" 'Skip crate tests when backend is unchanged')"
+require_block_line "$crate_skip_step" "        if: env.RUN_BACKEND != 'true'" 'declare the no-op crate test path'
 
 if ! grep -Fxq '    needs: changes' <<< "$onwards_image_job" || \
    ! grep -Fxq '    needs: changes' <<< "$dwctl_image_job"; then
@@ -139,9 +143,9 @@ fi
 
 trusted_pull_request_condition="github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'"
 
-require_block_line "$onwards_image_job" "    if: needs.changes.outputs.run-ci == 'true' && ${trusted_pull_request_condition}" 'run Onwards image publishing only for relevant trusted pull requests'
+require_block_line "$onwards_image_job" "    if: needs.changes.outputs.run-backend == 'true' && ${trusted_pull_request_condition}" 'run Onwards image publishing only for backend-changing trusted pull requests'
 require_block_line "$onwards_image_job" "          tags: ghcr.io/doublewordai/onwards:sha-\${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}" 'tag Onwards images with the PR head or merge-group SHA'
-require_block_line "$dwctl_image_job" "    if: needs.changes.outputs.run-ci == 'true' && ${trusted_pull_request_condition}" 'run dwctl image publishing only for relevant trusted pull requests'
+require_block_line "$dwctl_image_job" "    if: needs.changes.outputs.run-backend == 'true' && ${trusted_pull_request_condition}" 'run dwctl image publishing only for backend-changing trusted pull requests'
 require_block_line "$dwctl_image_job" '          DOCKER_METADATA_PR_HEAD_SHA: true' 'preserve PR-head metadata tagging for dwctl images'
 require_block_line "$dwctl_image_job" '            type=sha,prefix=sha-' 'preserve SHA metadata tagging for dwctl images'
 if grep -Fq 'type=raw,value=sha-' <<< "$dwctl_image_job"; then
@@ -208,7 +212,7 @@ while IFS= read -r name; do
       # Required through workspace / rust gate; no new branch-protection
       # context needs to be configured for this fan-out job.
       ;;
-    'release-only changes')
+    'change classification')
       # Change classification is an internal fan-out job, not a required
       # branch-protection context.
       ;;

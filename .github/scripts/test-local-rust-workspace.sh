@@ -453,16 +453,18 @@ require_scoped_line "$semantic_title_step" '        uses: amannn/action-semantic
 require_scoped_line "$merge_group_title_step" "        if: github.event_name == 'merge_group'" 'PR title no-op must be scoped to merge groups'
 
 crate_test_job="$(extract_workflow_job .github/workflows/ci.yaml backend-crate-test)"
-require_scoped_line "$crate_test_job" '    if: always()' 'Crate test matrix must expand for release-only changes'
-require_scoped_line "$crate_test_job" "      RUN_CI: \${{ needs.changes.outputs.run-ci }}" 'Crate tests must consume the release-only decision at step level'
-crate_skip_step="$(extract_workflow_step "$crate_test_job" 'Skip crate tests for release-only changes')"
-require_scoped_line "$crate_skip_step" "        if: env.RUN_CI != 'true'" 'Crate tests must declare a release-only no-op path'
+changes_job="$(extract_workflow_job .github/workflows/ci.yaml changes)"
+require_scoped_line "$changes_job" '      run-backend: ${{ steps.classify.outputs.run-backend }}' 'Change classification must publish the backend decision'
+require_scoped_line "$crate_test_job" '    if: always()' 'Crate test matrix must expand when backend checks are not required'
+require_scoped_line "$crate_test_job" "      RUN_BACKEND: \${{ needs.changes.outputs.run-backend }}" 'Crate tests must consume the backend decision at step level'
+crate_skip_step="$(extract_workflow_step "$crate_test_job" 'Skip crate tests when backend is unchanged')"
+require_scoped_line "$crate_skip_step" "        if: env.RUN_BACKEND != 'true'" 'Crate tests must declare a backend-unchanged no-op path'
 
 trusted_pull_request_condition="github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'"
 onwards_image_job="$(extract_workflow_job .github/workflows/ci.yaml onwards-pr-image)"
 dwctl_image_job="$(extract_workflow_job .github/workflows/ci.yaml build)"
-if ! grep -Fxq "    if: needs.changes.outputs.run-ci == 'true' && ${trusted_pull_request_condition}" <<< "$onwards_image_job" || \
-   ! grep -Fxq "    if: needs.changes.outputs.run-ci == 'true' && ${trusted_pull_request_condition}" <<< "$dwctl_image_job" || \
+if ! grep -Fxq "    if: needs.changes.outputs.run-backend == 'true' && ${trusted_pull_request_condition}" <<< "$onwards_image_job" || \
+   ! grep -Fxq "    if: needs.changes.outputs.run-backend == 'true' && ${trusted_pull_request_condition}" <<< "$dwctl_image_job" || \
    ! grep -Fxq '          DOCKER_METADATA_PR_HEAD_SHA: true' <<< "$dwctl_image_job" || \
    ! grep -Fxq '            type=sha,prefix=sha-' <<< "$dwctl_image_job" || \
    grep -Fq 'type=raw,value=sha-' <<< "$dwctl_image_job" || \
