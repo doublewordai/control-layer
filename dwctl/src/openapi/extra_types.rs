@@ -464,6 +464,18 @@ pub struct ModelObject {
     /// every provider behind this model. Returned only when requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supported_reasoning_efforts: Option<crate::reasoning::SupportedReasoningEfforts>,
+
+    /// Doubleword extension: active customer tariffs for the API key's billing
+    /// account, with general prices as fallback. Returned only with include=pricing.
+    /// Prices are decimal strings per token; disabled purposes and batch windows
+    /// are excluded. Other accounts' prices and serving-class details are omitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tariffs: Option<Vec<crate::api::models::tariffs::TariffResponse>>,
+
+    /// Doubleword extension: effective prompt-cache multipliers relative to input
+    /// token prices. Returned only with include=pricing; enabled=false if unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_pricing: Option<crate::api::models::cache_pricing::CachePricingResponse>,
 }
 
 // ============================================================================
