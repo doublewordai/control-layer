@@ -1942,13 +1942,13 @@ dependencies = [
  "hex",
  "hickory-resolver",
  "hmac 0.13.0",
- "http-body 1.1.0",
+ "http-body",
  "http-body-util",
  "humantime",
  "humantime-serde",
  "hyper-util",
  "jemalloc_pprof",
- "jsonwebtoken 10.3.0",
+ "jsonwebtoken 10.4.0",
  "lettre",
  "log",
  "metrics",
@@ -3742,9 +3742,9 @@ dependencies = [
 
 [[package]]
 name = "jsonwebtoken"
-version = "10.3.0"
+version = "10.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0529410abe238729a60b108898784df8984c87f6054c9c4fcacc47e4803c1ce1"
+checksum = "eba32bfb4ffdeaca3e34431072faf01745c9b26d25504aa7a6cf5684334fc4fc"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -3761,6 +3761,7 @@ dependencies = [
  "sha2 0.10.9",
  "signature",
  "simple_asn1",
+ "zeroize",
 ]
 
 [[package]]
