@@ -1,5 +1,7 @@
 //! OpenAI-compatible model listing for inference API keys.
 
+use std::collections::HashMap;
+
 use axum::{
     Extension, Json,
     extract::{Query, State},
@@ -13,7 +15,12 @@ use sqlx_pool_router::PoolProvider;
 
 use crate::{
     AppState,
-    db::handlers::Deployments,
+    api::models::{
+        cache_pricing::CachePricingResponse,
+        deployments::{DeployedModelResponse, enrichment::DeployedModelEnricher},
+        tariffs::TariffResponse,
+    },
+    db::handlers::{Deployments, Repository},
     inference::rejections::{self, Origin, Recorder, bearer_token},
     reasoning::SupportedReasoningEfforts,
 };
@@ -28,6 +35,7 @@ pub struct ModelsListResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct ModelsListQuery {
+    include: Option<String>,
     group: Option<String>,
     available_for_realtime: Option<String>,
     include_reasoning_capabilities: Option<String>,
@@ -71,6 +79,10 @@ struct ModelObject {
     owned_by: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     supported_reasoning_efforts: Option<SupportedReasoningEfforts>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tariffs: Option<Vec<TariffResponse>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_pricing: Option<CachePricingResponse>,
 }
 
 fn openai_error(status: StatusCode, message: &str, error_type: &str, code: &str) -> Response {
@@ -133,6 +145,7 @@ fn parse_optional_bool(param: &'static str, value: Option<&str>) -> Result<Optio
 // would add an allocation on every error path and make this handler's signature
 // differ from every other one for no benefit.
 #[allow(clippy::result_large_err)]
+#[tracing::instrument(skip_all)]
 pub async fn list_ai_models<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Query(query): Query<ModelsListQuery>,
@@ -159,6 +172,10 @@ pub async fn list_ai_models<P: PoolProvider>(
         parse_optional_bool("include_reasoning_capabilities", query.include_reasoning_capabilities.as_deref())
             .map_err(refuse_query)?
             .unwrap_or(false);
+    let include_pricing = query
+        .include
+        .as_deref()
+        .is_some_and(|includes| includes.split(',').any(|include| include.trim() == "pricing"));
 
     let mut conn = state
         .db
@@ -199,6 +216,7 @@ pub async fn list_ai_models<P: PoolProvider>(
     let mut models_query = QueryBuilder::new(
         r#"
         SELECT DISTINCT
+            dm.id,
             dm.alias,
             EXTRACT(EPOCH FROM dm.created_at)::BIGINT AS created
         FROM deployed_models dm
@@ -270,6 +288,53 @@ pub async fn list_ai_models<P: PoolProvider>(
         Default::default()
     };
 
+    // Reuse the customer catalogue's effective account prices, cache multipliers,
+    // and disabled-purpose/window filters. An inference key never gets the
+    // operator pricing view, even when its creator is a platform manager.
+    let mut pricing_models = if include_pricing && !rows.is_empty() {
+        let model_ids = rows.iter().map(|row| row.get("id")).collect::<Vec<_>>();
+        let mut repo = Deployments::new(&mut conn);
+        let models = repo
+            .get_bulk(model_ids.clone())
+            .await
+            .map_err(|e| database_error("load_priced_models", e))?;
+        let mut rules = repo
+            .get_traffic_rules_bulk(&model_ids)
+            .await
+            .map_err(|e| database_error("load_pricing_traffic_rules", e))?;
+        let models = models
+            .into_values()
+            .map(|model| {
+                let traffic_rules = rules.remove(&model.id).unwrap_or_default();
+                DeployedModelResponse::from(model).with_traffic_rules(traffic_rules)
+            })
+            .collect();
+        // Enrichment acquires its own read connections.
+        drop(conn);
+        DeployedModelEnricher {
+            db: &state.db.read(),
+            include_groups: false,
+            include_metrics: false,
+            include_status: false,
+            include_pricing: true,
+            include_endpoints: false,
+            include_components: false,
+            can_read_pricing: false,
+            can_read_rate_limits: false,
+            can_read_users: false,
+            pricing_account: Some(user_id),
+            can_read_composite_info: false,
+        }
+        .enrich_many(models)
+        .await
+        .map_err(|e| database_error("load_customer_pricing", e))?
+        .into_iter()
+        .map(|model| (model.alias.clone(), model))
+        .collect::<HashMap<_, _>>()
+    } else {
+        Default::default()
+    };
+
     Ok(Json(ModelsListResponse {
         object: "list".to_string(),
         data: rows
@@ -279,12 +344,18 @@ pub async fn list_ai_models<P: PoolProvider>(
                 let supported_reasoning_efforts = include_reasoning_capabilities
                     .then(|| reasoning_policies.get(&id).and_then(|policy| policy.supported_efforts()))
                     .flatten();
+                let (tariffs, cache_pricing) = pricing_models
+                    .remove(&id)
+                    .map(|model| (model.tariffs, model.cache_pricing))
+                    .unwrap_or_default();
                 ModelObject {
                     id,
                     object: "model".to_string(),
                     created: row.get::<Option<i64>, _>("created").unwrap_or_default(),
                     owned_by: "None".to_string(),
                     supported_reasoning_efforts,
+                    tariffs,
+                    cache_pricing,
                 }
             })
             .collect(),

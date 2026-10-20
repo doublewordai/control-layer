@@ -1,3 +1,4 @@
+pub mod ai_models;
 pub mod anthropic;
 pub mod batch_trace_attributes;
 pub mod cache_classifier;
