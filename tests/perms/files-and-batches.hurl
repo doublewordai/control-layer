@@ -444,7 +444,8 @@ jsonpath "$.endpoint" == "/v1/chat/completions"
 jsonpath "$.output_file_id" != null
 jsonpath "$.error_file_id" != null
 
-# Poll until the worker populates the batch and transitions to in_progress
+# Poll until the worker populates the batch and transitions out of validating.
+# A fast worker may complete the batch before this request observes in_progress.
 GET http://localhost:3001/ai/v1/batches/{{user1_batch_id}}
 [Options]
 retry: 10
@@ -453,7 +454,7 @@ retry-interval: 500
 dwctl_session: {{user_jwt}}
 HTTP 200
 [Asserts]
-jsonpath "$.status" == "in_progress"
+jsonpath "$.status" matches "^(in_progress|completed)$"
 jsonpath "$.request_counts.total" > 0
 
 # User1 CANNOT create batch from user2's file

@@ -11,7 +11,7 @@
 #     PostgreSQL client package
 
 [tools]
-rust = "stable"   # CI builds on stable; the release image pins 1.93.0
+rust = "stable"   # CI and the release image pin Rust 1.99.0
 node = "24"       # dashboard, matches CI
 pnpm = "latest"
 just = "latest"

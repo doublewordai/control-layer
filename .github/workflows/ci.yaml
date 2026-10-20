@@ -64,10 +64,10 @@ jobs:
       - name: Install pnpm
         uses: pnpm/action-setup@v6
         with:
-          version: 10
+          version: 10.34.7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
           cache: "pnpm"
@@ -78,9 +78,9 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Install just
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
         with:
-          just-version: "1.46.0"
+          just-version: "1.59.0"
 
       - name: Run frontend CI pipeline
         id: ci-step
@@ -194,9 +194,9 @@ jobs:
           cache-on-failure: true
 
       - name: Install just
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
         with:
-          just-version: "1.46.0"
+          just-version: "1.59.0"
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
@@ -347,9 +347,9 @@ jobs:
 
       - name: Install just
         if: env.RUN_CI == 'true'
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
         with:
-          just-version: "1.46.0"
+          just-version: "1.59.0"
 
       - name: Install sqlx-cli and cargo-llvm-cov
         if: env.RUN_CI == 'true'
@@ -428,9 +428,9 @@ jobs:
           shared-key: backend-lint
 
       - name: Install just
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
         with:
-          just-version: "1.46.0"
+          just-version: "1.59.0"
 
       - name: Install sqlx-cli
         run: cargo install sqlx-cli --version '^0.8' --no-default-features --features native-tls,postgres --locked
@@ -1347,17 +1347,17 @@ jobs:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
       - name: Install just
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
         with:
-          just-version: "1.46.0"
+          just-version: "1.59.0"
 
       - name: Install pnpm
         uses: pnpm/action-setup@v6
         with:
-          version: 10
+          version: 10.34.7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
           cache: "pnpm"

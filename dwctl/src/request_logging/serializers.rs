@@ -42,6 +42,7 @@
 use crate::config::Config;
 use crate::prompt_cache::CacheBilling;
 use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk, CompletionChunk, ParsedAIRequest, ResponsesRequest};
+use crate::request_logging::stream_completion::{CLIENT_DISCONNECTED, client_disconnected};
 use outlet::{RequestData, ResponseData};
 use outlet_postgres::SerializationError;
 use serde_json::Value;
@@ -611,7 +612,10 @@ impl UsageMetrics {
             cache_creation_1h_input_tokens: cache_tokens.creation_1h,
             cache_creation_24h_input_tokens: cache_tokens.creation_24h,
             response_type: metrics.response_type,
-            finish_reason: extract_finish_reason(parsed_response),
+            // A stream the client dropped before any finish_reason records the
+            // disconnect instead of NULL; a model's own reason always wins.
+            finish_reason: extract_finish_reason(parsed_response)
+                .or_else(|| client_disconnected(response_data).then(|| CLIENT_DISCONNECTED.to_string())),
             server_address: config.host.clone(),
             server_port: config.port,
             served_by: response_data.extensions.get::<onwards::ServedBy>().map(|s| s.url.clone()),
@@ -1250,6 +1254,7 @@ mod tests {
     };
     use crate::prompt_cache::{BilledCache, CacheBilling, CacheReadSource, CacheStats};
     use crate::request_logging::models::{AiRequest, AiResponse};
+    use crate::request_logging::stream_completion::{CLIENT_DISCONNECTED, StreamCompletion};
     use axum::http::{Method, StatusCode, Uri};
     use bytes::Bytes;
     use onwards::strict::schemas::chat_completions::{ChatCompletionChunk as ChatChunk, ChatCompletionResponse, Usage as ChatUsage};
@@ -3340,6 +3345,38 @@ mod tests {
             "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
         );
         assert_eq!(finish_reason_of(body, true), None);
+    }
+
+    /// The finish_reason recorded for a stream, given whether its body ended.
+    fn recorded_finish_reason(body: &'static str, ended: bool) -> Option<String> {
+        let (req, mut res) = chat_pair(body, true);
+        let completion = StreamCompletion::default();
+        if ended {
+            completion.mark_ended();
+        }
+        res.extensions.insert(completion);
+        let parsed = parse_ai_response(&req, &res).unwrap_or(AiResponse::Other(serde_json::Value::Null));
+        UsageMetrics::extract(uuid::Uuid::nil(), &req, &res, &parsed, &crate::config::Config::default()).finish_reason
+    }
+
+    /// A cut-off stream records the disconnect only when the client dropped it; an
+    /// upstream that ended the stream early still records NULL.
+    #[test]
+    fn finish_reason_records_a_client_disconnect() {
+        let body = concat!(
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        );
+        assert_eq!(recorded_finish_reason(body, false).as_deref(), Some(CLIENT_DISCONNECTED));
+        assert_eq!(recorded_finish_reason(body, true), None);
+    }
+
+    /// The model's own reason wins over a disconnect that came after it.
+    #[test]
+    fn finish_reason_prefers_the_model_reason_over_a_disconnect() {
+        let body = concat!(
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        assert_eq!(recorded_finish_reason(body, false).as_deref(), Some("stop"));
     }
 
     #[test]
