@@ -129,6 +129,7 @@ fi
 
 require_block_line "$changes_job" '      run-backend: ${{ steps.classify.outputs.run-backend }}' 'publish the backend change decision'
 require_text "! grep -Evq '^dashboard/'" 'limit the fast path to pure dashboard changes'
+require_text '[[ "$EVENT_NAME" == pull_request ]]' 'retain full backend validation for merge groups'
 require_text '[[ "$HEAD_REF" != preview/* ]]' 'retain full image builds for preview branches'
 require_block_line "$crate_test_job" '    if: always()' 'expand the crate matrix when backend checks are not required'
 require_block_line "$crate_test_job" "      RUN_BACKEND: \${{ needs.changes.outputs.run-backend }}" 'expose the backend change decision to crate test steps'

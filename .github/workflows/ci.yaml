@@ -24,6 +24,7 @@ jobs:
         id: classify
         shell: bash
         env:
+          EVENT_NAME: ${{ github.event_name }}
           HEAD_REF: ${{ github.head_ref }}
         run: |
           run_ci=true
@@ -57,8 +58,12 @@ jobs:
           # Pure dashboard changes do not affect the Rust workspace, images or
           # API compliance surfaces. Preview branches remain full builds because
           # their deployment contract publishes the dwctl image from this run.
+          # Merge groups also retain backend validation: they do not expose the
+          # source branch through github.head_ref, so the preview exception
+          # cannot be classified safely without an API lookup.
           run_backend=$run_ci
           if [[ "$run_ci" == true && -n "$changed_files" ]] &&
+             [[ "$EVENT_NAME" == pull_request ]] &&
              ! grep -Evq '^dashboard/' <<< "$changed_files" &&
              [[ "$HEAD_REF" != preview/* ]]; then
             run_backend=false

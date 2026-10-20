@@ -455,6 +455,7 @@ require_scoped_line "$merge_group_title_step" "        if: github.event_name == 
 crate_test_job="$(extract_workflow_job .github/workflows/ci.yaml backend-crate-test)"
 changes_job="$(extract_workflow_job .github/workflows/ci.yaml changes)"
 require_scoped_line "$changes_job" '      run-backend: ${{ steps.classify.outputs.run-backend }}' 'Change classification must publish the backend decision'
+require_scoped_line "$changes_job" '          EVENT_NAME: ${{ github.event_name }}' 'Change classification must identify merge-group events'
 require_scoped_line "$crate_test_job" '    if: always()' 'Crate test matrix must expand when backend checks are not required'
 require_scoped_line "$crate_test_job" "      RUN_BACKEND: \${{ needs.changes.outputs.run-backend }}" 'Crate tests must consume the backend decision at step level'
 crate_skip_step="$(extract_workflow_step "$crate_test_job" 'Skip crate tests when backend is unchanged')"
