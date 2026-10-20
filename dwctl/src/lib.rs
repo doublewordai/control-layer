@@ -2582,8 +2582,12 @@ pub async fn build_router(
     // it captures the translated Responses object (the row `GET /v1/responses/{id}`
     // reads); INNER to inference_mw, so the correlation headers it relies on
     // (`x-onwards-response-id` / `x-fusillade-request-id`) are already set.
+    // Stream completion sits just inside outlet, so it tracks the body outlet
+    // hands to the client and can tell a disconnect from an early end.
     let onwards_router = if let Some(outlet_layer) = outlet_layer.clone() {
-        onwards_router.layer(outlet_layer)
+        onwards_router
+            .layer(middleware::from_fn(request_logging::stream_completion::track_stream_completion))
+            .layer(outlet_layer)
     } else {
         onwards_router
     };
