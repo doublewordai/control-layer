@@ -80,7 +80,7 @@ jobs:
       - name: Install just
         uses: extractions/setup-just@v4
         with:
-          just-version: "1.46.0"
+          just-version: "1.59.0"
 
       - name: Run frontend CI pipeline
         id: ci-step
@@ -196,7 +196,7 @@ jobs:
       - name: Install just
         uses: extractions/setup-just@v4
         with:
-          just-version: "1.46.0"
+          just-version: "1.59.0"
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
@@ -349,7 +349,7 @@ jobs:
         if: env.RUN_CI == 'true'
         uses: extractions/setup-just@v4
         with:
-          just-version: "1.46.0"
+          just-version: "1.59.0"
 
       - name: Install sqlx-cli and cargo-llvm-cov
         if: env.RUN_CI == 'true'
@@ -430,7 +430,7 @@ jobs:
       - name: Install just
         uses: extractions/setup-just@v4
         with:
-          just-version: "1.46.0"
+          just-version: "1.59.0"
 
       - name: Install sqlx-cli
         run: cargo install sqlx-cli --version '^0.8' --no-default-features --features native-tls,postgres --locked
@@ -1349,7 +1349,7 @@ jobs:
       - name: Install just
         uses: extractions/setup-just@v4
         with:
-          just-version: "1.46.0"
+          just-version: "1.59.0"
 
       - name: Install pnpm
         uses: pnpm/action-setup@v6
