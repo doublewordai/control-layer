@@ -133,7 +133,7 @@ importers:
         version: 0.4.6(react-dom@19.2.5(react@19.2.5))(react@19.2.5)
       openai:
         specifier: ^6.0.0
-        version: 6.34.0(zod@3.25.76)
+        version: 6.49.0(zod@3.25.76)
       react:
         specifier: ^19.1.1
         version: 19.2.5
@@ -3197,13 +3197,21 @@ packages:
     resolution: {integrity: sha512-smsWv2LzFjP03xmvFoJ331ss6h+jixfA4UUV/Bsiyuu4YJPfN+FIQGOIiv4w9/+MoHkfkJ22UIaQWRVFRfH6Vw==}
     engines: {node: '>=20'}
 
-  openai@6.34.0:
-    resolution: {integrity: sha512-yEr2jdGf4tVFYG6ohmr3pF6VJuveP0EA/sS8TBx+4Eq5NT10alu5zg2dmxMXMgqpihRDQlFGpRt2XwsGj+Fyxw==}
-    hasBin: true
+  openai@6.49.0:
+    resolution: {integrity: sha512-aYCc0C6L864eR6WSYIwQGyXriw/nIyZx0ObvhzOEVuk0zoBDpynjSbrionWI7q65B5H8jJX0DXR9snEzM6bfPg==}
     peerDependencies:
+      '@aws-sdk/credential-provider-node': '>=3.972.0 <4'
+      '@smithy/hash-node': '>=4.3.0 <5'
+      '@smithy/signature-v4': '>=5.4.0 <6'
       ws: ^8.18.0
       zod: ^3.25 || ^4.0
     peerDependenciesMeta:
+      '@aws-sdk/credential-provider-node':
+        optional: true
+      '@smithy/hash-node':
+        optional: true
+      '@smithy/signature-v4':
+        optional: true
       ws:
         optional: true
       zod:
@@ -7093,7 +7101,7 @@ snapshots:
       powershell-utils: 0.1.0
       wsl-utils: 0.3.1
 
-  openai@6.34.0(zod@3.25.76):
+  openai@6.49.0(zod@3.25.76):
     optionalDependencies:
       zod: 3.25.76
 
