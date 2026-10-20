@@ -52,6 +52,7 @@ use crate::metrics::errors::component::ANALYTICS;
 use crate::request_logging::batcher::{AnalyticsOutboxWriter, RawAnalyticsRecord};
 use crate::request_logging::models::{AiResponse, ChatCompletionChunk};
 use crate::request_logging::serializers::{UsageMetrics, parse_ai_response};
+use crate::request_logging::stream_completion::client_disconnected;
 use crate::request_logging::utils::{extract_header_as_string, extract_header_as_uuid};
 use axum::http::StatusCode;
 use onwards::AuthenticatedApiKeyId;
@@ -266,6 +267,7 @@ impl RequestHandler for AnalyticsHandler {
                     response_type = %metrics.response_type,
                     request_model = metrics.request_model.as_deref(),
                     response_model = metrics.response_model.as_deref(),
+                    client_disconnected = client_disconnected(&response_data),
                     "Successful generative response recorded zero tokens"
                 );
             }
