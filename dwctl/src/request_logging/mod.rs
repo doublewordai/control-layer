@@ -1,5 +1,6 @@
 pub mod analytics_handler;
 pub mod batcher;
+pub mod credential_scrubber;
 pub mod models;
 pub mod serializers;
 pub mod stream_completion;
