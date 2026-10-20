@@ -32,6 +32,9 @@ use url::Url;
 use super::config::FetcherConfig;
 use super::ip_filter;
 
+/// Sent on every image fetch.
+const USER_AGENT: &str = "dwctl-image-fetcher/1.0 (+https://doubleword.ai; support@doubleword.ai)";
+
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
     /// Caller's URL is unacceptable: bad scheme, denied IP, oversize,
@@ -154,7 +157,9 @@ impl ImageFetcher {
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(self.config.timeout())
                 .resolve(host, resolved)
-                .user_agent("dwctl-image-fetcher/1.0")
+                // Identify ourselves with contact details, as Wikimedia's
+                // User-Agent policy and many hosts' bot policies ask.
+                .user_agent(USER_AGENT)
                 .build()
                 .map_err(|e| FetchError::Transient(format!("client build: {e}")))?;
 
