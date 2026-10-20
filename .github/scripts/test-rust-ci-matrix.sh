@@ -229,9 +229,13 @@ if ! diff -u \
   exit 1
 fi
 
-setup_just_count="$(grep -Fc 'uses: extractions/setup-just@v3' "$workflow")"
-pinned_just_count="$(grep -Fc 'just-version: "1.46.0"' "$workflow")"
+setup_just_count="$(grep -Fc 'uses: extractions/setup-just@' "$workflow" || true)"
+pinned_just_count="$(grep -Fc 'just-version: "1.59.0"' "$workflow" || true)"
+if [[ "$setup_just_count" == 0 ]]; then
+  echo "Rust CI workflow must install just with setup-just" >&2
+  exit 1
+fi
 if [[ "$setup_just_count" != "$pinned_just_count" ]]; then
-  echo "Every setup-just invocation must pin just-version 1.46.0" >&2
+  echo "Every setup-just invocation must pin just-version 1.59.0" >&2
   exit 1
 fi
