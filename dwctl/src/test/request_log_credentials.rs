@@ -77,31 +77,21 @@ async fn api_key_and_cookies_are_not_stored_in_the_request_log(pool: PgPool) {
     config.background_services.onwards_sync.enabled = true;
     let (server, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
 
-    // Onwards picks the model up asynchronously; 403/404 mean "not synced yet".
+    // The app loads its routing targets synchronously at startup, and everything
+    // above is seeded before it is built, so the first request is routable. One
+    // request means one row in each table, so "latest row" is this request's row.
     let body = serde_json::json!({
         "model": MODEL_ALIAS,
         "messages": [{ "role": "user", "content": "hello" }]
     });
-    for attempt in 0..100 {
-        let resp = server
-            .post("/ai/v1/chat/completions")
-            .add_header("authorization", format!("Bearer {}", api_key.secret))
-            .add_header("x-api-key", &api_key.secret)
-            .add_header("cookie", COOKIE_VALUE)
-            .json(&body)
-            .await;
-        let status = resp.status_code().as_u16();
-        if status == 200 {
-            break;
-        }
-        assert!(
-            matches!(status, 403 | 404),
-            "request should succeed; got {status}, body: {}",
-            resp.text()
-        );
-        assert!(attempt < 99, "model never became routable, last status: {status}");
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+    let resp = server
+        .post("/ai/v1/chat/completions")
+        .add_header("authorization", format!("Bearer {}", api_key.secret))
+        .add_header("x-api-key", &api_key.secret)
+        .add_header("cookie", COOKIE_VALUE)
+        .json(&body)
+        .await;
+    assert_eq!(resp.status_code().as_u16(), 200, "request should succeed, body: {}", resp.text());
 
     let request_row = poll_latest_row(&pool, "outlet.http_requests").await;
     let request_text = request_row.to_string();
