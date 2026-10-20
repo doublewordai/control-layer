@@ -38,6 +38,7 @@ use crate::pricing::{
 use crate::request_logging::serializers::{HttpAnalyticsRow, RequestParams};
 use chrono::{DateTime, Utc};
 use metrics::{counter, histogram};
+use rand::RngExt;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
@@ -218,6 +219,32 @@ fn compute_list_price(raw: &RawAnalyticsRecord, input_price: Option<Decimal>, ou
     list_price(raw.prompt_tokens, raw.completion_tokens, input_price, output_price)
 }
 
+/// How many times the direct outbox insert re-tries after a connection-class
+/// failure before giving up. Unlike the projector's work (which is retried by the
+/// next drain because the row is already durable), a failed direct insert is the
+/// only copy of the record: if it is not retried it becomes an unbilled request.
+/// Three retries at 100ms·2^n (≈0.7s total) recover the observed instant-fail
+/// severed-conn/TLS/Neon-auth blips without holding outlet's detached capture task
+/// for long. A sustained database outage still loses the record; that is what the
+/// `outbox_publish` alert's history tracks.
+const OUTBOX_PUBLISH_CONN_RETRIES: u32 = 3;
+
+/// A failure of the CONNECTION, not the query: a severed pooled conn (Io/Protocol),
+/// a TLS handshake killed mid-setup (Tls), or the upstream proxy timing out
+/// authentication on a fresh conn (surfaces as a database error with this message on
+/// Neon). These are instant-fail and safe to retry. Mirrors
+/// `prompt_cache::postgres::is_transient_connection_error`, which documents the same
+/// Neon burst-churn family; `PoolTimedOut` and `PoolClosed` are deliberately excluded —
+/// a timed-out acquire has already burned its budget, and a closed pool never reopens,
+/// so retrying either only delays the failure.
+fn is_transient_connection_error(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::Io(_) | sqlx::Error::Tls(_) | sqlx::Error::Protocol(_) => true,
+        sqlx::Error::Database(db) => db.message().contains("Authentication timed out"),
+        _ => false,
+    }
+}
+
 /// Direct writer for the durable analytics handoff. Each completed capture is
 /// inserted immediately; enrichment and final writes remain batched later.
 #[derive(Clone)]
@@ -249,19 +276,39 @@ impl AnalyticsOutboxWriter {
             AnalyticsOutboxDestination::Channel(_) => unreachable!("test channel is handled above"),
         };
         let payload = serde_json::to_value(&record)?;
-        sqlx::query(
-            r#"
-            INSERT INTO analytics_outbox (instance_id, correlation_id, payload)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (instance_id, correlation_id)
-            DO UPDATE SET payload = EXCLUDED.payload
-            "#,
-        )
-        .bind(record.instance_id)
-        .bind(record.correlation_id)
-        .bind(payload)
-        .execute(&pool.write())
-        .await?;
+        // Retry connection-class failures only. `pool.write()` is re-acquired on every
+        // attempt, so a retry lands on a fresh connection rather than the severed one.
+        // Jittered backoff keeps a fleet-wide blip — every pod's in-flight captures
+        // failing in the same second — from re-storming connection setup in lockstep,
+        // mirroring `with_conn_retry!` in `prompt_cache::postgres`.
+        let mut attempt: u32 = 0;
+        loop {
+            let result = sqlx::query(
+                r#"
+                INSERT INTO analytics_outbox (instance_id, correlation_id, payload)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (instance_id, correlation_id)
+                DO UPDATE SET payload = EXCLUDED.payload
+                "#,
+            )
+            .bind(record.instance_id)
+            .bind(record.correlation_id)
+            .bind(&payload)
+            .execute(&pool.write())
+            .await;
+            match result {
+                Ok(_) => break,
+                Err(error) if is_transient_connection_error(&error) && attempt < OUTBOX_PUBLISH_CONN_RETRIES => {
+                    counter!("dwctl_analytics_outbox_publish_retries_total").increment(1);
+                    debug!(attempt, error = %error, "analytics outbox publish hit a connection error; retrying with a fresh connection");
+                    let base_ms = 100u64 << attempt.min(4);
+                    let jitter_ms = rand::rng().random_range(0..(base_ms / 5 + 1));
+                    tokio::time::sleep(std::time::Duration::from_millis(base_ms + jitter_ms)).await;
+                    attempt += 1;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
 
         counter!("dwctl_analytics_outbox_published_total").increment(1);
         projector_notify.notify_one();
@@ -1824,6 +1871,26 @@ mod tests {
         assert_eq!(compute_billing_tier(None, Some("1h")), "flex");
         assert_eq!(compute_billing_tier(Some(batch_id), Some("1h")), "async");
         assert_eq!(compute_billing_tier(Some(batch_id), Some("24h")), "batch");
+    }
+
+    /// The exact errors observed in the 2026-10-20 curie blip (severed pool conn,
+    /// TLS EOF) and the Neon auth timeout must retry; a closed pool and a query-level
+    /// error must not, so shutdown is not delayed and bad data is not replayed.
+    #[test]
+    fn transient_outbox_connection_errors_are_classified_for_retry() {
+        use std::io;
+        assert!(is_transient_connection_error(&sqlx::Error::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "expected to read 5 bytes, got 0 bytes at EOF"
+        ))));
+        assert!(is_transient_connection_error(&sqlx::Error::Tls(Box::new(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "peer closed connection without sending TLS close_notify"
+        )))));
+        assert!(is_transient_connection_error(&sqlx::Error::Protocol("unexpected EOF".into())));
+        assert!(!is_transient_connection_error(&sqlx::Error::PoolClosed));
+        assert!(!is_transient_connection_error(&sqlx::Error::PoolTimedOut));
+        assert!(!is_transient_connection_error(&sqlx::Error::RowNotFound));
     }
 
     #[test]
