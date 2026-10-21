@@ -1,4 +1,3 @@
-use fusillade::PostgresDaemon;
 use fusillade::batch::{BackgroundBatchInput, BatchInput, RequestTemplateInput};
 use fusillade::daemon::{
     DaemonConfig, ModelEscalationConfig, RetentionMaintenanceConfig, default_should_retry,
@@ -8,6 +7,7 @@ use fusillade::manager::{ModelFilter, ModelFilterState, Storage};
 use fusillade::request::{
     CreateBackgroundInput, CreateFlexInput, Failed, ListRequestsFilter, Request, ServiceTierFilter,
 };
+use fusillade::{Daemon, DaemonMode, PostgresDaemon};
 use fusillade_arsenal::{PostgresRequestManager as PostgresStore, TestDbPools};
 use std::sync::Arc;
 use std::time::Duration;
@@ -102,6 +102,68 @@ async fn seed_leak_work(store: &TestStore) {
             .await
             .unwrap();
     }
+}
+
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+async fn heartbeat_lease_loss_fails_daemon_without_cancelling_caller(pool: sqlx::PgPool) {
+    let config = DaemonConfig {
+        mode: DaemonMode::RequestOnly,
+        heartbeat_interval_ms: 100,
+        stale_daemon_threshold_ms: 500,
+        claim_interval_ms: 1_000,
+        status_log_interval_ms: None,
+        throughput_log_interval_ms: None,
+        purge_interval_ms: 0,
+        ..Default::default()
+    };
+    let store = postgres_store(pool.clone(), &config).await;
+    let caller_shutdown = CancellationToken::new();
+    let daemon = Arc::new(Daemon::new(
+        store,
+        Arc::new(MockHttpClient::new()),
+        config,
+        caller_shutdown.clone(),
+    ));
+    let daemon_handle = tokio::spawn(daemon.run_with_mode(DaemonMode::RequestOnly));
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let running: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM daemons WHERE status = 'running')",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("daemon did not register as running");
+
+    // Block both heartbeat renewal and the best-effort dead-state write. The
+    // local lease must still expire and make the actual run loop return an
+    // error; cancellation must remain scoped below the caller's process token.
+    let mut lock = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE daemons IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+
+    let error = tokio::time::timeout(Duration::from_secs(3), daemon_handle)
+        .await
+        .expect("daemon did not self-fence after its heartbeat lease expired")
+        .expect("daemon task panicked")
+        .expect_err("heartbeat lease loss must fail the daemon run loop");
+    assert!(error.to_string().contains("heartbeat lease expired"));
+    assert!(
+        !caller_shutdown.is_cancelled(),
+        "self-fencing must not cancel the caller's process-wide token"
+    );
+
+    lock.rollback().await.unwrap();
 }
 
 /// Batch tokens must refill after actual dispatch while async still progresses.

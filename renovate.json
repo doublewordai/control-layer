@@ -14,10 +14,10 @@
       "groupName": "Cargo patch dependencies"
     },
     {
-      "description": "Group npm patch updates separately from Cargo updates",
+      "description": "Group npm non-major updates separately from Cargo updates",
       "matchManagers": ["npm"],
-      "matchUpdateTypes": ["patch"],
-      "groupName": "npm patch dependencies"
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "npm non-major dependencies"
     }
   ]
 }

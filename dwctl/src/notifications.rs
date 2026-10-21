@@ -160,6 +160,24 @@ fn batch_outcome(batch: &fusillade::batch::Batch) -> &'static str {
     batch_span_outcome(batch.completed_requests, batch.failed_requests, batch.canceled_requests)
 }
 
+/// Batches with fewer requests than this are `small` on the span. The batch
+/// failure alert ignores them, and a request count cannot be a metric label.
+const SMALL_BATCH_REQUESTS: i64 = 10;
+
+/// Size class of a batch with `total_requests`: `small` or `large`.
+fn batch_size_class(total_requests: i64) -> &'static str {
+    if total_requests < SMALL_BATCH_REQUESTS { "small" } else { "large" }
+}
+
+/// Whether a batch that finished at `finished_at` met its deadline (`met` or
+/// `missed`), with how many whole seconds late it finished (0 when on time).
+/// `None` when the batch has no deadline or no finish time.
+fn batch_deadline(expires_at: Option<DateTime<Utc>>, finished_at: Option<DateTime<Utc>>) -> Option<(&'static str, i64)> {
+    let (finished_at, expires_at) = (finished_at?, expires_at?);
+    let late_seconds = (finished_at - expires_at).num_seconds().max(0);
+    Some((if finished_at > expires_at { "missed" } else { "met" }, late_seconds))
+}
+
 /// The models a claimed batch's requests named. The claim reports them joined
 /// with `", "`, so an alias that itself contains `", "` comes back split. That
 /// is accepted rather than changing fusillade's public `BatchNotification` or
@@ -232,7 +250,9 @@ async fn emit_batch_finalized_spans<P: sqlx_pool_router::PoolProvider>(
             None => "unknown",
         });
         // When the batch finished; the span itself starts when the poller claims it.
-        let finalized_at = batch.completed_at.or(batch.failed_at).map(|at| at.to_rfc3339());
+        let finished_at = batch.completed_at.or(batch.failed_at);
+        let finalized_at = finished_at.map(|at| at.to_rfc3339());
+        let deadline = batch_deadline(batch.expires_at, finished_at);
         // A root span: the poller has no request to belong to. A producer,
         // because it reports on work it did not serve itself.
         let span = tracing::info_span!(
@@ -253,6 +273,9 @@ async fn emit_batch_finalized_spans<P: sqlx_pool_router::PoolProvider>(
             batch.outcome = outcome,
             batch.sample_error = sample_error,
             batch.finalized_at = finalized_at.as_deref(),
+            batch.size_class = batch_size_class(batch.total_requests),
+            batch.deadline = deadline.map(|(met, _)| met),
+            batch.late_seconds = deadline.map(|(_, late)| late),
         );
         // An array attribute, so a trace query can match any one of the models.
         let models = batch_models(notif)
@@ -2311,6 +2334,33 @@ mod tests {
         assert_eq!(batch_span_outcome(3, 0, 2), "partially_completed");
     }
 
+    #[test]
+    fn batch_span_size_class() {
+        assert_eq!(batch_size_class(1), "small");
+        assert_eq!(batch_size_class(9), "small");
+        assert_eq!(batch_size_class(10), "large");
+    }
+
+    #[test]
+    fn batch_span_deadline() {
+        let expires_at = Utc::now();
+        let at = |millis| Some(expires_at + chrono::Duration::milliseconds(millis));
+        assert_eq!(batch_deadline(Some(expires_at), at(-60_000)), Some(("met", 0)));
+        assert_eq!(
+            batch_deadline(Some(expires_at), at(0)),
+            Some(("met", 0)),
+            "finishing at the deadline is on time"
+        );
+        assert_eq!(
+            batch_deadline(Some(expires_at), at(500)),
+            Some(("missed", 0)),
+            "late by less than a second"
+        );
+        assert_eq!(batch_deadline(Some(expires_at), at(90_500)), Some(("missed", 90)));
+        assert_eq!(batch_deadline(None, at(0)), None);
+        assert_eq!(batch_deadline(Some(expires_at), None), None);
+    }
+
     /// Each finalized batch yields exactly one `fusillade.batch_finalized` span,
     /// because the claim hands a batch to the poller once. Account name, counts,
     /// outcome and a status-only failure sample ride on the span.
@@ -2388,6 +2438,14 @@ mod tests {
             .execute(&fusillade_pool)
             .await
             .unwrap();
+            if name == "all-failed" {
+                // Due an hour ago, so it finishes late.
+                sqlx::query("UPDATE batches SET expires_at = NOW() - INTERVAL '1 hour' WHERE id = $1")
+                    .bind(*batch.id)
+                    .execute(&fusillade_pool)
+                    .await
+                    .unwrap();
+            }
             batch_ids.push(batch.id);
         }
         manager.finalize_terminal_batches().await.unwrap();
@@ -2429,6 +2487,15 @@ mod tests {
             assert_eq!(span_attr(span, "batch.failed_requests").as_deref(), Some(failed));
             assert_eq!(span_attr(span, "batch.outcome").as_deref(), Some(outcome));
             assert!(span_attr(span, "batch.finalized_at").is_some(), "the batch's own finish time");
+            assert_eq!(span_attr(span, "batch.size_class").as_deref(), Some("small"));
+            let late_seconds: i64 = span_attr(span, "batch.late_seconds").expect("late_seconds").parse().unwrap();
+            if outcome == "failed" {
+                assert_eq!(span_attr(span, "batch.deadline").as_deref(), Some("missed"));
+                assert!(late_seconds >= 3600, "finished an hour after its deadline, got {late_seconds}");
+            } else {
+                assert_eq!(span_attr(span, "batch.deadline").as_deref(), Some("met"));
+                assert_eq!(late_seconds, 0);
+            }
             let sample = span_attr(span, "batch.sample_error");
             if outcome == "failed" {
                 assert_eq!(sample.as_deref(), Some("http_422"), "status class only, never the message");

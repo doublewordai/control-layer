@@ -34,7 +34,9 @@ use crate::AppState;
 use crate::client::HttpClient;
 use crate::errors::OnwardsErrorResponse;
 use crate::extract_model_from_request;
-use crate::handlers::{AuthenticatedApiKeyId, ResolvedTrust, target_message_handler};
+use crate::handlers::{
+    AuthenticatedApiKeyId, ResolvedTrust, UpstreamFailureLabels, target_message_handler,
+};
 use crate::rejections::RejectionContext;
 use axum::Json;
 use axum::body::{Body, Bytes};
@@ -1791,6 +1793,22 @@ fn parse_provider_status_code(code: &serde_json::Value) -> Option<u16> {
 /// The actual error is logged for debugging but never sent to the client.
 async fn sanitize_error_response(mut response: Response) -> Response {
     let status = response.status();
+
+    // Counted, not just logged: the status is the provider's own, before
+    // `standard_error_response` masks account-class codes (402 → 502), so this
+    // is the only metric that sees, say, a provider out of credits. Every
+    // response an upstream answered carries the labels.
+    if let Some(labels) = response.extensions().get::<UpstreamFailureLabels>() {
+        metrics::counter!(
+            "onwards_upstream_failed_total",
+            "reason" => "third_party_error",
+            "status" => status.as_str().to_string(),
+            "model" => labels.model.clone(),
+            "traffic" => labels.traffic,
+            "served_by" => labels.served_by.clone(),
+        )
+        .increment(1);
+    }
 
     // Drain the body (bounded, so a misbehaving provider cannot make us buffer
     // an arbitrarily large response) to record its length, but do NOT log its
@@ -4579,6 +4597,110 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         // Original message preserved, not replaced with a generic one.
         assert_eq!(json["error"]["message"], "You have insufficient credits");
+    }
+
+    /// Sends a chat request for `gpt-4` to a provider at
+    /// `https://openrouter.ai/api/v1` that answers 402, and returns the
+    /// caller-facing status with the `onwards_upstream_failed_total` lines it
+    /// recorded.
+    fn upstream_failures_for_402(trusted: bool) -> (StatusCode, Vec<String>) {
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::{LoadBalanceStrategy, Target, Targets};
+        use crate::test_utils::MockHttpClient;
+        use axum::body::Body;
+        use axum::http::Request;
+        use dashmap::DashMap;
+        use metrics_exporter_prometheus::PrometheusBuilder;
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        let targets_map = Arc::new(DashMap::new());
+        let pool = ProviderPool::with_config(
+            vec![Provider::new(
+                Target::builder()
+                    .url("https://openrouter.ai/api/v1".parse().unwrap())
+                    .onwards_key("sk-test".to_string())
+                    .build(),
+                1,
+            )],
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::default(),
+            trusted,
+            Vec::new(),
+        );
+        targets_map.insert("gpt-4".to_string(), pool.into());
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+        let mock_error = r#"{"error":{"message":"Insufficient credits","code":402}}"#;
+        let mock_client = MockHttpClient::new(StatusCode::PAYMENT_REQUIRED, mock_error);
+        let router =
+            crate::strict::build_strict_router(crate::AppState::with_client(targets, mock_client));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}"#,
+            ))
+            .unwrap();
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let status = metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async { router.oneshot(request).await.unwrap().status() })
+        });
+        let lines = handle
+            .render()
+            .lines()
+            .filter(|line| line.starts_with("onwards_upstream_failed_total{"))
+            .map(str::to_string)
+            .collect();
+        (status, lines)
+    }
+
+    /// The caller sees a masked 502, so the counter is the only place an
+    /// untrusted provider's own 402 (e.g. out of credits) is visible.
+    #[test]
+    fn sanitized_third_party_error_counts_provider_status_and_host() {
+        let (status, lines) = upstream_failures_for_402(false);
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(lines.len(), 1, "expected one counter line, got {lines:?}");
+        let line = &lines[0];
+        for label in [
+            r#"reason="third_party_error""#,
+            r#"status="402""#,
+            r#"served_by="openrouter.ai""#,
+            r#"model="gpt-4""#,
+            r#"traffic="realtime""#,
+        ] {
+            assert!(line.contains(label), "{label} missing from {line}");
+        }
+        assert!(line.ends_with(" 1"), "expected a count of 1: {line}");
+    }
+
+    /// A trusted provider's error is forwarded, not sanitized, so it is not a
+    /// third-party error.
+    #[test]
+    fn trusted_provider_error_is_not_counted_as_third_party() {
+        let (status, lines) = upstream_failures_for_402(true);
+
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        assert!(lines.is_empty(), "unexpected counter lines: {lines:?}");
     }
 
     #[tokio::test]

@@ -81,8 +81,12 @@
 //! `completion_window`, `batch.total_requests`, `batch.completed_requests`,
 //! `batch.failed_requests`, `batch.canceled_requests`, `batch.outcome`
 //! (`completed` | `partially_completed` | `failed`, with cancelled requests
-//! counted against the batch), `batch.finalized_at` and, for failed batches,
-//! `batch.sample_error` (an error class, never a message).
+//! counted against the batch), `batch.finalized_at`, `batch.size_class`
+//! (`small` under 10 requests, else `large`), and, for batches with a deadline,
+//! `batch.deadline` (`met` | `missed`, comparing the finish time with
+//! `expires_at`) and `batch.late_seconds` (whole seconds past the deadline, 0
+//! when on time). Failed batches also carry `batch.sample_error` (an error
+//! class, never a message).
 //!
 //! Example - to enable OTLP export and send traces to a custom OTLP HTTP endpoint with basic authorization header:
 //!

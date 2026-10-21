@@ -1,5 +1,70 @@
 # Changelog
 
+## [14.4.0](https://github.com/doublewordai/control-layer/compare/v14.3.1...v14.4.0) (2026-10-20)
+
+
+### Features
+
+* **analytics:** record client disconnects on streamed responses ([#2018](https://github.com/doublewordai/control-layer/issues/2018)) ([5dc99eb](https://github.com/doublewordai/control-layer/commit/5dc99ebb20abe9acbef814d1b5d662b7f2c1ecf4))
+* **api:** expose model pricing to inference keys ([#2050](https://github.com/doublewordai/control-layer/issues/2050)) ([f9b536a](https://github.com/doublewordai/control-layer/commit/f9b536af3c50eed7132363b37c59d5507ffe1d3b))
+* **dwctl:** record batch size class and deadline outcome on batch spans (DW-952) ([#2010](https://github.com/doublewordai/control-layer/issues/2010)) ([44ae3f4](https://github.com/doublewordai/control-layer/commit/44ae3f479aa084d8a49aecea3ed031eaa2234d03))
+* **onwards:** count sanitized third-party errors ([#2054](https://github.com/doublewordai/control-layer/issues/2054)) ([dc82a0b](https://github.com/doublewordai/control-layer/commit/dc82a0be4ba644fa3563d9ea8d306a5fe072f1b0))
+
+
+### Bug Fixes
+
+* **deps:** patch source-map-js vulnerability ([#2035](https://github.com/doublewordai/control-layer/issues/2035)) ([a5e4275](https://github.com/doublewordai/control-layer/commit/a5e4275bf366eab7f769fed4b0157f6b28fd89a7))
+* **deps:** pin pnpm for lockfile generation ([#2024](https://github.com/doublewordai/control-layer/issues/2024)) ([4470775](https://github.com/doublewordai/control-layer/commit/44707755ce0389d2b06f563bebad6baa52f0c7c5))
+* **fusillade:** exit after heartbeat lease loss ([#2039](https://github.com/doublewordai/control-layer/issues/2039)) ([6e499f7](https://github.com/doublewordai/control-layer/commit/6e499f7ed8e801aec3ef9cd6c2132f944adf4474))
+* **images:** name the failing image in image normaliser errors ([#2045](https://github.com/doublewordai/control-layer/issues/2045)) ([81a950e](https://github.com/doublewordai/control-layer/commit/81a950e168f80bc47917c5b4b0601df8d5191adb))
+* **request-logging:** keep credentials out of the outlet request log ([#1968](https://github.com/doublewordai/control-layer/issues/1968)) ([41cddc3](https://github.com/doublewordai/control-layer/commit/41cddc36720cd98a3f6ac0d337e9e0ec21d7c541))
+
+
+### Build System
+
+* **deps:** bump @humanfs/node from 0.16.7 to 0.16.8 in /dashboard ([#2000](https://github.com/doublewordai/control-layer/issues/2000)) ([aaf2d5e](https://github.com/doublewordai/control-layer/commit/aaf2d5e53a734b682665e042e0f61d4319666d9a))
+
+
+### Continuous Integration
+
+* streamline frontend dependency updates ([#2053](https://github.com/doublewordai/control-layer/issues/2053)) ([836a6f0](https://github.com/doublewordai/control-layer/commit/836a6f00f8a80f8ca23d77918b0923d87bc957dc))
+
+
+### Miscellaneous
+
+* **deps:** update actions/setup-node action to v7 ([#2001](https://github.com/doublewordai/control-layer/issues/2001)) ([647d8ef](https://github.com/doublewordai/control-layer/commit/647d8efe57fb1e0ecc137f5e53c120c4d43f3c03))
+* **deps:** update aws-sdk-rust monorepo ([#2016](https://github.com/doublewordai/control-layer/issues/2016)) ([e476146](https://github.com/doublewordai/control-layer/commit/e476146765857a0260a2fa5202f2834f12494f4e))
+* **deps:** update cargo patch dependencies ([#2012](https://github.com/doublewordai/control-layer/issues/2012)) ([ba651d3](https://github.com/doublewordai/control-layer/commit/ba651d3941710fe20720859bb4d7bbf52182b38b))
+* **deps:** update dependency @fontsource/space-grotesk to v5.3.0 ([#2017](https://github.com/doublewordai/control-layer/issues/2017)) ([b43ec60](https://github.com/doublewordai/control-layer/commit/b43ec603b55e3550444e437e29453b4a8021e316))
+* **deps:** update dependency @hookform/resolvers to v5.9.2 ([#2021](https://github.com/doublewordai/control-layer/issues/2021)) ([88a3c4b](https://github.com/doublewordai/control-layer/commit/88a3c4b6d5435aca629abcae56d4282972ba1493))
+* **deps:** update dependency @playwright/test to v1.64.1 ([#2023](https://github.com/doublewordai/control-layer/issues/2023)) ([c9bd711](https://github.com/doublewordai/control-layer/commit/c9bd7115397d47098fa228a7a99de8b86f20bb90))
+* **deps:** update dependency @testing-library/jest-dom to v7 ([#2009](https://github.com/doublewordai/control-layer/issues/2009)) ([b1e1bef](https://github.com/doublewordai/control-layer/commit/b1e1bef60df17abde49123cedab85d7d50df3bd5))
+* **deps:** update dependency @types/node to v24.19.2 ([#2026](https://github.com/doublewordai/control-layer/issues/2026)) ([d2c0658](https://github.com/doublewordai/control-layer/commit/d2c0658edd34cbfdc2328e8cadd1e03555a6cbc2))
+* **deps:** update dependency autoprefixer to v10.6.1 ([#2027](https://github.com/doublewordai/control-layer/issues/2027)) ([c30980e](https://github.com/doublewordai/control-layer/commit/c30980e88fa7c675b137f1091a5c8e1b7dad8003))
+* **deps:** update dependency date-fns to v4.4.0 ([#2028](https://github.com/doublewordai/control-layer/issues/2028)) ([36ea1c3](https://github.com/doublewordai/control-layer/commit/36ea1c38a50a22420ac8293671c9b503640bc1e6))
+* **deps:** update dependency globals to v17.13.0 ([#2029](https://github.com/doublewordai/control-layer/issues/2029)) ([f15921e](https://github.com/doublewordai/control-layer/commit/f15921e388369f644dfefa56e3b9e40e02777f1b))
+* **deps:** update dependency jsdom to v29.1.1 ([#2030](https://github.com/doublewordai/control-layer/issues/2030)) ([d6fa1d6](https://github.com/doublewordai/control-layer/commit/d6fa1d67b765ba9f05d2d98ab798c4b4b3d71d24))
+* **deps:** update dependency just to v1.59.0 ([#2031](https://github.com/doublewordai/control-layer/issues/2031)) ([1a1a82e](https://github.com/doublewordai/control-layer/commit/1a1a82e17b9f2dd1d18c85083ca721fe217ea76d))
+* **deps:** update dependency msw to v2.15.0 ([#2032](https://github.com/doublewordai/control-layer/issues/2032)) ([c17e562](https://github.com/doublewordai/control-layer/commit/c17e562840f36763e798f7637266b9d3b1075469))
+* **deps:** update dependency openai to v6.49.0 ([#2033](https://github.com/doublewordai/control-layer/issues/2033)) ([7e94d0b](https://github.com/doublewordai/control-layer/commit/7e94d0bf6a704a42bb8da215b8638cb962e8f9eb))
+* **deps:** update dependency react-hook-form to v7.90.0 ([#2036](https://github.com/doublewordai/control-layer/issues/2036)) ([c383abf](https://github.com/doublewordai/control-layer/commit/c383abf10ea9f26f29196381ce22d02967515ba7))
+* **deps:** update dependency rollup-plugin-visualizer to v7.1.1 ([#2037](https://github.com/doublewordai/control-layer/issues/2037)) ([3392ec5](https://github.com/doublewordai/control-layer/commit/3392ec5716c29e686a0d61d8ba6bab2ebd12fb9e))
+* **deps:** update dependency undici to v7.30.1 ([#2043](https://github.com/doublewordai/control-layer/issues/2043)) ([f0b683f](https://github.com/doublewordai/control-layer/commit/f0b683f211c0accaadc365acaf3391db7013e50c))
+* **deps:** update dependency vitest to v4.1.12 [security] ([#1727](https://github.com/doublewordai/control-layer/issues/1727)) ([edb099e](https://github.com/doublewordai/control-layer/commit/edb099eba58a177d133c1021878835d9aaa303f3))
+* **deps:** update extractions/setup-just action to v4 ([#951](https://github.com/doublewordai/control-layer/issues/951)) ([d4d9e87](https://github.com/doublewordai/control-layer/commit/d4d9e87a633869c6fb216e984d9411b65214ea68))
+* **deps:** update google-cloud-rust monorepo ([#2046](https://github.com/doublewordai/control-layer/issues/2046)) ([bb85689](https://github.com/doublewordai/control-layer/commit/bb85689a3aeb1efe5d0e97d2d031c41d9feba1d6))
+* **deps:** update npm non-major dependencies ([#2057](https://github.com/doublewordai/control-layer/issues/2057)) ([d761ea5](https://github.com/doublewordai/control-layer/commit/d761ea5f4370c982e8b25069df444589f92a5568))
+* **deps:** update npm patch dependencies ([#2013](https://github.com/doublewordai/control-layer/issues/2013)) ([447c548](https://github.com/doublewordai/control-layer/commit/447c548416fb9d1e1f862e8d9c0cd51854d14e0a))
+* **deps:** update react monorepo ([#2048](https://github.com/doublewordai/control-layer/issues/2048)) ([fd1bced](https://github.com/doublewordai/control-layer/commit/fd1bced0d3e072dbcd956cb95bbc96e856635044))
+* **deps:** update rust crate bon to v3.10.2 ([#2049](https://github.com/doublewordai/control-layer/issues/2049)) ([88ea55b](https://github.com/doublewordai/control-layer/commit/88ea55b3c1ba80a68bcdfc7a466677f5dc43a559))
+* **deps:** update rust crate either to v1.19.0 ([#2051](https://github.com/doublewordai/control-layer/issues/2051)) ([e41d922](https://github.com/doublewordai/control-layer/commit/e41d9222d74cbf06d4b7f22a5b96eb6938a70fc4))
+* **deps:** update rust crate humantime to v2.4.0 ([#2052](https://github.com/doublewordai/control-layer/issues/2052)) ([7ba95be](https://github.com/doublewordai/control-layer/commit/7ba95beb42f09bab548297cf758129ecad5852a2))
+* **deps:** update rust crate hyper to v1.12.0 ([#2055](https://github.com/doublewordai/control-layer/issues/2055)) ([399af4c](https://github.com/doublewordai/control-layer/commit/399af4c391e7cca0aa20fd07c3dcea032c91053f))
+* **deps:** update rust crate jsonwebtoken to v10.4.0 ([#2056](https://github.com/doublewordai/control-layer/issues/2056)) ([a5f77c9](https://github.com/doublewordai/control-layer/commit/a5f77c9ea4ecd92e349e6cfefafb25b5d5df182a))
+* **deps:** update rust crate minijinja to v2.24.0 ([#2058](https://github.com/doublewordai/control-layer/issues/2058)) ([650a581](https://github.com/doublewordai/control-layer/commit/650a5813a4aad92f3fb099fcc001450c6c8f45cd))
+* **deps:** update rust crate reqwest to 0.13 ([#2060](https://github.com/doublewordai/control-layer/issues/2060)) ([c14e964](https://github.com/doublewordai/control-layer/commit/c14e964a763cc7bf6d82a02a982b57d4c3b65468))
+* **deps:** update Vite tooling to v8 ([#870](https://github.com/doublewordai/control-layer/issues/870)) ([81246ac](https://github.com/doublewordai/control-layer/commit/81246aca25af6c3720f10882cccf84ec8dd28033))
+
 ## [14.3.1](https://github.com/doublewordai/control-layer/compare/v14.3.0...v14.3.1) (2026-10-19)
 
 

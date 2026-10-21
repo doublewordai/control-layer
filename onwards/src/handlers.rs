@@ -343,6 +343,19 @@ pub struct ServedBy {
     pub onwards_model: Option<String>,
 }
 
+/// Response extension carrying the `onwards_upstream_failed_total` labels of
+/// the request an upstream answered, for failures counted after
+/// `target_message_handler` returns (the strict router sanitizing a
+/// third-party error). Set alongside [`ServedBy`].
+#[derive(Clone, Debug)]
+pub(crate) struct UpstreamFailureLabels {
+    pub(crate) model: String,
+    pub(crate) traffic: &'static str,
+    /// Host of the upstream URL, matching dwctl's `served_by` label: one value
+    /// per endpoint, where the full URL could carry a path per deployment.
+    pub(crate) served_by: String,
+}
+
 /// Rewrite the request body's `model` to the bare alias after a class suffix
 /// was stripped. Bodies that do not parse (or carry no `model`) are returned
 /// untouched: the `Model-Override` header path has no body model to rewrite.
@@ -1528,6 +1541,7 @@ pub async fn target_message_handler<T: HttpClient>(
             otel.kind = "Client",
             http.request.method = %method,
             url.full = %upstream_uri,
+            server.address = target.url.host_str().unwrap_or_default(),
             http.response.status_code = tracing::field::Empty,
         );
         // The header wait ends at the earlier of the provider's request timeout
@@ -2213,6 +2227,11 @@ pub async fn target_message_handler<T: HttpClient>(
         response.extensions_mut().insert(ServedBy {
             url: target.url.to_string(),
             onwards_model: target.onwards_model.clone(),
+        });
+        response.extensions_mut().insert(UpstreamFailureLabels {
+            model: model_name.to_string(),
+            traffic,
+            served_by: target.url.host_str().unwrap_or_default().to_string(),
         });
         response
             .extensions_mut()

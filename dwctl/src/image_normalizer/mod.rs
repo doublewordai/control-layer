@@ -110,6 +110,39 @@ pub enum NormalizeError {
     AccessUnavailable,
 }
 
+impl NormalizeError {
+    /// Name the image a per-image error is about, so a request with several
+    /// images says which one failed. `label` comes from [`image_label`].
+    /// Errors not tied to one image's input pass through unchanged.
+    pub fn for_image(self, label: &str) -> Self {
+        match self {
+            NormalizeError::BadInput(m) => NormalizeError::BadInput(format!("{label}: {m}")),
+            NormalizeError::Unfetchable(m) => NormalizeError::Unfetchable(format!("{label}: {m}")),
+            NormalizeError::FetchFailed(m) => NormalizeError::FetchFailed(format!("{label}: {m}")),
+            NormalizeError::Transient(m) => NormalizeError::Transient(format!("{label}: {m}")),
+            other => other,
+        }
+    }
+}
+
+/// "image N" (1-based, in request order), plus the URL for an HTTP(S) image.
+/// The URL keeps only scheme, host and path: a query string or userinfo can
+/// carry credentials or signatures, and the label is returned to the caller
+/// and logged. Long paths are truncated.
+pub fn image_label(position: usize, url: &str) -> String {
+    const MAX_URL_CHARS: usize = 120;
+    match url::Url::parse(url) {
+        Ok(u) if matches!(u.scheme(), "http" | "https") => {
+            let mut shown = format!("{}://{}{}", u.scheme(), u.host_str().unwrap_or(""), u.path());
+            if shown.chars().count() > MAX_URL_CHARS {
+                shown = shown.chars().take(MAX_URL_CHARS - 3).collect::<String>() + "...";
+            }
+            format!("image {position} ({shown})")
+        }
+        _ => format!("image {position}"),
+    }
+}
+
 impl From<fetcher::FetchError> for NormalizeError {
     fn from(e: fetcher::FetchError) -> Self {
         match e {
@@ -688,5 +721,34 @@ mod tests {
                 assert!(msg.contains("backend"), "error should mention 'backend': {msg}");
             }
         }
+    }
+
+    #[test]
+    fn image_label_names_position_and_strips_query() {
+        assert_eq!(
+            image_label(2, "https://user:pw@cdn.example.com/a/b.png?sig=secret#frag"),
+            "image 2 (https://cdn.example.com/a/b.png)"
+        );
+        assert_eq!(image_label(1, "data:image/png;base64,AAAA"), "image 1");
+        assert_eq!(image_label(3, "dw-img://abc"), "image 3");
+    }
+
+    #[test]
+    fn image_label_truncates_long_urls() {
+        let label = image_label(1, &format!("https://cdn.example.com/{}", "x".repeat(300)));
+        assert!(label.ends_with("...)"), "{label}");
+        assert!(label.chars().count() < 140, "{label}");
+    }
+
+    #[test]
+    fn for_image_prefixes_per_image_errors_only() {
+        let msg = NormalizeError::Unfetchable("origin 403 Forbidden".into())
+            .for_image("image 2 (https://cdn.example.com/b.png)")
+            .to_string();
+        assert!(
+            msg.starts_with("the provided image URL could not be retrieved: image 2 (https://cdn.example.com/b.png): origin 403 Forbidden"),
+            "{msg}"
+        );
+        assert!(matches!(NormalizeError::Forbidden.for_image("image 1"), NormalizeError::Forbidden));
     }
 }

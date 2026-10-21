@@ -112,7 +112,8 @@
       "js-yaml": "^4.3.2",
       "@babel/core@<=7.29.0": "^7.29.6",
       "@ungap/structured-clone@<1.3.1": "^1.3.1",
-      "undici": "7.29.1"
+      "source-map-js@<1.2.2": "^1.2.2",
+      "undici": "7.30.1"
     },
     "onlyBuiltDependencies": [
       "esbuild",

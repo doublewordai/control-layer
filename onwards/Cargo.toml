@@ -65,7 +65,8 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 axum-test = "18.0.0"
 futures-util = "0.3"
-rstest = "0.26.1"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+rstest = "0.28.0"
 tower = "0.5"
 wiremock = "0.6"
 reqwest = { version = "0.13", features = ["json", "stream"] }
