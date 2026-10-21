@@ -111,11 +111,13 @@ use std::backtrace::{Backtrace, BacktraceStatus};
 use std::collections::HashMap;
 use std::io::Write;
 use std::panic::PanicHookInfo;
-use tracing::{Subscriber, info};
+use tracing::field::{Field, Visit};
+use tracing::span::{Attributes, Id, Record};
+use tracing::{Event, Subscriber, info};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-use tracing_subscriber::fmt::format::JsonFields;
-use tracing_subscriber::fmt::{FormattedFields, MakeWriter};
-use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::fmt::format::{Format, Json, JsonFields, Writer};
+use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, FormattedFields, MakeWriter};
+use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::registry::{LookupSpan, Registry, SpanRef};
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
@@ -278,8 +280,10 @@ pub fn init_telemetry(enable_otel_export: bool, log_format: LogFormat) -> anyhow
 /// JSON events carry their fields at the top level (`message`, `error`,
 /// `request_model`, ...) beside `timestamp`, `level` and `target`, the
 /// innermost span under `span` and the full span list, root first, under
-/// `spans`. Loki derives `detected_level` from `level`.
-fn fmt_layer<S, W>(format: LogFormat, writer: W) -> Box<dyn Layer<S> + Send + Sync>
+/// `spans`. Loki derives `detected_level` from `level`. The
+/// [`CORRELATION_FIELDS`] of the spans an event is in are repeated at the top
+/// level, so `| json | x_request_id="<id>"` finds every line of a request.
+pub(crate) fn fmt_layer<S, W>(format: LogFormat, writer: W) -> Box<dyn Layer<S> + Send + Sync>
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
     W: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
@@ -287,7 +291,142 @@ where
     let layer = tracing_subscriber::fmt::layer().with_writer(writer);
     match format {
         LogFormat::Compact => layer.compact().boxed(),
-        LogFormat::Json => layer.json().flatten_event(true).boxed(),
+        LogFormat::Json => CorrelationLayer
+            .and_then(
+                layer
+                    .json()
+                    .event_format(JsonWithCorrelation(tracing_subscriber::fmt::format().json().flatten_event(true))),
+            )
+            .boxed(),
+    }
+}
+
+/// Span fields that identify a request across services. In JSON output each
+/// is repeated at the top level of every event inside a span that recorded
+/// it, because Loki's `json` parser does not look inside the `spans` array.
+/// `x_request_id` is the key other services in the request path log the same
+/// ID under, so one key:value query matches all of them.
+const CORRELATION_FIELDS: [&str; 4] = ["x_request_id", "edge_request_id", "provider_request_id", "trace_id"];
+
+/// The [`CORRELATION_FIELDS`] a span has recorded, kept in its extensions by
+/// [`CorrelationLayer`].
+#[derive(Default)]
+struct CorrelationIds(Vec<(&'static str, String)>);
+
+impl Visit for CorrelationIds {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.set(field, value.to_string());
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        // A `display` value's Debug is its Display, so IDs recorded with
+        // `display` (as the request span's are) are not quoted.
+        self.set(field, format!("{value:?}"));
+    }
+}
+
+impl CorrelationIds {
+    fn set(&mut self, field: &Field, value: String) {
+        let Some(name) = CORRELATION_FIELDS.into_iter().find(|name| *name == field.name()) else {
+            return;
+        };
+        match self.0.iter_mut().find(|(existing, _)| *existing == name) {
+            Some((_, existing)) => *existing = value,
+            None => self.0.push((name, value)),
+        }
+    }
+}
+
+/// Records each span's [`CORRELATION_FIELDS`], at creation and when they are
+/// recorded later, for [`JsonWithCorrelation`] and the panic hook to read.
+struct CorrelationLayer;
+
+impl<S> Layer<S> for CorrelationLayer
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+{
+    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+        let mut ids = CorrelationIds::default();
+        attrs.record(&mut ids);
+        if !ids.0.is_empty()
+            && let Some(span) = ctx.span(id)
+        {
+            span.extensions_mut().insert(ids);
+        }
+    }
+
+    fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
+        let Some(span) = ctx.span(id) else { return };
+        let mut extensions = span.extensions_mut();
+        match extensions.get_mut::<CorrelationIds>() {
+            Some(ids) => values.record(ids),
+            None => {
+                let mut ids = CorrelationIds::default();
+                values.record(&mut ids);
+                if !ids.0.is_empty() {
+                    extensions.insert(ids);
+                }
+            }
+        }
+    }
+}
+
+/// The correlation IDs of a span scope given leaf first: the innermost value
+/// of each field wins, and fields `skip` names are left out. In
+/// [`CORRELATION_FIELDS`] order, so lines read the same way every time.
+fn correlation_ids<'a, R: LookupSpan<'a> + 'a>(
+    leaf_first: impl Iterator<Item = SpanRef<'a, R>>,
+    skip: impl Fn(&str) -> bool,
+) -> Vec<(&'static str, String)> {
+    let mut found: Vec<(&'static str, String)> = Vec::new();
+    for span in leaf_first {
+        if let Some(ids) = span.extensions().get::<CorrelationIds>() {
+            for (name, value) in &ids.0 {
+                if !skip(name) && !found.iter().any(|(existing, _)| existing == name) {
+                    found.push((name, value.clone()));
+                }
+            }
+        }
+    }
+    found.sort_by_key(|(name, _)| CORRELATION_FIELDS.iter().position(|field| field == name));
+    found
+}
+
+/// The JSON event format, with the event's correlation IDs (see
+/// [`CORRELATION_FIELDS`]) added at the top level. An event that sets one of
+/// those fields itself keeps its own value.
+struct JsonWithCorrelation(Format<Json>);
+
+impl<S, N> FormatEvent<S, N> for JsonWithCorrelation
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+    N: for<'writer> FormatFields<'writer> + 'static,
+{
+    fn format_event(&self, ctx: &FmtContext<'_, S, N>, mut writer: Writer<'_>, event: &Event<'_>) -> std::fmt::Result {
+        let fields = event.metadata().fields();
+        let ids = ctx
+            .event_scope()
+            .map(|scope| correlation_ids(scope, |name| fields.field(name).is_some()))
+            .unwrap_or_default();
+        if ids.is_empty() {
+            return self.0.format_event(ctx, writer, event);
+        }
+        let mut line = String::new();
+        self.0.format_event(ctx, Writer::new(&mut line), event)?;
+        // The JSON format writes one object and a newline; add the IDs as
+        // the object's last members.
+        let Some(close) = line.trim_end().strip_suffix('}').map(str::len) else {
+            return writer.write_str(&line);
+        };
+        let mut members = String::new();
+        for (name, value) in ids {
+            members.push(',');
+            members.push_str(&Value::from(name).to_string());
+            members.push(':');
+            members.push_str(&Value::from(value).to_string());
+        }
+        line.insert_str(close, &members);
+        writer.write_str(&line)
     }
 }
 
@@ -308,14 +447,24 @@ fn write_panic_as_json(info: &PanicHookInfo<'_>) {
 /// before unwinding, so this is the span of the request or task that
 /// panicked. `None` outside any span, or when the panic happened inside the
 /// subscriber, which then dispatches to no subscriber.
-fn current_spans() -> Option<(Value, Vec<Value>)> {
+fn current_spans() -> Option<PanicSpans> {
     tracing::dispatcher::get_default(|dispatch| {
         let registry = dispatch.downcast_ref::<Registry>()?;
         let id = dispatch.current_span().id()?.clone();
         let span = registry.span(&id)?;
-        let spans = span.scope().from_root().map(|span| span_json(&span)).collect();
-        Some((span_json(&span), spans))
+        Some(PanicSpans {
+            span: span_json(&span),
+            spans: span.scope().from_root().map(|span| span_json(&span)).collect(),
+            correlation_ids: correlation_ids(span.scope(), |_| false),
+        })
     })
+}
+
+/// The span context [`current_spans`] found for a panic.
+struct PanicSpans {
+    span: Value,
+    spans: Vec<Value>,
+    correlation_ids: Vec<(&'static str, String)>,
 }
 
 /// A span as the JSON layer writes it: its fields, then its `name`.
@@ -332,7 +481,7 @@ fn span_json(span: &SpanRef<'_, Registry>) -> Value {
 /// The JSON line [`write_panic_as_json`] writes. The message reads like
 /// Rust's default panic output, so searches for `panicked at` still match.
 /// The backtrace is included when `RUST_BACKTRACE` enables capturing one.
-fn panic_line(info: &PanicHookInfo<'_>, backtrace: &Backtrace, spans: Option<(Value, Vec<Value>)>) -> Value {
+fn panic_line(info: &PanicHookInfo<'_>, backtrace: &Backtrace, spans: Option<PanicSpans>) -> Value {
     let payload = info
         .payload()
         .downcast_ref::<&str>()
@@ -354,9 +503,12 @@ fn panic_line(info: &PanicHookInfo<'_>, backtrace: &Backtrace, spans: Option<(Va
         "location": location,
         "target": "panic",
     });
-    if let Some((span, spans)) = spans {
-        line["span"] = span;
-        line["spans"] = spans.into();
+    if let Some(spans) = spans {
+        line["span"] = spans.span;
+        line["spans"] = spans.spans.into();
+        for (name, value) in spans.correlation_ids {
+            line[name] = value.into();
+        }
     }
     if backtrace.status() == BacktraceStatus::Captured {
         line["backtrace"] = backtrace.to_string().into();
@@ -588,6 +740,77 @@ mod tests {
         );
     }
 
+    /// Writes JSON lines into a buffer, for tests that read them back.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Captured {
+        fn lines(&self) -> Vec<String> {
+            String::from_utf8(self.0.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    /// In JSON, the request IDs recorded on the spans an event is in are
+    /// repeated at the top level, the innermost value winning and recorded
+    /// late (as the request span records them) as well as at creation. An
+    /// event that sets one itself keeps its own value, and an event outside
+    /// any span gets none.
+    #[test]
+    fn json_events_carry_their_spans_request_ids_at_the_top_level() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("info"))
+            .with(fmt_layer(LogFormat::Json, move || writer.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            let request = tracing::info_span!("request", x_request_id = tracing::field::Empty, trace_id = "trace-1");
+            request.record("x_request_id", tracing::field::display("req-outer"));
+            request.in_scope(|| {
+                tracing::info_span!("handler", edge_request_id = "edge-1").in_scope(|| {
+                    tracing::info!("in request");
+                    tracing::info_span!("retry", x_request_id = "req-inner").in_scope(|| tracing::info!("in retry"));
+                    tracing::info!(x_request_id = "own", "sets its own");
+                });
+            });
+            tracing::info!("outside");
+        });
+
+        let lines = captured.lines();
+        let parsed: Vec<serde_json::Value> = lines.iter().map(|line| serde_json::from_str(line).unwrap()).collect();
+        let [in_request, in_retry, own, outside] = parsed.as_slice() else {
+            panic!("expected four lines: {lines:?}");
+        };
+        assert_eq!(in_request["x_request_id"], "req-outer");
+        assert_eq!(in_request["edge_request_id"], "edge-1");
+        assert_eq!(in_request["trace_id"], "trace-1");
+        assert_eq!(in_request["spans"][0]["x_request_id"], "req-outer", "the span list is unchanged");
+        assert_eq!(in_retry["x_request_id"], "req-inner");
+        assert_eq!(own["x_request_id"], "own");
+        assert_eq!(
+            lines[2].matches(r#""x_request_id":"own""#).count(),
+            1,
+            "the event's own field is not repeated: {}",
+            lines[2]
+        );
+        assert_eq!(own["edge_request_id"], "edge-1");
+        assert!(outside.get("x_request_id").is_none(), "{outside}");
+    }
+
     /// Run by [`json_logging_writes_every_error_as_one_json_line`] in a child
     /// process, which owns the global subscriber and panic hook. Does nothing
     /// in a normal test run.
@@ -604,7 +827,7 @@ mod tests {
         });
         log::error!("log crate error");
         let _ = std::thread::spawn(|| {
-            tracing::info_span!("request", request_id = 7).in_scope(|| {
+            tracing::info_span!("request", request_id = 7, x_request_id = "req-1").in_scope(|| {
                 tracing::info_span!("worker").in_scope(|| panic!("worker panic"));
             });
         })
@@ -663,6 +886,7 @@ mod tests {
         assert_eq!(panic["spans"][0]["name"], "request");
         assert_eq!(panic["spans"][0]["request_id"], 7);
         assert_eq!(panic["spans"][1]["name"], "worker");
+        assert_eq!(panic["x_request_id"], "req-1");
 
         let initialized = find("OTLP export enabled");
         assert_eq!(initialized["endpoint"], "http://127.0.0.1:9/v1/traces");

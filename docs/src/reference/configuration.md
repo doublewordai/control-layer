@@ -825,6 +825,18 @@ starts like Rust's default panic output (`thread '…' panicked at …`). The
 error `dwctl` exits with, including a configuration that fails to load, is
 logged once as `dwctl exited with an error`.
 
+Every JSON line logged while handling a request also carries the request's
+IDs at the top level: `x_request_id` (the ID dwctl mints and returns in the
+`X-Request-ID` header and forwards to providers), `edge_request_id` (an
+inbound `X-Request-ID`, such as one set by an ingress), `provider_request_id`
+and `trace_id`. Analytics logs written after the response carry
+`x_request_id` too. Find every line of a request, in dwctl and in any
+provider that logs `x_request_id` the same way, with one query:
+
+```logql
+{namespace=~"<namespaces>"} |= "<id>" | json | x_request_id="<id>"
+```
+
 Queries and alerts that match text in compact lines need updating when you
 switch, since the same event reads differently in each format.
 

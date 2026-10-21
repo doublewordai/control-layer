@@ -2776,8 +2776,10 @@ pub async fn build_router(
     // Add tracing layer with OTel-compatible span names and HTTP semantic conventions.
     // Tracing span fields appear on every fmt log line in the request, so only the
     // correlation keys are fields: trace_id, otel.name, x_request_id,
-    // edge_request_id and provider_request_id (the request IDs are what
-    // `|= "x_request_id=<id>"` log queries match on), plus otel.kind, which the
+    // edge_request_id and provider_request_id (the request IDs are what log
+    // queries match on: `|= "x_request_id=<id>"` on compact lines, and
+    // `| json | x_request_id="<id>"` on JSON lines, which repeat them at the
+    // top level; see `telemetry::CORRELATION_FIELDS`), plus otel.kind, which the
     // tracing-opentelemetry layer only reads from a field (as a raw attribute it
     // is ignored and the span exports as `internal`). All other attributes are
     // set via OpenTelemetrySpanExt::set_attribute() so they're exported to the
