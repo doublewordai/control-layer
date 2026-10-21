@@ -1,5 +1,16 @@
 # Changelog
 
+## [15.0.0](https://github.com/doublewordai/control-layer/compare/v14.5.0...v15.0.0) (2026-10-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* retire the serving-class presets, grants and default classes ([#2068](https://github.com/doublewordai/control-layer/issues/2068))
+
+### Code Refactoring
+
+* retire the serving-class presets, grants and default classes ([#2068](https://github.com/doublewordai/control-layer/issues/2068)) ([a28e3b3](https://github.com/doublewordai/control-layer/commit/a28e3b345dad73a30820d3b8498357e9a7d97a94))
+
 ## [14.5.0](https://github.com/doublewordai/control-layer/compare/v14.4.0...v14.5.0) (2026-10-21)
 
 
