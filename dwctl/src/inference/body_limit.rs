@@ -237,7 +237,7 @@ fn decode_blocking(encoding: Encoding, bytes: &[u8], max_bytes: usize) -> Result
             decoder.window_log_max(ZSTD_WINDOW_LOG_MAX).map_err(|_| DecodeError::Invalid)?;
             Box::new(decoder)
         }
-        Encoding::Brotli => Box::new(brotli::Decompressor::new(bytes, 4096)),
+        Encoding::Brotli => return decode_brotli(bytes, max_bytes),
     };
     let mut decoded = Vec::new();
     reader
@@ -248,6 +248,47 @@ fn decode_blocking(encoding: Encoding, bytes: &[u8], max_bytes: usize) -> Result
         return Err(DecodeError::TooLarge);
     }
     Ok(Bytes::from(decoded))
+}
+
+/// Brotli as RFC 7932 defines it, with windows up to 16 MiB. `brotli::Decompressor`
+/// also accepts the large-window extension, whose windows reach 1 GiB and are
+/// allocated before any output, so the output bound alone can't stop them.
+/// The strict decoder state refuses that extension; it is only reachable
+/// through the streaming API.
+fn decode_brotli(bytes: &[u8], max_bytes: usize) -> Result<Bytes, DecodeError> {
+    use brotli::{BrotliDecompressStream, BrotliResult, BrotliState, HeapAlloc, HuffmanCode};
+
+    let mut state = BrotliState::new_strict(
+        HeapAlloc::<u8>::new(0),
+        HeapAlloc::<u32>::new(0),
+        HeapAlloc::<HuffmanCode>::new(HuffmanCode::default()),
+    );
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut decoded = Vec::new();
+    let (mut available_in, mut input_offset, mut total_out) = (bytes.len(), 0, 0);
+    loop {
+        let (mut available_out, mut output_offset) = (buffer.len(), 0);
+        let result = BrotliDecompressStream(
+            &mut available_in,
+            &mut input_offset,
+            bytes,
+            &mut available_out,
+            &mut output_offset,
+            &mut buffer,
+            &mut total_out,
+            &mut state,
+        );
+        decoded.extend_from_slice(&buffer[..output_offset]);
+        if decoded.len() > max_bytes {
+            return Err(DecodeError::TooLarge);
+        }
+        match result {
+            BrotliResult::NeedsMoreOutput => continue,
+            // Bytes after the end of the stream aren't brotli data either.
+            BrotliResult::ResultSuccess if available_in == 0 => return Ok(Bytes::from(decoded)),
+            _ => return Err(DecodeError::Invalid),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -511,6 +552,38 @@ mod tests {
         };
         assert_eq!(decode_blocking(Encoding::Zstd, &framed(23), 1024).unwrap(), &b"{}"[..]);
         assert_eq!(decode_blocking(Encoding::Zstd, &framed(24), 1024), Err(DecodeError::Invalid));
+    }
+
+    #[test]
+    fn refuses_brotli_large_window_streams() {
+        use brotli::enc::BrotliEncoderParams;
+        let params = BrotliEncoderParams {
+            large_window: true,
+            lgwin: 30,
+            ..Default::default()
+        };
+        let mut large = Vec::new();
+        brotli::BrotliCompress(&mut &b"{}"[..], &mut large, &params).unwrap();
+        // A valid large-window stream, as the permissive decoder shows...
+        let mut permissive = Vec::new();
+        brotli::Decompressor::new(&large[..], 4096).read_to_end(&mut permissive).unwrap();
+        assert_eq!(permissive, b"{}");
+        // ...which the strict one refuses before allocating its window.
+        assert_eq!(decode_blocking(Encoding::Brotli, &large, 1024), Err(DecodeError::Invalid));
+        let standard = compress(Encoding::Brotli, b"{}");
+        assert_eq!(decode_blocking(Encoding::Brotli, &standard, 1024).unwrap(), &b"{}"[..]);
+    }
+
+    #[test]
+    fn decodes_every_concatenated_frame() {
+        for encoding in [Encoding::Gzip, Encoding::Zstd] {
+            let mut frames = compress(encoding, b"{\"a\":");
+            frames.extend(compress(encoding, b"1}"));
+            assert_eq!(decode_blocking(encoding, &frames, 1024).unwrap(), &b"{\"a\":1}"[..], "{encoding:?}");
+        }
+        let mut trailing = compress(Encoding::Brotli, b"{}");
+        trailing.extend_from_slice(b"junk");
+        assert_eq!(decode_blocking(Encoding::Brotli, &trailing, 1024), Err(DecodeError::Invalid));
     }
 
     #[tokio::test]

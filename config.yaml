@@ -506,7 +506,8 @@ batches:
 # limits:
 #   files:
 #     # Maximum file size in bytes (default: 100MB). Gzip and zstd files are
-#     # decoded as they upload, and this limit applies to the decoded size.
+#     # decoded as they upload, and this limit applies to the decoded size
+#     # (the compressed upload may not exceed it either).
 #     # Set to 0 for unlimited (not recommended for production)
 #     max_file_size: 104857600
 #     # Maximum number of requests (JSONL lines) per file

@@ -68,6 +68,11 @@ impl Detected {
 
 /// Identifies the format from the first bytes of a file.
 pub(crate) fn detect(prefix: &[u8]) -> Detected {
+    // A zstd stream may open with a skippable frame (magic 0x184D2A50 to
+    // 0x184D2A5F, little-endian) before its data frame; the decoder skips it.
+    if let [0x50..=0x5f, 0x2a, 0x4d, 0x18, ..] = prefix {
+        return Detected::Zstd;
+    }
     const SIGNATURES: &[(&[u8], Detected)] = &[
         (&[0x1f, 0x8b], Detected::Gzip),
         (&[0x28, 0xb5, 0x2f, 0xfd], Detected::Zstd),
@@ -132,10 +137,11 @@ where
                 decoder.multiple_members(true);
                 Box::pin(decoder)
             } else {
-                Box::pin(ZstdDecoder::with_params(
-                    reader,
-                    &[async_compression::zstd::DParameter::window_log_max(ZSTD_WINDOW_LOG_MAX)],
-                ))
+                let mut decoder =
+                    ZstdDecoder::with_params(reader, &[async_compression::zstd::DParameter::window_log_max(ZSTD_WINDOW_LOG_MAX)]);
+                // Like gzip members, concatenated zstd frames are one file.
+                decoder.multiple_members(true);
+                Box::pin(decoder)
             };
             Box::pin(ReaderStream::with_capacity(decoder, DECODED_CHUNK).map_err(upload_or_decode_error))
         }
@@ -189,9 +195,16 @@ mod tests {
     async fn decodes_gzip_and_zstd_files_whatever_the_chunking() {
         let mut two_members = gzip(&JSONL[..18]);
         two_members.extend(gzip(&JSONL[18..]));
+        let mut two_frames = zstd::encode_all(&JSONL[..18], 3).unwrap();
+        two_frames.extend(zstd::encode_all(&JSONL[18..], 3).unwrap());
+        // A skippable frame (magic, 4-byte length, payload) ahead of the data.
+        let mut skippable_first = vec![0x50, 0x2a, 0x4d, 0x18, 3, 0, 0, 0, b'x', b'y', b'z'];
+        skippable_first.extend(zstd::encode_all(JSONL, 3).unwrap());
         for (compressed, expected) in [
             (gzip(JSONL), Detected::Gzip),
             (two_members, Detected::Gzip),
+            (two_frames, Detected::Zstd),
+            (skippable_first, Detected::Zstd),
             (zstd::encode_all(JSONL, 3).unwrap(), Detected::Zstd),
             (JSONL.to_vec(), Detected::Plain),
         ] {
@@ -210,7 +223,15 @@ mod tests {
         let mut corrupt = gz.clone();
         let middle = corrupt.len() / 2;
         corrupt[middle] ^= 0xff;
-        for broken in [gz[..gz.len() - 4].to_vec(), zst[..zst.len() - 3].to_vec(), corrupt] {
+        // A later frame is checked like the first, not ignored.
+        let mut later_frame_truncated = zst.clone();
+        later_frame_truncated.extend_from_slice(&zst[..zst.len() - 3]);
+        for broken in [
+            gz[..gz.len() - 4].to_vec(),
+            zst[..zst.len() - 3].to_vec(),
+            corrupt,
+            later_frame_truncated,
+        ] {
             let (_, decoded) = read_all(broken, 7).await;
             assert!(matches!(decoded, Err(ChunkError::Decode(_))), "{decoded:?}");
         }
@@ -242,6 +263,7 @@ mod tests {
         assert_eq!(detect(b"PK\x03\x04"), Detected::Unsupported("zip"));
         assert_eq!(detect(b"\x04\x22\x4d\x18"), Detected::Unsupported("lz4"));
         assert_eq!(detect(b"{\"custom_id\""), Detected::Plain);
+        assert_eq!(detect(&[0x5a, 0x2a, 0x4d, 0x18, 0, 0]), Detected::Zstd);
         assert_eq!(detect(b""), Detected::Plain);
     }
 
