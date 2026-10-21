@@ -16,6 +16,17 @@ use onwards::strict::schemas::chat_completions::Usage;
 
 use super::types::{InputTokensDetails, OutputTokensDetails, ResponseUsage};
 
+/// The Responses `incomplete_details.reason` for a Chat Completions finish
+/// reason that cut the answer short, using OpenAI's reason names. `None` for a
+/// finished turn, including one that ends in tool calls.
+pub(super) fn incomplete_reason(finish_reason: Option<&str>) -> Option<&'static str> {
+    match finish_reason {
+        Some("length") => Some("max_output_tokens"),
+        Some("content_filter") => Some("content_filter"),
+        _ => None,
+    }
+}
+
 /// Insert a schema-valid placeholder only when the provider omitted a field.
 /// Used by the response normaliser, not by the serde types themselves (which
 /// stay strict).

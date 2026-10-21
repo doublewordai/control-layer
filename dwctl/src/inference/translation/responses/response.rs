@@ -14,10 +14,11 @@ use onwards::strict::schemas::chat_completions::{
 };
 
 use super::types::{
-    ContentPart, FunctionCallItem, Include, Item, ItemStatus, MessageContent as ResponseMessageContent, MessageItem, ReasoningContent,
-    ReasoningItem, ResponseStatus, ResponsesRequest, ResponsesResponse, SummaryContent, TextConfig, TextFormat, TruncationStrategy,
+    ContentPart, FunctionCallItem, Include, IncompleteDetails, Item, ItemStatus, MessageContent as ResponseMessageContent, MessageItem,
+    ReasoningContent, ReasoningItem, ResponseStatus, ResponsesRequest, ResponsesResponse, SummaryContent, TextConfig, TextFormat,
+    TruncationStrategy,
 };
-use super::util::{chat_usage_to_response_usage, merge_reasoning_text};
+use super::util::{chat_usage_to_response_usage, incomplete_reason, merge_reasoning_text};
 
 /// Convert a Chat Completions response to a Responses response, echoing request
 /// parameters as the Open Responses spec requires. `request` is the original
@@ -41,7 +42,7 @@ pub fn to_responses_response(
         })
         .collect();
 
-    let status = determine_response_status(&chat_response.choices);
+    let (status, incomplete_details) = determine_response_status(&chat_response.choices);
 
     let completed_at = if status == ResponseStatus::Completed {
         Some(chat_response.created)
@@ -63,7 +64,7 @@ pub fn to_responses_response(
         created_at: chat_response.created,
         completed_at,
         status,
-        incomplete_details: None,
+        incomplete_details,
         model: request.model.clone(),
         previous_response_id: request.previous_response_id.clone(),
         instructions: request.instructions.clone(),
@@ -107,9 +108,9 @@ fn message_to_items_with_projections(
     include_logprobs: bool,
 ) -> Vec<Item> {
     let mut items = Vec::new();
-    let status = match finish_reason {
-        Some("length") => Some(ItemStatus::Incomplete),
-        _ => Some(ItemStatus::Completed),
+    let status = match incomplete_reason(finish_reason) {
+        Some(_) => Some(ItemStatus::Incomplete),
+        None => Some(ItemStatus::Completed),
     };
 
     let reasoning_text = merge_reasoning_text(
@@ -183,18 +184,21 @@ fn projected_logprobs(chat_logprobs: Option<&serde_json::Value>, include: bool) 
         .unwrap_or_default()
 }
 
-/// Determine the response status from Chat Completions choices.
-fn determine_response_status(choices: &[Choice]) -> ResponseStatus {
+/// Determine the response status from Chat Completions choices. A turn that
+/// ends in tool calls is `completed`, as OpenAI reports it.
+fn determine_response_status(choices: &[Choice]) -> (ResponseStatus, Option<IncompleteDetails>) {
     if choices.is_empty() {
-        return ResponseStatus::Failed;
+        return (ResponseStatus::Failed, None);
     }
 
-    match choices[0].finish_reason.as_deref() {
-        Some("stop") => ResponseStatus::Completed,
-        Some("length") => ResponseStatus::Incomplete,
-        Some("tool_calls") => ResponseStatus::RequiresAction,
-        Some("content_filter") => ResponseStatus::Failed,
-        _ => ResponseStatus::Completed,
+    match choices.iter().find_map(|choice| incomplete_reason(choice.finish_reason.as_deref())) {
+        Some(reason) => (
+            ResponseStatus::Incomplete,
+            Some(IncompleteDetails {
+                reason: reason.to_string(),
+            }),
+        ),
+        None => (ResponseStatus::Completed, None),
     }
 }
 
@@ -295,7 +299,7 @@ mod tests {
             finish_reason: Some("stop".to_string()),
             logprobs: None,
         }];
-        assert_eq!(determine_response_status(&stop), ResponseStatus::Completed);
+        assert_eq!(determine_response_status(&stop).0, ResponseStatus::Completed);
 
         let mut tool_msg = assistant(None);
         tool_msg.tool_calls = Some(vec![]);
@@ -305,7 +309,21 @@ mod tests {
             finish_reason: Some("tool_calls".to_string()),
             logprobs: None,
         }];
-        assert_eq!(determine_response_status(&tool_calls), ResponseStatus::RequiresAction);
+        let (status, details) = determine_response_status(&tool_calls);
+        assert_eq!(status, ResponseStatus::Completed, "OpenAI reports a tool-calling turn as completed");
+        assert!(details.is_none());
+
+        for (finish_reason, reason) in [("length", "max_output_tokens"), ("content_filter", "content_filter")] {
+            let cut = vec![Choice {
+                index: 0,
+                message: assistant(Some("Do")),
+                finish_reason: Some(finish_reason.to_string()),
+                logprobs: None,
+            }];
+            let (status, details) = determine_response_status(&cut);
+            assert_eq!(status, ResponseStatus::Incomplete, "{finish_reason}");
+            assert_eq!(details.map(|d| d.reason).as_deref(), Some(reason), "{finish_reason}");
+        }
     }
 
     fn chat_response_with_usage(prompt: u32, completion: u32) -> ChatCompletionResponse {
