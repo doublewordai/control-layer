@@ -8,7 +8,6 @@ vi.mock("@/api/control-layer/hooks", () => ({
     isError: false,
     data: {
       organization_id: "org",
-      granted_serving_classes: [],
       self_hosted_only: false,
       overlays: [],
       cache_tariffs: [],

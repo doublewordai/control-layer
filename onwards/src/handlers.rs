@@ -11,9 +11,7 @@ use crate::errors::{ErrorResponseBody, OnwardsErrorResponse};
 use crate::inflight::{BATCH_INFLIGHT_SCOPE, InflightSlot};
 use crate::models::ListModelResponse;
 use crate::rejections::RejectionContext;
-use crate::serving::{
-    self, ProviderKind, RequestedServingClass, ServingClassOutcome, ServingResolution,
-};
+use crate::serving::{self, ProviderKind, ServingClassOutcome, ServingResolution};
 use crate::sse::SseBufferedStream;
 use crate::target::{ConcurrencyGuard, RequestClass, RoutingAction, Target};
 use axum::{
@@ -356,24 +354,6 @@ pub(crate) struct UpstreamFailureLabels {
     pub(crate) served_by: String,
 }
 
-/// Rewrite the request body's `model` to the bare alias after a class suffix
-/// was stripped. Bodies that do not parse (or carry no `model`) are returned
-/// untouched: the `Model-Override` header path has no body model to rewrite.
-fn rewrite_body_model(body: axum::body::Bytes, alias: &str) -> axum::body::Bytes {
-    if body.is_empty() {
-        return body;
-    }
-    let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body) else {
-        return body;
-    };
-    match parsed.get_mut("model") {
-        Some(model) if model.is_string() => {
-            *model = serde_json::Value::String(alias.to_string());
-            serde_json::to_vec(&parsed).map(Into::into).unwrap_or(body)
-        }
-        _ => body,
-    }
-}
 /// Stable identity of the API key accepted for this request. This is carried
 /// only in the in-process response extensions and is never sent to the client.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -505,7 +485,6 @@ pub async fn target_message_handler<T: HttpClient>(
         otel.name = "onwards.request",
         gen_ai.request.model = tracing::field::Empty,
         http.response.status_code = tracing::field::Empty,
-        onwards.serving.requested = tracing::field::Empty,
         onwards.serving.resolved = tracing::field::Empty,
     );
 
@@ -561,35 +540,6 @@ pub async fn target_message_handler<T: HttpClient>(
                 "Could not parse onwards model from request. 'model' parameter must be supplied in either the body or in the Model-Override header.",
                 Some("model"),
             ));
-        }
-    };
-
-    // A class suffix requests a serving class on the base alias. DWCTL strips
-    // it and hands it over as an extension; standalone callers are parsed here.
-    // Unknown class suffixes are a 400.
-    let suffix_class = req.extensions().get::<RequestedServingClass>().map(|c| c.0);
-    // DWCTL has already split the body selector once. Do not reinterpret its
-    // base alias (e.g. turn nonexistent `model:interactive` into `model`). A
-    // Model-Override header is a separate selector and still needs resolution.
-    let has_model_override = req.headers().get("model-override").and_then(|value| value.to_str().ok()).is_some();
-    let selected_model = if suffix_class.is_some() && !has_model_override {
-        Ok((model_name.as_str(), None))
-    } else {
-        serving::split_class_suffix(&model_name)
-    };
-    let (model_name, suffix_class, body_bytes) = match selected_model {
-        Ok((_, None)) => (model_name, suffix_class, body_bytes),
-        Ok((alias, Some(class))) => {
-            let alias = alias.to_string();
-            let body_bytes = rewrite_body_model(body_bytes, &alias);
-            // The suffix on the selected model string wins over the
-            // extension: the string is the source that took precedence
-            // (a `Model-Override` header over the body), so its class does too.
-            (alias, Some(class), body_bytes)
-        }
-        Err(unknown) => {
-            record_response_status(400);
-            return Err(OnwardsErrorResponse::bad_request(&unknown.to_string(), Some("model")));
         }
     };
 
@@ -755,13 +705,10 @@ pub async fn target_message_handler<T: HttpClient>(
         // If no bearer token, no labels to match — rules are skipped (allow by default)
     }
 
-    // Resolve the serving class: one flat field from the request's suffix,
-    // the owning account's settings (found through the key's `account`
-    // label), the account's overlay on THIS alias and the classes the alias
-    // offers. Done after routing rules so a redirected request is resolved
-    // against the pool that will serve it. Strict: a class named on the
-    // request that the account does not hold, or the alias does not offer,
-    // is refused rather than quietly downgraded.
+    // Resolve the serving policy from the owning account's settings (found
+    // through the key's `account` label) and the account's overlay on THIS
+    // alias. Done after routing rules so a redirected request is resolved
+    // against the pool that will serve it.
     let (account_id, account_name, key_purpose) = bearer_token
         .as_ref()
         .and_then(|token| state.targets.key_labels.get(token))
@@ -780,43 +727,16 @@ pub async fn target_message_handler<T: HttpClient>(
         let overlay = account_id
             .as_deref()
             .and_then(|id| alias_serving.overlays().get(id).cloned());
-        let resolution = match serving::resolve(
-            suffix_class,
+        let resolution = serving::resolve(
             account.as_ref(),
             overlay.as_ref(),
-            &model_name,
-            alias_serving.presets(),
             key_purpose.as_deref(),
-        ) {
-            Ok(resolution) => resolution,
-            Err(rejection) => {
-                debug!("Serving class refused for model '{}': {}", model_name, rejection);
-                metrics::counter!(
-                    "onwards_serving_class_rejections_total",
-                    "model" => model_name.to_string(),
-                )
-                .increment(1);
-                record_response_status(403);
-                return Err(OnwardsErrorResponse::builder()
-                    .body(ErrorResponseBody {
-                        message: rejection.to_string(),
-                        r#type: "invalid_request_error".to_string(),
-                        param: Some("model".to_string()),
-                        code: "serving_class_unavailable".to_string(),
-                    })
-                    .status(StatusCode::FORBIDDEN)
-                    .build());
-            }
-        };
-        let span = tracing::Span::current();
-        if let Some(requested) = resolution.requested {
-            span.record("onwards.serving.requested", requested.as_str());
-        }
-        span.record("onwards.serving.resolved", resolution.resolved.as_str());
+        );
+        tracing::Span::current().record("onwards.serving.resolved", resolution.resolved.as_str());
         metrics::counter!(
             "onwards_serving_class_requests_total",
             "model" => model_name.to_string(),
-            "requested" => resolution.requested.map(|c| c.as_str()).unwrap_or(""),
+            "requested" => "",
             "resolved" => resolution.resolved.as_str(),
         )
         .increment(1);

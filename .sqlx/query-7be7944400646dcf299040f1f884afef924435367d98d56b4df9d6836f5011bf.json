@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, username, email, display_name, avatar_url, auth_source, created_at, updated_at, last_login, is_admin, password_hash, external_user_id, payment_provider_id, is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent, low_balance_notification_sent, low_balance_threshold, user_type, auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, auto_topup_limit_notification_sent, verified, zero_data_retention, auto_topup_soft_failure_count, auto_topup_retry_after, invoicing_enabled, auto_join_enabled, granted_serving_classes, default_serving_class, self_hosted_only FROM users WHERE email = $1 AND id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false AND user_type = 'individual'",
+  "query": "\n            INSERT INTO users (id, username, email, display_name, avatar_url, auth_source, is_admin, password_hash, external_user_id)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)\n            RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at, last_login, is_admin, password_hash, external_user_id, payment_provider_id, is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent, low_balance_notification_sent, low_balance_threshold, user_type, auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, auto_topup_limit_notification_sent, verified, zero_data_retention, auto_topup_soft_failure_count, auto_topup_retry_after, invoicing_enabled, auto_join_enabled, self_hosted_only, toleration_preset\n            ",
   "describe": {
     "columns": [
       {
@@ -155,22 +155,25 @@
       },
       {
         "ordinal": 30,
-        "name": "granted_serving_classes",
-        "type_info": "TextArray"
+        "name": "self_hosted_only",
+        "type_info": "Bool"
       },
       {
         "ordinal": 31,
-        "name": "default_serving_class",
+        "name": "toleration_preset",
         "type_info": "Text"
-      },
-      {
-        "ordinal": 32,
-        "name": "self_hosted_only",
-        "type_info": "Bool"
       }
     ],
     "parameters": {
       "Left": [
+        "Uuid",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Bool",
+        "Text",
         "Text"
       ]
     },
@@ -206,9 +209,8 @@
       false,
       false,
       false,
-      true,
-      false
+      true
     ]
   },
-  "hash": "3eeeff204fd4edb60c30709611619a9005bdb5fd4f1fdd8e87faa4322f295677"
+  "hash": "7be7944400646dcf299040f1f884afef924435367d98d56b4df9d6836f5011bf"
 }

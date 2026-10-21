@@ -17,7 +17,7 @@ use onwards::target::{
     JitterStrategy as OnwardsJitterStrategy, KeyDefinition, LoadBalanceStrategy as OnwardsLoadBalanceStrategy, PoolSpec, PoolsSpec,
     ProviderSpec, RoutingAction, RoutingRule, TargetSpecOrList, Targets, WatchTargetsStream, inheritable_routing_rules,
 };
-use onwards::{AccountServing, ProviderKind, ServingClass, ServingOverlay, ServingPresets, ServingTargets};
+use onwards::{AccountServing, ProviderKind, ServingOverlay, ServingTargets};
 use sqlx::{PgPool, postgres::PgListener};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -68,9 +68,6 @@ struct OnwardsTarget {
     reasoning_translation: Option<ReasoningTranslationConfig>,
     /// Traffic routing rules from the model_traffic_rules table
     routing_rules: Vec<RoutingRule>,
-    /// Serving classes this alias offers, each a preset of targets
-    /// (`deployed_models.serving_classes`).
-    serving_classes: ServingPresets,
 
     // Fallback / backoff config. Standard (single-provider) models only retry
     // when fallback is on AND `with_replacement` is true (otherwise the
@@ -137,42 +134,12 @@ type AccountsById = HashMap<String, AccountServing>;
 
 type InflightOverridesByAlias = HashMap<String, HashMap<String, u32>>;
 
-/// Parse a stored class name; the CHECK constraints guarantee the set, so an
-/// unknown value is a schema drift worth a warning rather than a crash.
-fn parse_stored_class(value: Option<&str>) -> Option<ServingClass> {
-    let value = value?;
-    match value.parse::<ServingClass>() {
-        Ok(class) => Some(class),
-        Err(err) => {
-            warn!(%err, "ignoring unknown serving class stored in the database");
-            None
-        }
-    }
-}
-
 /// Parse a stored endpoint kind; the CHECK constraint guarantees the set.
 fn parse_provider_kind(value: &str) -> ProviderKind {
     value.parse().unwrap_or_else(|err: String| {
         warn!(%err, "ignoring unknown endpoint kind stored in the database; treating as external");
         ProviderKind::External
     })
-}
-
-fn parse_stored_classes(values: &[String]) -> Vec<ServingClass> {
-    values.iter().filter_map(|v| parse_stored_class(Some(v))).collect()
-}
-
-/// Parse a model's stored presets (`deployed_models.serving_classes`, JSONB
-/// object class → targets). The catalog writes them, so a malformed value is
-/// a schema drift worth a warning; the model then offers nothing.
-fn parse_stored_presets(value: &serde_json::Value, alias: &str) -> ServingPresets {
-    match serde_json::from_value(value.clone()) {
-        Ok(presets) => presets,
-        Err(err) => {
-            warn!(%err, alias, "ignoring malformed serving class presets stored in the database");
-            ServingPresets::new()
-        }
-    }
 }
 
 /// Parse an overlay's stored explicit targets (`model_overlays.targets`).
@@ -191,7 +158,7 @@ fn parse_stored_targets(value: Option<serde_json::Value>) -> Option<ServingTarge
 async fn load_overlays_from_db(db: &PgPool) -> Result<OverlaysByAlias, anyhow::Error> {
     let rows = sqlx::query!(
         r#"
-        SELECT mo.user_id, dm.alias, mo.default_serving_class, mo.targets, mo.self_hosted_only
+        SELECT mo.user_id, dm.alias, mo.targets, mo.self_hosted_only
         FROM model_overlays mo
         INNER JOIN deployed_models dm ON dm.id = mo.deployed_model_id
         INNER JOIN users u ON u.id = mo.user_id
@@ -207,7 +174,6 @@ async fn load_overlays_from_db(db: &PgPool) -> Result<OverlaysByAlias, anyhow::E
         overlays.entry(row.alias).or_default().insert(
             row.user_id.to_string(),
             ServingOverlay {
-                default_class: parse_stored_class(row.default_serving_class.as_deref()),
                 targets: parse_stored_targets(row.targets),
                 self_hosted_only: row.self_hosted_only,
             },
@@ -240,14 +206,14 @@ async fn load_inflight_overrides_from_db(db: &PgPool) -> Result<InflightOverride
 
 /// Loads the serving account settings of every account that has any. An
 /// account with nothing set is absent, so the config for everyone else is
-/// byte-identical to before serving classes existed.
+/// unchanged.
 async fn load_accounts_from_db(db: &PgPool) -> Result<AccountsById, anyhow::Error> {
     let rows = sqlx::query!(
         r#"
-        SELECT id, granted_serving_classes, default_serving_class, self_hosted_only
+        SELECT id, self_hosted_only
         FROM users
         WHERE is_deleted = FALSE
-          AND (granted_serving_classes <> '{}' OR default_serving_class IS NOT NULL OR self_hosted_only)
+          AND self_hosted_only
         "#
     )
     .fetch_all(db)
@@ -259,8 +225,6 @@ async fn load_accounts_from_db(db: &PgPool) -> Result<AccountsById, anyhow::Erro
             (
                 row.id.to_string(),
                 AccountServing {
-                    granted: parse_stored_classes(&row.granted_serving_classes),
-                    default_class: parse_stored_class(row.default_serving_class.as_deref()),
                     self_hosted_only: row.self_hosted_only,
                 },
             )
@@ -757,8 +721,6 @@ struct OnwardsCompositeModel {
     trusted: bool,
     /// Traffic routing rules from the database
     routing_rules: Vec<RoutingRule>,
-    /// Serving classes this alias offers, each a preset of targets.
-    serving_classes: ServingPresets,
     components: Vec<CompositeModelComponent>,
     // API keys that have access to this composite model
     api_keys: Vec<OnwardsApiKey>,
@@ -990,8 +952,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             aimd,
             affinity,
             sanitize_responses,
-            trusted,
-            serving_classes
+            trusted
         FROM deployed_models
         WHERE is_composite = TRUE
           AND deleted = FALSE
@@ -1009,7 +970,6 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             .and_then(LoadBalancingStrategy::try_parse)
             .unwrap_or_default();
 
-        let presets = parse_stored_presets(&row.serving_classes, &row.alias);
         composite_map.insert(
             row.composite_model_id,
             OnwardsCompositeModel {
@@ -1036,7 +996,6 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 sanitize_responses: row.sanitize_responses,
                 trusted: row.trusted,
                 routing_rules: Vec::new(), // Populated from separate query below
-                serving_classes: presets,
                 components: Vec::new(),
                 api_keys: Vec::new(),
             },
@@ -1071,8 +1030,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                         row.model_reasoning_translation_overrides,
                         &row.deployment_alias,
                     ),
-                    routing_rules: Vec::new(),              // Components don't have their own routing rules
-                    serving_classes: ServingPresets::new(), // Activation is the composite's, not a member's
+                    routing_rules: Vec::new(), // Components don't have their own routing rules
                     // Components don't surface their own fallback/backoff —
                     // the composite's PoolSpec.fallback drives retries across
                     // the whole pool.
@@ -1344,13 +1302,8 @@ fn convert_composite_to_target_spec(
         } else {
             inheritable_routing_rules(&composite.routing_rules)
         },
-        // Offered classes and per-account overlays are properties of the
-        // alias, declared on its default pool.
-        serving_classes: if pool_name == DEFAULT_COMPONENT_POOL {
-            composite.serving_classes.clone()
-        } else {
-            ServingPresets::new()
-        },
+        // Per-account overlays are properties of the alias, declared on its
+        // default pool.
         overlays: if pool_name == DEFAULT_COMPONENT_POOL {
             overlays.get(&composite.alias).cloned().unwrap_or_default()
         } else {
@@ -1511,7 +1464,6 @@ fn convert_to_config_file(
                 sanitize_response: target.sanitize_responses,
                 trusted: false,
                 routing_rules: target.routing_rules,
-                serving_classes: target.serving_classes,
                 overlays: overlays.get(&target.alias).cloned().unwrap_or_default(),
                 inflight_limit: None,
                 batch_inflight_limit: None,
@@ -1646,8 +1598,7 @@ pub async fn load_targets_from_db_with_batch_default(
             ak.user_zero_data_retention as "api_key_user_zero_data_retention?",
             ak.user_id as "api_key_user_id?",
             ak.user_username as "api_key_user_username?",
-            ak.user_display_name as "api_key_user_display_name?",
-            dm.serving_classes
+            ak.user_display_name as "api_key_user_display_name?"
         FROM deployed_models dm
         INNER JOIN inference_endpoints ie ON dm.hosted_on = ie.id
         LEFT JOIN LATERAL (
@@ -1799,7 +1750,6 @@ pub async fn load_targets_from_db_with_batch_default(
                     &row.alias,
                 ),
                 routing_rules: Vec::new(), // Populated from separate query below
-                serving_classes: parse_stored_presets(&row.serving_classes, &row.alias),
                 fallback_enabled: row.fallback_enabled.unwrap_or(true),
                 fallback_on_rate_limit: row.fallback_on_rate_limit.unwrap_or(true),
                 fallback_on_status: row.fallback_on_status.clone().unwrap_or_else(|| vec![429, 499, 500, 502, 503, 504]),

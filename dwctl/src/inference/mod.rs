@@ -25,6 +25,7 @@ pub mod body_limit;
 pub mod handler;
 pub mod image_normalizer_middleware;
 pub mod middleware;
+pub mod model_selector;
 pub mod outbound_request;
 pub mod rejections;
 pub mod response_store;

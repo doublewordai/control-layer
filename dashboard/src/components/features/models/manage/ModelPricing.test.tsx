@@ -39,13 +39,11 @@ const overlay: ServingOverlay = {
   organization_display_name: "Example Organisation",
   deployed_model_id: "model",
   alias: "example-model",
-  default_serving_class: "throughput",
   self_hosted_only: false,
   updated_at: "2020-01-01",
 };
 const serving: OrganizationServing = {
   organization_id: "org-a",
-  granted_serving_classes: ["interactive", "throughput"],
   self_hosted_only: true,
   overlays: [overlay],
   tariffs: [
@@ -86,10 +84,6 @@ const model: Model = {
       input_price_per_token: "0.000001",
     }),
   ],
-  serving_classes: {
-    interactive: { ttft_ms: 1000, itl_ms: 15, priority: 1 },
-    throughput: { ttft_ms: 5000, itl_ms: 60, priority: 0 },
-  },
   allowed_batch_completion_windows: ["1h", "24h"],
 };
 function mount(manager = true, initialOrganization?: string) {
@@ -196,7 +190,7 @@ describe("model pricing selector", () => {
     const playground = within(within(container).getByRole("region", { name: "Playground prices" }));
     expect(playground.getByText("Bespoke · interactive · realtime fallback")).toBeInTheDocument();
     expect(playground.getAllByText("$0")).toHaveLength(2);
-    expect(playground.getAllByText("$2.00")).toHaveLength(2);
+    expect(playground.getAllByText("$2.00")).toHaveLength(1);
   });
 
   it("starts general then shows effective class prices and inherited batch/cache values", async () => {
@@ -220,7 +214,7 @@ describe("model pricing selector", () => {
     const rt = within(page.getByRole("region", { name: "Realtime prices" }));
     expect(rt.getByText("Bespoke · interactive")).toBeInTheDocument();
     expect(rt.getAllByText("$0")).toHaveLength(2);
-    expect(rt.getAllByText("$2.00")).toHaveLength(2);
+    expect(rt.getAllByText("$2.00")).toHaveLength(1);
     const batch = within(
       page.getByRole("region", { name: "Batch and flex prices" }),
     );
@@ -234,12 +228,12 @@ describe("model pricing selector", () => {
     ).not.toBeInTheDocument();
     const cache = within(page.getByRole("region", { name: "Cache pricing" }));
     expect(cache.getByText("0.25×")).toBeInTheDocument();
-    expect(cache.getAllByText("Inherited · general model")).toHaveLength(2);
+    expect(cache.getAllByText("Inherited · general model")).toHaveLength(1);
     const sections = [...container.querySelectorAll("section[aria-label]")].map(
       (x) => x.getAttribute("aria-label"),
     );
     expect(sections.indexOf("Cache pricing")).toBeLessThan(
-      sections.indexOf("Serving classes"),
+      sections.indexOf("Organisation overlays"),
     );
     await user.click(page.getByRole("combobox", { name: "Pricing for" }));
     await user.click(
@@ -260,7 +254,6 @@ describe("model pricing selector", () => {
         overlays: [
           {
             ...overlay,
-            default_serving_class: null,
             targets: { ttft_ms: 1000, itl_ms: 20, priority: 1 },
           },
         ],

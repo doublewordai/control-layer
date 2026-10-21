@@ -184,9 +184,8 @@ that must be nonempty and contain no whitespace. Classes may share a destination
 Class keys retain their IDs when a display name,
 destination or price changes. Nonempty class configuration requires `standard`
 and `fast`, each with a realtime tariff. Additional keys may use lowercase letters,
-digits, hyphens and underscores, starting with a letter. The old numeric-target
-`serving_classes` declaration cannot be combined with `class_routes` on one model.
-Existing legacy-only catalogs remain valid.
+digits, hyphens and underscores, starting with a letter. The retired numeric-target
+`serving_classes` declaration is accepted only as an empty map; remove it.
 
 Batch tariffs are allowed only under `standard`: batch always resolves to that
 class regardless of the submitted name. Other classes cannot declare batch prices

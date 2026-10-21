@@ -9,7 +9,7 @@ fn offline_org_validator_checks_prices_purposes_and_model_references() {
     fs::create_dir(&models).unwrap();
     fs::create_dir(&orgs).unwrap();
     fs::write(models.join("model.yaml"),"model: org/model\nclay:\n  alias: org/model\n  deployments:\n    - {alias: provider, model_name: org/model, endpoint: onwards}\n  routing:\n    pools:\n      default:\n        - deployment: provider\n").unwrap();
-    let base = "org: example\nmodels:\n  - alias: org/model\n    class_pricing:\n      interactive:\n        tariffs:\n          - {name: price, purpose: realtime, input_per_million_tokens: '1', output_per_million_tokens: '2'}\n        cache_tariff: {write_multiplier_5m: '1', write_multiplier_1h: '1', write_multiplier_24h: '1', read_multiplier: '0.10000'}\n";
+    let base = "org: example\nmodels:\n  - alias: org/model\n    class_pricing:\n      custom:\n        tariffs:\n          - {name: price, purpose: realtime, input_per_million_tokens: '1', output_per_million_tokens: '2'}\n        cache_tariff: {write_multiplier_5m: '1', write_multiplier_1h: '1', write_multiplier_24h: '1', read_multiplier: '0.10000'}\n";
     for (yaml, valid, diagnostic) in [
         (base.to_owned(), true, ""),
         (
@@ -24,9 +24,9 @@ fn offline_org_validator_checks_prices_purposes_and_model_references() {
             false,
             "standard",
         ),
-        (base.replace("interactive:", "unknown-class:"), false, "unknown-class"),
+        (base.replace("custom:", "unknown-class:"), false, "unknown-class"),
         (
-            base.replace("interactive:", "standard:")
+            base.replace("custom:", "standard:")
                 .replace("purpose: realtime", "purpose: batch, completion_window: ' 24h '"),
             false,
             "completion_window",

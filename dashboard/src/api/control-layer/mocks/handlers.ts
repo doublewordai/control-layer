@@ -2914,7 +2914,6 @@ export const handlers = [
     if (!org) return HttpResponse.json({ error: "Not found" }, { status: 404 });
     return HttpResponse.json({
       organization_id: org.id,
-      granted_serving_classes: [],
       self_hosted_only: false,
       overlays: [],
       tariffs: [],

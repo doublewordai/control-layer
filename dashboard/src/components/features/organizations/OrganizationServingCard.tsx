@@ -2,7 +2,6 @@ import { useState } from "react";
 import { useOrganizationServing } from "@/api/control-layer/hooks";
 import type { OrganizationServing } from "@/api/control-layer/types";
 import { OverlayDetails } from "../serving/OverlayDetails";
-import { Badge } from "@/components/ui/badge";
 import {
   Card,
   CardContent,
@@ -44,40 +43,18 @@ export function OrganizationServingCard({
     );
   }
 
-  const classes = data.granted_serving_classes;
-
   return (
     <Card>
       <CardHeader>
         <CardTitle>Serving</CardTitle>
         <CardDescription>
-          Serving classes, routing preference and prices for this organisation.
+          Routing preference, overlays and prices for this organisation.
           Overlays and prices come from the organisation catalog; settings are
           edited here.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-6">
         <dl className="grid grid-cols-1 gap-4 text-sm sm:grid-cols-3">
-          <div>
-            <dt className="text-xs text-gray-500">Granted classes</dt>
-            <dd className="mt-1 flex flex-wrap gap-1">
-              {classes.length === 0 ? (
-                <span className="text-gray-500">none (standard only)</span>
-              ) : (
-                classes.map((c) => (
-                  <Badge key={c} variant="outline">
-                    {c}
-                  </Badge>
-                ))
-              )}
-            </dd>
-          </div>
-          <div>
-            <dt className="text-xs text-gray-500">Default class</dt>
-            <dd className="mt-1 font-medium">
-              {data.default_serving_class ?? "standard"}
-            </dd>
-          </div>
           <div>
             <dt className="text-xs text-gray-500">Self-hosted only</dt>
             <dd className="mt-1 font-medium">

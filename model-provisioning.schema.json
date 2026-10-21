@@ -157,21 +157,10 @@
           "default": []
         },
         "serving_classes": {
-          "description": "The serving classes this model offers, each a preset of targets the\nserving stack's router maps onto a pool. Declaring `interactive` or\n`throughput` is what makes an organisation that holds that class get\nit on this model; declare them once the serving side has pools for the\nmodel. A `standard` preset is optional and pins what unclassed traffic\nasks for; without one, standard sends no targets. Empty = standard only.",
+          "description": "Retired. Accepted only when empty, so existing catalog files still\nload; remove it.",
           "type": "object",
-          "properties": {
-            "interactive": {
-              "$ref": "#/$defs/ServingPreset"
-            },
-            "standard": {
-              "$ref": "#/$defs/ServingPreset"
-            },
-            "throughput": {
-              "$ref": "#/$defs/ServingPreset"
-            }
-          },
-          "additionalProperties": false,
-          "default": {}
+          "additionalProperties": true,
+          "maxProperties": 0
         },
         "class_routes": {
           "description": "Explicit class destinations and prices, staged independently of legacy routing.\nDeclaring these does not activate routes or advertise additional model names.",
@@ -779,35 +768,6 @@
         "batch",
         "playground",
         "continuation"
-      ]
-    },
-    "ServingPreset": {
-      "description": "The objective targets a class maps to on a model, or an organisation's\nexplicit targets on one model. Milliseconds; `priority` is the serving\nstack's scheduling priority (higher wins, 0 = today's realtime value).",
-      "type": "object",
-      "properties": {
-        "ttft_ms": {
-          "description": "Time-to-first-token target, milliseconds.",
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 1
-        },
-        "itl_ms": {
-          "description": "Inter-token-latency target, milliseconds.",
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 1
-        },
-        "priority": {
-          "description": "Scheduling priority; omit for 0.",
-          "type": "integer",
-          "format": "int32",
-          "default": 0
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "ttft_ms",
-        "itl_ms"
       ]
     },
     "ClassRoute": {
