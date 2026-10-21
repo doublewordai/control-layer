@@ -188,6 +188,50 @@ async fn root_span_records_request_ids(pool: sqlx::PgPool) {
     assert_eq!(attr(&span, "edge_request_id"), None);
 }
 
+/// In JSON logs every line of a request carries the ID at the top level,
+/// under the key other services in the request path use, so a single
+/// `| json | x_request_id="<id>"` query finds the whole request.
+#[dwctl_test_macros::test]
+async fn json_log_lines_carry_request_id_at_top_level(pool: sqlx::PgPool) {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let logs = LogBuffer::default();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new("info"))
+            .with(crate::telemetry::fmt_layer(crate::config::LogFormat::Json, logs.clone())),
+    );
+
+    let mock = wiremock::MockServer::start().await;
+    super::mount_chat_completions_mock(&mock).await;
+    let (server, key, _bg) = super::setup_ai_test(pool, &mock, true).await;
+    let start = logs.0.lock().unwrap().len();
+
+    let response = server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .add_header("x-request-id", "edge-123")
+        .json(&json!({"model":"gpt-4o", "messages":[{"role":"user","content":"hello"}]}))
+        .await;
+    response.assert_status_ok();
+    let id = response_id(&response).to_string();
+
+    let text = String::from_utf8_lossy(&logs.0.lock().unwrap()[start..]).into_owned();
+    let in_request: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("one JSON object per line"))
+        .filter(|line| line["spans"][0]["name"] == "request")
+        .collect();
+    assert!(
+        in_request.iter().any(|line| line["message"] == "finished processing request"),
+        "request lines logged:\n{text}"
+    );
+    for line in &in_request {
+        assert_eq!(line["x_request_id"], id.as_str(), "{line}");
+        assert_eq!(line["edge_request_id"], "edge-123", "{line}");
+    }
+}
+
 /// Failures inside the admin AI proxy middleware, which runs before routing,
 /// still carry our ID.
 #[dwctl_test_macros::test]

@@ -212,8 +212,15 @@ impl RequestHandler for AnalyticsHandler {
         let span = info_span!(
             "dwctl.analytics_handler",
             correlation_id = correlation_id,
-            status = %response_data.status
+            status = %response_data.status,
+            x_request_id = tracing::field::Empty,
         );
+        // This runs after the response, outside the request span, so it
+        // carries the request's ID itself for the analytics logs to be found
+        // by it. `assign_request_id` set the header before outlet captured it.
+        if let Some(x_request_id) = extract_header_as_string(&request_data, "x-request-id") {
+            span.record("x_request_id", tracing::field::display(x_request_id));
+        }
 
         async {
             // Whether this is a token-bearing generative endpoint. Gates the
@@ -265,8 +272,8 @@ impl RequestHandler for AnalyticsHandler {
                     correlation_id = correlation_id,
                     uri = %request_data.uri,
                     response_type = %metrics.response_type,
-                    request_model = ?metrics.request_model,
-                    response_model = ?metrics.response_model,
+                    request_model = metrics.request_model.as_deref(),
+                    response_model = metrics.response_model.as_deref(),
                     client_disconnected = client_disconnected(&response_data),
                     "Successful generative response recorded zero tokens"
                 );

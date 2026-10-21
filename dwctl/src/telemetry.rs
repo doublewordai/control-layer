@@ -12,6 +12,13 @@
 //! - `OTEL_EXPORTER_OTLP_HEADERS` - Headers as comma-separated key=value pairs. The values can have their spaces encoded URL style - i.e. replace %20 with space.
 //! - `OTEL_SERVICE_NAME` - Service name for resource identification
 //!
+//! # Log format
+//!
+//! `log_format` in the config (`DWCTL_LOG_FORMAT`) selects `compact` lines,
+//! the default, or `json`: one object per event, for log aggregators. Alert
+//! queries that read log lines depend on the JSON field names described on
+//! [`fmt_layer`], and in JSON mode panics are written in the same shape.
+//!
 //! # What gets exported
 //!
 //! Logs and traces are filtered separately. `RUST_LOG` decides what reaches the
@@ -97,16 +104,25 @@
 //! ```
 
 use axum::{extract::Request, middleware::Next, response::Response};
+use chrono::{SecondsFormat, Utc};
 use onwards::{ErrorOrigin, RequestIdentity, ServedBy};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
 pub use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::trace::Tracer;
+use serde_json::{Map, Value, json};
+use std::backtrace::{Backtrace, BacktraceStatus};
 use std::collections::HashMap;
-use tracing::{Subscriber, info};
+use std::io::Write;
+use std::panic::PanicHookInfo;
+use tracing::field::{Field, Visit};
+use tracing::span::{Attributes, Id, Record};
+use tracing::{Event, Subscriber, info};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::fmt::format::{Format, Json, JsonFields, Writer};
+use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, FormattedFields, MakeWriter};
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::registry::{LookupSpan, Registry, SpanRef};
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
@@ -118,6 +134,7 @@ pub const OTEL_TRACES_FILTER: &str = "OTEL_TRACES_FILTER";
 /// and events, no repository spans or debug lines.
 pub const DEFAULT_OTEL_TRACES_FILTER: &str = "info";
 
+use crate::config::LogFormat;
 use crate::inference::rejections::RejectionCode;
 
 /// Longest account name recorded on a span. Display names are free text, and
@@ -208,40 +225,299 @@ pub fn record_ai_response_attributes<B>(response: &axum::http::Response<B>, span
 /// Initialize tracing with optional OpenTelemetry support
 ///
 /// This function sets up tracing-subscriber with:
-/// - Console output (fmt layer)
+/// - Log output on stdout, in `log_format` (see [`fmt_layer`])
 /// - OpenTelemetry OTLP export (only if `enable_otel_export` is true and configured via environment variables)
+///
+/// With [`LogFormat::Json`] it also replaces the panic hook, so a panic is
+/// written as a JSON error line rather than as plain text (see
+/// [`write_panic_as_json`]).
 ///
 /// Parameters:
 /// - `enable_otel_export`: If true, attempts to configure OTLP export using environment variables
+/// - `log_format`: How log events are written
 ///
 /// Returns the tracer provider if OTLP export was successfully enabled. The caller should
 /// store this and call `provider.shutdown()` before application exit to flush pending spans.
-pub fn init_telemetry(enable_otel_export: bool) -> anyhow::Result<Option<SdkTracerProvider>> {
+///
+/// If OTLP export fails to set up, logging is still installed (without
+/// export) before the error is returned, so the caller can log the error in
+/// `log_format`.
+pub fn init_telemetry(enable_otel_export: bool, log_format: LogFormat) -> anyhow::Result<Option<SdkTracerProvider>> {
     let env_filter = EnvFilter::new(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()));
+    let traces_filter = std::env::var(OTEL_TRACES_FILTER).unwrap_or_else(|_| DEFAULT_OTEL_TRACES_FILTER.to_string());
+    let (otel, provider, otlp_settings, otlp_error) = match enable_otel_export.then(create_otlp_tracer) {
+        Some(Ok((tracer, provider, settings))) => (Some(otel_layer(tracer, &traces_filter)), Some(provider), Some(settings), None),
+        Some(Err(error)) => (None, None, None, Some(error)),
+        None => (None, None, None, None),
+    };
 
-    if enable_otel_export {
-        let (tracer, provider) = create_otlp_tracer()?;
-        let traces_filter = std::env::var(OTEL_TRACES_FILTER).unwrap_or_else(|_| DEFAULT_OTEL_TRACES_FILTER.to_string());
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt_layer(log_format, std::io::stdout))
+        .with(otel)
+        .try_init()?;
 
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(tracing_subscriber::fmt::layer().compact())
-            .with(otel_layer(tracer, &traces_filter))
-            .try_init()?;
-
-        info!(traces_filter, "Telemetry initialized with OTLP export enabled");
-        return Ok(Some(provider));
-    } else {
-        // OTLP export disabled - use only console logging
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(tracing_subscriber::fmt::layer().compact())
-            .try_init()?;
-
-        info!("Telemetry initialized (OTLP export disabled)");
+    if log_format == LogFormat::Json {
+        std::panic::set_hook(Box::new(write_panic_as_json));
     }
 
-    Ok(None)
+    if let Some(error) = otlp_error {
+        return Err(error.context("Failed to set up OTLP export"));
+    }
+    match otlp_settings {
+        Some(settings) => info!(
+            service_name = settings.service_name,
+            endpoint = settings.endpoint,
+            custom_headers = settings.header_count,
+            traces_filter,
+            ?log_format,
+            "Telemetry initialized with OTLP export enabled"
+        ),
+        None => info!(?log_format, "Telemetry initialized (OTLP export disabled)"),
+    }
+
+    Ok(provider)
+}
+
+/// The log output layer, writing to `writer` in `format`.
+///
+/// JSON events carry their fields at the top level (`message`, `error`,
+/// `request_model`, ...) beside `timestamp`, `level` and `target`, the
+/// innermost span under `span` and the full span list, root first, under
+/// `spans`. Loki derives `detected_level` from `level`. The
+/// [`CORRELATION_FIELDS`] of the spans an event is in are repeated at the top
+/// level, so `| json | x_request_id="<id>"` finds every line of a request.
+pub(crate) fn fmt_layer<S, W>(format: LogFormat, writer: W) -> Box<dyn Layer<S> + Send + Sync>
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+    W: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
+{
+    let layer = tracing_subscriber::fmt::layer().with_writer(writer);
+    match format {
+        LogFormat::Compact => layer.compact().boxed(),
+        LogFormat::Json => CorrelationLayer
+            .and_then(
+                layer
+                    .json()
+                    .event_format(JsonWithCorrelation(tracing_subscriber::fmt::format().json().flatten_event(true))),
+            )
+            .boxed(),
+    }
+}
+
+/// Span fields that identify a request across services. In JSON output each
+/// is repeated at the top level of every event inside a span that recorded
+/// it, because Loki's `json` parser does not look inside the `spans` array.
+/// `x_request_id` is the key other services in the request path log the same
+/// ID under, so one key:value query matches all of them.
+const CORRELATION_FIELDS: [&str; 4] = ["x_request_id", "edge_request_id", "provider_request_id", "trace_id"];
+
+/// The [`CORRELATION_FIELDS`] a span has recorded, kept in its extensions by
+/// [`CorrelationLayer`].
+#[derive(Default)]
+struct CorrelationIds(Vec<(&'static str, String)>);
+
+impl Visit for CorrelationIds {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.set(field, value.to_string());
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        // A `display` value's Debug is its Display, so IDs recorded with
+        // `display` (as the request span's are) are not quoted.
+        self.set(field, format!("{value:?}"));
+    }
+}
+
+impl CorrelationIds {
+    fn set(&mut self, field: &Field, value: String) {
+        let Some(name) = CORRELATION_FIELDS.into_iter().find(|name| *name == field.name()) else {
+            return;
+        };
+        match self.0.iter_mut().find(|(existing, _)| *existing == name) {
+            Some((_, existing)) => *existing = value,
+            None => self.0.push((name, value)),
+        }
+    }
+}
+
+/// Records each span's [`CORRELATION_FIELDS`], at creation and when they are
+/// recorded later, for [`JsonWithCorrelation`] and the panic hook to read.
+struct CorrelationLayer;
+
+impl<S> Layer<S> for CorrelationLayer
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+{
+    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+        let mut ids = CorrelationIds::default();
+        attrs.record(&mut ids);
+        if !ids.0.is_empty()
+            && let Some(span) = ctx.span(id)
+        {
+            span.extensions_mut().insert(ids);
+        }
+    }
+
+    fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
+        let Some(span) = ctx.span(id) else { return };
+        let mut extensions = span.extensions_mut();
+        match extensions.get_mut::<CorrelationIds>() {
+            Some(ids) => values.record(ids),
+            None => {
+                let mut ids = CorrelationIds::default();
+                values.record(&mut ids);
+                if !ids.0.is_empty() {
+                    extensions.insert(ids);
+                }
+            }
+        }
+    }
+}
+
+/// The correlation IDs of a span scope given leaf first: the innermost value
+/// of each field wins, and fields `skip` names are left out. In
+/// [`CORRELATION_FIELDS`] order, so lines read the same way every time.
+fn correlation_ids<'a, R: LookupSpan<'a> + 'a>(
+    leaf_first: impl Iterator<Item = SpanRef<'a, R>>,
+    skip: impl Fn(&str) -> bool,
+) -> Vec<(&'static str, String)> {
+    let mut found: Vec<(&'static str, String)> = Vec::new();
+    for span in leaf_first {
+        if let Some(ids) = span.extensions().get::<CorrelationIds>() {
+            for (name, value) in &ids.0 {
+                if !skip(name) && !found.iter().any(|(existing, _)| existing == name) {
+                    found.push((name, value.clone()));
+                }
+            }
+        }
+    }
+    found.sort_by_key(|(name, _)| CORRELATION_FIELDS.iter().position(|field| field == name));
+    found
+}
+
+/// The JSON event format, with the event's correlation IDs (see
+/// [`CORRELATION_FIELDS`]) added at the top level. An event that sets one of
+/// those fields itself keeps its own value.
+struct JsonWithCorrelation(Format<Json>);
+
+impl<S, N> FormatEvent<S, N> for JsonWithCorrelation
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+    N: for<'writer> FormatFields<'writer> + 'static,
+{
+    fn format_event(&self, ctx: &FmtContext<'_, S, N>, mut writer: Writer<'_>, event: &Event<'_>) -> std::fmt::Result {
+        let fields = event.metadata().fields();
+        let ids = ctx
+            .event_scope()
+            .map(|scope| correlation_ids(scope, |name| fields.field(name).is_some()))
+            .unwrap_or_default();
+        if ids.is_empty() {
+            return self.0.format_event(ctx, writer, event);
+        }
+        let mut line = String::new();
+        self.0.format_event(ctx, Writer::new(&mut line), event)?;
+        // The JSON format writes one object and a newline; add the IDs as
+        // the object's last members.
+        let Some(close) = line.trim_end().strip_suffix('}').map(str::len) else {
+            return writer.write_str(&line);
+        };
+        let mut members = String::new();
+        for (name, value) in ids {
+            members.push(',');
+            members.push_str(&Value::from(name).to_string());
+            members.push(':');
+            members.push_str(&Value::from(value).to_string());
+        }
+        line.insert_str(close, &members);
+        writer.write_str(&line)
+    }
+}
+
+/// Panic hook for JSON logging: writes the panic to stderr as one JSON error
+/// line, in the shape [`fmt_layer`] gives events.
+///
+/// It writes the line itself rather than emitting a tracing event, because an
+/// event can be lost exactly when it matters: `RUST_LOG` directives that don't
+/// cover the `panic` target filter it out, and a panic raised while the
+/// subscriber is handling an event is dispatched to no subscriber at all.
+fn write_panic_as_json(info: &PanicHookInfo<'_>) {
+    let line = panic_line(info, &Backtrace::capture(), current_spans());
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
+}
+
+/// The span the panicking thread is in and its scope, root first, shaped
+/// like the `span` and `spans` of a JSON event. The hook runs on that thread
+/// before unwinding, so this is the span of the request or task that
+/// panicked. `None` outside any span, or when the panic happened inside the
+/// subscriber, which then dispatches to no subscriber.
+fn current_spans() -> Option<PanicSpans> {
+    tracing::dispatcher::get_default(|dispatch| {
+        let registry = dispatch.downcast_ref::<Registry>()?;
+        let id = dispatch.current_span().id()?.clone();
+        let span = registry.span(&id)?;
+        Some(PanicSpans {
+            span: span_json(&span),
+            spans: span.scope().from_root().map(|span| span_json(&span)).collect(),
+            correlation_ids: correlation_ids(span.scope(), |_| false),
+        })
+    })
+}
+
+/// The span context [`current_spans`] found for a panic.
+struct PanicSpans {
+    span: Value,
+    spans: Vec<Value>,
+    correlation_ids: Vec<(&'static str, String)>,
+}
+
+/// A span as the JSON layer writes it: its fields, then its `name`.
+fn span_json(span: &SpanRef<'_, Registry>) -> Value {
+    let mut object = span
+        .extensions()
+        .get::<FormattedFields<JsonFields>>()
+        .and_then(|fields| serde_json::from_str::<Map<String, Value>>(fields).ok())
+        .unwrap_or_default();
+    object.insert("name".to_string(), span.name().into());
+    Value::Object(object)
+}
+
+/// The JSON line [`write_panic_as_json`] writes. The message reads like
+/// Rust's default panic output, so searches for `panicked at` still match.
+/// The backtrace is included when `RUST_BACKTRACE` enables capturing one.
+fn panic_line(info: &PanicHookInfo<'_>, backtrace: &Backtrace, spans: Option<PanicSpans>) -> Value {
+    let payload = info
+        .payload()
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("Box<dyn Any>");
+    let thread = std::thread::current();
+    let thread = thread.name().unwrap_or("<unnamed>");
+    let location = info.location().map(ToString::to_string);
+    let message = match &location {
+        Some(location) => format!("thread '{thread}' panicked at {location}: {payload}"),
+        None => format!("thread '{thread}' panicked: {payload}"),
+    };
+    let mut line = json!({
+        "timestamp": Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true),
+        "level": "ERROR",
+        "message": message,
+        "thread": thread,
+        "location": location,
+        "target": "panic",
+    });
+    if let Some(spans) = spans {
+        line["span"] = spans.span;
+        line["spans"] = spans.spans.into();
+        for (name, value) in spans.correlation_ids {
+            line[name] = value.into();
+        }
+    }
+    if backtrace.status() == BacktraceStatus::Captured {
+        line["backtrace"] = backtrace.to_string().into();
+    }
+    line
 }
 
 /// The span export layer: `tracer` behind its own `directives` filter, without
@@ -273,7 +549,7 @@ where
 /// - OTEL_SERVICE_NAME
 ///
 /// Returns both the tracer and provider. The provider must be retained for shutdown.
-fn create_otlp_tracer() -> anyhow::Result<(Tracer, SdkTracerProvider)> {
+fn create_otlp_tracer() -> anyhow::Result<(Tracer, SdkTracerProvider, OtlpSettings)> {
     // Get service name from env or use default
     let service_name = std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "dwctl".to_string());
 
@@ -286,9 +562,6 @@ fn create_otlp_tracer() -> anyhow::Result<(Tracer, SdkTracerProvider)> {
         format!("{}/v1/traces", base.trim_end_matches('/'))
     };
 
-    eprintln!("[OTLP] Initializing OTLP tracer with the following configuration:");
-    eprintln!("[OTLP] Service Name: {}", service_name);
-    eprintln!("[OTLP] Endpoint: {}", endpoint);
     // Parse headers from environment variable
     let mut headers = HashMap::new();
     if let Ok(headers_str) = std::env::var("OTEL_EXPORTER_OTLP_HEADERS") {
@@ -304,8 +577,9 @@ fn create_otlp_tracer() -> anyhow::Result<(Tracer, SdkTracerProvider)> {
                 headers.insert(key, value);
             }
         }
-        eprintln!("[OTLP] Custom headers, length: {}", headers.len());
     }
+
+    let headers_len = headers.len();
 
     // Determine protocol
     let protocol = match std::env::var("OTEL_EXPORTER_OTLP_PROTOCOL").as_deref().unwrap_or("http/protobuf") {
@@ -332,9 +606,21 @@ fn create_otlp_tracer() -> anyhow::Result<(Tracer, SdkTracerProvider)> {
         .with_resource(resource)
         .build();
 
-    let tracer = tracer_provider.tracer(service_name);
+    let tracer = tracer_provider.tracer(service_name.clone());
+    let settings = OtlpSettings {
+        service_name,
+        endpoint,
+        header_count: headers_len,
+    };
 
-    Ok((tracer, tracer_provider))
+    Ok((tracer, tracer_provider, settings))
+}
+
+/// What [`create_otlp_tracer`] configured, logged once logging is up.
+struct OtlpSettings {
+    service_name: String,
+    endpoint: String,
+    header_count: usize,
 }
 
 #[cfg(test)]
@@ -437,7 +723,7 @@ mod tests {
 
     #[test]
     fn otlp_tracer_builds_with_http_client() {
-        let (_, provider) = create_otlp_tracer().expect(
+        let (_, provider, _) = create_otlp_tracer().expect(
             "OTLP tracer failed to build - likely a feature flag conflict \
              (reqwest-client vs reqwest-blocking-client)",
         );
@@ -455,6 +741,162 @@ mod tests {
             result.is_ok(),
             "reqwest cannot make HTTPS requests — TLS not configured: {}",
             result.unwrap_err()
+        );
+    }
+
+    /// Writes JSON lines into a buffer, for tests that read them back.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Captured {
+        fn lines(&self) -> Vec<String> {
+            String::from_utf8(self.0.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    /// In JSON, the request IDs recorded on the spans an event is in are
+    /// repeated at the top level, the innermost value winning and recorded
+    /// late (as the request span records them) as well as at creation. An
+    /// event that sets one itself keeps its own value, and an event outside
+    /// any span gets none.
+    #[test]
+    fn json_events_carry_their_spans_request_ids_at_the_top_level() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("info"))
+            .with(fmt_layer(LogFormat::Json, move || writer.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            let request = tracing::info_span!("request", x_request_id = tracing::field::Empty, trace_id = "trace-1");
+            request.record("x_request_id", tracing::field::display("req-outer"));
+            request.in_scope(|| {
+                tracing::info_span!("handler", edge_request_id = "edge-1").in_scope(|| {
+                    tracing::info!("in request");
+                    tracing::info_span!("retry", x_request_id = "req-inner").in_scope(|| tracing::info!("in retry"));
+                    tracing::info!(x_request_id = "own", "sets its own");
+                });
+            });
+            tracing::info!("outside");
+        });
+
+        let lines = captured.lines();
+        let parsed: Vec<serde_json::Value> = lines.iter().map(|line| serde_json::from_str(line).unwrap()).collect();
+        let [in_request, in_retry, own, outside] = parsed.as_slice() else {
+            panic!("expected four lines: {lines:?}");
+        };
+        assert_eq!(in_request["x_request_id"], "req-outer");
+        assert_eq!(in_request["edge_request_id"], "edge-1");
+        assert_eq!(in_request["trace_id"], "trace-1");
+        assert_eq!(in_request["spans"][0]["x_request_id"], "req-outer", "the span list is unchanged");
+        assert_eq!(in_retry["x_request_id"], "req-inner");
+        assert_eq!(own["x_request_id"], "own");
+        assert_eq!(
+            lines[2].matches(r#""x_request_id":"own""#).count(),
+            1,
+            "the event's own field is not repeated: {}",
+            lines[2]
+        );
+        assert_eq!(own["edge_request_id"], "edge-1");
+        assert!(outside.get("x_request_id").is_none(), "{outside}");
+    }
+
+    /// Run by [`json_logging_writes_every_error_as_one_json_line`] in a child
+    /// process, which owns the global subscriber and panic hook. Does nothing
+    /// in a normal test run.
+    #[test]
+    fn json_logging_child() {
+        if std::env::var_os(JSON_LOGGING_CHILD).is_none() {
+            return;
+        }
+        // Nothing listens on the endpoint; setting up export doesn't connect.
+        let provider = init_telemetry(true, LogFormat::Json).unwrap();
+        assert!(provider.is_some());
+        tracing::info_span!("request").in_scope(|| {
+            tracing::error!(error = "first line\nsecond line", request_model = Some("model-a"), "tracing error");
+        });
+        log::error!("log crate error");
+        let _ = std::thread::spawn(|| {
+            tracing::info_span!("request", request_id = 7, x_request_id = "req-1").in_scope(|| {
+                tracing::info_span!("worker").in_scope(|| panic!("worker panic"));
+            });
+        })
+        .join();
+    }
+
+    const JSON_LOGGING_CHILD: &str = "DWCTL_JSON_LOGGING_TEST_CHILD";
+
+    /// With `log_format: json`, a tracing error (multi-line message included),
+    /// a `log`-crate error from a dependency and a panic each reach the output
+    /// as a single JSON line at level `ERROR`, the panic with the spans it
+    /// happened in, and setting up OTLP export prints nothing outside the log.
+    /// Runs the real initialization in a child process, since it installs the
+    /// global subscriber and panic hook.
+    #[test]
+    fn json_logging_writes_every_error_as_one_json_line() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "telemetry::tests::json_logging_child", "--nocapture"])
+            .env(JSON_LOGGING_CHILD, "1")
+            .env("RUST_LOG", "info")
+            .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:9")
+            .output()
+            .expect("start json logging child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "json logging child failed:\n{stdout}\n{stderr}");
+
+        let lines: Vec<serde_json::Value> = stdout
+            .lines()
+            .chain(stderr.lines())
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let find = |message: &str| {
+            lines
+                .iter()
+                .find(|line| line["message"].as_str().is_some_and(|m| m.contains(message)))
+                .unwrap_or_else(|| panic!("no JSON line for {message:?}:\n{stdout}\n{stderr}"))
+        };
+
+        let tracing_error = find("tracing error");
+        assert_eq!(tracing_error["level"], "ERROR");
+        assert_eq!(tracing_error["error"], "first line\nsecond line");
+        assert_eq!(tracing_error["request_model"], "model-a");
+        assert_eq!(tracing_error["spans"][0]["name"], "request");
+
+        assert_eq!(find("log crate error")["level"], "ERROR");
+
+        let panic = find("worker panic");
+        assert_eq!(panic["level"], "ERROR");
+        assert_eq!(panic["target"], "panic");
+        assert!(
+            panic["message"].as_str().unwrap().contains("panicked at"),
+            "panic message keeps the default wording: {panic}"
+        );
+        assert_eq!(panic["span"]["name"], "worker");
+        assert_eq!(panic["spans"][0]["name"], "request");
+        assert_eq!(panic["spans"][0]["request_id"], 7);
+        assert_eq!(panic["spans"][1]["name"], "worker");
+        assert_eq!(panic["x_request_id"], "req-1");
+
+        let initialized = find("OTLP export enabled");
+        assert_eq!(initialized["endpoint"], "http://127.0.0.1:9/v1/traces");
+        assert!(
+            !stdout.contains("[OTLP]") && !stderr.contains("[OTLP]"),
+            "OTLP setup is logged as an event, not printed: {stderr}"
         );
     }
 }
