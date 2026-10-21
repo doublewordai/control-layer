@@ -29,6 +29,7 @@ use crate::db::{
 use crate::errors::{Error, Result};
 use crate::image_normalizer::{ImageInput, ImageNormalizer, Mode as ImageNormalizerMode, walker as image_walker};
 use crate::reasoning::ModelReasoningPolicy;
+use crate::sync::key_policy::AccountTolerations;
 use crate::types::Resource;
 use axum::{
     Json,
@@ -177,7 +178,7 @@ impl OpenAIBatchRequest {
         api_key: String,
         accessible_models: &HashMap<String, AccessibleBatchModel>,
         allowed_url_paths: &[String],
-        tolerations: Option<&serde_json::Value>,
+        tolerations: &AccountTolerations,
     ) -> Result<fusillade::RequestTemplateInput> {
         // Validate custom_id is safe for HTTP headers
         validate_custom_id(&self.custom_id)?;
@@ -236,10 +237,11 @@ impl OpenAIBatchRequest {
         crate::inference::middleware::strip_scheduling_priority(&mut sanitized_body);
 
         // A preset-pinned account's batch requests carry its preset's fixed
-        // toleration list, exactly as its realtime and flex requests do. Applied
-        // after the strip above so the client can never override it.
-        if let Some(tolerations) = tolerations {
-            crate::inference::middleware::set_routing_tolerations(&mut sanitized_body, tolerations);
+        // toleration list for this line's model, exactly as its realtime and
+        // flex requests do. Applied after the strip above so the client can
+        // never override it.
+        if let Some(tolerations) = tolerations.for_model(&model) {
+            crate::inference::middleware::set_routing_tolerations(&mut sanitized_body, &tolerations);
         }
 
         // Serialize sanitized body back to string
@@ -697,11 +699,10 @@ struct FileRequestContext {
     api_key: String,
     accessible_models: HashMap<String, AccessibleBatchModel>,
     allowed_url_paths: Vec<String>,
-    /// The toleration list the account that owns this upload is pinned to,
-    /// resolved from its preset, or `None` when it is on "Default". Written
-    /// verbatim to `nvext.routing_constraints.tolerations` on every template
-    /// body.
-    tolerations: Option<serde_json::Value>,
+    /// The toleration presets of the account that owns this upload, resolved
+    /// per line by its model. A pinned line's list is written verbatim to
+    /// `nvext.routing_constraints.tolerations` on its template body.
+    tolerations: AccountTolerations,
 }
 
 struct AccessibleBatchModel {
@@ -946,7 +947,7 @@ fn create_file_stream(
                                                 api_key.clone(),
                                                 &accessible_models,
                                                 &allowed_url_paths,
-                                                tolerations.as_ref(),
+                                                &tolerations,
                                             ) {
                                                 Ok(mut template) => {
                                                     // Normalise image URLs in the per-template body
@@ -1043,7 +1044,7 @@ fn create_file_stream(
                                         api_key.clone(),
                                         &accessible_models,
                                         &allowed_url_paths,
-                                        tolerations.as_ref(),
+                                        &tolerations,
                                     ) {
                                         Ok(mut template) => {
                                             // Normalise image URLs in the trailing line as well.
@@ -1267,13 +1268,13 @@ pub async fn upload_file<P: PoolProvider>(
     // account's policy straight off the users row, reusing the connection `conn`
     // this handler already holds — a cached account on Default is not a miss, so
     // an ordinary upload never takes a second connection.
-    let tolerations = match state.key_policy_cache.tolerations_if_known(&user_api_key) {
+    let tolerations = match state.key_policy_cache.account_tolerations_if_known(&user_api_key) {
         Some(resolved) => resolved,
         None => {
             let policy = crate::sync::key_policy::load_policy(&mut conn, target_user_id)
                 .await
                 .map_err(|e| Error::Database(e.into()))?;
-            state.key_policy_cache.presets().resolve(policy.toleration_preset.as_deref())
+            state.key_policy_cache.account_tolerations(policy)
         }
     };
 
@@ -1319,7 +1320,7 @@ pub async fn upload_file<P: PoolProvider>(
             api_key: user_api_key,
             accessible_models,
             allowed_url_paths: config.batches.allowed_url_paths.clone(),
-            tolerations: tolerations.map(|t| (*t).clone()),
+            tolerations,
         },
         Some(api_key_id),
     );

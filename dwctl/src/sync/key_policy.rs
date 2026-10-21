@@ -46,6 +46,39 @@ pub struct KeyPolicy {
     /// every ZDR and modality read already does) copies a refcount rather than
     /// allocating a fresh `String`.
     pub toleration_preset: Option<Arc<str>>,
+    /// Per-model preset ids from the account catalog (`account_model_policies`),
+    /// keyed by model alias, each overriding `toleration_preset` for requests to
+    /// that model. A class policy has already been folded over its model's.
+    /// Shared by every key of the account.
+    pub model_toleration_presets: Option<Arc<HashMap<String, Arc<str>>>>,
+}
+
+impl KeyPolicy {
+    /// The preset id that applies to a request for `model`: the model's (or
+    /// its class's) from the account catalog, else the account's own.
+    pub fn toleration_preset_for(&self, model: &str) -> Option<&str> {
+        self.model_toleration_presets
+            .as_ref()
+            .and_then(|presets| presets.get(model))
+            .or(self.toleration_preset.as_ref())
+            .map(|preset| &**preset)
+    }
+}
+
+/// One account's toleration presets, resolvable per model: what a batch
+/// upload stamps on each line, by the line's model.
+#[derive(Clone, Default)]
+pub struct AccountTolerations {
+    policy: KeyPolicy,
+    presets: TolerationPresets,
+}
+
+impl AccountTolerations {
+    /// The toleration list for a request to `model`, or `None` when the
+    /// account is on "Default" for it.
+    pub fn for_model(&self, model: &str) -> Option<Arc<serde_json::Value>> {
+        self.presets.resolve(self.policy.toleration_preset_for(model))
+    }
 }
 
 /// Lock-free, cheap-to-clone handle to the shared secret-to-policy map, plus
@@ -108,28 +141,30 @@ impl KeyPolicyCache {
         self.policy(secret).disabled_modalities
     }
 
-    /// The toleration list the account owning `secret` is pinned to, resolved
-    /// from its stored preset id, or `None` when the account is on "Default".
-    /// An id the config no longer defines fails closed to the empty list. Hot
-    /// path safe.
-    pub fn tolerations(&self, secret: &str) -> Option<Arc<serde_json::Value>> {
-        self.presets.resolve(self.preset_id(secret).as_deref())
+    /// The toleration list the account owning `secret` is pinned to for a
+    /// request to `model`: the account catalog's preset for that model, else
+    /// the account's own, or `None` when neither is set ("Default"). An id the
+    /// config no longer defines fails closed to the empty list. Hot path safe.
+    pub fn tolerations(&self, secret: &str, model: &str) -> Option<Arc<serde_json::Value>> {
+        let map = self.inner.load();
+        self.presets
+            .resolve(map.get(secret).and_then(|policy| policy.toleration_preset_for(model)))
     }
 
-    /// The stored preset id for `secret`, cheaply cloned (an `Arc<str>`), so a
-    /// caller that only needs the id does not allocate a whole `KeyPolicy`.
-    fn preset_id(&self, secret: &str) -> Option<Arc<str>> {
-        self.inner.load().get(secret).and_then(|p| p.toleration_preset.clone())
+    /// Everything needed to resolve the tolerations of the account owning
+    /// `secret`, for any model, when the key is present in the map. `None`
+    /// means the key is absent (a key created since the last refresh), which
+    /// the caller may resolve from the DB with [`load_policy`]. Hot path safe.
+    pub fn account_tolerations_if_known(&self, secret: &str) -> Option<AccountTolerations> {
+        self.policy_if_known(secret).map(|policy| self.account_tolerations(policy))
     }
 
-    /// The tolerations for `secret` when the key is present in the map:
-    /// `Some(Some(list))` when pinned, `Some(None)` when the account is on
-    /// Default. `None` means the key is absent from the map (a key created
-    /// since the last refresh), which the caller may resolve from the DB. Hot
-    /// path safe.
-    pub fn tolerations_if_known(&self, secret: &str) -> Option<Option<Arc<serde_json::Value>>> {
-        let policy = self.policy_if_known(secret)?;
-        Some(self.presets.resolve(policy.toleration_preset.as_deref()))
+    /// Resolve tolerations for an account policy read directly from the DB.
+    pub fn account_tolerations(&self, policy: KeyPolicy) -> AccountTolerations {
+        AccountTolerations {
+            policy,
+            presets: self.presets.clone(),
+        }
     }
 
     /// The presets a stored id resolves against, for a caller that read an
@@ -185,7 +220,7 @@ impl KeyPolicyCache {
 async fn load(pool: &PgPool) -> Result<HashMap<String, KeyPolicy>, sqlx::Error> {
     let rows = sqlx::query!(
         r#"
-        SELECT ak.secret, u.zero_data_retention, u.disabled_modalities, u.toleration_preset
+        SELECT ak.secret, ak.user_id, u.zero_data_retention, u.disabled_modalities, u.toleration_preset
         FROM api_keys ak
         JOIN users u ON u.id = ak.user_id
         WHERE NOT ak.is_deleted
@@ -193,6 +228,7 @@ async fn load(pool: &PgPool) -> Result<HashMap<String, KeyPolicy>, sqlx::Error> 
     )
     .fetch_all(pool)
     .await?;
+    let model_presets = load_model_presets(pool, None).await?;
 
     Ok(rows
         .into_iter()
@@ -203,10 +239,45 @@ async fn load(pool: &PgPool) -> Result<HashMap<String, KeyPolicy>, sqlx::Error> 
                     zdr: r.zero_data_retention,
                     disabled_modalities: ModalitySet::from_db(&r.disabled_modalities),
                     toleration_preset: r.toleration_preset.map(Arc::from),
+                    model_toleration_presets: model_presets.get(&r.user_id).cloned(),
                 },
             )
         })
         .collect())
+}
+
+/// Per-model preset ids from the account catalog, for every account or for
+/// one, each account's map shared by `Arc` across its keys. A class row
+/// (`standard`, the only class a request resolves to today) overrides its
+/// model row.
+async fn load_model_presets<'c>(
+    conn: impl sqlx::PgExecutor<'c>,
+    account: Option<crate::types::UserId>,
+) -> Result<HashMap<crate::types::UserId, Arc<HashMap<String, Arc<str>>>>, sqlx::Error> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT p.user_id, dm.alias, p.toleration_preset AS "toleration_preset!"
+        FROM account_model_policies p
+        JOIN deployed_models dm ON dm.id = p.deployed_model_id
+        WHERE p.toleration_preset IS NOT NULL
+          AND dm.deleted = FALSE
+          AND (p.serving_class IS NULL OR p.serving_class = 'standard')
+          AND ($1::uuid IS NULL OR p.user_id = $1)
+        ORDER BY p.serving_class NULLS FIRST
+        "#,
+        account
+    )
+    .fetch_all(conn)
+    .await?;
+
+    let mut presets: HashMap<crate::types::UserId, HashMap<String, Arc<str>>> = HashMap::new();
+    for row in rows {
+        presets
+            .entry(row.user_id)
+            .or_default()
+            .insert(row.alias, Arc::from(row.toleration_preset));
+    }
+    Ok(presets.into_iter().map(|(account, presets)| (account, Arc::new(presets))).collect())
 }
 
 /// Reload `cache` in place from the DB, returning the number of keys loaded.
@@ -234,14 +305,17 @@ pub async fn load_policy(conn: &mut sqlx::PgConnection, user_id: crate::types::U
     )
     .fetch_optional(&mut *conn)
     .await?;
+    let Some(row) = row else {
+        return Ok(KeyPolicy::default());
+    };
 
-    Ok(row
-        .map(|r| KeyPolicy {
-            zdr: r.zero_data_retention,
-            disabled_modalities: ModalitySet::from_db(&r.disabled_modalities),
-            toleration_preset: r.toleration_preset.map(Arc::from),
-        })
-        .unwrap_or_default())
+    let model_toleration_presets = load_model_presets(&mut *conn, Some(user_id)).await?.remove(&user_id);
+    Ok(KeyPolicy {
+        zdr: row.zero_data_retention,
+        disabled_modalities: ModalitySet::from_db(&row.disabled_modalities),
+        toleration_preset: row.toleration_preset.map(Arc::from),
+        model_toleration_presets,
+    })
 }
 
 /// Load the map once, synchronously, returning a populated cache. Call at
@@ -436,24 +510,88 @@ mod tests {
             ],
         );
         assert_eq!(
-            cache.tolerations("sk-preset").as_deref(),
+            cache.tolerations("sk-preset", "any/model").as_deref(),
             Some(&serde_json::json!([{"key": "pool", "operator": "Equal", "value": "dedicated"}]))
         );
-        assert_eq!(cache.tolerations("sk-empty").as_deref(), Some(&serde_json::json!([])));
+        assert_eq!(cache.tolerations("sk-empty", "any/model").as_deref(), Some(&serde_json::json!([])));
         // The Default setting and an unknown key are both unpinned.
-        assert!(cache.tolerations("sk-default").is_none());
-        assert!(cache.tolerations("sk-missing").is_none());
-        // `tolerations_if_known` distinguishes a cached Default (`Some(None)`)
-        // from a key absent from the map (`None`), so the batch upload only
-        // pays for a DB read on a genuine miss.
-        assert_eq!(cache.tolerations_if_known("sk-default"), Some(None));
-        assert_eq!(cache.tolerations_if_known("sk-missing"), None);
-        assert_eq!(
-            cache.tolerations_if_known("sk-preset").map(|t| t.map(|v| v.as_ref().clone())),
-            Some(Some(
-                serde_json::json!([{"key": "pool", "operator": "Equal", "value": "dedicated"}])
-            ))
+        assert!(cache.tolerations("sk-default", "any/model").is_none());
+        assert!(cache.tolerations("sk-missing", "any/model").is_none());
+        // `account_tolerations_if_known` distinguishes a cached Default from a
+        // key absent from the map (`None`), so the batch upload only pays for
+        // a DB read on a genuine miss.
+        assert!(
+            cache
+                .account_tolerations_if_known("sk-default")
+                .unwrap()
+                .for_model("any/model")
+                .is_none()
         );
+        assert!(cache.account_tolerations_if_known("sk-missing").is_none());
+        assert_eq!(
+            cache
+                .account_tolerations_if_known("sk-preset")
+                .unwrap()
+                .for_model("any/model")
+                .as_deref(),
+            Some(&serde_json::json!([{"key": "pool", "operator": "Equal", "value": "dedicated"}]))
+        );
+    }
+
+    #[test]
+    fn a_model_preset_overrides_the_account_preset_for_that_model_only() {
+        use crate::config::{SchedulingConfig, TolerationPreset};
+        use crate::scheduling::{SchedulingOperator, SchedulingToleration};
+
+        let presets = TolerationPresets::new(&SchedulingConfig {
+            toleration_presets: vec![
+                SchedulingConfig::default_preset(),
+                TolerationPreset {
+                    id: "gpu".to_string(),
+                    label: "GPU".to_string(),
+                    description: "GPU capacity only.".to_string(),
+                    tolerations: vec![SchedulingToleration {
+                        key: "pool".to_string(),
+                        operator: Some(SchedulingOperator::Equal),
+                        value: Some("dedicated".to_string()),
+                        effect: None,
+                    }],
+                },
+            ],
+        });
+        let models = Arc::new(HashMap::from([("org/pinned".to_string(), Arc::<str>::from("no-overflow"))]));
+        let cache = KeyPolicyCache::from_policies_with_presets(
+            presets,
+            [
+                (
+                    "sk-both".to_string(),
+                    KeyPolicy {
+                        toleration_preset: Some("gpu".into()),
+                        model_toleration_presets: Some(models.clone()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "sk-model-only".to_string(),
+                    KeyPolicy {
+                        model_toleration_presets: Some(models),
+                        ..Default::default()
+                    },
+                ),
+            ],
+        );
+        let gpu = serde_json::json!([{"key": "pool", "operator": "Equal", "value": "dedicated"}]);
+        assert_eq!(cache.tolerations("sk-both", "org/pinned").as_deref(), Some(&serde_json::json!([])));
+        assert_eq!(cache.tolerations("sk-both", "org/other").as_deref(), Some(&gpu));
+        assert_eq!(
+            cache.tolerations("sk-model-only", "org/pinned").as_deref(),
+            Some(&serde_json::json!([]))
+        );
+        // "No preset" stays distinct from the empty list on other models.
+        assert!(cache.tolerations("sk-model-only", "org/other").is_none());
+        let account = cache.account_tolerations_if_known("sk-both").unwrap();
+        assert_eq!(account.for_model("org/pinned").as_deref(), Some(&serde_json::json!([])));
+        assert_eq!(account.for_model("org/other").as_deref(), Some(&gpu));
     }
 
     #[test]
@@ -470,6 +608,9 @@ mod tests {
         );
         // A preset an operator has dropped from config resolves to the most
         // restrictive option rather than leaving the account unpinned.
-        assert_eq!(cache.tolerations("sk-retired").as_deref(), Some(&serde_json::json!([])));
+        assert_eq!(
+            cache.tolerations("sk-retired", "any/model").as_deref(),
+            Some(&serde_json::json!([]))
+        );
     }
 }

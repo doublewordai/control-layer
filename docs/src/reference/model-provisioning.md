@@ -384,6 +384,7 @@ priority: 100                     # optional; default for every model
 models:
   example/chat-model:
     priority: 300                 # optional; overrides the account default
+    toleration_preset: no-overflow  # optional; overrides the account's preset
     tariffs:                      # batch prices only, at model level
       - {name: batch-24h, purpose: batch, completion_window: 24h,
          input_per_million_tokens: "0.50", output_per_million_tokens: "1.50"}
@@ -398,6 +399,7 @@ models:
         ttft_ms: 1000             # optional latency targets
         itl_ms: 30
         priority: 500             # optional; overrides the model's priority
+        toleration_preset: gpu    # optional; overrides the model's preset
 ```
 
 The older shape is still accepted and means the same as
@@ -421,6 +423,13 @@ Rules:
   `ttft_ms` and `itl_ms` are sent as latency targets on the same realtime
   requests. Neither changes the class the request is billed as. Priority
   `-2147483648` is reserved for background work and rejected.
+- `toleration_preset` names one of `scheduling.toleration_presets` (see
+  [Account Scheduling](./configuration.md#account-scheduling-tolerations-and-provider-fallback)).
+  It inherits class, then model, then the account's own preset (set by a
+  platform manager), then none. It applies to realtime, flex and background
+  requests, and to batch lines by each line's model. A preset id the
+  deployment does not configure is logged at startup and fails closed to the
+  empty (most restrictive) list.
 - If a model appears in both shapes, the two limits must be equal.
 - An account/model pair may be configured in its account file or in an
   [organisation overlay](#organisation-catalog-validation-and-ownership), not

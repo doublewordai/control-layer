@@ -703,6 +703,11 @@ scheduling:
 | `description` | string | One or two sentences of help text shown as the dashboard tooltip. Must be non-empty. |
 | `tolerations` | list | The request-field list (`{key, operator?, value?, effect?}`). `operator` defaults to `Equal` and then requires `value`; `Exists` forbids `value`; `effect` may be `NoSchedule` or `PreferNoSchedule`. May be empty; validated at config load. |
 
+An [account file](./model-provisioning.md#account-limits) can also set a
+preset for one model, or one class of a model, in place of the account's own
+preset for those requests. The more specific setting wins: class, then model,
+then the account.
+
 The `GET /admin/api/v1/config` endpoint exposes the presets (id, label,
 description) so the dashboard can render the control. An account stores only the
 preset's id; an id the config no longer defines is logged and the request path

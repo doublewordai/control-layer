@@ -13,7 +13,7 @@
 //! what this catalog owns.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     path::Path,
 };
@@ -78,6 +78,10 @@ pub struct AccountModelPolicy {
     /// Scheduling priority on this model, overriding the account's.
     #[serde(default)]
     pub priority: Option<i32>,
+    /// Scheduling-toleration preset id for this model, in place of the
+    /// account's own preset.
+    #[serde(default)]
+    pub toleration_preset: Option<String>,
     /// The account's batch and flex prices on this model, per completion
     /// window. Realtime prices are set per class.
     #[serde(default)]
@@ -110,11 +114,15 @@ pub struct AccountClassPolicy {
     /// Scheduling priority on this class, overriding the model's and the account's.
     #[serde(default)]
     pub priority: Option<i32>,
+    /// Scheduling-toleration preset id for this class, overriding the model's
+    /// and the account's.
+    #[serde(default)]
+    pub toleration_preset: Option<String>,
 }
 
 impl AccountModelPolicy {
     fn is_empty(&self) -> bool {
-        self.priority.is_none() && self.tariffs.is_empty() && self.classes.is_empty()
+        self.priority.is_none() && self.toleration_preset.is_none() && self.tariffs.is_empty() && self.classes.is_empty()
     }
 }
 
@@ -126,10 +134,11 @@ impl AccountClassPolicy {
             && self.ttft_ms.is_none()
             && self.itl_ms.is_none()
             && self.priority.is_none()
+            && self.toleration_preset.is_none()
     }
 
     fn has_policy(&self) -> bool {
-        self.priority.is_some() || self.ttft_ms.is_some() || self.itl_ms.is_some()
+        self.priority.is_some() || self.ttft_ms.is_some() || self.itl_ms.is_some() || self.toleration_preset.is_some()
     }
 }
 
@@ -208,6 +217,22 @@ impl AccountLimitsCatalog {
     /// An account/model pair is configured in one catalog only: either an
     /// account file's `models` entry or an organisation overlay, never both.
     /// A limit in the older top-level shape may sit alongside an overlay.
+    /// Every toleration preset id the files name, for checking against the
+    /// deployment's configured presets.
+    pub fn toleration_presets(&self) -> BTreeSet<&str> {
+        self.files
+            .iter()
+            .flat_map(|file| file.document.models.values())
+            .flat_map(|model| {
+                model
+                    .toleration_preset
+                    .as_deref()
+                    .into_iter()
+                    .chain(model.classes.values().filter_map(|class| class.toleration_preset.as_deref()))
+            })
+            .collect()
+    }
+
     pub fn validate_against_overlays(&self, overlays: &OrgCatalog) -> Result<()> {
         let mut declared: HashMap<(String, String), &str> = HashMap::new();
         for entry in &overlays.orgs {
@@ -256,6 +281,7 @@ impl AccountLimitsCatalog {
                 let context = format!("{source}: model {alias:?}");
                 ensure!(!model.is_empty(), "{context} configures nothing");
                 validate_priority(model.priority, &context)?;
+                validate_preset(model.toleration_preset.as_deref(), &context)?;
                 validate_tariffs(&model.tariffs, &context)?;
                 ensure!(
                     model.tariffs.iter().all(|t| t.purpose == TariffPurpose::Batch),
@@ -287,6 +313,7 @@ impl AccountLimitsCatalog {
                         validate_cache_tariff(&cache.as_tariff(), &context)?;
                     }
                     validate_priority(policy.priority, &context)?;
+                    validate_preset(policy.toleration_preset.as_deref(), &context)?;
                     validate_target(policy.ttft_ms, "ttft_ms", &context)?;
                     validate_target(policy.itl_ms, "itl_ms", &context)?;
                 }
@@ -304,6 +331,20 @@ fn validate_priority(priority: Option<i32>, context: &str) -> Result<()> {
         "{context}: priority {} is reserved for background work",
         i32::MIN
     );
+    Ok(())
+}
+
+/// A preset id is the operator's slug from `scheduling.toleration_presets`.
+/// Whether it is configured is checked at startup (and an unconfigured id
+/// fails closed at request time), since the files are validated without the
+/// deployment's config.
+fn validate_preset(preset: Option<&str>, context: &str) -> Result<()> {
+    if let Some(preset) = preset {
+        ensure!(
+            !preset.is_empty() && preset.trim() == preset,
+            "{context}: toleration_preset must be a non-empty id without surrounding whitespace"
+        );
+    }
     Ok(())
 }
 
@@ -328,6 +369,7 @@ struct PolicyRow {
     priority: Option<i32>,
     ttft_ms: Option<i32>,
     itl_ms: Option<i32>,
+    toleration_preset: Option<String>,
 }
 
 pub async fn apply(pool: &PgPool, catalog: &AccountLimitsCatalog) -> Result<()> {
@@ -440,7 +482,7 @@ async fn apply_policies(
         let account = accounts[&file.document.account];
         for (alias, model) in &file.document.models {
             let model_id = models[alias];
-            if model.priority.is_some() {
+            if model.priority.is_some() || model.toleration_preset.is_some() {
                 rows.push(PolicyRow {
                     account,
                     model: model_id,
@@ -448,6 +490,7 @@ async fn apply_policies(
                     priority: model.priority,
                     ttft_ms: None,
                     itl_ms: None,
+                    toleration_preset: model.toleration_preset.clone(),
                 });
             }
             for (class, policy) in &model.classes {
@@ -459,6 +502,7 @@ async fn apply_policies(
                         priority: policy.priority,
                         ttft_ms: policy.ttft_ms.map(i32::try_from).transpose()?,
                         itl_ms: policy.itl_ms.map(i32::try_from).transpose()?,
+                        toleration_preset: policy.toleration_preset.clone(),
                     });
                 }
             }
@@ -470,6 +514,7 @@ async fn apply_policies(
     let priorities_col: Vec<Option<i32>> = rows.iter().map(|r| r.priority).collect();
     let ttft_col: Vec<Option<i32>> = rows.iter().map(|r| r.ttft_ms).collect();
     let itl_col: Vec<Option<i32>> = rows.iter().map(|r| r.itl_ms).collect();
+    let presets_col: Vec<Option<String>> = rows.iter().map(|r| r.toleration_preset.clone()).collect();
 
     sqlx::query(
         "DELETE FROM account_model_policies p
@@ -514,19 +559,22 @@ async fn apply_policies(
         );
     }
     sqlx::query(
-        "INSERT INTO account_model_policies (user_id, deployed_model_id, serving_class, priority, ttft_ms, itl_ms, provisioning_source)
-         SELECT d.user_id, d.deployed_model_id, d.serving_class, d.priority, d.ttft_ms, d.itl_ms, $7
-         FROM UNNEST($1::uuid[], $2::uuid[], $3::text[], $4::int[], $5::int[], $6::int[])
-              AS d(user_id, deployed_model_id, serving_class, priority, ttft_ms, itl_ms)
+        "INSERT INTO account_model_policies
+             (user_id, deployed_model_id, serving_class, priority, ttft_ms, itl_ms, toleration_preset, provisioning_source)
+         SELECT d.user_id, d.deployed_model_id, d.serving_class, d.priority, d.ttft_ms, d.itl_ms, d.toleration_preset, $8
+         FROM UNNEST($1::uuid[], $2::uuid[], $3::text[], $4::int[], $5::int[], $6::int[], $7::text[])
+              AS d(user_id, deployed_model_id, serving_class, priority, ttft_ms, itl_ms, toleration_preset)
          ON CONFLICT ON CONSTRAINT uq_account_model_policies_scope DO UPDATE SET
              priority = EXCLUDED.priority,
              ttft_ms = EXCLUDED.ttft_ms,
              itl_ms = EXCLUDED.itl_ms,
+             toleration_preset = EXCLUDED.toleration_preset,
              provisioning_source = EXCLUDED.provisioning_source,
              updated_at = NOW()
          WHERE (account_model_policies.priority, account_model_policies.ttft_ms, account_model_policies.itl_ms,
-                account_model_policies.provisioning_source)
-               IS DISTINCT FROM (EXCLUDED.priority, EXCLUDED.ttft_ms, EXCLUDED.itl_ms, EXCLUDED.provisioning_source)",
+                account_model_policies.toleration_preset, account_model_policies.provisioning_source)
+               IS DISTINCT FROM (EXCLUDED.priority, EXCLUDED.ttft_ms, EXCLUDED.itl_ms, EXCLUDED.toleration_preset,
+                                 EXCLUDED.provisioning_source)",
     )
     .bind(&accounts_col)
     .bind(&models_col)
@@ -534,6 +582,7 @@ async fn apply_policies(
     .bind(&priorities_col)
     .bind(&ttft_col)
     .bind(&itl_col)
+    .bind(&presets_col)
     .bind(POLICY_SOURCE)
     .execute(&mut *db)
     .await
@@ -867,6 +916,14 @@ mod tests {
                 "ttft_ms must be positive",
             ),
             (
+                "account: acme\nmodels:\n  org/model:\n    toleration_preset: ' gpu'\n".to_owned(),
+                "toleration_preset must be a non-empty id",
+            ),
+            (
+                "account: acme\nmodels:\n  org/model:\n    classes:\n      standard:\n        toleration_preset: ''\n".to_owned(),
+                "toleration_preset must be a non-empty id",
+            ),
+            (
                 "account: acme\nmodels:\n  org/model:\n    classes:\n      standard:\n        itl_ms: 2147483648\n".to_owned(),
                 "itl_ms must be positive and at most",
             ),
@@ -1157,5 +1214,56 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(untouched, (Some(7), Some("elsewhere".to_owned())));
+    }
+
+    #[dwctl_test_macros::test]
+    async fn toleration_presets_are_written_per_model_and_class_and_cleared(pool: PgPool) {
+        let org = insert_account(&pool, "acme", "organization").await;
+        insert_virtual_model(&pool, "org/model").await;
+        let directory = tempdir().unwrap();
+        write(
+            directory.path(),
+            "acme.yaml",
+            "account: acme\nmodels:\n  org/model:\n    toleration_preset: no-overflow\n    classes:\n      standard:\n        toleration_preset: gpu\n",
+        );
+        let catalog = AccountLimitsCatalog::load(directory.path()).unwrap();
+        assert_eq!(
+            catalog.toleration_presets().into_iter().collect::<Vec<_>>(),
+            vec!["gpu", "no-overflow"]
+        );
+        apply(&pool, &catalog).await.unwrap();
+        let presets = || async {
+            sqlx::query_as::<_, (Option<String>, Option<String>)>(
+                "SELECT serving_class, toleration_preset FROM account_model_policies WHERE user_id = $1 ORDER BY serving_class NULLS FIRST",
+            )
+            .bind(org)
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+        };
+        assert_eq!(
+            presets().await,
+            vec![(None, Some("no-overflow".into())), (Some("standard".into()), Some("gpu".into()))]
+        );
+
+        // The per-key policy sees the class preset folded over the model's.
+        let key = format!("sk-{}", Uuid::new_v4());
+        sqlx::query("INSERT INTO api_keys (name, secret, user_id, created_by, purpose) VALUES ('k', $1, $2, $2, 'realtime')")
+            .bind(&key)
+            .bind(org)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let cache = crate::sync::key_policy::KeyPolicyCache::empty();
+        crate::sync::key_policy::refresh(&pool, &cache).await.unwrap();
+        assert_eq!(cache.policy(&key).toleration_preset_for("org/model"), Some("gpu"));
+        assert_eq!(cache.policy(&key).toleration_preset_for("org/other"), None);
+        let mut conn = pool.acquire().await.unwrap();
+        let direct = crate::sync::key_policy::load_policy(&mut conn, org).await.unwrap();
+        assert_eq!(direct.toleration_preset_for("org/model"), Some("gpu"));
+
+        write(directory.path(), "acme.yaml", "account: acme\npriority: 1\n");
+        apply(&pool, &AccountLimitsCatalog::load(directory.path()).unwrap()).await.unwrap();
+        assert!(presets().await.is_empty());
     }
 }
