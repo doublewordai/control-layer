@@ -1321,6 +1321,8 @@ pub async fn target_message_handler<T: HttpClient>(
         // the capability strip above refused scheduling fields for it): when
         // neither the body nor the preset sets one, realtime's 0, so the
         // dynamo frontend is never left to pick a value for a missing one.
+        // Account and model policy hints (priority, latency targets) travel
+        // the same way but leave the request billed as its own class.
         // A priority already present is kept, and targets overwrite rather
         // than remove: this same crate runs again as the hop inside the
         // serving namespace, with no key policy of its own, and must forward
@@ -1335,6 +1337,7 @@ pub async fn target_message_handler<T: HttpClient>(
                             targets.stamp(object);
                         }
                         if !scheduling_fields_refused {
+                            serving_resolution.hints.stamp(object);
                             serving::stamp_default_priority(object);
                         }
                         attempt_body = match serde_json::to_vec(&body) {

@@ -28,6 +28,7 @@ use sqlx::{PgConnection, PgPool, Row};
 use uuid::Uuid;
 
 use crate::db::handlers::ModelProvisioning;
+use crate::db::handlers::model_provisioning::{ORG_CATALOG_TARIFF_SOURCE, retire_omitted_account_prices};
 use crate::model_provisioning::{ServingPreset, Tariff, validate_cache_tariff, validate_tariffs};
 
 /// Prefix of the `provisioning_source` marker on rows this catalog owns.
@@ -367,34 +368,11 @@ async fn apply_in(db: &mut PgConnection, catalog: &OrgCatalog) -> Result<()> {
     }
 
     // Rows this catalog owns but no longer declares are removed; hand rows
-    // (NULL source) and rows owned by anything else are left alone.
-    let (org_ids, model_ids): (Vec<Uuid>, Vec<Uuid>) = desired.into_iter().unzip();
-    // Price ownership is independent of routing overlays. Omission only retires
+    // (NULL source) and rows owned by anything else are left alone. Price
+    // ownership is independent of routing overlays: omission only retires
     // prices written by this catalog; manual prices survive even on owned models.
-    for table in ["model_tariffs", "model_cache_tariffs"] {
-        let omitted = "t.provisioning_source = 'org-overlays' AND NOT EXISTS (
-            SELECT 1 FROM UNNEST($1::uuid[], $2::uuid[]) AS d(user_id, deployed_model_id)
-            WHERE d.user_id = t.user_id AND d.deployed_model_id = t.deployed_model_id)";
-        let future: bool = sqlx::query_scalar(&format!(
-            "SELECT EXISTS (SELECT 1 FROM {table} t WHERE t.valid_from > $3
-             AND (t.valid_until IS NULL OR t.valid_until > t.valid_from) AND {omitted})"
-        ))
-        .bind(&org_ids)
-        .bind(&model_ids)
-        .bind(effective_at)
-        .fetch_one(&mut *db)
-        .await?;
-        ensure!(!future, "removed overlay has future-dated prices; resolve these before removing it");
-        sqlx::query(&format!(
-            "UPDATE {table} t SET valid_until = $3 WHERE t.valid_from <= $3
-             AND (t.valid_until IS NULL OR t.valid_until > $3) AND {omitted}"
-        ))
-        .bind(&org_ids)
-        .bind(&model_ids)
-        .bind(effective_at)
-        .execute(&mut *db)
-        .await?;
-    }
+    retire_omitted_account_prices(db, ORG_CATALOG_TARIFF_SOURCE, &desired, effective_at).await?;
+    let (org_ids, model_ids): (Vec<Uuid>, Vec<Uuid>) = desired.into_iter().unzip();
     sqlx::query(
         r#"DELETE FROM model_overlays mo
            WHERE mo.provisioning_source LIKE $1

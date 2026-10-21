@@ -371,36 +371,91 @@ leaves partial model edits. Metadata-only edits are still permitted.
 
 ## Account limits
 
-An account limit file gives one account its own realtime in-flight limit on
-some virtual models, in place of each model's
-`settings.realtime_inflight_limit`. The account is a user or an organisation,
-named by its username, and an organisation's limit covers every key the
+An account file holds one account's own settings on some virtual models: its
+realtime in-flight limits, its prices, and the scheduling priority and latency
+targets sent with its requests. The account is a user or an organisation,
+named by its username, and an organisation's settings cover every key the
 organisation owns. One file per account, mounted at
 `model_provisioning.account_limits_directory`:
 
 ```yaml
 account: acme
-realtime_inflight:
-  example/chat-model: 200
-  example/fast-model: 40
+priority: 100                     # optional; default for every model
+models:
+  example/chat-model:
+    priority: 300                 # optional; overrides the account default
+    tariffs:                      # batch prices only, at model level
+      - {name: batch-24h, purpose: batch, completion_window: 24h,
+         input_per_million_tokens: "0.50", output_per_million_tokens: "1.50"}
+    classes:
+      standard:
+        realtime_inflight: 200
+        tariffs:                  # realtime and playground prices, per class
+          - {name: realtime, purpose: realtime,
+             input_per_million_tokens: "0.70", output_per_million_tokens: "1.40"}
+        cache_tariff: {read_multiplier: "0.2", write_multiplier_5m: "1",
+                       write_multiplier_1h: "1", write_multiplier_24h: "1"}
+        ttft_ms: 1000             # optional latency targets
+        itl_ms: 30
+        priority: 500             # optional; overrides the model's priority
 ```
 
-Startup applies the files after the model catalog, in one transaction, and
-replaces every stored per-account limit with what the files declare. Removing
-a line or a file returns that account to the model's default on the next
-start. An empty directory clears every per-account limit; a missing directory
-changes nothing. An unknown account, or a model that is not a live virtual
-model, fails startup before any per-account limit is written; the model catalog
-and organisation overlays have already been applied by then.
+The older shape is still accepted and means the same as
+`classes.standard.realtime_inflight`:
+
+```yaml
+account: acme
+realtime_inflight:
+  example/chat-model: 200
+```
+
+Rules:
+
+- `classes` may name only `standard` for now. A class the file omits keeps the
+  model's defaults.
+- Limits, realtime and playground prices, and the cache tariff are declared per
+  class; model-level `tariffs` take batch prices only.
+- Priority inherits class, then model, then account, then the default. It is
+  sent as the scheduling priority on the account's realtime requests to
+  `dynamo` serving members; batch and flex keep their deadline priority.
+  `ttft_ms` and `itl_ms` are sent as latency targets on the same realtime
+  requests. Neither changes the class the request is billed as. Priority
+  `-2147483648` is reserved for background work and rejected.
+- If a model appears in both shapes, the two limits must be equal.
+- An account/model pair may be configured in its account file or in an
+  [organisation overlay](#organisation-catalog-validation-and-ownership), not
+  both. The older limits shape may sit alongside an overlay.
+
+Startup applies the files after the model catalog and organisation overlays,
+in one transaction under one advisory lock:
+
+- **Limits** replace every stored per-account limit with what the files
+  declare. Removing a line or a file returns that account to the model's
+  default on the next start.
+- **Priorities, latency targets and prices** are owned row by row. Declaring
+  an account/model pair makes the file authoritative for its current prices
+  and policies, adopting matching rows written by hand. Omitted prices retire, and changed
+  prices are versioned without altering historical amounts. Rows that another
+  writer owns, such as the organisation catalog's prices, are refused, never
+  taken over.
+
+An empty directory clears everything the account files own. A missing
+directory changes nothing. An unknown account, or a model that is not a live
+virtual model, fails startup before any account-file setting is written; the
+model catalog and organisation overlays have already been applied by then.
 
 Run the same offline validation used by deployment CI:
 
 ```sh
-dwctl-model-provisioning validate-account-limits ./account-limits.d --models ./model-provisioning.d
+dwctl-model-provisioning validate-account-limits ./account-limits.d \
+  --models ./model-provisioning.d --org-overlays ./org-overlays.d
+dwctl-model-provisioning account-schema
 ```
 
-It rejects unknown fields, limits below 1, an account declared in two files and
-models absent from the model catalog. Whether each account exists can only be
+It rejects unknown fields and classes, limits and latency targets below 1, an
+account declared in two files, entries that configure nothing, prices at the
+wrong level, models absent from the model catalog and, with `--org-overlays`,
+pairs configured in both catalogs. Whether each account exists can only be
 checked against the database, at startup.
 
 `GET /admin/api/v1/models/{id}/realtime-inflight-limits` returns a virtual

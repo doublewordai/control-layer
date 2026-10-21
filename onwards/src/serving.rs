@@ -8,9 +8,15 @@
 //! [`ServingClass::Custom`]; otherwise it resolves as
 //! [`ServingClass::Standard`] and sends no targets.
 //!
+//! Separately, an account may carry a scheduling **priority** (account-wide,
+//! or per model on an overlay) and per-model latency targets. These are sent
+//! the same way but leave the request [`ServingClass::Standard`]: they change
+//! scheduling, not the price.
+//!
 //! Daemon legs (batch and flex on the batch-purpose key, continuation resume
-//! legs) never receive overlay targets: their existing deadline priorities
-//! carry the ordering.
+//! legs) never receive overlay targets or priorities and keep their own:
+//! batch and flex carry deadline-derived priorities, background dispatch the
+//! reserved `i32::MIN`, and continuation resumes their fixed priority.
 //!
 //! The targets travel in the request body as `nvext.router.{ttft_target,
 //! itl_target}` and, when non-zero, the priority as
@@ -240,12 +246,16 @@ pub struct AccountServing {
     /// Never fall over to an external provider.
     #[serde(default)]
     pub self_hosted_only: bool,
+    /// Scheduling priority for the account's realtime requests on every
+    /// alias, unless an overlay sets its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i32>,
 }
 
 impl AccountServing {
     /// True when nothing here changes a request; such accounts are not synced.
     pub fn is_empty(&self) -> bool {
-        !self.self_hosted_only
+        !self.self_hosted_only && self.priority.is_none()
     }
 }
 
@@ -259,6 +269,76 @@ pub struct ServingOverlay {
     /// Overrides the account's `self_hosted_only` on this alias.
     #[serde(default)]
     pub self_hosted_only: Option<bool>,
+    /// Scheduling priority on this alias, overriding the account's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i32>,
+    /// Time-to-first-token target on this alias, milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft_ms: Option<u32>,
+    /// Inter-token-latency target on this alias, milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub itl_ms: Option<u32>,
+}
+
+/// Scheduling hints for one request that do not change how it is billed:
+/// each field is written into the body only when set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServingHints {
+    pub priority: Option<i32>,
+    pub ttft_ms: Option<u32>,
+    pub itl_ms: Option<u32>,
+}
+
+impl ServingHints {
+    pub fn is_empty(&self) -> bool {
+        self.priority.is_none() && self.ttft_ms.is_none() && self.itl_ms.is_none()
+    }
+
+    /// Write the set hints into a request body, overwriting existing values:
+    /// `nvext.router.{ttft_target, itl_target}` and `nvext.agent_hints.priority`.
+    pub fn stamp(&self, body: &mut serde_json::Map<String, serde_json::Value>) {
+        if self.is_empty() {
+            return;
+        }
+        let nvext = body
+            .entry(NVEXT_FIELD)
+            .or_insert_with(|| serde_json::Value::Object(Default::default()));
+        if !nvext.is_object() {
+            *nvext = serde_json::Value::Object(Default::default());
+        }
+        let nvext = nvext
+            .as_object_mut()
+            .expect("nvext was just made an object");
+        if self.ttft_ms.is_some() || self.itl_ms.is_some() {
+            let router = nvext
+                .entry(NVEXT_ROUTER_FIELD)
+                .or_insert_with(|| serde_json::Value::Object(Default::default()));
+            if !router.is_object() {
+                *router = serde_json::Value::Object(Default::default());
+            }
+            let router = router
+                .as_object_mut()
+                .expect("router was just made an object");
+            if let Some(ttft) = self.ttft_ms {
+                router.insert(TTFT_TARGET_FIELD.to_string(), ttft.into());
+            }
+            if let Some(itl) = self.itl_ms {
+                router.insert(ITL_TARGET_FIELD.to_string(), itl.into());
+            }
+        }
+        if let Some(priority) = self.priority {
+            let hints = nvext
+                .entry(NVEXT_AGENT_HINTS_FIELD)
+                .or_insert_with(|| serde_json::Value::Object(Default::default()));
+            if !hints.is_object() {
+                *hints = serde_json::Value::Object(Default::default());
+            }
+            hints
+                .as_object_mut()
+                .expect("agent_hints was just made an object")
+                .insert(PRIORITY_FIELD.to_string(), priority.into());
+        }
+    }
 }
 
 /// Key purposes whose requests are daemon legs: the ordering already travels
@@ -272,6 +352,9 @@ pub struct ServingResolution {
     pub resolved: ServingClass,
     /// What a `dynamo` member is told to serve to; `None` sends nothing.
     pub targets: Option<ServingTargets>,
+    /// Priority and latency targets that leave the class unchanged. Empty
+    /// whenever `targets` is set.
+    pub hints: ServingHints,
     /// Restrict the composite to its non-external members.
     pub self_hosted_only: bool,
 }
@@ -304,11 +387,23 @@ pub fn resolve(
         Some(targets) if !daemon => ServingResolution {
             resolved: ServingClass::Custom,
             targets: Some(targets),
+            hints: ServingHints::default(),
             self_hosted_only,
         },
         _ => ServingResolution {
             resolved: ServingClass::Standard,
             targets: None,
+            hints: if daemon {
+                ServingHints::default()
+            } else {
+                ServingHints {
+                    priority: overlay
+                        .and_then(|o| o.priority)
+                        .or(account.and_then(|a| a.priority)),
+                    ttft_ms: overlay.and_then(|o| o.ttft_ms),
+                    itl_ms: overlay.and_then(|o| o.itl_ms),
+                }
+            },
             self_hosted_only,
         },
     }
@@ -364,6 +459,7 @@ mod tests {
     fn self_hosted_only_comes_from_the_account_unless_the_overlay_overrides() {
         let a = AccountServing {
             self_hosted_only: true,
+            ..Default::default()
         };
         assert!(resolve(Some(&a), None, Some("realtime")).self_hosted_only);
         // the daemon leg carries the restriction too: batch work must not spill either
@@ -452,6 +548,94 @@ mod tests {
         let mut body = serde_json::json!({"nvext": {"agent_hints": 7}});
         stamp_default_priority(body.as_object_mut().unwrap());
         assert_eq!(body["nvext"]["agent_hints"]["priority"], 0);
+    }
+
+    #[test]
+    fn account_and_overlay_priorities_resolve_as_standard_hints() {
+        let account = AccountServing {
+            priority: Some(100),
+            ..Default::default()
+        };
+        let r = resolve(Some(&account), None, Some("realtime"));
+        assert_eq!(r.resolved, ServingClass::Standard);
+        assert_eq!(
+            r.hints.priority,
+            Some(100),
+            "the account default applies everywhere"
+        );
+
+        let overlay = ServingOverlay {
+            priority: Some(300),
+            ttft_ms: Some(900),
+            itl_ms: Some(25),
+            ..Default::default()
+        };
+        let r = resolve(Some(&account), Some(&overlay), Some("realtime"));
+        assert_eq!(
+            r.resolved,
+            ServingClass::Standard,
+            "hints never change the billed class"
+        );
+        assert_eq!(
+            r.hints,
+            ServingHints {
+                priority: Some(300),
+                ttft_ms: Some(900),
+                itl_ms: Some(25)
+            }
+        );
+
+        // Daemon legs keep their deadline priority.
+        assert!(
+            resolve(Some(&account), Some(&overlay), Some("batch"))
+                .hints
+                .is_empty()
+        );
+
+        // Explicit overlay targets still win and carry their own priority.
+        let legacy = ServingOverlay {
+            targets: Some(DEAL),
+            priority: Some(1),
+            ..Default::default()
+        };
+        let r = resolve(Some(&account), Some(&legacy), Some("realtime"));
+        assert_eq!(r.resolved, ServingClass::Custom);
+        assert!(r.hints.is_empty());
+    }
+
+    #[test]
+    fn hints_stamp_only_what_is_set() {
+        let mut body =
+            serde_json::json!({"model": "m", "nvext": {"agent_hints": {"max_batch_size": 8}}});
+        ServingHints {
+            priority: Some(500),
+            ..Default::default()
+        }
+        .stamp(body.as_object_mut().unwrap());
+        assert_eq!(
+            body["nvext"]["agent_hints"],
+            serde_json::json!({"max_batch_size": 8, "priority": 500})
+        );
+        assert!(body["nvext"].get("router").is_none());
+
+        let mut body = serde_json::json!({"model": "m"});
+        ServingHints {
+            ttft_ms: Some(1000),
+            ..Default::default()
+        }
+        .stamp(body.as_object_mut().unwrap());
+        assert_eq!(
+            body["nvext"],
+            serde_json::json!({"router": {"ttft_target": 1000}})
+        );
+
+        let mut body = serde_json::json!({"model": "m"});
+        ServingHints::default().stamp(body.as_object_mut().unwrap());
+        assert_eq!(
+            body,
+            serde_json::json!({"model": "m"}),
+            "nothing set, nothing written"
+        );
     }
 
     #[test]
@@ -695,6 +879,7 @@ mod handler_tests {
         let mut s = with_deal(&[EXTERNAL]);
         s.account = Some(AccountServing {
             self_hosted_only: true,
+            ..Default::default()
         });
         let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
         let request = Request::builder()
@@ -729,6 +914,56 @@ mod handler_tests {
             assert!(body(req).get("nvext").is_none(), "{:?}", member.1);
             assert_eq!(body(req)["model"], "gpt-4");
         }
+    }
+
+    #[tokio::test]
+    async fn account_and_overlay_hints_reach_dynamo_members_as_standard() {
+        let mut s = setup(&[DYNAMO]);
+        s.account = Some(AccountServing {
+            priority: Some(100),
+            ..Default::default()
+        });
+        let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
+        assert_eq!(
+            post(&server(&s, &mock), ALIAS, json!({}))
+                .await
+                .status_code(),
+            200
+        );
+        assert_eq!(
+            body(&mock.get_requests()[0])["nvext"],
+            json!({"agent_hints": {"priority": 100}})
+        );
+
+        s.overlay = Some(ServingOverlay {
+            priority: Some(300),
+            ttft_ms: Some(900),
+            itl_ms: Some(25),
+            ..Default::default()
+        });
+        let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
+        assert_eq!(
+            post(&server(&s, &mock), ALIAS, json!({}))
+                .await
+                .status_code(),
+            200
+        );
+        assert_eq!(sent(&mock.get_requests()[0]), Some((900, 25, Some(300))));
+
+        // An external member never receives them.
+        let mut s = setup(&[EXTERNAL]);
+        s.account = Some(AccountServing {
+            priority: Some(100),
+            ..Default::default()
+        });
+        let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
+        assert_eq!(
+            post(&server(&s, &mock), ALIAS, json!({}))
+                .await
+                .status_code(),
+            200
+        );
+        assert!(body(&mock.get_requests()[0]).get("nvext").is_none());
     }
 
     #[tokio::test]
@@ -890,6 +1125,7 @@ mod handler_tests {
         let mut s = setup(&members);
         s.account = Some(AccountServing {
             self_hosted_only: true,
+            ..Default::default()
         });
         let mock = MockHttpClient::new(StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"boom"}"#);
         let srv = server(&s, &mock);
@@ -913,6 +1149,7 @@ mod handler_tests {
         let mut s = setup(&[EXTERNAL]);
         s.account = Some(AccountServing {
             self_hosted_only: true,
+            ..Default::default()
         });
         let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
         let srv = server(&s, &mock);
@@ -926,6 +1163,7 @@ mod handler_tests {
         let mut s = setup(&[DYNAMO, HOSTED]);
         s.account = Some(AccountServing {
             self_hosted_only: true,
+            ..Default::default()
         });
         let mock = MockHttpClient::new(StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"boom"}"#);
         let srv = server(&s, &mock);
@@ -936,6 +1174,7 @@ mod handler_tests {
         let mut s = setup(&members);
         s.account = Some(AccountServing {
             self_hosted_only: true,
+            ..Default::default()
         });
         s.overlay = Some(ServingOverlay {
             self_hosted_only: Some(false),
