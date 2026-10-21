@@ -87,6 +87,12 @@ pub async fn translation_middleware(State(registry): State<TranslationRegistry>,
             let model = rejections::model_of(&original_request);
             return rejections::refuse(&parts, response, "invalid_parameter", Some(param), model.as_deref());
         }
+        Err(TranslationError::Reasoning(error)) => {
+            let status = StatusCode::from_u16(error.status_code()).unwrap_or(StatusCode::BAD_REQUEST);
+            let (status, bytes) = translator.error_for_code(status, error.message(), error.param(), error.code());
+            let model = rejections::model_of(&original_request);
+            return rejections::refuse(&parts, json_response(status, bytes), error.code(), error.param(), model.as_deref());
+        }
         Err(TranslationError::Internal(msg)) => {
             warn!(error = %msg, translator = translator.name(), "edge translation: request translate failed");
             return error_response(translator.as_ref(), StatusCode::INTERNAL_SERVER_ERROR, &msg);

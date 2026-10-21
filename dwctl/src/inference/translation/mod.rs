@@ -49,6 +49,7 @@ pub mod responses;
 
 use axum::http::{HeaderMap, StatusCode, Uri, request::Parts};
 use bytes::Bytes;
+use onwards::reasoning::ReasoningError;
 use onwards::strict::schema_mismatch::{SchemaMismatch, locate_declared};
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
@@ -68,6 +69,10 @@ pub enum TranslationError {
     /// 400 naming the field).
     #[error("{message}")]
     InvalidParameter { param: &'static str, message: String },
+    /// A reasoning control the protocol refuses (maps to the error's own
+    /// status, param and code).
+    #[error("{0}")]
+    Reasoning(ReasoningError),
     /// Something went wrong on our side translating (maps to a 5xx).
     #[error("{0}")]
     Internal(String),
@@ -165,6 +170,12 @@ pub trait ProtocolTranslator: Send + Sync {
     /// field at fault where the protocol's error shape has a place for it.
     fn error_for_param(&self, status: StatusCode, message: &str, _param: Option<&str>) -> (StatusCode, Bytes) {
         self.error_from_message(status, message)
+    }
+
+    /// As [`error_for_param`](Self::error_for_param), with a machine-readable
+    /// error code where the protocol's error shape has a place for it.
+    fn error_for_code(&self, status: StatusCode, message: &str, param: Option<&str>, _code: &str) -> (StatusCode, Bytes) {
+        self.error_for_param(status, message, param)
     }
 
     /// Create a fresh, stateful reframer for one streaming (SSE) response. The
