@@ -58,9 +58,9 @@ tracing = "0.1"
 # It is a default feature, listed so it survives `default-features = false`.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "tracing-log"] }
 # OpenTelemetry
-opentelemetry = "0.32.0"
-opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+opentelemetry = "0.33.0"
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = [
   "http-proto",
   "http-json",
   "reqwest-blocking-client",
