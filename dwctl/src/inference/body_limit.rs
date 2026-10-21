@@ -267,14 +267,17 @@ fn decode_brotli(bytes: &[u8], max_bytes: usize) -> Result<Bytes, DecodeError> {
     let mut decoded = Vec::new();
     let (mut available_in, mut input_offset, mut total_out) = (bytes.len(), 0, 0);
     loop {
-        let (mut available_out, mut output_offset) = (buffer.len(), 0);
+        // Never decode more than one byte past the limit, as the other
+        // codecs' `take(max_bytes + 1)` does.
+        let room = (max_bytes - decoded.len()).saturating_add(1).min(buffer.len());
+        let (mut available_out, mut output_offset) = (room, 0);
         let result = BrotliDecompressStream(
             &mut available_in,
             &mut input_offset,
             bytes,
             &mut available_out,
             &mut output_offset,
-            &mut buffer,
+            &mut buffer[..room],
             &mut total_out,
             &mut state,
         );
@@ -572,6 +575,20 @@ mod tests {
         assert_eq!(decode_blocking(Encoding::Brotli, &large, 1024), Err(DecodeError::Invalid));
         let standard = compress(Encoding::Brotli, b"{}");
         assert_eq!(decode_blocking(Encoding::Brotli, &standard, 1024).unwrap(), &b"{}"[..]);
+    }
+
+    #[test]
+    fn decodes_up_to_the_limit_and_not_a_byte_further() {
+        let body = vec![b'x'; 200_000];
+        for encoding in [Encoding::Gzip, Encoding::Zstd, Encoding::Brotli] {
+            let compressed = compress(encoding, &body);
+            assert_eq!(decode_blocking(encoding, &compressed, body.len()).unwrap().len(), body.len());
+            assert_eq!(
+                decode_blocking(encoding, &compressed, body.len() - 1),
+                Err(DecodeError::TooLarge),
+                "{encoding:?}"
+            );
+        }
     }
 
     #[test]
