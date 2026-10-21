@@ -103,11 +103,25 @@ async fn assert_compressed_bodies_reach_upstream_decoded(pool: PgPool, strict_mo
         assert_eq!(body["messages"][0]["content"], "compressed hello", "strict_mode={strict_mode}");
     }
 
+    // Plain JSON under a coding it isn't in worked before compression was
+    // supported, and reaches the upstream plain.
+    let response = server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .add_header("Content-Type", "application/json")
+        .add_header("Content-Encoding", "utf-8")
+        .bytes(json.into())
+        .await;
+    response.assert_status_ok();
+    let received = mock.received_requests().await.unwrap();
+    assert_eq!(received.len(), 3, "strict_mode={strict_mode}");
+    assert!(received[2].headers.get("content-encoding").is_none(), "strict_mode={strict_mode}");
+
     let response = server
         .post("/ai/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {key}"))
         .add_header("Content-Encoding", "lz4")
-        .bytes(json.into())
+        .bytes((&b"\x04\x22\x4d\x18 compressed bytes"[..]).into())
         .await;
     response.assert_status(axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE);
     assert_eq!(
@@ -116,7 +130,7 @@ async fn assert_compressed_bodies_reach_upstream_decoded(pool: PgPool, strict_mo
     );
     assert_eq!(
         mock.received_requests().await.unwrap().len(),
-        2,
+        3,
         "refused before reaching the upstream"
     );
 }

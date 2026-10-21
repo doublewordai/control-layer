@@ -1,7 +1,7 @@
 //! Bound inference bodies before middleware parses, copies, or logs them, and
 //! decode compressed ones so every layer behind this one sees plain JSON.
 
-use std::io::Read;
+use std::{io::Read, sync::LazyLock};
 
 use axum::{
     Json,
@@ -15,6 +15,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
+use tokio::sync::Semaphore;
+
 use super::rejections;
 
 /// The content codings an inference body may arrive in, as advertised on a 415.
@@ -25,55 +27,38 @@ const ACCEPTED_ENCODINGS: &str = "gzip, zstd, br";
 /// allocated.
 const ZSTD_WINDOW_LOG_MAX: u32 = 23;
 
+/// Decodes running at once, one per CPU. Decoding runs before authentication,
+/// and a few kilobytes of compressed body can expand to the full body limit
+/// plus a decoder window of up to 16 MiB. Without a bound, a burst of small
+/// anonymous requests could hold hundreds of those at once. Requests over the
+/// bound wait for a slot rather than being refused, so legitimate traffic is
+/// only ever delayed; uncompressed bodies never take one.
+static DECODE_SLOTS: LazyLock<Semaphore> =
+    LazyLock::new(|| Semaphore::new(std::thread::available_parallelism().map_or(1, |cpus| cpus.get())));
+
 /// Install outside all inference middleware, including request logging and
 /// daemon dispatch bypasses. File uploads use a separate router and limit.
 /// A zero limit retains the configured unlimited behavior.
 ///
 /// A body sent with `Content-Encoding: gzip`, `zstd` or `br` is decoded here,
 /// and the limit applies to the decoded size: that is what every inner layer
-/// buffers. Any other coding is refused with a 415 before the body is read.
+/// buffers. Any other coding is refused with a 415.
+///
+/// Before compression was supported the header was ignored, so a plain JSON
+/// body under a wrong or meaningless `Content-Encoding` worked. Such a body
+/// still does: it is passed on as it is and counted, rather than refused.
 pub async fn limit_inference_body(State(max_bytes): State<usize>, request: Request<Body>, next: Next) -> Response {
-    let encoding = match content_encoding(request.headers()) {
-        Ok(encoding) => encoding,
-        Err(UnsupportedEncoding) => {
-            let (parts, _) = request.into_parts();
-            let response = unsupported_encoding(parts.uri.path());
-            return rejections::refuse(&parts, response, "unsupported_content_encoding", None, None);
-        }
-    };
-    if max_bytes == 0 && encoding.is_none() {
+    let declared = content_encoding(request.headers());
+    if max_bytes == 0 && declared == Ok(None) {
         return next.run(request).await;
     }
 
     let (mut parts, body) = request.into_parts();
-    match read_inference_body(&parts.headers, body, max_bytes).await {
-        Ok(bytes) => {
-            let Some(encoding) = encoding else {
-                return next.run(Request::from_parts(parts, Body::from(bytes))).await;
-            };
-            let limit = if max_bytes == 0 { usize::MAX } else { max_bytes };
-            match decode(encoding, bytes, limit).await {
-                Ok(decoded) => {
-                    metrics::counter!("dwctl_inference_bodies_decoded_total", "encoding" => encoding.name()).increment(1);
-                    parts.headers.remove(CONTENT_ENCODING);
-                    parts.headers.insert(CONTENT_LENGTH, HeaderValue::from(decoded.len()));
-                    next.run(Request::from_parts(parts, Body::from(decoded))).await
-                }
-                Err(DecodeError::TooLarge) => {
-                    let message = format!("Decoded request body exceeds the maximum size of {max_bytes} bytes");
-                    let response = oversized_body(message, parts.uri.path());
-                    rejections::refuse(&parts, response, "request_too_large", None, None)
-                }
-                Err(DecodeError::Invalid) => {
-                    let message = format!("Request body is not valid {} data", encoding.name());
-                    let response = invalid_request(StatusCode::BAD_REQUEST, parts.uri.path(), "body_decode_failed", &message);
-                    rejections::refuse(&parts, response, "body_decode_failed", None, None)
-                }
-            }
-        }
+    let bytes = match read_inference_body(&parts.headers, body, max_bytes).await {
+        Ok(bytes) => bytes,
         Err(crate::errors::Error::PayloadTooLarge { message }) => {
             let response = oversized_body(message, parts.uri.path());
-            rejections::refuse(&parts, response, "request_too_large", None, None)
+            return rejections::refuse(&parts, response, "request_too_large", None, None);
         }
         Err(_) => {
             let response = (
@@ -85,9 +70,53 @@ pub async fn limit_inference_body(State(max_bytes): State<usize>, request: Reque
                 }})),
             )
                 .into_response();
-            rejections::refuse(&parts, response, "body_read_failed", None, None)
+            return rejections::refuse(&parts, response, "body_read_failed", None, None);
         }
-    }
+    };
+
+    let body = match declared {
+        Ok(None) => return next.run(Request::from_parts(parts, Body::from(bytes))).await,
+        Ok(Some(encoding)) => {
+            let limit = if max_bytes == 0 { usize::MAX } else { max_bytes };
+            match decode(&DECODE_SLOTS, encoding, bytes.clone(), limit).await {
+                Ok(decoded) => {
+                    metrics::counter!("dwctl_inference_bodies_decoded_total", "encoding" => encoding.name()).increment(1);
+                    decoded
+                }
+                Err(DecodeError::TooLarge) => {
+                    let message = format!("Decoded request body exceeds the maximum size of {max_bytes} bytes");
+                    let response = oversized_body(message, parts.uri.path());
+                    return rejections::refuse(&parts, response, "request_too_large", None, None);
+                }
+                Err(DecodeError::Invalid) if is_json(&bytes) => mislabelled(encoding.name(), bytes),
+                Err(DecodeError::Invalid) => {
+                    let message = format!("Request body is not valid {} data", encoding.name());
+                    let response = invalid_request(StatusCode::BAD_REQUEST, parts.uri.path(), "body_decode_failed", &message);
+                    return rejections::refuse(&parts, response, "body_decode_failed", None, None);
+                }
+            }
+        }
+        Err(UnsupportedEncoding) if is_json(&bytes) => mislabelled("other", bytes),
+        Err(UnsupportedEncoding) => {
+            let response = unsupported_encoding(parts.uri.path());
+            return rejections::refuse(&parts, response, "unsupported_content_encoding", None, None);
+        }
+    };
+    // Inner layers and the upstream see the body as it now is: plain.
+    parts.headers.remove(CONTENT_ENCODING);
+    parts.headers.insert(CONTENT_LENGTH, HeaderValue::from(body.len()));
+    next.run(Request::from_parts(parts, Body::from(body))).await
+}
+
+/// Whether `bytes` is a complete JSON document, as every inference body is.
+fn is_json(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<serde::de::IgnoredAny>(bytes).is_ok()
+}
+
+/// A plain JSON body under a `Content-Encoding` it isn't in: passed on as it is.
+fn mislabelled(declared: &'static str, bytes: Bytes) -> Bytes {
+    metrics::counter!("dwctl_inference_bodies_mislabelled_total", "declared" => declared).increment(1);
+    bytes
 }
 
 /// Shared with the authenticated playground proxy, whose model parser runs
@@ -209,10 +238,14 @@ enum DecodeError {
     Invalid,
 }
 
-/// Decodes `bytes`, stopping as soon as the output passes `max_bytes`, so a
-/// small body that inflates without bound costs at most the limit. Runs on a
-/// blocking thread: inflating a full-size body takes tens of milliseconds.
-async fn decode(encoding: Encoding, bytes: Bytes, max_bytes: usize) -> Result<Bytes, DecodeError> {
+/// Decodes `bytes` once one of `slots` is free, stopping as soon as the output
+/// passes `max_bytes`, so a small body that inflates without bound costs at
+/// most the limit. Runs on a blocking thread: inflating a full-size body takes
+/// tens of milliseconds.
+async fn decode(slots: &Semaphore, encoding: Encoding, bytes: Bytes, max_bytes: usize) -> Result<Bytes, DecodeError> {
+    let Ok(_slot) = slots.acquire().await else {
+        return Err(DecodeError::Invalid);
+    };
     tokio::task::spawn_blocking(move || decode_blocking(encoding, &bytes, max_bytes))
         .await
         .unwrap_or(Err(DecodeError::Invalid))
@@ -476,19 +509,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_other_encodings_with_415_before_reading_the_body() {
+    async fn refuses_other_encodings_with_415() {
         for header in ["deflate", "lz4", "compress", "gzip, br", "snappy"] {
-            let polls = Arc::new(AtomicUsize::new(0));
-            let observed = polls.clone();
-            let body = Body::from_stream(futures::stream::poll_fn(move |_| {
-                observed.fetch_add(1, Ordering::SeqCst);
-                std::task::Poll::Ready(None::<Result<Bytes, std::io::Error>>)
-            }));
             let response = decoding_app(1024)
                 .oneshot(
                     Request::post("/chat/completions")
                         .header(CONTENT_ENCODING, header)
-                        .body(body)
+                        .body(Body::from(&b"\x04\x22\x4d\x18 compressed bytes"[..]))
                         .unwrap(),
                 )
                 .await
@@ -496,8 +523,46 @@ mod tests {
             assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE, "{header}");
             assert_eq!(response.headers()[ACCEPT_ENCODING], "gzip, zstd, br");
             assert_eq!(error_of(response).await["error"]["code"], "unsupported_content_encoding");
-            assert_eq!(polls.load(Ordering::SeqCst), 0, "{header}");
         }
+    }
+
+    #[tokio::test]
+    async fn passes_plain_json_under_a_wrong_content_encoding_through() {
+        // These worked before compression was supported, when the header was
+        // ignored; they must keep working, as plain bodies.
+        let json = br#"{"model":"m","messages":[]}"#;
+        for header in ["utf-8", "gzip", "zstd", "br", "lz4", "gzip, br"] {
+            let response = decoding_app(1024)
+                .oneshot(
+                    Request::post("/chat/completions")
+                        .header(CONTENT_ENCODING, header)
+                        .body(Body::from(&json[..]))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{header}");
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 1024).await.unwrap(),
+                &json[..],
+                "{header}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn decodes_wait_for_a_free_slot() {
+        let slots = Semaphore::new(1);
+        let compressed = Bytes::from(compress(Encoding::Gzip, b"{}"));
+        let busy = slots.acquire().await.unwrap();
+        let mut waiting = Box::pin(decode(&slots, Encoding::Gzip, compressed, 1024));
+        assert!(
+            futures::poll!(&mut waiting).is_pending(),
+            "a decode must wait while every slot is taken"
+        );
+        drop(busy);
+        assert_eq!(waiting.await.unwrap(), &b"{}"[..]);
+        assert_eq!(slots.available_permits(), 1, "the slot is returned after decoding");
     }
 
     #[tokio::test]
@@ -610,7 +675,7 @@ mod tests {
                 .oneshot(
                     Request::post("/chat/completions")
                         .header(CONTENT_ENCODING, encoding.name())
-                        .body(Body::from(r#"{"model":"m"}"#))
+                        .body(Body::from("neither compressed nor JSON"))
                         .unwrap(),
                 )
                 .await
