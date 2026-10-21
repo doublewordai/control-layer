@@ -1,5 +1,12 @@
 # Changelog
 
+## [14.5.0](https://github.com/doublewordai/control-layer/compare/v14.4.0...v14.5.0) (2026-10-21)
+
+
+### Features
+
+* **telemetry:** add JSON log format ([#2044](https://github.com/doublewordai/control-layer/issues/2044)) ([1e87af0](https://github.com/doublewordai/control-layer/commit/1e87af07c096a8a028556794f649823e5c5a5e83))
+
 ## [14.4.0](https://github.com/doublewordai/control-layer/compare/v14.3.1...v14.4.0) (2026-10-20)
 
 

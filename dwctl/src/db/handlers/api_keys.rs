@@ -2566,6 +2566,7 @@ mod tests {
             enable_analytics: true,
             analytics: Default::default(),
             enable_otel_export: false,
+            log_format: Default::default(),
             credits: Default::default(),
             batches: Default::default(),
             background_services: crate::config::BackgroundServicesConfig::default(),

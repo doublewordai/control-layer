@@ -1,6 +1,6 @@
 [package]
 name = "dwctl"
-version = "14.4.0" # x-release-please-version
+version = "14.5.0" # x-release-please-version
 edition = "2024"
 publish = false
 description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
@@ -54,7 +54,9 @@ anyhow = "1.0"
 arc-swap = "1.7"
 log = "0.4"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# `tracing-log` forwards `log`-crate events (from dependencies) into tracing.
+# It is a default feature, listed so it survives `default-features = false`.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "tracing-log"] }
 # OpenTelemetry
 opentelemetry = "0.32.0"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
