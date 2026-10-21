@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE users SET self_hosted_only = true WHERE id = '00000000-0000-0000-0000-0000000000a1'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "97ed98d95b232b32298169ba2ce03b6155ff37920e710a4684695906baecdaf8"
+}

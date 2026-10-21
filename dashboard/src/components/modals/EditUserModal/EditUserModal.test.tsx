@@ -36,8 +36,6 @@ describe("EditUserModal serving payload permissions", () => {
             username: "test",
             roles: ["StandardUser"],
             zero_data_retention: false,
-            granted_serving_classes: ["interactive"],
-            default_serving_class: null,
             self_hosted_only: true,
           }}
         />,
@@ -46,17 +44,11 @@ describe("EditUserModal serving payload permissions", () => {
       await waitFor(() => expect(mutateAsync).toHaveBeenCalledOnce());
       const data = mutateAsync.mock.calls[0][0].data;
       if (canEditServing) {
-        expect(data).toMatchObject({
-          granted_serving_classes: ["interactive"],
-          default_serving_class: null,
-          self_hosted_only: true,
-        });
+        expect(data).toMatchObject({ self_hosted_only: true });
+        expect(data).not.toHaveProperty("granted_serving_classes");
+        expect(data).not.toHaveProperty("default_serving_class");
       } else {
-        for (const field of [
-          "granted_serving_classes",
-          "default_serving_class",
-          "self_hosted_only",
-        ]) {
+        for (const field of ["self_hosted_only", "toleration_preset"]) {
           expect(data).not.toHaveProperty(field);
         }
       }

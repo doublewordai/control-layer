@@ -19,7 +19,7 @@ use crate::auth::KeySet;
 use crate::inflight::InflightLimits;
 use crate::load_balancer::{Provider, ProviderPool};
 use crate::reasoning::ReasoningTranslationConfig;
-use crate::serving::{AccountServing, ProviderKind, ServingOverlay, ServingPresets};
+use crate::serving::{AccountServing, ProviderKind, ServingOverlay};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use bon::Builder;
@@ -428,12 +428,6 @@ pub struct PoolSpec {
     #[serde(default)]
     pub routing_rules: Vec<RoutingRule>,
 
-    /// The serving classes this alias offers, each a preset of targets (see
-    /// [`crate::serving`]). Declared on the `default` pool: activation is a
-    /// property of the alias.
-    #[serde(default)]
-    pub serving_classes: ServingPresets,
-
     /// Per-account overrides on this alias, keyed by account id (the value of
     /// a key's `account` label). See [`crate::serving::ServingOverlay`].
     #[serde(default)]
@@ -573,7 +567,6 @@ pub struct PoolConfig {
     pub sanitize_response: bool,
     pub trusted: bool,
     pub routing_rules: Vec<RoutingRule>,
-    pub serving_classes: ServingPresets,
     pub overlays: HashMap<String, ServingOverlay>,
     pub inflight_limit: Option<u32>,
     pub batch_inflight_limit: Option<u32>,
@@ -593,7 +586,6 @@ impl From<PoolSpec> for PoolConfig {
             sanitize_response: pool.sanitize_response,
             trusted: pool.trusted,
             routing_rules: pool.routing_rules,
-            serving_classes: pool.serving_classes,
             overlays: pool.overlays,
             inflight_limit: pool.inflight_limit,
             batch_inflight_limit: pool.batch_inflight_limit,
@@ -742,7 +734,6 @@ impl TargetSpecOrList {
                     sanitize_response: false,
                     trusted,
                     routing_rules: Vec::new(),
-                    serving_classes: ServingPresets::new(),
                     overlays: HashMap::new(),
                     inflight_limit: None,
                     batch_inflight_limit: None,
@@ -786,7 +777,6 @@ impl TargetSpecOrList {
                     sanitize_response,
                     trusted,
                     routing_rules: Vec::new(),
-                    serving_classes: ServingPresets::new(),
                     overlays: HashMap::new(),
                     inflight_limit: None,
                     batch_inflight_limit: None,
@@ -1129,13 +1119,6 @@ impl TargetPools {
         labels: &HashMap<String, String>,
     ) -> Option<&RoutingAction> {
         self.default.evaluate_routing_rules(labels)
-    }
-
-    /// The serving classes this alias offers, with their presets. Declared on the
-    /// default pool: activation is a property of the alias, not of which
-    /// pool serves a request class.
-    pub fn active_serving_classes(&self) -> &ServingPresets {
-        self.default.serving_classes()
     }
 
     /// Look a pool up by name.
@@ -1509,7 +1492,7 @@ fn build_pool(
         pool_config.trusted,
         pool_config.routing_rules,
     )
-    .with_serving(pool_config.serving_classes, pool_config.overlays)
+    .with_overlays(pool_config.overlays)
     .with_inflight_limits(pool_config.inflight_limit.map(|default| InflightLimits {
         default,
         accounts: pool_config.account_inflight_limits,
@@ -1518,14 +1501,11 @@ fn build_pool(
 }
 
 impl Targets {
-    /// The configured alias `model` selects, with any serving-class suffix
-    /// removed. `None` when it names no configured alias, so a caller can label
-    /// by model without taking arbitrary client input.
+    /// The configured alias `model` names. `None` when it names no configured
+    /// alias, so a caller can label by model without taking arbitrary client
+    /// input.
     pub fn configured_alias<'m>(&self, model: &'m str) -> Option<&'m str> {
-        crate::serving::split_class_suffix(model)
-            .ok()
-            .map(|(alias, _)| alias)
-            .filter(|alias| self.targets.contains_key(*alias))
+        Some(model).filter(|alias| self.targets.contains_key(*alias))
     }
 
     pub async fn from_config_file(config_path: &PathBuf) -> Result<Self, anyhow::Error> {
@@ -2919,7 +2899,6 @@ mod tests {
                 accepts_scheduling_priority: false,
                 kind: Default::default(),
             }],
-            serving_classes: Default::default(),
             overlays: Default::default(),
             inflight_limit: None,
             batch_inflight_limit: None,

@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import { User, Info } from "lucide-react";
 import { useUpdateUser, useConfig } from "../../../api/control-layer";
-import type { Role, ServingClassName } from "../../../api/control-layer/types";
+import type { Role } from "../../../api/control-layer/types";
 import { SchedulingTolerations } from "../../features/scheduling/SchedulingTolerations";
 import {
   AVAILABLE_ROLES,
@@ -33,8 +33,6 @@ interface EditUserModalProps {
     avatar?: string;
     roles: Role[];
     zero_data_retention: boolean;
-    granted_serving_classes?: ServingClassName[];
-    default_serving_class?: ServingClassName | null;
     self_hosted_only?: boolean;
     toleration_preset?: string | null;
   };
@@ -69,9 +67,6 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
     avatar_url: currentUser.avatar || "",
     roles: currentUser.roles,
     zero_data_retention: currentUser.zero_data_retention,
-    granted_serving_classes: currentUser.granted_serving_classes ?? [],
-    default_serving_class: (currentUser.default_serving_class ?? "standard") as
-      ServingClassName | "standard",
     self_hosted_only: currentUser.self_hosted_only ?? false,
     // null/absent both mean "Default" (no preset pinned).
     toleration_preset: currentUser.toleration_preset ?? null,
@@ -100,11 +95,6 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
           // Serving settings are platform-manager only server-side.
           ...(canEditServing
             ? {
-                granted_serving_classes: formData.granted_serving_classes,
-                default_serving_class:
-                  formData.default_serving_class === "standard"
-                    ? null
-                    : formData.default_serving_class,
                 self_hosted_only: formData.self_hosted_only,
                 // Scheduling tolerations are platform-manager only too, and
                 // share the serving-settings gate server-side.
@@ -323,67 +313,6 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
           {canEditServing && (
             <section className="space-y-4 border-t pt-4">
               <SectionHeading>Serving (platform managers only)</SectionHeading>
-              <div className="grid gap-4 sm:grid-cols-2">
-                <div className="grid gap-2">
-                  <span className="text-sm text-gray-700">
-                    Serving classes held
-                  </span>
-                  <div className="flex gap-4">
-                    {(["interactive", "throughput"] as const).map((c) => (
-                      <label
-                        key={c}
-                        className="flex items-center gap-2 text-sm"
-                      >
-                        <input
-                          type="checkbox"
-                          checked={formData.granted_serving_classes.includes(c)}
-                          onChange={(e) =>
-                            setFormData((prev) => ({
-                              ...prev,
-                              granted_serving_classes: e.target.checked
-                                ? Array.from(
-                                    new Set([
-                                      ...prev.granted_serving_classes,
-                                      c,
-                                    ]),
-                                  )
-                                : prev.granted_serving_classes.filter(
-                                    (x) => x !== c,
-                                  ),
-                            }))
-                          }
-                          aria-label={`Grant ${c}`}
-                        />
-                        {c}
-                      </label>
-                    ))}
-                  </div>
-                </div>
-                <div className="grid gap-2">
-                  <label
-                    htmlFor="default_serving_class"
-                    className="text-sm text-gray-700"
-                  >
-                    Default class
-                  </label>
-                  <select
-                    id="default_serving_class"
-                    className="h-9 rounded-md border border-gray-300 bg-white px-3 text-sm"
-                    value={formData.default_serving_class}
-                    onChange={(e) =>
-                      setFormData((prev) => ({
-                        ...prev,
-                        default_serving_class: e.target.value as
-                          ServingClassName | "standard",
-                      }))
-                    }
-                  >
-                    <option value="standard">standard</option>
-                    <option value="interactive">interactive</option>
-                    <option value="throughput">throughput</option>
-                  </select>
-                </div>
-              </div>
               <div className="flex items-center justify-between gap-4">
                 <div className="flex items-center gap-1">
                   <label

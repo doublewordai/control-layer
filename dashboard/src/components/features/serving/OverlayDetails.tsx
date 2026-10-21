@@ -24,14 +24,8 @@ export function OverlayDetails({
     <div className="space-y-4 text-sm">
       <dl className="grid gap-3 sm:grid-cols-2">
         <div>
-          <dt className="text-muted-foreground">Default class</dt>
-          <dd>
-            {overlay?.targets
-              ? "Custom targets"
-              : overlay?.default_serving_class
-                ? `${overlay.default_serving_class} · model override`
-                : `Inherit account · ${serving.default_serving_class ?? "standard"}`}
-          </dd>
+          <dt className="text-muted-foreground">Targets</dt>
+          <dd>{overlay?.targets ? "Custom targets" : "Standard"}</dd>
         </div>
         <div>
           <dt className="text-muted-foreground">Self-hosted only</dt>
@@ -39,12 +33,6 @@ export function OverlayDetails({
             {overlay?.self_hosted_only != null
               ? `${overlay.self_hosted_only ? "Yes" : "No"} · model override`
               : `Inherit account · ${serving.self_hosted_only ? "Yes" : "No"}`}
-          </dd>
-        </div>
-        <div>
-          <dt className="text-muted-foreground">Account class grants</dt>
-          <dd>
-            {serving.granted_serving_classes.join(", ") || "Standard only"}
           </dd>
         </div>
         <div>

@@ -1,7 +1,7 @@
 # Organization model overlays
 
 Organization overlays configure per-model serving behavior and pricing for an
-organization in a Control Layer installation. Account defaults, class grants and
+organization in a Control Layer installation. Account settings and
 model access are configured separately; declaring a price does not grant model
 access or enable a serving class.
 
@@ -73,7 +73,7 @@ retires all catalog-owned entries; a missing/unconfigured catalog is not a clean
 request. Future-dated prices must be resolved before catalog adoption or editing:
 startup reconciliation applies immediately and does not author schedules.
 
-## Example: batch/flex and class-specific realtime prices
+## Example: batch/flex and custom-target prices
 
 The organization, model alias and prices below are fictional. Token prices are
 expressed per million tokens:
@@ -82,7 +82,7 @@ expressed per million tokens:
 org: example-organization
 models:
   - alias: example-model
-    default_class: throughput
+    targets: {ttft_ms: 800, itl_ms: 30, priority: 50}
     tariffs:
       - name: realtime-default
         purpose: realtime
@@ -104,20 +104,9 @@ models:
       write_multiplier_24h: "2"
       read_multiplier: "0.10"
     class_pricing:
-      throughput:
+      custom:
         tariffs:
-          - name: throughput-realtime
-            purpose: realtime
-            input_per_million_tokens: "1.50"
-            output_per_million_tokens: "4.50"
-        cache_tariff:
-          write_multiplier_5m: "1"
-          write_multiplier_1h: "1.25"
-          write_multiplier_24h: "2"
-          read_multiplier: "0.08"
-      interactive:
-        tariffs:
-          - name: interactive-realtime
+          - name: custom-realtime
             purpose: realtime
             input_per_million_tokens: "3.00"
             output_per_million_tokens: "9.00"
@@ -128,12 +117,11 @@ models:
           read_multiplier: "0.15"
 ```
 
-For this example, enable the model's throughput/interactive presets and grant the
-organization those classes separately. Realtime requests use the resolved class:
-explicit suffix first, then applicable overlay/account/model defaults. Batch and
-flex use standard; flex uses the batch `1h` tariff. Prefer putting batch prices in
-the all-class `tariffs` list. `class_pricing.standard` also supports batch;
-interactive/throughput batch prices are rejected by validation.
+Realtime requests to which the overlay's explicit `targets` apply resolve as
+`custom`; everything else resolves as `standard`. Batch and flex use standard;
+flex uses the batch `1h` tariff. Prefer putting batch prices in the all-class
+`tariffs` list. `class_pricing.standard` also supports batch; `custom` batch
+prices are rejected by validation.
 
 ## Billing, display and admission
 

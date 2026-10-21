@@ -190,13 +190,13 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         None => false,
     };
 
-    // A serving-class suffix (`alias:interactive`) is a request for a class,
-    // not part of the model's identity: strip it here, at the outermost layer,
-    // so analytics, the prompt cache and billing all key on the bare alias,
-    // and hand the class to onwards as a request extension. An unknown class
-    // is a 400 (a typo must not silently change how a request is served).
-    let (requested_class, scrubbed_class) = match strip_serving_class_suffix(&mut request_value, is_daemon_processed) {
-        Ok(result) => result,
+    // Asynchronous requests are scheduled by their deadline, so a model
+    // suffix (`alias:suffix`) is discarded here, at the outermost layer, and
+    // analytics, the prompt cache and billing all key on the bare alias. A
+    // malformed selector is a 400. Realtime model names are passed through
+    // unchanged.
+    let scrubbed_suffix = match strip_async_model_suffix(&mut request_value, is_daemon_processed) {
+        Ok(changed) => changed,
         Err(err) => {
             let response = Response::builder()
                 .status(StatusCode::BAD_REQUEST)
@@ -207,7 +207,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 ))
                 .unwrap();
             let model = request_value["model"].as_str();
-            return rejections::refuse(&parts, response, "invalid_serving_class", Some("model"), model);
+            return rejections::refuse(&parts, response, "invalid_model_selector", Some("model"), model);
         }
     };
 
@@ -216,7 +216,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // `request_value` only stays removed if the bytes are rebuilt from it.
     // Every scrubber reports whether it changed something; the common case
     // (nothing to scrub, no suffix, no pin) keeps the caller's bytes untouched.
-    let mut body_bytes = if scrubbed_class || scrubbed_ids || scrubbed_scheduling || scrubbed_pinned {
+    let mut body_bytes = if scrubbed_suffix || scrubbed_ids || scrubbed_scheduling || scrubbed_pinned {
         bytes::Bytes::from(request_value.to_string())
     } else {
         body_bytes
@@ -590,19 +590,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             // The parsed JSON is no longer needed on the realtime path. Release
             // its strings before the upstream request is held open.
             drop(request_value);
-            let response = handle_realtime(
-                &state,
-                realtime_input,
-                &resp_id,
-                model,
-                background,
-                zdr,
-                requested_class,
-                parts,
-                body_bytes,
-                next,
-            )
-            .await;
+            let response = handle_realtime(&state, realtime_input, &resp_id, model, background, zdr, parts, body_bytes, next).await;
             match client_usage {
                 Some(usage) => super::stream_usage::apply(response, usage, state.sse_buffer_limit),
                 None => response,
@@ -980,7 +968,6 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     model: &str,
     background: bool,
     zdr: bool,
-    requested_class: Option<onwards::ServingClass>,
     parts: axum::http::request::Parts,
     body_bytes: bytes::Bytes,
     next: Next,
@@ -1009,9 +996,6 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     // Strip the "resp_" prefix — onwards re-adds it.
     let raw_id = resp_id.strip_prefix("resp_").unwrap_or(resp_id);
     let mut req = Request::from_parts(parts, Body::from(body_bytes));
-    if let Some(class) = requested_class {
-        req.extensions_mut().insert(onwards::RequestedServingClass(class));
-    }
     req.headers_mut()
         .insert("x-fusillade-request-id", raw_id.parse().expect("response_id is valid header value"));
     req.headers_mut().insert(
@@ -1536,25 +1520,25 @@ pub(crate) fn set_routing_tolerations(value: &mut serde_json::Value, tolerations
     true
 }
 
-fn strip_serving_class_suffix(
+/// Discard a model suffix on an asynchronous request, returning whether the
+/// body changed. Realtime requests are left alone.
+fn strip_async_model_suffix(
     value: &mut serde_json::Value,
     asynchronous: bool,
-) -> Result<(Option<onwards::ServingClass>, bool), onwards::serving::InvalidModelSelector> {
+) -> Result<bool, super::model_selector::InvalidModelSelector> {
+    if !asynchronous {
+        return Ok(false);
+    }
     let Some(model) = value.get("model").and_then(|m| m.as_str()) else {
-        return Ok((None, false));
+        return Ok(false);
     };
-    let (alias, suffix) = onwards::serving::split_model_suffix(model)?;
-    let class = if asynchronous {
-        None
-    } else {
-        onwards::serving::split_class_suffix(model)?.1
-    };
+    let (alias, suffix) = super::model_selector::split_model_suffix(model)?;
     let changed = suffix.is_some();
     if changed {
         let alias = alias.to_string();
         value["model"] = serde_json::Value::String(alias);
     }
-    Ok((class, changed))
+    Ok(changed)
 }
 
 #[cfg(test)]
@@ -1650,33 +1634,25 @@ mod tests {
     }
 
     #[test]
-    fn serving_class_suffix_is_stripped_and_returned() {
-        let mut body = serde_json::json!({"model": "zai-org/GLM-5.2:interactive", "messages": []});
-        let class = strip_serving_class_suffix(&mut body, false).unwrap();
-        assert_eq!(class, (Some(onwards::ServingClass::Interactive), true));
-        assert_eq!(body["model"], "zai-org/GLM-5.2", "layers above onwards key on the bare alias");
-
-        let mut body = serde_json::json!({"model": "zai-org/GLM-5.2", "messages": []});
-        assert_eq!(strip_serving_class_suffix(&mut body, false).unwrap(), (None, false));
-        assert_eq!(body["model"], "zai-org/GLM-5.2");
-
-        let mut body = serde_json::json!({"model": "zai-org/GLM-5.2:fast"});
-        let err = strip_serving_class_suffix(&mut body, false).unwrap_err();
-        assert!(err.to_string().contains("'fast'"));
-        assert_eq!(body["model"], "zai-org/GLM-5.2:fast", "an invalid request is left as sent");
-
-        // No model at all (Model-Override header path): nothing to do.
-        let mut body = serde_json::json!({"messages": []});
-        assert_eq!(strip_serving_class_suffix(&mut body, false).unwrap(), (None, false));
+    fn realtime_model_names_are_passed_through_unchanged() {
+        let mut body = serde_json::json!({"model": "org/model:suffix", "messages": []});
+        assert_eq!(strip_async_model_suffix(&mut body, false), Ok(false));
+        assert_eq!(body["model"], "org/model:suffix");
     }
 
     #[test]
-    fn async_suffixes_are_discarded_without_class_validation() {
+    fn async_suffixes_are_discarded_after_a_shape_check() {
         let mut body = serde_json::json!({"model":"m:x-fast"});
-        assert_eq!(strip_serving_class_suffix(&mut body, true).unwrap(), (None, true));
+        assert_eq!(strip_async_model_suffix(&mut body, true), Ok(true));
         assert_eq!(body["model"], "m");
-        let mut body = serde_json::json!({"model":"m:throughput:interactive"});
-        assert!(strip_serving_class_suffix(&mut body, true).is_err());
+        let mut body = serde_json::json!({"model":"m"});
+        assert_eq!(strip_async_model_suffix(&mut body, true), Ok(false));
+        let mut body = serde_json::json!({"model":"m:a:b"});
+        assert!(strip_async_model_suffix(&mut body, true).is_err());
+        assert_eq!(body["model"], "m:a:b", "an invalid request is left as sent");
+        // No model at all (Model-Override header path): nothing to do.
+        let mut body = serde_json::json!({"messages": []});
+        assert_eq!(strip_async_model_suffix(&mut body, true), Ok(false));
     }
 
     #[test]

@@ -515,9 +515,7 @@ pub async fn confirm_password_reset<P: PoolProvider>(
         auto_topup_threshold: None,
         auto_topup_monthly_limit: None,
         zero_data_retention: None,
-        default_serving_class: None,
         self_hosted_only: None,
-        granted_serving_classes: Default::default(),
         toleration_preset: Default::default(),
     };
 
@@ -656,9 +654,7 @@ pub async fn change_password<P: PoolProvider>(
         auto_topup_threshold: None,
         auto_topup_monthly_limit: None,
         zero_data_retention: None,
-        default_serving_class: None,
         self_hosted_only: None,
-        granted_serving_classes: Default::default(),
         toleration_preset: Default::default(),
     };
 

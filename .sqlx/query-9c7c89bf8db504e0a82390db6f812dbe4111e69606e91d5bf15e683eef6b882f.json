@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id as composite_model_id,\n            alias,\n            realtime_inflight_limit,\n            batch_capacity,\n            lb_strategy,\n            fallback_enabled,\n            fallback_on_rate_limit,\n            fallback_on_status,\n            fallback_realtime_on_status,\n            fallback_with_replacement,\n            fallback_max_attempts,\n            backoff_enabled,\n            backoff_initial_ms,\n            backoff_max_ms,\n            backoff_factor,\n            backoff_jitter,\n            backoff_max_total_ms,\n            first_token_timeout_ms,\n            aimd,\n            affinity,\n            sanitize_responses,\n            trusted,\n            serving_classes\n        FROM deployed_models\n        WHERE is_composite = TRUE\n          AND deleted = FALSE\n        ",
+  "query": "\n        SELECT\n            id as composite_model_id,\n            alias,\n            realtime_inflight_limit,\n            batch_capacity,\n            lb_strategy,\n            fallback_enabled,\n            fallback_on_rate_limit,\n            fallback_on_status,\n            fallback_realtime_on_status,\n            fallback_with_replacement,\n            fallback_max_attempts,\n            backoff_enabled,\n            backoff_initial_ms,\n            backoff_max_ms,\n            backoff_factor,\n            backoff_jitter,\n            backoff_max_total_ms,\n            first_token_timeout_ms,\n            aimd,\n            affinity,\n            sanitize_responses,\n            trusted\n        FROM deployed_models\n        WHERE is_composite = TRUE\n          AND deleted = FALSE\n        ",
   "describe": {
     "columns": [
       {
@@ -112,11 +112,6 @@
         "ordinal": 21,
         "name": "trusted",
         "type_info": "Bool"
-      },
-      {
-        "ordinal": 22,
-        "name": "serving_classes",
-        "type_info": "Jsonb"
       }
     ],
     "parameters": {
@@ -144,9 +139,8 @@
       true,
       true,
       false,
-      false,
       false
     ]
   },
-  "hash": "b26b5029fd3185c8a6c88768a22094fc819b814eb0adc6e8184efd31dcfce1a3"
+  "hash": "9c7c89bf8db504e0a82390db6f812dbe4111e69606e91d5bf15e683eef6b882f"
 }

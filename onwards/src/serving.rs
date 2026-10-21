@@ -1,54 +1,25 @@
-//! Serving classes: the per-request dispatch mode and how it is resolved.
+//! Per-request serving policy: overlay targets, scheduling priority and the
+//! self-hosted restriction.
 //!
-//! A serving class names how a request wants to be served. `interactive`
-//! (per-stream speed, fast first token) and `throughput` (aggregate volume)
-//! are *elevated* classes; `standard` is what everyone gets when nothing is
-//! set. A class is a name for a **preset** of objective targets declared on
-//! the model: a time-to-first-token target, an inter-token-latency target and
-//! a scheduling priority. The serving stack's global router maps the targets
-//! onto whichever pool of workers meets them, and its planner sizes those
-//! pools from the traffic it sees; this crate never names a pool.
-//!
-//! Two facts gate an elevated class, both cheap to administer:
-//!
-//! * the **organisation holds it** — an account setting synced once per org
-//!   ([`AccountServing::granted`]);
-//! * the **model offers it** — a preset for that class declared on the alias
-//!   ([`crate::target::PoolSpec::serving_classes`]).
-//!
-//! Resolution is one flat field:
-//!
-//! ```text
-//! requested = model suffix, else the org's overlay default for this alias,
-//!             else the org's account default, else none
-//! resolved  = requested if the org holds it AND the alias offers it, else standard
-//! targets   = the alias's preset for the resolved class (a `standard` preset
-//!             is optional: without one, standard sends nothing)
-//! ```
-//!
-//! An overlay may instead carry **explicit targets** for a bespoke deal on
-//! one alias. Those are used as-is when the request names no class, imply the
-//! authority to use them (no grant is checked) and resolve as [`ServingClass::Custom`].
-//!
-//! **Strict mode.** A class named on the request itself is a promise, never a
-//! hint: if the org does not hold it, or the alias does not offer it, the
-//! request is rejected rather than quietly served as `standard`. Only the
-//! silent inputs (an account default, an overlay default) degrade silently,
-//! because nobody asked for anything on that request.
+//! An organisation's **overlay** on an alias may carry explicit objective
+//! targets for a bespoke deal: a time-to-first-token target, an
+//! inter-token-latency target and a scheduling priority. When present they are
+//! sent to members of kind `dynamo` and the request resolves as
+//! [`ServingClass::Custom`]; otherwise it resolves as
+//! [`ServingClass::Standard`] and sends no targets.
 //!
 //! Daemon legs (batch and flex on the batch-purpose key, continuation resume
-//! legs) always resolve to `standard` and send no targets: their existing
-//! deadline priorities carry the ordering.
+//! legs) never receive overlay targets: their existing deadline priorities
+//! carry the ordering.
 //!
 //! The targets travel in the request body as `nvext.router.{ttft_target,
-//! itl_target}` and, when the preset carries one, the priority as
+//! itl_target}` and, when non-zero, the priority as
 //! `nvext.agent_hints.priority`, on members of kind `dynamo` only. A request
 //! to a `dynamo` member that carries no priority is sent
 //! [`DEFAULT_PRIORITY`], so every priority is relative to realtime's 0.
 //! Everything a client could send to steer this itself is scrubbed at dwctl's
 //! ingress; only the resolver sets them.
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -70,8 +41,6 @@ pub const PRIORITY_FIELD: &str = "priority";
 /// The priority a request to a `dynamo` member carries when nothing set one:
 /// realtime's. Batch deadlines sit below it, continuation resumes above.
 pub const DEFAULT_PRIORITY: i32 = 0;
-/// Separator between a model alias and its class suffix (`alias:class`).
-pub const SUFFIX_SEPARATOR: char = ':';
 /// Key label naming the account (organisation) that owns the key. The account
 /// policy in [`crate::target::Targets::accounts`] and an alias's overlays are
 /// both keyed by its value.
@@ -81,43 +50,23 @@ pub const ACCOUNT_NAME_LABEL: &str = "account_name";
 /// [`ACCOUNT_NAME_LABEL`] is used when it is absent.
 pub const ACCOUNT_DISPLAY_NAME_LABEL: &str = "account_display_name";
 
-/// The dispatch mode a request is served under.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+/// How a request was served, for analytics and tariff selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ServingClass {
-    /// Elevated: per-stream speed.
-    Interactive,
-    /// Elevated: aggregate volume.
-    Throughput,
-    /// The absence of a choice.
+    /// No overlay targets applied.
     Standard,
-    /// Explicit targets from an overlay: a bespoke deal on one alias. Never
-    /// requestable by suffix, never declared on a model or an account: an
-    /// outcome only, so configuration cannot spell it.
-    #[serde(skip_deserializing)]
+    /// Explicit targets from an overlay: a bespoke deal on one alias. An
+    /// outcome only, never configuration.
     Custom,
 }
 
 impl ServingClass {
-    /// Every class a request may name, in the order the 400 message lists them.
-    pub const ALL: [ServingClass; 3] = [
-        ServingClass::Interactive,
-        ServingClass::Throughput,
-        ServingClass::Standard,
-    ];
-
     pub fn as_str(self) -> &'static str {
         match self {
-            ServingClass::Interactive => "interactive",
-            ServingClass::Throughput => "throughput",
             ServingClass::Standard => "standard",
             ServingClass::Custom => "custom",
         }
-    }
-
-    /// Elevated classes are the ones a model offers and an org holds.
-    pub fn is_elevated(self) -> bool {
-        matches!(self, ServingClass::Interactive | ServingClass::Throughput)
     }
 }
 
@@ -127,86 +76,8 @@ impl fmt::Display for ServingClass {
     }
 }
 
-/// A class name that is not in the requestable set.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnknownServingClass(pub String);
-
-impl fmt::Display for UnknownServingClass {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Unknown serving class '{}'. Valid classes: {}.",
-            self.0,
-            ServingClass::ALL
-                .iter()
-                .map(|c| c.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    }
-}
-
-impl std::error::Error for UnknownServingClass {}
-
-/// A malformed model selector or an unsupported realtime serving class.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InvalidModelSelector {
-    Malformed,
-    UnknownClass(UnknownServingClass),
-}
-
-impl fmt::Display for InvalidModelSelector {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Malformed => f.write_str("Invalid model selector: expected a nonempty alias with at most one nonempty ':class' suffix."),
-            Self::UnknownClass(error) => error.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for InvalidModelSelector {}
-
-/// Validate selector syntax without interpreting the class. Async ingestion
-/// discards the suffix because its deadline determines scheduling.
-pub fn split_model_suffix(model: &str) -> Result<(&str, Option<&str>), InvalidModelSelector> {
-    match model.split_once(SUFFIX_SEPARATOR) {
-        None if !model.is_empty() => Ok((model, None)),
-        Some((alias, suffix))
-            if !alias.is_empty() && !suffix.is_empty() && !suffix.contains(SUFFIX_SEPARATOR) =>
-        {
-            Ok((alias, Some(suffix)))
-        }
-        _ => Err(InvalidModelSelector::Malformed),
-    }
-}
-
-impl FromStr for ServingClass {
-    type Err = UnknownServingClass;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        ServingClass::ALL
-            .into_iter()
-            .find(|c| c.as_str() == s)
-            .ok_or_else(|| UnknownServingClass(s.to_string()))
-    }
-}
-
-/// Split `alias:class` into the bare alias and the requested class.
-///
-/// Public model aliases do not contain colons; a colon selects a serving class.
-pub fn split_class_suffix(
-    model: &str,
-) -> Result<(&str, Option<ServingClass>), InvalidModelSelector> {
-    let (alias, suffix) = split_model_suffix(model)?;
-    let class = suffix
-        .map(str::parse)
-        .transpose()
-        .map_err(InvalidModelSelector::UnknownClass)?;
-    Ok((alias, class))
-}
-
-/// The objective targets one request is served to. A class is a name for a
-/// preset of these on a model; an overlay may carry them explicitly.
+/// The objective targets one request is served to. An overlay may carry them
+/// explicitly for a bespoke deal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServingTargets {
     /// Time-to-first-token target, milliseconds.
@@ -261,8 +132,8 @@ impl ServingTargets {
 
 /// Write [`DEFAULT_PRIORITY`] as `nvext.agent_hints.priority` unless the body
 /// already carries a priority. One already present was set by someone
-/// entitled to: the daemon (batch deadline, continuation resume), a resolved
-/// preset, or the first hop when this crate runs again inside the serving
+/// entitled to: the daemon (batch deadline, continuation resume), resolved overlay
+/// targets, or the first hop when this crate runs again inside the serving
 /// namespace; callers' own are scrubbed at dwctl's ingress. The rest of
 /// `nvext` is kept.
 pub fn stamp_default_priority(body: &mut serde_json::Map<String, serde_json::Value>) {
@@ -308,11 +179,6 @@ pub fn scrub_router_targets(nvext: &mut serde_json::Map<String, serde_json::Valu
     removed.iter().any(Option::is_some)
 }
 
-/// The presets an alias offers, by class. Declaring a preset for a class is
-/// what makes the alias offer it; a `standard` preset is optional and only
-/// changes what `standard` sends.
-pub type ServingPresets = BTreeMap<ServingClass, ServingTargets>;
-
 /// What kind of server a provider is. Decides who receives the targets and
 /// who counts as external for a self-hosted-only organisation. Deliberately
 /// its own fact rather than a reading of some other flag (`trusted`,
@@ -355,20 +221,12 @@ impl FromStr for ProviderKind {
     }
 }
 
-/// Request extension: the class the request asked for by suffix.
-///
-/// Inserted by whoever stripped the suffix ahead of onwards (dwctl's inference
-/// middleware does, so the model string every layer above onwards keys on —
-/// analytics, the prompt cache, billing — is the bare alias). Onwards also
-/// parses a suffix it still finds, so the extension is an optimisation, not a
-/// contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RequestedServingClass(pub ServingClass);
-
-/// Response extension: what the request asked for and what it was served as.
+/// Response extension: what the request was served as.
 ///
 /// Present on every response that went through the resolver (which is every
 /// response an upstream produced); absent on auth/validation rejections.
+/// `requested` is reserved for explicitly requested classes and is currently
+/// always `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServingClassOutcome {
     pub requested: Option<ServingClass>,
@@ -379,12 +237,6 @@ pub struct ServingClassOutcome {
 /// looked up by the key's [`ACCOUNT_LABEL`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountServing {
-    /// Elevated classes the organisation holds.
-    #[serde(default)]
-    pub granted: Vec<ServingClass>,
-    /// Class its requests ask for when the request names none.
-    #[serde(default)]
-    pub default_class: Option<ServingClass>,
     /// Never fall over to an external provider.
     #[serde(default)]
     pub self_hosted_only: bool,
@@ -393,21 +245,15 @@ pub struct AccountServing {
 impl AccountServing {
     /// True when nothing here changes a request; such accounts are not synced.
     pub fn is_empty(&self) -> bool {
-        self.granted.is_empty() && self.default_class.is_none() && !self.self_hosted_only
+        !self.self_hosted_only
     }
 }
 
 /// An organisation's per-alias overrides of its account settings. Lives on
-/// the alias's pool spec, keyed by account id. `default_class` and `targets`
-/// are mutually exclusive: the catalog refuses both.
+/// the alias's pool spec, keyed by account id.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServingOverlay {
-    /// Overrides the account's default class on this alias.
-    #[serde(default)]
-    pub default_class: Option<ServingClass>,
-    /// Explicit targets for a bespoke deal on this alias, used when the
-    /// request names no class. Writing them implies authority: no grant is
-    /// checked, and they take precedence over any preset.
+    /// Explicit targets for a bespoke deal on this alias.
     #[serde(default)]
     pub targets: Option<ServingTargets>,
     /// Overrides the account's `self_hosted_only` on this alias.
@@ -423,7 +269,6 @@ const DAEMON_PURPOSES: [&str; 2] = ["batch", "continuation"];
 /// The outcome of resolving one request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServingResolution {
-    pub requested: Option<ServingClass>,
     pub resolved: ServingClass,
     /// What a `dynamo` member is told to serve to; `None` sends nothing.
     pub targets: Option<ServingTargets>,
@@ -434,395 +279,100 @@ pub struct ServingResolution {
 impl ServingResolution {
     pub fn outcome(&self) -> ServingClassOutcome {
         ServingClassOutcome {
-            requested: self.requested,
+            requested: None,
             resolved: self.resolved,
         }
     }
 }
 
-/// Why an explicitly requested class was refused (strict mode).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClassRejection {
-    /// The organisation does not hold the class.
-    NotHeld { class: ServingClass },
-    /// The organisation holds the class but this alias does not offer it.
-    NotOffered { class: ServingClass, alias: String },
-}
-
-impl fmt::Display for ClassRejection {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ClassRejection::NotHeld { class } => {
-                write!(
-                    f,
-                    "Serving class '{class}' is not available for this account."
-                )
-            }
-            ClassRejection::NotOffered { class, alias } => {
-                write!(
-                    f,
-                    "Serving class '{class}' is not available on model '{alias}'."
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for ClassRejection {}
-
-/// Resolve the serving class for one request.
+/// Resolve the serving policy for one request.
 ///
-/// * `suffix` — the class named on the request itself, if any.
 /// * `account` — the owning organisation's settings, if it has any.
 /// * `overlay` — the organisation's overrides on this alias, if any.
-/// * `alias` — the model alias the customer called (for messages).
-/// * `presets` — the classes the alias offers, each with its targets.
-/// * `purpose` — the key's purpose label; daemon purposes resolve to standard.
+/// * `purpose` — the key's purpose label; daemon purposes get no targets.
 pub fn resolve(
-    suffix: Option<ServingClass>,
     account: Option<&AccountServing>,
     overlay: Option<&ServingOverlay>,
-    alias: &str,
-    presets: &ServingPresets,
     purpose: Option<&str>,
-) -> Result<ServingResolution, ClassRejection> {
+) -> ServingResolution {
     let self_hosted_only = overlay
         .and_then(|o| o.self_hosted_only)
         .unwrap_or_else(|| account.is_some_and(|a| a.self_hosted_only));
 
-    if purpose.is_some_and(|p| DAEMON_PURPOSES.contains(&p)) {
-        return Ok(ServingResolution {
-            requested: None,
-            resolved: ServingClass::Standard,
-            targets: None,
-            self_hosted_only,
-        });
-    }
-
-    let held = |class: ServingClass| account.is_some_and(|a| a.granted.contains(&class));
-    let offered = |class: ServingClass| presets.contains_key(&class);
-
-    // Strict mode: a class named on the request is honoured or refused.
-    if let Some(class) = suffix
-        && class.is_elevated()
-    {
-        if !held(class) {
-            return Err(ClassRejection::NotHeld { class });
-        }
-        if !offered(class) {
-            return Err(ClassRejection::NotOffered {
-                class,
-                alias: alias.to_string(),
-            });
-        }
-    }
-
-    // Explicit overlay targets: the bespoke deal applies whenever the
-    // request itself names nothing. A suffix still outranks them.
-    if suffix.is_none()
-        && let Some(targets) = overlay.and_then(|o| o.targets)
-    {
-        return Ok(ServingResolution {
-            requested: None,
+    let daemon = purpose.is_some_and(|p| DAEMON_PURPOSES.contains(&p));
+    match overlay.and_then(|o| o.targets) {
+        Some(targets) if !daemon => ServingResolution {
             resolved: ServingClass::Custom,
             targets: Some(targets),
             self_hosted_only,
-        });
+        },
+        _ => ServingResolution {
+            resolved: ServingClass::Standard,
+            targets: None,
+            self_hosted_only,
+        },
     }
-
-    let requested = suffix
-        .or(overlay.and_then(|o| o.default_class))
-        .or(account.and_then(|a| a.default_class));
-
-    let resolved = match requested {
-        Some(class) if class.is_elevated() && held(class) && offered(class) => class,
-        _ => ServingClass::Standard,
-    };
-
-    Ok(ServingResolution {
-        requested,
-        resolved,
-        targets: presets.get(&resolved).copied(),
-        self_hosted_only,
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const INTERACTIVE: ServingTargets = ServingTargets {
+    const DEAL: ServingTargets = ServingTargets {
         ttft_ms: 500,
         itl_ms: 20,
         priority: 200,
     };
-    const THROUGHPUT: ServingTargets = ServingTargets {
-        ttft_ms: 5_000,
-        itl_ms: 100,
-        priority: 100,
-    };
-    const BOTH_CLASSES: [ServingClass; 2] = [ServingClass::Interactive, ServingClass::Throughput];
 
-    fn both() -> ServingPresets {
-        ServingPresets::from([
-            (ServingClass::Interactive, INTERACTIVE),
-            (ServingClass::Throughput, THROUGHPUT),
-        ])
-    }
-
-    fn account(granted: &[ServingClass], default: Option<ServingClass>) -> AccountServing {
-        AccountServing {
-            granted: granted.to_vec(),
-            default_class: default,
-            self_hosted_only: false,
+    fn overlay_with(targets: ServingTargets) -> ServingOverlay {
+        ServingOverlay {
+            targets: Some(targets),
+            ..Default::default()
         }
     }
 
-    fn realtime(
-        suffix: Option<ServingClass>,
-        account: Option<&AccountServing>,
-        overlay: Option<&ServingOverlay>,
-        presets: &ServingPresets,
-    ) -> Result<ServingResolution, ClassRejection> {
-        resolve(suffix, account, overlay, "m", presets, Some("realtime"))
-    }
-
     #[test]
-    fn suffix_is_split_and_unknown_class_is_an_error() {
-        assert_eq!(
-            split_class_suffix("zai-org/GLM-5.2"),
-            Ok(("zai-org/GLM-5.2", None))
-        );
-        assert_eq!(
-            split_class_suffix("zai-org/GLM-5.2:interactive"),
-            Ok(("zai-org/GLM-5.2", Some(ServingClass::Interactive)))
-        );
-        assert_eq!(
-            split_class_suffix("m:standard"),
-            Ok(("m", Some(ServingClass::Standard)))
-        );
-        let err = split_class_suffix("m:fast").unwrap_err();
-        assert_eq!(
-            err,
-            InvalidModelSelector::UnknownClass(UnknownServingClass("fast".to_string()))
-        );
-        assert!(
-            err.to_string()
-                .contains("interactive, throughput, standard")
-        );
-        // `custom` is an outcome, never a request
-        assert!(split_class_suffix("m:custom").is_err());
-    }
-
-    #[test]
-    fn selector_syntax_is_checked_before_class_resolution() {
-        for model in [
-            "",
-            ":interactive",
-            "m:",
-            "m:throughput:interactive",
-            "m::interactive",
-        ] {
-            assert_eq!(
-                split_model_suffix(model),
-                Err(InvalidModelSelector::Malformed)
-            );
-            assert_eq!(
-                split_class_suffix(model),
-                Err(InvalidModelSelector::Malformed)
-            );
-        }
-        assert_eq!(split_model_suffix("m:x-fast"), Ok(("m", Some("x-fast"))));
-    }
-
-    #[test]
-    fn nothing_set_resolves_to_standard_with_no_request_and_no_targets() {
-        let r = realtime(None, None, None, &both()).unwrap();
-        assert_eq!(r.requested, None);
+    fn nothing_set_resolves_to_standard_with_no_targets() {
+        let r = resolve(None, None, Some("realtime"));
         assert_eq!(r.resolved, ServingClass::Standard);
         assert_eq!(r.targets, None);
         assert!(!r.self_hosted_only);
+        assert_eq!(r.outcome().requested, None);
     }
 
     #[test]
-    fn precedence_is_suffix_then_overlay_then_account() {
-        let a = account(&BOTH_CLASSES, Some(ServingClass::Interactive));
-        let o = ServingOverlay {
-            default_class: Some(ServingClass::Throughput),
-            ..Default::default()
-        };
-        // suffix wins over everything
-        let r = realtime(Some(ServingClass::Interactive), Some(&a), Some(&o), &both()).unwrap();
-        assert_eq!(r.resolved, ServingClass::Interactive);
-        assert_eq!(r.targets, Some(INTERACTIVE));
-        // overlay default wins over the account default
-        let r = realtime(None, Some(&a), Some(&o), &both()).unwrap();
-        assert_eq!(r.requested, Some(ServingClass::Throughput));
-        assert_eq!(r.resolved, ServingClass::Throughput);
-        assert_eq!(r.targets, Some(THROUGHPUT));
-        // account default alone
-        let r = realtime(None, Some(&a), None, &both()).unwrap();
-        assert_eq!(r.resolved, ServingClass::Interactive);
-    }
-
-    #[test]
-    fn explicit_overlay_targets_apply_without_a_grant_and_lose_to_a_suffix() {
-        let bespoke = ServingTargets {
-            ttft_ms: 800,
-            itl_ms: 30,
-            priority: 0,
-        };
-        let o = ServingOverlay {
-            targets: Some(bespoke),
-            ..Default::default()
-        };
-        // no account settings at all, and a model that offers nothing: still applied
-        let r = realtime(None, None, Some(&o), &ServingPresets::new()).unwrap();
-        assert_eq!(r.requested, None);
+    fn overlay_targets_resolve_as_custom_for_realtime() {
+        let o = overlay_with(DEAL);
+        let r = resolve(None, Some(&o), Some("realtime"));
         assert_eq!(r.resolved, ServingClass::Custom);
-        assert_eq!(r.targets, Some(bespoke));
-        // an explicit suffix outranks the deal, and is still gated
-        let a = account(&BOTH_CLASSES, None);
-        let r = realtime(Some(ServingClass::Throughput), Some(&a), Some(&o), &both()).unwrap();
-        assert_eq!(r.resolved, ServingClass::Throughput);
-        assert_eq!(r.targets, Some(THROUGHPUT));
-        let r = realtime(Some(ServingClass::Standard), Some(&a), Some(&o), &both()).unwrap();
-        assert_eq!(r.resolved, ServingClass::Standard);
-        assert_eq!(r.targets, None);
-        assert!(realtime(Some(ServingClass::Interactive), None, Some(&o), &both()).is_err());
-        // daemon legs ignore the deal too
-        let r = resolve(None, None, Some(&o), "m", &both(), Some("batch")).unwrap();
-        assert_eq!(r.targets, None);
+        assert_eq!(r.targets, Some(DEAL));
+        // a key without a purpose label is treated as realtime
+        assert_eq!(resolve(None, Some(&o), None).targets, Some(DEAL));
     }
 
     #[test]
-    fn explicit_standard_suffix_opts_down_and_sends_the_standard_preset_if_any() {
-        let a = account(&BOTH_CLASSES, Some(ServingClass::Interactive));
-        let r = realtime(Some(ServingClass::Standard), Some(&a), None, &both()).unwrap();
-        assert_eq!(r.requested, Some(ServingClass::Standard));
-        assert_eq!(r.resolved, ServingClass::Standard);
-        assert_eq!(
-            r.targets, None,
-            "no standard preset: standard sends nothing"
-        );
-
-        let standard = ServingTargets {
-            ttft_ms: 10_000,
-            itl_ms: 200,
-            priority: 0,
-        };
-        let mut presets = both();
-        presets.insert(ServingClass::Standard, standard);
-        let r = realtime(Some(ServingClass::Standard), Some(&a), None, &presets).unwrap();
-        assert_eq!(r.targets, Some(standard));
-        let r = realtime(None, None, None, &presets).unwrap();
-        assert_eq!(r.resolved, ServingClass::Standard);
-        assert_eq!(
-            r.targets,
-            Some(standard),
-            "the model pins what standard means"
-        );
-    }
-
-    #[test]
-    fn strict_mode_refuses_an_explicit_class_the_org_does_not_hold_or_the_model_does_not_offer() {
-        // not held (no account at all, or account without it)
-        let err = realtime(Some(ServingClass::Interactive), None, None, &both()).unwrap_err();
-        assert_eq!(
-            err,
-            ClassRejection::NotHeld {
-                class: ServingClass::Interactive
-            }
-        );
-        let a = account(&[ServingClass::Throughput], None);
-        let err = realtime(Some(ServingClass::Interactive), Some(&a), None, &both()).unwrap_err();
-        assert!(matches!(err, ClassRejection::NotHeld { .. }));
-        assert!(err.to_string().contains("not available for this account"));
-        // held but the model does not offer it
-        let a = account(&BOTH_CLASSES, None);
-        let err = realtime(
-            Some(ServingClass::Interactive),
-            Some(&a),
-            None,
-            &ServingPresets::new(),
-        )
-        .unwrap_err();
-        assert_eq!(
-            err,
-            ClassRejection::NotOffered {
-                class: ServingClass::Interactive,
-                alias: "m".to_string()
-            }
-        );
-        assert!(err.to_string().contains("not available on model 'm'"));
-    }
-
-    #[test]
-    fn silent_defaults_degrade_to_standard_but_stay_visible() {
-        // account default on a model that offers nothing: served standard, requested recorded
-        let a = account(&BOTH_CLASSES, Some(ServingClass::Interactive));
-        let r = realtime(None, Some(&a), None, &ServingPresets::new()).unwrap();
-        assert_eq!(r.requested, Some(ServingClass::Interactive));
-        assert_eq!(r.resolved, ServingClass::Standard);
-        assert_eq!(r.targets, None);
-        // overlay default for a class the org does not hold: same
-        let a = account(&[], None);
-        let o = ServingOverlay {
-            default_class: Some(ServingClass::Throughput),
-            ..Default::default()
-        };
-        let r = realtime(None, Some(&a), Some(&o), &both()).unwrap();
-        assert_eq!(r.requested, Some(ServingClass::Throughput));
-        assert_eq!(r.resolved, ServingClass::Standard);
-    }
-
-    #[test]
-    fn daemon_legs_always_resolve_to_standard_even_with_a_suffix() {
-        let a = account(&BOTH_CLASSES, Some(ServingClass::Interactive));
-        for purpose in DAEMON_PURPOSES {
-            let r = resolve(
-                Some(ServingClass::Interactive),
-                Some(&a),
-                None,
-                "m",
-                &both(),
-                Some(purpose),
-            )
-            .unwrap();
-            assert_eq!(r.requested, None, "{purpose}");
+    fn daemon_legs_never_receive_overlay_targets() {
+        let o = overlay_with(DEAL);
+        for purpose in ["batch", "continuation"] {
+            let r = resolve(None, Some(&o), Some(purpose));
             assert_eq!(r.resolved, ServingClass::Standard, "{purpose}");
             assert_eq!(r.targets, None, "{purpose}");
         }
-        // playground behaves like realtime
-        let r = resolve(None, Some(&a), None, "m", &both(), Some("playground")).unwrap();
-        assert_eq!(r.resolved, ServingClass::Interactive);
     }
 
     #[test]
     fn self_hosted_only_comes_from_the_account_unless_the_overlay_overrides() {
-        let mut a = account(&[], None);
-        a.self_hosted_only = true;
-        let none = ServingPresets::new();
-        assert!(
-            realtime(None, Some(&a), None, &none)
-                .unwrap()
-                .self_hosted_only
-        );
+        let a = AccountServing {
+            self_hosted_only: true,
+        };
+        assert!(resolve(Some(&a), None, Some("realtime")).self_hosted_only);
         // the daemon leg carries the restriction too: batch work must not spill either
-        assert!(
-            resolve(None, Some(&a), None, "m", &none, Some("batch"))
-                .unwrap()
-                .self_hosted_only
-        );
+        assert!(resolve(Some(&a), None, Some("batch")).self_hosted_only);
         let o = ServingOverlay {
             self_hosted_only: Some(false),
             ..Default::default()
         };
-        assert!(
-            !realtime(None, Some(&a), Some(&o), &none)
-                .unwrap()
-                .self_hosted_only
-        );
+        assert!(!resolve(Some(&a), Some(&o), Some("realtime")).self_hosted_only);
     }
 
     #[test]
@@ -831,7 +381,7 @@ mod tests {
             "model": "m",
             "nvext": {"cache_control": {"enabled": true}, "router": {"ttft_target": 1}, "agent_hints": {"max_batch_size": 8}}
         });
-        INTERACTIVE.stamp(body.as_object_mut().unwrap());
+        DEAL.stamp(body.as_object_mut().unwrap());
         assert_eq!(body["nvext"]["router"]["ttft_target"], 500, "overwritten");
         assert_eq!(body["nvext"]["router"]["itl_target"], 20);
         assert_eq!(body["nvext"]["agent_hints"]["priority"], 200);
@@ -905,55 +455,39 @@ mod tests {
     }
 
     #[test]
-    fn kinds_and_classes() {
-        assert!(ServingClass::Interactive.is_elevated());
-        assert!(!ServingClass::Standard.is_elevated());
-        assert!(!ServingClass::Custom.is_elevated());
+    fn kinds_and_outcomes() {
         assert!(AccountServing::default().is_empty());
         assert_eq!(ProviderKind::default(), ProviderKind::External);
         assert_eq!("dynamo".parse::<ProviderKind>(), Ok(ProviderKind::Dynamo));
         assert!("cloud".parse::<ProviderKind>().is_err());
-    }
-
-    #[test]
-    fn serde_uses_lowercase_names_and_class_keyed_presets() {
-        let json = serde_json::to_string(&AccountServing {
-            granted: vec![ServingClass::Interactive],
-            ..Default::default()
-        })
-        .unwrap();
-        assert!(json.contains("\"granted\":[\"interactive\"]"));
-        let back: AccountServing = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.granted, vec![ServingClass::Interactive]);
-        assert_eq!(
-            serde_json::to_string(&ProviderKind::Dynamo).unwrap(),
-            "\"dynamo\""
-        );
-
-        // `custom` is an outcome, never configuration.
+        assert_eq!(ServingClass::Standard.as_str(), "standard");
         assert_eq!(
             serde_json::to_string(&ServingClass::Custom).unwrap(),
             "\"custom\""
         );
-        assert!(serde_json::from_str::<ServingClass>("\"custom\"").is_err());
-        assert!(serde_json::from_str::<AccountServing>(r#"{"granted": ["custom"]}"#).is_err());
-        assert!(
-            serde_json::from_str::<ServingPresets>(r#"{"custom": {"ttft_ms": 1, "itl_ms": 1}}"#)
-                .is_err()
-        );
+    }
 
-        let presets: ServingPresets =
-            serde_json::from_str(r#"{"interactive": {"ttft_ms": 500, "itl_ms": 20, "priority": 200}, "standard": {"ttft_ms": 9, "itl_ms": 9}}"#)
-                .unwrap();
-        assert_eq!(presets[&ServingClass::Interactive], INTERACTIVE);
+    #[test]
+    fn retired_class_fields_in_stored_config_are_ignored() {
+        // Configuration written before the class presets were retired must
+        // still load: the old fields are dropped, the rest is kept.
+        let a: AccountServing = serde_json::from_str(
+            r#"{"granted": ["interactive"], "default_class": "throughput", "self_hosted_only": true}"#,
+        )
+        .unwrap();
+        assert!(a.self_hosted_only);
+        let o: ServingOverlay = serde_json::from_str(
+            r#"{"default_class": "interactive", "targets": {"ttft_ms": 800, "itl_ms": 30}}"#,
+        )
+        .unwrap();
         assert_eq!(
-            presets[&ServingClass::Standard].priority,
-            0,
+            o.targets.map(|t| (t.ttft_ms, t.itl_ms, t.priority)),
+            Some((800, 30, 0)),
             "priority defaults to 0"
         );
         assert_eq!(
-            serde_json::to_value(&presets).unwrap()["interactive"]["ttft_ms"],
-            500
+            serde_json::to_string(&ProviderKind::Dynamo).unwrap(),
+            "\"dynamo\""
         );
     }
 }
@@ -965,7 +499,6 @@ mod handler_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use axum::Extension;
     use axum::body::Body;
     use axum::extract::State;
     use axum::http::{Request, StatusCode};
@@ -992,7 +525,6 @@ mod handler_tests {
 
     struct Setup {
         members: Vec<Member>,
-        presets: ServingPresets,
         purpose: &'static str,
         account: Option<AccountServing>,
         overlay: Option<ServingOverlay>,
@@ -1001,11 +533,25 @@ mod handler_tests {
     fn setup(members: &[Member]) -> Setup {
         Setup {
             members: members.to_vec(),
-            presets: ServingPresets::new(),
             purpose: "realtime",
             account: None,
             overlay: None,
         }
+    }
+
+    const DEAL: ServingTargets = ServingTargets {
+        ttft_ms: 500,
+        itl_ms: 20,
+        priority: 200,
+    };
+
+    fn with_deal(members: &[Member]) -> Setup {
+        let mut s = setup(members);
+        s.overlay = Some(ServingOverlay {
+            targets: Some(DEAL),
+            ..Default::default()
+        });
+        s
     }
 
     fn targets(s: &Setup) -> Targets {
@@ -1038,7 +584,7 @@ mod handler_tests {
             false,
             Vec::new(),
         )
-        .with_serving(s.presets.clone(), overlays);
+        .with_overlays(overlays);
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             ALIAS.to_string(),
@@ -1064,13 +610,6 @@ mod handler_tests {
             accounts,
             strict_mode: false,
             http_pool_config: None,
-        }
-    }
-
-    fn holds(classes: &[ServingClass]) -> AccountServing {
-        AccountServing {
-            granted: classes.to_vec(),
-            ..Default::default()
         }
     }
 
@@ -1110,23 +649,6 @@ mod handler_tests {
             .await
     }
 
-    const INTERACTIVE: ServingTargets = ServingTargets {
-        ttft_ms: 500,
-        itl_ms: 20,
-        priority: 200,
-    };
-    const THROUGHPUT: ServingTargets = ServingTargets {
-        ttft_ms: 5_000,
-        itl_ms: 100,
-        priority: 0,
-    };
-    const BOTH_CLASSES: [ServingClass; 2] = [ServingClass::Interactive, ServingClass::Throughput];
-    fn both() -> ServingPresets {
-        ServingPresets::from([
-            (ServingClass::Interactive, INTERACTIVE),
-            (ServingClass::Throughput, THROUGHPUT),
-        ])
-    }
     const DYNAMO: Member = ("https://dynamo.example.com/", ProviderKind::Dynamo);
     const EXTERNAL: Member = ("https://third-party.example.com/", ProviderKind::External);
     const HOSTED: Member = ("https://hosted.example.com/", ProviderKind::Hosted);
@@ -1140,60 +662,46 @@ mod handler_tests {
     }
 
     #[tokio::test]
-    async fn strict_handlers_preserve_the_ingress_class_extension() {
+    async fn strict_handlers_send_overlay_targets() {
         for (path, payload) in [
             ("/chat/completions", json!({"model":ALIAS,"messages":[]})),
             ("/completions", json!({"model":ALIAS,"prompt":"hi"})),
             ("/embeddings", json!({"model":ALIAS,"input":"hi"})),
             ("/responses", json!({"model":ALIAS,"input":"hi"})),
         ] {
-            let mut s = setup(&[DYNAMO]);
-            s.presets = both();
-            for granted in [false, true] {
-                s.account = granted.then(|| holds(&BOTH_CLASSES));
-                // An upstream failure avoids coupling this forwarding test to
-                // four different success-response schemas.
-                let mock =
-                    MockHttpClient::new(StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"failed"}"#);
-                let router = build_strict_router(AppState::with_client(targets(&s), mock.clone()))
-                    .layer(Extension(RequestedServingClass(ServingClass::Interactive)));
-                let srv = TestServer::new(router).unwrap();
-                let response = srv
-                    .post(path)
-                    .add_header("authorization", format!("Bearer {KEY}"))
-                    .json(&payload)
-                    .await;
-                if granted {
-                    assert_eq!(response.status_code(), 502, "{path}");
-                    assert_eq!(
-                        sent(&mock.get_requests()[0]),
-                        Some((500, 20, Some(200))),
-                        "{path}"
-                    );
-                } else {
-                    assert_eq!(response.status_code(), 403, "{path}");
-                    assert!(mock.get_requests().is_empty(), "{path}");
-                }
-            }
+            let s = with_deal(&[DYNAMO]);
+            // An upstream failure avoids coupling this forwarding test to
+            // four different success-response schemas.
+            let mock =
+                MockHttpClient::new(StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"failed"}"#);
+            let router = build_strict_router(AppState::with_client(targets(&s), mock.clone()));
+            let srv = TestServer::new(router).unwrap();
+            let response = srv
+                .post(path)
+                .add_header("authorization", format!("Bearer {KEY}"))
+                .json(&payload)
+                .await;
+            assert_eq!(response.status_code(), 502, "{path}");
+            assert_eq!(
+                sent(&mock.get_requests()[0]),
+                Some((500, 20, Some(200))),
+                "{path}"
+            );
         }
     }
 
     #[tokio::test]
     async fn no_eligible_provider_retains_the_resolved_class() {
-        let mut s = setup(&[EXTERNAL]);
-        s.presets = both();
+        let mut s = with_deal(&[EXTERNAL]);
         s.account = Some(AccountServing {
             self_hosted_only: true,
-            ..holds(&BOTH_CLASSES)
         });
         let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
         let request = Request::builder()
             .method("POST")
             .uri("/chat/completions")
             .header("authorization", format!("Bearer {KEY}"))
-            .body(Body::from(
-                json!({"model":"gpt-4:interactive","messages":[]}).to_string(),
-            ))
+            .body(Body::from(json!({"model":ALIAS,"messages":[]}).to_string()))
             .unwrap();
         let error = target_message_handler(
             State(AppState::with_client(targets(&s), mock.clone())),
@@ -1204,109 +712,23 @@ mod handler_tests {
         assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             error.serving_outcome.unwrap().resolved,
-            ServingClass::Interactive
+            ServingClass::Custom
         );
         assert!(mock.get_requests().is_empty());
     }
 
     #[tokio::test]
-    async fn elevated_class_sends_its_preset_to_a_dynamo_member_and_the_suffix_is_stripped() {
-        let mut s = setup(&[DYNAMO]);
-        s.presets = both();
-        s.account = Some(holds(&BOTH_CLASSES));
-        let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
-        let srv = server(&s, &mock);
-
-        let response = post(&srv, "gpt-4:interactive", json!({})).await;
-        assert_eq!(response.status_code(), 200);
-        let requests = mock.get_requests();
-        assert_eq!(requests.len(), 1);
-        let req = &requests[0];
-        assert_eq!(sent(req), Some((500, 20, Some(200))));
-        assert_eq!(
-            body(req)["model"],
-            "gpt-4",
-            "the suffix never reaches an upstream"
-        );
-        assert_eq!(
-            body(req)["messages"][0]["content"],
-            "hi",
-            "the rest of the body is untouched"
-        );
-
-        let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
-        let srv = server(&s, &mock);
-        assert_eq!(
-            post(&srv, "gpt-4:throughput", json!({}))
-                .await
-                .status_code(),
-            200
-        );
-        let req = &mock.get_requests()[0];
-        assert_eq!(
-            sent(req),
-            Some((5_000, 100, Some(0))),
-            "a zero preset priority is sent as realtime's 0"
-        );
-    }
-
-    #[tokio::test]
     async fn only_dynamo_members_receive_the_targets() {
         for member in [EXTERNAL, HOSTED] {
-            let mut s = setup(&[member]);
-            s.presets = both();
-            s.account = Some(holds(&BOTH_CLASSES));
+            let s = with_deal(&[member]);
             let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
             let srv = server(&s, &mock);
-            assert_eq!(
-                post(&srv, "gpt-4:interactive", json!({}))
-                    .await
-                    .status_code(),
-                200
-            );
+            assert_eq!(post(&srv, ALIAS, json!({})).await.status_code(), 200);
             let req = &mock.get_requests()[0];
             assert_eq!(sent(req), None, "{:?}", member.1);
             assert!(body(req).get("nvext").is_none(), "{:?}", member.1);
             assert_eq!(body(req)["model"], "gpt-4");
         }
-    }
-
-    #[tokio::test]
-    async fn account_default_applies_silently_and_degrades_silently() {
-        // held and offered: the default elevates without a suffix
-        let mut s = setup(&[DYNAMO]);
-        s.presets = both();
-        s.account = Some(AccountServing {
-            granted: BOTH_CLASSES.to_vec(),
-            default_class: Some(ServingClass::Throughput),
-            self_hosted_only: false,
-        });
-        let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
-        let srv = server(&s, &mock);
-        assert_eq!(post(&srv, "gpt-4", json!({})).await.status_code(), 200);
-        assert_eq!(sent(&mock.get_requests()[0]), Some((5_000, 100, Some(0))));
-
-        // same account, a model that offers nothing: served with no targets,
-        // only realtime's priority
-        s.presets = ServingPresets::new();
-        let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
-        let srv = server(&s, &mock);
-        assert_eq!(post(&srv, "gpt-4", json!({})).await.status_code(), 200);
-        assert_eq!(
-            body(&mock.get_requests()[0])["nvext"],
-            json!({"agent_hints": {"priority": 0}})
-        );
-
-        // an overlay default overrides the account default on this alias
-        s.presets = both();
-        s.overlay = Some(ServingOverlay {
-            default_class: Some(ServingClass::Interactive),
-            ..Default::default()
-        });
-        let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
-        let srv = server(&s, &mock);
-        assert_eq!(post(&srv, "gpt-4", json!({})).await.status_code(), 200);
-        assert_eq!(sent(&mock.get_requests()[0]), Some((500, 20, Some(200))));
     }
 
     #[tokio::test]
@@ -1322,17 +744,22 @@ mod handler_tests {
         });
         let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
         let srv = server(&s, &mock);
-        assert_eq!(post(&srv, "gpt-4", json!({})).await.status_code(), 200);
-        assert_eq!(sent(&mock.get_requests()[0]), Some((800, 30, Some(50))));
+        assert_eq!(post(&srv, ALIAS, json!({})).await.status_code(), 200);
+        let req = &mock.get_requests()[0];
+        assert_eq!(sent(req), Some((800, 30, Some(50))));
+        assert_eq!(
+            body(req)["messages"][0]["content"],
+            "hi",
+            "the rest of the body is untouched"
+        );
     }
 
     #[tokio::test]
     async fn no_policy_at_all_sends_only_realtimes_priority() {
-        let mut s = setup(&[DYNAMO]);
-        s.presets = both();
+        let s = setup(&[DYNAMO]);
         let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
         let srv = server(&s, &mock);
-        assert_eq!(post(&srv, "gpt-4", json!({})).await.status_code(), 200);
+        assert_eq!(post(&srv, ALIAS, json!({})).await.status_code(), 200);
         let req = &mock.get_requests()[0];
         assert_eq!(body(req)["nvext"], json!({"agent_hints": {"priority": 0}}));
         assert_eq!(body(req)["messages"][0]["content"], "hi");
@@ -1358,42 +785,13 @@ mod handler_tests {
     }
 
     #[tokio::test]
-    async fn an_explicit_class_the_org_does_not_hold_or_the_model_does_not_offer_is_refused() {
-        // not held
-        let mut s = setup(&[DYNAMO]);
-        s.presets = both();
+    async fn a_colon_suffix_is_not_a_class_selector() {
+        // Retired class suffixes are ordinary (unknown) model names now.
+        let s = setup(&[DYNAMO]);
         let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
         let srv = server(&s, &mock);
         let response = post(&srv, "gpt-4:interactive", json!({})).await;
-        assert_eq!(response.status_code(), 403);
-        let err: serde_json::Value = response.json();
-        assert!(
-            err["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("not available for this account"),
-            "{err}"
-        );
-        assert!(
-            mock.get_requests().is_empty(),
-            "nothing reaches an upstream"
-        );
-
-        // held, not offered
-        s.presets = ServingPresets::new();
-        s.account = Some(holds(&BOTH_CLASSES));
-        let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
-        let srv = server(&s, &mock);
-        let response = post(&srv, "gpt-4:interactive", json!({})).await;
-        assert_eq!(response.status_code(), 403);
-        let err: serde_json::Value = response.json();
-        assert!(
-            err["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("not available on model 'gpt-4'"),
-            "{err}"
-        );
+        assert_eq!(response.status_code(), 404, "{}", response.text());
         assert!(mock.get_requests().is_empty());
     }
 
@@ -1401,45 +799,40 @@ mod handler_tests {
     async fn inbound_targets_pass_through_and_a_resolution_overwrites_them() {
         // No policy: this crate is also the hop inside the serving namespace and
         // must forward what the first hop stamped; clients are scrubbed at dwctl.
-        let mut s = setup(&[DYNAMO]);
-        s.presets = both();
+        let s = setup(&[DYNAMO]);
         let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
         let srv = server(&s, &mock);
-        let inbound = json!({"nvext": {"router": {"ttft_target": 500, "itl_target": 20}, "agent_hints": {"priority": 200}}});
-        let response = post(&srv, "gpt-4", inbound.clone()).await;
+        let inbound = json!({"nvext": {"router": {"ttft_target": 9, "itl_target": 9}, "agent_hints": {"priority": 7}}});
+        let response = post(&srv, ALIAS, inbound.clone()).await;
         assert_eq!(response.status_code(), 200);
-        let req = &mock.get_requests()[0];
         assert_eq!(
-            sent(req),
-            Some((500, 20, Some(200))),
+            sent(&mock.get_requests()[0]),
+            Some((9, 9, Some(7))),
             "second-hop pass-through"
         );
 
-        s.account = Some(holds(&BOTH_CLASSES));
+        let s = with_deal(&[DYNAMO]);
         let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
         let srv = server(&s, &mock);
-        let response = post(&srv, "gpt-4:throughput", inbound).await;
+        let response = post(&srv, ALIAS, inbound).await;
         assert_eq!(response.status_code(), 200);
-        let req = &mock.get_requests()[0];
         assert_eq!(
-            sent(req),
-            Some((5_000, 100, Some(200))),
+            sent(&mock.get_requests()[0]),
+            Some((500, 20, Some(200))),
             "the targets are overwritten"
         );
     }
 
     #[tokio::test]
-    async fn daemon_purpose_keys_resolve_to_standard_even_with_a_suffix() {
-        let mut s = setup(&[DYNAMO]);
-        s.presets = both();
-        s.account = Some(holds(&BOTH_CLASSES));
+    async fn daemon_purpose_keys_get_no_overlay_targets() {
+        let mut s = with_deal(&[DYNAMO]);
         s.purpose = "batch";
         let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
         let srv = server(&s, &mock);
         // the deadline priority the daemon injected travels untouched
         let response = post(
             &srv,
-            "gpt-4:interactive",
+            ALIAS,
             json!({"nvext": {"agent_hints": {"priority": -1234}}}),
         )
         .await;
@@ -1447,14 +840,11 @@ mod handler_tests {
         let req = &mock.get_requests()[0];
         assert_eq!(sent(req), None);
         assert_eq!(body(req)["nvext"]["agent_hints"]["priority"], -1234);
-        assert_eq!(body(req)["model"], "gpt-4");
     }
 
     #[tokio::test]
     async fn an_upstream_failure_still_reports_the_resolved_class() {
-        let mut s = setup(&[DYNAMO]);
-        s.presets = both();
-        s.account = Some(holds(&BOTH_CLASSES));
+        let s = with_deal(&[DYNAMO]);
         let mock = MockHttpClient::new(StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"boom"}"#);
         // Straight through the router: the extension lives on the axum
         // response, which the test-server wrapper does not expose.
@@ -1465,7 +855,8 @@ mod handler_tests {
             .header("content-type", "application/json")
             .header("authorization", format!("Bearer {KEY}"))
             .body(axum::body::Body::from(
-                json!({"model": "gpt-4:interactive", "messages": [{"role": "user", "content": "hi"}]}).to_string(),
+                json!({"model": ALIAS, "messages": [{"role": "user", "content": "hi"}]})
+                    .to_string(),
             ))
             .unwrap();
         let response = build_router(AppState::with_client(targets(&s), mock.clone()))
@@ -1478,25 +869,8 @@ mod handler_tests {
             .get::<ServingClassOutcome>()
             .copied()
             .expect("the outcome rides on error responses too, for analytics");
-        assert_eq!(outcome.requested, Some(ServingClass::Interactive));
-        assert_eq!(outcome.resolved, ServingClass::Interactive);
-    }
-
-    #[tokio::test]
-    async fn unknown_class_suffix_is_rejected_with_the_valid_set() {
-        let s = setup(&[DYNAMO]);
-        let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
-        let srv = server(&s, &mock);
-        let response = post(&srv, "gpt-4:fast", json!({})).await;
-        assert_eq!(response.status_code(), 400);
-        let err: serde_json::Value = response.json();
-        let message = err["error"]["message"].as_str().unwrap();
-        assert!(message.contains("'fast'"), "{message}");
-        assert!(
-            message.contains("interactive, throughput, standard"),
-            "{message}"
-        );
-        assert!(mock.get_requests().is_empty());
+        assert_eq!(outcome.requested, None);
+        assert_eq!(outcome.resolved, ServingClass::Custom);
     }
 
     #[tokio::test]
@@ -1516,7 +890,6 @@ mod handler_tests {
         let mut s = setup(&members);
         s.account = Some(AccountServing {
             self_hosted_only: true,
-            ..Default::default()
         });
         let mock = MockHttpClient::new(StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"boom"}"#);
         let srv = server(&s, &mock);
@@ -1540,7 +913,6 @@ mod handler_tests {
         let mut s = setup(&[EXTERNAL]);
         s.account = Some(AccountServing {
             self_hosted_only: true,
-            ..Default::default()
         });
         let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
         let srv = server(&s, &mock);
@@ -1554,7 +926,6 @@ mod handler_tests {
         let mut s = setup(&[DYNAMO, HOSTED]);
         s.account = Some(AccountServing {
             self_hosted_only: true,
-            ..Default::default()
         });
         let mock = MockHttpClient::new(StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"boom"}"#);
         let srv = server(&s, &mock);
@@ -1565,7 +936,6 @@ mod handler_tests {
         let mut s = setup(&members);
         s.account = Some(AccountServing {
             self_hosted_only: true,
-            ..Default::default()
         });
         s.overlay = Some(ServingOverlay {
             self_hosted_only: Some(false),
@@ -1579,12 +949,9 @@ mod handler_tests {
 
     #[tokio::test]
     async fn a_named_pool_request_is_resolved_against_the_alias_policy() {
-        // Presets and overlays are declared on the alias's default pool; a
-        // request served by a named pool (here: completions) must still see
-        // them, or an explicit class would be refused as "not offered".
-        let mut s = setup(&[DYNAMO]);
-        s.presets = both();
-        s.account = Some(holds(&BOTH_CLASSES));
+        // Overlays are declared on the alias's default pool; a request served
+        // by a named pool (here: completions) must still see them.
+        let s = with_deal(&[DYNAMO]);
         let mock = MockHttpClient::new(
             StatusCode::OK,
             r#"{"id":"cmpl-1","object":"text_completion","model":"gpt-4","choices":[]}"#,
@@ -1619,7 +986,7 @@ mod handler_tests {
         let response = srv
             .post("/v1/completions")
             .add_header("authorization", format!("Bearer {KEY}"))
-            .json(&json!({"model": "gpt-4:interactive", "prompt": "hi"}))
+            .json(&json!({"model": "gpt-4", "prompt": "hi"}))
             .await;
         assert_eq!(response.status_code(), 200, "{}", response.text());
         let req = &mock.get_requests()[0];
@@ -1678,6 +1045,8 @@ mod handler_tests {
 
     #[test]
     fn accounts_and_overlays_round_trip_through_config_json() {
+        // Retired class fields (`serving_classes`, `granted`, `default_class`)
+        // in a stored config are ignored rather than rejected.
         let json = json!({
             "targets": {
                 "gpt-4": {
@@ -1695,18 +1064,10 @@ mod handler_tests {
         let config: crate::target::ConfigFile = serde_json::from_value(json).unwrap();
         let targets = Targets::from_config(config).unwrap();
         let account = targets.accounts.get("org-1").unwrap();
-        assert_eq!(account.granted, BOTH_CLASSES.to_vec());
         assert!(account.self_hosted_only);
         let pools = targets.targets.get("gpt-4").unwrap();
-        assert_eq!(
-            pools.active_serving_classes()[&ServingClass::Interactive],
-            INTERACTIVE
-        );
         let overlays = pools.default_pool().overlays();
-        assert_eq!(
-            overlays["org-1"].default_class,
-            Some(ServingClass::Interactive)
-        );
+        assert_eq!(overlays["org-1"].self_hosted_only, Some(false));
         assert_eq!(
             overlays["org-2"]
                 .targets

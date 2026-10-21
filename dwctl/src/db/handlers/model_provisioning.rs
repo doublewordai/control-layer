@@ -307,13 +307,9 @@ impl<'c> ModelProvisioning<'c> {
             };
         let source = format!("model-catalog:{}", desired.source);
         let pricing = pricing_fields(provider_pricing)?;
-        // Activation is the virtual model's; a physical deployment row is a
-        // composite member and never activates classes of its own.
-        let serving_classes = if is_composite {
-            serde_json::to_value(&desired.clay.serving_classes).context("serialize serving class presets")?
-        } else {
-            serde_json::json!({})
-        };
+        // Serving class presets are retired: the column is kept empty until
+        // it is dropped.
+        let serving_classes = serde_json::json!({});
         let fallback = &desired.clay.routing.fallback;
         let backoff_enabled = is_composite && fallback.backoff.is_some();
         let backoff_initial = fallback.backoff.as_ref().map_or(100, |backoff| backoff.initial_ms);

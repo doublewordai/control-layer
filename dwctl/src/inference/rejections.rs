@@ -280,7 +280,7 @@ mod tests {
         let (lines, (code, identities)) = rejections(async {
             let mut code = None;
             let mut identities = Vec::new();
-            for (model, dispatched) in [("known-model:interactive", false), ("not-configured", true)] {
+            for (model, dispatched) in [("known-model", false), ("not-configured", true)] {
                 let mut request = Request::post("/chat/completions").header("authorization", "Bearer sk-test");
                 if dispatched {
                     request = request.header(DISPATCHED_HEADER, "2026-01-01T00:00:00Z");

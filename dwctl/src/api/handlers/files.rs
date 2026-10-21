@@ -198,9 +198,9 @@ impl OpenAIBatchRequest {
             })?
             .to_string();
 
-        // Batches use deadline scheduling, so all serving-class suffixes
-        // are ignored. Resolve the base model before validating access.
-        let (model, _) = onwards::serving::split_model_suffix(&model).map_err(|error| Error::BadRequest {
+        // Batches use deadline scheduling, so a model suffix is ignored.
+        // Resolve the base model before validating access.
+        let (model, _) = crate::inference::model_selector::split_model_suffix(&model).map_err(|error| Error::BadRequest {
             message: error.to_string(),
         })?;
         let model = model.to_string();

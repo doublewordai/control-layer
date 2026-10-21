@@ -286,15 +286,16 @@ describe("serving setting authorization and cancellation", () => {
     render(<EditOrganizationModal isOpen onClose={vi.fn()} organization={mockOrg} canEditServing={canEditServing} />, { wrapper: createWrapper() });
     const dialog = within(screen.getByRole("dialog"));
     if (canEditServing) {
-      await user.click(dialog.getByRole("checkbox", { name: "Grant interactive" }));
+      expect(dialog.queryByRole("checkbox", { name: "Grant interactive" })).not.toBeInTheDocument();
       await user.click(dialog.getByRole("switch", { name: "Toggle no external-provider fallback" }));
     }
     await user.click(dialog.getByRole("button", { name: /save/i }));
     await waitFor(() => expect(submitted).toBeDefined());
     if (canEditServing) {
-      expect(submitted).toMatchObject({ granted_serving_classes: ["interactive"], default_serving_class: null, self_hosted_only: true });
+      expect(submitted).toMatchObject({ self_hosted_only: true });
+      for (const field of ["granted_serving_classes", "default_serving_class"]) expect(submitted).not.toHaveProperty(field);
     } else {
-      for (const field of ["granted_serving_classes", "default_serving_class", "self_hosted_only"]) expect(submitted).not.toHaveProperty(field);
+      for (const field of ["self_hosted_only", "toleration_preset"]) expect(submitted).not.toHaveProperty(field);
     }
   });
 
@@ -302,13 +303,13 @@ describe("serving setting authorization and cancellation", () => {
     const user = userEvent.setup();
     const props = { onClose: vi.fn(), organization: mockOrg, canEditServing: true };
     const { rerender } = render(<EditOrganizationModal {...props} isOpen />, { wrapper: createWrapper() });
-    const checkbox = within(screen.getByRole("dialog")).getByRole("checkbox", { name: "Grant interactive" });
-    await user.click(checkbox);
-    expect(checkbox).toBeChecked();
+    const toggle = within(screen.getByRole("dialog")).getByRole("switch", { name: "Toggle no external-provider fallback" });
+    await user.click(toggle);
+    expect(toggle).toBeChecked();
     await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: /cancel/i }));
     rerender(<EditOrganizationModal {...props} isOpen={false} />);
     rerender(<EditOrganizationModal {...props} isOpen />);
-    expect(within(screen.getByRole("dialog")).getByRole("checkbox", { name: "Grant interactive" })).not.toBeChecked();
+    expect(within(screen.getByRole("dialog")).getByRole("switch", { name: "Toggle no external-provider fallback" })).not.toBeChecked();
   });
 });
 

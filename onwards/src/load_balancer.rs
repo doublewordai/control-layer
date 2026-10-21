@@ -11,7 +11,7 @@ use crate::affinity::{self, AffinityConfig, Tracker};
 use crate::aimd::{AimdConfig, Controller, Observation};
 use crate::auth::KeySet;
 use crate::inflight::InflightLimits;
-use crate::serving::{ServingOverlay, ServingPresets};
+use crate::serving::ServingOverlay;
 use crate::target::{
     ConcurrencyGuard, ConcurrencyLimiter, FallbackConfig, LoadBalanceStrategy, RateLimiter,
     RoutingAction, RoutingRule, Target,
@@ -98,9 +98,9 @@ pub struct ProviderPool {
     trusted: bool,
     /// Routing rules evaluated against key labels before processing
     routing_rules: Vec<RoutingRule>,
-    /// The alias's serving policy (default pool only): offered presets and
-    /// per-account overlays. Shared, so cloning the pool per request is
-    /// cheap however many organisations have overlays on the alias.
+    /// The alias's serving policy (default pool only): per-account overlays.
+    /// Shared, so cloning the pool per request is cheap however many
+    /// organisations have overlays on the alias.
     serving: AliasServing,
     inflight: Option<Arc<InflightLimits>>,
     /// The alias's global batch in-flight cap, shared across every daemon pod
@@ -108,27 +108,19 @@ pub struct ProviderPool {
     batch_inflight: Option<u32>,
 }
 
-/// The serving policy declared on an alias: the presets it offers and its
-/// per-account overlays. Both behind `Arc`: the handler clones the selected
-/// pool for every request and this must not scale with the number of
-/// organisations configured.
+/// The serving policy declared on an alias: its per-account overlays. Behind
+/// `Arc`: the handler clones the selected pool for every request and this must
+/// not scale with the number of organisations configured.
 #[derive(Clone, Debug, Default)]
 pub struct AliasServing {
-    presets: Arc<ServingPresets>,
     overlays: Arc<HashMap<String, ServingOverlay>>,
 }
 
 impl AliasServing {
-    pub fn new(presets: ServingPresets, overlays: HashMap<String, ServingOverlay>) -> Self {
+    pub fn new(overlays: HashMap<String, ServingOverlay>) -> Self {
         Self {
-            presets: Arc::new(presets),
             overlays: Arc::new(overlays),
         }
-    }
-
-    /// The classes the alias offers, each with its preset.
-    pub fn presets(&self) -> &ServingPresets {
-        &self.presets
     }
 
     /// Per-account overlays on the alias, keyed by account id.
@@ -230,14 +222,9 @@ impl ProviderPool {
         }
     }
 
-    /// Attach the alias's offered serving presets and per-account overlays
-    /// (see [`crate::serving`]).
-    pub fn with_serving(
-        mut self,
-        serving_classes: ServingPresets,
-        overlays: HashMap<String, ServingOverlay>,
-    ) -> Self {
-        self.serving = AliasServing::new(serving_classes, overlays);
+    /// Attach the alias's per-account overlays (see [`crate::serving`]).
+    pub fn with_overlays(mut self, overlays: HashMap<String, ServingOverlay>) -> Self {
+        self.serving = AliasServing::new(overlays);
         self
     }
 
@@ -257,11 +244,6 @@ impl ProviderPool {
 
     pub fn batch_inflight_limit(&self) -> Option<u32> {
         self.batch_inflight
-    }
-
-    /// Elevated serving classes the alias offers.
-    pub fn serving_classes(&self) -> &ServingPresets {
-        self.serving.presets()
     }
 
     /// Per-account overrides on this alias, keyed by account id.

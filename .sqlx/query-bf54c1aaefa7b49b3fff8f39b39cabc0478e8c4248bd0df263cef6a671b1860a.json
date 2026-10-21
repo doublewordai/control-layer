@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO users (id, username, email, display_name, avatar_url, auth_source, user_type, is_admin)\n            VALUES ($1, $2, $3, $4, $5, 'organization', 'organization', false)\n            RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,\n                      is_admin, password_hash, external_user_id, payment_provider_id,\n                      is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,\n                      low_balance_notification_sent, low_balance_threshold,\n                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, invoicing_enabled, zero_data_retention,\n                   granted_serving_classes, default_serving_class, self_hosted_only\n            ",
+  "query": "\n            SELECT id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,\n                   is_admin, password_hash, external_user_id, payment_provider_id,\n                   is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,\n                   low_balance_notification_sent, low_balance_threshold,\n                   auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, invoicing_enabled, zero_data_retention,\n                   self_hosted_only, toleration_preset\n            FROM users\n            WHERE (username = $1 OR username LIKE $1 || '~%')\n              AND user_type = 'organization'\n              -- A soft-deleted workspace must never receive join requests:\n              -- nobody is left to approve them, so the requester would sit on a\n              -- queue no one can see.\n              AND is_deleted = false\n              -- Same reasoning one level down: a workspace whose owners and\n              -- admins have all been deleted is still `is_deleted = false`, but\n              -- there is equally nobody home to approve anything.\n              --\n              -- `Users::delete` no longer creates these - it hands a workspace\n              -- to a successor or closes it - but it used to walk away from the\n              -- departing user's `user_organizations` rows, which stranded any\n              -- workspace whose only owner was deleted: still claiming the\n              -- domain, still offered to every colleague who signed up,\n              -- unadministrable. This covers those legacy rows, and anything\n              -- else that reaches the same state by a route we have not thought\n              -- of. `users` inside the subquery is the outer row - the inner one\n              -- is aliased.\n              AND EXISTS (\n                  SELECT 1\n                  FROM user_organizations uo\n                  JOIN users admin ON admin.id = uo.user_id\n                  WHERE uo.organization_id = users.id\n                    AND uo.role IN ('owner', 'admin')\n                    AND uo.status = 'active'\n                    AND admin.is_deleted = false\n              )\n            ORDER BY created_at ASC\n            LIMIT 1\n            ",
   "describe": {
     "columns": [
       {
@@ -130,27 +130,18 @@
       },
       {
         "ordinal": 25,
-        "name": "granted_serving_classes",
-        "type_info": "TextArray"
+        "name": "self_hosted_only",
+        "type_info": "Bool"
       },
       {
         "ordinal": 26,
-        "name": "default_serving_class",
+        "name": "toleration_preset",
         "type_info": "Text"
-      },
-      {
-        "ordinal": 27,
-        "name": "self_hosted_only",
-        "type_info": "Bool"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Varchar",
-        "Varchar",
-        "Varchar",
-        "Varchar"
+        "Text"
       ]
     },
     "nullable": [
@@ -180,9 +171,8 @@
       false,
       false,
       false,
-      true,
-      false
+      true
     ]
   },
-  "hash": "b26923e64d58f98e50cac53a7ab94d0b6fc105e312b9ead96336a0f20b098c8a"
+  "hash": "bf54c1aaefa7b49b3fff8f39b39cabc0478e8c4248bd0df263cef6a671b1860a"
 }

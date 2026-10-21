@@ -28,7 +28,7 @@ use sqlx::{PgConnection, PgPool, Row};
 use uuid::Uuid;
 
 use crate::db::handlers::ModelProvisioning;
-use crate::model_provisioning::{ServingClassName, ServingPreset, Tariff, validate_cache_tariff, validate_tariffs};
+use crate::model_provisioning::{ServingPreset, Tariff, validate_cache_tariff, validate_tariffs};
 
 /// Prefix of the `provisioning_source` marker on rows this catalog owns.
 const SOURCE_PREFIX: &str = "org-overlays:";
@@ -61,25 +61,28 @@ pub struct OrgDocument {
     pub models: Vec<OrgModelOverlay>,
 }
 
-/// Billing follows the resolved outcome, including operator-authored custom targets.
+/// Billing follows the resolved outcome: `custom` when the overlay's explicit
+/// targets applied, otherwise `standard`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PricingClass {
     Standard,
-    Interactive,
-    Throughput,
     Custom,
 }
 impl PricingClass {
+    pub(crate) const ALL: [PricingClass; 2] = [PricingClass::Standard, PricingClass::Custom];
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Standard => "standard",
-            Self::Interactive => "interactive",
-            Self::Throughput => "throughput",
             Self::Custom => "custom",
         }
     }
 }
+
+/// Class names this catalog may have priced before the serving-class presets
+/// were retired. Rows it owns under them are retired on the next apply.
+const RETIRED_PRICING_CLASSES: [&str; 2] = ["interactive", "throughput"];
 
 pub use crate::model_provisioning::CachePrices;
 
@@ -98,14 +101,8 @@ pub struct ClassPrices {
 pub struct OrgModelOverlay {
     /// A virtual model alias from the model catalog.
     pub alias: String,
-    /// Overrides the account's default serving class on this model. Applies
-    /// only where the organisation holds the class and the model offers it.
-    /// Mutually exclusive with `targets`.
-    #[serde(default)]
-    pub default_class: Option<ServingClassName>,
-    /// Explicit targets for a bespoke deal on this model, sent as-is whenever
-    /// a request names no class. Writing them here is the authority to use
-    /// them: no class grant is checked. Mutually exclusive with `default_class`.
+    /// Explicit targets for a bespoke deal on this model, sent as-is to
+    /// self-hosted serving members on realtime requests.
     #[serde(default)]
     pub targets: Option<ServingPreset>,
     /// Overrides the account's `self_hosted_only` setting on this model.
@@ -129,8 +126,7 @@ pub struct OrgModelOverlay {
 impl OrgModelOverlay {
     /// Whether this entry changes any serving or pricing field.
     fn overrides_something(&self) -> bool {
-        self.default_class.is_some()
-            || self.targets.is_some()
+        self.targets.is_some()
             || self.self_hosted_only.is_some()
             || !self.tariffs.is_empty()
             || self.cache_tariff.is_some()
@@ -218,11 +214,6 @@ impl OrgCatalog {
                 if let Some(cache) = &model.cache_tariff {
                     validate_cache_tariff(&cache.as_tariff(), &format!("{source}: model {:?}", model.alias))?;
                 }
-                ensure!(
-                    model.default_class.is_none() || model.targets.is_none(),
-                    "{source}: overlay for model {:?} sets both default_class and targets; use one",
-                    model.alias
-                );
                 for (class, prices) in &model.class_pricing {
                     ensure!(
                         !prices.tariffs.is_empty() || prices.cache_tariff.is_some(),
@@ -319,18 +310,16 @@ async fn apply_in(db: &mut PgConnection, catalog: &OrgCatalog) -> Result<()> {
                 )
                 .await
                 .with_context(|| format!("reconcile cache tariff of org {:?} on {:?}", entry.document.org, model.alias))?;
-            for class in [
-                PricingClass::Standard,
-                PricingClass::Interactive,
-                PricingClass::Throughput,
-                PricingClass::Custom,
-            ] {
-                let prices = model.class_pricing.get(&class);
+            let declared = PricingClass::ALL
+                .into_iter()
+                .map(|class| (class.as_str(), model.class_pricing.get(&class)));
+            let retired = RETIRED_PRICING_CLASSES.into_iter().map(|class| (class, None));
+            for (class, prices) in declared.chain(retired) {
                 provisioning
                     .reconcile_tariffs(
                         model_id,
                         Some(org_id),
-                        Some(class.as_str()),
+                        Some(class),
                         prices.map_or(&[], |p| p.tariffs.as_slice()),
                         effective_at,
                     )
@@ -338,29 +327,23 @@ async fn apply_in(db: &mut PgConnection, catalog: &OrgCatalog) -> Result<()> {
                     .with_context(|| {
                         format!(
                             "{}: reconcile token prices of org {:?}, model {:?}, class {:?}",
-                            entry.source,
-                            entry.document.org,
-                            model.alias,
-                            class.as_str()
+                            entry.source, entry.document.org, model.alias, class
                         )
                     })?;
                 let cache = prices.and_then(|p| p.cache_tariff.as_ref()).map(CachePrices::as_tariff);
                 provisioning
-                    .reconcile_cache_tariff(model_id, Some(org_id), Some(class.as_str()), cache.as_ref(), effective_at)
+                    .reconcile_cache_tariff(model_id, Some(org_id), Some(class), cache.as_ref(), effective_at)
                     .await
                     .with_context(|| {
                         format!(
                             "{}: reconcile cache prices of org {:?}, model {:?}, class {:?}",
-                            entry.source,
-                            entry.document.org,
-                            model.alias,
-                            class.as_str()
+                            entry.source, entry.document.org, model.alias, class
                         )
                     })?;
             }
             sqlx::query(
                 r#"INSERT INTO model_overlays (user_id, deployed_model_id, default_serving_class, targets, self_hosted_only, provisioning_source)
-                   VALUES ($1, $2, $3, $4, $5, $6)
+                   VALUES ($1, $2, NULL, $3, $4, $5)
                    ON CONFLICT (user_id, deployed_model_id) DO UPDATE SET
                        default_serving_class = EXCLUDED.default_serving_class,
                        targets = EXCLUDED.targets,
@@ -374,7 +357,6 @@ async fn apply_in(db: &mut PgConnection, catalog: &OrgCatalog) -> Result<()> {
             )
             .bind(org_id)
             .bind(model_id)
-            .bind(model.default_class.map(|class| class.as_db_str()))
             .bind(model.targets.map(serde_json::to_value).transpose().context("serialize overlay targets")?)
             .bind(model.self_hosted_only)
             .bind(&source)
@@ -505,7 +487,7 @@ mod tests {
                 "input_per_million_tokens":"1", "output_per_million_tokens":"2"});
             for model in [
                 serde_json::json!({"alias":"m", "tariffs":[tariff.clone()]}),
-                serde_json::json!({"alias":"m", "class_pricing":{"interactive":{"tariffs":[tariff.clone()]}}}),
+                serde_json::json!({"alias":"m", "class_pricing":{"custom":{"tariffs":[tariff.clone()]}}}),
             ] {
                 assert!(serde_json::from_value::<OrgDocument>(serde_json::json!({"org":"acme","models":[model]})).is_err());
             }
@@ -534,7 +516,7 @@ mod tests {
         write(
             directory.path(),
             "acme.yaml",
-            "org: acme\nmodels:\n  - alias: m\n    default_class: throughput\n  - alias: M\n    self_hosted_only: true\n",
+            "org: acme\nmodels:\n  - alias: m\n    self_hosted_only: false\n  - alias: M\n    self_hosted_only: true\n",
         );
         let err = OrgCatalog::load(directory.path()).unwrap_err().to_string();
         assert!(err.contains("duplicate overlay for model"), "{err}");
@@ -542,7 +524,7 @@ mod tests {
         write(
             directory.path(),
             "acme.yaml",
-            "org: acme\nmodels:\n  - alias: m\n    default_class: throughput\n",
+            "org: acme\nmodels:\n  - alias: m\n    self_hosted_only: true\n",
         );
         write(directory.path(), "acme2.yaml", "org: ACME\nmodels: []\n");
         let err = OrgCatalog::load(directory.path()).unwrap_err().to_string();
@@ -555,15 +537,13 @@ mod tests {
         );
         assert!(OrgCatalog::load(directory.path()).is_err(), "unknown fields are rejected");
 
-        // A class default and explicit targets are two ways of saying what a
-        // request asks for; one entry says one thing.
+        // The retired default class is refused as an unknown field.
         write(
             directory.path(),
             "acme2.yaml",
-            "org: other\nmodels:\n  - alias: m\n    default_class: throughput\n    targets: {ttft_ms: 800, itl_ms: 30}\n",
+            "org: other\nmodels:\n  - alias: m\n    default_class: throughput\n",
         );
-        let err = OrgCatalog::load(directory.path()).unwrap_err().to_string();
-        assert!(err.contains("both default_class and targets"), "{err}");
+        assert!(OrgCatalog::load(directory.path()).is_err(), "default_class is retired");
         write(
             directory.path(),
             "acme2.yaml",
@@ -579,7 +559,7 @@ mod tests {
         );
         let catalog = OrgCatalog::load(directory.path()).unwrap();
         assert_eq!(catalog.orgs.len(), 2);
-        assert_eq!(catalog.orgs[0].document.models[0].default_class, Some(ServingClassName::Throughput));
+        assert_eq!(catalog.orgs[0].document.models[0].self_hosted_only, Some(true));
         assert_eq!(
             catalog.orgs[1].document.models[0].targets,
             Some(ServingPreset {
@@ -616,7 +596,7 @@ mod tests {
         write(
             directory.path(),
             "bob.yaml",
-            "org: bob\nmodels:\n  - alias: org/model\n    default_class: throughput\n",
+            "org: bob\nmodels:\n  - alias: org/model\n    self_hosted_only: true\n",
         );
         let err = apply(&pool, &OrgCatalog::load(directory.path()).unwrap())
             .await
@@ -629,7 +609,7 @@ mod tests {
         write(
             directory.path(),
             "acme.yaml",
-            "org: acme\nmodels:\n  - alias: nope\n    default_class: throughput\n",
+            "org: acme\nmodels:\n  - alias: nope\n    self_hosted_only: true\n",
         );
         let err = apply(&pool, &OrgCatalog::load(directory.path()).unwrap())
             .await
@@ -640,7 +620,7 @@ mod tests {
         write(
             directory.path(),
             "acme.yaml",
-            "org: acme\nmodels:\n  - alias: org/model\n    default_class: throughput\n    self_hosted_only: true\n",
+            "org: acme\nmodels:\n  - alias: org/model\n    self_hosted_only: true\n",
         );
         apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();
         let row = sqlx::query("SELECT default_serving_class, targets, self_hosted_only, provisioning_source FROM model_overlays WHERE user_id = $1 AND deployed_model_id = $2")
@@ -649,10 +629,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(
-            row.try_get::<Option<String>, _>("default_serving_class").unwrap().as_deref(),
-            Some("throughput")
-        );
+        assert_eq!(row.try_get::<Option<String>, _>("default_serving_class").unwrap(), None);
         assert_eq!(row.try_get::<Option<serde_json::Value>, _>("targets").unwrap(), None);
         assert_eq!(row.try_get::<Option<bool>, _>("self_hosted_only").unwrap(), Some(true));
         assert_eq!(
@@ -660,7 +637,7 @@ mod tests {
             Some("org-overlays:acme.yaml")
         );
 
-        // Switching the entry to explicit targets replaces the class default.
+        // Switching the entry to explicit targets replaces the restriction.
         write(
             directory.path(),
             "acme.yaml",
@@ -800,9 +777,9 @@ mod tests {
 models:
   - alias: class-model
     class_pricing:
-      interactive:
+      custom:
         tariffs:
-          - {name: interactive, purpose: realtime, input_per_million_tokens: '0', output_per_million_tokens: '1'}
+          - {name: custom, purpose: realtime, input_per_million_tokens: '0', output_per_million_tokens: '1'}
         cache_tariff: {write_multiplier_5m: '1', write_multiplier_1h: '1', write_multiplier_24h: '1', read_multiplier: '0'}
 "#;
         write(directory.path(), "org.yaml", yaml);
@@ -820,7 +797,7 @@ models:
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(class, "interactive");
+        assert_eq!(class, "custom");
         // A missing mount is a no-op, distinct from an explicitly empty mounted catalog.
         apply(&pool, &OrgCatalog::load(directory.path().join("missing")).unwrap())
             .await
@@ -860,7 +837,7 @@ models:
     async fn catalog_rejects_future_manual_price_collisions_atomically(pool: PgPool) {
         let org: Uuid = sqlx::query_scalar("INSERT INTO users (username,email,auth_source,user_type) VALUES ('future-org','future@example.com','test','organization') RETURNING id").fetch_one(&pool).await.unwrap();
         let directory = tempdir().unwrap();
-        for class in [None, Some("interactive")] {
+        for class in [None, Some("custom")] {
             for finite in [false, true] {
                 for cache in [false, true] {
                     let alias = format!("future-{}-{finite}-{cache}", class.unwrap_or("all"));
@@ -931,7 +908,7 @@ models:
                         "tariffs:\n  - {name: replacement, purpose: realtime, input_per_million_tokens: '3', output_per_million_tokens: '4'}".to_owned()
                     };
                     let scope = if class.is_some() {
-                        "    class_pricing:\n      interactive:\n"
+                        "    class_pricing:\n      custom:\n"
                     } else {
                         ""
                     };
@@ -1131,7 +1108,7 @@ models:
                 directory.path(),
                 "org.yaml",
                 &format!(
-                    "org: review-org\nmodels:\n  - alias: review-model\n    class_pricing:\n      interactive:\n        tariffs:\n          - {{name: deal, purpose: realtime, input_per_million_tokens: '{input}', output_per_million_tokens: '2'}}\n"
+                    "org: review-org\nmodels:\n  - alias: review-model\n    class_pricing:\n      custom:\n        tariffs:\n          - {{name: deal, purpose: realtime, input_per_million_tokens: '{input}', output_per_million_tokens: '2'}}\n"
                 ),
             );
             apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();

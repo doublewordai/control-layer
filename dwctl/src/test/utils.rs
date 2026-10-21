@@ -605,9 +605,7 @@ pub async fn get_system_user(pool: &mut PgConnection) -> UserResponse {
         organizations: None,
         active_organization_id: None,
         onboarding_redirect_url: None,
-        default_serving_class: None,
         self_hosted_only: false,
-        granted_serving_classes: Default::default(),
         toleration_preset: Default::default(),
     }
 }
@@ -799,9 +797,7 @@ pub async fn create_test_org(pool: &PgPool, created_by: UserId) -> UserResponse 
         organizations: None,
         active_organization_id: None,
         onboarding_redirect_url: None,
-        default_serving_class: None,
         self_hosted_only: false,
-        granted_serving_classes: Default::default(),
         toleration_preset: Default::default(),
     }
 }
