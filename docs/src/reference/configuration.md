@@ -819,18 +819,22 @@ error spans several lines. `json` writes one JSON object per event, for log
 aggregators: `timestamp`, `level`, `message` and `target`, the event's own
 fields at the top level, the innermost span under `span` and every enclosing
 span, root first, under `spans`. A multi-line error stays on one line. In
-`json` mode panics are written to stderr in the same shape, including the
-spans the panic happened in, with `target` set to `panic` and a message that
-starts like Rust's default panic output (`thread '…' panicked at …`). The
+`json` mode panics are written to stderr in the same shape, with `target` set
+to `panic` and a message that starts like Rust's default panic output
+(`thread '…' panicked at …`). They include the spans the panic happened in
+when there are any; a panic outside every span, or inside the logging
+subscriber itself, has none. The
 error `dwctl` exits with, including a configuration that fails to load, is
 logged once as `dwctl exited with an error`.
 
-Every JSON line logged while handling a request also carries the request's
-IDs at the top level: `x_request_id` (the ID dwctl mints and returns in the
-`X-Request-ID` header and forwards to providers), `edge_request_id` (an
-inbound `X-Request-ID`, such as one set by an ingress), `provider_request_id`
-and `trace_id`. Analytics logs written after the response carry
-`x_request_id` too. Find every line of a request, in dwctl and in any
+Every JSON line logged while handling a request carries `x_request_id` at the
+top level: the ID dwctl mints, returns in the `X-Request-ID` header and
+forwards to providers. Other IDs are added at the top level once they are
+known: `edge_request_id` when the request arrived with its own
+`X-Request-ID` (for example from an ingress), `trace_id` when the request
+has a trace context, and `provider_request_id` on lines logged after the
+provider's response returned its own `X-Request-ID`. Analytics logs written
+after the response carry `x_request_id` too. Find every line of a request, in dwctl and in any
 provider that logs `x_request_id` the same way, with one query:
 
 ```logql
