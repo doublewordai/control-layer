@@ -418,8 +418,9 @@ Rules:
 - Priority inherits class, then model, then account, then the default. It is
   sent as the scheduling priority on the account's realtime requests to
   `dynamo` serving members; batch and flex keep their deadline priority.
-  `ttft_ms` and `itl_ms` are sent as latency targets. Neither changes the
-  class the request is billed as.
+  `ttft_ms` and `itl_ms` are sent as latency targets on the same realtime
+  requests. Neither changes the class the request is billed as. Priority
+  `-2147483648` is reserved for background work and rejected.
 - If a model appears in both shapes, the two limits must be equal.
 - An account/model pair may be configured in its account file or in an
   [organisation overlay](#organisation-catalog-validation-and-ownership), not
@@ -432,15 +433,16 @@ in one transaction under one advisory lock:
   declare. Removing a line or a file returns that account to the model's
   default on the next start.
 - **Priorities, latency targets and prices** are owned row by row. Declaring
-  an account/model pair makes the file authoritative for its current prices,
-  adopting matching rows written by hand. Omitted prices retire, and changed
-  prices are versioned without altering historical amounts. Prices that the
-  organisation catalog owns are refused, never taken over.
+  an account/model pair makes the file authoritative for its current prices
+  and policies, adopting matching rows written by hand. Omitted prices retire, and changed
+  prices are versioned without altering historical amounts. Rows that another
+  writer owns, such as the organisation catalog's prices, are refused, never
+  taken over.
 
 An empty directory clears everything the account files own. A missing
 directory changes nothing. An unknown account, or a model that is not a live
-virtual model, fails startup before anything is written; the model catalog and
-organisation overlays have already been applied by then.
+virtual model, fails startup before any account-file setting is written; the
+model catalog and organisation overlays have already been applied by then.
 
 Run the same offline validation used by deployment CI:
 

@@ -14,8 +14,9 @@
 //! scheduling, not the price.
 //!
 //! Daemon legs (batch and flex on the batch-purpose key, continuation resume
-//! legs) never receive overlay targets or priorities: their existing deadline
-//! priorities carry the ordering.
+//! legs) never receive overlay targets or priorities and keep their own:
+//! batch and flex carry deadline-derived priorities, background dispatch the
+//! reserved `i32::MIN`, and continuation resumes their fixed priority.
 //!
 //! The targets travel in the request body as `nvext.router.{ttft_target,
 //! itl_target}` and, when non-zero, the priority as

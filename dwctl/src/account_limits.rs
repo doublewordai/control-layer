@@ -248,12 +248,14 @@ impl AccountLimitsCatalog {
                 document.priority.is_some() || !document.realtime_inflight.is_empty() || !document.models.is_empty(),
                 "{source}: account {account:?} declares nothing; set `priority`, `models` or `realtime_inflight`"
             );
+            validate_priority(document.priority, &format!("{source}: account {account:?}"))?;
             for (alias, limit) in &document.realtime_inflight {
                 ensure!(*limit > 0, "{source}: realtime_inflight limit on {alias:?} must be positive");
             }
             for (alias, model) in &document.models {
                 let context = format!("{source}: model {alias:?}");
                 ensure!(!model.is_empty(), "{context} configures nothing");
+                validate_priority(model.priority, &context)?;
                 validate_tariffs(&model.tariffs, &context)?;
                 ensure!(
                     model.tariffs.iter().all(|t| t.purpose == TariffPurpose::Batch),
@@ -284,13 +286,37 @@ impl AccountLimitsCatalog {
                     if let Some(cache) = &policy.cache_tariff {
                         validate_cache_tariff(&cache.as_tariff(), &context)?;
                     }
-                    ensure!(policy.ttft_ms != Some(0), "{context}: ttft_ms must be positive");
-                    ensure!(policy.itl_ms != Some(0), "{context}: itl_ms must be positive");
+                    validate_priority(policy.priority, &context)?;
+                    validate_target(policy.ttft_ms, "ttft_ms", &context)?;
+                    validate_target(policy.itl_ms, "itl_ms", &context)?;
                 }
             }
         }
         Ok(())
     }
+}
+
+/// `i32::MIN` is the batch daemon's background tier; realtime policy may not
+/// tie with it.
+fn validate_priority(priority: Option<i32>, context: &str) -> Result<()> {
+    ensure!(
+        priority != Some(i32::MIN),
+        "{context}: priority {} is reserved for background work",
+        i32::MIN
+    );
+    Ok(())
+}
+
+/// Latency targets are stored as positive `INTEGER`s.
+fn validate_target(target: Option<u32>, field: &str, context: &str) -> Result<()> {
+    if let Some(target) = target {
+        ensure!(
+            target > 0 && i32::try_from(target).is_ok(),
+            "{context}: {field} must be positive and at most {}",
+            i32::MAX
+        );
+    }
+    Ok(())
 }
 
 /// One policy row: an account's priority and targets on a model (class
@@ -431,8 +457,8 @@ async fn apply_policies(
                         model: model_id,
                         class: Some(class.clone()),
                         priority: policy.priority,
-                        ttft_ms: policy.ttft_ms.map(|v| v as i32),
-                        itl_ms: policy.itl_ms.map(|v| v as i32),
+                        ttft_ms: policy.ttft_ms.map(i32::try_from).transpose()?,
+                        itl_ms: policy.itl_ms.map(i32::try_from).transpose()?,
                     });
                 }
             }
@@ -461,6 +487,32 @@ async fn apply_policies(
     .execute(&mut *db)
     .await
     .context("remove undeclared account policies")?;
+    // Unowned rows on a declared scope are adopted, as manual prices are; a
+    // row another writer owns is never taken over.
+    let foreign: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
+        "SELECT u.username, dm.alias, p.serving_class, p.provisioning_source
+         FROM account_model_policies p
+         JOIN UNNEST($1::uuid[], $2::uuid[], $3::text[]) AS d(user_id, deployed_model_id, serving_class)
+           ON d.user_id = p.user_id AND d.deployed_model_id = p.deployed_model_id
+          AND d.serving_class IS NOT DISTINCT FROM p.serving_class
+         JOIN users u ON u.id = p.user_id
+         JOIN deployed_models dm ON dm.id = p.deployed_model_id
+         WHERE p.provisioning_source IS NOT NULL AND p.provisioning_source <> $4
+         ORDER BY u.username, dm.alias, p.serving_class NULLS FIRST",
+    )
+    .bind(&accounts_col)
+    .bind(&models_col)
+    .bind(&classes_col)
+    .bind(POLICY_SOURCE)
+    .fetch_all(&mut *db)
+    .await
+    .context("check account policy ownership")?;
+    if let Some((account, alias, class, owner)) = foreign.first() {
+        bail!(
+            "account {account:?} policy on {alias:?} (class {}) is owned by {owner:?}; remove it there first",
+            class.as_deref().unwrap_or("all")
+        );
+    }
     sqlx::query(
         "INSERT INTO account_model_policies (user_id, deployed_model_id, serving_class, priority, ttft_ms, itl_ms, provisioning_source)
          SELECT d.user_id, d.deployed_model_id, d.serving_class, d.priority, d.ttft_ms, d.itl_ms, $7
@@ -815,6 +867,15 @@ mod tests {
                 "ttft_ms must be positive",
             ),
             (
+                "account: acme\nmodels:\n  org/model:\n    classes:\n      standard:\n        itl_ms: 2147483648\n".to_owned(),
+                "itl_ms must be positive and at most",
+            ),
+            ("account: acme\npriority: -2147483648\n".to_owned(), "reserved for background work"),
+            (
+                "account: acme\nmodels:\n  org/model:\n    priority: -2147483648\n".to_owned(),
+                "reserved for background work",
+            ),
+            (
                 "account: acme\nmodels:\n  org/model:\n    classes:\n      standard:\n        realtime_inflight: 0\n".to_owned(),
                 "must be positive",
             ),
@@ -1054,5 +1115,47 @@ mod tests {
                 .unwrap_err()
         );
         assert!(error.contains("conflicts with a manually managed tariff"), "{error}");
+    }
+
+    #[dwctl_test_macros::test]
+    async fn unowned_policies_are_adopted_and_other_writers_policies_are_refused(pool: PgPool) {
+        let org = insert_account(&pool, "acme", "organization").await;
+        let model = insert_virtual_model(&pool, "org/model").await;
+        sqlx::query("INSERT INTO account_model_policies (user_id, deployed_model_id, priority) VALUES ($1, $2, 7)")
+            .bind(org)
+            .bind(model)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let directory = tempdir().unwrap();
+        write(
+            directory.path(),
+            "acme.yaml",
+            "account: acme\nmodels:\n  org/model:\n    priority: 9\n",
+        );
+        let catalog = AccountLimitsCatalog::load(directory.path()).unwrap();
+        apply(&pool, &catalog).await.unwrap();
+        let adopted: (Option<i32>, Option<String>) =
+            sqlx::query_as("SELECT priority, provisioning_source FROM account_model_policies WHERE user_id = $1")
+                .bind(org)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(adopted, (Some(9), Some(POLICY_SOURCE.to_owned())));
+
+        sqlx::query("UPDATE account_model_policies SET priority = 7, provisioning_source = 'elsewhere' WHERE user_id = $1")
+            .bind(org)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let error = format!("{:#}", apply(&pool, &catalog).await.unwrap_err());
+        assert!(error.contains("is owned by \"elsewhere\""), "{error}");
+        let untouched: (Option<i32>, Option<String>) =
+            sqlx::query_as("SELECT priority, provisioning_source FROM account_model_policies WHERE user_id = $1")
+                .bind(org)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(untouched, (Some(7), Some("elsewhere".to_owned())));
     }
 }
