@@ -399,7 +399,7 @@ models:
         ttft_ms: 1000             # optional latency targets
         itl_ms: 30
         priority: 500             # optional; overrides the model's priority
-        toleration_preset: gpu    # optional; overrides the model's preset
+        toleration_preset: gpu-only  # optional; overrides the model's preset
 ```
 
 The older shape is still accepted and means the same as
