@@ -505,7 +505,8 @@ batches:
 # Controls file size, request count, and concurrency limits to prevent resource exhaustion
 # limits:
 #   files:
-#     # Maximum file size in bytes (default: 100MB)
+#     # Maximum file size in bytes (default: 100MB). Gzip and zstd files are
+#     # decoded as they upload, and this limit applies to the decoded size.
 #     # Set to 0 for unlimited (not recommended for production)
 #     max_file_size: 104857600
 #     # Maximum number of requests (JSONL lines) per file
@@ -526,6 +527,8 @@ batches:
 #     # in batch JSONL files and to realtime request bodies on /ai/v1/*.
 #     # Inference bodies are bounded before parsing or request logging;
 #     # oversized bodies return HTTP 413. Multipart uploads use max_file_size.
+#     # Realtime bodies may be sent with Content-Encoding gzip, zstd or br;
+#     # the limit applies to the decoded size, and other codings get HTTP 415.
 #     # Set to 0 for unlimited (not recommended for production)
 #     # Default: 10MB (10485760)
 #     # Changing this limit requires a restart to rebuild all routing layers.

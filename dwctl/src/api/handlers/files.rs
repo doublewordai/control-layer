@@ -30,6 +30,7 @@ use crate::errors::{Error, Result};
 use crate::image_normalizer::{ImageInput, ImageNormalizer, Mode as ImageNormalizerMode, walker as image_walker};
 use crate::reasoning::ModelReasoningPolicy;
 use crate::types::Resource;
+use crate::upload_compression::{self, ChunkError, Detected};
 use axum::{
     Json,
     body::Body,
@@ -484,6 +485,10 @@ enum FileUploadError {
     InvalidJson { line: u64, error: String },
     /// Invalid UTF-8 encoding in the file
     InvalidUtf8 { line: u64, byte_offset: i64, error: String },
+    /// The file starts as gzip or zstd but isn't valid data for it (corrupt or truncated)
+    InvalidCompression { format: &'static str, message: String },
+    /// The file is compressed in a format we recognise but don't decode
+    UnsupportedCompression { format: &'static str },
     /// No file field in multipart upload
     NoFile,
     /// File contains no valid request templates
@@ -572,6 +577,14 @@ impl FileUploadError {
                 message: format!(
                     "File contains invalid UTF-8 on/near line {} at byte offset {}: {}",
                     line, byte_offset, error
+                ),
+            },
+            FileUploadError::InvalidCompression { format, message } => Error::BadRequest {
+                message: format!("File is not valid {format} data: {message}"),
+            },
+            FileUploadError::UnsupportedCompression { format } => Error::BadRequest {
+                message: format!(
+                    "File is compressed with {format}, which is not supported. Upload it uncompressed, or compressed with gzip or zstd."
                 ),
             },
             FileUploadError::NoFile => Error::BadRequest {
@@ -826,8 +839,15 @@ fn create_file_stream(
                     }
                 }
                 "file" => {
-                    // Extract filename from the field
-                    metadata.filename = field.file_name().map(|s| s.to_string());
+                    let filename = field.file_name().map(|s| s.to_string());
+
+                    // A gzip or zstd file is decoded as it streams in: the size
+                    // limit, the parser and the stored file all see decoded content.
+                    let (format, mut chunks) = upload_compression::open(Box::pin(field)).await;
+                    if let Detected::Unsupported(format) = format {
+                        abort!(FileUploadError::UnsupportedCompression { format });
+                    }
+                    metadata.filename = filename.map(|name| format.decoded_file_name(&name));
 
                     // Send metadata before processing file content
                     if tx.send(fusillade::FileStreamItem::Metadata(metadata.clone())).await.is_err() {
@@ -835,11 +855,9 @@ fn create_file_stream(
                     }
 
                     // Now stream and parse the file content
-                    let mut field = field;
-
                     loop {
-                        match field.chunk().await {
-                            Ok(Some(chunk)) => {
+                        match chunks.next().await {
+                            Some(Ok(chunk)) => {
                                 let chunk_size = chunk.len() as u64;
                                 total_size += chunk_size;
 
@@ -1001,11 +1019,17 @@ fn create_file_stream(
                                     }
                                 }
                             }
-                            Ok(None) => {
+                            None => {
                                 // Normal end of stream
                                 break;
                             }
-                            Err(e) => {
+                            Some(Err(ChunkError::Decode(e))) => {
+                                abort!(FileUploadError::InvalidCompression {
+                                    format: format.name(),
+                                    message: e.to_string(),
+                                });
+                            }
+                            Some(Err(ChunkError::Upload(e))) => {
                                 // Log Display and Debug representations
                                 tracing::warn!(
                                     error_display = %e,
@@ -1137,7 +1161,7 @@ fn create_file_stream(
 Each line must be a valid JSON object containing `custom_id`, `method`, `url`, and `body` fields. The `model` field in the body must reference a model your API key has access to.",
     request_body(
         content_type = "multipart/form-data",
-        description = "Multipart form with `file` (the JSONL file) and `purpose` (must be `batch`)."
+        description = "Multipart form with `file` (the JSONL file, optionally gzip- or zstd-compressed) and `purpose` (must be `batch`)."
     ),
     responses(
         (status = 201, description = "File uploaded and validated successfully.", body = FileResponse),
@@ -2410,6 +2434,83 @@ mod tests {
             let down_json: serde_json::Value =
                 serde_json::from_str(down).unwrap_or_else(|_| panic!("Failed to parse downloaded line {}", i));
             assert_eq!(orig_json, down_json, "Line {} should match (orig: {}, down: {})", i, orig, down);
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_upload_compressed_file_stores_decoded_content(pool: PgPool) {
+        use std::io::Write;
+
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello 1"}]}}
+{"custom_id":"request-2","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello 2"}]}}
+"#;
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(jsonl_content.as_bytes()).unwrap();
+        let gzip = gzip.finish().unwrap();
+        let zstd = zstd::encode_all(jsonl_content.as_bytes(), 3).unwrap();
+
+        for (compressed, name) in [(gzip, "test-batch.jsonl.gz"), (zstd, "test-batch.jsonl.zst")] {
+            let upload_response = app
+                .post("/ai/v1/files")
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                .multipart(
+                    axum_test::multipart::MultipartForm::new()
+                        .add_text("purpose", "batch")
+                        .add_part("file", axum_test::multipart::Part::bytes(compressed).file_name(name)),
+                )
+                .await;
+
+            upload_response.assert_status(axum::http::StatusCode::CREATED);
+            let file: FileResponse = upload_response.json();
+            assert_eq!(file.filename, "test-batch.jsonl", "{name}");
+            assert_eq!(file.bytes, jsonl_content.len() as i64, "{name}: size is the decoded size");
+
+            let downloaded = app
+                .get(&format!("/ai/v1/files/{}/content", file.id))
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                .await
+                .text();
+            let ids: Vec<String> = downloaded
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["custom_id"].to_string())
+                .collect();
+            assert_eq!(ids, ["\"request-1\"", "\"request-2\""], "{name}");
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_upload_broken_or_unsupported_compression_names_the_problem(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        let truncated_gzip = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xab\x56".to_vec();
+        let xz = b"\xfd7zXZ\x00\x00\x04\xe6\xd6\xb4\x46".to_vec();
+        for (content, expected) in [(truncated_gzip, "not valid gzip data"), (xz, "compressed with xz")] {
+            let upload_response = app
+                .post("/ai/v1/files")
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                .multipart(
+                    axum_test::multipart::MultipartForm::new()
+                        .add_text("purpose", "batch")
+                        .add_part("file", axum_test::multipart::Part::bytes(content).file_name("batch.jsonl")),
+                )
+                .await;
+
+            upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+            let body = upload_response.text();
+            assert!(body.contains(expected), "{body}");
         }
     }
 

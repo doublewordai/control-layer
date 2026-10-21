@@ -28,7 +28,7 @@ fusillade = { path = "../fusillade" }
 fusillade-arsenal = { path = "../fusillade-arsenal" }
 tokio = { version = "1.0", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["rt", "io"] }
 notify = "8.2.0"
 sqlx = { version = "0.8", features = [
   "runtime-tokio-rustls",
@@ -109,6 +109,8 @@ outlet = "0.11.0"
 outlet-postgres = "0.8.0"
 brotli = "8.0"
 flate2 = "1"
+zstd = "0.13"
+async-compression = { version = "0.4", features = ["tokio", "gzip", "zstd"] }
 lettre = { version = "0.11", features = [
   "smtp-transport",
   "file-transport",

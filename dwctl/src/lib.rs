@@ -186,6 +186,7 @@ pub mod task_retention;
 pub mod tasks;
 pub mod telemetry;
 mod types;
+mod upload_compression;
 pub mod webhooks;
 
 // Test modules

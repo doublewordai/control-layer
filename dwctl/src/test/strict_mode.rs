@@ -53,6 +53,84 @@ async fn test_inference_body_limit_precedes_processing_in_all_modes(pool: PgPool
     }
 }
 
+/// A compressed realtime body is decoded before the inference stack reads it:
+/// the upstream receives plain JSON without `Content-Encoding`, and an
+/// encoding we don't decode is refused before it gets that far.
+async fn assert_compressed_bodies_reach_upstream_decoded(pool: PgPool, strict_mode: bool) {
+    use std::io::Write;
+
+    let mock = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-compressed",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })))
+        .mount(&mock)
+        .await;
+    let mut config = create_test_config();
+    config.onwards.strict_mode = strict_mode;
+    config.cache.enabled = false;
+    let (server, key, _services) = super::responses::setup_ai_test_with_config(pool, &mock, config).await;
+
+    let json = serde_json::to_vec(&serde_json::json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "compressed hello"}]
+    }))
+    .unwrap();
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gzip.write_all(&json).unwrap();
+    for (encoding, body) in [("gzip", gzip.finish().unwrap()), ("zstd", zstd::encode_all(&json[..], 3).unwrap())] {
+        let response = server
+            .post("/ai/v1/chat/completions")
+            .add_header("Authorization", format!("Bearer {key}"))
+            .add_header("Content-Type", "application/json")
+            .add_header("Content-Encoding", encoding)
+            .bytes(body.into())
+            .await;
+        response.assert_status_ok();
+    }
+
+    let received = mock.received_requests().await.unwrap();
+    assert_eq!(received.len(), 2, "strict_mode={strict_mode}");
+    for request in received {
+        assert!(request.headers.get("content-encoding").is_none(), "strict_mode={strict_mode}");
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["messages"][0]["content"], "compressed hello", "strict_mode={strict_mode}");
+    }
+
+    let response = server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .add_header("Content-Encoding", "lz4")
+        .bytes(json.into())
+        .await;
+    response.assert_status(axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(
+        response.json::<serde_json::Value>()["error"]["code"],
+        "unsupported_content_encoding"
+    );
+    assert_eq!(
+        mock.received_requests().await.unwrap().len(),
+        2,
+        "refused before reaching the upstream"
+    );
+}
+
+#[dwctl_test_macros::test]
+async fn test_compressed_bodies_reach_upstream_decoded_in_strict_mode(pool: PgPool) {
+    assert_compressed_bodies_reach_upstream_decoded(pool, true).await;
+}
+
+#[dwctl_test_macros::test]
+async fn test_compressed_bodies_reach_upstream_decoded_in_passthrough_mode(pool: PgPool) {
+    assert_compressed_bodies_reach_upstream_decoded(pool, false).await;
+}
+
 /// Test that strict mode rejects unknown endpoints with 404
 #[dwctl_test_macros::test]
 #[test_log::test]
