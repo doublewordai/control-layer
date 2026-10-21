@@ -354,6 +354,64 @@ async fn a_preset_account_stamps_its_tolerations_on_uploaded_batch_requests(pool
     assert_eq!(body["model"], "plain");
 }
 
+impl Fixture {
+    /// Write an account-catalog policy row carrying a preset for `alias`
+    /// (`class` None = the whole model) and refresh the per-key policy map.
+    async fn set_model_preset(&self, alias: &str, class: Option<&str>, preset: &str) {
+        sqlx::query(
+            "INSERT INTO account_model_policies (user_id, deployed_model_id, serving_class, toleration_preset, provisioning_source)
+             SELECT $1, id, $3, $4, 'account-catalog' FROM deployed_models WHERE alias = $2",
+        )
+        .bind(self.user)
+        .bind(alias)
+        .bind(class)
+        .bind(preset)
+        .execute(&self.pool)
+        .await
+        .unwrap();
+        self.services.sync_key_policy(&self.pool).await.unwrap();
+    }
+}
+
+/// An account-catalog preset on a model overrides the account's own preset for
+/// that model only; a class preset overrides its model's. Realtime and batch
+/// agree.
+#[dwctl_test_macros::test]
+async fn a_model_preset_overrides_the_account_preset_on_that_model(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let gpu = json!([{"key": "pool", "operator": "Equal", "value": "gpu"}]);
+    f.set_preset(Some("gpu")).await;
+
+    // A preset on another model leaves this one on the account's preset.
+    f.set_model_preset("preset-member", None, "no-overflow").await;
+    assert_eq!(f.post_realtime().await["nvext"]["routing_constraints"]["tolerations"], gpu);
+    assert_eq!(f.upload_batch().await["nvext"]["routing_constraints"]["tolerations"], gpu);
+
+    // A model-level preset on this model replaces the account's.
+    f.set_model_preset("plain", None, "no-overflow").await;
+    assert_eq!(f.post_realtime().await["nvext"]["routing_constraints"]["tolerations"], json!([]));
+    assert_eq!(f.upload_batch().await["nvext"]["routing_constraints"]["tolerations"], json!([]));
+
+    // A class preset overrides the model's.
+    f.set_model_preset("plain", Some("standard"), "gpu").await;
+    assert_eq!(f.post_realtime().await["nvext"]["routing_constraints"]["tolerations"], gpu);
+    assert_eq!(f.post_responses().await["nvext"]["routing_constraints"]["tolerations"], gpu);
+    assert_eq!(f.upload_batch().await["nvext"]["routing_constraints"]["tolerations"], gpu);
+}
+
+/// A model preset applies to an account with no preset of its own, and only
+/// on that model: "no preset" elsewhere stays distinct from the empty list.
+#[dwctl_test_macros::test]
+async fn a_model_preset_pins_an_otherwise_default_account(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    f.set_model_preset("preset-member", None, "gpu").await;
+    let body = f.post_realtime().await;
+    assert!(body["nvext"]["routing_constraints"]["tolerations"].is_null(), "{body}");
+
+    f.set_model_preset("plain", None, "no-overflow").await;
+    assert_eq!(f.post_realtime().await["nvext"]["routing_constraints"]["tolerations"], json!([]));
+}
+
 /// A platform manager sets the preset through the admin API; a non-manager
 /// cannot, an unknown id is refused, and the preset is only visible back to a
 /// platform manager.
