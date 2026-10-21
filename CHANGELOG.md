@@ -1,5 +1,12 @@
 # Changelog
 
+## [15.1.0](https://github.com/doublewordai/control-layer/compare/v15.0.0...v15.1.0) (2026-10-21)
+
+
+### Features
+
+* account files carry priority, latency targets and prices ([#2075](https://github.com/doublewordai/control-layer/issues/2075)) ([a2f91a6](https://github.com/doublewordai/control-layer/commit/a2f91a6e2bfad9f67af1a47116aa9e613c1d29dc))
+
 ## [15.0.0](https://github.com/doublewordai/control-layer/compare/v14.5.0...v15.0.0) (2026-10-21)
 
 
