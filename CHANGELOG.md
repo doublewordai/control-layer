@@ -1,5 +1,12 @@
 # Changelog
 
+## [15.2.0](https://github.com/doublewordai/control-layer/compare/v15.1.0...v15.2.0) (2026-10-21)
+
+
+### Features
+
+* per-model and per-class toleration presets in account files ([#2081](https://github.com/doublewordai/control-layer/issues/2081)) ([d916973](https://github.com/doublewordai/control-layer/commit/d916973cd77971e79e7088edbc4a3d46b90fd1a0))
+
 ## [15.1.0](https://github.com/doublewordai/control-layer/compare/v15.0.0...v15.1.0) (2026-10-21)
 
 
