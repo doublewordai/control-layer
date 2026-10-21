@@ -92,18 +92,20 @@ export function ModelPricing({
   const selectedOverlay = own.data?.overlays.find(
     (row) => row.deployed_model_id === model.id,
   );
+  // Billing resolves to `standard`, or `custom` when the overlay's explicit
+  // targets apply; prices under any other class name are never selected.
   const classes = organization
     ? [
-        ...new Set([
-          "standard",
-          ...(selectedOverlay?.targets ? ["custom"] : []),
-          ...rows
-            .filter((row) => row.organization_id === organization)
-            .flatMap((row) => (row.serving_class ? [row.serving_class] : [])),
-          ...orgCache.flatMap((row) =>
-            row.serving_class ? [row.serving_class] : [],
-          ),
-        ]),
+        "standard",
+        ...(selectedOverlay?.targets ||
+        rows.some(
+          (row) =>
+            row.organization_id === organization &&
+            row.serving_class === "custom",
+        ) ||
+        orgCache.some((row) => row.serving_class === "custom")
+          ? ["custom"]
+          : []),
       ]
     : ["standard"];
   const windows = [

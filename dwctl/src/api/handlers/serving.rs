@@ -448,6 +448,34 @@ mod tests {
                 );
             }
         }
+
+        // The retired class fields are ignored on PATCH and never returned.
+        server
+            .patch(&format!("/admin/api/v1/organizations/{}", org.id))
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"granted_serving_classes": ["interactive"], "default_serving_class": "interactive", "self_hosted_only": true}))
+            .await
+            .assert_status_ok();
+        let serving: Value = get(&server, &format!("/admin/api/v1/organizations/{}/serving", org.id), &admin)
+            .await
+            .json();
+        assert_eq!(serving["self_hosted_only"], json!(true));
+        let organization: Value = get(&server, &format!("/admin/api/v1/organizations/{}", org.id), &admin)
+            .await
+            .json();
+        for body in [&serving, &organization] {
+            for field in ["granted_serving_classes", "default_serving_class"] {
+                assert!(body.get(field).is_none(), "{field} is retired: {body}");
+            }
+        }
+        let stored: (Vec<String>, Option<String>) =
+            sqlx::query_as("SELECT granted_serving_classes, default_serving_class FROM users WHERE id = $1")
+                .bind(org.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, (Vec::new(), None), "the retired columns are never written");
     }
 
     #[dwctl_test_macros::test]

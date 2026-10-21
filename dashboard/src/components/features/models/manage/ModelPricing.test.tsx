@@ -51,9 +51,9 @@ const serving: OrganizationServing = {
       organization_id: "org-a",
       input_price_per_token: "0.000002",
     }),
-    tariff("interactive", {
+    tariff("custom", {
       organization_id: "org-a",
-      serving_class: "interactive",
+      serving_class: "custom",
       input_price_per_token: "0",
       output_price_per_token: "0",
     }),
@@ -62,7 +62,7 @@ const serving: OrganizationServing = {
     {
       deployed_model_id: "model",
       alias: "example-model",
-      serving_class: "interactive",
+      serving_class: "custom",
       read_multiplier: "0.25",
       write_multiplier_5m: "1",
       write_multiplier_1h: "2",
@@ -188,7 +188,7 @@ describe("model pricing selector", () => {
   it("shows effective playground prices when only realtime is configured", () => {
     const { container } = mount(true, "org-a");
     const playground = within(within(container).getByRole("region", { name: "Playground prices" }));
-    expect(playground.getByText("Bespoke · interactive · realtime fallback")).toBeInTheDocument();
+    expect(playground.getByText("Bespoke · custom · realtime fallback")).toBeInTheDocument();
     expect(playground.getAllByText("$0")).toHaveLength(2);
     expect(playground.getAllByText("$2.00")).toHaveLength(1);
   });
@@ -212,7 +212,7 @@ describe("model pricing selector", () => {
       }),
     );
     const rt = within(page.getByRole("region", { name: "Realtime prices" }));
-    expect(rt.getByText("Bespoke · interactive")).toBeInTheDocument();
+    expect(rt.getByText("Bespoke · custom")).toBeInTheDocument();
     expect(rt.getAllByText("$0")).toHaveLength(2);
     expect(rt.getAllByText("$2.00")).toHaveLength(1);
     const batch = within(
@@ -246,6 +246,30 @@ describe("model pricing selector", () => {
     ).toBeInTheDocument();
     expect(cache.queryByText("0.25×")).not.toBeInTheDocument();
     expect(cache.getByText("0.1×")).toBeInTheDocument();
+  });
+  it("never lists prices under a retired class name", () => {
+    vi.mocked(useOrganizationServing).mockReturnValue({
+      data: {
+        ...serving,
+        tariffs: [
+          tariff("legacy", {
+            organization_id: "org-a",
+            serving_class: "interactive",
+            input_price_per_token: "0",
+            output_price_per_token: "0",
+          }),
+        ],
+        cache_tariffs: [],
+      },
+      isLoading: false,
+      isError: false,
+    } as unknown as ReturnType<typeof useOrganizationServing>);
+    const { container } = mount(true, "org-a");
+    const rt = within(
+      within(container).getByRole("region", { name: "Realtime prices" }),
+    );
+    expect(rt.queryByText("interactive")).not.toBeInTheDocument();
+    expect(rt.getByText("standard")).toBeInTheDocument();
   });
   it("shows custom target pricing even without a class-specific tariff", () => {
     vi.mocked(useOrganizationServing).mockReturnValue({
