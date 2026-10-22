@@ -205,6 +205,18 @@ fn validate_metadata(metadata: &ModelCatalogMetadata) -> Result<()> {
             message: format!("metadata.max_output_tokens ({max_output_tokens}) must not exceed metadata.context_window ({context_window})"),
         });
     }
+    if let Some(default_max_tokens) = metadata.default_max_tokens {
+        validate_token_limit("metadata.default_max_tokens", default_max_tokens)?;
+    }
+    if let (Some(default_max_tokens), Some(context_window)) = (metadata.default_max_tokens, metadata.context_window)
+        && default_max_tokens > context_window
+    {
+        return Err(Error::BadRequest {
+            message: format!(
+                "metadata.default_max_tokens ({default_max_tokens}) must not exceed metadata.context_window ({context_window})"
+            ),
+        });
+    }
     Ok(())
 }
 

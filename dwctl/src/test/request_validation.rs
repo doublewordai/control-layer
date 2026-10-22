@@ -772,3 +772,95 @@ async fn disabled_validation_forwards_a_violating_request(pool: PgPool) {
     assert_eq!(response.status_code(), StatusCode::OK, "{}", response.text());
     assert_eq!(rejected_by(&response), None);
 }
+
+/// The body of the last chat completion the upstream received.
+async fn last_upstream_chat_body(fixture: &Fixture) -> Value {
+    let requests = fixture._mock.received_requests().await.expect("request recording is on");
+    let request = requests
+        .iter()
+        .rev()
+        .find(|request| request.url.path() == "/v1/chat/completions")
+        .expect("the upstream received a chat completion");
+    serde_json::from_slice(&request.body).expect("upstream body is JSON")
+}
+
+/// Deploy a chat model with `metadata` and wait until it routes.
+async fn routable_chat_model(fixture: &Fixture, pool: &PgPool, prefix: &str, metadata: Value) -> String {
+    let alias = format!("{prefix}-{}", Uuid::new_v4());
+    fixture
+        .create_model(model_body(
+            &alias,
+            fixture.endpoint_id,
+            json!({"model_type": "CHAT", "metadata": metadata}),
+        ))
+        .await;
+    fixture.sync(pool).await;
+    fixture.wait_until_routable(&alias).await;
+    alias
+}
+
+/// A request without an output cap reaches the upstream with the product
+/// default; one with its own cap reaches it unchanged.
+#[sqlx::test]
+#[test_log::test]
+async fn uncapped_requests_get_the_default_output_cap(pool: PgPool) {
+    let fixture = setup(&pool, validation_config(false, RuleMode::Shadow)).await;
+    let alias = routable_chat_model(&fixture, &pool, "defaulted", json!({"context_window": 1_048_576})).await;
+
+    let response = fixture.chat(chat_request(&alias, "hi")).await;
+    assert_eq!(response.status_code(), StatusCode::OK, "{}", response.text());
+    let forwarded = last_upstream_chat_body(&fixture).await;
+    assert_eq!(forwarded["max_tokens"], 65_536, "{forwarded}");
+
+    let mut capped = chat_request(&alias, "hi");
+    capped["max_completion_tokens"] = json!(300_000);
+    let response = fixture.chat(capped).await;
+    assert_eq!(response.status_code(), StatusCode::OK, "{}", response.text());
+    let forwarded = last_upstream_chat_body(&fixture).await;
+    assert_eq!(forwarded["max_completion_tokens"], 300_000, "{forwarded}");
+    assert!(forwarded.get("max_tokens").is_none(), "{forwarded}");
+}
+
+/// A model's catalog `default_max_tokens` replaces the product default.
+#[sqlx::test]
+#[test_log::test]
+async fn the_catalog_default_overrides_the_product_default(pool: PgPool) {
+    let fixture = setup(&pool, validation_config(false, RuleMode::Shadow)).await;
+    let alias = routable_chat_model(
+        &fixture,
+        &pool,
+        "long-default",
+        json!({"context_window": 1_048_576, "default_max_tokens": 262_144}),
+    )
+    .await;
+
+    let response = fixture.chat(chat_request(&alias, "hi")).await;
+    assert_eq!(response.status_code(), StatusCode::OK, "{}", response.text());
+    assert_eq!(last_upstream_chat_body(&fixture).await["max_tokens"], 262_144);
+}
+
+/// With `request_defaults` off, an uncapped request is forwarded uncapped.
+#[sqlx::test]
+#[test_log::test]
+async fn disabled_defaults_forward_an_uncapped_request(pool: PgPool) {
+    let mut config = validation_config(false, RuleMode::Shadow);
+    config.request_defaults.enabled = false;
+    let fixture = setup(&pool, config).await;
+    let alias = routable_chat_model(&fixture, &pool, "undefaulted", json!({"context_window": 1_048_576})).await;
+
+    let response = fixture.chat(chat_request(&alias, "hi")).await;
+    assert_eq!(response.status_code(), StatusCode::OK, "{}", response.text());
+    assert!(last_upstream_chat_body(&fixture).await.get("max_tokens").is_none());
+}
+
+/// A model with no `context_window` cannot be shown to fit, so it is left alone.
+#[sqlx::test]
+#[test_log::test]
+async fn a_model_without_a_context_window_is_forwarded_uncapped(pool: PgPool) {
+    let fixture = setup(&pool, validation_config(false, RuleMode::Shadow)).await;
+    let alias = routable_chat_model(&fixture, &pool, "windowless", json!({})).await;
+
+    let response = fixture.chat(chat_request(&alias, "hi")).await;
+    assert_eq!(response.status_code(), StatusCode::OK, "{}", response.text());
+    assert!(last_upstream_chat_body(&fixture).await.get("max_tokens").is_none());
+}

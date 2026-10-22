@@ -176,13 +176,15 @@ pub struct ModelSettings {
     pub sanitize_responses: bool,
     pub trusted: bool,
     pub allowed_batch_completion_windows: Option<Vec<String>>,
-    /// Free-form catalog metadata. `context_window` and `max_output_tokens`
-    /// are validated when present; unknown keys pass through untouched.
+    /// Free-form catalog metadata. `context_window`, `max_output_tokens` and
+    /// `default_max_tokens` are validated when present; unknown keys pass
+    /// through untouched.
     #[schemars(extend(
         "type" = "object",
         "properties" = {
             "context_window": {"type": "integer", "minimum": 1, "maximum": MODEL_TOKEN_LIMIT_MAX},
-            "max_output_tokens": {"type": "integer", "minimum": 1, "maximum": MODEL_TOKEN_LIMIT_MAX}
+            "max_output_tokens": {"type": "integer", "minimum": 1, "maximum": MODEL_TOKEN_LIMIT_MAX},
+            "default_max_tokens": {"type": "integer", "minimum": 1, "maximum": MODEL_TOKEN_LIMIT_MAX}
         },
         "additionalProperties" = true
     ))]
@@ -808,6 +810,17 @@ fn validate_settings(settings: &ModelSettings, source: &str, field: &str) -> Res
     {
         bail!(
             "{source}: {field}.metadata.max_output_tokens ({max_output_tokens}) must not exceed metadata.context_window ({context_window})"
+        );
+    }
+    let default_max_tokens = match settings.metadata.get("default_max_tokens") {
+        Some(value) => Some(parse_metadata_token_limit(value, source, field, "default_max_tokens")?),
+        None => None,
+    };
+    if let (Some(default_max_tokens), Some(context_window)) = (default_max_tokens, context_window)
+        && default_max_tokens > context_window
+    {
+        bail!(
+            "{source}: {field}.metadata.default_max_tokens ({default_max_tokens}) must not exceed metadata.context_window ({context_window})"
         );
     }
     Ok(())

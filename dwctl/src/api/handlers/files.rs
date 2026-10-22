@@ -28,7 +28,7 @@ use crate::db::{
 };
 use crate::errors::{Error, Result};
 use crate::image_normalizer::{ImageInput, ImageNormalizer, Mode as ImageNormalizerMode, walker as image_walker};
-use crate::inference::validation::{ExactCountBudget, Source, Surface, ValidationStage};
+use crate::inference::validation::{ExactCountBudget, OutputCapDefaults, Source, Surface, ValidationStage};
 use crate::reasoning::ModelReasoningPolicy;
 use crate::sync::key_policy::AccountTolerations;
 use crate::types::Resource;
@@ -723,6 +723,9 @@ struct FileRequestContext {
     allowed_url_paths: Vec<String>,
     /// Inference request validation, applied to every line. `None` when disabled.
     validation: Option<ValidationStage>,
+    /// The product-level output cap, given to every line that sets none.
+    /// `None` when disabled.
+    output_cap_defaults: Option<OutputCapDefaults>,
     /// The toleration presets of the account that owns this upload, resolved
     /// per line by its model. A pinned line's list is written verbatim to
     /// `nvext.routing_constraints.tolerations` on its template body.
@@ -755,6 +758,26 @@ async fn validate_batch_line(
             message: violation.message,
         }),
         None => Ok(()),
+    }
+}
+
+/// Give a batch line that sets no output cap the product default, as the
+/// inference endpoints do for realtime and flex requests.
+async fn apply_batch_line_defaults(
+    defaults: Option<&OutputCapDefaults>,
+    budget: Option<&ExactCountBudget>,
+    template: &mut fusillade::RequestTemplateInput,
+) {
+    let (Some(defaults), Some(surface)) = (defaults, Surface::from_path(&template.path)) else {
+        return;
+    };
+    let Ok(mut body) = serde_json::from_str::<serde_json::Value>(&template.body) else {
+        return;
+    };
+    if defaults.apply(surface, &mut body, budget).await.changed()
+        && let Ok(serialized) = serde_json::to_string(&body)
+    {
+        template.body = serialized;
     }
 }
 
@@ -791,11 +814,13 @@ fn create_file_stream(
         accessible_models,
         allowed_url_paths,
         validation,
+        output_cap_defaults,
         tolerations,
     } = req_ctx;
     // Lines are validated one after another, so cap the tokenizer round trips
     // a single upload can spend on exact counts.
     let exact_budget = validation.as_ref().map(ValidationStage::batch_file_budget);
+    let defaults_budget = output_cap_defaults.as_ref().map(OutputCapDefaults::batch_file_budget);
     let normalizer = config.normalizer.clone();
     let normalizer_mode = config.normalizer_mode;
     let access_pool = config.access_pool.clone();
@@ -1017,6 +1042,12 @@ fn create_file_stream(
                                                     {
                                                         abort!(e);
                                                     }
+                                                    apply_batch_line_defaults(
+                                                        output_cap_defaults.as_ref(),
+                                                        defaults_budget.as_ref(),
+                                                        &mut template,
+                                                    )
+                                                    .await;
 
                                                     // Normalise image URLs in the per-template body
                                                     // before the size cap check, since substitution
@@ -1127,6 +1158,12 @@ fn create_file_stream(
                                             {
                                                 abort!(e);
                                             }
+                                            apply_batch_line_defaults(
+                                                output_cap_defaults.as_ref(),
+                                                defaults_budget.as_ref(),
+                                                &mut template,
+                                            )
+                                            .await;
 
                                             // Normalise image URLs in the trailing line as well.
                                             if let Err(e) = normalize_template_body_in_place(
@@ -1411,6 +1448,7 @@ pub async fn upload_file<P: PoolProvider>(
             accessible_models,
             allowed_url_paths: config.batches.allowed_url_paths.clone(),
             validation: state.request_validation.clone(),
+            output_cap_defaults: state.output_cap_defaults.clone(),
             tolerations,
         },
         Some(api_key_id),

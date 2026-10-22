@@ -28,12 +28,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::models::deployments::ModelType;
 
+pub mod defaults;
 pub mod envelope;
 pub mod exact;
 pub mod rules;
 pub mod stage;
 pub mod view;
 
+pub use defaults::{DefaultsConfig, OutputCapDefaults};
 pub use rules::evaluate;
 pub use stage::{ExactCountBudget, Source, ValidationStage};
 pub use view::RequestView;
@@ -102,6 +104,9 @@ pub struct ModelInfo {
     pub context_window: Option<u64>,
     /// Maximum completion tokens the model may be asked for.
     pub max_output_tokens: Option<u64>,
+    /// Output cap given to a request that sets none, overriding
+    /// `request_defaults.max_tokens` for this model.
+    pub default_max_tokens: Option<u64>,
     /// Catalog capabilities (`vision`, `reasoning`, ...). `None` = unknown,
     /// which disables capability-based rules for the model.
     pub capabilities: Option<Vec<String>>,

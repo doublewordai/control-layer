@@ -52,7 +52,7 @@ impl ExactCountBudget {
         Self(AtomicUsize::new(max))
     }
 
-    fn try_take(&self) -> bool {
+    pub(super) fn try_take(&self) -> bool {
         #[allow(deprecated)] // `try_update` from Rust 1.99; see `continuation::try_acquire`.
         let taken = self
             .0
@@ -205,6 +205,7 @@ mod tests {
             model_type: Some(ModelType::Chat),
             context_window: Some(100),
             max_output_tokens: None,
+            default_max_tokens: None,
             capabilities: Some(vec!["reasoning".to_string()]),
         };
         let embedder = ModelInfo {

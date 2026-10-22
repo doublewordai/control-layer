@@ -122,6 +122,7 @@ async fn load(pool: &PgPool) -> Result<AliasMap, sqlx::Error> {
                 model_type: model_type_from_str(row.model_type.as_deref()),
                 context_window: token_count(&row.metadata, "context_window"),
                 max_output_tokens: token_count(&row.metadata, "max_output_tokens"),
+                default_max_tokens: token_count(&row.metadata, "default_max_tokens"),
                 capabilities: row.capabilities,
             };
             (row.alias, Arc::new(info))
@@ -323,6 +324,7 @@ mod tests {
             model_type,
             context_window,
             max_output_tokens,
+            default_max_tokens: None,
             capabilities: None,
         }
     }
