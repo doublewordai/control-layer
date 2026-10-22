@@ -43,7 +43,7 @@ clay:
       display_name: Fast
       endpoint: gateway
       upstream_model_name: dynamo-example/fast
-      aliases: [example/model-fast]
+      realtime_inflight_limit: 7
       tariffs:
         - name: fast
           purpose: realtime
@@ -66,24 +66,53 @@ async fn setup(pool: &PgPool) {
 }
 
 #[test]
-fn class_catalog_rejects_missing_fast() {
+fn class_catalog_requires_standard_and_nothing_else() {
     let mut v = fixture();
     v["clay"]["class_routes"].as_mapping_mut().unwrap().remove("fast");
-    assert!(catalog(&v).unwrap_err().to_string().contains("standard and fast"));
-}
-
-#[test]
-fn class_catalog_rejects_synonym_shadowing_primary_fast_name() {
+    catalog(&v).unwrap();
     let mut v = fixture();
-    v["clay"]["class_routes"]["fast"]["aliases"] = serde_yaml::to_value(["example/model:fast"]).unwrap();
-    assert!(catalog(&v).is_err());
+    v["clay"]["class_routes"].as_mapping_mut().unwrap().remove("standard");
+    assert!(catalog(&v).unwrap_err().to_string().contains("requires a standard class"));
 }
 
 #[test]
-fn class_catalog_rejects_activation_in_yaml() {
+fn class_catalog_rejects_class_aliases_and_bad_limits() {
+    let mut v = fixture();
+    v["clay"]["class_routes"]["fast"]["aliases"] = serde_yaml::to_value(["example/model-fast"]).unwrap();
+    assert!(catalog(&v).unwrap_err().to_string().contains("class aliases are retired"));
+    let mut v = fixture();
+    v["clay"]["class_routes"]["fast"]["realtime_inflight_limit"] = serde_yaml::to_value(0).unwrap();
+    assert!(
+        catalog(&v)
+            .unwrap_err()
+            .to_string()
+            .contains("realtime_inflight_limit must be positive")
+    );
+}
+
+#[test]
+fn class_catalog_activation_needs_standard_and_no_redirects() {
     let mut v = fixture();
     v["clay"]["routing_mode"] = serde_yaml::Value::String("class_routes".into());
-    assert!(catalog(&v).is_err());
+    catalog(&v).unwrap();
+
+    let mut without_classes = v.clone();
+    without_classes["clay"].as_mapping_mut().unwrap().remove("class_routes");
+    assert!(
+        catalog(&without_classes)
+            .unwrap_err()
+            .to_string()
+            .contains("requires a standard class")
+    );
+
+    let mut redirecting = v.clone();
+    redirecting["clay"]["traffic_rules"] =
+        serde_yaml::from_str("- {action: redirect, purpose: batch, target: legacy-example/model}").unwrap();
+    assert!(catalog(&redirecting).unwrap_err().to_string().contains("cannot redirect"));
+
+    let mut denying = v;
+    denying["clay"]["traffic_rules"] = serde_yaml::from_str("- {action: deny, purpose: playground}").unwrap();
+    catalog(&denying).unwrap();
 }
 
 fn add_batch_price(value: &mut serde_yaml::Value, class: &str) {
@@ -103,7 +132,6 @@ fn class_catalog_rejects_batch_prices_on_nonstandard_classes() {
         let mut value = fixture();
         if key != "fast" {
             value["clay"]["class_routes"][key] = value["clay"]["class_routes"]["fast"].clone();
-            value["clay"]["class_routes"][key]["aliases"] = serde_yaml::to_value(Vec::<String>::new()).unwrap();
         }
         add_batch_price(&mut value, key);
         let error = catalog(&value).unwrap_err().to_string();
@@ -137,11 +165,12 @@ async fn staging_classes_preserves_legacy_route_and_effective_price(pool: PgPool
         .await
         .unwrap();
     assert_eq!(members, 1);
-    let names: Vec<String> = sqlx::query_scalar("SELECT alias FROM model_aliases ORDER BY alias")
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-    assert_eq!(names, ["example/model-fast"]);
+    let limits: Vec<(String, Option<i32>)> =
+        sqlx::query_as("SELECT class_key, realtime_inflight_limit FROM model_serving_classes ORDER BY class_key")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(limits, [("fast".into(), Some(7)), ("standard".into(), None)]);
     for class in [None, Some("standard"), Some("fast")] {
         let price: Decimal =
             sqlx::query_scalar("SELECT input_price_per_token FROM effective_model_tariff($1,NULL,'realtime',NULL,$2,NOW())")
@@ -232,9 +261,9 @@ async fn omitted_class_configuration_retires_prices_without_erasing_history(pool
 }
 
 #[sqlx::test]
-async fn synonym_collision_with_existing_private_model_rolls_back_catalog(pool: PgPool) {
+async fn class_name_collision_with_existing_model_rolls_back_catalog(pool: PgPool) {
     setup(&pool).await;
-    sqlx::query("INSERT INTO deployed_models (alias,model_name,is_composite,created_by) VALUES ('example/model-fast','private',true,'00000000-0000-0000-0000-000000000000')").execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO deployed_models (alias,model_name,is_composite,created_by) VALUES ('example/model:fast','private',true,'00000000-0000-0000-0000-000000000000')").execute(&pool).await.unwrap();
     assert!(apply(&pool, &catalog(&fixture()).unwrap()).await.is_err());
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM model_serving_classes")
         .fetch_one(&pool)
@@ -279,31 +308,35 @@ fn class_catalog_schema_restricts_class_keys() {
 }
 
 #[sqlx::test]
-async fn catalog_refuses_activated_models_without_resetting_operator_mode(pool: PgPool) {
+async fn the_catalog_owns_activation_and_rolls_it_back(pool: PgPool) {
     setup(&pool).await;
-    let c = catalog(&fixture()).unwrap();
-    apply(&pool, &c).await.unwrap();
-    sqlx::query("UPDATE deployed_models SET routing_mode='class_routes' WHERE alias='example/model'")
-        .execute(&pool)
-        .await
-        .unwrap();
-    let error = apply(&pool, &c).await.unwrap_err();
-    assert!(error.to_string().contains("activated"));
-    let mode: String = sqlx::query_scalar("SELECT routing_mode FROM deployed_models WHERE alias='example/model'")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(mode, "class_routes");
+    let mode = || async {
+        sqlx::query_scalar::<_, String>("SELECT routing_mode FROM deployed_models WHERE alias='example/model'")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    let mut v = fixture();
+    v["clay"]["routing_mode"] = serde_yaml::Value::String("class_routes".into());
+    apply(&pool, &catalog(&v).unwrap()).await.unwrap();
+    assert_eq!(mode().await, "class_routes");
+    // Editing an activated model is ordinary catalog work now.
+    v["clay"]["class_routes"]["fast"]["upstream_model_name"] = serde_yaml::Value::String("moved".into());
+    apply(&pool, &catalog(&v).unwrap()).await.unwrap();
+    assert_eq!(mode().await, "class_routes");
+    // Rolling back is removing the field.
+    apply(&pool, &catalog(&fixture()).unwrap()).await.unwrap();
+    assert_eq!(mode().await, "legacy");
 }
 
 #[sqlx::test]
-async fn ordinary_model_creation_cannot_claim_a_class_synonym(pool: PgPool) {
+async fn ordinary_model_creation_cannot_claim_a_class_name(pool: PgPool) {
     use crate::db::handlers::{Deployments, repository::Repository};
     use crate::db::models::deployments::DeploymentCreateDBRequest;
     setup(&pool).await;
     apply(&pool, &catalog(&fixture()).unwrap()).await.unwrap();
     let mut conn = pool.acquire().await.unwrap();
-    for name in ["example/model-fast", "example/model:fast"] {
+    for name in ["example/model:fast", "EXAMPLE/model:FAST"] {
         let request = DeploymentCreateDBRequest::builder()
             .created_by(Uuid::nil())
             .alias(name.into())
@@ -315,13 +348,15 @@ async fn ordinary_model_creation_cannot_claim_a_class_synonym(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn renaming_a_model_cannot_shadow_an_existing_synonym_with_its_class_name(pool: PgPool) {
+async fn renaming_a_model_cannot_shadow_an_existing_model_with_its_class_name(pool: PgPool) {
     use crate::db::handlers::{Deployments, repository::Repository};
     use crate::db::models::deployments::DeploymentUpdateDBRequest;
     setup(&pool).await;
-    let mut v = fixture();
-    v["clay"]["class_routes"]["fast"]["aliases"] = serde_yaml::to_value(["renamed/model:fast"]).unwrap();
-    apply(&pool, &catalog(&v).unwrap()).await.unwrap();
+    sqlx::query("INSERT INTO deployed_models (alias,model_name,is_composite,created_by) VALUES ('renamed/model:fast','other',true,'00000000-0000-0000-0000-000000000000')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    apply(&pool, &catalog(&fixture()).unwrap()).await.unwrap();
     let id: Uuid = sqlx::query_scalar("SELECT id FROM deployed_models WHERE alias='example/model'")
         .fetch_one(&pool)
         .await
@@ -352,7 +387,7 @@ async fn concurrent_model_writer_waits_for_catalog_and_then_rejects_collision(po
     let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *conn).await.unwrap();
     let request = DeploymentCreateDBRequest::builder()
         .created_by(Uuid::nil())
-        .alias("example/model-fast".into())
+        .alias("example/model:fast".into())
         .model_name("competing".into())
         .is_composite(true)
         .build();

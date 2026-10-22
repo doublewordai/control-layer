@@ -156,6 +156,11 @@
           },
           "default": []
         },
+        "routing_mode": {
+          "description": "How the model routes: `legacy` (its composite routing) or\n`class_routes` (each class in `class_routes` to its own upstream:\n`alias` to `standard`, `alias:<class>` to that class).",
+          "$ref": "#/$defs/RoutingMode",
+          "default": "legacy"
+        },
         "serving_classes": {
           "description": "Retired. Accepted only when empty, so existing catalog files still\nload; remove it.",
           "type": "object",
@@ -163,7 +168,7 @@
           "maxProperties": 0
         },
         "class_routes": {
-          "description": "Explicit class destinations and prices, staged independently of legacy routing.\nDeclaring these does not activate routes or advertise additional model names.",
+          "description": "Class destinations and prices. Declaring them alone changes nothing;\n`routing_mode: class_routes` activates them. `standard` is required.",
           "type": "object",
           "additionalProperties": {
             "$ref": "#/$defs/ClassRoute"
@@ -770,6 +775,21 @@
         "continuation"
       ]
     },
+    "RoutingMode": {
+      "description": "How a virtual model routes its requests.",
+      "oneOf": [
+        {
+          "description": "The model's composite routing (`routing`).",
+          "type": "string",
+          "const": "legacy"
+        },
+        {
+          "description": "Each class in `class_routes` routes to its own upstream.",
+          "type": "string",
+          "const": "class_routes"
+        }
+      ]
+    },
     "ClassRoute": {
       "description": "Complete catalog declaration for a stable class of the existing public model.",
       "type": "object",
@@ -784,12 +804,21 @@
           "type": "string"
         },
         "aliases": {
-          "description": "Optional exact ingress spellings, never additional discovery entries.",
+          "description": "Retired. Accepted only when empty: a class is reached only by the\nmodel's alias (`alias` or `alias:<class>`).",
           "type": "array",
           "items": {
             "type": "string"
           },
-          "default": []
+          "maxItems": 0
+        },
+        "realtime_inflight_limit": {
+          "description": "Concurrent realtime requests one account may have in flight on this\nclass. Omit for the model's `settings.realtime_inflight_limit`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32",
+          "minimum": 1
         },
         "tariffs": {
           "type": "array",
