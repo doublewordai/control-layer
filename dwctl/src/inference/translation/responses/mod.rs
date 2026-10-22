@@ -278,7 +278,7 @@ fn openai_error(status: StatusCode, message: &str, param: Option<&str>, code: Op
 /// Wraps the (dwctl-owned) [`streaming::StreamingState`] in the [`StreamReframer`]
 /// interface: each upstream Chat Completions chunk is fed through `process_chunk`
 /// and the resulting Responses SSE events are serialised out; `finish` flushes
-/// `finalize` (which emits `response.completed`).
+/// `finalize` (which emits `response.completed` or `response.incomplete`).
 struct ResponsesStreamReframer {
     /// `None` only if the (already validated) request failed to re-parse; we then
     /// emit a single terminal error rather than a stream.
@@ -700,6 +700,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["object"], "response");
         assert_eq!(v["status"], "incomplete", "length-capped replies surface as incomplete");
+        assert_eq!(v["incomplete_details"]["reason"], "max_output_tokens");
         assert_eq!(v["model"], "m", "model backfilled from the request");
         assert_eq!(v["output"][0]["role"], "assistant", "missing role defaults to assistant");
         assert_eq!(v["output"][0]["content"][0]["text"], "Hello");
@@ -737,6 +738,49 @@ mod tests {
         let text = response.text();
         assert!(text.contains("event: response.output_text.delta"), "chunk was dropped:\n{text}");
         assert!(text.contains("Hi"), "missing text delta in:\n{text}");
+    }
+
+    /// A stream the output cap ends inside the reasoning (the shape pi used to
+    /// end silently on) must close with `response.incomplete` and a reason.
+    #[tokio::test]
+    async fn length_cut_stream_ends_with_response_incomplete() {
+        async fn fake_chat_sse(_req: Request) -> Response {
+            let sse = concat!(
+                "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"Let me think\"}}]}\n\n",
+                "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+                "data: [DONE]\n\n",
+            );
+            let mut r = Response::new(Body::from(sse));
+            r.headers_mut()
+                .insert(header::CONTENT_TYPE, header::HeaderValue::from_static("text/event-stream"));
+            r
+        }
+
+        let registry = TranslationRegistry::new(vec![Arc::new(OpenResponses::new())]);
+        let inner = Router::new()
+            .route("/responses", post(fake_chat_sse))
+            .layer(axum::middleware::from_fn_with_state(registry, translation_middleware));
+        let server = axum_test::TestServer::new(Router::new().nest("/ai/v1", inner)).expect("test server");
+
+        let response = server
+            .post("/ai/v1/responses")
+            .json(&serde_json::json!({ "model": "m", "input": "hi", "stream": true, "max_output_tokens": 16 }))
+            .await;
+
+        assert_eq!(response.status_code().as_u16(), 200);
+        let text = response.text();
+        assert!(!text.contains("response.completed"), "{text}");
+        let terminal = text
+            .split("\n\n")
+            .filter_map(|frame| frame.lines().find_map(|line| line.strip_prefix("data: ")))
+            .last()
+            .expect("a terminal event");
+        let terminal: serde_json::Value = serde_json::from_str(terminal).unwrap();
+        assert_eq!(terminal["type"], "response.incomplete", "{text}");
+        assert_eq!(terminal["response"]["status"], "incomplete");
+        assert_eq!(terminal["response"]["incomplete_details"]["reason"], "max_output_tokens");
+        assert_eq!(terminal["response"]["output"][0]["type"], "reasoning");
+        assert_eq!(terminal["response"]["output"][0]["status"], "incomplete");
     }
 
     /// A 2xx body the translator genuinely cannot translate must surface as a

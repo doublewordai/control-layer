@@ -514,6 +514,11 @@ pub fn detail_to_response_object(detail: &fusillade::RequestDetail) -> serde_jso
             if let Some(usage) = parsed.get("usage") {
                 resp["usage"] = usage.clone();
             }
+            // A Responses body cut short by the output cap or a content filter.
+            if parsed.get("status").and_then(|s| s.as_str()) == Some("incomplete") {
+                resp["status"] = serde_json::json!("incomplete");
+                resp["incomplete_details"] = parsed.get("incomplete_details").cloned().unwrap_or(serde_json::Value::Null);
+            }
             // ChatCompletion format (batch results)
             if parsed.get("choices").is_some() {
                 resp["output"] = serde_json::json!([{
@@ -523,7 +528,12 @@ pub fn detail_to_response_object(detail: &fusillade::RequestDetail) -> serde_jso
                 }]);
             }
         }
-        resp["completed_at"] = serde_json::json!(detail.completed_at.map(|t| t.timestamp()));
+        // An incomplete response has no completion time, as on the live path.
+        resp["completed_at"] = if resp["status"] == "incomplete" {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!(detail.completed_at.map(|t| t.timestamp()))
+        };
     }
 
     if status == "failed"
@@ -796,7 +806,8 @@ pub fn chat_completion_to_stream_chunks(completion: &serde_json::Value, include_
 ///   │    response.output_text.delta      (the whole text in one delta)
 ///   │    response.output_text.done
 ///   │    response.output_item.done       (closes the text part)
-///   response.completed                   (terminator; carries usage)
+///   response.completed                   (terminator; carries usage;
+///                                         response.incomplete when cut short)
 ///
 /// Tool-call / reasoning items in `output` are passed through inside
 /// `response.completed` but not given their own lifecycle events here (the
@@ -873,7 +884,12 @@ pub fn response_object_to_stream_events(response: &serde_json::Value) -> Vec<(&'
     }
 
     // Terminator: carries the full assembled object (usage, status, etc.).
-    events.push(mk("response.completed", serde_json::json!({ "response": response.clone() })));
+    let terminal = if response.get("status").and_then(|s| s.as_str()) == Some("incomplete") {
+        "response.incomplete"
+    } else {
+        "response.completed"
+    };
+    events.push(mk(terminal, serde_json::json!({ "response": response.clone() })));
     events
 }
 
@@ -1344,6 +1360,22 @@ mod tests {
             service_tier: None,
             created_by: "test-user".to_string(),
         }
+    }
+
+    #[test]
+    fn truncated_flex_response_stays_incomplete() {
+        let body = r#"{"object":"response","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"total_tokens":4}}"#;
+        let mut detail = make_detail("completed", Some(200), Some(body), None);
+        detail.completed_at = Some(chrono::Utc::now());
+
+        let response = detail_to_response_object(&detail);
+
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(response["incomplete_details"]["reason"], "max_output_tokens");
+        assert!(response["completed_at"].is_null());
+        let events = response_object_to_stream_events(&response);
+        assert_eq!(events.last().map(|(name, _)| *name), Some("response.incomplete"));
+        assert!(events.iter().all(|(name, _)| *name != "response.completed"));
     }
 
     #[test]

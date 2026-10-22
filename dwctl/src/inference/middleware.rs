@@ -1117,7 +1117,7 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
 
         match response_store::poll_until_complete(&state.request_manager, resp_id, poll_interval, timeout, state.keystore.as_ref()).await {
             Ok(response_obj) => {
-                let status_code = if response_obj["status"].as_str() == Some("completed") {
+                let status_code = if matches!(response_obj["status"].as_str(), Some("completed" | "incomplete")) {
                     StatusCode::OK
                 } else {
                     // Extract the real HTTP status from the error's code field,
@@ -1301,8 +1301,8 @@ async fn handle_chat_completion_flex_streaming<P: PoolProvider + Clone + Send + 
 /// Symmetric with [`handle_chat_completion_flex_streaming`]: respond-first,
 /// then replay the finished Responses object as the `response.*` SSE event
 /// sequence the live warm path also emits — `response.created` →
-/// `response.completed` on success, `response.created` → `response.failed` on
-/// error. There is no `[DONE]` sentinel on this surface; the terminal event
+/// `response.completed` on success (`response.incomplete` when the answer was
+/// cut short), `response.created` → `response.failed` on error. There is no `[DONE]` sentinel on this surface; the terminal event
 /// is the terminator.
 async fn handle_responses_flex_streaming<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &InferenceMiddlewareState<P>,
@@ -1318,7 +1318,7 @@ async fn handle_responses_flex_streaming<P: PoolProvider + Clone + Send + Sync +
         move |result| match result {
             Ok(detail) => {
                 let response = response_store::detail_to_response_object(detail);
-                if response["status"] == "completed" {
+                if matches!(response["status"].as_str(), Some("completed" | "incomplete")) {
                     response_store::response_object_to_stream_events(&response)
                         .into_iter()
                         .map(|(event, data)| ReplayFrame::named(event, data))
