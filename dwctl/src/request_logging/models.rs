@@ -48,6 +48,45 @@ pub struct ResponsesRequest {
     pub stream: Option<bool>,
 }
 
+/// Content-free fields of a /v1/messages (Anthropic) request, read off the raw JSON.
+///
+/// The body itself is stored as sent (`AiRequest::Other`): Anthropic content blocks
+/// (`tool_use`, `tool_result`, `thinking`) do not fit the chat schema, and the untagged
+/// parse would otherwise fall through to completions and keep only `model` and
+/// `max_tokens`.
+#[derive(Debug, Clone, Default)]
+pub struct MessagesRequest {
+    pub model: Option<String>,
+    pub stream: Option<bool>,
+    pub max_tokens: Option<i64>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    /// Number of tool definitions on the request; 0 when `tools` is absent.
+    pub tool_count: i32,
+    /// Number of entries in `messages`; `None` when the body has no `messages` array.
+    pub message_count: Option<i32>,
+}
+
+impl MessagesRequest {
+    pub fn from_value(value: &Value) -> Self {
+        let array_len = |key: &str| {
+            value
+                .get(key)
+                .and_then(Value::as_array)
+                .map(|a| i32::try_from(a.len()).unwrap_or(i32::MAX))
+        };
+        Self {
+            model: value.get("model").and_then(Value::as_str).map(String::from),
+            stream: value.get("stream").and_then(Value::as_bool),
+            max_tokens: value.get("max_tokens").and_then(Value::as_i64),
+            temperature: value.get("temperature").and_then(Value::as_f64).map(|t| t as f32),
+            top_p: value.get("top_p").and_then(Value::as_f64).map(|t| t as f32),
+            tool_count: array_len("tools").unwrap_or(0),
+            message_count: array_len("messages"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedAIRequest {
     pub headers: HashMap<String, String>,
@@ -56,6 +95,10 @@ pub struct ParsedAIRequest {
     /// Skipped during serde because `ResponsesRequest` is a local computation artifact.
     #[serde(skip)]
     pub responses_request: Option<ResponsesRequest>,
+    /// Populated when the request was routed to /v1/messages. Skipped during serde
+    /// for the same reason as `responses_request`.
+    #[serde(skip)]
+    pub messages_request: Option<MessagesRequest>,
 }
 
 /// SSE frame emitted by an upstream provider when it fails mid-stream.
