@@ -858,3 +858,13 @@ pub async fn wait_for_advisory_waiter(pool: &PgPool, pid: i32) {
     .await
     .expect("replica did not wait for the catalog lock");
 }
+
+/// The process-wide count of file uploads refused for `code`.
+pub fn upload_rejections(code: &str) -> u64 {
+    let series = format!(r#"dwctl_file_upload_rejections_total{{code="{code}"}} "#);
+    crate::get_or_install_prometheus_handle()
+        .render()
+        .lines()
+        .find_map(|line| line.strip_prefix(&series))
+        .map_or(0, |count| count.parse().unwrap())
+}
