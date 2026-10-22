@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT dm.alias, c.class_key\n            FROM model_serving_classes c\n            JOIN deployed_models dm ON dm.id = c.deployed_model_id\n            WHERE dm.routing_mode = 'class_routes'\n              AND c.class_key <> 'standard'\n              AND dm.alias || ':' || c.class_key = ANY($1)\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "class_key",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "6c424a3c9bba1f80db626146149c9ba6c644fcce943dc868d01198df68d4d7a0"
+}
