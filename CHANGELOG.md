@@ -1,5 +1,27 @@
 # Changelog
 
+## [15.4.0](https://github.com/doublewordai/control-layer/compare/v15.3.0...v15.4.0) (2026-10-22)
+
+
+### Features
+
+* overlay targets are scheduling hints, not a serving class ([#2087](https://github.com/doublewordai/control-layer/issues/2087)) ([4723cfa](https://github.com/doublewordai/control-layer/commit/4723cfa5453762d1f40e4afe3e6bdf8ffd68e31e))
+
+
+### Bug Fixes
+
+* report truncated Responses output as incomplete (DW-976) ([#2079](https://github.com/doublewordai/control-layer/issues/2079)) ([43e6729](https://github.com/doublewordai/control-layer/commit/43e6729f96e3f2623979e290aa78413e7b747be0))
+
+
+### Miscellaneous
+
+* **deps:** update npm non-major dependencies ([#2066](https://github.com/doublewordai/control-layer/issues/2066)) ([d12f0f9](https://github.com/doublewordai/control-layer/commit/d12f0f9a422d3edd0c71b167e3a7e36364843fab))
+* **deps:** update rust crate rust_decimal to v1.43.0 ([#2063](https://github.com/doublewordai/control-layer/issues/2063)) ([758a753](https://github.com/doublewordai/control-layer/commit/758a7531f880ae88c2378122c641d95c74186a75))
+* **deps:** update rust crate rust-embed to v8.13.0 ([#2064](https://github.com/doublewordai/control-layer/issues/2064)) ([ed7ecfd](https://github.com/doublewordai/control-layer/commit/ed7ecfd1032995819a55c1094f747a64d155378c))
+* **deps:** update rust crate tokio to v1.54.1 ([#2069](https://github.com/doublewordai/control-layer/issues/2069)) ([ee9a165](https://github.com/doublewordai/control-layer/commit/ee9a1651f96cd2b9269110041bd162154ccf194a))
+* **deps:** update rust crate uuid to v1.28.0 ([#2070](https://github.com/doublewordai/control-layer/issues/2070)) ([6a02d72](https://github.com/doublewordai/control-layer/commit/6a02d724f2250fb2064e6be28cbfe16f56b09959))
+* **deps:** update rust docker tag to v1.99.1 ([#2072](https://github.com/doublewordai/control-layer/issues/2072)) ([a07b9de](https://github.com/doublewordai/control-layer/commit/a07b9de12b2dfff14835b96b4f1bd27a472446fa))
+
 ## [15.3.0](https://github.com/doublewordai/control-layer/compare/v15.2.0...v15.3.0) (2026-10-22)
 
 

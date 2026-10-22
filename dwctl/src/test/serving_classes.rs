@@ -314,9 +314,12 @@ async fn dispatch_clears_stored_targets_but_preserves_deadline_priority(pool: Pg
 }
 
 #[dwctl_test_macros::test]
-async fn overlay_targets_select_the_custom_organisation_price(pool: PgPool) {
+async fn overlay_targets_change_neither_the_class_nor_the_price(pool: PgPool) {
+    // The account has a standard-class deal and a class-less one. Targets are
+    // scheduling hints: with or without them the request is standard and pays
+    // the standard deal.
     let f = Fixture::new(&pool).await;
-    sqlx::query("INSERT INTO model_tariffs(deployed_model_id,user_id,serving_class,name,api_key_purpose,input_price_per_token,output_price_per_token) SELECT id,$1,c.class,'org-deal','realtime',c.price,c.price FROM deployed_models CROSS JOIN (VALUES (NULL::text,0.002::numeric),('custom',0.003::numeric)) c(class,price) WHERE alias='policy'")
+    sqlx::query("INSERT INTO model_tariffs(deployed_model_id,user_id,serving_class,name,api_key_purpose,input_price_per_token,output_price_per_token) SELECT id,$1,c.class,'org-deal','realtime',c.price,c.price FROM deployed_models CROSS JOIN (VALUES (NULL::text,0.002::numeric),('standard',0.003::numeric)) c(class,price) WHERE alias='policy'")
         .bind(f.user).execute(&pool).await.unwrap();
     f.set_overlay(&pool, Some(json!({"ttft_ms":800,"itl_ms":30,"priority":50}))).await;
     f.post("chat/completions", "policy", false).await.assert_status_ok();
@@ -333,8 +336,8 @@ async fn overlay_targets_select_the_custom_organisation_price(pool: PgPool) {
     assert_eq!(
         rows,
         vec![
-            ("policy".to_owned(), "custom".to_owned(), Decimal::new(45, 3)),
-            ("policy".to_owned(), "standard".to_owned(), Decimal::new(30, 3)),
+            ("policy".to_owned(), "standard".to_owned(), Decimal::new(45, 3)),
+            ("policy".to_owned(), "standard".to_owned(), Decimal::new(45, 3)),
         ]
     );
     f.services.shutdown().await;

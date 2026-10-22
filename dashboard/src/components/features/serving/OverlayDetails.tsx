@@ -24,8 +24,8 @@ export function OverlayDetails({
     <div className="space-y-4 text-sm">
       <dl className="grid gap-3 sm:grid-cols-2">
         <div>
-          <dt className="text-muted-foreground">Targets</dt>
-          <dd>{overlay?.targets ? "Custom targets" : "Standard"}</dd>
+          <dt className="text-muted-foreground">Scheduling hints</dt>
+          <dd>{overlay?.targets ? "Set (see below)" : "None"}</dd>
         </div>
         <div>
           <dt className="text-muted-foreground">Self-hosted only</dt>
@@ -43,7 +43,7 @@ export function OverlayDetails({
         </div>
         {overlay?.targets && (
           <div>
-            <dt className="text-muted-foreground">Explicit targets</dt>
+            <dt className="text-muted-foreground">Priority and latency targets</dt>
             <dd>
               TTFT {overlay.targets.ttft_ms} ms · ITL {overlay.targets.itl_ms}{" "}
               ms · priority {overlay.targets.priority ?? 0}

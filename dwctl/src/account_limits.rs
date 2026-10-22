@@ -1095,7 +1095,6 @@ mod tests {
             (overlay.priority, overlay.ttft_ms, overlay.itl_ms),
             (Some(300), Some(1000), Some(30))
         );
-        assert!(overlay.targets.is_none(), "policy never becomes billed custom targets");
         assert_eq!(gateway_limit(&pool, "org/model", org).await, 900);
 
         // Removing the files clears what this catalog owns, keeping history.

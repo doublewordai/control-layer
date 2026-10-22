@@ -1928,7 +1928,7 @@ async fn test_cache_shape_component_pool_becomes_a_named_pool(pool: sqlx::PgPool
 
 #[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_cache_shape_serving_accounts_and_overlays(pool: sqlx::PgPool) {
-    use onwards::{AccountServing, ProviderKind, ServingOverlay, ServingTargets};
+    use onwards::{AccountServing, ProviderKind, ServingOverlay};
 
     // User A holds the self-hosted restriction and an overlay lifting it on the
     // model; user B has a bespoke-targets overlay and nothing else. The default
@@ -1985,21 +1985,18 @@ async fn test_cache_shape_serving_accounts_and_overlays(pool: sqlx::PgPool) {
     assert_eq!(
         overlays["00000000-0000-0000-0000-0000000000a1"],
         ServingOverlay {
-            targets: None,
             self_hosted_only: Some(false),
             ..Default::default()
         }
     );
     assert_eq!(
         overlays["00000000-0000-0000-0000-0000000000b1"],
+        // Stored targets are scheduling hints, not a class.
         ServingOverlay {
-            targets: Some(ServingTargets {
-                ttft_ms: 800,
-                itl_ms: 30,
-                priority: 0
-            }),
             self_hosted_only: None,
-            ..Default::default()
+            priority: Some(0),
+            ttft_ms: Some(800),
+            itl_ms: Some(30),
         }
     );
     let private = targets.targets.get("regular-private").unwrap();
@@ -2693,4 +2690,41 @@ async fn batch_capacity_non_positive_falls_back_to_the_default(pool: sqlx::PgPoo
             "batch_capacity={invalid} must fall back to the default"
         );
     }
+}
+
+#[dwctl_test_macros::test]
+async fn a_priority_only_policy_keeps_overlay_targets(pool: sqlx::PgPool) {
+    let user: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO users (username,email,auth_source,user_type) VALUES ('hint-org','hint-org@example.com','test','organization') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let model: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO deployed_models (model_name,alias,is_composite,created_by) VALUES ('hint-model','hint-model',true,$1) RETURNING id",
+    )
+    .bind(user)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO model_overlays (user_id, deployed_model_id, targets) VALUES ($1, $2, '{\"ttft_ms\": 800, \"itl_ms\": 30, \"priority\": 50}')")
+        .bind(user)
+        .bind(model)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO account_model_policies (user_id, deployed_model_id, serving_class, priority) VALUES ($1, $2, 'standard', 400)",
+    )
+    .bind(user)
+    .bind(model)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let overlays = super::load_overlays_from_db(&pool).await.unwrap();
+    let overlay = &overlays["hint-model"][&user.to_string()];
+    assert_eq!(
+        (overlay.priority, overlay.ttft_ms, overlay.itl_ms),
+        (Some(400), Some(800), Some(30))
+    );
 }

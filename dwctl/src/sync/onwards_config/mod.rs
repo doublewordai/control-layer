@@ -17,7 +17,7 @@ use onwards::target::{
     JitterStrategy as OnwardsJitterStrategy, KeyDefinition, LoadBalanceStrategy as OnwardsLoadBalanceStrategy, PoolSpec, PoolsSpec,
     ProviderSpec, RoutingAction, RoutingRule, TargetSpecOrList, Targets, WatchTargetsStream, inheritable_routing_rules,
 };
-use onwards::{AccountServing, ProviderKind, ServingOverlay, ServingTargets};
+use onwards::{AccountServing, ProviderKind, ServingOverlay};
 use sqlx::{PgPool, postgres::PgListener};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -143,8 +143,18 @@ fn parse_provider_kind(value: &str) -> ProviderKind {
     })
 }
 
-/// Parse an overlay's stored explicit targets (`model_overlays.targets`).
-fn parse_stored_targets(value: Option<serde_json::Value>) -> Option<ServingTargets> {
+/// An organisation overlay's stored targets (`model_overlays.targets`). They
+/// are scheduling hints: they set the request's priority and latency targets
+/// but never its class.
+#[derive(serde::Deserialize)]
+struct StoredTargets {
+    ttft_ms: u32,
+    itl_ms: u32,
+    #[serde(default)]
+    priority: i32,
+}
+
+fn parse_stored_targets(value: Option<serde_json::Value>) -> Option<StoredTargets> {
     let value = value?;
     match serde_json::from_value(value) {
         Ok(targets) => Some(targets),
@@ -172,12 +182,14 @@ async fn load_overlays_from_db(db: &PgPool) -> Result<OverlaysByAlias, anyhow::E
 
     let mut overlays: OverlaysByAlias = HashMap::new();
     for row in rows {
+        let targets = parse_stored_targets(row.targets);
         overlays.entry(row.alias).or_default().insert(
             row.user_id.to_string(),
             ServingOverlay {
-                targets: parse_stored_targets(row.targets),
                 self_hosted_only: row.self_hosted_only,
-                ..Default::default()
+                priority: targets.as_ref().map(|t| t.priority),
+                ttft_ms: targets.as_ref().map(|t| t.ttft_ms),
+                itl_ms: targets.as_ref().map(|t| t.itl_ms),
             },
         );
     }
@@ -204,9 +216,15 @@ async fn load_overlays_from_db(db: &PgPool) -> Result<OverlaysByAlias, anyhow::E
         if row.priority.is_some() {
             overlay.priority = row.priority;
         }
+        // Only set values override, so a priority-only policy keeps any
+        // targets already on the overlay.
         if row.serving_class.is_some() {
-            overlay.ttft_ms = row.ttft_ms.and_then(|v| u32::try_from(v).ok());
-            overlay.itl_ms = row.itl_ms.and_then(|v| u32::try_from(v).ok());
+            if let Some(ttft) = row.ttft_ms.and_then(|v| u32::try_from(v).ok()) {
+                overlay.ttft_ms = Some(ttft);
+            }
+            if let Some(itl) = row.itl_ms.and_then(|v| u32::try_from(v).ok()) {
+                overlay.itl_ms = Some(itl);
+            }
         }
     }
     Ok(overlays)
