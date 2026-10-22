@@ -80,7 +80,7 @@ model_provisioning:
 | `enabled` | boolean | `false` | Apply the declarative model catalog during startup. |
 | `directory` | path | `/app/model-provisioning.d` | Directory containing one `.yaml` or `.yml` document per canonical model. |
 | `org_overlays_directory` | path | `/app/org-overlays.d` | Directory containing one `.yaml` or `.yml` document per organisation with per-model serving overrides (explicit `targets`, `self_hosted_only`). Applied after the model catalog when `enabled` is set. A missing directory is an empty catalog, so a deployment that does not mount one applies no overlays; an existing path that is not a directory fails startup. |
-| `account_limits_directory` | path | `/app/account-limits.d` | Directory containing one `.yaml` or `.yml` document per account with its own realtime in-flight limits on virtual models. Applied after the model catalog when `enabled` is set, replacing every stored per-account limit. A missing directory changes nothing; an empty one clears every per-account limit. See [Account limits](./model-provisioning.md#account-limits). |
+| `account_limits_directory` | path | `/app/account-limits.d` | Directory containing one `.yaml` or `.yml` document per account with its own realtime in-flight limits, prices, scheduling priority and latency targets on virtual models. Applied after the model catalog and organisation overlays when `enabled` is set; limits replace every stored per-account limit, and the other settings are owned row by row. A missing directory changes nothing; an empty one clears what the files own. See [Account limits](./model-provisioning.md#account-limits). |
 
 When enabled, the directory must exist. Startup fails before any provisioning
 writes if loading, validation, or a referenced endpoint/group lookup fails.
@@ -364,7 +364,7 @@ batches:
 |-------|------|---------|-------------|
 | `enabled` | boolean | `true` | Enable `/ai/v1/files` and `/ai/v1/batches` endpoints. |
 | `allowed_completion_windows` | list | `["24h"]` | SLA options users can select. |
-| `files.max_file_size` | integer | `104857600` | Maximum upload size in bytes. |
+| `files.max_file_size` | integer | `104857600` | Maximum upload size in bytes. A gzip or zstd file is decoded as it uploads, and the limit applies to its decoded size; the compressed upload itself may not exceed the limit either. |
 | `files.default_expiry_seconds` | integer | `86400` | Default file retention. |
 
 ## Background Services
@@ -702,6 +702,11 @@ scheduling:
 | `label` | string | Short human label for the dashboard control. Must be non-empty. |
 | `description` | string | One or two sentences of help text shown as the dashboard tooltip. Must be non-empty. |
 | `tolerations` | list | The request-field list (`{key, operator?, value?, effect?}`). `operator` defaults to `Equal` and then requires `value`; `Exists` forbids `value`; `effect` may be `NoSchedule` or `PreferNoSchedule`. May be empty; validated at config load. |
+
+An [account file](./model-provisioning.md#account-limits) can also set a
+preset for one model, or one class of a model, in place of the account's own
+preset for those requests. The more specific setting wins: class, then model,
+then the account.
 
 The `GET /admin/api/v1/config` endpoint exposes the presets (id, label,
 description) so the dashboard can render the control. An account stores only the

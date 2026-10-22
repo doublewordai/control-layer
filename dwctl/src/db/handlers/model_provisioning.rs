@@ -19,6 +19,54 @@ use crate::model_provisioning::{
 /// release it automatically and works through transaction-pooled connections.
 const MODEL_PROVISIONING_LOCK: i64 = 0x4457_4d4f_4445_4c50;
 
+/// Ownership marker on prices written by the organisation catalog.
+pub(crate) const ORG_CATALOG_TARIFF_SOURCE: &str = "org-overlays";
+/// Ownership marker on prices written by the account catalog.
+pub(crate) const ACCOUNT_CATALOG_TARIFF_SOURCE: &str = "account-catalog";
+
+/// Close the active prices a catalog owns (`source`) on every account/model
+/// pair it no longer declares. Manual rows and rows another catalog owns are
+/// never touched. Future-dated owned rows on a removed pair are refused:
+/// startup provisioning has no scheduling semantics.
+pub(crate) async fn retire_omitted_account_prices(
+    db: &mut PgConnection,
+    source: &str,
+    declared: &[(Uuid, Uuid)],
+    effective_at: DateTime<Utc>,
+) -> Result<()> {
+    let (account_ids, model_ids): (Vec<Uuid>, Vec<Uuid>) = declared.iter().copied().unzip();
+    for table in ["model_tariffs", "model_cache_tariffs"] {
+        let omitted = "t.provisioning_source = $4 AND NOT EXISTS (
+            SELECT 1 FROM UNNEST($1::uuid[], $2::uuid[]) AS d(user_id, deployed_model_id)
+            WHERE d.user_id = t.user_id AND d.deployed_model_id = t.deployed_model_id)";
+        let future: bool = sqlx::query_scalar(&format!(
+            "SELECT EXISTS (SELECT 1 FROM {table} t WHERE t.valid_from > $3
+             AND (t.valid_until IS NULL OR t.valid_until > t.valid_from) AND {omitted})"
+        ))
+        .bind(&account_ids)
+        .bind(&model_ids)
+        .bind(effective_at)
+        .bind(source)
+        .fetch_one(&mut *db)
+        .await?;
+        ensure!(
+            !future,
+            "removed account/model entry has future-dated prices; resolve these before removing it"
+        );
+        sqlx::query(&format!(
+            "UPDATE {table} t SET valid_until = $3 WHERE t.valid_from <= $3
+             AND (t.valid_until IS NULL OR t.valid_until > $3) AND {omitted}"
+        ))
+        .bind(&account_ids)
+        .bind(&model_ids)
+        .bind(effective_at)
+        .bind(source)
+        .execute(&mut *db)
+        .await?;
+    }
+    Ok(())
+}
+
 pub struct ModelProvisioning<'c> {
     db: &'c mut PgConnection,
     tariff_source: Option<&'static str>,
@@ -41,8 +89,22 @@ impl<'c> ModelProvisioning<'c> {
     pub(crate) fn for_org_catalog(db: &'c mut PgConnection) -> Self {
         Self {
             db,
-            tariff_source: Some("org-overlays"),
+            tariff_source: Some(ORG_CATALOG_TARIFF_SOURCE),
         }
+    }
+
+    /// Account catalog prices carry their own ownership marker, so each catalog
+    /// retires only the rows it wrote.
+    pub(crate) fn for_account_catalog(db: &'c mut PgConnection) -> Self {
+        Self {
+            db,
+            tariff_source: Some(ACCOUNT_CATALOG_TARIFF_SOURCE),
+        }
+    }
+
+    fn account_tariff_source(&self) -> Result<&'static str> {
+        self.tariff_source
+            .context("account price ownership requires an organisation or account catalog writer")
     }
 
     pub async fn apply(&mut self, catalog: &Catalog) -> Result<()> {
@@ -168,6 +230,7 @@ impl<'c> ModelProvisioning<'c> {
     /// YAML is authoritative for the complete declared org/model, including
     /// prices originally inserted manually. Historical amounts remain immutable.
     pub(crate) async fn adopt_account_model_tariffs(&mut self, account: Uuid, model: Uuid, effective_at: DateTime<Utc>) -> Result<()> {
+        let source = self.account_tariff_source()?;
         for table in ["model_tariffs", "model_cache_tariffs"] {
             let future: Option<(DateTime<Utc>, Option<String>)> = sqlx::query_as(&format!(
                 "SELECT valid_from, serving_class FROM {table}
@@ -186,15 +249,18 @@ impl<'c> ModelProvisioning<'c> {
                     class.as_deref().unwrap_or("all")
                 );
             }
+            // Only manual rows are adopted: a row another catalog owns stays
+            // with it, and reconciliation then reports the conflict.
             sqlx::query(&format!(
-                "UPDATE {table} SET provisioning_source='org-overlays'
+                "UPDATE {table} SET provisioning_source=$4
                  WHERE user_id=$1 AND deployed_model_id=$2 AND valid_from<=$3
                    AND (valid_until IS NULL OR valid_until>$3)
-                   AND provisioning_source IS DISTINCT FROM 'org-overlays'"
+                   AND provisioning_source IS NULL"
             ))
             .bind(account)
             .bind(model)
             .bind(effective_at)
+            .bind(source)
             .execute(&mut *self.db)
             .await?;
         }
@@ -204,16 +270,18 @@ impl<'c> ModelProvisioning<'c> {
     /// Refuse to reconcile an organisation whose rows carry a future `valid_from`:
     /// startup provisioning has no scheduling semantics (same rule as the model catalog).
     pub(crate) async fn preflight_future_account_tariffs(&mut self, account: Uuid, effective_at: DateTime<Utc>) -> Result<()> {
+        let source = self.account_tariff_source()?;
         for table in ["model_tariffs", "model_cache_tariffs"] {
             let future: Option<(DateTime<Utc>, String, Option<String>)> = sqlx::query_as(&format!(
                 "SELECT t.valid_from, dm.alias, t.serving_class FROM {table} t
                  JOIN deployed_models dm ON dm.id=t.deployed_model_id
-                 WHERE t.user_id=$1 AND t.provisioning_source='org-overlays' AND t.valid_from>$2
+                 WHERE t.user_id=$1 AND t.provisioning_source=$3 AND t.valid_from>$2
                    AND (t.valid_until IS NULL OR t.valid_until>t.valid_from)
                  ORDER BY t.valid_from, t.id LIMIT 1"
             ))
             .bind(account)
             .bind(effective_at)
+            .bind(source)
             .fetch_optional(&mut *self.db)
             .await
             .with_context(|| format!("check future {table} rows of an organisation"))?;

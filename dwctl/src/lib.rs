@@ -186,6 +186,7 @@ pub mod task_retention;
 pub mod tasks;
 pub mod telemetry;
 mod types;
+mod upload_compression;
 pub mod webhooks;
 
 // Test modules
@@ -1616,6 +1617,22 @@ async fn setup_database(
         let catalog = model_provisioning::Catalog::load(&config.model_provisioning.directory)?;
         let overlays = org_overlays::OrgCatalog::load(&config.model_provisioning.org_overlays_directory)?;
         let account_limits = account_limits::AccountLimitsCatalog::load(&config.model_provisioning.account_limits_directory)?;
+        account_limits.validate_against_overlays(&overlays)?;
+        // An unconfigured id fails closed at request time; say so up front.
+        for preset in account_limits.toleration_presets() {
+            if !config
+                .scheduling
+                .toleration_presets
+                .iter()
+                .any(|configured| configured.id == preset)
+            {
+                tracing::warn!(
+                    preset,
+                    "account files name a toleration preset this deployment does not configure; \
+                     its requests get the empty (most restrictive) toleration list"
+                );
+            }
+        }
         model_provisioning::apply(&main.pooled.write(), &catalog).await?;
         org_overlays::apply(&main.pooled.write(), &overlays).await?;
         account_limits::apply(&main.pooled.write(), &account_limits).await?;

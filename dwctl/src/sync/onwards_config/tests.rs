@@ -1967,7 +1967,13 @@ async fn test_cache_shape_serving_accounts_and_overlays(pool: sqlx::PgPool) {
         .accounts
         .get("00000000-0000-0000-0000-0000000000a1")
         .expect("user A has settings");
-    assert_eq!(*account_a.value(), AccountServing { self_hosted_only: true });
+    assert_eq!(
+        *account_a.value(),
+        AccountServing {
+            self_hosted_only: true,
+            ..Default::default()
+        }
+    );
     assert!(
         targets.accounts.get("00000000-0000-0000-0000-0000000000b1").is_none(),
         "an account with nothing set is not synced"
@@ -1981,6 +1987,7 @@ async fn test_cache_shape_serving_accounts_and_overlays(pool: sqlx::PgPool) {
         ServingOverlay {
             targets: None,
             self_hosted_only: Some(false),
+            ..Default::default()
         }
     );
     assert_eq!(
@@ -1992,6 +1999,7 @@ async fn test_cache_shape_serving_accounts_and_overlays(pool: sqlx::PgPool) {
                 priority: 0
             }),
             self_hosted_only: None,
+            ..Default::default()
         }
     );
     let private = targets.targets.get("regular-private").unwrap();

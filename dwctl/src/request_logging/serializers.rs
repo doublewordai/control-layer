@@ -41,7 +41,9 @@
 
 use crate::config::Config;
 use crate::prompt_cache::CacheBilling;
-use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk, CompletionChunk, ParsedAIRequest, ResponsesRequest};
+use crate::request_logging::models::{
+    AiRequest, AiResponse, ChatCompletionChunk, CompletionChunk, MessagesRequest, ParsedAIRequest, ResponsesRequest,
+};
 use crate::request_logging::stream_completion::{CLIENT_DISCONNECTED, client_disconnected};
 use outlet::{RequestData, ResponseData};
 use outlet_postgres::SerializationError;
@@ -193,7 +195,7 @@ pub struct UsageMetrics {
 
 /// Content-free request parameters, read off the parsed request body.
 ///
-/// All `None` when the body did not parse as a typed chat/completions request
+/// All `None` when the body was not a chat, completions or Messages request
 /// (embeddings, the Responses API, opaque bodies). `stream` is `Some(false)` when a typed
 /// request omitted the field, because "not streaming" is the meaningful value there.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -204,9 +206,9 @@ pub struct RequestParams {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub n: Option<i32>,
-    /// Number of tool definitions on the request (`tools`). Chat completions only.
+    /// Number of tool definitions on the request (`tools`). Chat completions and Messages only.
     pub tool_count: Option<i32>,
-    /// Number of entries in `messages`. Chat completions only.
+    /// Number of entries in `messages`. Chat completions and Messages only.
     pub message_count: Option<i32>,
 }
 
@@ -216,6 +218,17 @@ impl RequestParams {
     pub fn from_parsed(parsed: &ParsedAIRequest) -> Self {
         if parsed.responses_request.is_some() {
             return Self::default();
+        }
+        if let Some(req) = &parsed.messages_request {
+            return Self {
+                stream: Some(req.stream.unwrap_or(false)),
+                max_tokens: req.max_tokens,
+                temperature: req.temperature,
+                top_p: req.top_p,
+                n: None,
+                tool_count: Some(req.tool_count),
+                message_count: req.message_count,
+            };
         }
         match &parsed.request {
             AiRequest::ChatCompletions(req) => Self {
@@ -271,6 +284,7 @@ pub fn parse_ai_request(request_data: &RequestData) -> Result<ParsedAIRequest, S
                 headers,
                 request: AiRequest::Other(Value::Null),
                 responses_request: None,
+                messages_request: None,
             });
         }
     };
@@ -282,6 +296,7 @@ pub fn parse_ai_request(request_data: &RequestData) -> Result<ParsedAIRequest, S
             headers,
             request: AiRequest::Other(Value::Null),
             responses_request: None,
+            messages_request: None,
         });
     }
 
@@ -297,8 +312,31 @@ pub fn parse_ai_request(request_data: &RequestData) -> Result<ParsedAIRequest, S
                     headers,
                     request: AiRequest::Other(value),
                     responses_request: Some(ResponsesRequest { model, stream }),
+                    messages_request: None,
                 })
             }
+            Err(e) => {
+                let base64_encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+                Err(SerializationError {
+                    fallback_data: format!("base64:{base64_encoded}"),
+                    error: Box::new(e),
+                })
+            }
+        };
+    }
+
+    // /v1/messages (Anthropic) bodies are stored as sent, like /responses. Their content
+    // blocks (`tool_use`, `tool_result`, `thinking`) fail the chat parse, and the
+    // untagged fallback would classify them as completions, which keeps only `model`
+    // and `max_tokens` and drops `messages`, `system` and `tools`.
+    if request_data.uri.path().ends_with("/messages") {
+        return match serde_json::from_str::<Value>(&body_str) {
+            Ok(value) => Ok(ParsedAIRequest {
+                headers,
+                messages_request: Some(MessagesRequest::from_value(&value)),
+                request: AiRequest::Other(value),
+                responses_request: None,
+            }),
             Err(e) => {
                 let base64_encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
                 Err(SerializationError {
@@ -342,6 +380,7 @@ pub fn parse_ai_request(request_data: &RequestData) -> Result<ParsedAIRequest, S
                 headers,
                 request,
                 responses_request: None,
+                messages_request: None,
             })
         }
         Err(e) => {
@@ -520,6 +559,8 @@ impl UsageMetrics {
             Some(parsed_request) => {
                 if let Some(responses_req) = parsed_request.responses_request {
                     responses_req.model
+                } else if let Some(messages_req) = parsed_request.messages_request {
+                    messages_req.model
                 } else {
                     match parsed_request.request {
                         AiRequest::ChatCompletions(req) => Some(req.model),
@@ -2685,6 +2726,109 @@ mod tests {
             duration: Duration::from_millis(100),
             duration_to_first_byte: Duration::from_millis(50),
         }
+    }
+
+    /// An agent-loop Messages body: system blocks, tool definitions, and assistant turns
+    /// carrying `thinking` and `tool_use` blocks answered by a `tool_result`.
+    fn agent_loop_messages_body() -> Value {
+        serde_json::json!({
+            "model": "claude-3-5-sonnet",
+            "max_tokens": 4096,
+            "temperature": 0.5,
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "system": [{"type": "text", "text": "You are a helpful agent."}],
+            "tools": [
+                {"name": "read_file", "description": "Read a file", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}},
+                {"name": "list_dir", "description": "List a directory", "input_schema": {"type": "object", "properties": {}}}
+            ],
+            "messages": [
+                {"role": "user", "content": "What is in README.md?"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "I should read the file.", "signature": "sig"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {"path": "README.md"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "# Example project"}
+                ]}
+            ],
+            "stream": true
+        })
+    }
+
+    fn messages_request_with_body(body: &Value) -> RequestData {
+        RequestData {
+            body: Some(Bytes::from(body.to_string())),
+            ..messages_request_data(false)
+        }
+    }
+
+    /// Messages bodies with Anthropic content blocks used to fail the chat parse and
+    /// fall through to completions, which stored only `{model, max_tokens, thinking}`.
+    #[test]
+    fn test_parse_ai_request_messages_body_stored_as_sent() {
+        let body = agent_loop_messages_body();
+        let parsed = parse_ai_request(&messages_request_with_body(&body)).unwrap();
+
+        match &parsed.request {
+            AiRequest::Other(value) => assert_eq!(value, &body, "the body must be stored complete"),
+            other => panic!("expected AiRequest::Other for /v1/messages, got {other:?}"),
+        }
+        assert_eq!(serde_json::to_value(&parsed.request).unwrap(), body);
+
+        let mr = parsed.messages_request.expect("messages_request should be set");
+        assert_eq!(mr.model.as_deref(), Some("claude-3-5-sonnet"));
+        assert_eq!(mr.stream, Some(true));
+        assert!(parsed.responses_request.is_none());
+    }
+
+    /// A plain-text Messages body would pass the untagged chat parse; the path still wins.
+    #[test]
+    fn test_parse_ai_request_plain_messages_body_not_classified_as_chat() {
+        let parsed = parse_ai_request(&messages_request_data(false)).unwrap();
+        assert!(matches!(parsed.request, AiRequest::Other(_)));
+        assert!(parsed.messages_request.is_some());
+    }
+
+    #[test]
+    fn test_analytics_metrics_messages_request_params_and_model() {
+        let request_data = messages_request_with_body(&agent_loop_messages_body());
+        let sse = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":12,\"output_tokens\":0}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":8}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let response_data = ok_response(sse);
+
+        let parsed = parse_ai_response(&request_data, &response_data).unwrap();
+        let metrics = UsageMetrics::extract(
+            Uuid::new_v4(),
+            &request_data,
+            &response_data,
+            &parsed,
+            &crate::test::utils::create_test_config(),
+        );
+        assert_eq!(metrics.request_model.as_deref(), Some("claude-3-5-sonnet"));
+        assert_eq!(
+            metrics.request_params,
+            RequestParams {
+                stream: Some(true),
+                max_tokens: Some(4096),
+                temperature: Some(0.5),
+                top_p: None,
+                n: None,
+                tool_count: Some(2),
+                message_count: Some(3),
+            }
+        );
+    }
+
+    /// A Messages request without `tools` or `stream` reads as zero tools, not streaming.
+    #[test]
+    fn test_messages_request_params_defaults() {
+        let parsed = parse_ai_request(&messages_request_with_body(
+            &serde_json::json!({"model": "m", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]}),
+        ))
+        .unwrap();
+        let p = RequestParams::from_parsed(&parsed);
+        assert_eq!(p.stream, Some(false));
+        assert_eq!(p.tool_count, Some(0));
+        assert_eq!(p.message_count, Some(1));
     }
 
     #[test]

@@ -177,19 +177,6 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(|s| s.to_string());
 
-    // An operator can pin an account to a scheduling-toleration preset: every
-    // request from the account then carries exactly the preset's list at
-    // `nvext.routing_constraints.tolerations`, replacing anything the client
-    // sent (stripped by `strip_scheduling_priority` above). The preset id is
-    // resolved against config through the per-key policy map, so this covers
-    // realtime, flex and background alike; batch JSONL files are scrubbed and
-    // stamped at ingest. The "Default" setting and every unpinned account are
-    // unchanged.
-    let scrubbed_pinned = match pinned_tolerations(&state.key_policy_cache, api_key.as_deref()) {
-        Some(tolerations) => set_routing_tolerations(&mut request_value, &tolerations),
-        None => false,
-    };
-
     // Asynchronous requests are scheduled by their deadline, so a model
     // suffix (`alias:suffix`) is discarded here, at the outermost layer, and
     // analytics, the prompt cache and billing all key on the bare alias. A
@@ -209,6 +196,24 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             let model = request_value["model"].as_str();
             return rejections::refuse(&parts, response, "invalid_model_selector", Some("model"), model);
         }
+    };
+
+    // An operator can pin an account to a scheduling-toleration preset, for
+    // all of its models or (through the account catalog) for one model: every
+    // such request then carries exactly the preset's list at
+    // `nvext.routing_constraints.tolerations`, replacing anything the client
+    // sent (stripped by `strip_scheduling_priority` above). Resolved after the
+    // suffix strip, so it keys on the bare alias, through the per-key policy
+    // map; this covers realtime, flex and background alike, and batch JSONL
+    // files are scrubbed and stamped at ingest. The "Default" setting and
+    // every unpinned account are unchanged.
+    let scrubbed_pinned = match pinned_tolerations(
+        &state.key_policy_cache,
+        api_key.as_deref(),
+        request_value["model"].as_str().unwrap_or_default(),
+    ) {
+        Some(tolerations) => set_routing_tolerations(&mut request_value, &tolerations),
+        None => false,
     };
 
     // The realtime path forwards `body_bytes` verbatim and onwards forwards the
@@ -287,6 +292,18 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 "encrypted reasoning item replay is not supported by this Responses API implementation",
                 "unsupported_parameter",
                 "input",
+            );
+        }
+
+        // The edge translation refuses provider-native thinking fields, but
+        // queued and background requests are accepted before it runs. Refuse
+        // them here so the caller gets the 400 instead of a failed response later.
+        if let Err(error) = onwards::reasoning::validate_canonical_reasoning(nested_path, &request_value) {
+            let param = error.param().unwrap_or_default();
+            return refuse(
+                invalid_request_response(error.message(), error.code(), param),
+                error.code(),
+                error.param(),
             );
         }
     }
@@ -1486,8 +1503,9 @@ pub(crate) fn strip_scheduling_priority(value: &mut serde_json::Value) -> bool {
 pub(crate) fn pinned_tolerations(
     cache: &crate::sync::key_policy::KeyPolicyCache,
     api_key: Option<&str>,
+    model: &str,
 ) -> Option<std::sync::Arc<serde_json::Value>> {
-    api_key.and_then(|secret| cache.tolerations(secret))
+    api_key.and_then(|secret| cache.tolerations(secret, model))
 }
 
 /// Write `tolerations` to `nvext.routing_constraints.tolerations`, in place,
@@ -1593,9 +1611,9 @@ mod tests {
                 },
             )],
         );
-        assert!(pinned_tolerations(&cache, Some("sk-pinned")).is_some());
-        assert!(pinned_tolerations(&cache, Some("sk-other")).is_none());
-        assert!(pinned_tolerations(&cache, None).is_none());
+        assert!(pinned_tolerations(&cache, Some("sk-pinned"), "any/model").is_some());
+        assert!(pinned_tolerations(&cache, Some("sk-other"), "any/model").is_none());
+        assert!(pinned_tolerations(&cache, None, "any/model").is_none());
     }
 
     #[test]
@@ -1979,5 +1997,48 @@ mod tests {
                 .expect("resolve unknown key"),
             None
         );
+    }
+
+    #[dwctl_test_macros::test]
+    async fn responses_refuse_native_thinking_fields_before_acceptance(pool: sqlx::PgPool) {
+        use crate::api::models::users::Role;
+        use crate::test::utils::{create_test_api_key_for_user, create_test_app, create_test_user};
+
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let key = create_test_api_key_for_user(&pool, user.id).await;
+
+        // Realtime with `background: true` is accepted with a 202 before translation too.
+        let tiers = [
+            (Some("flex"), false),
+            (Some("flex"), true),
+            (Some("background"), true),
+            (None, true),
+            (Some("auto"), true),
+            (Some("priority"), true),
+        ];
+        for (tier, background) in tiers {
+            let mut request = serde_json::json!({
+                "model": "gpt-4",
+                "input": "hi",
+                "background": background,
+                "chat_template_kwargs": {"enable_thinking": false}
+            });
+            if let Some(tier) = tier {
+                request["service_tier"] = tier.into();
+            }
+            let response = server
+                .post("/ai/v1/responses")
+                .add_header("Authorization", &format!("Bearer {}", key.secret))
+                .json(&request)
+                .await;
+
+            assert_eq!(response.status_code().as_u16(), 400, "{tier:?}/{background}: {}", response.text());
+            let body: serde_json::Value = response.json();
+            assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
+            assert_eq!(body["error"]["code"], "unsupported_parameter", "{body}");
+            assert_eq!(body["error"]["param"], "chat_template_kwargs.enable_thinking", "{body}");
+            assert!(body["error"]["message"].as_str().unwrap().contains("reasoning.effort"), "{body}");
+        }
     }
 }

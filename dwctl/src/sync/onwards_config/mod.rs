@@ -126,7 +126,8 @@ struct OnwardsApiKey {
 }
 
 /// Every alias's overlays, keyed by alias then by account id (as a string,
-/// the value of the key's `account` label), as read from `model_overlays`.
+/// the value of the key's `account` label), as read from `model_overlays`
+/// and `account_model_policies`.
 type OverlaysByAlias = HashMap<String, HashMap<String, ServingOverlay>>;
 
 /// Serving account settings per account id, for accounts that have any.
@@ -176,8 +177,37 @@ async fn load_overlays_from_db(db: &PgPool) -> Result<OverlaysByAlias, anyhow::E
             ServingOverlay {
                 targets: parse_stored_targets(row.targets),
                 self_hosted_only: row.self_hosted_only,
+                ..Default::default()
             },
         );
+    }
+
+    // Account catalog policies: a model-wide row (no class) and the standard
+    // class row, the class taking precedence. Further classes take effect once
+    // models serve them.
+    let policies = sqlx::query!(
+        r#"
+        SELECT p.user_id, dm.alias, p.serving_class, p.priority, p.ttft_ms, p.itl_ms
+        FROM account_model_policies p
+        INNER JOIN deployed_models dm ON dm.id = p.deployed_model_id
+        INNER JOIN users u ON u.id = p.user_id
+        WHERE dm.deleted = FALSE
+          AND u.is_deleted = FALSE
+          AND (p.serving_class IS NULL OR p.serving_class = 'standard')
+        ORDER BY p.serving_class NULLS FIRST
+        "#
+    )
+    .fetch_all(db)
+    .await?;
+    for row in policies {
+        let overlay = overlays.entry(row.alias).or_default().entry(row.user_id.to_string()).or_default();
+        if row.priority.is_some() {
+            overlay.priority = row.priority;
+        }
+        if row.serving_class.is_some() {
+            overlay.ttft_ms = row.ttft_ms.and_then(|v| u32::try_from(v).ok());
+            overlay.itl_ms = row.itl_ms.and_then(|v| u32::try_from(v).ok());
+        }
     }
     Ok(overlays)
 }
@@ -210,10 +240,10 @@ async fn load_inflight_overrides_from_db(db: &PgPool) -> Result<InflightOverride
 async fn load_accounts_from_db(db: &PgPool) -> Result<AccountsById, anyhow::Error> {
     let rows = sqlx::query!(
         r#"
-        SELECT id, self_hosted_only
+        SELECT id, self_hosted_only, scheduling_priority
         FROM users
         WHERE is_deleted = FALSE
-          AND self_hosted_only
+          AND (self_hosted_only OR scheduling_priority IS NOT NULL)
         "#
     )
     .fetch_all(db)
@@ -226,6 +256,7 @@ async fn load_accounts_from_db(db: &PgPool) -> Result<AccountsById, anyhow::Erro
                 row.id.to_string(),
                 AccountServing {
                     self_hosted_only: row.self_hosted_only,
+                    priority: row.scheduling_priority,
                 },
             )
         })

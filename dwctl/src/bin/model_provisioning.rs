@@ -26,9 +26,14 @@ enum Command {
         directory: PathBuf,
         #[arg(long)]
         models: PathBuf,
+        /// Also check that no account/model pair is configured in both catalogs.
+        #[arg(long)]
+        org_overlays: Option<PathBuf>,
     },
     /// Print the JSON Schema for one organisation document.
     OrgSchema,
+    /// Print the JSON Schema for one account document.
+    AccountSchema,
     /// Print the JSON Schema for one model document.
     Schema,
 }
@@ -46,16 +51,25 @@ fn main() -> Result<()> {
             overlays.validate_models(&Catalog::load(&models)?)?;
             println!("org overlay catalog is valid: {}", directory.display());
         }
-        Command::ValidateAccountLimits { directory, models } => {
+        Command::ValidateAccountLimits {
+            directory,
+            models,
+            org_overlays,
+        } => {
             ensure!(
                 directory.is_dir(),
                 "account limits directory does not exist: {}",
                 directory.display()
             );
-            AccountLimitsCatalog::load(&directory)?.validate_models(&Catalog::load(&models)?)?;
+            let accounts = AccountLimitsCatalog::load(&directory)?;
+            accounts.validate_models(&Catalog::load(&models)?)?;
+            if let Some(org_overlays) = org_overlays {
+                accounts.validate_against_overlays(&OrgCatalog::load(&org_overlays)?)?;
+            }
             println!("account limits are valid: {}", directory.display());
         }
         Command::OrgSchema => println!("{}", OrgCatalog::json_schema()?),
+        Command::AccountSchema => println!("{}", AccountLimitsCatalog::json_schema()?),
         Command::Schema => println!("{}", Catalog::json_schema()?),
     }
     Ok(())

@@ -1,5 +1,34 @@
 # Changelog
 
+## [15.3.0](https://github.com/doublewordai/control-layer/compare/v15.2.0...v15.3.0) (2026-10-22)
+
+
+### Features
+
+* **dwctl:** accept gzip, zstd and br request bodies and compressed batch files (DW-985) ([#2082](https://github.com/doublewordai/control-layer/issues/2082)) ([673a64c](https://github.com/doublewordai/control-layer/commit/673a64c471e3026336803b29e45e228713f87ff2))
+
+
+### Bug Fixes
+
+* answer unreadable request formats with 415, and count content types (DW-985) ([#2083](https://github.com/doublewordai/control-layer/issues/2083)) ([58e3a52](https://github.com/doublewordai/control-layer/commit/58e3a527a892c9a3be0c6b2f20c7b8671babac76))
+* **build:** refresh the image CA bundle after eMudhra intermediate compromise ([#2077](https://github.com/doublewordai/control-layer/issues/2077)) ([ae3442c](https://github.com/doublewordai/control-layer/commit/ae3442c03c4a2ea7c42771499039febc20932a57))
+* **deps:** bump webpki-roots to 1.0.10 to drop the compromised emSign root ([#2078](https://github.com/doublewordai/control-layer/issues/2078)) ([552993e](https://github.com/doublewordai/control-layer/commit/552993e14111f07619e387d68a27d423ff62e34c))
+* **dwctl:** store /v1/messages request bodies as sent (DW-984) ([#2085](https://github.com/doublewordai/control-layer/issues/2085)) ([c4bb16f](https://github.com/doublewordai/control-layer/commit/c4bb16f299f44fe0f3bf900613d22f985862ac5d))
+
+## [15.2.0](https://github.com/doublewordai/control-layer/compare/v15.1.0...v15.2.0) (2026-10-21)
+
+
+### Features
+
+* per-model and per-class toleration presets in account files ([#2081](https://github.com/doublewordai/control-layer/issues/2081)) ([d916973](https://github.com/doublewordai/control-layer/commit/d916973cd77971e79e7088edbc4a3d46b90fd1a0))
+
+## [15.1.0](https://github.com/doublewordai/control-layer/compare/v15.0.0...v15.1.0) (2026-10-21)
+
+
+### Features
+
+* account files carry priority, latency targets and prices ([#2075](https://github.com/doublewordai/control-layer/issues/2075)) ([a2f91a6](https://github.com/doublewordai/control-layer/commit/a2f91a6e2bfad9f67af1a47116aa9e613c1d29dc))
+
 ## [15.0.0](https://github.com/doublewordai/control-layer/compare/v14.5.0...v15.0.0) (2026-10-21)
 
 
