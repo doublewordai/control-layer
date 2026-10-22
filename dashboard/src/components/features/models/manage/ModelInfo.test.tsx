@@ -144,6 +144,45 @@ describe("ModelInfo", () => {
     expect(request.data).not.toHaveProperty("reasoning_translation_overrides");
   });
 
+  it("asks for a limit instead of saving when the in-flight limit is cleared", async () => {
+    vi.mocked(useModel).mockReturnValue({
+      data: { ...virtualModel, realtime_inflight_limit: 14 },
+      isLoading: false,
+      error: null,
+    } as ReturnType<typeof useModel>);
+    const user = userEvent.setup();
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const { container } = render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={["/models/manage/virtual-model-id"]}>
+          <Routes>
+            <Route path="/models/manage/:modelId" element={<ModelInfo />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    const detailsHeading = within(container).getByRole("heading", {
+      name: "Model Details",
+    });
+    await user.click(within(detailsHeading.parentElement!).getByRole("button"));
+    await user.clear(
+      within(container).getByRole("spinbutton", {
+        name: "Realtime In-Flight Limit",
+      }),
+    );
+    await user.click(
+      within(container).getByRole("button", { name: "Save Changes" }),
+    );
+
+    expect(
+      within(container).getByText("Enter a realtime in-flight limit of 1 or more."),
+    ).toBeInTheDocument();
+    expect(updateModel).not.toHaveBeenCalled();
+  });
+
   it("warns when the model is managed by startup provisioning", () => {
     vi.mocked(useModel).mockReturnValue({
       data: {

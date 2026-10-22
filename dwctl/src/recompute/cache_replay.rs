@@ -12,9 +12,9 @@
 //!
 //! # Two bounds on the answer
 //!
-//! - **Retention.** `prompt_cache_entries` currently keeps expired rows, so all history is
-//!   reachable. Once the sweeper ships with its grace period, requests older than the grace
-//!   have no entries left and the split cannot be reconstructed at all.
+//! - **Retention.** The prompt-cache retention daemon deletes an entry once it has been
+//!   expired for longer than its grace. Entries for requests older than the grace may already
+//!   have been pruned, and a pruned entry reads back as a miss.
 //! - **Accuracy before the episode-per-row cutover.** Today a post-expiry write revives the
 //!   same row in place and keeps its original `created_at`, so `[created_at, expires_at]`
 //!   can span invisible dead gaps. Liveness is therefore *over*-approximated: some creations
@@ -157,7 +157,7 @@ mod tests {
 
     /// The whole point: an entry that expired long ago is invisible to the live index but
     /// must be found when asking about an instant it covered.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn an_expired_entry_is_found_at_an_instant_it_covered(pool: PgPool) {
         let principal = Uuid::new_v4();
         let hash = b"prefix-a".to_vec();
@@ -201,7 +201,7 @@ mod tests {
     }
 
     /// Scope is part of the key: another principal's identical prefix is not a hit.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn lookup_is_scoped_to_the_principal(pool: PgPool) {
         let mine = Uuid::new_v4();
         let theirs = Uuid::new_v4();
@@ -218,7 +218,7 @@ mod tests {
 
     /// A reconstruction that wrote to the index would corrupt the evidence for every later
     /// run over the same period, so writes fail loudly rather than being ignored.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn writes_are_refused_not_silently_dropped(pool: PgPool) {
         let idx = HistoricalIndex::new(pool, Utc::now());
         let entry = CacheEntry {

@@ -145,37 +145,6 @@ export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
         );
       },
     },
-    // {
-    //   id: "rateLimit",
-    //   header: "Rate Limit",
-    //   cell: ({ row }) => {
-    //     const apiKey = row.original;
-    //     const { requests_per_second, burst_size } = apiKey;
-
-    //     if (!requests_per_second && !burst_size) {
-    //       return (
-    //         <span className="text-doubleword-neutral-400 text-sm">
-    //           No limit
-    //         </span>
-    //       );
-    //     }
-
-    //     return (
-    //       <div className="text-sm">
-    //         {requests_per_second && (
-    //           <div className="text-doubleword-neutral-700">
-    //             {requests_per_second} req/s
-    //           </div>
-    //         )}
-    //         {burst_size && (
-    //           <div className="text-doubleword-neutral-500">
-    //             burst: {burst_size}
-    //           </div>
-    //         )}
-    //       </div>
-    //     );
-    //   },
-    // },
     {
       id: "usageLimit",
       header: "Usage Limit",

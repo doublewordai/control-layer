@@ -27,20 +27,23 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use fusillade_arsenal::PostgresRequestManager;
 use metrics::counter;
+use opentelemetry::{Array, StringValue, Value};
 use rust_decimal::prelude::ToPrimitive;
 use sqlx::postgres::PgListener;
 use sqlx_pool_router::DbPools;
 use tokio_util::sync::CancellationToken;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 use crate::config::NotificationsConfig;
 use crate::db::handlers::repository::Repository;
 use crate::db::handlers::users::{AutoTopupUser, LowBalanceUser, Users};
-use crate::db::handlers::{Credits, Webhooks};
+use crate::db::handlers::{Credits, Organizations, Webhooks};
 use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
 use crate::db::models::webhooks::WebhookDeliveryCreateDBRequest;
 use crate::email::EmailService;
 use crate::payment_providers::{self, AutoTopupDeclineKind, PaymentError, PaymentProvider};
+use crate::telemetry::span_account_name;
 use crate::webhooks::WebhookDispatcher;
 use crate::webhooks::events::{WebhookEvent, WebhookEventType};
 
@@ -136,6 +139,150 @@ impl BatchNotificationInfo {
             output_file_id: batch.output_file_id.map(|f| f.0),
             error_file_id: batch.error_file_id.map(|f| f.0),
         })
+    }
+}
+
+/// How a finalized batch ended, as recorded on its `fusillade.batch_finalized`
+/// span. Cancelled requests count against the batch like failed ones: a batch
+/// that answered none of its requests failed, whatever stopped them.
+fn batch_span_outcome(completed: i64, failed: i64, canceled: i64) -> &'static str {
+    if failed == 0 && canceled == 0 {
+        "completed"
+    } else if completed == 0 {
+        "failed"
+    } else {
+        "partially_completed"
+    }
+}
+
+/// Outcome of `batch`, see [`batch_span_outcome`].
+fn batch_outcome(batch: &fusillade::batch::Batch) -> &'static str {
+    batch_span_outcome(batch.completed_requests, batch.failed_requests, batch.canceled_requests)
+}
+
+/// Batches with fewer requests than this are `small` on the span. The batch
+/// failure alert ignores them, and a request count cannot be a metric label.
+const SMALL_BATCH_REQUESTS: i64 = 10;
+
+/// Size class of a batch with `total_requests`: `small` or `large`.
+fn batch_size_class(total_requests: i64) -> &'static str {
+    if total_requests < SMALL_BATCH_REQUESTS { "small" } else { "large" }
+}
+
+/// Whether a batch that finished at `finished_at` met its deadline (`met` or
+/// `missed`), with how many whole seconds late it finished (0 when on time).
+/// `None` when the batch has no deadline or no finish time.
+fn batch_deadline(expires_at: Option<DateTime<Utc>>, finished_at: Option<DateTime<Utc>>) -> Option<(&'static str, i64)> {
+    let (finished_at, expires_at) = (finished_at?, expires_at?);
+    let late_seconds = (finished_at - expires_at).num_seconds().max(0);
+    Some((if finished_at > expires_at { "missed" } else { "met" }, late_seconds))
+}
+
+/// The models a claimed batch's requests named. The claim reports them joined
+/// with `", "`, so an alias that itself contains `", "` comes back split. That
+/// is accepted rather than changing fusillade's public `BatchNotification` or
+/// scanning each batch's requests a second time.
+fn batch_models(notif: &fusillade::batch::BatchNotification) -> Vec<&str> {
+    notif.model.split(", ").filter(|model| !model.is_empty()).collect()
+}
+
+/// Emits one root `fusillade.batch_finalized` span per claimed batch so batch
+/// outcomes can be alerted on from traces. Callers pass only batches this
+/// process just claimed, and a batch is claimed once, so each batch yields one
+/// span. The attributes are listed in [`crate::telemetry`].
+///
+/// Enrichment (account display names, a failure sample) is best-effort: a
+/// failed lookup is reported and the span is still emitted without it.
+async fn emit_batch_finalized_spans<P: sqlx_pool_router::PoolProvider>(
+    request_manager: &PostgresRequestManager<P>,
+    conn: &mut sqlx::PgConnection,
+    batches: &[fusillade::batch::BatchNotification],
+) {
+    let owners: Vec<Uuid> = batches
+        .iter()
+        .filter_map(|n| n.batch.created_by.parse().ok())
+        .collect::<HashSet<Uuid>>()
+        .into_iter()
+        .collect();
+    let names: std::collections::HashMap<Uuid, String> = if owners.is_empty() {
+        Default::default()
+    } else {
+        match Users::new(conn).get_bulk(owners).await {
+            Ok(users) => users
+                .into_iter()
+                .map(|(id, user)| (id, span_account_name(user.display_name.as_deref(), &user.username)))
+                .collect(),
+            Err(e) => {
+                crate::background_error!(NOTIFICATIONS, "batch_span_account_names", Warning, error = %e, "Failed to look up account names for batch spans");
+                Default::default()
+            }
+        }
+    };
+
+    let fully_failed: Vec<_> = batches
+        .iter()
+        .filter(|n| batch_outcome(&n.batch) == "failed")
+        .map(|n| n.batch.id)
+        .collect();
+    let samples = if fully_failed.is_empty() {
+        Default::default()
+    } else {
+        request_manager.failed_batch_sample_classes(&fully_failed).await.unwrap_or_else(|e| {
+            crate::background_error!(NOTIFICATIONS, "batch_span_failure_sample", Warning, error = %e, "Failed to sample failures for batch spans");
+            Default::default()
+        })
+    };
+
+    for notif in batches {
+        let batch = &notif.batch;
+        let outcome = batch_outcome(batch);
+        let account_name = batch.created_by.parse::<Uuid>().ok().and_then(|id| names.get(&id));
+        let completion_window = if batch.service_tier.as_deref() == Some("background") {
+            "background"
+        } else {
+            batch.completion_window.as_deref().unwrap_or_default()
+        };
+        // A batch nothing answered and nothing failed in was cancelled request
+        // by request, so there is no failure to sample.
+        let sample_error = (outcome == "failed").then(|| match samples.get(&batch.id) {
+            Some(class) => class.as_str(),
+            None if batch.failed_requests == 0 => "canceled",
+            None => "unknown",
+        });
+        // When the batch finished; the span itself starts when the poller claims it.
+        let finished_at = batch.completed_at.or(batch.failed_at);
+        let finalized_at = finished_at.map(|at| at.to_rfc3339());
+        let deadline = batch_deadline(batch.expires_at, finished_at);
+        // A root span: the poller has no request to belong to. A producer,
+        // because it reports on work it did not serve itself.
+        let span = tracing::info_span!(
+            parent: None,
+            "fusillade.batch_finalized",
+            otel.name = "fusillade.batch_finalized",
+            otel.kind = "producer",
+            batch_id = %batch.id,
+            doubleword.account_id = %batch.created_by,
+            doubleword.account_name = account_name.map(String::as_str),
+            // For display: every model, joined with ", ". Filter on `batch.models`.
+            gen_ai.request.model = %notif.model,
+            completion_window = completion_window,
+            batch.total_requests = batch.total_requests,
+            batch.completed_requests = batch.completed_requests,
+            batch.failed_requests = batch.failed_requests,
+            batch.canceled_requests = batch.canceled_requests,
+            batch.outcome = outcome,
+            batch.sample_error = sample_error,
+            batch.finalized_at = finalized_at.as_deref(),
+            batch.size_class = batch_size_class(batch.total_requests),
+            batch.deadline = deadline.map(|(met, _)| met),
+            batch.late_seconds = deadline.map(|(_, late)| late),
+        );
+        // An array attribute, so a trace query can match any one of the models.
+        let models = batch_models(notif)
+            .into_iter()
+            .map(|model| StringValue::from(model.to_string()))
+            .collect();
+        span.set_attribute("batch.models", Value::Array(Array::String(models)));
     }
 }
 
@@ -285,6 +432,10 @@ pub async fn run_notification_poller(
             Ok(batches) => {
                 if !batches.is_empty() {
                     tracing::info!(count = batches.len(), "Claimed finalized batches for notification");
+
+                    // One trace span per claimed batch, whether or not email or webhooks
+                    // are configured: every finalization path converges on this claim.
+                    emit_batch_finalized_spans(&request_manager, &mut conn, &batches).await;
 
                     let infos: Vec<_> = batches.iter().filter_map(BatchNotificationInfo::try_from_batch).collect();
 
@@ -968,7 +1119,10 @@ async fn process_auto_topups(
             }
             Err(e) => {
                 crate::background_error!(AUTO_TOPUP, "payment_method_lookup", Error, user_id = %user.id, error = %e, "Failed to fetch default payment method");
-                if let Err(state_error) = Users::new(&mut *conn).pause_auto_topup_after_provider_failure(user.id).await {
+                if let Err(state_error) = Users::new(&mut *conn)
+                    .pause_auto_topup_after_provider_failure(user.id, credits_config.auto_topup_retry_delay)
+                    .await
+                {
                     crate::background_error!(
                         AUTO_TOPUP, "provider_backoff_state", Error,
                         user_id = %user.id,
@@ -1005,7 +1159,11 @@ async fn process_auto_topups(
                     match kind {
                         AutoTopupDeclineKind::Soft => {
                             users
-                                .apply_auto_topup_soft_decline(user.id, user.auto_topup_soft_failure_count)
+                                .apply_auto_topup_soft_decline(
+                                    user.id,
+                                    user.auto_topup_soft_failure_count,
+                                    credits_config.auto_topup_retry_delay,
+                                )
                                 .await
                         }
                         AutoTopupDeclineKind::Hard => users.disable_auto_topup_after_hard_decline(user.id).await,
@@ -1075,7 +1233,10 @@ async fn process_auto_topups(
                     "Failed to charge auto top-up"
                 );
 
-                let transition_applied = match Users::new(&mut *conn).pause_auto_topup_after_provider_failure(user.id).await {
+                let transition_applied = match Users::new(&mut *conn)
+                    .pause_auto_topup_after_provider_failure(user.id, credits_config.auto_topup_retry_delay)
+                    .await
+                {
                     Ok(applied) => applied,
                     Err(state_error) => {
                         crate::background_error!(
@@ -1190,6 +1351,12 @@ async fn process_auto_topups(
 }
 
 /// Send low-balance notification emails to the given users.
+///
+/// An organization's alert goes to its contact email and to every active
+/// owner and admin, since any of them can add credits. A personal account
+/// has no members, so it gets its own address only. The flag is set once
+/// any recipient was reached: retrying on a partial failure would mail the
+/// ones who already have it again every tick.
 async fn send_low_balance_notifications(
     email_service: &EmailService,
     users: &[&LowBalanceUser],
@@ -1202,19 +1369,35 @@ async fn send_low_balance_notifications(
         let Some(balance) = balance_for(user) else { continue };
         let name = user.display_name.as_deref().unwrap_or(&user.username);
 
-        if let Err(e) = email_service.send_low_balance_email(&user.email, Some(name), &balance).await {
+        let admin_emails = Organizations::new(&mut *conn).list_admin_emails(user.id).await.unwrap_or_else(|e| {
             crate::background_error!(
-                NOTIFICATIONS, "email_send", Warning,
+                NOTIFICATIONS, "low_balance_recipients", Warning,
                 user_id = %user.id,
-                email = %user.email,
                 error = %e,
-                "Failed to send low-balance notification email"
+                "Failed to list organization admins for a low-balance notification"
             );
-            continue;
+            Vec::new()
+        });
+
+        let mut delivered = false;
+        for recipient in low_balance_recipients(&user.email, admin_emails) {
+            if let Err(e) = email_service.send_low_balance_email(&recipient, Some(name), &balance).await {
+                crate::background_error!(
+                    NOTIFICATIONS, "email_send", Warning,
+                    user_id = %user.id,
+                    email = %recipient,
+                    error = %e,
+                    "Failed to send low-balance notification email"
+                );
+                continue;
+            }
+            tracing::info!(user_id = %user.id, email = %recipient, balance = %balance, "Sent low-balance notification");
+            delivered = true;
         }
 
-        tracing::info!(user_id = %user.id, email = %user.email, balance = %balance, "Sent low-balance notification");
-        sent_ids.push(user.id);
+        if delivered {
+            sent_ids.push(user.id);
+        }
     }
 
     // Bulk-mark all successfully sent notifications
@@ -1224,6 +1407,18 @@ async fn send_low_balance_notifications(
             crate::background_error!(NOTIFICATIONS, "mark_low_balance_sent", Warning, error = %e, "Failed to mark low-balance notifications as sent");
         }
     }
+}
+
+/// The account's own address first, then its owners and admins, each
+/// address once regardless of case.
+fn low_balance_recipients(account_email: &str, admin_emails: Vec<String>) -> Vec<String> {
+    let mut recipients: Vec<String> = Vec::with_capacity(admin_emails.len() + 1);
+    for email in std::iter::once(account_email.to_string()).chain(admin_emails) {
+        if !recipients.iter().any(|r| r.eq_ignore_ascii_case(&email)) {
+            recipients.push(email);
+        }
+    }
+    recipients
 }
 
 #[cfg(test)]
@@ -1268,7 +1463,7 @@ mod tests {
     /// immediately (post-pay) without any card being involved. `cus_test_soft_decline`
     /// is the dummy provider's "this card always declines" customer, so if the
     /// branch leaked into the card path this would decline instead of crediting.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_invoices_instead_of_charging(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_soft_decline", 0).await;
@@ -1304,7 +1499,7 @@ mod tests {
     }
 
     /// The flag defaults false, so every existing account keeps the card path.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_defaults_to_charging_a_card(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_soft_decline", 0).await;
@@ -1326,7 +1521,7 @@ mod tests {
         assert_eq!(state, 1, "unchanged behaviour for card-billed accounts");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_first_soft_decline_pauses_without_charging(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_soft_decline", 0).await;
@@ -1361,7 +1556,7 @@ mod tests {
         assert_eq!(transaction_count, 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_second_soft_decline_disables_without_charging(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_soft_decline", 1).await;
@@ -1381,7 +1576,7 @@ mod tests {
         assert_eq!(state.auto_topup_monthly_limit, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_hard_decline_disables_immediately(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_hard_decline", 0).await;
@@ -1401,7 +1596,7 @@ mod tests {
         assert_eq!(state.auto_topup_monthly_limit, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_provider_error_pauses_without_advancing_decline_state(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_provider_error", 1).await;
@@ -1430,7 +1625,7 @@ mod tests {
         assert_eq!(transaction_count, 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_payment_method_lookup_error_pauses_without_advancing_decline_state(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_payment_method_lookup_error", 0).await;
@@ -1449,7 +1644,7 @@ mod tests {
         assert!(state.auto_topup_retry_after > Some(Utc::now()));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_without_payment_method_disables_auto_topup(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_no_payment_method", 0).await;
@@ -1475,7 +1670,7 @@ mod tests {
         assert_eq!(state.auto_topup_retry_after, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_success_resets_soft_decline_state(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_success_after_decline", 1).await;
@@ -1643,7 +1838,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_skips_when_charge_already_in_flight(pool: sqlx::PgPool) {
         // A concurrent sweep on another replica already owns this charge. We must
         // skip without crediting the user, rather than treating it as a failure.
@@ -1676,7 +1871,7 @@ mod tests {
         assert_eq!(count.count, 0, "must not credit the user when another replica owns the charge");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_charges_below_threshold(pool: sqlx::PgPool) {
         // Create a test user with auto top-up configured
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
@@ -1714,7 +1909,7 @@ mod tests {
         assert!(txn.source_id.contains(&user.id.to_string()), "source_id should contain user ID");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_skips_above_threshold(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
 
@@ -1764,7 +1959,7 @@ mod tests {
         assert_eq!(count.count.unwrap(), 1, "Should only have the seed transaction");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_idempotent(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
 
@@ -1805,7 +2000,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_respects_monthly_limit(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
 
@@ -1873,7 +2068,7 @@ mod tests {
         assert_eq!(count.count.unwrap(), 2, "Should have charged (total $50 = limit)");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_blocks_when_limit_exceeded(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
 
@@ -1945,7 +2140,7 @@ mod tests {
         assert_eq!(rows[1].description.as_deref(), Some("Automatic top-up (capped by monthly limit)"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_skips_when_limit_fully_exhausted(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
 
@@ -2014,5 +2209,312 @@ mod tests {
             1,
             "Should NOT have charged (limit fully exhausted, zero headroom)"
         );
+    }
+
+    #[test]
+    fn test_low_balance_recipients_lists_each_address_once() {
+        let recipients = low_balance_recipients(
+            "Billing@Example.com",
+            vec!["billing@example.com".into(), "owner@example.com".into(), "OWNER@example.com".into()],
+        );
+        assert_eq!(recipients, vec!["Billing@Example.com".to_string(), "owner@example.com".to_string()]);
+    }
+
+    /// An organization's low-balance alert reaches everyone who can add
+    /// credits (its contact address, owners and admins) and no plain members.
+    #[dwctl_test_macros::test]
+    async fn test_low_balance_notification_reaches_org_owners_and_admins(pool: sqlx::PgPool) {
+        let scratch = std::env::temp_dir().join(format!("dwctl-test-emails-low-balance-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let mut config = crate::test::utils::create_test_config();
+        config.email.transport = crate::config::EmailTransportConfig::File {
+            path: scratch.to_string_lossy().to_string(),
+        };
+        let email_service = EmailService::new(&config).unwrap();
+
+        let owner = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let admin = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let member = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let org = {
+            let mut orgs = Organizations::new(&mut conn);
+            let org = orgs
+                .create(
+                    &crate::db::models::organizations::OrganizationCreateDBRequest {
+                        name: "low-balance-org".into(),
+                        email: "billing@low-balance.example.com".into(),
+                        display_name: Some("Low Balance Org".into()),
+                        avatar_url: None,
+                        created_by: owner.id,
+                    },
+                    &[Role::StandardUser],
+                )
+                .await
+                .unwrap();
+            orgs.add_member(org.id, admin.id, "admin").await.unwrap();
+            orgs.add_member(org.id, member.id, "member").await.unwrap();
+            org
+        };
+
+        let org_user = LowBalanceUser {
+            id: org.id,
+            email: org.email.clone(),
+            username: org.username.clone(),
+            display_name: org.display_name.clone(),
+            low_balance_threshold: Decimal::from(10),
+            low_balance_notification_sent: false,
+            checkpoint_balance: Some(Decimal::from(2)),
+        };
+        send_low_balance_notifications(&email_service, &[&org_user], &|u: &LowBalanceUser| u.checkpoint_balance, &mut conn).await;
+
+        let to_addresses: Vec<String> = std::fs::read_dir(&scratch)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("eml"))
+            .map(|path| std::fs::read_to_string(path).unwrap())
+            .flat_map(|body| {
+                body.lines()
+                    .filter_map(|line| line.strip_prefix("To: ").map(|rest| rest.trim().to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        // Lines read `To: "Name" <address>`; match on the address.
+        for expected in [&org.email, &owner.email, &admin.email] {
+            let hits = to_addresses.iter().filter(|to| to.contains(expected.as_str())).count();
+            assert_eq!(hits, 1, "{expected} gets exactly one email; got {to_addresses:?}");
+        }
+        assert_eq!(to_addresses.len(), 3, "nobody else is mailed; got {to_addresses:?}");
+        assert!(
+            !to_addresses.iter().any(|to| to.contains(member.email.as_str())),
+            "a plain member cannot add credits and is not mailed"
+        );
+
+        let sent: bool = sqlx::query_scalar("SELECT low_balance_notification_sent FROM users WHERE id = $1")
+            .bind(org.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(sent, "the org is marked as notified");
+
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    #[derive(Clone, Default, Debug)]
+    struct ExportedSpans(Arc<std::sync::Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>);
+    impl opentelemetry_sdk::trace::SpanExporter for ExportedSpans {
+        async fn export(&self, batch: Vec<opentelemetry_sdk::trace::SpanData>) -> opentelemetry_sdk::error::OTelSdkResult {
+            self.0.lock().unwrap().extend(batch);
+            Ok(())
+        }
+    }
+
+    fn span_attr(span: &opentelemetry_sdk::trace::SpanData, key: &str) -> Option<String> {
+        span.attributes.iter().find(|a| a.key.as_str() == key).map(|a| a.value.to_string())
+    }
+
+    /// The `batch.models` array attribute, sorted.
+    fn span_models(span: &opentelemetry_sdk::trace::SpanData) -> Vec<String> {
+        let value = span.attributes.iter().find(|a| a.key.as_str() == "batch.models").map(|a| &a.value);
+        let Some(Value::Array(Array::String(models))) = value else {
+            panic!("batch.models is not a string array: {value:?}");
+        };
+        let mut models: Vec<String> = models.iter().map(|model| model.to_string()).collect();
+        models.sort();
+        models
+    }
+
+    #[test]
+    fn batch_span_classification() {
+        assert_eq!(batch_span_outcome(5, 0, 0), "completed");
+        assert_eq!(batch_span_outcome(0, 5, 0), "failed");
+        assert_eq!(batch_span_outcome(3, 2, 0), "partially_completed");
+        // Cancelled requests are not answered, so they count against the batch.
+        assert_eq!(batch_span_outcome(0, 0, 5), "failed");
+        assert_eq!(batch_span_outcome(3, 0, 2), "partially_completed");
+    }
+
+    #[test]
+    fn batch_span_size_class() {
+        assert_eq!(batch_size_class(1), "small");
+        assert_eq!(batch_size_class(9), "small");
+        assert_eq!(batch_size_class(10), "large");
+    }
+
+    #[test]
+    fn batch_span_deadline() {
+        let expires_at = Utc::now();
+        let at = |millis| Some(expires_at + chrono::Duration::milliseconds(millis));
+        assert_eq!(batch_deadline(Some(expires_at), at(-60_000)), Some(("met", 0)));
+        assert_eq!(
+            batch_deadline(Some(expires_at), at(0)),
+            Some(("met", 0)),
+            "finishing at the deadline is on time"
+        );
+        assert_eq!(
+            batch_deadline(Some(expires_at), at(500)),
+            Some(("missed", 0)),
+            "late by less than a second"
+        );
+        assert_eq!(batch_deadline(Some(expires_at), at(90_500)), Some(("missed", 90)));
+        assert_eq!(batch_deadline(None, at(0)), None);
+        assert_eq!(batch_deadline(Some(expires_at), None), None);
+    }
+
+    /// Each finalized batch yields exactly one `fusillade.batch_finalized` span,
+    /// because the claim hands a batch to the poller once. Account name, counts,
+    /// outcome and a status-only failure sample ride on the span.
+    #[dwctl_test_macros::test]
+    async fn test_batch_finalized_span_emitted_once_per_claim(pool: sqlx::PgPool) {
+        use fusillade::{DaemonStorage, Storage};
+        use opentelemetry::trace::TracerProvider as _;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let exported = ExportedSpans::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exported.clone())
+            .build();
+        // The test runtime is single-threaded, so a thread-local subscriber sees every span.
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(provider.tracer("batch-span-test"))),
+        );
+
+        let owner = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        sqlx::query("UPDATE users SET display_name = 'Example Analytics Ltd' WHERE id = $1")
+            .bind(owner.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let fusillade_pool = crate::test::utils::setup_fusillade_pool(&pool).await;
+        let manager = PostgresRequestManager::new(
+            fusillade_arsenal::TestDbPools::new(fusillade_pool.clone()).await.unwrap(),
+            fusillade_arsenal::PostgresStorageConfig::default(),
+        );
+
+        let mut batch_ids = Vec::new();
+        let one_model = ["span-test-model", "span-test-model"];
+        for (name, state, status, models) in [
+            ("all-failed", "failed", 422, one_model),
+            ("all-completed", "completed", 200, one_model),
+            ("all-canceled", "canceled", 0, ["span-model-a", "span-model-b"]),
+        ] {
+            let templates = models
+                .iter()
+                .enumerate()
+                .map(|(i, model)| fusillade::RequestTemplateInput {
+                    custom_id: Some(format!("{name}-{i}")),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: model.to_string(),
+                    api_key: "key".to_string(),
+                })
+                .collect();
+            let file_id = manager.create_file(format!("{name}-file"), None, templates).await.unwrap();
+            let batch = manager
+                .create_batch(fusillade::BatchInput {
+                    file_id,
+                    endpoint: "/v1/chat/completions".to_string(),
+                    completion_window: "24h".to_string(),
+                    metadata: None,
+                    created_by: Some(owner.id.to_string()),
+                    api_key_id: None,
+                    api_key: None,
+                    total_requests: None,
+                })
+                .await
+                .unwrap();
+            sqlx::query(
+                "UPDATE requests SET state = $2, response_status = NULLIF($3, 0), \
+                 completed_at = CASE WHEN $2 <> 'canceled' THEN NOW() END, failed_at = CASE WHEN $2 = 'failed' THEN NOW() END, \
+                 canceled_at = CASE WHEN $2 = 'canceled' THEN NOW() END, \
+                 response_body = CASE WHEN $2 = 'completed' THEN '{}' END, error = CASE WHEN $2 = 'failed' THEN 'secret detail' END \
+                 WHERE batch_id = $1",
+            )
+            .bind(*batch.id)
+            .bind(state)
+            .bind(status as i16)
+            .execute(&fusillade_pool)
+            .await
+            .unwrap();
+            if name == "all-failed" {
+                // Due an hour ago, so it finishes late.
+                sqlx::query("UPDATE batches SET expires_at = NOW() - INTERVAL '1 hour' WHERE id = $1")
+                    .bind(*batch.id)
+                    .execute(&fusillade_pool)
+                    .await
+                    .unwrap();
+            }
+            batch_ids.push(batch.id);
+        }
+        manager.finalize_terminal_batches().await.unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let claimed = manager.claim_batch_notifications().await.unwrap();
+        assert_eq!(claimed.len(), 3);
+        emit_batch_finalized_spans(&manager, &mut conn, &claimed).await;
+        // Nothing is left to claim, so the next poll emits nothing.
+        let again = manager.claim_batch_notifications().await.unwrap();
+        assert!(again.is_empty());
+        emit_batch_finalized_spans(&manager, &mut conn, &again).await;
+
+        provider.force_flush().unwrap();
+        let spans = exported.0.lock().unwrap();
+        let spans: Vec<_> = spans.iter().filter(|s| s.name == "fusillade.batch_finalized").collect();
+        assert_eq!(spans.len(), 3, "one span per claimed batch");
+        // The poller produces the span for a batch it did not serve, so the
+        // kind is the span's own kind, never a string attribute.
+        for span in &spans {
+            assert_eq!(span.span_kind, opentelemetry::trace::SpanKind::Producer);
+            assert_eq!(span_attr(span, "otel.kind"), None, "otel.kind must not leak as an attribute");
+        }
+        let span_of = |batch_id: fusillade::BatchId| {
+            spans
+                .iter()
+                .find(|s| span_attr(s, "batch_id") == Some(batch_id.to_string()))
+                .expect("span for batch")
+        };
+        for (batch_id, outcome, completed, failed) in [(batch_ids[0], "failed", "0", "2"), (batch_ids[1], "completed", "2", "0")] {
+            let span = span_of(batch_id);
+            assert_eq!(span_attr(span, "doubleword.account_id"), Some(owner.id.to_string()));
+            assert_eq!(span_attr(span, "doubleword.account_name").as_deref(), Some("Example Analytics Ltd"));
+            assert_eq!(span_attr(span, "gen_ai.request.model").as_deref(), Some("span-test-model"));
+            assert_eq!(span_models(span), vec!["span-test-model"]);
+            assert_eq!(span_attr(span, "completion_window").as_deref(), Some("24h"));
+            assert_eq!(span_attr(span, "batch.total_requests").as_deref(), Some("2"));
+            assert_eq!(span_attr(span, "batch.completed_requests").as_deref(), Some(completed));
+            assert_eq!(span_attr(span, "batch.failed_requests").as_deref(), Some(failed));
+            assert_eq!(span_attr(span, "batch.outcome").as_deref(), Some(outcome));
+            assert!(span_attr(span, "batch.finalized_at").is_some(), "the batch's own finish time");
+            assert_eq!(span_attr(span, "batch.size_class").as_deref(), Some("small"));
+            let late_seconds: i64 = span_attr(span, "batch.late_seconds").expect("late_seconds").parse().unwrap();
+            if outcome == "failed" {
+                assert_eq!(span_attr(span, "batch.deadline").as_deref(), Some("missed"));
+                assert!(late_seconds >= 3600, "finished an hour after its deadline, got {late_seconds}");
+            } else {
+                assert_eq!(span_attr(span, "batch.deadline").as_deref(), Some("met"));
+                assert_eq!(late_seconds, 0);
+            }
+            let sample = span_attr(span, "batch.sample_error");
+            if outcome == "failed" {
+                assert_eq!(sample.as_deref(), Some("http_422"), "status class only, never the message");
+            } else {
+                assert_eq!(sample, None);
+            }
+        }
+
+        // Cancelled request by request: nothing answered, so the batch failed,
+        // with nothing failed to sample. Both its models are shown, and each
+        // can be filtered on.
+        let canceled = span_of(batch_ids[2]);
+        assert_eq!(span_attr(canceled, "batch.outcome").as_deref(), Some("failed"));
+        assert_eq!(span_attr(canceled, "batch.canceled_requests").as_deref(), Some("2"));
+        assert_eq!(span_attr(canceled, "batch.sample_error").as_deref(), Some("canceled"));
+        assert_eq!(
+            span_attr(canceled, "gen_ai.request.model").as_deref(),
+            Some("span-model-a, span-model-b")
+        );
+        assert_eq!(span_models(canceled), vec!["span-model-a", "span-model-b"]);
     }
 }

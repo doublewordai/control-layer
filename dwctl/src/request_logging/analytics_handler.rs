@@ -52,6 +52,7 @@ use crate::metrics::errors::component::ANALYTICS;
 use crate::request_logging::batcher::{AnalyticsOutboxWriter, RawAnalyticsRecord};
 use crate::request_logging::models::{AiResponse, ChatCompletionChunk};
 use crate::request_logging::serializers::{UsageMetrics, parse_ai_response};
+use crate::request_logging::stream_completion::client_disconnected;
 use crate::request_logging::utils::{extract_header_as_string, extract_header_as_uuid};
 use axum::http::StatusCode;
 use onwards::AuthenticatedApiKeyId;
@@ -211,8 +212,15 @@ impl RequestHandler for AnalyticsHandler {
         let span = info_span!(
             "dwctl.analytics_handler",
             correlation_id = correlation_id,
-            status = %response_data.status
+            status = %response_data.status,
+            x_request_id = tracing::field::Empty,
         );
+        // This runs after the response, outside the request span, so it
+        // carries the request's ID itself for the analytics logs to be found
+        // by it. `assign_request_id` set the header before outlet captured it.
+        if let Some(x_request_id) = extract_header_as_string(&request_data, "x-request-id") {
+            span.record("x_request_id", tracing::field::display(x_request_id));
+        }
 
         async {
             // Whether this is a token-bearing generative endpoint. Gates the
@@ -264,8 +272,9 @@ impl RequestHandler for AnalyticsHandler {
                     correlation_id = correlation_id,
                     uri = %request_data.uri,
                     response_type = %metrics.response_type,
-                    request_model = ?metrics.request_model,
-                    response_model = ?metrics.response_model,
+                    request_model = metrics.request_model.as_deref(),
+                    response_model = metrics.response_model.as_deref(),
+                    client_disconnected = client_disconnected(&response_data),
                     "Successful generative response recorded zero tokens"
                 );
             }
@@ -316,6 +325,7 @@ impl RequestHandler for AnalyticsHandler {
                 server_address: metrics.server_address,
                 server_port: metrics.server_port,
                 served_by: metrics.served_by,
+                served_model: metrics.served_model,
                 requested_serving_class: metrics.requested_serving_class,
                 resolved_serving_class: metrics.resolved_serving_class,
                 api_key_id,
@@ -327,6 +337,7 @@ impl RequestHandler for AnalyticsHandler {
                 batch_request_source,
                 trace_id: request_data.trace_id.clone(),
                 gateway_span_id: request_data.span_id.clone(),
+                x_request_id: extract_header_as_uuid(&request_data, "x-request-id"),
             };
 
             // The first handoff is durable: write the raw record directly to

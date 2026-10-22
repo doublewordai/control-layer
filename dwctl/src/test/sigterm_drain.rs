@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::test::utils::setup_fusillade_pool;
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn shutdown_marks_onwards_daemon_dead_and_releases_rows(pool: PgPool) {
     let pool = setup_fusillade_pool(&pool).await;
 
@@ -39,15 +39,7 @@ async fn shutdown_marks_onwards_daemon_dead_and_releases_rows(pool: PgPool) {
     .expect("insert daemon");
 
     // Create a template + request_processing row owned by this daemon.
-    sqlx::query(
-        "INSERT INTO request_templates \
-         (id, file_id, custom_id, endpoint, method, path, body, model, api_key, body_byte_size) \
-         VALUES ($1, NULL, NULL, 'http://upstream', 'POST', '/v1/responses', '{}', 'm', '', 0)",
-    )
-    .bind(template_id)
-    .execute(&pool)
-    .await
-    .expect("insert template");
+    crate::test::utils::insert_fusillade_template(&pool, template_id, None, "m", "", "http://upstream", "/v1/responses", "{}", None).await;
     sqlx::query(
         "INSERT INTO requests \
          (id, batch_id, template_id, model, custom_id, state, daemon_id, claimed_at, started_at, created_by) \
@@ -84,7 +76,7 @@ async fn shutdown_marks_onwards_daemon_dead_and_releases_rows(pool: PgPool) {
     assert_eq!(row.2, None, "started_at should be cleared");
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn drain_with_no_owned_rows_is_a_noop(pool: PgPool) {
     let pool = setup_fusillade_pool(&pool).await;
     let daemon_id = Uuid::new_v4();
@@ -108,7 +100,7 @@ async fn drain_with_no_owned_rows_is_a_noop(pool: PgPool) {
     assert_eq!(status, "dead");
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn drain_does_not_touch_other_daemons_rows(pool: PgPool) {
     let pool = setup_fusillade_pool(&pool).await;
     let our_daemon = Uuid::new_v4();
@@ -126,15 +118,7 @@ async fn drain_does_not_touch_other_daemons_rows(pool: PgPool) {
         .await
         .unwrap();
     }
-    sqlx::query(
-        "INSERT INTO request_templates \
-         (id, file_id, custom_id, endpoint, method, path, body, model, api_key, body_byte_size) \
-         VALUES ($1, NULL, NULL, 'http://upstream', 'POST', '/v1/responses', '{}', 'm', '', 0)",
-    )
-    .bind(template_id)
-    .execute(&pool)
-    .await
-    .unwrap();
+    crate::test::utils::insert_fusillade_template(&pool, template_id, None, "m", "", "http://upstream", "/v1/responses", "{}", None).await;
     sqlx::query(
         "INSERT INTO requests \
          (id, batch_id, template_id, model, custom_id, state, daemon_id, claimed_at, started_at, created_by) \

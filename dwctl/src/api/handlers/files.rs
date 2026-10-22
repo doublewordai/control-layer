@@ -30,7 +30,9 @@ use crate::errors::{Error, Result};
 use crate::image_normalizer::{ImageInput, ImageNormalizer, Mode as ImageNormalizerMode, walker as image_walker};
 use crate::inference::validation::{ExactCountBudget, Source, Surface, ValidationStage};
 use crate::reasoning::ModelReasoningPolicy;
+use crate::sync::key_policy::AccountTolerations;
 use crate::types::Resource;
+use crate::upload_compression::{self, ChunkError, Detected};
 use axum::{
     Json,
     body::Body,
@@ -177,6 +179,7 @@ impl OpenAIBatchRequest {
         api_key: String,
         accessible_models: &HashMap<String, AccessibleBatchModel>,
         allowed_url_paths: &[String],
+        tolerations: &AccountTolerations,
     ) -> Result<fusillade::RequestTemplateInput> {
         // Validate custom_id is safe for HTTP headers
         validate_custom_id(&self.custom_id)?;
@@ -197,9 +200,9 @@ impl OpenAIBatchRequest {
             })?
             .to_string();
 
-        // Batches use deadline scheduling, so all serving-class suffixes
-        // are ignored. Resolve the base model before validating access.
-        let (model, _) = onwards::serving::split_model_suffix(&model).map_err(|error| Error::BadRequest {
+        // Batches use deadline scheduling, so a model suffix is ignored.
+        // Resolve the base model before validating access.
+        let (model, _) = crate::inference::model_selector::split_model_suffix(&model).map_err(|error| Error::BadRequest {
             message: error.to_string(),
         })?;
         let model = model.to_string();
@@ -233,6 +236,14 @@ impl OpenAIBatchRequest {
         let mut sanitized_body = self.body.clone();
         sanitized_body["model"] = model.clone().into();
         crate::inference::middleware::strip_scheduling_priority(&mut sanitized_body);
+
+        // A preset-pinned account's batch requests carry its preset's fixed
+        // toleration list for this line's model, exactly as its realtime and
+        // flex requests do. Applied after the strip above so the client can
+        // never override it.
+        if let Some(tolerations) = tolerations.for_model(&model) {
+            crate::inference::middleware::set_routing_tolerations(&mut sanitized_body, &tolerations);
+        }
 
         // Serialize sanitized body back to string
         let body = serde_json::to_string(&sanitized_body).map_err(|e| Error::BadRequest {
@@ -476,6 +487,10 @@ enum FileUploadError {
     InvalidJson { line: u64, error: String },
     /// Invalid UTF-8 encoding in the file
     InvalidUtf8 { line: u64, byte_offset: i64, error: String },
+    /// The file starts as gzip or zstd but isn't valid data for it (corrupt or truncated)
+    InvalidCompression { format: &'static str, message: String },
+    /// The file is compressed in a format we recognise but don't decode
+    UnsupportedCompression { format: &'static str },
     /// No file field in multipart upload
     NoFile,
     /// File contains no valid request templates
@@ -566,6 +581,14 @@ impl FileUploadError {
                     line, byte_offset, error
                 ),
             },
+            FileUploadError::InvalidCompression { format, message } => Error::BadRequest {
+                message: format!("File is not valid {format} data: {message}"),
+            },
+            FileUploadError::UnsupportedCompression { format } => Error::UnsupportedMediaType {
+                message: format!(
+                    "File is compressed with {format}, which is not supported. Upload it uncompressed, or compressed with gzip or zstd."
+                ),
+            },
             FileUploadError::NoFile => Error::BadRequest {
                 message: "No file field found in multipart upload".to_string(),
             },
@@ -612,6 +635,15 @@ impl FileUploadError {
 
 /// Check if an error (or any error in its source chain) is a body/stream length limit error.
 /// Uses typed error matching via downcasting, with string-based fallback for wrapped errors.
+/// Whether the request declares a `multipart/form-data` body, parameters aside.
+fn is_multipart_form(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("multipart/form-data"))
+}
+
 fn is_length_limit_error(err: &(dyn std::error::Error + 'static)) -> bool {
     // Check for axum's LengthLimitError directly
     if err.downcast_ref::<LengthLimitError>().is_some() {
@@ -691,6 +723,10 @@ struct FileRequestContext {
     allowed_url_paths: Vec<String>,
     /// Inference request validation, applied to every line. `None` when disabled.
     validation: Option<ValidationStage>,
+    /// The toleration presets of the account that owns this upload, resolved
+    /// per line by its model. A pinned line's list is written verbatim to
+    /// `nvext.routing_constraints.tolerations` on its template body.
+    tolerations: AccountTolerations,
 }
 
 struct AccessibleBatchModel {
@@ -755,6 +791,7 @@ fn create_file_stream(
         accessible_models,
         allowed_url_paths,
         validation,
+        tolerations,
     } = req_ctx;
     // Lines are validated one after another, so cap the tokenizer round trips
     // a single upload can spend on exact counts.
@@ -842,8 +879,15 @@ fn create_file_stream(
                     }
                 }
                 "file" => {
-                    // Extract filename from the field
-                    metadata.filename = field.file_name().map(|s| s.to_string());
+                    let filename = field.file_name().map(|s| s.to_string());
+
+                    // A gzip or zstd file is decoded as it streams in: the size
+                    // limit, the parser and the stored file all see decoded content.
+                    let (format, mut chunks) = upload_compression::open(Box::pin(field)).await;
+                    if let Detected::Unsupported(format) = format {
+                        abort!(FileUploadError::UnsupportedCompression { format });
+                    }
+                    metadata.filename = filename.map(|name| format.decoded_file_name(&name));
 
                     // Send metadata before processing file content
                     if tx.send(fusillade::FileStreamItem::Metadata(metadata.clone())).await.is_err() {
@@ -851,11 +895,9 @@ fn create_file_stream(
                     }
 
                     // Now stream and parse the file content
-                    let mut field = field;
-
                     loop {
-                        match field.chunk().await {
-                            Ok(Some(chunk)) => {
+                        match chunks.next().await {
+                            Some(Ok(chunk)) => {
                                 let chunk_size = chunk.len() as u64;
                                 total_size += chunk_size;
 
@@ -957,8 +999,13 @@ fn create_file_stream(
                                     match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
                                         Ok(openai_req) => {
                                             // Transform to internal format (includes model access validation)
-                                            match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models, &allowed_url_paths)
-                                            {
+                                            match openai_req.to_internal(
+                                                &endpoint,
+                                                api_key.clone(),
+                                                &accessible_models,
+                                                &allowed_url_paths,
+                                                &tolerations,
+                                            ) {
                                                 Ok(mut template) => {
                                                     if let Err(e) = validate_batch_line(
                                                         validation.as_ref(),
@@ -1023,11 +1070,17 @@ fn create_file_stream(
                                     }
                                 }
                             }
-                            Ok(None) => {
+                            None => {
                                 // Normal end of stream
                                 break;
                             }
-                            Err(e) => {
+                            Some(Err(ChunkError::Decode(e))) => {
+                                abort!(FileUploadError::InvalidCompression {
+                                    format: format.name(),
+                                    message: e.to_string(),
+                                });
+                            }
+                            Some(Err(ChunkError::Upload(e))) => {
                                 // Log Display and Debug representations
                                 tracing::warn!(
                                     error_display = %e,
@@ -1060,7 +1113,13 @@ fn create_file_stream(
 
                             match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
                                 Ok(openai_req) => {
-                                    match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models, &allowed_url_paths) {
+                                    match openai_req.to_internal(
+                                        &endpoint,
+                                        api_key.clone(),
+                                        &accessible_models,
+                                        &allowed_url_paths,
+                                        &tolerations,
+                                    ) {
                                         Ok(mut template) => {
                                             if let Err(e) =
                                                 validate_batch_line(validation.as_ref(), exact_budget.as_ref(), &template, line_count + 1)
@@ -1160,13 +1219,14 @@ fn create_file_stream(
 Each line must be a valid JSON object containing `custom_id`, `method`, `url`, and `body` fields. The `model` field in the body must reference a model your API key has access to.",
     request_body(
         content_type = "multipart/form-data",
-        description = "Multipart form with `file` (the JSONL file) and `purpose` (must be `batch`)."
+        description = "Multipart form with `file` (the JSONL file, optionally gzip- or zstd-compressed) and `purpose` (must be `batch`)."
     ),
     responses(
         (status = 201, description = "File uploaded and validated successfully.", body = FileResponse),
         (status = 400, description = "Invalid file format, malformed JSON, missing required fields, etc."),
         (status = 403, description = "Model referenced in the file is not configured or not accessible to your account."),
         (status = 413, description = "File exceeds the maximum allowed size."),
+        (status = 415, description = "The request is not `multipart/form-data`, or the file is compressed in a format other than gzip or zstd."),
         (status = 422, description = "A referenced image URL could not be retrieved because its origin refused access (e.g. 403/404). The file is well-formed but references an image that is forbidden, gated, or missing."),
         (status = 429, description = "Too many concurrent uploads. Retry after a short delay."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists."),
@@ -1179,6 +1239,14 @@ pub async fn upload_file<P: PoolProvider>(
     current_user: RequiresPermission<resource::Files, operation::CreateOwn>,
     request: axum::http::Request<axum::body::Body>,
 ) -> Result<(StatusCode, Json<FileResponse>)> {
+    // Refuse a body that isn't a multipart form before it takes an upload slot.
+    // A malformed form (a bad boundary, say) is still a 400 below.
+    if !is_multipart_form(request.headers()) {
+        return Err(Error::UnsupportedMediaType {
+            message: "File uploads must be sent as multipart/form-data, with the file in a `file` field".to_string(),
+        });
+    }
+
     // Acquire upload permit (if limiter is configured)
     // The permit is held for the duration of the upload to limit concurrency
     let _permit = if let Some(ref limiter) = state.limiters.file_uploads {
@@ -1277,6 +1345,29 @@ pub async fn upload_file<P: PoolProvider>(
         .await
         .map_err(Error::Database)?;
 
+    // The account's resolved scheduling tolerations, if it is pinned to a
+    // preset. The hidden batch key belongs to the account that owns the batch
+    // (`target_user_id` is the org in org context, else the person), so its
+    // per-key policy carries the account's preset. Read it from the same policy
+    // map realtime uses, so batch and realtime agree on the toleration list.
+    //
+    // A just-created hidden key cannot be in the policy map yet: the map is
+    // refreshed asynchronously off the auth_config_changed notification, which
+    // this request's `api_keys` INSERT fires but the LISTEN/NOTIFY loop has not
+    // consumed. Only in that case (the key is absent from the map) read the
+    // account's policy straight off the users row, reusing the connection `conn`
+    // this handler already holds — a cached account on Default is not a miss, so
+    // an ordinary upload never takes a second connection.
+    let tolerations = match state.key_policy_cache.account_tolerations_if_known(&user_api_key) {
+        Some(resolved) => resolved,
+        None => {
+            let policy = crate::sync::key_policy::load_policy(&mut conn, target_user_id)
+                .await
+                .map_err(|e| Error::Database(e.into()))?;
+            state.key_policy_cache.account_tolerations(policy)
+        }
+    };
+
     // Construct batch execution endpoint (where fusillade will send requests)
     let endpoint = format!("http://{}:{}/ai", config.host, config.port);
 
@@ -1320,6 +1411,7 @@ pub async fn upload_file<P: PoolProvider>(
             accessible_models,
             allowed_url_paths: config.batches.allowed_url_paths.clone(),
             validation: state.request_validation.clone(),
+            tolerations,
         },
         Some(api_key_id),
     );
@@ -2019,12 +2111,23 @@ pub async fn delete_file<P: PoolProvider>(
     // Soft-delete the file: cancels non-terminal batches and unlinks them
     // (file_id = NULL), NULLs output_file_id/error_file_id, and marks the file
     // deleted (retained for audit). Existing batch results survive file deletion.
+    //
+    // `delete_file` reports `FileNotFound` when the row is already soft-deleted,
+    // which happens when a duplicate/concurrent DELETE loses the race. That is a
+    // client-visible `404`, not a server fault — matching the `get_file` check
+    // above, which already returns 404 once the row is gone.
     state
         .request_manager
         .delete_file(fusillade::FileId(file_id))
         .await
-        .map_err(|e| Error::Internal {
-            operation: format!("delete file: {}", e),
+        .map_err(|e| match e {
+            fusillade::FusilladeError::FileNotFound(_) => Error::NotFound {
+                resource: "File".to_string(),
+                id: file_id_str.clone(),
+            },
+            other => Error::Internal {
+                operation: format!("delete file: {}", other),
+            },
         })?;
 
     Ok(Json(FileDeleteResponse {
@@ -2267,7 +2370,7 @@ mod tests {
             .await
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn validates_reasoning_controls_during_upload(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2338,7 +2441,7 @@ mod tests {
         assert!(missing_budget_limit.text().contains("max_completion_tokens is not set"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_and_download_file_content(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2402,7 +2505,119 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_upload_compressed_file_stores_decoded_content(pool: PgPool) {
+        use std::io::Write;
+
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello 1"}]}}
+{"custom_id":"request-2","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello 2"}]}}
+"#;
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(jsonl_content.as_bytes()).unwrap();
+        let gzip = gzip.finish().unwrap();
+        let zstd = zstd::encode_all(jsonl_content.as_bytes(), 3).unwrap();
+
+        for (compressed, name) in [(gzip, "test-batch.jsonl.gz"), (zstd, "test-batch.jsonl.zst")] {
+            let upload_response = app
+                .post("/ai/v1/files")
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                .multipart(
+                    axum_test::multipart::MultipartForm::new()
+                        .add_text("purpose", "batch")
+                        .add_part("file", axum_test::multipart::Part::bytes(compressed).file_name(name)),
+                )
+                .await;
+
+            upload_response.assert_status(axum::http::StatusCode::CREATED);
+            let file: FileResponse = upload_response.json();
+            assert_eq!(file.filename, "test-batch.jsonl", "{name}");
+            assert_eq!(file.bytes, jsonl_content.len() as i64, "{name}: size is the decoded size");
+
+            let downloaded = app
+                .get(&format!("/ai/v1/files/{}/content", file.id))
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                .await
+                .text();
+            let ids: Vec<String> = downloaded
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["custom_id"].to_string())
+                .collect();
+            assert_eq!(ids, ["\"request-1\"", "\"request-2\""], "{name}");
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_upload_broken_or_unsupported_compression_names_the_problem(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        let truncated_gzip = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xab\x56".to_vec();
+        let xz = b"\xfd7zXZ\x00\x00\x04\xe6\xd6\xb4\x46".to_vec();
+        for (content, status, expected) in [
+            (truncated_gzip, axum::http::StatusCode::BAD_REQUEST, "not valid gzip data"),
+            (xz, axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE, "compressed with xz"),
+        ] {
+            let upload_response = app
+                .post("/ai/v1/files")
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                .multipart(
+                    axum_test::multipart::MultipartForm::new()
+                        .add_text("purpose", "batch")
+                        .add_part("file", axum_test::multipart::Part::bytes(content).file_name("batch.jsonl")),
+                )
+                .await;
+
+            upload_response.assert_status(status);
+            let body = upload_response.text();
+            assert!(body.contains(expected), "{body}");
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_upload_that_is_not_a_multipart_form_returns_415(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let line = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4"}}"#;
+
+        for content_type in [Some("application/jsonl"), Some("application/x-www-form-urlencoded"), None] {
+            let mut request = app
+                .post("/ai/v1/files")
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1);
+            if let Some(content_type) = content_type {
+                request = request.content_type(content_type);
+            }
+            let upload_response = request.bytes(line.as_bytes().to_vec().into()).await;
+
+            upload_response.assert_status(axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+            assert!(upload_response.text().contains("multipart/form-data"), "{content_type:?}");
+        }
+
+        // A multipart content type with a broken form is still malformed, not unsupported.
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .content_type("multipart/form-data")
+            .bytes(line.as_bytes().to_vec().into())
+            .await;
+        upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_missing_model_field(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2430,7 +2645,7 @@ mod tests {
         assert!(error_body.contains("model"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_invalid_purpose_returns_400(pool: PgPool) {
         // Any unsupported purpose must be a 400 — and must NOT write a file.
@@ -2481,7 +2696,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_model_access_denied(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2516,7 +2731,7 @@ mod tests {
         assert!(error_body.contains("has not been configured or is not available to user"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_missing_custom_id(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2545,7 +2760,7 @@ mod tests {
         assert!(error_body.contains("custom_id"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_custom_id_with_control_characters(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2576,7 +2791,7 @@ mod tests {
         assert!(error_body.contains("invalid characters"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_custom_id_too_long(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2611,7 +2826,7 @@ mod tests {
         assert!(error_body.contains("exceeds maximum length"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_invalid_json_body(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2639,7 +2854,7 @@ mod tests {
         assert!(error_body.contains("model"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_malformed_jsonl(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2665,7 +2880,7 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_empty_file(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2691,7 +2906,7 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_with_metadata_after_file_field(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2741,7 +2956,7 @@ mod tests {
         assert_eq!(retrieved_file.purpose, crate::api::models::files::Purpose::Batch);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_file_cost_estimate(pool: PgPool) {
         use rust_decimal::Decimal;
@@ -2878,7 +3093,7 @@ mod tests {
         assert_eq!(estimate.total_estimated_output_tokens, total_output);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_file_cost_estimate_with_different_slas(pool: PgPool) {
         use rust_decimal::Decimal;
@@ -2998,7 +3213,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_invalid_http_method(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3031,7 +3246,7 @@ mod tests {
         assert!(error_body.contains("GET"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_invalid_url_path(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3067,7 +3282,7 @@ mod tests {
         assert!(error_body.contains("/v1/responses"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_accepts_responses_url_path(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3096,7 +3311,7 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_accepts_messages_url_path(pool: PgPool) {
         // The Anthropic Messages ingress (/v1/messages) is an allowed batch URL
@@ -3128,7 +3343,7 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_strips_priority_field(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3194,7 +3409,7 @@ mod tests {
     }
 
     /// Test that X-Incomplete is false for static batch input files (no pagination)
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_x_incomplete_false_for_batch_input_file(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3245,7 +3460,7 @@ mod tests {
     }
 
     /// Test that X-Incomplete is true when pagination indicates more data
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_x_incomplete_true_with_pagination(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3315,7 +3530,7 @@ mod tests {
     }
 
     /// Test that X-Incomplete reflects batch running status for output files
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_x_incomplete_for_batch_output_file_running(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3379,7 +3594,7 @@ mod tests {
     }
 
     /// Test that X-Incomplete is false for output file when batch is complete
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_x_incomplete_false_for_batch_output_file_complete(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3517,7 +3732,7 @@ mod tests {
         let _ = handle.await;
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_with_rate_limiter_configured(pool: PgPool) {
         // Create app with rate limiting enabled
@@ -3555,7 +3770,7 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_rejects_file_exceeding_max_requests(pool: PgPool) {
         // Create app with max_requests_per_file = 2
@@ -3599,7 +3814,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_allows_file_at_max_requests(pool: PgPool) {
         // Create app with max_requests_per_file = 2
@@ -3644,7 +3859,7 @@ mod tests {
     /// 2. Unlimited responses use streaming (no content-length header)
     /// 3. Paginated downloads return correct subset and headers
     /// 4. Each line is valid JSON
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_file_content_streaming(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4022,7 +4237,7 @@ mod tests {
     }
 
     /// Test that Content-Length header triggers early rejection for oversized files
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_content_length_early_rejection(pool: PgPool) {
         // Create app with a small file size limit
@@ -4057,7 +4272,7 @@ mod tests {
     }
 
     /// Test that files exceeding size limit during streaming return 413
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_streaming_size_limit_returns_413(pool: PgPool) {
         // Use a limit large enough for multipart overhead but small enough
@@ -4100,7 +4315,7 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_invalid_utf8(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4155,7 +4370,7 @@ mod tests {
         assert_error::<LengthLimitError>();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_rejects_request_exceeding_max_body_size(pool: PgPool) {
         // Create app with a small per-request body size limit
@@ -4199,7 +4414,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_allows_request_within_max_body_size(pool: PgPool) {
         // Create app with a generous per-request body size limit
@@ -4233,7 +4448,7 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_rejects_embeddings_model_on_chat_endpoint(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4272,7 +4487,7 @@ mod tests {
         assert!(body.contains("/v1/chat/completions"), "Expected endpoint in error, got: {}", body);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_rejects_chat_model_on_embeddings_endpoint(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4312,7 +4527,7 @@ mod tests {
         assert!(body.contains("/v1/embeddings"), "Expected endpoint in error, got: {}", body);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_allows_matching_endpoint_and_model_type(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4364,7 +4579,7 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_skips_validation_for_untyped_models(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4396,7 +4611,7 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_files_member_id_rejected_outside_org_context(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4418,7 +4633,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_files_member_id_no_key_returns_empty(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4439,7 +4654,7 @@ mod tests {
         assert_eq!(body["data"].as_array().unwrap().len(), 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_files_enrichment_in_personal_context(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;

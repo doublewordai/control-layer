@@ -4,13 +4,14 @@
 //! route them to appropriate targets, and handle authentication and rate limiting.
 
 use crate::AppState;
+use crate::affinity;
 use crate::auth;
 use crate::client::HttpClient;
 use crate::errors::{ErrorResponseBody, OnwardsErrorResponse};
+use crate::inflight::{BATCH_INFLIGHT_SCOPE, InflightSlot};
 use crate::models::ListModelResponse;
-use crate::serving::{
-    self, ProviderKind, RequestedServingClass, ServingClassOutcome, ServingResolution,
-};
+use crate::rejections::RejectionContext;
+use crate::serving::{self, ProviderKind, ServingClassOutcome, ServingResolution};
 use crate::sse::SseBufferedStream;
 use crate::target::{ConcurrencyGuard, RequestClass, RoutingAction, Target};
 use axum::{
@@ -26,6 +27,7 @@ use axum::{
 use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
 use serde_json::map::Entry;
 use tracing::{Instrument, debug, error, instrument, trace, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 /// Adapter to extract W3C trace context from an axum HeaderMap.
@@ -55,6 +57,13 @@ impl Injector for HeaderInjector<'_> {
 /// Record HTTP response status code on the current span
 fn record_response_status(status_code: u16) {
     tracing::Span::current().record("http.response.status_code", status_code);
+}
+
+/// Whether an upstream status means the provider had no room for the request.
+/// A provider that is up answers 529 when its workers are busy and 503 when no
+/// worker can take the request; a provider that is down never answers at all.
+fn is_capacity_refusal(status: u16) -> bool {
+    matches!(status, 503 | 529)
 }
 
 /// Detect a provider error envelope embedded in an HTTP 200 body.
@@ -282,6 +291,8 @@ struct GuardedStream<S> {
     inner: S,
     _guard: ConcurrencyGuard,
     _inflight_guard: InflightGuard,
+    _inflight_slot: Option<InflightSlot>,
+    _batch_inflight_slot: Option<InflightSlot>,
 }
 
 impl<S, E> futures_util::Stream for GuardedStream<S>
@@ -330,24 +341,19 @@ pub struct ServedBy {
     pub onwards_model: Option<String>,
 }
 
-/// Rewrite the request body's `model` to the bare alias after a class suffix
-/// was stripped. Bodies that do not parse (or carry no `model`) are returned
-/// untouched: the `Model-Override` header path has no body model to rewrite.
-fn rewrite_body_model(body: axum::body::Bytes, alias: &str) -> axum::body::Bytes {
-    if body.is_empty() {
-        return body;
-    }
-    let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body) else {
-        return body;
-    };
-    match parsed.get_mut("model") {
-        Some(model) if model.is_string() => {
-            *model = serde_json::Value::String(alias.to_string());
-            serde_json::to_vec(&parsed).map(Into::into).unwrap_or(body)
-        }
-        _ => body,
-    }
+/// Response extension carrying the `onwards_upstream_failed_total` labels of
+/// the request an upstream answered, for failures counted after
+/// `target_message_handler` returns (the strict router sanitizing a
+/// third-party error). Set alongside [`ServedBy`].
+#[derive(Clone, Debug)]
+pub(crate) struct UpstreamFailureLabels {
+    pub(crate) model: String,
+    pub(crate) traffic: &'static str,
+    /// Host of the upstream URL, matching dwctl's `served_by` label: one value
+    /// per endpoint, where the full URL could carry a path per deployment.
+    pub(crate) served_by: String,
 }
+
 /// Stable identity of the API key accepted for this request. This is carried
 /// only in the in-process response extensions and is never sent to the client.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -479,8 +485,9 @@ pub async fn target_message_handler<T: HttpClient>(
         otel.name = "onwards.request",
         gen_ai.request.model = tracing::field::Empty,
         http.response.status_code = tracing::field::Empty,
-        onwards.serving.requested = tracing::field::Empty,
         onwards.serving.resolved = tracing::field::Empty,
+        onwards.serving.priority = tracing::field::Empty,
+        onwards.serving.targets_configured = tracing::field::Empty,
     );
 
     // Extract W3C trace context (traceparent + tracestate) from inbound headers
@@ -491,11 +498,13 @@ pub async fn target_message_handler<T: HttpClient>(
     if req.headers().contains_key("traceparent") {
         let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
         let parent_ctx = propagator.extract(&HeaderExtractor(req.headers()));
-        use tracing_opentelemetry::OpenTelemetrySpanExt;
         let _ = span.set_parent(parent_ctx);
     }
 
     async move {
+
+    let mut rejection = RejectionContext::from_request(&state, req.headers());
+    let result = async {
 
     // Track inflight requests for observability. The guard is moved into GuardedStream
     // on the success path so the gauge stays incremented for the full lifetime of
@@ -536,35 +545,6 @@ pub async fn target_message_handler<T: HttpClient>(
         }
     };
 
-    // A class suffix requests a serving class on the base alias. DWCTL strips
-    // it and hands it over as an extension; standalone callers are parsed here.
-    // Unknown class suffixes are a 400.
-    let suffix_class = req.extensions().get::<RequestedServingClass>().map(|c| c.0);
-    // DWCTL has already split the body selector once. Do not reinterpret its
-    // base alias (e.g. turn nonexistent `model:interactive` into `model`). A
-    // Model-Override header is a separate selector and still needs resolution.
-    let has_model_override = req.headers().get("model-override").and_then(|value| value.to_str().ok()).is_some();
-    let selected_model = if suffix_class.is_some() && !has_model_override {
-        Ok((model_name.as_str(), None))
-    } else {
-        serving::split_class_suffix(&model_name)
-    };
-    let (model_name, suffix_class, body_bytes) = match selected_model {
-        Ok((_, None)) => (model_name, suffix_class, body_bytes),
-        Ok((alias, Some(class))) => {
-            let alias = alias.to_string();
-            let body_bytes = rewrite_body_model(body_bytes, &alias);
-            // The suffix on the selected model string wins over the
-            // extension: the string is the source that took precedence
-            // (a `Model-Override` header over the body), so its class does too.
-            (alias, Some(class), body_bytes)
-        }
-        Err(unknown) => {
-            record_response_status(400);
-            return Err(OnwardsErrorResponse::bad_request(&unknown.to_string(), Some("model")));
-        }
-    };
-
     // Record model in span for trace correlation
     tracing::Span::current().record("gen_ai.request.model", &model_name);
 
@@ -590,12 +570,11 @@ pub async fn target_message_handler<T: HttpClient>(
     // then run on the chosen pool exactly as they ran on the single pool
     // before. A composite with no pool for this class resolves to its default,
     // which is byte-identically today's behaviour. Resolution happens INSIDE
-    // the map guard so only the chosen pool is cloned: KeySets are owned, so a
-    // whole-TargetPools clone would deep-copy every pool's keys per request.
+    // the map guard so only the chosen pool is cloned, not every pool.
     let request_class = RequestClass::from_path(&canonical_request_path);
     // The alias's serving policy (presets, overlays) is declared on its
     // default pool and applies whichever pool serves this request's class.
-    let (mut resolved_pool_name, mut pool, mut alias_serving) = match state.targets.targets.get(&model_name) {
+    let (mut resolved_pool_name, mut pool, mut alias_serving, alias_inflight, alias_batch_inflight) = match state.targets.targets.get(&model_name) {
         Some(pools) => {
             // Now that the model is known to be a configured target, tag the
             // in-flight guard so `onwards_model_inflight{model=…}` tracks this
@@ -606,10 +585,13 @@ pub async fn target_message_handler<T: HttpClient>(
             if let Some(guard) = inflight_guard.as_mut() {
                 guard.set_model(&model_name);
             }
+            rejection.set_model(&model_name);
             (
                 pools.resolved_name(request_class),
                 pools.resolve(request_class).clone(),
                 pools.default_pool().alias_serving().clone(),
+                pools.default_pool().inflight_limits().cloned(),
+                pools.default_pool().batch_inflight_limit(),
             )
         }
         None => {
@@ -725,92 +707,134 @@ pub async fn target_message_handler<T: HttpClient>(
         // If no bearer token, no labels to match — rules are skipped (allow by default)
     }
 
-    // Resolve the serving class: one flat field from the request's suffix,
-    // the owning account's settings (found through the key's `account`
-    // label), the account's overlay on THIS alias and the classes the alias
-    // offers. Done after routing rules so a redirected request is resolved
-    // against the pool that will serve it. Strict: a class named on the
-    // request that the account does not hold, or the alias does not offer,
-    // is refused rather than quietly downgraded.
+    // Resolve the serving policy from the owning account's settings (found
+    // through the key's `account` label) and the account's overlay on THIS
+    // alias. Done after routing rules so a redirected request is resolved
+    // against the pool that will serve it.
+    let (account_id, account_name, key_purpose) = bearer_token
+        .as_ref()
+        .and_then(|token| state.targets.key_labels.get(token))
+        .map(|labels| {
+            (
+                labels.get(serving::ACCOUNT_LABEL).cloned(),
+                labels.get(serving::ACCOUNT_NAME_LABEL).cloned(),
+                labels.get("purpose").cloned(),
+            )
+        })
+        .unwrap_or((None, None, None));
     let serving_resolution: ServingResolution = {
-        let (account_id, key_purpose) = bearer_token
-            .as_ref()
-            .and_then(|token| state.targets.key_labels.get(token))
-            .map(|labels| {
-                (
-                    labels.get(serving::ACCOUNT_LABEL).cloned(),
-                    labels.get("purpose").cloned(),
-                )
-            })
-            .unwrap_or((None, None));
         let account = account_id
             .as_deref()
             .and_then(|id| state.targets.accounts.get(id).map(|r| r.value().clone()));
         let overlay = account_id
             .as_deref()
             .and_then(|id| alias_serving.overlays().get(id).cloned());
-        let resolution = match serving::resolve(
-            suffix_class,
+        let resolution = serving::resolve(
             account.as_ref(),
             overlay.as_ref(),
-            &model_name,
-            alias_serving.presets(),
             key_purpose.as_deref(),
-        ) {
-            Ok(resolution) => resolution,
-            Err(rejection) => {
-                debug!("Serving class refused for model '{}': {}", model_name, rejection);
-                metrics::counter!(
-                    "onwards_serving_class_rejections_total",
-                    "model" => model_name.to_string(),
-                )
-                .increment(1);
-                record_response_status(403);
-                return Err(OnwardsErrorResponse::builder()
-                    .body(ErrorResponseBody {
-                        message: rejection.to_string(),
-                        r#type: "invalid_request_error".to_string(),
-                        param: Some("model".to_string()),
-                        code: "serving_class_unavailable".to_string(),
-                    })
-                    .status(StatusCode::FORBIDDEN)
-                    .build());
-            }
-        };
+        );
         let span = tracing::Span::current();
-        if let Some(requested) = resolution.requested {
-            span.record("onwards.serving.requested", requested.as_str());
-        }
         span.record("onwards.serving.resolved", resolution.resolved.as_str());
+        // The customer's configured scheduling hints, recorded apart from
+        // the class. Whether an attempt actually carried them is recorded on
+        // its `onwards.provider_attempt` span (`onwards.hints_sent`).
+        if let Some(priority) = resolution.hints.priority {
+            span.record("onwards.serving.priority", priority);
+        }
+        span.record(
+            "onwards.serving.targets_configured",
+            resolution.hints.ttft_ms.is_some() || resolution.hints.itl_ms.is_some(),
+        );
         metrics::counter!(
             "onwards_serving_class_requests_total",
             "model" => model_name.to_string(),
-            "requested" => resolution.requested.map(|c| c.as_str()).unwrap_or(""),
+            "requested" => "",
             "resolved" => resolution.resolved.as_str(),
         )
         .increment(1);
         resolution
     };
 
+    // Realtime traffic is everything the batch dispatcher did not stamp with
+    // the exempt header.
+    let is_realtime = !state
+        .first_token_timeout_exempt_header
+        .as_deref()
+        .is_some_and(|header| req.headers().contains_key(header));
+    // Labels failure outcomes, so a realtime outage can be told apart from a
+    // batch backlog retrying against the same model.
+    let traffic = if is_realtime { "realtime" } else { "dispatched" };
+
+    let body_json = if !body_bytes.is_empty()
+        && crate::reasoning::uses_reasoning_contract(&canonical_request_path)
+    {
+        Some(serde_json::from_slice::<serde_json::Value>(&body_bytes).map_err(|_| {
+            OnwardsErrorResponse::bad_request("Request body must be valid JSON.", None)
+        })?)
+    } else {
+        None
+    };
+
+    // Parameters not every worker can serve. Each is counted and recorded on
+    // the request span; the configured ones are refused here.
+    let flagged_params = match body_json.as_ref() {
+        Some(body) if state.targets.strict_mode => {
+            crate::unsupported_params::request_params(&canonical_request_path, body)
+        }
+        _ => Vec::new(),
+    };
+    if !flagged_params.is_empty() {
+        let rejected: Vec<&'static str> = flagged_params
+            .iter()
+            .copied()
+            .filter(|param| state.rejected_params.contains(param))
+            .collect();
+        for param in &flagged_params {
+            let action = if rejected.contains(param) { "rejected" } else { "logged" };
+            metrics::counter!(
+                "onwards_unsupported_params_total",
+                "param" => *param,
+                "model" => model_name.to_string(),
+                "traffic" => traffic,
+                "action" => action,
+            )
+            .increment(1);
+        }
+        let span = tracing::Span::current();
+        span.set_attribute("onwards.unsupported_params", flagged_params.join(","));
+        if let Some(account) = &account_id {
+            span.set_attribute("onwards.account", account.clone());
+        }
+        if let Some(api_key_id) = authenticated_api_key_id {
+            span.set_attribute("onwards.api_key_id", api_key_id.to_string());
+        }
+        if let Some(first) = rejected.first() {
+            record_response_status(400);
+            return Err(OnwardsErrorResponse::invalid_request(
+                &crate::unsupported_params::rejection_message(&rejected),
+                Some(first),
+                "unsupported_parameter",
+            ));
+        }
+    }
+
     let canonical_reasoning = if let Some(reasoning) = req
         .extensions()
         .get::<crate::reasoning::CanonicalReasoningRequest>()
     {
         Some(reasoning.clone())
-    } else if !body_bytes.is_empty()
-        && crate::reasoning::uses_reasoning_contract(&canonical_request_path)
-    {
-        let body: serde_json::Value = serde_json::from_slice(&body_bytes).map_err(|_| {
-            OnwardsErrorResponse::bad_request("Request body must be valid JSON.", None)
-        })?;
+    } else if let Some(body) = body_json.as_ref() {
         crate::reasoning::parse_reasoning_request(
             &canonical_request_path,
-            &body,
+            body,
             state.targets.strict_mode,
         ).map_err(|error| OnwardsErrorResponse::reasoning(&error))?
     } else {
         None
     };
+    // Not needed past here; don't hold the parsed body while the upstream works.
+    drop(body_json);
 
     if let Some(reasoning) = canonical_reasoning.as_ref() {
         for provider in pool.providers() {
@@ -827,18 +851,97 @@ pub async fn target_message_handler<T: HttpClient>(
     if pool.is_empty() {
         debug!("Pool for model '{}' has no providers", model_name);
         // Counted, not just logged: this is a debug line on a hot path, so under
-        // load it is exactly the signal a log pipeline sheds, and the 503 it
-        // produces is indistinguishable downstream from every other 503.
+        // load it is exactly the signal a log pipeline sheds. Nothing is
+        // serving the model, which is a capacity refusal, not an outage.
         metrics::counter!(
             "onwards_upstream_failed_total",
             "reason" => "no_providers",
-            "status" => "503",
+            "status" => "529",
             "model" => model_name.to_string(),
+            "traffic" => traffic,
         )
         .increment(1);
-        record_response_status(503);
-        return Err(OnwardsErrorResponse::service_unavailable());
+        record_response_status(529);
+        return Err(OnwardsErrorResponse::no_capacity());
     }
+
+    let mut inflight_slot = match (is_realtime, alias_inflight.as_deref(), account_id.as_deref()) {
+        (true, Some(limits), Some(account)) => {
+            let limit = limits.for_account(account);
+            let account_name = account_name.unwrap_or_default();
+            metrics::gauge!(
+                "onwards_inflight_account_limit",
+                "model" => model_name.clone(),
+                "account" => account.to_string(),
+                "account_name" => account_name.clone(),
+            )
+            .set(f64::from(limit));
+            metrics::counter!(
+                "onwards_inflight_limit_checks_total",
+                "model" => model_name.clone(),
+                "account" => account.to_string(),
+                "account_name" => account_name.clone(),
+            )
+            .increment(1);
+            match state
+                .inflight_limiter
+                .try_acquire(account, &model_name, limit)
+                .await
+            {
+                Some(slot) => Some(slot),
+                None => {
+                    debug!(
+                        "In-flight limit of {} reached for account {} on model {}",
+                        limit, account, model_name
+                    );
+                    metrics::counter!(
+                        "onwards_inflight_limit_refusals_total",
+                        "model" => model_name.clone(),
+                        "account" => account.to_string(),
+                        "account_name" => account_name,
+                    )
+                    .increment(1);
+                    record_response_status(429);
+                    return Err(OnwardsErrorResponse::inflight_limited(&model_name, limit));
+                }
+            }
+        }
+        _ => None,
+    };
+
+    // Batch (dispatched) traffic gets its own per-model ceiling, held in the
+    // same shared limiter under a reserved scope so it is counted globally on
+    // the alias the request named. Realtime requests skip it; batch requests
+    // skip the per-account realtime limit above. A refusal is a 529, not a
+    // 429, so the batch dispatcher backs off instead of treating it as a
+    // per-key rate limit.
+    let mut batch_inflight_slot = if !is_realtime
+        && state.batch_inflight_enforce
+        && let Some(limit) = alias_batch_inflight
+    {
+        match state
+            .batch_inflight_limiter
+            .try_acquire(BATCH_INFLIGHT_SCOPE, &model_name, limit)
+            .await
+        {
+            Some(slot) => Some(slot),
+            None => {
+                debug!(
+                    "Batch in-flight cap of {} reached for model {}",
+                    limit, model_name
+                );
+                metrics::counter!(
+                    "onwards_batch_inflight_refusals_total",
+                    "model" => model_name.clone(),
+                )
+                .increment(1);
+                record_response_status(529);
+                return Err(OnwardsErrorResponse::batch_capacity_exceeded(&model_name, limit));
+            }
+        }
+    } else {
+        None
+    };
 
     // Check pool-level rate limit before selecting a provider
     {
@@ -856,7 +959,10 @@ pub async fn target_message_handler<T: HttpClient>(
             && let Some(limiter) = state.targets.key_rate_limiters.get(token)
             && limiter.check().is_err()
         {
-            debug!("Per-key rate limit exceeded for token: {}", token);
+            debug!(
+                api_key_id = ?authenticated_api_key_id,
+                "Per-key rate limit exceeded"
+            );
             record_response_status(429);
             return Err(OnwardsErrorResponse::rate_limited());
         }
@@ -873,7 +979,17 @@ pub async fn target_message_handler<T: HttpClient>(
                         "Pool-level concurrency limit exceeded for model: {}",
                         model_name
                     );
-                    return Err(OnwardsErrorResponse::concurrency_limited());
+                    // The model's own cap is capacity, not the caller's limit.
+                    metrics::counter!(
+                        "onwards_upstream_failed_total",
+                        "reason" => "model_at_capacity",
+                        "status" => "529",
+                        "model" => model_name.to_string(),
+                        "traffic" => traffic,
+                    )
+                    .increment(1);
+                    record_response_status(529);
+                    return Err(OnwardsErrorResponse::overloaded());
                 }
             }
         } else {
@@ -886,7 +1002,10 @@ pub async fn target_message_handler<T: HttpClient>(
                 match limiter.try_acquire() {
                     Some(guard) => Some(guard),
                     None => {
-                        debug!("Per-key concurrency limit exceeded for token: {}", token);
+                        debug!(
+                            api_key_id = ?authenticated_api_key_id,
+                            "Per-key concurrency limit exceeded"
+                        );
                         return Err(OnwardsErrorResponse::concurrency_limited());
                     }
                 }
@@ -972,14 +1091,9 @@ pub async fn target_message_handler<T: HttpClient>(
     // headers only arrive once the whole completion is done, so a deadline
     // would cut off legitimately long answers. So is traffic carrying the
     // configured exempt header (e.g. batch dispatch, which runs its own retries).
-    // Realtime traffic is everything the batch dispatcher did not stamp with
-    // the exempt header. Only realtime gets the first-token deadline, AIMD
-    // observation and the realtime-only fallback statuses: dispatched traffic
-    // tolerates latency and runs its own retries.
-    let is_realtime = !state
-        .first_token_timeout_exempt_header
-        .as_deref()
-        .is_some_and(|header| original_headers.contains_key(header));
+    // Only realtime traffic (see `is_realtime`) gets the first-token deadline,
+    // AIMD observation and the realtime-only fallback statuses: dispatched
+    // traffic tolerates latency and runs its own retries.
     let first_token_timeout = pool
         .fallback()
         .filter(|f| f.enabled)
@@ -1002,12 +1116,18 @@ pub async fn target_message_handler<T: HttpClient>(
     } else {
         pool_max_attempts.min(eligible_member_count)
     };
+    // An upstream with no room answers 503 or 529 depending on what sits in
+    // front of its workers, so a pool that fails over on either refusal fails
+    // over on both.
+    let listed = |lists: &dyn Fn(u16) -> bool, status: u16| {
+        lists(status) || (is_capacity_refusal(status) && (lists(503) || lists(529)))
+    };
     let fails_over_on = |status: u16, attempt_number: u32| {
-        pool.should_fallback_on_status(status)
+        listed(&|s| pool.should_fallback_on_status(s), status)
             || (is_realtime
                 && eligible_member_count > 1
                 && (attempt_number as usize) < realtime_failover_attempts
-                && pool.should_fallback_on_realtime_status(status))
+                && listed(&|s| pool.should_fallback_on_realtime_status(s), status))
     };
 
     // Unsupported traffic keeps ordinary routing and contributes no observations.
@@ -1015,8 +1135,22 @@ pub async fn target_message_handler<T: HttpClient>(
         && state.targets.strict_mode
         && requests_stream(&body_bytes)
         && is_realtime;
+    // Conversation affinity decides preferred-first once per conversation;
+    // only realtime traffic on pools that opt in pays for the body parse.
+    let conversation = if pool.affinity_enabled() && is_realtime {
+        serde_json::from_slice::<serde_json::Value>(&body_bytes)
+            .ok()
+            .and_then(|body| {
+                let header = original_headers
+                    .get(affinity::SESSION_HEADER)
+                    .and_then(|v| v.to_str().ok());
+                affinity::conversation_key(header, &body)
+            })
+    } else {
+        None
+    };
     let mut providers = pool
-        .select_iter_aimd(aimd_eligible, &model_name, resolved_pool_name.unwrap_or("default"))
+        .select_iter_routed(aimd_eligible, conversation, &model_name, resolved_pool_name.unwrap_or("default"))
         .excluding_members(ineligible_members.iter().copied());
     while let Some((member_idx, target, connection_guard)) = providers.next() {
         any_attempted = true;
@@ -1048,6 +1182,7 @@ pub async fn target_message_handler<T: HttpClient>(
             http.response.status_code = tracing::field::Empty,
             onwards.fallback = tracing::field::Empty,
             onwards.pool = tracing::field::Empty,
+            onwards.hints_sent = tracing::field::Empty,
         );
         // Recorded only when a non-default pool served the request, so the
         // field's presence answers "did per-class routing engage here?".
@@ -1075,6 +1210,11 @@ pub async fn target_message_handler<T: HttpClient>(
             .extensions()
             .get::<OriginalModel>()
             .map(|m| m.0.to_string());
+
+        // The upstream status THIS attempt received, if it got that far.
+        // Unlike `last_upstream_status` it never carries over from an earlier
+        // attempt, so it can say whether this member refused the request.
+        let mut attempt_upstream_status: Option<u16> = None;
 
         let action = async {
 
@@ -1119,7 +1259,7 @@ pub async fn target_message_handler<T: HttpClient>(
             && let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&attempt_body)
             && let Some(obj) = parsed.as_object_mut()
         {
-            let removed = [obj.remove("priority"), obj.remove("nvext")];
+            let removed = [obj.shift_remove("priority"), obj.shift_remove("nvext")];
             if removed.iter().any(Option::is_some)
                 && let Ok(stripped) = serde_json::to_vec(&parsed)
             {
@@ -1188,46 +1328,35 @@ pub async fn target_message_handler<T: HttpClient>(
             };
         }
 
-        // Send the resolved serving targets to a member of kind `dynamo`, the
-        // only serving stack that reads them, as `nvext.router` targets plus
-        // (when the preset carries one) `nvext.agent_hints.priority`. Every
-        // JSON request to a `dynamo` member also carries a priority (unless
-        // the capability strip above refused scheduling fields for it): when
-        // neither the body nor the preset sets one, realtime's 0, so the
-        // dynamo frontend is never left to pick a value for a missing one.
-        // A priority already present is kept, and targets overwrite rather
-        // than remove: this same crate runs again as the hop inside the
-        // serving namespace, with no key policy of its own, and must forward
-        // what the first hop set. Client-supplied targets are scrubbed at
-        // dwctl's ingress, alongside the body priority (the same perimeter
-        // the priority strip relies on).
-        if target.kind == ProviderKind::Dynamo && !attempt_body.is_empty() {
-            match serde_json::from_slice::<serde_json::Value>(&attempt_body) {
-                Ok(mut body) => {
-                    if let Some(object) = body.as_object_mut() {
-                        if let Some(targets) = serving_resolution.targets {
-                            targets.stamp(object);
-                        }
-                        if !scheduling_fields_refused {
-                            serving::stamp_default_priority(object);
-                        }
-                        attempt_body = match serde_json::to_vec(&body) {
-                            Ok(bytes) => axum::body::Bytes::from(bytes),
-                            Err(_) => return LoopAction::Done(Err(OnwardsErrorResponse::internal())),
-                        };
-                    }
-                }
-                // Targets must reach the member; a body that cannot carry
-                // them is refused. Without targets a non-JSON body (a
-                // multipart upload) is forwarded as it came.
-                Err(_) if serving_resolution.targets.is_some() => {
-                    return LoopAction::Done(Err(OnwardsErrorResponse::bad_request(
-                        "Request body must be valid JSON.",
-                        None,
-                    )))
-                }
-                Err(_) => {}
+        // Send the resolved scheduling hints (priority, latency targets) to a
+        // member of kind `dynamo`, the only serving stack that reads them.
+        // They never change the request's class. Every JSON request to a
+        // `dynamo` member also carries a priority (unless the capability strip
+        // above refused scheduling fields for it): when neither the body nor
+        // the hints set one, realtime's 0, so the dynamo frontend is never left
+        // to pick a value for a missing one. A priority already present is
+        // kept, and hints overwrite rather than remove: this same crate runs
+        // again as the hop inside the serving namespace, with no key policy of
+        // its own, and must forward what the first hop set. Client-supplied
+        // values are scrubbed at dwctl's ingress, alongside the body priority
+        // (the same perimeter the priority strip relies on).
+        // A non-JSON body (a multipart upload) carries no hints and is
+        // forwarded as it came.
+        if target.kind == ProviderKind::Dynamo
+            && !scheduling_fields_refused
+            && !attempt_body.is_empty()
+            && let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(&attempt_body)
+            && let Some(object) = body.as_object_mut()
+        {
+            serving_resolution.hints.stamp(object);
+            if !serving_resolution.hints.is_empty() {
+                tracing::Span::current().record("onwards.hints_sent", true);
             }
+            serving::stamp_default_priority(object);
+            attempt_body = match serde_json::to_vec(&body) {
+                Ok(bytes) => axum::body::Bytes::from(bytes),
+                Err(_) => return LoopAction::Done(Err(OnwardsErrorResponse::internal())),
+            };
         }
 
         // Build the upstream URI for this target
@@ -1304,7 +1433,6 @@ pub async fn target_message_handler<T: HttpClient>(
         //   letting the third party re-emit our trace IDs on its own outbound
         //   calls.
         if resolve_trace_propagation(target, pool.is_trusted()) {
-            use tracing_opentelemetry::OpenTelemetrySpanExt;
             let ctx = tracing::Span::current().context();
             let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
             propagator.inject_context(&ctx, &mut HeaderInjector(&mut attempt_headers));
@@ -1336,6 +1464,7 @@ pub async fn target_message_handler<T: HttpClient>(
             otel.kind = "Client",
             http.request.method = %method,
             url.full = %upstream_uri,
+            server.address = target.url.host_str().unwrap_or_default(),
             http.response.status_code = tracing::field::Empty,
         );
         // The header wait ends at the earlier of the provider's request timeout
@@ -1415,6 +1544,7 @@ pub async fn target_message_handler<T: HttpClient>(
 
         let status = response.status().as_u16();
         last_upstream_status = Some(status);
+        attempt_upstream_status = Some(status);
         upstream_span.record("http.response.status_code", status);
         tracing::Span::current().record("http.response.status_code", status);
         // An error status settles the attempt's observation now: overload
@@ -1433,12 +1563,22 @@ pub async fn target_message_handler<T: HttpClient>(
                 status, target.url
             );
             tracing::Span::current().record("onwards.fallback", "status_fallback");
+            // A 503 or 529 means the provider is full, not broken. If it is
+            // the last word, the caller is told to retry shortly rather than
+            // handed a 502 that reads as an outage.
             let error = if status == 429 {
                 OnwardsErrorResponse::upstream_rate_limited(state.upstream_rate_limit_message.as_deref())
+            } else if is_capacity_refusal(status) {
+                OnwardsErrorResponse::overloaded()
             } else {
                 OnwardsErrorResponse::bad_gateway()
             };
             return LoopAction::Continue(Some(error));
+        }
+
+        if is_capacity_refusal(status) {
+            record_response_status(529);
+            return LoopAction::Done(Err(OnwardsErrorResponse::overloaded()));
         }
 
         if status == 429
@@ -1479,6 +1619,7 @@ pub async fn target_message_handler<T: HttpClient>(
                         code: "upstream_error".to_string(),
                     })
                     .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST))
+                    .from_upstream(true)
                     .build()
             } else {
                 OnwardsErrorResponse::builder()
@@ -1489,6 +1630,7 @@ pub async fn target_message_handler<T: HttpClient>(
                         code: "internal_error".to_string(),
                     })
                     .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY))
+                    .from_upstream(true)
                     .build()
             };
 
@@ -1740,23 +1882,31 @@ pub async fn target_message_handler<T: HttpClient>(
                 // A 200 carrying an embedded error IS that error for our
                 // purposes, so it overrides the 200 recorded above.
                 last_upstream_status = Some(embedded);
+                attempt_upstream_status = Some(embedded);
 
                 let retryable = fails_over_on(embedded, attempt_number)
                     || (embedded == 429 && pool.should_fallback_on_rate_limit());
                 if retryable {
                     tracing::Span::current().record("onwards.fallback", "embedded_error");
-                    // Retain rate-limit semantics if all attempts are exhausted.
+                    // Retain rate-limit and overload semantics if all attempts
+                    // are exhausted.
                     let error = if embedded == 429 {
                         OnwardsErrorResponse::upstream_rate_limited(state.upstream_rate_limit_message.as_deref())
+                    } else if is_capacity_refusal(embedded) {
+                        OnwardsErrorResponse::overloaded().reported_by_upstream()
                     } else {
-                        OnwardsErrorResponse::service_unavailable()
+                        OnwardsErrorResponse::service_unavailable().reported_by_upstream()
                     };
                     return LoopAction::Continue(Some(error));
                 }
 
+                if is_capacity_refusal(embedded) {
+                    record_response_status(529);
+                    return LoopAction::Done(Err(OnwardsErrorResponse::overloaded().reported_by_upstream()));
+                }
                 record_response_status(embedded);
                 // Keep upstream details private while preserving rate-limit semantics.
-                // Embedded server errors still collapse to a generic 503.
+                // Other embedded server errors still collapse to a generic 503.
                 // For trusted providers, retain the standard client-error fields
                 // so the caller can fix the request. Never log the body: even
                 // validation errors can echo request content.
@@ -1764,7 +1914,7 @@ pub async fn target_message_handler<T: HttpClient>(
                 let err = if embedded == 429 {
                     OnwardsErrorResponse::upstream_rate_limited(state.upstream_rate_limit_message.as_deref())
                 } else if embedded >= 500 {
-                    OnwardsErrorResponse::service_unavailable()
+                    OnwardsErrorResponse::service_unavailable().reported_by_upstream()
                 } else {
                     OnwardsErrorResponse::builder()
                         .body(ErrorResponseBody {
@@ -1789,6 +1939,7 @@ pub async fn target_message_handler<T: HttpClient>(
                             },
                         })
                         .status(StatusCode::from_u16(embedded).unwrap_or(StatusCode::BAD_REQUEST))
+                        .from_upstream(true)
                         .build()
                 };
                 return LoopAction::Done(Err(err));
@@ -1806,13 +1957,13 @@ pub async fn target_message_handler<T: HttpClient>(
                     tracing::Span::current().record("onwards.fallback", "empty_body");
                     // Retry internally; on exhaustion the loop's final-error handling
                     // surfaces the sanitized 503 carried below.
-                    return LoopAction::Continue(Some(OnwardsErrorResponse::service_unavailable()));
+                    return LoopAction::Continue(Some(OnwardsErrorResponse::service_unavailable().reported_by_upstream()));
                 }
 
                 // Not configured to retry 502s: collapse the anomalous empty 200 to a
                 // generic 503 rather than forwarding a bodyless success to the client.
                 record_response_status(503);
-                return LoopAction::Done(Err(OnwardsErrorResponse::service_unavailable()));
+                return LoopAction::Done(Err(OnwardsErrorResponse::service_unavailable().reported_by_upstream()));
             }
             Scan2xx::Clean => {}
         }
@@ -1956,9 +2107,10 @@ pub async fn target_message_handler<T: HttpClient>(
             }
         }
 
-        // Override the response `id` field for /responses and /chat/completions
-        // requests when the caller supplied a response ID via the configured
-        // header. Both response bodies expose a top-level `id` we can rewrite.
+        // Override the response `id` field for /responses, /chat/completions and
+        // /completions requests when the caller supplied a response ID via the
+        // configured header. All three bodies expose a top-level `id` we can
+        // rewrite; strict mode does the same for streamed chunks.
         if let Some(ref header_name) = state.response_id_header
             && crate::response_id::path_supports_id_override(&path_and_query)
             && (200..300).contains(&status)
@@ -1999,6 +2151,11 @@ pub async fn target_message_handler<T: HttpClient>(
             url: target.url.to_string(),
             onwards_model: target.onwards_model.clone(),
         });
+        response.extensions_mut().insert(UpstreamFailureLabels {
+            model: model_name.to_string(),
+            traffic,
+            served_by: target.url.host_str().unwrap_or_default().to_string(),
+        });
         response
             .extensions_mut()
             .insert::<ServingClassOutcome>(serving_resolution.outcome());
@@ -2016,6 +2173,8 @@ pub async fn target_message_handler<T: HttpClient>(
             inner: body.into_data_stream(),
             _guard: connection_guard,
             _inflight_guard: inflight_guard.take().expect("inflight_guard taken once on success path"),
+            _inflight_slot: inflight_slot.take(),
+            _batch_inflight_slot: batch_inflight_slot.take(),
         };
         let response = Response::from_parts(parts, axum::body::Body::from_stream(guarded));
 
@@ -2026,6 +2185,12 @@ pub async fn target_message_handler<T: HttpClient>(
         match action {
             LoopAction::Continue(err) => {
                 last_error = err;
+                // A member that refused for overload is full right now: trying
+                // it again within this request cannot succeed, so it sits out
+                // the rest of the request.
+                if attempt_upstream_status.is_some_and(|s| s == 429 || is_capacity_refusal(s)) {
+                    providers.mark_refused(member_idx);
+                }
                 // Sleep here — *after* the current connection_guard has gone
                 // out of scope but *before* select_iter().next() grabs the
                 // next one — so we don't pin a concurrency slot while waiting.
@@ -2084,11 +2249,12 @@ pub async fn target_message_handler<T: HttpClient>(
             "onwards_upstream_failed_total",
             "reason" => "retries_exhausted",
             // The upstream's own status on the final attempt, NOT the gateway
-            // response above: both a 529 and a 500 sanitize to 503, and only
-            // the former is backpressure. Falls back to the response status
-            // when no attempt got far enough to see one.
+            // response above, which collapses several upstream statuses into
+            // one. Falls back to the response status when no attempt got far
+            // enough to see one.
             "status" => last_upstream_status.unwrap_or(status).to_string(),
             "model" => model_name.to_string(),
+            "traffic" => traffic,
         )
         .increment(1);
         record_response_status(status);
@@ -2105,6 +2271,7 @@ pub async fn target_message_handler<T: HttpClient>(
             "reason" => "no_eligible_provider",
             "status" => "503",
             "model" => model_name.to_string(),
+            "traffic" => traffic,
         )
         .increment(1);
         record_response_status(503);
@@ -2123,12 +2290,13 @@ pub async fn target_message_handler<T: HttpClient>(
         metrics::counter!(
             "onwards_upstream_failed_total",
             "reason" => "all_at_capacity",
-            "status" => "429",
+            "status" => "529",
             "model" => model_name.to_string(),
+            "traffic" => traffic,
         )
         .increment(1);
-        record_response_status(429);
-        Err(OnwardsErrorResponse::concurrency_limited())
+        record_response_status(529);
+        Err(OnwardsErrorResponse::overloaded())
     } else {
         // Empty pool (shouldn't normally happen, targets resolved earlier)
         let err = OnwardsErrorResponse::model_not_found(model_name.as_str());
@@ -2138,6 +2306,7 @@ pub async fn target_message_handler<T: HttpClient>(
             "reason" => "empty_pool_late",
             "status" => status.to_string(),
             "model" => model_name.to_string(),
+            "traffic" => traffic,
         )
         .increment(1);
         record_response_status(status);
@@ -2147,6 +2316,39 @@ pub async fn target_message_handler<T: HttpClient>(
     .await;
 
     result.map_err(|error| error.with_authenticated_api_key_id(authenticated_api_key_id))
+    }
+    .await;
+
+    if let Err(error) = &result {
+        rejection.record_error(error);
+    }
+    // Every authenticated request, whatever its outcome, names its caller on
+    // this span and on the response, so an embedding gateway can attribute
+    // provider errors and successes the same way as refusals.
+    rejection.record_identity();
+    let identity = rejection.identity();
+    // The status the caller receives, on this span. Upstream responses record
+    // theirs from inside a provider-attempt span, so it is set here too.
+    let final_status = match &result {
+        Ok(response) => response.status().as_u16(),
+        Err(error) => error.status.as_u16(),
+    };
+    record_response_status(final_status);
+    result
+        .map(|mut response| {
+            if let Some(identity) = identity.clone() {
+                response.extensions_mut().insert(identity);
+            }
+            // An error status on a response (rather than an `Err`) reports
+            // what an upstream answered, even when its body was sanitized.
+            if response.status().as_u16() >= 400
+                && response.extensions().get::<crate::ErrorOrigin>().is_none()
+            {
+                response.extensions_mut().insert(crate::ErrorOrigin::Provider);
+            }
+            response
+        })
+        .map_err(|error| error.with_identity(identity))
     }
     .instrument(span)
     .await
@@ -3055,6 +3257,12 @@ mod tests {
             sse_buffer_limit: crate::sse::DEFAULT_SSE_BUFFER_LIMIT,
             first_token_timeout: None,
             first_token_timeout_exempt_header: None,
+            rejected_params: Vec::new(),
+            inflight_limiter: std::sync::Arc::new(crate::inflight::LocalInflightLimiter::default()),
+            batch_inflight_enforce: false,
+            batch_inflight_limiter: std::sync::Arc::new(
+                crate::inflight::LocalInflightLimiter::default(),
+            ),
         };
 
         // Create a simple POST request

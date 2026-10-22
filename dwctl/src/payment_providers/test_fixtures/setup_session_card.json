@@ -1,0 +1,74 @@
+{
+  "id": "cs_test_ExampleSetupSession0000000000000000000000000000",
+  "object": "checkout.session",
+  "amount_subtotal": null,
+  "amount_total": null,
+  "automatic_tax": {
+    "enabled": false,
+    "liability": null,
+    "provider": null,
+    "status": null
+  },
+  "billing_address_collection": null,
+  "cancel_url": "https://console.example.test/cost-management?payment=cancelled",
+  "client_reference_id": "00000000-0000-0000-0000-000000000000",
+  "created": 1780346867,
+  "currency": null,
+  "custom_fields": [],
+  "custom_text": {
+    "after_submit": null,
+    "shipping_address": null,
+    "submit": null,
+    "terms_of_service_acceptance": null
+  },
+  "customer": "cus_ExampleCustomer",
+  "customer_email": null,
+  "expires_at": 1780433266,
+  "livemode": false,
+  "metadata": {},
+  "mode": "setup",
+  "payment_intent": null,
+  "payment_method_types": [
+    "card"
+  ],
+  "payment_status": "no_payment_required",
+  "shipping_options": [],
+  "setup_intent": {
+    "id": "seti_ExampleSetupIntent0000",
+    "object": "setup_intent",
+    "created": 1780346900,
+    "customer": "cus_ExampleCustomer",
+    "description": "Payment method verification",
+    "livemode": false,
+    "metadata": {
+      "purpose": "verification"
+    },
+    "payment_method": {
+      "id": "pm_ExamplePaymentMethod",
+      "object": "payment_method",
+      "billing_details": {},
+      "card": {
+        "brand": "visa",
+        "exp_month": 12,
+        "exp_year": 2034,
+        "fingerprint": "fp_ExampleCardFingerprint",
+        "funding": "credit",
+        "last4": "4242"
+      },
+      "created": 1780346899,
+      "customer": "cus_ExampleCustomer",
+      "livemode": false,
+      "metadata": {},
+      "type": "card"
+    },
+    "payment_method_types": [
+      "card"
+    ],
+    "status": "succeeded",
+    "usage": "off_session"
+  },
+  "status": "complete",
+  "success_url": "https://console.example.test/cost-management?payment=success",
+  "ui_mode": "hosted",
+  "url": null
+}

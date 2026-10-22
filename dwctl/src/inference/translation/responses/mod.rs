@@ -26,7 +26,7 @@ use onwards::strict::schemas::chat_completions::{
 
 use self::types::ResponsesRequest;
 
-use super::{ProtocolTranslator, StreamReframer, TranslatedRequest, TranslationError};
+use super::{ProtocolTranslator, StreamReframer, TranslatedRequest, TranslationError, parse_request};
 
 /// Translator for the OpenAI Responses API. Pure and stateless; see module docs.
 pub struct OpenResponses;
@@ -54,8 +54,8 @@ impl ProtocolTranslator for OpenResponses {
     }
 
     fn translate_request(&self, parts: &Parts, body: Bytes) -> Result<TranslatedRequest, TranslationError> {
-        let req: ResponsesRequest =
-            serde_json::from_slice(&body).map_err(|e| TranslationError::BadRequest(format!("invalid OpenAI Responses request: {e}")))?;
+        let req: ResponsesRequest = parse_request(&body, DECLARED_FIELDS, "OpenAI Responses")?;
+        validate_reasoning_controls(&req)?;
 
         let chat = request::to_chat_request(&req);
         let new_body = serde_json::to_vec(&chat).map_err(|e| TranslationError::Internal(e.to_string()))?;
@@ -110,12 +110,38 @@ impl ProtocolTranslator for OpenResponses {
     }
 
     fn error_from_message(&self, status: StatusCode, message: &str) -> (StatusCode, Bytes) {
-        (status, openai_error(status, message))
+        self.error_for_param(status, message, None)
+    }
+
+    fn error_for_param(&self, status: StatusCode, message: &str, param: Option<&str>) -> (StatusCode, Bytes) {
+        (status, openai_error(status, message, param, None))
+    }
+
+    fn error_for_code(&self, status: StatusCode, message: &str, param: Option<&str>, code: &str) -> (StatusCode, Bytes) {
+        (status, openai_error(status, message, param, Some(code)))
     }
 
     fn stream_reframer(&self, request: &Bytes, response_id: Option<&str>) -> Box<dyn StreamReframer> {
         Box::new(ResponsesStreamReframer::new(request, response_id))
     }
+}
+
+/// Refuse provider-native thinking fields and malformed `reasoning.effort`
+/// against the Responses surface. Conversion keeps only `reasoning.effort` and
+/// `nvext`, so onwards, which sees the Chat Completions body, can no longer
+/// tell that a native field was sent.
+fn validate_reasoning_controls(req: &ResponsesRequest) -> Result<(), TranslationError> {
+    let mut controls = match &req.extra {
+        Some(Value::Object(extra)) => extra.clone(),
+        _ => serde_json::Map::new(),
+    };
+    if let Some(reasoning) = &req.reasoning {
+        let reasoning = serde_json::to_value(reasoning).map_err(|e| TranslationError::Internal(e.to_string()))?;
+        controls.insert("reasoning".to_string(), reasoning);
+    }
+    onwards::reasoning::validate_canonical_reasoning("/responses", &Value::Object(controls))
+        .map(|_| ())
+        .map_err(TranslationError::Reasoning)
 }
 
 /// Rewrite a `.../responses` path to `.../chat/completions`, preserving any
@@ -136,9 +162,102 @@ fn normalize_path(uri: &Uri) -> Result<Uri, TranslationError> {
         .map_err(|e| TranslationError::Internal(format!("failed to build normalised URI: {e}")))
 }
 
-/// Build an OpenAI-shaped error envelope (`{"error": {"message", "type"}}`),
-/// the same shape the Responses API returns.
-fn openai_error(status: StatusCode, message: &str) -> Bytes {
+/// The field names and renames the request types in [`types`] declare,
+/// sorted, for locating where a request stopped matching [`ResponsesRequest`]
+/// without recording a key the client chose. Response-only names are left out:
+/// in a request they are the client's. A name missing here is recorded as `*`;
+/// a test keeps the list equal to the request types' fields.
+const DECLARED_FIELDS: &[&str] = &[
+    "allowed_tools",
+    "annotation_type",
+    "annotations",
+    "arguments",
+    "background",
+    "call_id",
+    "code_interpreter",
+    "computer_use_preview",
+    "container",
+    "content",
+    "content_filter",
+    "custom",
+    "data",
+    "defer_loading",
+    "description",
+    "detail",
+    "display_height",
+    "display_width",
+    "effort",
+    "encrypted_content",
+    "environment",
+    "extra",
+    "file_id",
+    "file_search",
+    "filename",
+    "filters",
+    "format",
+    "function",
+    "headers",
+    "hosted_tool",
+    "id",
+    "image_url",
+    "include",
+    "input",
+    "input_file",
+    "input_image",
+    "input_text",
+    "instructions",
+    "json_object",
+    "json_schema",
+    "logprobs",
+    "max_num_results",
+    "max_output_tokens",
+    "mcp",
+    "message.output_text.logprobs",
+    "metadata",
+    "model",
+    "name",
+    "namespace",
+    "output",
+    "output_text",
+    "parallel_tool_calls",
+    "parameters",
+    "previous_response_id",
+    "reasoning",
+    "reasoning.encrypted_content",
+    "reasoning_text",
+    "refusal",
+    "require_approval",
+    "role",
+    "schema",
+    "search_context_size",
+    "server_label",
+    "server_url",
+    "service_tier",
+    "status",
+    "stop",
+    "store",
+    "stream",
+    "strict",
+    "summary",
+    "summary_text",
+    "temperature",
+    "text",
+    "tool_choice",
+    "tool_type",
+    "tools",
+    "top_logprobs",
+    "top_p",
+    "truncation",
+    "type",
+    "user",
+    "user_location",
+    "vector_store_ids",
+    "web_search_preview",
+];
+
+/// Build an OpenAI-shaped error envelope (`{"error": {"message", "type", "param"}}`,
+/// plus `code` when given), the same shape the Responses API returns.
+fn openai_error(status: StatusCode, message: &str, param: Option<&str>, code: Option<&str>) -> Bytes {
     let err_type = match status.as_u16() {
         400 => "invalid_request_error",
         401 => "authentication_error",
@@ -149,14 +268,17 @@ fn openai_error(status: StatusCode, message: &str) -> Bytes {
         s if s >= 500 => "server_error",
         _ => "invalid_request_error",
     };
-    let body = serde_json::json!({ "error": { "message": message, "type": err_type } });
+    let mut body = serde_json::json!({ "error": { "message": message, "type": err_type, "param": param } });
+    if let Some(code) = code {
+        body["error"]["code"] = Value::from(code);
+    }
     Bytes::from(serde_json::to_vec(&body).unwrap_or_default())
 }
 
 /// Wraps the (dwctl-owned) [`streaming::StreamingState`] in the [`StreamReframer`]
 /// interface: each upstream Chat Completions chunk is fed through `process_chunk`
 /// and the resulting Responses SSE events are serialised out; `finish` flushes
-/// `finalize` (which emits `response.completed`).
+/// `finalize` (which emits `response.completed` or `response.incomplete`).
 struct ResponsesStreamReframer {
     /// `None` only if the (already validated) request failed to re-parse; we then
     /// emit a single terminal error rather than a stream.
@@ -195,8 +317,18 @@ impl ResponsesStreamReframer {
 
 impl StreamReframer for ResponsesStreamReframer {
     fn push(&mut self, chunk: &Value) -> Vec<u8> {
+        if self.errored {
+            return Vec::new();
+        }
         if self.state.is_none() {
             return self.emit_error("could not initialise Responses stream");
+        }
+        // An upstream error inside the stream (onwards forwards it as a bare
+        // `{"error":{...}}` chunk) is terminal: surface it, and never follow it
+        // with `response.completed`.
+        if let Some(err) = chunk.get("error").filter(|e| e.is_object()) {
+            let message = err.get("message").and_then(Value::as_str).unwrap_or("upstream error");
+            return self.emit_error(message);
         }
         // Backfill fields backends legally omit on chunks before the strict
         // parse (same relaxation as the blocking path); then skip a chunk we
@@ -220,6 +352,9 @@ impl StreamReframer for ResponsesStreamReframer {
     }
 
     fn finish(&mut self) -> Vec<u8> {
+        if self.errored {
+            return Vec::new();
+        }
         match self.state.as_mut() {
             Some(state) => state.finalize().iter().flat_map(|e| e.to_sse().into_bytes()).collect(),
             None => Vec::new(),
@@ -242,7 +377,96 @@ mod tests {
     use axum::body::Body;
     use axum::response::Response;
     use axum::{Router, extract::Request, routing::post};
+    use onwards::strict::schema_mismatch::SchemaMismatch;
     use std::sync::Arc;
+
+    /// How the translator refuses `body`, which must not translate.
+    fn refusal(body: &[u8]) -> TranslationError {
+        let (parts, ()) = axum::http::Request::builder().uri("/v1/responses").body(()).unwrap().into_parts();
+        match OpenResponses::new().translate_request(&parts, Bytes::copy_from_slice(body)) {
+            Ok(_) => panic!("the body should not translate"),
+            Err(e) => e,
+        }
+    }
+
+    fn located(body: &[u8]) -> Option<SchemaMismatch> {
+        match refusal(body) {
+            TranslationError::SchemaMismatch { mismatch, .. } => mismatch,
+            other => panic!("expected a schema mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_schema_mismatch_names_the_field_but_not_its_value() {
+        let found = located(br#"{"model":"m","input":"hi","max_output_tokens":"planted-secret","metadata":{"planted-secret":1}}"#)
+            .expect("located");
+        assert_eq!(found.path.as_deref(), Some("max_output_tokens"));
+        assert_eq!(found.reason, "invalid_type");
+        assert!(!format!("{found:?}").contains("planted"));
+    }
+
+    #[test]
+    fn a_schema_mismatch_hides_client_keys_in_free_form_values() {
+        // With serde_json's `raw_value` feature this object must hold a string,
+        // so the free-form `metadata` fails beneath keys the client chose.
+        let found =
+            located(br#"{"model":"m","input":"hi","metadata":{"client_secret":{"$serde_json::private::RawValue":1}}}"#).expect("located");
+        assert_eq!(found.path.as_deref(), Some("metadata"));
+
+        // Keys named like fields are still the client's inside a free-form value.
+        let found =
+            located(br#"{"model":"m","input":"hi","metadata":{"model":{"input":{"$serde_json::private::RawValue":1}}}}"#).expect("located");
+        assert_eq!(found.path.as_deref(), Some("metadata"));
+    }
+
+    #[test]
+    fn a_malformed_input_item_is_located_at_input() {
+        // `Input` is untagged and `Item` re-parses through a `Value`, so serde
+        // reports these at `input` without the inner path.
+        let found =
+            located(br#"{"model":"m","input":[{"type":"function_call","call_id":5,"name":"f","arguments":"{}"}]}"#).expect("located");
+        assert_eq!(found.path.as_deref(), Some("input"));
+        assert_eq!(found.reason, "no_matching_variant");
+    }
+
+    #[test]
+    fn a_missing_field_is_named() {
+        let found = located(br#"{"input":"hi"}"#).expect("located");
+        assert_eq!(found.path.as_deref(), Some("model"));
+        assert_eq!(found.reason, "missing_field");
+    }
+
+    #[test]
+    fn a_body_that_is_not_json_is_not_a_schema_mismatch() {
+        assert!(matches!(refusal(b"{not json"), TranslationError::InvalidJson(_)));
+    }
+
+    #[test]
+    fn errors_name_the_param() {
+        let (_, body) = OpenResponses::new().error_for_param(StatusCode::BAD_REQUEST, "bad", Some("input"));
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["param"], "input");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        let (_, body) = OpenResponses::new().error_from_message(StatusCode::BAD_REQUEST, "bad");
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["param"], Value::Null);
+    }
+
+    #[test]
+    fn declared_fields_are_sorted_and_unique() {
+        assert!(DECLARED_FIELDS.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn declared_fields_are_the_request_types_fields() {
+        let source = include_str!("types.rs");
+        let start = source.find("/// Request body for POST /v1/responses").expect("request types start");
+        let end = source.find("/// Response from POST /v1/responses").expect("response types start");
+        let declared: std::collections::BTreeSet<String> =
+            onwards::test_utils::declared_field_names(&source[start..end]).into_iter().collect();
+        let listed: std::collections::BTreeSet<String> = DECLARED_FIELDS.iter().map(|name| name.to_string()).collect();
+        assert_eq!(listed, declared, "DECLARED_FIELDS must list exactly the request types' fields");
+    }
 
     #[test]
     fn detect_claims_responses_ignoring_headers() {
@@ -427,6 +651,38 @@ mod tests {
         );
     }
 
+    /// An upstream error after partial output ends the Responses stream with an
+    /// `error` event, never with `response.completed`, even when the upstream
+    /// follows it with `[DONE]`.
+    #[test]
+    fn embedded_upstream_error_ends_the_stream_with_an_error_event() {
+        let request = Bytes::from(r#"{"model":"m","input":"hi","stream":true}"#);
+        let mut reframer = OpenResponses::new().stream_reframer(&request, None);
+        let content = serde_json::json!({
+            "id": "c1", "object": "chat.completion.chunk", "created": 0, "model": "m",
+            "choices": [{"index": 0, "delta": {"content": "Hel"}}]
+        });
+        let error = serde_json::json!({
+            "error": {"message": "The response stream was interrupted before it finished. Retry the request.", "type": "api_error", "param": null, "code": 502}
+        });
+
+        let mut out = reframer.push(&content);
+        out.extend(reframer.push(&error));
+        out.extend(reframer.push(&content));
+        out.extend(reframer.finish());
+        let text = String::from_utf8(out).unwrap();
+
+        assert!(text.contains("event: response.output_text.delta"), "{text}");
+        assert!(text.contains("event: error"), "{text}");
+        assert!(text.contains("interrupted before it finished"), "{text}");
+        assert!(!text.contains("response.completed"), "{text}");
+        assert_eq!(text.matches("event: error").count(), 1, "{text}");
+        assert!(
+            text.rfind("event: error") > text.rfind("output_text.delta"),
+            "nothing follows the error: {text}"
+        );
+    }
+
     /// A blocking reply whose message omits `role` (and other optional-per-spec
     /// top-level fields) must still translate. This is the shape a reassembled
     /// single-chunk stream takes when the backend never sends `role` on its
@@ -444,6 +700,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["object"], "response");
         assert_eq!(v["status"], "incomplete", "length-capped replies surface as incomplete");
+        assert_eq!(v["incomplete_details"]["reason"], "max_output_tokens");
         assert_eq!(v["model"], "m", "model backfilled from the request");
         assert_eq!(v["output"][0]["role"], "assistant", "missing role defaults to assistant");
         assert_eq!(v["output"][0]["content"][0]["text"], "Hello");
@@ -483,6 +740,49 @@ mod tests {
         assert!(text.contains("Hi"), "missing text delta in:\n{text}");
     }
 
+    /// A stream the output cap ends inside the reasoning (the shape pi used to
+    /// end silently on) must close with `response.incomplete` and a reason.
+    #[tokio::test]
+    async fn length_cut_stream_ends_with_response_incomplete() {
+        async fn fake_chat_sse(_req: Request) -> Response {
+            let sse = concat!(
+                "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"Let me think\"}}]}\n\n",
+                "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+                "data: [DONE]\n\n",
+            );
+            let mut r = Response::new(Body::from(sse));
+            r.headers_mut()
+                .insert(header::CONTENT_TYPE, header::HeaderValue::from_static("text/event-stream"));
+            r
+        }
+
+        let registry = TranslationRegistry::new(vec![Arc::new(OpenResponses::new())]);
+        let inner = Router::new()
+            .route("/responses", post(fake_chat_sse))
+            .layer(axum::middleware::from_fn_with_state(registry, translation_middleware));
+        let server = axum_test::TestServer::new(Router::new().nest("/ai/v1", inner)).expect("test server");
+
+        let response = server
+            .post("/ai/v1/responses")
+            .json(&serde_json::json!({ "model": "m", "input": "hi", "stream": true, "max_output_tokens": 16 }))
+            .await;
+
+        assert_eq!(response.status_code().as_u16(), 200);
+        let text = response.text();
+        assert!(!text.contains("response.completed"), "{text}");
+        let terminal = text
+            .split("\n\n")
+            .filter_map(|frame| frame.lines().find_map(|line| line.strip_prefix("data: ")))
+            .last()
+            .expect("a terminal event");
+        let terminal: serde_json::Value = serde_json::from_str(terminal).unwrap();
+        assert_eq!(terminal["type"], "response.incomplete", "{text}");
+        assert_eq!(terminal["response"]["status"], "incomplete");
+        assert_eq!(terminal["response"]["incomplete_details"]["reason"], "max_output_tokens");
+        assert_eq!(terminal["response"]["output"][0]["type"], "reasoning");
+        assert_eq!(terminal["response"]["output"][0]["status"], "incomplete");
+    }
+
     /// A 2xx body the translator genuinely cannot translate must surface as a
     /// status the batch daemon will NOT retry (it retries >=500, 429, 408 and
     /// 404): the upstream succeeded, so every retry fails identically.
@@ -509,5 +809,73 @@ mod tests {
         assert_eq!(response.status_code().as_u16(), 422);
         let body: serde_json::Value = response.json();
         assert_eq!(body["error"]["message"], "response translation failed");
+    }
+
+    /// The Chat Completions body onwards receives keeps only `reasoning.effort`,
+    /// so provider-native thinking fields must be refused here, with the same
+    /// envelope Chat Completions uses for them.
+    #[tokio::test]
+    async fn native_thinking_fields_are_refused_before_translation() {
+        async fn unreachable_upstream(_req: Request) -> Response {
+            panic!("a refused request must not reach onwards");
+        }
+        let registry = TranslationRegistry::new(vec![Arc::new(OpenResponses::new())]);
+        let inner = Router::new()
+            .route("/responses", post(unreachable_upstream))
+            .layer(axum::middleware::from_fn_with_state(registry, translation_middleware));
+        let server = axum_test::TestServer::new(Router::new().nest("/ai/v1", inner)).expect("test server");
+
+        let cases = [
+            ("reasoning_effort", serde_json::json!("none")),
+            (
+                "chat_template_kwargs.enable_thinking",
+                serde_json::json!({"enable_thinking": false}),
+            ),
+            ("chat_template_kwargs.thinking", serde_json::json!({"thinking": false})),
+            ("chat_template_kwargs", serde_json::json!({"reasoning_effort": "low"})),
+            ("thinking", serde_json::json!({"type": "disabled"})),
+            ("thinking_token_budget", serde_json::json!(128)),
+        ];
+        for (param, value) in cases {
+            let field = param.split('.').next().unwrap();
+            let mut request = serde_json::json!({"model": "gpt-4o", "input": "hello", "reasoning": {"effort": "low"}});
+            request[field] = value;
+
+            let response = server.post("/ai/v1/responses").json(&request).await;
+
+            assert_eq!(response.status_code().as_u16(), 400, "{param}");
+            let body: serde_json::Value = response.json();
+            assert_eq!(body["error"]["type"], "invalid_request_error", "{param}: {body}");
+            assert_eq!(body["error"]["code"], "unsupported_parameter", "{param}: {body}");
+            assert_eq!(body["error"]["param"], param, "{body}");
+            assert_eq!(
+                body["error"]["message"],
+                format!("Unsupported parameter '{param}'; use 'reasoning.effort'."),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_invalid_reasoning_effort_is_named_by_its_responses_path() {
+        let error = match refusal(br#"{"model":"gpt-4o","input":"hello","reasoning":{"effort":"ultra"}}"#) {
+            TranslationError::Reasoning(error) => error,
+            other => panic!("expected a reasoning refusal, got {other:?}"),
+        };
+        assert_eq!(error.param(), Some("reasoning.effort"));
+        assert_eq!(error.code(), "invalid_value");
+    }
+
+    #[test]
+    fn canonical_reasoning_and_nvext_still_translate() {
+        let (parts, ()) = axum::http::Request::builder().uri("/v1/responses").body(()).unwrap().into_parts();
+        let body =
+            br#"{"model":"gpt-4o","input":"hello","reasoning":{"effort":"none","summary":"auto"},"nvext":{"routing_constraints":{}}}"#;
+
+        let out = OpenResponses::new().translate_request(&parts, Bytes::from_static(body)).unwrap();
+
+        let chat: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(chat["reasoning_effort"], "none");
+        assert!(chat.get("nvext").is_some(), "{chat}");
     }
 }

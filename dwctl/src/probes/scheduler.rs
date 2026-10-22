@@ -501,7 +501,7 @@ mod tests {
         crate::test::utils::create_test_config()
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_scheduler_initialize(pool: sqlx::PgPool) {
         // Create separate deployments for each probe
         let deployment_id1 = setup_test_deployment(&pool).await;
@@ -546,7 +546,7 @@ mod tests {
         assert_eq!(schedulers.len(), 2);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_sync_starts_new_schedulers(pool: sqlx::PgPool) {
         let deployment_id = setup_test_deployment(&pool).await;
 
@@ -580,7 +580,7 @@ mod tests {
         assert_eq!(new_count, 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_sync_stops_deactivated_schedulers(pool: sqlx::PgPool) {
         let deployment_id = setup_test_deployment(&pool).await;
 
@@ -612,7 +612,7 @@ mod tests {
         assert_eq!(scheduler.schedulers.read().await.len(), 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_stop_all_schedulers(pool: sqlx::PgPool) {
         // Create separate deployment for each probe
         for i in 0..3 {
@@ -643,7 +643,7 @@ mod tests {
         assert_eq!(scheduler.schedulers.read().await.len(), 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_scheduler_ignores_inactive_probes(pool: sqlx::PgPool) {
         let deployment_id = setup_test_deployment(&pool).await;
 

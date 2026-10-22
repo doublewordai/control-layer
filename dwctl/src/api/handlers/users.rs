@@ -4,6 +4,7 @@ use sqlx_pool_router::PoolProvider;
 
 use crate::{
     AppState,
+    api::handlers::validate_toleration_preset,
     api::models::{
         groups::GroupResponse,
         pagination::PaginatedResponse,
@@ -96,6 +97,10 @@ pub async fn list_users<P: PoolProvider>(
     // Check if user has permission to view billing data (Credits ReadAll)
     let can_view_billing = permissions::has_permission(&current_user, Resource::Credits, Operation::ReadAll);
 
+    // Platform managers see each account's pinned scheduling tolerations in the
+    // list (drives the "dedicated capacity" badge); nobody else does.
+    let can_update_all_users = permissions::can_update_all_resources(&current_user, Resource::Users);
+
     // If includes billing AND user has permission, create balances_map.
     //
     // Both billing facts are fetched together so `include=billing` means the
@@ -133,7 +138,12 @@ pub async fn list_users<P: PoolProvider>(
 
     // Iterate through and enrich users
     for user in users {
-        let mut response_user = UserResponse::from(user);
+        let toleration_preset = if can_update_all_users {
+            user.toleration_preset.clone()
+        } else {
+            None
+        };
+        let mut response_user = UserResponse::from(user).with_toleration_preset(toleration_preset);
         // If includes groups
         if let Some(groups_map) = &groups_map
             && let Some(user_groups_map) = &user_groups_map
@@ -256,7 +266,17 @@ pub async fn get_user<P: PoolProvider>(
         id: target_user_id.to_string(),
     })?;
 
-    let mut response = UserResponse::from(user);
+    // The scheduling-toleration preset is an operator's routing decision, so
+    // only platform managers (UpdateAll on users) see it, here as well as on
+    // the PATCH. `UserResponse::from` deliberately drops the field.
+    let can_update_all_users = permissions::can_update_all_resources(&current_user, Resource::Users);
+    let toleration_preset = if can_update_all_users {
+        user.toleration_preset.clone()
+    } else {
+        None
+    };
+
+    let mut response = UserResponse::from(user).with_toleration_preset(toleration_preset);
 
     // Include billing if requested and permitted
     // Permitted if:
@@ -439,24 +459,18 @@ pub async fn update_user<P: PoolProvider>(
 
     // The serving account settings change how the account's traffic is routed
     // and prioritised fleet-wide: an operator decision, never self-service.
-    if !can_update_all_users
-        && (user_data.granted_serving_classes.is_some()
-            || user_data.default_serving_class.is_some()
-            || user_data.self_hosted_only.is_some())
-    {
+    if !can_update_all_users && (user_data.self_hosted_only.is_some() || user_data.toleration_preset.is_some()) {
         return Err(Error::InsufficientPermissions {
             required: Permission::Allow(Resource::Users, Operation::UpdateAll),
             action: Operation::UpdateAll,
             resource: "serving settings".to_string(),
         });
     }
-    if let Some(Some(class)) = &user_data.default_serving_class {
-        super::validate_elevated_serving_class(class)?;
-    }
-    if let Some(classes) = &user_data.granted_serving_classes {
-        for class in classes {
-            super::validate_elevated_serving_class(class)?;
-        }
+    // Reject a preset id this deployment does not define, so a typo fails here
+    // rather than silently pinning the account to nothing (or, at request
+    // time, failing closed to the most restrictive list).
+    if let Some(Some(preset)) = &user_data.toleration_preset {
+        validate_toleration_preset(&state, preset)?;
     }
 
     // Validate auto-topup fields if provided
@@ -488,7 +502,14 @@ pub async fn update_user<P: PoolProvider>(
     let db_request = UserUpdateDBRequest::new(user_data);
 
     let user = repo.update(user_id, &db_request).await?;
-    Ok(Json(UserResponse::from(user)))
+    // Only a platform manager could have set a preset (the UpdateAll gate above
+    // rejects anyone else), so they are the only caller who sees it back.
+    let toleration_preset = if can_update_all_users {
+        user.toleration_preset.clone()
+    } else {
+        None
+    };
+    Ok(Json(UserResponse::from(user).with_toleration_preset(toleration_preset)))
 }
 
 // DELETE /user/{user_id} - Delete user (admin only)
@@ -735,7 +756,7 @@ mod tests {
     use std::str::FromStr;
     use uuid::Uuid;
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_current_user_info(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -758,7 +779,7 @@ mod tests {
     /// `verified` has to reach the client, not just the database: the onboarding
     /// ZDR gate reads it off `/users/current` to decide whether the account may
     /// turn on zero data retention.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_current_user_reports_verified_once_set(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -794,7 +815,7 @@ mod tests {
     /// it has to be read-after-write consistent, not eventually consistent.
     ///
     /// Deliberately no polling or retry: the very next read must already see it.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_current_user_verified_is_read_after_write_consistent(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -819,7 +840,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_users_as_admin(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -837,7 +858,7 @@ mod tests {
         assert!(paginated.total_count > 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_users_as_non_admin_forbidden(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -852,7 +873,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_user_as_admin(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -879,7 +900,7 @@ mod tests {
         assert_eq!(created_user.email, "newuser@example.com");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_unauthenticated_request(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool, false).await;
@@ -888,7 +909,7 @@ mod tests {
         response.assert_status_unauthorized();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_users_with_pagination(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -950,7 +971,7 @@ mod tests {
         assert_eq!(paginated.limit, MAX_LIMIT); // Limit should be clamped
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_other_user_as_admin(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -969,7 +990,7 @@ mod tests {
         assert_eq!(user_response.email, regular_user.email);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_other_user_as_non_admin_forbidden(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -985,7 +1006,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_user_not_found(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1001,7 +1022,7 @@ mod tests {
         response.assert_status_not_found();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_users_with_groups_include(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1077,7 +1098,7 @@ mod tests {
         assert!(groups.contains(&group.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_users_with_billing_include(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1139,7 +1160,7 @@ mod tests {
         assert_eq!(found_user.credit_balance.unwrap(), 250.0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_users_with_groups_and_billing_include(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1184,7 +1205,7 @@ mod tests {
         assert_eq!(found_user.credit_balance.unwrap(), 500.0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_users_billing_with_zero_balance(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1207,7 +1228,7 @@ mod tests {
         assert_eq!(found_user.credit_balance.unwrap(), 0.0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_users_billing_with_multiple_transactions(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1255,7 +1276,7 @@ mod tests {
         assert_eq!(found_user3.credit_balance.unwrap(), 300.0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_users_billing_manager_can_view_billing(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1279,7 +1300,7 @@ mod tests {
         assert_eq!(found_user.credit_balance.unwrap(), 350.0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_user_as_admin(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1305,7 +1326,7 @@ mod tests {
         assert_eq!(updated_user.avatar_url.as_deref(), Some("https://example.com/new-avatar.jpg"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_own_user_as_standard_user(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1330,19 +1351,17 @@ mod tests {
         assert_eq!(updated_user.avatar_url.as_deref(), Some("https://example.com/my-avatar.jpg"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_users_cannot_touch_their_own_serving_settings_only_platform_managers(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
 
-        // Grants, default class and routing preference are operated by
-        // platform managers only; a user gets a 403 even mixed with a field
-        // they may edit, and nothing is applied.
+        // The routing preference is operated by platform managers only; a
+        // user gets a 403 even mixed with a field they may edit, and nothing
+        // is applied.
         for body in [
-            json!({ "granted_serving_classes": ["interactive"] }),
-            json!({ "default_serving_class": "throughput" }),
             json!({ "self_hosted_only": true }),
             json!({ "display_name": "Renamed", "self_hosted_only": true }),
         ] {
@@ -1361,8 +1380,6 @@ mod tests {
             .await;
         response.assert_status_ok();
         let current: UserResponse = response.json();
-        assert!(current.granted_serving_classes.is_empty());
-        assert_eq!(current.default_serving_class, None);
         assert!(!current.self_hosted_only);
         assert_ne!(current.display_name.as_deref(), Some("Renamed"));
 
@@ -1370,20 +1387,14 @@ mod tests {
             .patch(&format!("/admin/api/v1/users/{}", user.id))
             .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
             .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
-            .json(&json!({
-                "granted_serving_classes": ["interactive", "throughput"],
-                "default_serving_class": "interactive",
-                "self_hosted_only": true
-            }))
+            .json(&json!({ "self_hosted_only": true }))
             .await;
         response.assert_status_ok();
         let updated: UserResponse = response.json();
-        assert_eq!(updated.granted_serving_classes, vec!["interactive", "throughput"]);
-        assert_eq!(updated.default_serving_class.as_deref(), Some("interactive"));
         assert!(updated.self_hosted_only);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_user_as_non_admin_forbidden(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1404,7 +1415,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_nonexistent_user(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1425,7 +1436,7 @@ mod tests {
         response.assert_status_not_found();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_user_as_admin(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1450,7 +1461,7 @@ mod tests {
         get_response.assert_status_not_found();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_user_as_non_admin_forbidden(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1466,7 +1477,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_nonexistent_user(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1482,7 +1493,7 @@ mod tests {
         response.assert_status_not_found();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_self_forbidden(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1497,7 +1508,7 @@ mod tests {
         response.assert_status_bad_request();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_standard_user_permissions(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1569,7 +1580,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_request_viewer_permissions(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1616,7 +1627,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_user_permissions(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1674,7 +1685,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::NO_CONTENT);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_multi_role_user_permissions(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1741,7 +1752,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_user_access_isolation(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1774,7 +1785,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_role_layering_user_access(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1865,7 +1876,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_admin_bypass_vs_role_permissions(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1902,7 +1913,7 @@ mod tests {
         standard_response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_user_roles_backend_protection(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1950,7 +1961,7 @@ mod tests {
         assert!(updated_user.roles.contains(&Role::StandardUser));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_admin_can_toggle_zero_data_retention(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1984,7 +1995,7 @@ mod tests {
         assert!(!response.json::<UserResponse>().zero_data_retention);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_standard_user_can_toggle_own_zero_data_retention(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2031,7 +2042,7 @@ mod tests {
     }
 
     // Test: GET /users/{user_id}/balance returns own balance for standard user
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_own_balance_as_standard_user(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2058,7 +2069,7 @@ mod tests {
     /// `has_payment_provider_id`: an account that verified a card, or merely
     /// tried to switch on auto top-up, has a provider record and no purchase,
     /// and is still owed the match.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_billing_include_reports_first_purchase_state(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2103,7 +2114,7 @@ mod tests {
 
     /// `include=billing` has to mean the same thing on the list endpoint as it
     /// does on the single-user one, or callers can't rely on it at all.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_users_billing_include_reports_first_purchase_state(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2149,7 +2160,7 @@ mod tests {
 
     /// Absent without `include=billing`, so a caller can tell "not asked for"
     /// apart from "asked for, and the answer is no".
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_first_purchase_state_is_omitted_without_the_billing_include(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2166,7 +2177,7 @@ mod tests {
     }
 
     // Test: GET /users/current/balance works for standard user with billing info
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_current_user_balance(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2188,7 +2199,7 @@ mod tests {
     }
 
     // Test: GET /users/{other_user_id} returns 403 for standard user asking for billing
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_other_user_balance_forbidden(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2205,7 +2216,7 @@ mod tests {
     }
 
     // Test: GET /users/{user_id} works for own balance as RequestViewer
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_own_balance_as_request_viewer(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2227,7 +2238,7 @@ mod tests {
     }
 
     // Test: GET /users/current works for RequestViewer with billing info
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_current_user_balance_request_viewer(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2249,7 +2260,7 @@ mod tests {
     }
 
     // Test: GET /users/current works for PlatformManager with billing info
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_current_user_balance_platform_manager(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2271,7 +2282,7 @@ mod tests {
     }
 
     // Test: PlatformManager can view any user's balance (has ReadAll permission)
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_can_view_any_balance(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2294,7 +2305,7 @@ mod tests {
     }
 
     // Test: BillingManager can view any user's balance
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_billing_manager_can_view_any_balance(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2316,7 +2327,7 @@ mod tests {
         assert_eq!(balance.credit_balance, Some(300.0));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_onboarding_redirect_for_new_user_with_null_last_login(pool: PgPool) {
         let mut config = create_test_config();
@@ -2339,7 +2350,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_onboarding_redirect_for_recently_created_user_with_last_login_set(pool: PgPool) {
         let mut config = create_test_config();
@@ -2372,7 +2383,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_no_onboarding_redirect_for_returning_user(pool: PgPool) {
         let mut config = create_test_config();
@@ -2403,7 +2414,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_no_onboarding_redirect_when_not_configured(pool: PgPool) {
         // Default test config has onboarding_url: None

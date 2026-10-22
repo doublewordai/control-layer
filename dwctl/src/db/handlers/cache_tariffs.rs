@@ -86,7 +86,7 @@ impl<'c> CacheTariffs<'c> {
                 own.deployed_model_id, own.serving_class, own.write_multiplier_5m, own.write_multiplier_1h,
                 own.write_multiplier_24h, own.read_multiplier, general.min_prefix_tokens, own.valid_from, own.valid_until
              FROM model_cache_tariffs own JOIN model_cache_tariffs general ON general.deployed_model_id = own.deployed_model_id
-                AND general.user_id IS NULL AND general.valid_from <= NOW() AND (general.valid_until IS NULL OR general.valid_until > NOW())
+                AND general.user_id IS NULL AND general.serving_class IS NULL AND general.valid_from <= NOW() AND (general.valid_until IS NULL OR general.valid_until > NOW())
              WHERE own.deployed_model_id = ANY($1) AND own.user_id = $2 AND own.serving_class IS NOT NULL
                 AND own.valid_from <= NOW() AND (own.valid_until IS NULL OR own.valid_until > NOW())
              ORDER BY own.deployed_model_id, own.serving_class, own.valid_from DESC, general.valid_from DESC",
@@ -116,7 +116,7 @@ impl<'c> CacheTariffs<'c> {
     /// Enable (or re-price) caching for a model: expire the current active version, then
     /// insert a new one from `defaults` + `overrides`. Idempotent in spirit — calling it
     /// again just supersedes the previous version, keeping the old one for audit.
-    #[instrument(skip(self, defaults, overrides), fields(deployed_model_id = %model_id), err)]
+    #[instrument(level = "debug", skip(self, defaults, overrides), fields(deployed_model_id = %model_id), err)]
     pub async fn enable(&mut self, model_id: DeploymentId, defaults: &CachePricingConfig, overrides: CacheTariffOverrides) -> Result<()> {
         // Atomic: expire the active version and insert the new one in one transaction, so a
         // failed insert can't leave the model unintentionally disabled (ledger: never edit a
@@ -130,7 +130,7 @@ impl<'c> CacheTariffs<'c> {
         sqlx::query!(
             r#"UPDATE model_cache_tariffs SET valid_until = now()
                WHERE deployed_model_id = $1
-                 AND user_id IS NULL
+                 AND user_id IS NULL AND serving_class IS NULL
                  AND valid_from <= now()
                  AND (valid_until IS NULL OR valid_until > now())"#,
             model_id,
@@ -160,14 +160,14 @@ impl<'c> CacheTariffs<'c> {
     /// Disable caching for a model: expire its active tariff version (config retained for
     /// audit). Returns true if a version was active. Caching turns off within the
     /// resolver's cache TTL.
-    #[instrument(skip(self), fields(deployed_model_id = %model_id), err)]
+    #[instrument(level = "debug", skip(self), fields(deployed_model_id = %model_id), err)]
     pub async fn disable(&mut self, model_id: DeploymentId) -> Result<bool> {
         // Only expire the currently-effective version (valid_from <= now()), matching the
         // resolver's as-of-now active check — a future-dated version is left intact.
         let res = sqlx::query!(
             r#"UPDATE model_cache_tariffs SET valid_until = now()
                WHERE deployed_model_id = $1
-                 AND user_id IS NULL
+                 AND user_id IS NULL AND serving_class IS NULL
                  AND valid_from <= now()
                  AND (valid_until IS NULL OR valid_until > now())"#,
             model_id,
@@ -179,7 +179,7 @@ impl<'c> CacheTariffs<'c> {
 
     /// The tariff version effective *now* (the as-of-now active check the resolver uses),
     /// or `None` if cache pricing is currently off for this model.
-    #[instrument(skip(self), fields(deployed_model_id = %model_id), err)]
+    #[instrument(level = "debug", skip(self), fields(deployed_model_id = %model_id), err)]
     pub async fn get_active(&mut self, model_id: DeploymentId) -> Result<Option<ActiveTariff>> {
         let row = sqlx::query_as!(
             ActiveTariff,
@@ -187,7 +187,7 @@ impl<'c> CacheTariffs<'c> {
                       read_multiplier, min_prefix_tokens, valid_from, valid_until
                FROM model_cache_tariffs
                WHERE deployed_model_id = $1
-                 AND user_id IS NULL
+                 AND user_id IS NULL AND serving_class IS NULL
                  AND valid_from <= now()
                  AND (valid_until IS NULL OR valid_until > now())
                ORDER BY valid_from DESC
@@ -201,7 +201,7 @@ impl<'c> CacheTariffs<'c> {
 
     /// One organisation's active cache versions on a set of models. Empty for models the
     /// organisation has no override on; callers layer the result over [`Self::get_active_bulk`].
-    #[instrument(skip(self, model_ids), fields(model_count = model_ids.len()), err)]
+    #[instrument(level = "debug", skip(self, model_ids), fields(model_count = model_ids.len()), err)]
     pub async fn get_active_for_account_bulk(
         &mut self,
         model_ids: &[DeploymentId],
@@ -246,7 +246,7 @@ impl<'c> CacheTariffs<'c> {
 
     /// Active tariff versions effective now, keyed by deployment ID. Models without an
     /// active row are omitted from the map.
-    #[instrument(skip(self, model_ids), fields(model_count = model_ids.len()), err)]
+    #[instrument(level = "debug", skip(self, model_ids), fields(model_count = model_ids.len()), err)]
     pub async fn get_active_bulk(&mut self, model_ids: &[DeploymentId]) -> Result<HashMap<DeploymentId, ActiveTariff>> {
         if model_ids.is_empty() {
             return Ok(HashMap::new());
@@ -258,7 +258,7 @@ impl<'c> CacheTariffs<'c> {
                       read_multiplier, min_prefix_tokens, valid_from, valid_until
                FROM model_cache_tariffs
                WHERE deployed_model_id = ANY($1)
-                 AND user_id IS NULL
+                 AND user_id IS NULL AND serving_class IS NULL
                  AND valid_from <= now()
                  AND (valid_until IS NULL OR valid_until > now())
                ORDER BY deployed_model_id, valid_from DESC"#,
@@ -294,7 +294,7 @@ mod tests {
     use crate::test::utils::{create_test_endpoint, create_test_model, create_test_user};
     use sqlx::PgPool;
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn enable_then_disable_toggles_resolver(pool: PgPool) {
         let user = create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
         let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
@@ -325,7 +325,7 @@ mod tests {
         assert!(!ModelConfigResolver::new(pool).resolve("enable-alias").await.unwrap().enabled);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn enable_twice_supersedes_keeping_history(pool: PgPool) {
         let user = create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
         let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
@@ -362,7 +362,7 @@ mod tests {
         assert_eq!(active, Some(1), "exactly one active version");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn partial_unique_index_rejects_two_active_versions(pool: PgPool) {
         let user = create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
         let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
@@ -392,7 +392,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn get_active_reflects_enable_disable(pool: PgPool) {
         let user = create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
         let endpoint = create_test_endpoint(&pool, "ep", user.id).await;

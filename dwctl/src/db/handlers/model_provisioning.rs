@@ -1,5 +1,7 @@
 //! Transaction-scoped persistence for the declarative model catalog.
 
+pub(crate) mod classes;
+
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -16,6 +18,54 @@ use crate::model_provisioning::{
 /// A fixed application-level lock ID. Transaction scope makes a crashed startup
 /// release it automatically and works through transaction-pooled connections.
 const MODEL_PROVISIONING_LOCK: i64 = 0x4457_4d4f_4445_4c50;
+
+/// Ownership marker on prices written by the organisation catalog.
+pub(crate) const ORG_CATALOG_TARIFF_SOURCE: &str = "org-overlays";
+/// Ownership marker on prices written by the account catalog.
+pub(crate) const ACCOUNT_CATALOG_TARIFF_SOURCE: &str = "account-catalog";
+
+/// Close the active prices a catalog owns (`source`) on every account/model
+/// pair it no longer declares. Manual rows and rows another catalog owns are
+/// never touched. Future-dated owned rows on a removed pair are refused:
+/// startup provisioning has no scheduling semantics.
+pub(crate) async fn retire_omitted_account_prices(
+    db: &mut PgConnection,
+    source: &str,
+    declared: &[(Uuid, Uuid)],
+    effective_at: DateTime<Utc>,
+) -> Result<()> {
+    let (account_ids, model_ids): (Vec<Uuid>, Vec<Uuid>) = declared.iter().copied().unzip();
+    for table in ["model_tariffs", "model_cache_tariffs"] {
+        let omitted = "t.provisioning_source = $4 AND NOT EXISTS (
+            SELECT 1 FROM UNNEST($1::uuid[], $2::uuid[]) AS d(user_id, deployed_model_id)
+            WHERE d.user_id = t.user_id AND d.deployed_model_id = t.deployed_model_id)";
+        let future: bool = sqlx::query_scalar(&format!(
+            "SELECT EXISTS (SELECT 1 FROM {table} t WHERE t.valid_from > $3
+             AND (t.valid_until IS NULL OR t.valid_until > t.valid_from) AND {omitted})"
+        ))
+        .bind(&account_ids)
+        .bind(&model_ids)
+        .bind(effective_at)
+        .bind(source)
+        .fetch_one(&mut *db)
+        .await?;
+        ensure!(
+            !future,
+            "removed account/model entry has future-dated prices; resolve these before removing it"
+        );
+        sqlx::query(&format!(
+            "UPDATE {table} t SET valid_until = $3 WHERE t.valid_from <= $3
+             AND (t.valid_until IS NULL OR t.valid_until > $3) AND {omitted}"
+        ))
+        .bind(&account_ids)
+        .bind(&model_ids)
+        .bind(effective_at)
+        .bind(source)
+        .execute(&mut *db)
+        .await?;
+    }
+    Ok(())
+}
 
 pub struct ModelProvisioning<'c> {
     db: &'c mut PgConnection,
@@ -39,8 +89,22 @@ impl<'c> ModelProvisioning<'c> {
     pub(crate) fn for_org_catalog(db: &'c mut PgConnection) -> Self {
         Self {
             db,
-            tariff_source: Some("org-overlays"),
+            tariff_source: Some(ORG_CATALOG_TARIFF_SOURCE),
         }
+    }
+
+    /// Account catalog prices carry their own ownership marker, so each catalog
+    /// retires only the rows it wrote.
+    pub(crate) fn for_account_catalog(db: &'c mut PgConnection) -> Self {
+        Self {
+            db,
+            tariff_source: Some(ACCOUNT_CATALOG_TARIFF_SOURCE),
+        }
+    }
+
+    fn account_tariff_source(&self) -> Result<&'static str> {
+        self.tariff_source
+            .context("account price ownership requires an organisation or account catalog writer")
     }
 
     pub async fn apply(&mut self, catalog: &Catalog) -> Result<()> {
@@ -58,6 +122,7 @@ impl<'c> ModelProvisioning<'c> {
             .context("read model provisioning effective timestamp")?;
 
         let (endpoints, groups) = self.preflight_named_references(catalog).await?;
+        self.preflight_class_names(catalog).await?;
         self.preflight_existing_model_types(catalog).await?;
         self.preflight_future_tariffs(catalog, effective_at).await?;
 
@@ -102,6 +167,7 @@ impl<'c> ModelProvisioning<'c> {
                 .await?;
             self.reconcile_cache_tariff(model_id, None, None, model.clay.cache_tariff.as_ref(), effective_at)
                 .await?;
+            self.reconcile_classes(model_id, model, &endpoints, effective_at).await?;
             self.reconcile_groups(model_id, &model.clay.access_groups, &groups).await?;
             self.reconcile_traffic_rules(model_id, &model.clay.traffic_rules, &redirect_ids)
                 .await?;
@@ -115,7 +181,14 @@ impl<'c> ModelProvisioning<'c> {
         let endpoint_names: HashSet<String> = catalog
             .models
             .iter()
-            .flat_map(|model| model.clay.deployments.iter().map(|deployment| deployment.endpoint.clone()))
+            .flat_map(|model| {
+                model
+                    .clay
+                    .deployments
+                    .iter()
+                    .map(|deployment| deployment.endpoint.clone())
+                    .chain(model.clay.class_routes.values().map(|class| class.endpoint.clone()))
+            })
             .collect();
         let group_names: HashSet<String> = catalog
             .models
@@ -157,6 +230,7 @@ impl<'c> ModelProvisioning<'c> {
     /// YAML is authoritative for the complete declared org/model, including
     /// prices originally inserted manually. Historical amounts remain immutable.
     pub(crate) async fn adopt_account_model_tariffs(&mut self, account: Uuid, model: Uuid, effective_at: DateTime<Utc>) -> Result<()> {
+        let source = self.account_tariff_source()?;
         for table in ["model_tariffs", "model_cache_tariffs"] {
             let future: Option<(DateTime<Utc>, Option<String>)> = sqlx::query_as(&format!(
                 "SELECT valid_from, serving_class FROM {table}
@@ -175,15 +249,18 @@ impl<'c> ModelProvisioning<'c> {
                     class.as_deref().unwrap_or("all")
                 );
             }
+            // Only manual rows are adopted: a row another catalog owns stays
+            // with it, and reconciliation then reports the conflict.
             sqlx::query(&format!(
-                "UPDATE {table} SET provisioning_source='org-overlays'
+                "UPDATE {table} SET provisioning_source=$4
                  WHERE user_id=$1 AND deployed_model_id=$2 AND valid_from<=$3
                    AND (valid_until IS NULL OR valid_until>$3)
-                   AND provisioning_source IS DISTINCT FROM 'org-overlays'"
+                   AND provisioning_source IS NULL"
             ))
             .bind(account)
             .bind(model)
             .bind(effective_at)
+            .bind(source)
             .execute(&mut *self.db)
             .await?;
         }
@@ -193,16 +270,18 @@ impl<'c> ModelProvisioning<'c> {
     /// Refuse to reconcile an organisation whose rows carry a future `valid_from`:
     /// startup provisioning has no scheduling semantics (same rule as the model catalog).
     pub(crate) async fn preflight_future_account_tariffs(&mut self, account: Uuid, effective_at: DateTime<Utc>) -> Result<()> {
+        let source = self.account_tariff_source()?;
         for table in ["model_tariffs", "model_cache_tariffs"] {
             let future: Option<(DateTime<Utc>, String, Option<String>)> = sqlx::query_as(&format!(
                 "SELECT t.valid_from, dm.alias, t.serving_class FROM {table} t
                  JOIN deployed_models dm ON dm.id=t.deployed_model_id
-                 WHERE t.user_id=$1 AND t.provisioning_source='org-overlays' AND t.valid_from>$2
+                 WHERE t.user_id=$1 AND t.provisioning_source=$3 AND t.valid_from>$2
                    AND (t.valid_until IS NULL OR t.valid_until>t.valid_from)
                  ORDER BY t.valid_from, t.id LIMIT 1"
             ))
             .bind(account)
             .bind(effective_at)
+            .bind(source)
             .fetch_optional(&mut *self.db)
             .await
             .with_context(|| format!("check future {table} rows of an organisation"))?;
@@ -296,13 +375,9 @@ impl<'c> ModelProvisioning<'c> {
             };
         let source = format!("model-catalog:{}", desired.source);
         let pricing = pricing_fields(provider_pricing)?;
-        // Activation is the virtual model's; a physical deployment row is a
-        // composite member and never activates classes of its own.
-        let serving_classes = if is_composite {
-            serde_json::to_value(&desired.clay.serving_classes).context("serialize serving class presets")?
-        } else {
-            serde_json::json!({})
-        };
+        // Serving class presets are retired: the column is kept empty until
+        // it is dropped.
+        let serving_classes = serde_json::json!({});
         let fallback = &desired.clay.routing.fallback;
         let backoff_enabled = is_composite && fallback.backoff.is_some();
         let backoff_initial = fallback.backoff.as_ref().map_or(100, |backoff| backoff.initial_ms);
@@ -313,7 +388,7 @@ impl<'c> ModelProvisioning<'c> {
         sqlx::query(
             r#"INSERT INTO deployed_models (
                    model_name, alias, display_name, description, type, capabilities, created_by, hosted_on,
-                   requests_per_second, burst_size, capacity, batch_capacity, throughput,
+                   batch_capacity, throughput,
                    downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token,
                    downstream_hourly_rate, downstream_input_token_cost_ratio,
                    is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status,
@@ -321,12 +396,12 @@ impl<'c> ModelProvisioning<'c> {
                    backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms,
                    sanitize_responses, trusted, allowed_batch_completion_windows, metadata,
                    reasoning_translation_overrides, provisioning_source, deleted, updated_at, serving_classes,
-                   fallback_realtime_on_status
+                   fallback_realtime_on_status, affinity
                ) VALUES (
                    $1,$2,$3,$4,$5,$6,'00000000-0000-0000-0000-000000000000',$7,
-                   $8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,
-                   $27,$28,$29,$30,$31,$32,$33,$34,$35,$36,FALSE,$37,$38,
-                   COALESCE($39::INTEGER[], '{}')
+                   $8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,
+                   $24,$25,$26,$27,$28,$29,$30,$31,$32,$33,FALSE,$34,$35,
+                   COALESCE($36::INTEGER[], '{}'), $37::JSONB
                )
                ON CONFLICT (alias) DO UPDATE SET
                    model_name = EXCLUDED.model_name,
@@ -335,9 +410,6 @@ impl<'c> ModelProvisioning<'c> {
                    type = EXCLUDED.type,
                    capabilities = EXCLUDED.capabilities,
                    hosted_on = EXCLUDED.hosted_on,
-                   requests_per_second = EXCLUDED.requests_per_second,
-                   burst_size = EXCLUDED.burst_size,
-                   capacity = EXCLUDED.capacity,
                    batch_capacity = EXCLUDED.batch_capacity,
                    throughput = EXCLUDED.throughput,
                    downstream_pricing_mode = EXCLUDED.downstream_pricing_mode,
@@ -350,12 +422,21 @@ impl<'c> ModelProvisioning<'c> {
                        AND (EXCLUDED.lb_strategy <> 'priority' OR NOT EXCLUDED.fallback_enabled)
                        AND COALESCE(deployed_models.aimd->'enabled' = 'false'::JSONB, FALSE) IS FALSE
                        THEN NULL ELSE deployed_models.aimd END,
+                   -- A declared catalog value replaces the stored one; an omitted one keeps
+                   -- it while the routing stays compatible.
+                   affinity = CASE
+                       WHEN EXCLUDED.is_composite AND $37::JSONB IS NOT NULL THEN $37::JSONB
+                       WHEN EXCLUDED.is_composite
+                           AND (EXCLUDED.lb_strategy <> 'priority' OR NOT EXCLUDED.fallback_enabled)
+                           AND COALESCE(deployed_models.affinity->'enabled' = 'false'::JSONB, FALSE) IS FALSE
+                           THEN NULL
+                       ELSE deployed_models.affinity END,
                    lb_strategy = CASE WHEN EXCLUDED.is_composite THEN EXCLUDED.lb_strategy ELSE deployed_models.lb_strategy END,
                    fallback_enabled = CASE WHEN EXCLUDED.is_composite THEN EXCLUDED.fallback_enabled ELSE deployed_models.fallback_enabled END,
                    fallback_on_rate_limit = CASE WHEN EXCLUDED.is_composite THEN EXCLUDED.fallback_on_rate_limit ELSE deployed_models.fallback_on_rate_limit END,
                    fallback_on_status = CASE WHEN EXCLUDED.is_composite THEN EXCLUDED.fallback_on_status ELSE deployed_models.fallback_on_status END,
                    -- An omitted catalog value keeps the stored one.
-                   fallback_realtime_on_status = CASE WHEN EXCLUDED.is_composite AND $39::INTEGER[] IS NOT NULL
+                   fallback_realtime_on_status = CASE WHEN EXCLUDED.is_composite AND $36::INTEGER[] IS NOT NULL
                        THEN EXCLUDED.fallback_realtime_on_status ELSE deployed_models.fallback_realtime_on_status END,
                    fallback_with_replacement = CASE WHEN EXCLUDED.is_composite THEN EXCLUDED.fallback_with_replacement ELSE deployed_models.fallback_with_replacement END,
                    fallback_max_attempts = CASE WHEN EXCLUDED.is_composite THEN EXCLUDED.fallback_max_attempts ELSE deployed_models.fallback_max_attempts END,
@@ -376,7 +457,6 @@ impl<'c> ModelProvisioning<'c> {
                    updated_at = CASE WHEN ROW(
                        deployed_models.model_name, deployed_models.display_name, deployed_models.description,
                        deployed_models.type, deployed_models.capabilities, deployed_models.hosted_on,
-                       deployed_models.requests_per_second, deployed_models.burst_size, deployed_models.capacity,
                        deployed_models.batch_capacity, deployed_models.throughput, deployed_models.downstream_pricing_mode,
                        deployed_models.downstream_input_price_per_token, deployed_models.downstream_output_price_per_token,
                        deployed_models.downstream_hourly_rate, deployed_models.downstream_input_token_cost_ratio,
@@ -389,11 +469,11 @@ impl<'c> ModelProvisioning<'c> {
                        deployed_models.allowed_batch_completion_windows, deployed_models.metadata,
                        deployed_models.reasoning_translation_overrides, deployed_models.deleted,
                        deployed_models.serving_classes,
-                       deployed_models.fallback_realtime_on_status
+                       deployed_models.fallback_realtime_on_status,
+                       deployed_models.affinity
                    ) IS DISTINCT FROM ROW(
                        EXCLUDED.model_name, EXCLUDED.display_name, EXCLUDED.description,
                        EXCLUDED.type, EXCLUDED.capabilities, EXCLUDED.hosted_on,
-                       EXCLUDED.requests_per_second, EXCLUDED.burst_size, EXCLUDED.capacity,
                        EXCLUDED.batch_capacity, EXCLUDED.throughput, EXCLUDED.downstream_pricing_mode,
                        EXCLUDED.downstream_input_price_per_token, EXCLUDED.downstream_output_price_per_token,
                        EXCLUDED.downstream_hourly_rate, EXCLUDED.downstream_input_token_cost_ratio,
@@ -412,9 +492,16 @@ impl<'c> ModelProvisioning<'c> {
                        EXCLUDED.sanitize_responses, EXCLUDED.trusted, EXCLUDED.allowed_batch_completion_windows,
                        EXCLUDED.metadata, EXCLUDED.reasoning_translation_overrides, FALSE,
                        EXCLUDED.serving_classes,
-                       CASE WHEN EXCLUDED.is_composite AND $39::INTEGER[] IS NOT NULL
-                           THEN EXCLUDED.fallback_realtime_on_status ELSE deployed_models.fallback_realtime_on_status END
-                   ) THEN $37 ELSE deployed_models.updated_at END"#,
+                       CASE WHEN EXCLUDED.is_composite AND $36::INTEGER[] IS NOT NULL
+                           THEN EXCLUDED.fallback_realtime_on_status ELSE deployed_models.fallback_realtime_on_status END,
+                       CASE
+                           WHEN EXCLUDED.is_composite AND $37::JSONB IS NOT NULL THEN $37::JSONB
+                           WHEN EXCLUDED.is_composite
+                               AND (EXCLUDED.lb_strategy <> 'priority' OR NOT EXCLUDED.fallback_enabled)
+                               AND COALESCE(deployed_models.affinity->'enabled' = 'false'::JSONB, FALSE) IS FALSE
+                               THEN NULL
+                           ELSE deployed_models.affinity END
+                   ) THEN $34 ELSE deployed_models.updated_at END"#,
         )
         .bind(model_name)
         .bind(alias)
@@ -423,9 +510,6 @@ impl<'c> ModelProvisioning<'c> {
         .bind(model_type.map(|kind| kind.as_db_str()))
         .bind(capabilities)
         .bind(hosted_on)
-        .bind(settings.requests_per_second)
-        .bind(settings.burst_size)
-        .bind(settings.capacity)
         .bind(settings.batch_capacity)
         .bind(settings.throughput)
         .bind(pricing.mode)
@@ -455,9 +539,23 @@ impl<'c> ModelProvisioning<'c> {
         .bind(effective_at)
         .bind(serving_classes)
         .bind(if is_composite { fallback.realtime_on_status.as_deref() } else { None })
+        .bind(if is_composite { fallback.affinity.as_ref().map(sqlx::types::Json) } else { None })
         .execute(&mut *self.db)
         .await
         .with_context(|| format!("upsert model alias {alias:?}"))?;
+
+        if let Some(limit) = settings.realtime_inflight_limit {
+            sqlx::query(
+                "UPDATE deployed_models SET realtime_inflight_limit = $1, updated_at = $2 \
+                 WHERE alias = $3 AND realtime_inflight_limit <> $1",
+            )
+            .bind(limit)
+            .bind(effective_at)
+            .bind(alias)
+            .execute(&mut *self.db)
+            .await
+            .with_context(|| format!("set realtime in-flight limit for model alias {alias:?}"))?;
+        }
 
         sqlx::query_scalar("SELECT id FROM deployed_models WHERE alias = $1")
             .bind(alias)

@@ -13,7 +13,7 @@ use fusillade_arsenal::PostgresRequestManager;
 use sqlx_pool_router::PoolProvider;
 use uuid::Uuid;
 
-use crate::inference::response_store::{ResponseStore, StoreError};
+use crate::inference::response_store::{ResponseContext, ResponseStore, StoreError};
 
 /// Header set by the inference middleware so the outlet handler knows which
 /// fusillade row to update with the response body.
@@ -514,6 +514,11 @@ pub fn detail_to_response_object(detail: &fusillade::RequestDetail) -> serde_jso
             if let Some(usage) = parsed.get("usage") {
                 resp["usage"] = usage.clone();
             }
+            // A Responses body cut short by the output cap or a content filter.
+            if parsed.get("status").and_then(|s| s.as_str()) == Some("incomplete") {
+                resp["status"] = serde_json::json!("incomplete");
+                resp["incomplete_details"] = parsed.get("incomplete_details").cloned().unwrap_or(serde_json::Value::Null);
+            }
             // ChatCompletion format (batch results)
             if parsed.get("choices").is_some() {
                 resp["output"] = serde_json::json!([{
@@ -523,7 +528,12 @@ pub fn detail_to_response_object(detail: &fusillade::RequestDetail) -> serde_jso
                 }]);
             }
         }
-        resp["completed_at"] = serde_json::json!(detail.completed_at.map(|t| t.timestamp()));
+        // An incomplete response has no completion time, as on the live path.
+        resp["completed_at"] = if resp["status"] == "incomplete" {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!(detail.completed_at.map(|t| t.timestamp()))
+        };
     }
 
     if status == "failed"
@@ -548,10 +558,11 @@ pub fn detail_to_response_object(detail: &fusillade::RequestDetail) -> serde_jso
 
 /// Convert a terminal `RequestDetail` into an HTTP status + chat-completions body.
 ///
-/// On success the upstream `chat.completion` body is returned verbatim — flex requests
-/// are drop-in compatible with non-flex chat completions. On failure the OpenAI error
-/// envelope is returned with the upstream HTTP status surfaced in both the response
-/// status and the `error.code` field.
+/// On success the upstream `chat.completion` body is returned with the platform's
+/// recorded serving tier restored. Flex strips the control-plane field before dispatch,
+/// so the upstream cannot report the tier that actually served the customer request.
+/// On failure the OpenAI error envelope is returned with the upstream HTTP status
+/// surfaced in both the response status and the `error.code` field.
 pub fn detail_to_chat_completion_object(detail: &fusillade::RequestDetail) -> (u16, serde_json::Value) {
     match detail.status.as_str() {
         "completed" => {
@@ -585,7 +596,14 @@ pub fn detail_to_chat_completion_object(detail: &fusillade::RequestDetail) -> (u
                     // always returns 200 in practice but the helper is
                     // pass-through by design — a 201/204/3xx from upstream
                     // should propagate, not get rewritten to 200.
-                    Some(parsed) => (response_status, parsed),
+                    Some(mut parsed) => {
+                        if let Some(service_tier) = detail.service_tier.as_deref()
+                            && let Some(object) = parsed.as_object_mut()
+                        {
+                            object.insert("service_tier".to_string(), serde_json::Value::String(service_tier.to_string()));
+                        }
+                        (response_status, parsed)
+                    }
                     None => (
                         500,
                         serde_json::json!({
@@ -654,9 +672,9 @@ pub fn detail_to_chat_completion_object(detail: &fusillade::RequestDetail) -> (u
 /// chunk carrying `finish_reason`. The terminating `data: [DONE]` sentinel
 /// is emitted by the caller, not included here.
 ///
-/// `include_usage` mirrors `stream_options.include_usage`: when set, a
-/// trailing usage-only chunk (empty `choices`, populated `usage`) is
-/// appended, matching OpenAI's behaviour.
+/// `include_usage` mirrors `stream_options.include_usage`: when set, every
+/// chunk carries `usage: null` and a trailing usage-only chunk (empty
+/// `choices`, populated `usage`) is appended, matching OpenAI's behaviour.
 ///
 /// `completion` is expected to be a successful (`object: "chat.completion"`)
 /// body. If it has no `choices` array the result is just the optional usage
@@ -668,6 +686,7 @@ pub fn chat_completion_to_stream_chunks(completion: &serde_json::Value, include_
     let created = completion.get("created").cloned().unwrap_or(serde_json::Value::Null);
     let model = completion.get("model").cloned().unwrap_or(serde_json::Value::Null);
     let system_fingerprint = completion.get("system_fingerprint").cloned();
+    let service_tier = completion.get("service_tier").cloned();
 
     let base_chunk = |delta: serde_json::Value, index: i64, finish_reason: serde_json::Value| {
         let mut choice = serde_json::json!({
@@ -686,6 +705,12 @@ pub fn chat_completion_to_stream_chunks(completion: &serde_json::Value, include_
         });
         if let Some(fp) = system_fingerprint.clone() {
             chunk["system_fingerprint"] = fp;
+        }
+        if let Some(tier) = service_tier.clone() {
+            chunk["service_tier"] = tier;
+        }
+        if include_usage {
+            chunk["usage"] = serde_json::Value::Null;
         }
         chunk
     };
@@ -749,6 +774,9 @@ pub fn chat_completion_to_stream_chunks(completion: &serde_json::Value, include_
         if let Some(fp) = system_fingerprint {
             chunk["system_fingerprint"] = fp;
         }
+        if let Some(tier) = service_tier {
+            chunk["service_tier"] = tier;
+        }
         chunks.push(chunk);
     }
 
@@ -778,7 +806,8 @@ pub fn chat_completion_to_stream_chunks(completion: &serde_json::Value, include_
 ///   │    response.output_text.delta      (the whole text in one delta)
 ///   │    response.output_text.done
 ///   │    response.output_item.done       (closes the text part)
-///   response.completed                   (terminator; carries usage)
+///   response.completed                   (terminator; carries usage;
+///                                         response.incomplete when cut short)
 ///
 /// Tool-call / reasoning items in `output` are passed through inside
 /// `response.completed` but not given their own lifecycle events here (the
@@ -855,7 +884,12 @@ pub fn response_object_to_stream_events(response: &serde_json::Value) -> Vec<(&'
     }
 
     // Terminator: carries the full assembled object (usage, status, etc.).
-    events.push(mk("response.completed", serde_json::json!({ "response": response.clone() })));
+    let terminal = if response.get("status").and_then(|s| s.as_str()) == Some("incomplete") {
+        "response.incomplete"
+    } else {
+        "response.completed"
+    };
+    events.push(mk(terminal, serde_json::json!({ "response": response.clone() })));
     events
 }
 
@@ -866,7 +900,7 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> ResponseStore for Fusillad
         Ok(id)
     }
 
-    async fn get_context(&self, response_id: &str, owner: &str) -> Result<Option<serde_json::Value>, StoreError> {
+    async fn get_context(&self, response_id: &str, owner: &str) -> Result<Option<ResponseContext>, StoreError> {
         // Ownership is checked on the resolved row (live or retained) before
         // any content is returned: a foreign or batch response reads as absent.
         let parsed_uuid = parse_response_id(response_id)?;
@@ -878,12 +912,23 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> ResponseStore for Fusillad
         if detail.created_by != owner {
             return Ok(None);
         }
-        // Context lookups are never ZDR, so `Gone` cannot arise here; fold it
-        // into `None` alongside `NotFound` for a total mapping.
-        Ok(match self.get_response(response_id).await? {
-            ResponseLookup::Found(v) => Some(v),
-            ResponseLookup::NotFound | ResponseLookup::Gone => None,
-        })
+        let Some(body) = detail.body.as_deref().filter(|body| !body.is_empty()) else {
+            return Ok(None);
+        };
+        // A flex ZDR request remains encrypted at rest after its request key is
+        // shredded. If the owner later disables ZDR, a continuation can reach
+        // this lookup, but the prior input is permanently unavailable.
+        if crate::inference::zdr::is_zdr_body(body) {
+            return Ok(None);
+        }
+        let request: serde_json::Value =
+            serde_json::from_str(body).map_err(|e| StoreError::SerializationError(format!("Failed to parse previous request: {e}")))?;
+        let input = request
+            .get("input")
+            .cloned()
+            .ok_or_else(|| StoreError::SerializationError("Previous request has no input".to_string()))?;
+        let response = detail_to_response_object(&detail);
+        Ok(Some(ResponseContext { input, response }))
     }
 }
 
@@ -960,6 +1005,33 @@ mod tests {
         let usage_chunk = chunks.last().unwrap();
         assert_eq!(usage_chunk["choices"], serde_json::json!([]));
         assert_eq!(usage_chunk["usage"]["total_tokens"], 7);
+        for chunk in &chunks[..3] {
+            assert_eq!(chunk.get("usage"), Some(&serde_json::Value::Null), "{chunk}");
+        }
+
+        let chunks = chat_completion_to_stream_chunks(&completion, false);
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks.iter().all(|chunk| chunk.get("usage").is_none()));
+    }
+
+    #[test]
+    fn test_chat_completion_to_stream_chunks_preserves_service_tier() {
+        let completion = serde_json::json!({
+            "id": "chatcmpl-flex",
+            "model": "gpt-test",
+            "service_tier": "flex",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "hi" },
+                "finish_reason": "stop",
+            }],
+            "usage": { "total_tokens": 7 },
+        });
+
+        let chunks = chat_completion_to_stream_chunks(&completion, true);
+
+        assert!(!chunks.is_empty());
+        assert!(chunks.iter().all(|chunk| chunk["service_tier"] == "flex"));
     }
 
     #[test]
@@ -1291,6 +1363,22 @@ mod tests {
     }
 
     #[test]
+    fn truncated_flex_response_stays_incomplete() {
+        let body = r#"{"object":"response","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"total_tokens":4}}"#;
+        let mut detail = make_detail("completed", Some(200), Some(body), None);
+        detail.completed_at = Some(chrono::Utc::now());
+
+        let response = detail_to_response_object(&detail);
+
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(response["incomplete_details"]["reason"], "max_output_tokens");
+        assert!(response["completed_at"].is_null());
+        let events = response_object_to_stream_events(&response);
+        assert_eq!(events.last().map(|(name, _)| *name), Some("response.incomplete"));
+        assert!(events.iter().all(|(name, _)| *name != "response.completed"));
+    }
+
+    #[test]
     fn background_request_detail_preserves_async_tier_in_response_object() {
         let mut detail = make_detail("pending", None, None, None);
         detail.body = Some(r#"{"model":"test-model","input":"hello"}"#.to_string());
@@ -1312,6 +1400,18 @@ mod tests {
         assert_eq!(value["id"], "chatcmpl-abc");
         assert_eq!(value["object"], "chat.completion");
         assert!(value.get("error").is_none());
+    }
+
+    #[test]
+    fn test_detail_to_chat_completion_completed_reports_recorded_service_tier() {
+        let body = r#"{"id":"chatcmpl-flex","object":"chat.completion","service_tier":"default","choices":[]}"#;
+        let mut detail = make_detail("completed", Some(200), Some(body), None);
+        detail.service_tier = Some("flex".to_string());
+
+        let (status, value) = detail_to_chat_completion_object(&detail);
+
+        assert_eq!(status, 200);
+        assert_eq!(value["service_tier"], "flex");
     }
 
     #[test]

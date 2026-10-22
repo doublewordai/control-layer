@@ -7,8 +7,8 @@ use crate::api::models::cache_pricing::CachePricingResponse;
 use crate::api::models::groups::GroupResponse;
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::db::models::deployments::{
-    AimdConfig, BackoffConfig, DeploymentDBResponse, FallbackConfig, JitterStrategy, LoadBalancingStrategy, ModelCatalogMetadata,
-    ModelType, ProviderPricing, ProviderPricingUpdate, TrafficRuleDBRow,
+    AffinityConfig, AimdConfig, BackoffConfig, DeploymentDBResponse, FallbackConfig, JitterStrategy, LoadBalancingStrategy,
+    ModelCatalogMetadata, ModelType, ProviderPricing, ProviderPricingUpdate, TrafficRuleDBRow,
 };
 use crate::reasoning::{ReasoningTranslationOverrides, SupportedReasoningEfforts};
 use crate::types::{DeploymentId, InferenceEndpointId, UserId};
@@ -218,13 +218,7 @@ pub struct StandardModelCreate {
     pub model_type: Option<ModelType>,
     /// Optional array of model capabilities
     pub capabilities: Option<Vec<String>>,
-    /// Global per-model rate limit: requests per second (null = no limit)
-    pub requests_per_second: Option<f32>,
-    /// Global per-model rate limit: maximum burst size (null = no limit)
-    pub burst_size: Option<i32>,
-    /// Maximum number of concurrent requests allowed for this model (null = no limit)
-    pub capacity: Option<i32>,
-    /// Maximum number of concurrent batch requests allowed for this model (null = defaults to capacity or no limit)
+    /// Maximum number of concurrent batch requests allowed for this model (null = the batch daemon default)
     pub batch_capacity: Option<i32>,
     /// Throughput in requests/second for batch capacity calculations (null = use config default)
     pub throughput: Option<f32>,
@@ -292,13 +286,8 @@ pub struct CompositeModelCreate {
     pub model_type: Option<ModelType>,
     /// Optional array of model capabilities
     pub capabilities: Option<Vec<String>>,
-    /// Global per-model rate limit: requests per second (null = no limit)
-    pub requests_per_second: Option<f32>,
-    /// Global per-model rate limit: maximum burst size (null = no limit)
-    pub burst_size: Option<i32>,
-    /// Maximum number of concurrent requests allowed for this model (null = no limit)
-    pub capacity: Option<i32>,
-    /// Maximum number of concurrent batch requests allowed for this model (null = defaults to capacity or no limit)
+    pub realtime_inflight_limit: Option<i32>,
+    /// Maximum number of concurrent batch requests allowed for this model (null = the batch daemon default)
     pub batch_capacity: Option<i32>,
     /// Throughput in requests/second for batch capacity calculations (null = use config default)
     pub throughput: Option<f32>,
@@ -357,6 +346,10 @@ pub struct CompositeModelCreate {
     /// Set enabled=false to disable. Explicit enabled overrides require a compatible deadline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aimd: Option<AimdConfig>,
+    /// Priority-only conversation affinity; absent/null keeps per-request selection.
+    /// Set `target_conversations` to what the preferred provider can serve concurrently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affinity: Option<AffinityConfig>,
     /// Whether to sanitize/filter sensitive data from model responses (defaults to false, used when strict_mode=false)
     #[serde(default)]
     pub sanitize_responses: bool,
@@ -409,15 +402,8 @@ pub struct DeployedModelUpdate {
     pub description: Option<Option<String>>,
     pub model_type: Option<Option<ModelType>>,
     pub capabilities: Option<Option<Vec<String>>>,
-    /// Global per-model rate limit: requests per second (null = no change, Some(None) = remove limit)
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
-    pub requests_per_second: Option<Option<f32>>,
-    /// Global per-model rate limit: maximum burst size (null = no change, Some(None) = remove limit)
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
-    pub burst_size: Option<Option<i32>>,
-    /// Maximum concurrent requests (null = no change, Some(None) = remove limit, Some(Some(n)) = set limit)
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
-    pub capacity: Option<Option<i32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realtime_inflight_limit: Option<i32>,
     /// Maximum concurrent batch requests (null = no change, Some(None) = remove limit, Some(Some(n)) = set limit)
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub batch_capacity: Option<Option<i32>>,
@@ -478,6 +464,10 @@ pub struct DeployedModelUpdate {
     /// Use {"enabled":false} to disable.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub aimd: Option<Option<AimdConfig>>,
+    /// Omitted = unchanged; null = per-request selection; object = replace the
+    /// affinity configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub affinity: Option<Option<AffinityConfig>>,
     /// Whether to sanitize/filter sensitive data from model responses (null = no change, used when strict_mode=false)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sanitize_responses: Option<bool>,
@@ -540,16 +530,9 @@ pub struct DeployedModelResponse {
     pub hosted_on: Option<InferenceEndpointId>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    /// Global per-model rate limit: requests per second (null = no limit)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub requests_per_second: Option<f32>,
-    /// Global per-model rate limit: maximum burst size (null = no limit)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub burst_size: Option<i32>,
-    /// Maximum number of concurrent requests allowed for this model (null = no limit)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub capacity: Option<i32>,
-    /// Maximum number of concurrent batch requests allowed for this model (null = defaults to capacity or no limit)
+    pub realtime_inflight_limit: Option<i32>,
+    /// Maximum number of concurrent batch requests allowed for this model (null = the batch daemon default)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_capacity: Option<i32>,
     /// Throughput in requests/second for batch capacity calculations (null = use config default)
@@ -620,13 +603,6 @@ pub struct DeployedModelResponse {
     /// Declarative source reapplied during startup. Absent for manually managed models.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provisioning_source: Option<String>,
-    /// Serving classes this model offers, keyed by class name (`interactive`,
-    /// `throughput`, optionally `standard`), each a preset of targets
-    /// `{ttft_ms, itl_ms, priority}`. Empty object = standard only. Declared
-    /// in the model catalog. An internal, platform-manager detail: only
-    /// included for callers with `Models::ReadAll`, never shown to customers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub serving_classes: Option<serde_json::Value>,
 }
 
 impl From<DeploymentDBResponse> for DeployedModelResponse {
@@ -654,6 +630,7 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             max_total_backoff_ms: db.backoff_max_total_ms,
             first_token_timeout_ms: db.first_token_timeout_ms,
             aimd: db.aimd,
+            affinity: db.affinity,
         });
 
         Self {
@@ -668,9 +645,7 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             hosted_on: db.hosted_on,
             created_at: db.created_at,
             updated_at: db.updated_at,
-            requests_per_second: db.requests_per_second,
-            burst_size: db.burst_size,
-            capacity: db.capacity,
+            realtime_inflight_limit: db.is_composite.then_some(db.realtime_inflight_limit),
             batch_capacity: db.batch_capacity,
             throughput: db.throughput,
             groups: None,           // By default, relationships are not included
@@ -702,7 +677,6 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
                 .filter(|m| *m != ModelCatalogMetadata::default()),
             provisioning_source: db.provisioning_source,
             // Attached by the handler for platform managers only.
-            serving_classes: None,
         }
     }
 }
@@ -732,12 +706,6 @@ impl DeployedModelResponse {
         self
     }
 
-    /// Include the model's serving-class presets (platform managers only).
-    pub fn with_serving_classes(mut self, serving_classes: Option<serde_json::Value>) -> Self {
-        self.serving_classes = serving_classes;
-        self
-    }
-
     /// Create a response with cache pricing included.
     pub fn with_cache_pricing(mut self, cache_pricing: CachePricingResponse) -> Self {
         self.cache_pricing = Some(cache_pricing);
@@ -752,14 +720,12 @@ impl DeployedModelResponse {
 
     /// Mask rate limiting information (sets to None for users without permission)
     pub fn mask_rate_limiting(mut self) -> Self {
-        self.requests_per_second = None;
-        self.burst_size = None;
+        self.realtime_inflight_limit = None;
         self
     }
 
     /// Mask capacity information (sets to None for users without permission)
     pub fn mask_capacity(mut self) -> Self {
-        self.capacity = None;
         self.batch_capacity = None;
         self.throughput = None;
         self

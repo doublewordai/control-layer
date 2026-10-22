@@ -19,6 +19,7 @@ use sqlx::PgPool;
 
 use crate::db::handlers::ModelProvisioning;
 use crate::db::models::deployments::MODEL_TOKEN_LIMIT_MAX;
+use crate::db::models::deployments::AffinityConfig;
 
 const PER_MILLION: i64 = 1_000_000;
 
@@ -76,36 +77,35 @@ pub struct ClayModel {
     pub access_groups: Vec<String>,
     #[serde(default)]
     pub traffic_rules: Vec<TrafficRule>,
-    /// The serving classes this model offers, each a preset of targets the
-    /// serving stack's router maps onto a pool. Declaring `interactive` or
-    /// `throughput` is what makes an organisation that holds that class get
-    /// it on this model; declare them once the serving side has pools for the
-    /// model. A `standard` preset is optional and pins what unclassed traffic
-    /// asks for; without one, standard sends no targets. Empty = standard only.
+    /// Retired. Accepted only when empty, so existing catalog files still
+    /// load; remove it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[schemars(extend("maxProperties" = 0))]
+    pub serving_classes: BTreeMap<String, serde_json::Value>,
+    /// Explicit class destinations and prices, staged independently of legacy routing.
+    /// Declaring these does not activate routes or advertise additional model names.
     #[serde(default)]
-    pub serving_classes: BTreeMap<PresetClass, ServingPreset>,
+    #[schemars(extend("propertyNames" = {"pattern": "^[a-z][a-z0-9_-]*$"}))]
+    pub class_routes: BTreeMap<String, ClassRoute>,
 }
 
-/// The two elevated serving classes a model can activate and an org can be
-/// granted. `standard` is the absence of a choice and is never granted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ServingClassName {
-    Interactive,
-    Throughput,
+/// Complete catalog declaration for a stable class of the existing public model.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClassRoute {
+    pub display_name: String,
+    pub endpoint: String,
+    pub upstream_model_name: String,
+    /// Optional exact ingress spellings, never additional discovery entries.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    pub tariffs: Vec<Tariff>,
+    /// Omit to inherit the model's all-class multipliers; does not enable caching.
+    #[serde(default)]
+    pub cache_tariff: Option<CachePrices>,
 }
 
-/// The classes a model can declare a preset for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum PresetClass {
-    Interactive,
-    Throughput,
-    Standard,
-}
-
-/// The objective targets a class maps to on a model, or an organisation's
-/// explicit targets on one model. Milliseconds; `priority` is the serving
+/// An organisation's explicit targets on one model. Milliseconds; `priority` is the serving
 /// stack's scheduling priority (higher wins, 0 = today's realtime value).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -126,15 +126,6 @@ impl ServingPreset {
         ensure!(self.ttft_ms > 0, "{context}: ttft_ms must be positive");
         ensure!(self.itl_ms > 0, "{context}: itl_ms must be positive");
         Ok(())
-    }
-}
-
-impl ServingClassName {
-    pub(crate) fn as_db_str(self) -> &'static str {
-        match self {
-            Self::Interactive => "interactive",
-            Self::Throughput => "throughput",
-        }
     }
 }
 
@@ -160,9 +151,26 @@ impl ModelKind {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelSettings {
-    pub requests_per_second: Option<f32>,
-    pub burst_size: Option<i32>,
-    pub capacity: Option<i32>,
+    #[serde(rename = "requests_per_second")]
+    #[schemars(extend("deprecated" = true))]
+    pub ignored_requests_per_second: Option<f32>,
+    #[serde(rename = "burst_size")]
+    #[schemars(extend("deprecated" = true))]
+    pub ignored_burst_size: Option<i32>,
+    #[serde(rename = "capacity")]
+    #[schemars(extend("deprecated" = true))]
+    pub ignored_capacity: Option<i32>,
+    pub realtime_inflight_limit: Option<i32>,
+    /// Dual-purpose batch concurrency. It seeds fusillade's **starting**
+    /// per-daemon concurrency for the model (adaptive concurrency may grow past
+    /// it), and, once `limits.batch_inflight.enforce` is on, it is also the
+    /// **global** onwards cap on batch requests in flight on the alias. A
+    /// positive value is used directly; when omitted, the onwards cap falls back
+    /// to `limits.batch_inflight.default_capacity` (default 200) while
+    /// fusillade's starting concurrency falls back to
+    /// `background_services.batch_daemon.default_model_concurrency`. Raise it to
+    /// the intended global ceiling before enabling enforcement. The cap is
+    /// shared by file batches, flex and background requests.
     pub batch_capacity: Option<i32>,
     pub throughput: Option<f32>,
     pub sanitize_responses: bool,
@@ -185,9 +193,10 @@ pub struct ModelSettings {
 impl Default for ModelSettings {
     fn default() -> Self {
         Self {
-            requests_per_second: None,
-            burst_size: None,
-            capacity: None,
+            ignored_requests_per_second: None,
+            ignored_burst_size: None,
+            ignored_capacity: None,
+            realtime_inflight_limit: None,
             batch_capacity: None,
             throughput: None,
             sanitize_responses: false,
@@ -281,6 +290,11 @@ pub struct Fallback {
     /// value already stored for the model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub realtime_on_status: Option<Vec<i32>>,
+    /// Conversation affinity (priority strategy only). Omit to keep the value
+    /// already stored for the model. `target_conversations` must match what
+    /// the preferred member can serve concurrently.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub affinity: Option<AffinityConfig>,
     pub with_replacement: bool,
     pub max_attempts: Option<i32>,
     pub backoff: Option<Backoff>,
@@ -294,6 +308,7 @@ impl Default for Fallback {
             on_rate_limit: true,
             on_status: default_fallback_statuses(),
             realtime_on_status: None,
+            affinity: None,
             with_replacement: false,
             max_attempts: None,
             backoff: None,
@@ -414,6 +429,28 @@ pub struct CacheTariff {
     pub min_prefix_tokens: i32,
 }
 
+/// Scoped cache tariffs change multipliers only. The model owns enablement and
+/// the minimum prefix length used by the classifier.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CachePrices {
+    pub write_multiplier_5m: String,
+    pub write_multiplier_1h: String,
+    pub write_multiplier_24h: String,
+    pub read_multiplier: String,
+}
+impl CachePrices {
+    pub(crate) fn as_tariff(&self) -> CacheTariff {
+        CacheTariff {
+            write_multiplier_5m: self.write_multiplier_5m.clone(),
+            write_multiplier_1h: self.write_multiplier_1h.clone(),
+            write_multiplier_24h: self.write_multiplier_24h.clone(),
+            read_multiplier: self.read_multiplier.clone(),
+            min_prefix_tokens: 1,
+        }
+    }
+}
+
 fn default_read_multiplier() -> String {
     "0.1".to_string()
 }
@@ -490,12 +527,81 @@ impl Catalog {
                 ensure_nonempty(&deployment.model_name, &model.source, "deployment.model_name")?;
                 ensure_nonempty(&deployment.endpoint, &model.source, "deployment.endpoint")?;
                 validate_settings(&deployment.settings, &model.source, "deployment.settings")?;
+                ensure!(
+                    deployment.settings.realtime_inflight_limit.is_none(),
+                    "{}: deployment.settings.realtime_inflight_limit is set on {:?}; the limit belongs to the virtual model in clay.settings",
+                    model.source,
+                    deployment.alias
+                );
                 validate_provider_pricing(deployment.provider_pricing.as_ref(), &model.source, &deployment.alias)?;
                 deployments.insert(deployment.alias.clone());
             }
         }
 
         for model in &self.models {
+            if !model.clay.class_routes.is_empty() {
+                ensure!(
+                    model.clay.class_routes.contains_key("standard") && model.clay.class_routes.contains_key("fast"),
+                    "{}: class_routes requires standard and fast",
+                    model.source
+                );
+                for (key, class) in &model.clay.class_routes {
+                    ensure!(
+                        key.bytes().next().is_some_and(|c| c.is_ascii_lowercase())
+                            && key
+                                .bytes()
+                                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-'),
+                        "{}: invalid class key {key:?}",
+                        model.source
+                    );
+                    ensure_nonempty(&class.display_name, &model.source, "class display_name")?;
+                    ensure_nonempty(&class.endpoint, &model.source, "class endpoint")?;
+                    ensure!(
+                        !class.upstream_model_name.is_empty() && !class.upstream_model_name.chars().any(char::is_whitespace),
+                        "{}: class upstream_model_name must be nonempty without whitespace",
+                        model.source
+                    );
+                    validate_tariffs(&class.tariffs, &model.source)?;
+                    ensure!(
+                        key == "standard" || class.tariffs.iter().all(|t| t.purpose != TariffPurpose::Batch),
+                        "{}: class {key:?}: batch prices can only specialize standard",
+                        model.source
+                    );
+                    ensure!(
+                        class.tariffs.iter().any(|t| t.purpose == TariffPurpose::Realtime),
+                        "{}: class {key:?} requires a realtime tariff",
+                        model.source
+                    );
+                    if let Some(cache) = &class.cache_tariff {
+                        ensure!(
+                            model.clay.cache_tariff.is_some(),
+                            "{}: class cache multipliers require a model cache_tariff",
+                            model.source
+                        );
+                        validate_cache_tariff(&cache.as_tariff(), &model.source)?;
+                    }
+                    if key != "standard" {
+                        validate_alias(
+                            &mut aliases,
+                            &format!("{}:{key}", model.clay.alias),
+                            &model.source,
+                            "primary class name",
+                        )?;
+                    }
+                }
+            }
+        }
+        for model in &self.models {
+            for class in model.clay.class_routes.values() {
+                for alias in &class.aliases {
+                    ensure!(
+                        !alias.is_empty() && !alias.chars().any(char::is_whitespace),
+                        "{}: class alias must be nonempty without whitespace",
+                        model.source
+                    );
+                    validate_alias(&mut aliases, alias, &model.source, "class synonym")?;
+                }
+            }
             let mut component_keys = HashSet::new();
             for (pool, components) in &model.clay.routing.pools {
                 ensure!(
@@ -535,6 +641,16 @@ impl Catalog {
                 model.source
             );
             validate_fallback(&model.clay.routing.fallback, &model.source)?;
+            if let Some(affinity) = model.clay.routing.fallback.affinity.as_ref().filter(|a| a.enabled) {
+                ensure!(
+                    matches!(model.clay.routing.strategy, RoutingStrategy::Priority) && model.clay.routing.fallback.enabled,
+                    "{}: routing.fallback.affinity requires the priority strategy with fallback enabled",
+                    model.source
+                );
+                onwards::affinity::AffinityConfig::from(affinity.clone())
+                    .validate()
+                    .map_err(|e| anyhow::anyhow!("{}: routing.fallback.affinity: {e}", model.source))?;
+            }
 
             validate_tariffs(&model.clay.tariffs, &model.source)?;
             if let Some(cache) = &model.clay.cache_tariff {
@@ -543,9 +659,11 @@ impl Catalog {
 
             ensure_unique_strings(&model.clay.access_groups, &model.source, "access group")?;
 
-            for (class, preset) in &model.clay.serving_classes {
-                preset.validate(&format!("{}: serving class {class:?} preset", model.source))?;
-            }
+            ensure!(
+                model.clay.serving_classes.is_empty(),
+                "{}: serving_classes presets are retired; remove the field",
+                model.source
+            );
 
             let mut purposes = HashSet::new();
             for rule in &model.clay.traffic_rules {
@@ -667,14 +785,8 @@ fn validate_alias<'a>(
 }
 
 fn validate_settings(settings: &ModelSettings, source: &str, field: &str) -> Result<()> {
-    if let Some(value) = settings.requests_per_second {
-        ensure!(value > 0.0, "{source}: {field}.requests_per_second must be positive");
-    }
-    if let Some(value) = settings.burst_size {
-        ensure!(value > 0, "{source}: {field}.burst_size must be positive");
-    }
-    if let Some(value) = settings.capacity {
-        ensure!(value > 0, "{source}: {field}.capacity must be positive");
+    if let Some(value) = settings.realtime_inflight_limit {
+        ensure!(value > 0, "{source}: {field}.realtime_inflight_limit must be positive");
     }
     if let Some(value) = settings.batch_capacity {
         ensure!(value > 0, "{source}: {field}.batch_capacity must be positive");
@@ -913,101 +1025,24 @@ clay:
       purpose: realtime
       input_per_million_tokens: "0.50"
       output_per_million_tokens: "1.50"
-  serving_classes:
-{serving_classes}
+  serving_classes: {serving_classes}
 "#
         )
     }
 
-    const BOTH_PRESETS: &str = "    interactive: {ttft_ms: 500, itl_ms: 20, priority: 200}\n    throughput: {ttft_ms: 5000, itl_ms: 100}";
-
     #[test]
-    fn serving_classes_are_validated() {
+    fn retired_serving_class_presets_load_only_when_empty() {
         let directory = tempdir().unwrap();
+        write(directory.path(), "model.yaml", &classes_catalog_yaml("{}"));
+        assert!(Catalog::load(directory.path()).is_ok(), "an empty map still loads");
+
         write(
             directory.path(),
             "model.yaml",
-            &classes_catalog_yaml("    interactive: {ttft_ms: 0, itl_ms: 20}"),
+            &classes_catalog_yaml("{interactive: {ttft_ms: 500, itl_ms: 20}}"),
         );
         let err = Catalog::load(directory.path()).unwrap_err().to_string();
-        assert!(err.contains("ttft_ms must be positive"), "{err}");
-
-        write(
-            directory.path(),
-            "model.yaml",
-            &classes_catalog_yaml("    fast: {ttft_ms: 1, itl_ms: 1}"),
-        );
-        assert!(
-            Catalog::load(directory.path()).is_err(),
-            "unknown class names are rejected by the schema"
-        );
-        write(
-            directory.path(),
-            "model.yaml",
-            &classes_catalog_yaml("    interactive: {ttft_ms: 1, itl_ms: 1, pool: x}"),
-        );
-        assert!(Catalog::load(directory.path()).is_err(), "unknown preset fields are rejected");
-
-        write(directory.path(), "model.yaml", &classes_catalog_yaml(BOTH_PRESETS));
-        let catalog = Catalog::load(directory.path()).unwrap();
-        let presets = &catalog.models[0].clay.serving_classes;
-        assert_eq!(
-            presets[&PresetClass::Interactive],
-            ServingPreset {
-                ttft_ms: 500,
-                itl_ms: 20,
-                priority: 200
-            }
-        );
-        assert_eq!(presets[&PresetClass::Throughput].priority, 0, "priority defaults to 0");
-    }
-
-    #[sqlx::test]
-    async fn apply_materialises_offered_classes(pool: PgPool) {
-        sqlx::query(
-            "INSERT INTO inference_endpoints (name, url, created_by) VALUES ('onwards', 'http://onwards.test', '00000000-0000-0000-0000-000000000000')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        let directory = tempdir().unwrap();
-        write(directory.path(), "model.yaml", &classes_catalog_yaml(BOTH_PRESETS));
-        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
-
-        let presets: serde_json::Value = sqlx::query_scalar("SELECT serving_classes FROM deployed_models WHERE alias = 'org/model'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(
-            presets,
-            serde_json::json!({
-                "interactive": {"ttft_ms": 500, "itl_ms": 20, "priority": 200},
-                "throughput": {"ttft_ms": 5000, "itl_ms": 100, "priority": 0}
-            })
-        );
-        let physical_presets: serde_json::Value =
-            sqlx::query_scalar("SELECT serving_classes FROM deployed_models WHERE alias = 'provider-org-model'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(
-            physical_presets,
-            serde_json::json!({}),
-            "a physical member never offers classes of its own"
-        );
-
-        // The file is the source: dropping a class removes it on the next apply.
-        write(
-            directory.path(),
-            "model.yaml",
-            &classes_catalog_yaml("    interactive: {ttft_ms: 500, itl_ms: 20, priority: 200}"),
-        );
-        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
-        let presets: serde_json::Value = sqlx::query_scalar("SELECT serving_classes FROM deployed_models WHERE alias = 'org/model'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(presets.as_object().unwrap().keys().collect::<Vec<_>>(), vec!["interactive"]);
+        assert!(err.contains("serving_classes presets are retired"), "{err}");
     }
 
     #[test]
@@ -1018,7 +1053,7 @@ clay:
         assert!(Catalog::load(directory.path()).unwrap().models.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn empty_catalog_does_not_clear_provisioning_sources(pool: PgPool) {
         let model_id: Uuid = sqlx::query_scalar(
             "INSERT INTO deployed_models (model_name, alias, created_by, is_composite, provisioning_source) VALUES ('existing', 'existing', '00000000-0000-0000-0000-000000000000', TRUE, 'existing.yaml') RETURNING id",
@@ -1082,7 +1117,7 @@ clay:
         )
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn catalog_reconciles_incompatible_aimd_overrides(pool: PgPool) {
         sqlx::query("INSERT INTO inference_endpoints (name, url, created_by) VALUES ('onwards', 'http://onwards.test', '00000000-0000-0000-0000-000000000000')")
             .execute(&pool).await.unwrap();
@@ -1121,7 +1156,54 @@ clay:
         assert_eq!(disabled, Some(serde_json::json!({"enabled":false})));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
+    async fn catalog_sets_the_realtime_inflight_limit_and_ignores_retired_limits(pool: PgPool) {
+        sqlx::query("INSERT INTO inference_endpoints (name, url, created_by) VALUES ('onwards', 'http://onwards.test', '00000000-0000-0000-0000-000000000000')")
+            .execute(&pool).await.unwrap();
+        let limits = || async {
+            sqlx::query_as::<_, (i32, Option<i32>, Option<f32>)>(
+                "SELECT realtime_inflight_limit, capacity, requests_per_second FROM deployed_models WHERE alias = 'org/model'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        let directory = tempdir().unwrap();
+        let omitted = catalog_yaml("0.50", false, "0.1");
+        let retired = omitted.replace(
+            "  settings:\n    sanitize_responses: true\n  deployments:",
+            "  settings:\n    sanitize_responses: true\n    capacity: 12\n    requests_per_second: 5\n    burst_size: 10\n  deployments:",
+        );
+        write(directory.path(), "model.yaml", &retired);
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        assert_eq!(limits().await, (14, None, None));
+
+        let declared = omitted.replace(
+            "  settings:\n    sanitize_responses: true\n  deployments:",
+            "  settings:\n    sanitize_responses: true\n    realtime_inflight_limit: 250\n  deployments:",
+        );
+        write(directory.path(), "model.yaml", &declared);
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        assert_eq!(limits().await, (250, None, None));
+
+        write(directory.path(), "model.yaml", &omitted);
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        assert_eq!(limits().await.0, 250);
+    }
+
+    #[test]
+    fn the_realtime_inflight_limit_belongs_to_the_virtual_model() {
+        let directory = tempdir().unwrap();
+        let on_component = catalog_yaml("0.50", false, "0.1").replace(
+            "      settings:\n        sanitize_responses: true",
+            "      settings:\n        sanitize_responses: true\n        realtime_inflight_limit: 5",
+        );
+        write(directory.path(), "model.yaml", &on_component);
+        let error = Catalog::load(directory.path()).unwrap_err().to_string();
+        assert!(error.contains("realtime_inflight_limit"), "{error}");
+    }
+
+    #[dwctl_test_macros::test]
     async fn catalog_keeps_realtime_fallback_statuses_unless_declared(pool: PgPool) {
         sqlx::query("INSERT INTO inference_endpoints (name, url, created_by) VALUES ('onwards', 'http://onwards.test', '00000000-0000-0000-0000-000000000000')")
             .execute(&pool).await.unwrap();
@@ -1150,7 +1232,47 @@ clay:
         assert_eq!(realtime_statuses().await, Vec::<i32>::new());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
+    async fn catalog_declares_affinity_and_keeps_it_unless_redeclared(pool: PgPool) {
+        sqlx::query("INSERT INTO inference_endpoints (name, url, created_by) VALUES ('onwards', 'http://onwards.test', '00000000-0000-0000-0000-000000000000')")
+            .execute(&pool).await.unwrap();
+        let stored = || async {
+            sqlx::query_scalar::<_, Option<serde_json::Value>>("SELECT affinity FROM deployed_models WHERE alias = 'org/model'")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+        let directory = tempdir().unwrap();
+        let weighted = catalog_yaml("0.50", false, "0.1");
+        let priority = weighted.replace("  routing:\n", "  routing:\n    strategy: priority\n");
+        let declared = weighted.replace(
+            "  routing:\n",
+            "  routing:\n    strategy: priority\n    fallback:\n      affinity:\n        target_conversations: 40\n",
+        );
+        write(directory.path(), "model.yaml", &declared);
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        assert_eq!(stored().await.unwrap()["target_conversations"], 40);
+
+        // Omitted: the stored value stays while the routing remains compatible.
+        write(directory.path(), "model.yaml", &priority);
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        assert_eq!(stored().await.unwrap()["target_conversations"], 40);
+
+        // Leaving the priority strategy clears it.
+        write(directory.path(), "model.yaml", &weighted);
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        assert!(stored().await.is_none());
+
+        // Declaring it on a weighted model is rejected.
+        let invalid = weighted.replace(
+            "  routing:\n",
+            "  routing:\n    fallback:\n      affinity:\n        target_conversations: 40\n",
+        );
+        write(directory.path(), "model.yaml", &invalid);
+        assert!(Catalog::load(directory.path()).is_err());
+    }
+
+    #[dwctl_test_macros::test]
     async fn catalog_sets_component_enabled_only_on_create(pool: PgPool) {
         sqlx::query("INSERT INTO inference_endpoints (name, url, created_by) VALUES ('onwards', 'http://onwards.test', '00000000-0000-0000-0000-000000000000')")
             .execute(&pool).await.unwrap();
@@ -1183,7 +1305,7 @@ clay:
         assert_eq!(component().await, (true, 5));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn startup_apply_is_idempotent_and_versions_tariffs(pool: PgPool) {
         sqlx::query(
             "INSERT INTO inference_endpoints (name, url, created_by) VALUES ('onwards', 'http://onwards.test', '00000000-0000-0000-0000-000000000000')",
@@ -1322,7 +1444,7 @@ clay:
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn waiting_replica_uses_time_after_catalog_lock(pool: PgPool) {
         sqlx::query("INSERT INTO inference_endpoints (name,url,created_by) VALUES ('onwards','http://onwards.test','00000000-0000-0000-0000-000000000000')").execute(&pool).await.unwrap();
         let directory = tempdir().unwrap();
@@ -1357,3 +1479,6 @@ clay:
         }
     }
 }
+
+#[cfg(test)]
+mod class_routes_tests;

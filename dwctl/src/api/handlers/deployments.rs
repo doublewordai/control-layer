@@ -4,7 +4,8 @@ use sqlx_pool_router::PoolProvider;
 
 use crate::api::models::deployments::{ModelFacets, ModelListResponse, TariffDefinition, TrafficRoutingAction, TrafficRoutingRule};
 use crate::db::models::deployments::{
-    AimdConfig, LoadBalancingStrategy, MODEL_CATALOG_METADATA_MAX_BYTES, MODEL_CATALOG_METADATA_MAX_EXTRA_KEYS, MODEL_TOKEN_LIMIT_MAX,
+    AffinityConfig, AimdConfig, LoadBalancingStrategy, MODEL_CATALOG_METADATA_MAX_BYTES, MODEL_CATALOG_METADATA_MAX_EXTRA_KEYS,
+    MODEL_TOKEN_LIMIT_MAX,
     ModelCatalogMetadata, TrafficRuleAction,
 };
 use crate::db::models::tariffs::TariffCreateDBRequest;
@@ -33,6 +34,7 @@ use axum::{
     extract::{Path, Query, State},
     response::Json,
 };
+use onwards::affinity::AffinityConfig as OnwardsAffinityConfig;
 use onwards::aimd::AimdConfig as OnwardsAimdConfig;
 use sqlx::Acquire;
 
@@ -90,6 +92,23 @@ fn validate_aimd(timeout: Option<i64>, config: Option<&AimdConfig>, composite: b
                 message: "AIMD requires an explicit first_token_timeout_ms of 0 or at least latency_budget_ms".into(),
             });
         }
+    }
+    Ok(())
+}
+
+fn validate_affinity(config: Option<&AffinityConfig>, composite: bool, priority: bool, fallback: bool) -> Result<()> {
+    let Some(config) = config else {
+        return Ok(());
+    };
+    let config: OnwardsAffinityConfig = config.clone().into();
+    if !config.enabled {
+        return Ok(());
+    }
+    config.validate().map_err(|message| Error::BadRequest { message: message.into() })?;
+    if !composite || !priority || !fallback {
+        return Err(Error::BadRequest {
+            message: "conversation affinity requires a priority composite model with fallback enabled".into(),
+        });
     }
     Ok(())
 }
@@ -495,11 +514,7 @@ pub async fn list_deployed_models<P: PoolProvider>(
         .into_iter()
         .map(|model| {
             let provider_pricing = if can_read_pricing { model.provider_pricing.clone() } else { None };
-            // Serving presets are an operator detail, never a customer one.
-            let serving_classes = can_read_all_models.then(|| model.serving_classes.clone());
-            DeployedModelResponse::from(model)
-                .with_provider_pricing(provider_pricing)
-                .with_serving_classes(serving_classes)
+            DeployedModelResponse::from(model).with_provider_pricing(provider_pricing)
         })
         .collect();
 
@@ -586,6 +601,27 @@ pub async fn list_deployed_models<P: PoolProvider>(
     }))
 }
 
+fn validate_realtime_inflight_limit(limit: Option<i32>) -> Result<()> {
+    if limit.is_some_and(|limit| limit < 1) {
+        return Err(Error::BadRequest {
+            message: "realtime_inflight_limit must be at least 1".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// A non-positive `batch_capacity` is stored as either a cap of zero (which
+/// refuses every batch request) or a value onwards would read as uncapped, so
+/// reject it before it reaches the database.
+fn validate_batch_capacity(capacity: Option<i32>) -> Result<()> {
+    if capacity.is_some_and(|capacity| capacity < 1) {
+        return Err(Error::BadRequest {
+            message: "batch_capacity must be at least 1".to_string(),
+        });
+    }
+    Ok(())
+}
+
 #[utoipa::path(
     post,
     path = "/models",
@@ -638,6 +674,13 @@ pub async fn create_deployed_model<P: PoolProvider>(
     }
 
     validate_tariff_prices(tariffs.as_deref())?;
+
+    // Validate batch capacity if provided (both standard and composite models).
+    let batch_capacity = match &create {
+        DeployedModelCreate::Standard(s) => s.batch_capacity,
+        DeployedModelCreate::Composite(c) => c.batch_capacity,
+    };
+    validate_batch_capacity(batch_capacity)?;
 
     // Validate throughput is positive if provided
     if let Some(t) = throughput
@@ -694,16 +737,25 @@ pub async fn create_deployed_model<P: PoolProvider>(
     validate_backoff(Some(b_initial), Some(b_max), Some(b_factor), b_total)?;
     if let DeployedModelCreate::Composite(c) = &create {
         validate_realtime_fallback_statuses(Some(&c.fallback_realtime_on_status))?;
+        validate_realtime_inflight_limit(c.realtime_inflight_limit)?;
     }
     match &create {
         DeployedModelCreate::Standard(s) => validate_aimd(s.first_token_timeout_ms, s.aimd.as_ref(), false, false, s.backoff_enabled)?,
-        DeployedModelCreate::Composite(c) => validate_aimd(
-            c.first_token_timeout_ms,
-            c.aimd.as_ref(),
-            true,
-            c.lb_strategy == LoadBalancingStrategy::Priority,
-            c.fallback_enabled,
-        )?,
+        DeployedModelCreate::Composite(c) => {
+            validate_aimd(
+                c.first_token_timeout_ms,
+                c.aimd.as_ref(),
+                true,
+                c.lb_strategy == LoadBalancingStrategy::Priority,
+                c.fallback_enabled,
+            )?;
+            validate_affinity(
+                c.affinity.as_ref(),
+                true,
+                c.lb_strategy == LoadBalancingStrategy::Priority,
+                c.fallback_enabled,
+            )?;
+        }
     }
 
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
@@ -835,6 +887,9 @@ pub async fn update_deployed_model<P: PoolProvider>(
 
     validate_tariff_prices(update.tariffs.as_deref())?;
 
+    // `Some(None)` clears the cap; only a concrete non-positive value is invalid.
+    validate_batch_capacity(update.batch_capacity.flatten())?;
+
     if let Some(Some(t)) = update.throughput
         && t <= 0.0
     {
@@ -872,7 +927,19 @@ pub async fn update_deployed_model<P: PoolProvider>(
     // We also keep the current row so we can (a) validate the *merged* backoff
     // state — not just the fields in this PATCH — and (b) derive the
     // standard-model fallback invariant below.
-    let (model_alias, is_composite, prev_lb_strategy, cur_initial, cur_max, cur_factor, cur_total, cur_timeout, cur_aimd, cur_fallback) = {
+    let (
+        model_alias,
+        is_composite,
+        prev_lb_strategy,
+        cur_initial,
+        cur_max,
+        cur_factor,
+        cur_total,
+        cur_timeout,
+        cur_aimd,
+        cur_affinity,
+        cur_fallback,
+    ) = {
         let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
         match repo.get_by_id(deployment_id).await {
             Ok(Some(model)) => {
@@ -892,6 +959,7 @@ pub async fn update_deployed_model<P: PoolProvider>(
                     model.backoff_max_total_ms,
                     model.first_token_timeout_ms,
                     model.aimd,
+                    model.affinity,
                     model.fallback_enabled,
                 )
             }
@@ -913,12 +981,25 @@ pub async fn update_deployed_model<P: PoolProvider>(
         update.lb_strategy.as_ref().unwrap_or(&prev_lb_strategy) == &LoadBalancingStrategy::Priority,
         update.fallback_enabled.unwrap_or(cur_fallback),
     )?;
+    validate_affinity(
+        update.affinity.as_ref().map(|v| v.as_ref()).unwrap_or(cur_affinity.as_ref()),
+        is_composite,
+        update.lb_strategy.as_ref().unwrap_or(&prev_lb_strategy) == &LoadBalancingStrategy::Priority,
+        update.fallback_enabled.unwrap_or(cur_fallback),
+    )?;
 
     if is_composite && update.reasoning_translation_overrides.is_some() {
         return Err(Error::BadRequest {
             message: "reasoning_translation_overrides is only supported for standard models".to_string(),
         });
     }
+
+    if !is_composite && update.realtime_inflight_limit.is_some() {
+        return Err(Error::BadRequest {
+            message: "realtime_inflight_limit is only supported for composite models".to_string(),
+        });
+    }
+    validate_realtime_inflight_limit(update.realtime_inflight_limit)?;
 
     // Validate the backoff state the update would *result in*, merging
     // incoming fields over the stored values. Without merging, a one-sided
@@ -1010,7 +1091,7 @@ pub async fn update_deployed_model<P: PoolProvider>(
             }
         }
         let scheduled: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM model_tariffs WHERE deployed_model_id=$1 AND user_id IS NULL
+            "SELECT EXISTS (SELECT 1 FROM model_tariffs WHERE deployed_model_id=$1 AND user_id IS NULL AND serving_class IS NULL
              AND valid_from>NOW() AND (valid_until IS NULL OR valid_until>valid_from))",
         )
         .bind(deployment_id)
@@ -1246,10 +1327,7 @@ pub async fn get_deployed_model<P: PoolProvider>(
     } else {
         None
     };
-    let serving_classes = can_read_all_models.then(|| model.serving_classes.clone());
-    let mut response = DeployedModelResponse::from(model)
-        .with_provider_pricing(provider_pricing)
-        .with_serving_classes(serving_classes);
+    let mut response = DeployedModelResponse::from(model).with_provider_pricing(provider_pricing);
 
     // Fetch and attach traffic rules
     {
@@ -1604,7 +1682,7 @@ mod tests {
     use serde_json::json;
     use sqlx::PgPool;
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn aimd_api_create_patch_clear_and_validate(pool: PgPool) {
         let (app, _bg) = create_test_app(pool.clone(), false).await;
         let user = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -1692,7 +1770,7 @@ mod tests {
         assert!(stored.first_token_timeout_ms.is_none());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn realtime_fallback_statuses_default_patch_and_validate(pool: PgPool) {
         let (app, _bg) = create_test_app(pool.clone(), false).await;
         let user = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -1745,12 +1823,91 @@ mod tests {
         assert_eq!(model.fallback.unwrap().realtime_on_status, vec![529]);
     }
 
+    #[dwctl_test_macros::test]
+    async fn affinity_api_create_patch_clear_and_validate(pool: PgPool) {
+        let (app, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let headers = add_auth_headers(&user);
+        let response = app
+            .post("/admin/api/v1/models")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"type":"composite","model_name":"affinity-model","lb_strategy":"priority",
+                "fallback_enabled":true,"affinity":{"target_conversations":40}}))
+            .await;
+        response.assert_status_ok();
+        let model: DeployedModelResponse = response.json();
+        assert_eq!(model.fallback.as_ref().unwrap().affinity.as_ref().unwrap().target_conversations, 40);
+        let path = format!("/admin/api/v1/models/{}", model.id);
+
+        // Typed deserialization rejects unknown members before persistence.
+        app.patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"affinity":{"target":5}}))
+            .await
+            .assert_status_unprocessable_entity();
+        // Invalid settings, and routing that affinity cannot run on.
+        for patch in [
+            json!({"affinity":{"target_conversations":0}}),
+            json!({"lb_strategy":"weighted_random"}),
+            json!({"fallback_enabled":false}),
+        ] {
+            app.patch(&path)
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .json(&patch)
+                .await
+                .assert_status_bad_request();
+        }
+        let response = app
+            .patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"affinity":{"target_conversations":60,"margin":5}}))
+            .await;
+        response.assert_status_ok();
+        let model: DeployedModelResponse = response.json();
+        let affinity = model.fallback.unwrap().affinity.unwrap();
+        assert_eq!((affinity.target_conversations, affinity.margin), (60, Some(5)));
+        // An unrelated change keeps the setting.
+        let response = app
+            .patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"description":"unchanged routing"}))
+            .await;
+        response.assert_status_ok();
+        let model: DeployedModelResponse = response.json();
+        assert!(model.fallback.unwrap().affinity.is_some());
+        // Null returns the model to per-request selection.
+        app.patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"affinity":null}))
+            .await
+            .assert_status_ok();
+        let mut conn = pool.acquire().await.unwrap();
+        let stored = Deployments::new(&mut conn).get_by_id(model.id).await.unwrap().unwrap();
+        assert!(stored.affinity.is_none());
+        // A weighted composite cannot be created with affinity.
+        app.post("/admin/api/v1/models")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(
+                &json!({"type":"composite","model_name":"weighted-affinity","lb_strategy":"weighted_random",
+                "fallback_enabled":true,"affinity":{"target_conversations":10}}),
+            )
+            .await
+            .assert_status_bad_request();
+    }
+
     /// Helper function to find a model by ID in a paginated response
     fn get_model_by_id(id: DeploymentId, response: &PaginatedResponse<DeployedModelResponse>) -> Option<&DeployedModelResponse> {
         response.data.iter().find(|model| model.id == id)
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_deployments(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1769,7 +1926,7 @@ mod tests {
         assert!(response_body.data.is_empty() || !response_body.data.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn admin_models_include_pricing_exposes_cache_tariffs(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1852,7 +2009,7 @@ mod tests {
         assert!(model.get("cache_pricing").is_none());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn customer_model_prices_hide_class_details_but_managers_keep_them(pool: PgPool) {
         let (app, _services) = create_test_app(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -1926,7 +2083,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_deployments_with_nonexistent_endpoint(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1942,7 +2099,7 @@ mod tests {
         response.assert_status_not_found();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_model_operations(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2020,7 +2177,7 @@ mod tests {
         response.assert_status_ok(); // Admin can see deleted model with deleted=true
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_composite_model_patch_rejects_reasoning_translation_overrides(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2061,7 +2218,103 @@ mod tests {
         assert_eq!(stored, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_realtime_inflight_limit_below_one_is_rejected(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let auth = add_auth_headers(&user);
+
+        app.post("/admin/api/v1/models")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .json(&json!({ "type": "composite", "model_name": "inflight-zero", "alias": "inflight-zero", "realtime_inflight_limit": 0 }))
+            .await
+            .assert_status_bad_request();
+
+        let response = app
+            .post("/admin/api/v1/models")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .json(&json!({ "type": "composite", "model_name": "inflight-one", "alias": "inflight-one" }))
+            .await;
+        response.assert_status_ok();
+        let created: DeployedModelResponse = response.json();
+        app.patch(&format!("/admin/api/v1/models/{}", created.id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .json(&json!({ "realtime_inflight_limit": 0 }))
+            .await
+            .assert_status_bad_request();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_non_positive_batch_capacity_is_rejected(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let auth = add_auth_headers(&user);
+
+        for invalid in [0, -1] {
+            app.post("/admin/api/v1/models")
+                .add_header(&auth[0].0, &auth[0].1)
+                .add_header(&auth[1].0, &auth[1].1)
+                .json(&json!({ "type": "composite", "model_name": format!("batch-{invalid}"), "alias": format!("batch-{invalid}"), "batch_capacity": invalid }))
+                .await
+                .assert_status_bad_request();
+        }
+
+        let response = app
+            .post("/admin/api/v1/models")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .json(&json!({ "type": "composite", "model_name": "batch-valid", "alias": "batch-valid", "batch_capacity": 5 }))
+            .await;
+        response.assert_status_ok();
+        let created: DeployedModelResponse = response.json();
+
+        for invalid in [0, -1] {
+            app.patch(&format!("/admin/api/v1/models/{}", created.id))
+                .add_header(&auth[0].0, &auth[0].1)
+                .add_header(&auth[1].0, &auth[1].1)
+                .json(&json!({ "batch_capacity": invalid }))
+                .await
+                .assert_status_bad_request();
+        }
+
+        let stored = sqlx::query_scalar::<_, i32>("SELECT batch_capacity FROM deployed_models WHERE id = $1")
+            .bind(created.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, 5, "a rejected update must leave the stored value untouched");
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_standard_model_patch_rejects_realtime_inflight_limit(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let model = create_test_deployment(&pool, user.id, "inflight-standard", "inflight-standard").await;
+
+        let response = app
+            .patch(&format!("/admin/api/v1/models/{}", model.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .json(&json!({ "realtime_inflight_limit": 500 }))
+            .await;
+
+        response.assert_status_bad_request();
+
+        let stored = sqlx::query_scalar::<_, i32>("SELECT realtime_inflight_limit FROM deployed_models WHERE id = $1")
+            .bind(model.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, 14);
+    }
+
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_deployments_with_groups_include(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2131,7 +2384,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_deployments_with_reasoning_capabilities_include(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2194,7 +2447,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_role_based_visibility_for_deleted_models(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2252,7 +2505,7 @@ mod tests {
         // Verify the API behavior is consistent with soft deletion
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_role_based_list_filtering(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2323,7 +2576,7 @@ mod tests {
         assert!(!user_models.data.iter().any(|it| it.id == deployment2.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_role_based_update_access_for_deleted_models(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2369,7 +2622,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_soft_delete_preserves_model_accessibility_for_admin(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2441,7 +2694,7 @@ mod tests {
         assert_eq!(updated_model.alias, "updated-after-deletion");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn invalid_tariffs_are_rejected_atomically_on_create_and_update(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -2490,7 +2743,7 @@ mod tests {
         assert_eq!(count, 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn negative_tariff_prices_are_rejected_before_model_or_ledger_changes(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -2557,7 +2810,7 @@ mod tests {
         assert_eq!(count, 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn zero_tariff_prices_remain_valid_on_create_and_update(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -2596,7 +2849,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn customer_tariff_windows_are_normalized_on_create_and_update(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2648,7 +2901,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn unchanged_legacy_tariff_allows_metadata_edits_but_not_repricing(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -2692,7 +2945,7 @@ mod tests {
         assert_eq!(billable, 0, "preserving legacy metadata must not make it billable");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_deployed_model(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2727,7 +2980,7 @@ mod tests {
         assert_eq!(created_model.created_by, Some(admin_user.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_deployed_model_with_defaults(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2758,7 +3011,7 @@ mod tests {
         assert_eq!(created_model.created_by, Some(admin_user.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_deployed_model_non_admin_forbidden(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2781,7 +3034,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_deployed_model_nonexistent_endpoint(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2803,7 +3056,7 @@ mod tests {
         response.assert_status_not_found();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_include_groups_admin_only(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2874,7 +3127,7 @@ mod tests {
         assert!(test_model.groups.is_none(), "Regular user should NOT see groups included");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_accessible_parameter_filtering(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2967,7 +3220,7 @@ mod tests {
         assert!(get_model_by_id(deployment1.id, &admin_accessible).is_some());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_include_metrics_parameter(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3050,7 +3303,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_sees_all_models_by_default(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3119,7 +3372,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_can_request_accessible_filtering(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3183,7 +3436,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_request_viewer_role_gets_filtered(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3248,7 +3501,7 @@ mod tests {
         assert!(pm_models.data.iter().any(|m| m.id == deployment2.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_can_see_newly_created_models(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3295,7 +3548,7 @@ mod tests {
         assert_eq!(found_model.alias, "Platform Manager New Model");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_standard_user_cannot_see_ungrouped_models(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3336,7 +3589,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_request_viewer_cannot_modify_models(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3383,7 +3636,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_standard_user_cannot_modify_models(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3430,7 +3683,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_multi_role_user_cannot_modify_models_without_platform_manager(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3478,7 +3731,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_plus_standard_user_can_modify_models(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3527,7 +3780,7 @@ mod tests {
         response.assert_status_ok();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_accessibility_filtering_permissions(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3594,7 +3847,7 @@ mod tests {
         assert!(pm_models.data.iter().any(|m| m.id == inaccessible_deployment.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_groups_include_permission_enforcement(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3657,81 +3910,70 @@ mod tests {
         assert!(rv_model.groups.is_none(), "RequestViewer should NOT see groups even when requested");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn test_rate_limits_permission_gating(pool: PgPool) {
+    async fn test_realtime_inflight_limit_permission_gating(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager = create_test_admin_user(&pool, Role::PlatformManager).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
+        let auth = |user| add_auth_headers(user);
 
-        // Create a deployment with rate limits
-        let deployment = create_test_deployment(&pool, platform_manager.id, "rate-limit-test", "rate-limit-alias").await;
-
-        // Set rate limits on the deployment
-        let update = json!({
-            "requests_per_second": 100.0,
-            "burst_size": 200
-        });
+        let manager_auth = auth(&platform_manager);
         let response = app
-            .patch(&format!("/admin/api/v1/models/{}", deployment.id))
-            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
-            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
-            .json(&update)
+            .post("/admin/api/v1/models")
+            .add_header(&manager_auth[0].0, &manager_auth[0].1)
+            .add_header(&manager_auth[1].0, &manager_auth[1].1)
+            .json(&json!({
+                "type": "composite",
+                "model_name": "inflight-composite",
+                "alias": "inflight-composite",
+                "realtime_inflight_limit": 40
+            }))
+            .await;
+        response.assert_status_ok();
+        let created: DeployedModelResponse = response.json();
+        assert_eq!(created.realtime_inflight_limit, Some(40));
+
+        let response = app
+            .patch(&format!("/admin/api/v1/models/{}", created.id))
+            .add_header(&manager_auth[0].0, &manager_auth[0].1)
+            .add_header(&manager_auth[1].0, &manager_auth[1].1)
+            .json(&json!({ "realtime_inflight_limit": 60 }))
             .await;
         response.assert_status_ok();
 
-        // Create a group and add users to it so they can see the deployment
         let mut pool_conn = pool.acquire().await.unwrap();
         let mut group_repo = Groups::new(&mut pool_conn);
-        let group_create = GroupCreateDBRequest {
-            name: "Rate Limit Test Group".to_string(),
-            description: Some("Test group for rate limit permissions".to_string()),
-            created_by: platform_manager.id,
-        };
-        let group = group_repo.create(&group_create).await.unwrap();
+        let group = group_repo
+            .create(&GroupCreateDBRequest {
+                name: "In-flight Limit Test Group".to_string(),
+                description: None,
+                created_by: platform_manager.id,
+            })
+            .await
+            .unwrap();
         group_repo.add_user_to_group(standard_user.id, group.id).await.unwrap();
         group_repo.add_user_to_group(request_viewer.id, group.id).await.unwrap();
         group_repo
-            .add_deployment_to_group(deployment.id, group.id, platform_manager.id)
+            .add_deployment_to_group(created.id, group.id, platform_manager.id)
             .await
             .unwrap();
 
-        // PlatformManager should see rate limits (has ModelRateLimits::ReadAll)
-        let response = app
-            .get(&format!("/admin/api/v1/models/{}", deployment.id))
-            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
-            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
-            .await;
-        response.assert_status_ok();
-        let pm_model: DeployedModelResponse = response.json();
-        assert_eq!(pm_model.requests_per_second, Some(100.0), "PlatformManager should see rate limits");
-        assert_eq!(pm_model.burst_size, Some(200), "PlatformManager should see burst size");
-
-        // StandardUser should NOT see rate limits (masked)
-        let response = app
-            .get(&format!("/admin/api/v1/models/{}", deployment.id))
-            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
-            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
-            .await;
-        response.assert_status_ok();
-        let user_model: DeployedModelResponse = response.json();
-        assert_eq!(user_model.requests_per_second, None, "StandardUser should NOT see rate limits");
-        assert_eq!(user_model.burst_size, None, "StandardUser should NOT see burst size");
-
-        // RequestViewer should NOT see rate limits (masked)
-        let response = app
-            .get(&format!("/admin/api/v1/models/{}", deployment.id))
-            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
-            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
-            .await;
-        response.assert_status_ok();
-        let rv_model: DeployedModelResponse = response.json();
-        assert_eq!(rv_model.requests_per_second, None, "RequestViewer should NOT see rate limits");
-        assert_eq!(rv_model.burst_size, None, "RequestViewer should NOT see burst size");
+        for (user, expected) in [(&platform_manager, Some(60)), (&standard_user, None), (&request_viewer, None)] {
+            let headers = auth(user);
+            let response = app
+                .get(&format!("/admin/api/v1/models/{}", created.id))
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .await;
+            response.assert_status_ok();
+            let model: DeployedModelResponse = response.json();
+            assert_eq!(model.realtime_inflight_limit, expected);
+        }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_metrics_permission_gating(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3795,7 +4037,7 @@ mod tests {
         assert!(rv_model.metrics.is_some(), "RequestViewer should see metrics when requested");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_models_pagination(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3882,7 +4124,7 @@ mod tests {
         assert_eq!(empty_page.data.len(), 0, "Offset beyond available models should return empty array");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_models_with_group_filter(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3978,7 +4220,7 @@ mod tests {
         assert!(all_models.data.len() >= 3, "Empty group list should return all models");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_models_with_available_for_realtime_filter(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4046,7 +4288,7 @@ mod tests {
 
     // ===== Traffic Routing Rules Tests =====
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_model_with_traffic_rules(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4103,7 +4345,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_model_includes_traffic_rules(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4147,7 +4389,7 @@ mod tests {
         ));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_models_includes_traffic_rules(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4187,7 +4429,7 @@ mod tests {
         assert_eq!(rules[0].api_key_purpose, crate::db::models::api_keys::ApiKeyPurpose::Playground);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_model_set_traffic_rules(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4225,7 +4467,7 @@ mod tests {
         assert_eq!(fetched.traffic_routing_rules.unwrap().len(), 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_model_clear_traffic_rules(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4277,7 +4519,7 @@ mod tests {
         assert!(fetched.traffic_routing_rules.is_none());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_model_no_change_to_traffic_rules(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4319,7 +4561,7 @@ mod tests {
         assert_eq!(rules.len(), 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_model_self_redirect_rejected(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4344,7 +4586,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_model_nonexistent_redirect_target(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4369,7 +4611,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_model_empty_redirect_target(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4394,7 +4636,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_redirect_target_cascades(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4443,7 +4685,7 @@ mod tests {
             "traffic rules should be cleared after cascade delete of redirect target"
         );
     }
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn tariff_replacement_rejects_future_schedule_without_partial_updates(pool: PgPool) {
         let (app, _services) = create_test_app(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;

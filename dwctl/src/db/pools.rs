@@ -101,7 +101,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_pool_metrics_sampler_runs_and_shuts_down(pool: sqlx::PgPool) {
         let shutdown = CancellationToken::new();
         let shutdown_clone = shutdown.clone();

@@ -176,6 +176,9 @@ pub struct Config {
     pub analytics: AnalyticsConfig,
     /// Enable OpenTelemetry OTLP export for distributed tracing
     pub enable_otel_export: bool,
+    /// Log output format: `compact` (human-readable lines) or `json` (one
+    /// JSON object per event, for log aggregators)
+    pub log_format: LogFormat,
     /// Credit system configuration
     pub credits: CreditsConfig,
     /// Sample file generation configuration for new users
@@ -239,6 +242,134 @@ pub struct Config {
     /// shadow mode. See [`crate::inference::validation::ValidationConfig`].
     #[serde(default)]
     pub request_validation: crate::inference::validation::ValidationConfig,
+    /// Opt-in sampled jemalloc heap profiling, served on a separate
+    /// cluster-internal listener. Off by default. See
+    /// [`crate::profiling::HeapProfilingConfig`].
+    #[serde(default)]
+    pub heap_profiling: crate::profiling::HeapProfilingConfig,
+    /// Account scheduling tolerations: the named presets an operator may pin to
+    /// an account. See [`SchedulingConfig`].
+    #[serde(default)]
+    pub scheduling: SchedulingConfig,
+}
+
+/// Operator-defined scheduling-toleration presets.
+///
+/// Each preset affixes a fixed, Kubernetes-style toleration list to every
+/// inference request from an account pinned to it, written to
+/// `nvext.routing_constraints.tolerations` before the request reaches the
+/// upstream inference backend. An account stores only the preset's `id`
+/// (`users.toleration_preset`); the tolerations themselves live here, so an
+/// operator can retune a preset without walking every account.
+///
+/// The list is deliberately backend-agnostic: a backend that honours
+/// tolerations uses it to decide which capacity may serve the request. An
+/// empty list (`[]`) asks a backend to keep the account's work off any
+/// tainted capacity.
+///
+/// Validate with [`SchedulingConfig::validate`], which is called at load time:
+/// ids must be unique slugs and every toleration must be one the request path
+/// could serialise into a valid body.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SchedulingConfig {
+    /// The presets an account may be pinned to, in display order.
+    pub toleration_presets: Vec<TolerationPreset>,
+}
+
+/// One operator-defined scheduling-toleration preset.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TolerationPreset {
+    /// Stable slug the account stores (`users.toleration_preset`). Unique
+    /// across presets; matched case-sensitively.
+    pub id: String,
+    /// Short human label for the control (e.g. "No overflow capacity").
+    pub label: String,
+    /// One or two sentences of help text (the dashboard tooltip).
+    pub description: String,
+    /// The toleration list written to `nvext.routing_constraints.tolerations`,
+    /// in the same shape as the request field. An empty list is a real preset.
+    pub tolerations: Vec<crate::scheduling::SchedulingToleration>,
+}
+
+impl SchedulingConfig {
+    /// The generic preset shipped in the default config: pin the account's
+    /// work off any tainted capacity, the most common operator intent.
+    pub fn default_preset() -> TolerationPreset {
+        TolerationPreset {
+            id: "no-overflow".to_string(),
+            label: "No overflow capacity".to_string(),
+            description: "Never placed on capacity the backend marks with any taint, such as overflow capacity; \
+                          requests may be refused when dedicated capacity is full."
+                .to_string(),
+            tolerations: Vec::new(),
+        }
+    }
+
+    /// Look up a preset by id.
+    pub fn preset(&self, id: &str) -> Option<&TolerationPreset> {
+        self.toleration_presets.iter().find(|preset| preset.id == id)
+    }
+
+    /// Resolve an account's stored preset id to the toleration list the request
+    /// path writes. `None` (the "Default" setting) means nothing is pinned, so
+    /// the backend decides. An id that is absent from the config is a
+    /// misconfiguration the caller must fail closed on; see
+    /// [`crate::scheduling::TolerationPresets::resolve`].
+    pub fn resolve(&self, id: Option<&str>) -> Option<&[crate::scheduling::SchedulingToleration]> {
+        id.and_then(|id| self.preset(id)).map(|preset| preset.tolerations.as_slice())
+    }
+
+    /// Whether every id is a unique slug and every toleration is valid.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
+        for (index, preset) in self.toleration_presets.iter().enumerate() {
+            if preset.id.trim().is_empty() {
+                return Err(format!("scheduling.toleration_presets[{index}] has an empty id"));
+            }
+            if preset.id != preset.id.trim() {
+                return Err(format!(
+                    "scheduling.toleration_presets[{index}] id {:?} has leading or trailing whitespace",
+                    preset.id
+                ));
+            }
+            if preset.id == crate::scheduling::DEFAULT_PRESET_SENTINEL {
+                return Err(format!(
+                    "scheduling.toleration_presets[{index}] id {:?} is reserved for the dashboard's \
+                     \"Default\" option",
+                    preset.id
+                ));
+            }
+            if !seen.insert(preset.id.as_str()) {
+                return Err(format!("scheduling.toleration_presets has a duplicate id {:?}", preset.id));
+            }
+            if preset.label.trim().is_empty() {
+                return Err(format!(
+                    "scheduling.toleration_presets[{index}] ({:?}) has an empty label",
+                    preset.id
+                ));
+            }
+            if preset.description.trim().is_empty() {
+                return Err(format!(
+                    "scheduling.toleration_presets[{index}] ({:?}) has an empty description",
+                    preset.id
+                ));
+            }
+            crate::scheduling::PinnedTolerations(preset.tolerations.clone())
+                .validate()
+                .map_err(|error| format!("scheduling.toleration_presets[{:?}] is invalid: {error}", preset.id))?;
+        }
+        Ok(())
+    }
+}
+
+impl Default for SchedulingConfig {
+    fn default() -> Self {
+        Self {
+            toleration_presets: vec![Self::default_preset()],
+        }
+    }
 }
 
 /// Controls exposure of the OpenAPI specs and Scalar doc UIs.
@@ -755,6 +886,38 @@ pub struct StripeConfig {
     /// Stripe tax code for auto top-up tax calculations (e.g. "txcd_10000000").
     /// If not set, falls back to the account-level default tax code in Stripe Tax settings.
     pub tax_code: Option<String>,
+    /// Base URL of the Stripe API (e.g. "http://localhost:12111"). Unset in
+    /// production, which talks to `https://api.stripe.com/`; set it to point the
+    /// client at a Stripe-compatible mock server or an egress proxy. Must be an
+    /// http(s) URL without a query or fragment; a path prefix is allowed, with
+    /// or without a trailing slash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_base_url: Option<String>,
+}
+
+impl StripeConfig {
+    /// The configured Stripe API base, normalised to end in `/`.
+    ///
+    /// async-stripe appends `v1/...` to the base verbatim, so a path prefix
+    /// without its trailing slash (`https://proxy.example.test/stripe`) would
+    /// otherwise send requests to `.../stripev1/...`.
+    pub fn api_base(&self) -> Result<Option<String>, String> {
+        let Some(raw) = &self.api_base_url else {
+            return Ok(None);
+        };
+        let mut url = Url::parse(raw).map_err(|e| format!("payment.stripe.api_base_url {raw:?} is not a valid URL: {e}"))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(format!("payment.stripe.api_base_url {raw:?} must be an http or https URL"));
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(format!("payment.stripe.api_base_url {raw:?} must not have a query or fragment"));
+        }
+        if !url.path().ends_with('/') {
+            let path = format!("{}/", url.path());
+            url.set_path(&path);
+        }
+        Ok(Some(url.into()))
+    }
 }
 
 /// Dummy payment configuration for testing.
@@ -846,10 +1009,8 @@ pub struct AuthConfig {
     /// Applies to user registration and proxy header auth auto-creation
     /// StandardUser role is always guaranteed to be present even if not specified
     pub default_user_roles: Vec<Role>,
-    /// Default rate-limit tiers applied to API keys based on the owning user's
-    /// `verified` flag. Only used when the api_key has no explicit per-key
-    /// override. Leaving either tier as `None` means "no limit for that tier".
-    pub rate_limits: RateLimitTiersConfig,
+    #[serde(rename = "rate_limits", skip_serializing)]
+    pub ignored_rate_limits: serde::de::IgnoredAny,
     /// Extra email domains to treat as personal, on top of the built-in list
     /// in `auth::utils`.
     ///
@@ -889,27 +1050,10 @@ impl Default for AuthConfig {
             proxy_header: ProxyHeaderAuthConfig::default(),
             security: SecurityConfig::default(),
             default_user_roles: vec![Role::StandardUser, Role::BackgroundInferenceUser],
-            rate_limits: RateLimitTiersConfig::default(),
+            ignored_rate_limits: serde::de::IgnoredAny,
             personal_email_domains: Vec::new(),
         }
     }
-}
-
-/// Per-tier defaults for API key rate limits. A `None` tier means no default
-/// limit is applied, preserving the legacy "unlimited unless overridden"
-/// behaviour for that tier.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct RateLimitTiersConfig {
-    pub verified: Option<RateLimitTierConfig>,
-    pub unverified: Option<RateLimitTierConfig>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RateLimitTierConfig {
-    pub requests_per_second: f32,
-    pub burst_size: Option<i32>,
 }
 
 /// Native username/password authentication configuration.
@@ -1166,6 +1310,95 @@ pub struct LimitsConfig {
     pub files: FileLimitsConfig,
     /// Request limits (per-request body size within batch files)
     pub requests: RequestLimitsConfig,
+    /// Realtime (interactive) per-account in-flight limits, counted per key
+    /// account.
+    pub realtime_inflight: RealtimeInflightLimitsConfig,
+    /// Global per-model batch in-flight cap. Reuses
+    /// [`RealtimeInflightLimitsConfig::redis_url`] for its shared counter, so
+    /// the cap holds across replicas; it is a separate switch because batch and
+    /// realtime limits can be rolled out independently.
+    pub batch_inflight: BatchInflightLimitsConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RealtimeInflightLimitsConfig {
+    pub enforce: bool,
+    pub redis_url: Option<String>,
+}
+
+/// Per-model batch in-flight cap.
+///
+/// When enforced, each virtual (composite) model's `batch_capacity` becomes a
+/// ceiling on how many batch (dispatched) requests may be in flight against
+/// that alias at once, counted globally across replicas in the same Redis used
+/// by [`RealtimeInflightLimitsConfig`]. `realtime_inflight` traffic is not
+/// affected. `redis_url` is intentionally not duplicated here: batch reuses
+/// `limits.realtime_inflight.redis_url`. With `enforce` false (the default)
+/// nothing is refused and no shared count is touched.
+///
+/// Enabling this changes the meaning of `batch_capacity`: without it the value
+/// is only fusillade's per-daemon *starting* concurrency (adaptive concurrency
+/// can grow past it), while with it the same value is also the *global*
+/// ceiling. Raise `batch_capacity` to the intended global cap before turning
+/// enforcement on. File batches, flex and background requests all share this
+/// single per-model ceiling.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BatchInflightLimitsConfig {
+    pub enforce: bool,
+    /// Default global batch in-flight cap applied to virtual (composite) models
+    /// that do not set their own positive `batch_capacity`. Default: 200.
+    ///
+    /// This only affects the onwards cap; it does not change fusillade's
+    /// per-daemon starting concurrency, which keeps using
+    /// `background_services.batch_daemon.default_model_concurrency` for models
+    /// without an explicit `batch_capacity`. Set to `null` or `0` to leave
+    /// virtual models without their own value uncapped. Negative values are
+    /// rejected at config load.
+    #[serde(
+        default = "default_batch_inflight_capacity",
+        deserialize_with = "deserialize_batch_inflight_default_capacity"
+    )]
+    pub default_capacity: Option<u32>,
+}
+
+/// Default global batch in-flight cap for virtual models without a positive
+/// `batch_capacity` of their own.
+pub const DEFAULT_BATCH_INFLIGHT_CAPACITY: u32 = 200;
+
+fn default_batch_inflight_capacity() -> Option<u32> {
+    Some(DEFAULT_BATCH_INFLIGHT_CAPACITY)
+}
+
+/// Accepts a positive integer, or the "off" forms `null` and `0`; rejects
+/// negative values with a clear config-load error.
+fn deserialize_batch_inflight_default_capacity<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let value: Option<i64> = Option::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(value) if value < 0 => Err(D::Error::custom(format!(
+            "limits.batch_inflight.default_capacity must not be negative, got {value}"
+        ))),
+        Some(0) => Ok(None),
+        Some(value) => u32::try_from(value)
+            .map(Some)
+            .map_err(|_| D::Error::custom(format!("limits.batch_inflight.default_capacity is too large, got {value}"))),
+    }
+}
+
+impl Default for BatchInflightLimitsConfig {
+    fn default() -> Self {
+        Self {
+            enforce: false,
+            default_capacity: default_batch_inflight_capacity(),
+        }
+    }
 }
 
 /// Request limits configuration.
@@ -1198,7 +1431,8 @@ impl Default for RequestLimitsConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OnwardsConfig {
-    /// Maximum pending bytes of an unfinished SSE event in the proxy, cache, and continuation layers.
+    /// Maximum pending bytes of an unfinished SSE event in the proxy, cache, continuation and
+    /// client usage layers.
     /// Complete events are forwarded first.
     /// Increase for providers that emit large tool-call events. Default: 65536.
     pub sse_buffer_limit: usize,
@@ -1219,6 +1453,13 @@ pub struct OnwardsConfig {
     /// breach without cutting it off; once breaches exceed the controller's
     /// target rate, later requests shift to the alternates. Set to 0 to disable.
     pub first_token_timeout_ms: u64,
+    /// Strict-mode chat and legacy completions parameters that get a 400
+    /// instead of being forwarded.
+    /// Every parameter onwards flags as not servable by every worker is counted
+    /// (`onwards_unsupported_params_total`) and traced; only the ones listed
+    /// here are refused. Names must come from `onwards::unsupported_params::params()`.
+    /// Default: empty (observe only).
+    pub rejected_params: Vec<String>,
 }
 
 impl Default for OnwardsConfig {
@@ -1230,6 +1471,7 @@ impl Default for OnwardsConfig {
                 "This is a shared best-effort endpoint, rate limited under load – retry with backoff. For production workloads that aren't latency-sensitive, try our async or batch tiers (https://docs.doubleword.ai/inference-api/batch-inference); for a dedicated real-time endpoint with SLAs, higher rate limits, and volume pricing, contact support@doubleword.ai."
                     .to_string(),
             first_token_timeout_ms: 20_000,
+            rejected_params: Vec::new(),
         }
     }
 }
@@ -1808,6 +2050,19 @@ impl BatchConfig {
     }
 }
 
+/// How log events are written to stdout.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LogFormat {
+    /// One human-readable line per event.
+    #[default]
+    Compact,
+    /// One JSON object per event, with the event's fields at the top level
+    /// and the spans it occurred in under `span` and `spans`. Panics are
+    /// written in the same shape.
+    Json,
+}
+
 /// Which fusillade claim loops should run inside this daemon process.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -2028,13 +2283,13 @@ pub struct DaemonConfig {
     pub batch_metadata_fields: Vec<String>,
 
     /// Interval for running the orphaned row purge task (milliseconds).
-    /// Deletes orphaned request_templates and requests whose parent file/batch
+    /// Deletes orphaned request templates and requests whose parent file/batch
     /// has been soft-deleted, for right-to-erasure compliance.
     /// Set to 0 to disable purging. Default: 600000 (10 minutes).
     pub purge_interval_ms: u64,
 
     /// Maximum number of orphaned rows to delete per purge iteration.
-    /// Each iteration deletes up to this many requests and this many request_templates.
+    /// Each iteration deletes up to this many requests and this many request templates.
     /// Default: 1000.
     pub purge_batch_size: i64,
 
@@ -2089,10 +2344,12 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub batch_archive_retirement_enabled: bool,
 
-    /// Route new file-backed request templates into the weekly generation-2
-    /// store. Reads are generation-transparent either way.
-    #[serde(default)]
-    pub template_generation_writes_enabled: bool,
+    /// Deprecated and ignored: the weekly generation-2 template store is the
+    /// only write path since the generation-1 heap was retired. The key is
+    /// still accepted so existing values files keep parsing; a warning is
+    /// logged at startup when it is set. Remove it from your configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_generation_writes_enabled: Option<bool>,
 
     /// Allow file-content expiry and weekly template partition retirement.
     /// Disabled by default and additionally requires an explicit retention
@@ -2468,7 +2725,7 @@ impl Default for DaemonConfig {
             retained_response_retirement_enabled: false,
             batch_archive_retirement_enabled: false,
             batch_archive_retention_days: None,
-            template_generation_writes_enabled: false,
+            template_generation_writes_enabled: None,
             template_retirement_enabled: false,
             template_retention_days: None,
             retained_response_partition_maintenance_url: None,
@@ -2677,6 +2934,9 @@ pub struct BackgroundServicesConfig {
     pub leader_election: LeaderElectionConfig,
     /// Configuration for database pool metrics sampling
     pub pool_metrics: PoolMetricsSamplerConfig,
+    /// jemalloc statistics sampling for the allocator Prometheus gauges.
+    /// See [`crate::metrics::allocator::AllocatorMetricsConfig`].
+    pub allocator_metrics: crate::metrics::allocator::AllocatorMetricsConfig,
     /// Configuration for batch completion notifications (email + webhooks)
     pub notifications: NotificationsConfig,
     /// Configuration for connection sync workers (file ingestion, batch activation)
@@ -2685,6 +2945,8 @@ pub struct BackgroundServicesConfig {
     pub task_workers: TaskWorkersConfig,
     /// Bounded deletion of expired Underway tasks
     pub task_retention: TaskRetentionConfig,
+    /// Bounded deletion of long-expired prompt-cache entries
+    pub prompt_cache_retention: PromptCacheRetentionConfig,
 }
 
 /// Underway task retention daemon configuration.
@@ -2739,6 +3001,70 @@ impl TaskRetentionConfig {
         }
         if self.min_age_days > Self::MAX_MIN_AGE_DAYS {
             return Err(format!("min_age_days must be at most {}", Self::MAX_MIN_AGE_DAYS));
+        }
+        Ok(())
+    }
+}
+
+/// Prompt-cache entry retention daemon configuration.
+///
+/// Expired prompt-cache entries serve no request, but nothing else deletes them. This
+/// daemon deletes entries that expired more than `grace_days` ago, oldest first, in bounded
+/// batches, so the table tracks the live cache plus the recompute grace instead of every
+/// prefix ever written.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PromptCacheRetentionConfig {
+    /// Enable the retention daemon (default: false).
+    pub enabled: bool,
+    /// Seconds between sweeps (default: 300).
+    pub interval_seconds: u64,
+    /// Rows deleted per statement (default: 1000). Each batch is its own transaction.
+    pub batch_size: u32,
+    /// Pause between consecutive batches of one sweep in milliseconds (default: 2000).
+    /// Throttles the sweep while a large backlog drains.
+    pub batch_pause_milliseconds: u64,
+    /// Days an entry is kept after it expires (default and minimum:
+    /// [`crate::recompute::report::CACHE_GRACE_DAYS`]). Usage recompute re-derives a past
+    /// request's cache split from the entries live at that time, so it needs this history.
+    pub grace_days: u64,
+}
+
+impl Default for PromptCacheRetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_seconds: 300,
+            batch_size: 1000,
+            batch_pause_milliseconds: 2000,
+            grace_days: crate::recompute::report::CACHE_GRACE_DAYS as u64,
+        }
+    }
+}
+
+impl PromptCacheRetentionConfig {
+    /// Upper bound on `grace_days` (a century): keeps the grace representable as a
+    /// `Duration`/`interval` and catches a unit mistake in configuration.
+    pub const MAX_GRACE_DAYS: u64 = 36_500;
+
+    /// The grace as a duration. `grace_days` is bounded by [`Self::validate`], so this
+    /// cannot overflow.
+    pub fn grace(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.grace_days.min(Self::MAX_GRACE_DAYS) * 86_400)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.batch_size == 0 {
+            return Err("batch_size must be at least 1".to_string());
+        }
+        let minimum = crate::recompute::report::CACHE_GRACE_DAYS as u64;
+        if self.grace_days < minimum {
+            return Err(format!(
+                "grace_days must be at least {minimum}: usage recompute re-derives cache splits from that much history"
+            ));
+        }
+        if self.grace_days > Self::MAX_GRACE_DAYS {
+            return Err(format!("grace_days must be at most {}", Self::MAX_GRACE_DAYS));
         }
         Ok(())
     }
@@ -2979,6 +3305,11 @@ pub struct CreditsConfig {
     /// billing target (see `Credits::grant_verification_credits`).
     #[serde(default)]
     pub verification_credits: rust_decimal::Decimal,
+    /// Pause after a transient provider failure or the first soft card decline
+    /// before auto top-up is eligible again. Production defaults to 24 hours;
+    /// staging may shorten it to exercise the complete decline lifecycle.
+    #[serde(with = "humantime_serde")]
+    pub auto_topup_retry_delay: Duration,
 }
 
 impl Default for CreditsConfig {
@@ -2990,6 +3321,7 @@ impl Default for CreditsConfig {
             first_payment_match_up_to: rust_decimal::Decimal::ZERO,
             // Default to 0 (no signup credits on card verification)
             verification_credits: rust_decimal::Decimal::ZERO,
+            auto_topup_retry_delay: Duration::from_secs(24 * 60 * 60),
         }
     }
 }
@@ -3152,6 +3484,7 @@ impl Default for Config {
             enable_analytics: true,
             analytics: AnalyticsConfig::default(),
             enable_otel_export: false,
+            log_format: LogFormat::default(),
             credits: CreditsConfig::default(),
             sample_files: SampleFilesConfig::default(),
             limits: LimitsConfig::default(),
@@ -3168,6 +3501,8 @@ impl Default for Config {
             prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),
             continuation: ContinuationConfig::default(),
             request_validation: Default::default(),
+            heap_profiling: crate::profiling::HeapProfilingConfig::default(),
+            scheduling: SchedulingConfig::default(),
         }
     }
 }
@@ -3223,6 +3558,7 @@ pub struct ModelProvisioningConfig {
     /// Directory containing per-organisation overlay YAML documents (see
     /// `org_overlays`). A missing directory is an empty catalog.
     pub org_overlays_directory: PathBuf,
+    pub account_limits_directory: PathBuf,
 }
 
 impl Default for ModelProvisioningConfig {
@@ -3231,6 +3567,7 @@ impl Default for ModelProvisioningConfig {
             enabled: false,
             directory: PathBuf::from("/app/model-provisioning.d"),
             org_overlays_directory: PathBuf::from("/app/org-overlays.d"),
+            account_limits_directory: PathBuf::from("/app/account-limits.d"),
         }
     }
 }
@@ -3453,6 +3790,35 @@ impl Config {
         if let Err(error) = self.background_services.task_retention.validate() {
             return Err(Error::Internal {
                 operation: format!("Config validation: task retention is invalid: {error}"),
+            });
+        }
+        if let Err(error) = self.background_services.prompt_cache_retention.validate() {
+            return Err(Error::Internal {
+                operation: format!("Config validation: prompt-cache retention is invalid: {error}"),
+            });
+        }
+        if let Some(name) = self
+            .onwards
+            .rejected_params
+            .iter()
+            .find(|name| onwards::unsupported_params::known_param(name).is_none())
+        {
+            return Err(Error::Internal {
+                operation: format!("Config validation: onwards.rejected_params names an unknown parameter: {name}"),
+            });
+        }
+        // The payment provider is rebuilt from config on every request, so a
+        // bad base URL must fail here rather than panic in each handler.
+        if let Some(PaymentConfig::Stripe(stripe)) = &self.payment
+            && let Err(error) = stripe.api_base()
+        {
+            return Err(Error::Internal {
+                operation: format!("Config validation: {error}"),
+            });
+        }
+        if let Err(error) = self.scheduling.validate() {
+            return Err(Error::Internal {
+                operation: format!("Config validation: {error}"),
             });
         }
         if self.background_services.batch_daemon.retention.expire_files
@@ -3927,8 +4293,67 @@ mod tests {
     use figment::Jail;
 
     #[test]
+    fn auto_topup_retry_delay_defaults_to_24_hours() {
+        assert_eq!(CreditsConfig::default().auto_topup_retry_delay, Duration::from_secs(24 * 60 * 60));
+    }
+
+    #[test]
     fn default_auth_roles_include_background_inference() {
         assert!(AuthConfig::default().default_user_roles.contains(&Role::BackgroundInferenceUser));
+    }
+
+    #[test]
+    fn batch_inflight_enforcement_defaults_off_and_parses_on() {
+        assert!(!LimitsConfig::default().batch_inflight.enforce);
+
+        let parsed: LimitsConfig = serde_json::from_value(serde_json::json!({
+            "batch_inflight": { "enforce": true }
+        }))
+        .unwrap();
+        assert!(parsed.batch_inflight.enforce);
+    }
+
+    #[test]
+    fn batch_inflight_default_capacity_defaults_to_200() {
+        assert_eq!(LimitsConfig::default().batch_inflight.default_capacity, Some(200));
+    }
+
+    #[test]
+    fn batch_inflight_default_capacity_parses_an_explicit_positive_value() {
+        let parsed: LimitsConfig = serde_json::from_value(serde_json::json!({
+            "batch_inflight": { "default_capacity": 500 }
+        }))
+        .unwrap();
+        assert_eq!(parsed.batch_inflight.default_capacity, Some(500));
+    }
+
+    #[test]
+    fn batch_inflight_default_capacity_accepts_the_off_forms() {
+        for off in [serde_json::json!(null), serde_json::json!(0)] {
+            let parsed: LimitsConfig = serde_json::from_value(serde_json::json!({
+                "batch_inflight": { "default_capacity": off }
+            }))
+            .unwrap();
+            assert_eq!(parsed.batch_inflight.default_capacity, None, "{off} should mean no default");
+        }
+    }
+
+    #[test]
+    fn batch_inflight_default_capacity_rejects_negative_values() {
+        let error = serde_json::from_value::<LimitsConfig>(serde_json::json!({
+            "batch_inflight": { "default_capacity": -1 }
+        }))
+        .expect_err("a negative default capacity must be rejected");
+        assert!(error.to_string().contains("must not be negative"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn batch_inflight_default_capacity_rejects_out_of_range_values() {
+        let error = serde_json::from_value::<LimitsConfig>(serde_json::json!({
+            "batch_inflight": { "default_capacity": 5_000_000_000i64 }
+        }))
+        .expect_err("a default capacity beyond u32 must be rejected");
+        assert!(error.to_string().contains("too large"), "unexpected error: {error}");
     }
 
     #[test]
@@ -3954,7 +4379,6 @@ mod tests {
             "retained_response_retirement_enabled",
             "batch_archive_retirement_enabled",
             "batch_archive_retention_days",
-            "template_generation_writes_enabled",
             "template_retirement_enabled",
             "template_retention_days",
         ] {
@@ -4007,6 +4431,84 @@ mod tests {
             .insert("unknown".to_string(), 60);
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("unsupported service tier"));
+    }
+
+    fn stripe_config_with_base(api_base_url: Option<&str>) -> StripeConfig {
+        StripeConfig {
+            api_key: "sk_test_fake".to_string(),
+            webhook_secret: "whsec_test".to_string(),
+            price_id: "price_ExampleCredits".to_string(),
+            enable_invoice_creation: false,
+            auto_topup_terms_of_service_text: None,
+            setup_terms_of_service_text: None,
+            tax_code: None,
+            api_base_url: api_base_url.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn stripe_api_base_is_normalised_to_a_trailing_slash() {
+        for (configured, expected) in [
+            (None, None),
+            (Some("http://localhost:12111"), Some("http://localhost:12111/")),
+            (Some("http://localhost:12111/"), Some("http://localhost:12111/")),
+            (
+                Some("https://egress.example.test/stripe"),
+                Some("https://egress.example.test/stripe/"),
+            ),
+            (
+                Some("https://egress.example.test/stripe/"),
+                Some("https://egress.example.test/stripe/"),
+            ),
+        ] {
+            assert_eq!(
+                stripe_config_with_base(configured).api_base().unwrap().as_deref(),
+                expected,
+                "{configured:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stripe_api_base_rejects_unusable_urls() {
+        for configured in [
+            "localhost:12111",
+            "not a url",
+            "ftp://files.example.test/",
+            "https://egress.example.test/stripe?region=a",
+            "https://egress.example.test/stripe#frag",
+        ] {
+            assert!(
+                stripe_config_with_base(Some(configured)).api_base().is_err(),
+                "{configured:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn config_validation_rejects_a_bad_stripe_api_base() {
+        let mut config = Config::default();
+        config.secret_key = Some("test-secret-key".to_string());
+        config.payment = Some(PaymentConfig::Stripe(stripe_config_with_base(Some(
+            "https://egress.example.test/stripe",
+        ))));
+        config.validate().unwrap();
+
+        config.payment = Some(PaymentConfig::Stripe(stripe_config_with_base(Some("not a url"))));
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("api_base_url"), "got {error}");
+    }
+
+    #[test]
+    fn rejected_params_must_be_known() {
+        let mut config = Config::default();
+        config.secret_key = Some("test-secret-key".to_string());
+        config.onwards.rejected_params = vec!["logprobs".to_string()];
+        config.validate().unwrap();
+
+        config.onwards.rejected_params.push("top_k".to_string());
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("onwards.rejected_params names an unknown parameter: top_k"));
     }
 
     #[test]
@@ -4665,7 +5167,8 @@ secret_key: "test-secret-key"
         daemon.retained_response_retirement_enabled = true;
         daemon.batch_archive_retirement_enabled = true;
         daemon.batch_archive_retention_days = Some(1);
-        daemon.template_generation_writes_enabled = true;
+        // Deprecated no-op key: still parses, never rejects.
+        daemon.template_generation_writes_enabled = Some(true);
         daemon.template_retirement_enabled = true;
         daemon.template_retention_days = Some(1);
         assert!(config.validate().is_ok(), "{:?}", config.validate().err());
@@ -4940,6 +5443,65 @@ secret_key: "test-secret-key"
 
             let config = Config::load(&args)?;
             assert_eq!(config.batches.default_throughput, 75.5);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_batch_inflight_enforce_env_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            assert!(!Config::load(&args)?.limits.batch_inflight.enforce, "default is off");
+
+            jail.set_env("DWCTL_LIMITS__BATCH_INFLIGHT__ENFORCE", "true");
+            let config = Config::load(&args)?;
+            assert!(config.limits.batch_inflight.enforce);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_batch_inflight_default_capacity_env_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            assert_eq!(
+                Config::load(&args)?.limits.batch_inflight.default_capacity,
+                Some(200),
+                "default is 200"
+            );
+
+            jail.set_env("DWCTL_LIMITS__BATCH_INFLIGHT__DEFAULT_CAPACITY", "250");
+            assert_eq!(Config::load(&args)?.limits.batch_inflight.default_capacity, Some(250));
+
+            // 0 is the "off" form: no default cap.
+            jail.set_env("DWCTL_LIMITS__BATCH_INFLIGHT__DEFAULT_CAPACITY", "0");
+            assert_eq!(Config::load(&args)?.limits.batch_inflight.default_capacity, None);
+
+            // A negative override is rejected at load.
+            jail.set_env("DWCTL_LIMITS__BATCH_INFLIGHT__DEFAULT_CAPACITY", "-1");
+            assert!(Config::load(&args).is_err(), "a negative env override must be rejected");
 
             Ok(())
         });
@@ -5661,6 +6223,20 @@ background_services:
 
             Ok(())
         });
+    }
+
+    #[test]
+    fn prompt_cache_retention_keeps_at_least_the_recompute_grace() {
+        let config = PromptCacheRetentionConfig::default();
+        assert_eq!(config.grace_days, crate::recompute::report::CACHE_GRACE_DAYS as u64);
+        assert!(config.validate().is_ok());
+        let shorter = PromptCacheRetentionConfig {
+            grace_days: config.grace_days - 1,
+            ..config.clone()
+        };
+        assert!(shorter.validate().unwrap_err().contains("at least"));
+        let longer = PromptCacheRetentionConfig { grace_days: 30, ..config };
+        assert!(longer.validate().is_ok());
     }
 
     #[test]

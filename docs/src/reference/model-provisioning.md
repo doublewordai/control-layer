@@ -23,9 +23,7 @@ clay:
   capabilities: [reasoning]
 
   settings:
-    requests_per_second: 100
-    burst_size: 200
-    capacity: 64
+    realtime_inflight_limit: 64
     batch_capacity: 16
     throughput: 8
     sanitize_responses: true
@@ -141,6 +139,92 @@ its pools; repeating the deployment declaration would be an alias collision.
 Every virtual model requires a non-empty `routing.pools.default`. The only pool
 names currently supported are `default` and `completions`.
 
+## Staging class destinations and public prices
+
+`clay.class_routes` stages explicit destinations on the existing model UUID. This
+is preparatory storage: this release continues using the legacy route, general
+price, cache configuration and model discovery. Public class prices are deliberately
+excluded from runtime tariff/cache histories and existing dashboard price panels;
+customer-specific class deals retain their established billing and credit checks.
+This release does not accept new inference names or enable class routing. Keep the existing `deployments`, `routing`,
+`tariffs` and `cache_tariff` definitions while staging classes.
+
+```yaml
+# Merge into the existing clay block, retaining its other fields:
+clay:
+  class_routes:
+    standard:
+      display_name: Standard
+      endpoint: gateway
+      upstream_model_name: dynamo-example/model:throughput
+      tariffs:
+        - name: Standard realtime
+          purpose: realtime
+          input_per_million_tokens: "1.00"
+          output_per_million_tokens: "2.00"
+    fast:
+      display_name: Fast
+      endpoint: gateway
+      upstream_model_name: dynamo-example/model:fast
+      aliases: [example/model-fast]
+      tariffs:
+        - name: Fast realtime
+          purpose: realtime
+          input_per_million_tokens: "2.00"
+          output_per_million_tokens: "4.00"
+      cache_tariff:
+        write_multiplier_5m: "1.25"
+        write_multiplier_1h: "2.0"
+        write_multiplier_24h: "3.0"
+        read_multiplier: "0.1"
+```
+
+The endpoint must exist. Upstream names are configurable, endpoint-scoped strings
+that must be nonempty and contain no whitespace. Classes may share a destination.
+Class keys retain their IDs when a display name,
+destination or price changes. Nonempty class configuration requires `standard`
+and `fast`, each with a realtime tariff. Additional keys may use lowercase letters,
+digits, hyphens and underscores, starting with a letter. The retired numeric-target
+`serving_classes` declaration is accepted only as an empty map; remove it.
+
+Batch tariffs are allowed only under `standard`: batch always resolves to that
+class regardless of the submitted name. Other classes cannot declare batch prices
+that would never be selected. Model-level batch tariffs remain supported.
+
+Optional aliases are exact synonyms, not discovery entries or extra model rows.
+Do not list the primary bare name or generated `:fast` name as synonyms. Validation
+reserves primary class names and rejects collisions with existing models and other
+synonyms. Ordinary model creates/renames share the catalog lock and collision check.
+Synonyms cannot be rebound to another model/class by a catalog edit; deliberate
+private-name migration requires a later, separately validated procedure.
+
+For a model present in the catalog, class routes and synonyms are complete desired
+state. Omitted synonyms are removed; omitted classes are removed and their public
+prices retired, preserving tariff history. An unchanged declaration preserves IDs,
+timestamps and price versions. A whole model omitted from the catalog follows the
+existing ownership-release rule below, rather than deleting its classes.
+
+Public class tariffs use the existing ledger with `user_id = NULL` and a class
+key. The future resolver order is account/class, account/all-classes, public/class,
+then general compatibility price. Batch still exhausts exact completion-window
+prices before its standard realtime fallback; zero is a price. Class cache tariffs
+contain multipliers, not token prices. They inherit model-level cache enablement
+and minimum prefix length; omission inherits the model's multipliers. Declaring
+class multipliers requires a model-level `cache_tariff`.
+
+The database's `routing_mode` defaults to `legacy` and is outside catalog ownership;
+putting it in YAML is rejected. This release is **not activation-ready**: request
+resolution, billing snapshots, reactive forwarding and writer support must land
+before switching any model. The catalog refuses edits to models already set to
+`class_routes`, instead of overwriting an active route with a composite definition.
+The class-aware SQL resolver is not an activation mechanism: switching this flag
+manually would bypass the supported rollout boundary. Class-aware admission,
+durable billing/cache context and dashboard readers must be integrated together
+before enabling it. Do not enable individual public-price readers in this release.
+Deploy this support release and update the catalog validator before publishing
+catalogs containing the new field. Do not run an older binary against staged public
+class prices: its readers do not distinguish them from general prices.
+
 ## Authoritative behavior
 
 The complete catalog is loaded and validated before a transaction starts. The
@@ -163,6 +247,34 @@ models. Two values are exceptions:
 - A component's `enabled` is applied when provisioning creates the component.
   An existing component keeps its stored value across restarts; enable or
   disable it through the admin API or dashboard.
+- `settings.realtime_inflight_limit` on the virtual model (the default number
+  of realtime requests one account may have in flight on it): when omitted,
+  the stored value is kept, and a new model starts at 14. It belongs to the
+  virtual model; setting it on a deployment is an error. Per-account limits
+  are declared in [account limit files](#account-limits), not in the model
+  catalog. A request that a traffic rule redirects to another model counts
+  against the limit of the model it named.
+- `settings.batch_capacity` on the virtual model is the global cap on batch
+  requests in flight on it, enforced by onwards when
+  [`limits.batch_inflight.enforce`](./configuration.md#batch-in-flight-limits)
+  is on. A deployment's own `batch_capacity` remains valid and still sets that
+  deployment's fusillade starting concurrency; only the virtual model's value
+  becomes the onwards batch cap. A positive virtual-model value
+  is used as the cap; when it is omitted (or non-positive, which is invalid),
+  the model falls back to
+  [`limits.batch_inflight.default_capacity`](./configuration.md#batch-in-flight-limits)
+  (default `200`). Over the cap, batch requests are refused with `529` and
+  code `batch_capacity_exceeded`, never `429`. The virtual-model value is
+  dual-purpose: it
+  also seeds fusillade's per-daemon *starting* concurrency, which adaptive
+  concurrency may grow past (the configured default does **not** change that
+  starting concurrency). Turning enforcement on turns that starting point into
+  a global ceiling, so set the value — or raise `default_capacity` — to the
+  intended global cap first. File batches, flex and background requests all
+  share this one per-model ceiling.
+
+The retired settings `requests_per_second`, `burst_size` and `capacity` are
+still accepted so older catalogs load, but they are ignored.
 
 Models omitted from YAML are not deleted or otherwise rewritten. Their
 `provisioning_source` becomes `NULL`, which makes them manually managed again.
@@ -171,8 +283,10 @@ endpoint synchronization does not delete or rewrite YAML-owned rows.
 
 ## Tariff history
 
-Tariffs retain their temporal history. Their natural key is `(model, purpose,
-completion_window)`, with `completion_window` required only for `batch`:
+Tariffs retain their temporal history. Within an account/class scope, their natural
+key is `(model, purpose, completion_window)`, with `completion_window` required only
+for `batch`. Model-level `tariffs` remain the public all-class compatibility scope;
+each `class_routes.<key>.tariffs` declaration owns its public class scope:
 
 - An identical active tariff is left untouched, retaining its ID and
   `valid_from`.
@@ -254,3 +368,104 @@ A pre-existing future-dated general tariff is different: it already reserves a
 future interval. Model tariff replacement returns an explicit bad-request error
 until an operator resolves that schedule; it neither cancels the schedule nor
 leaves partial model edits. Metadata-only edits are still permitted.
+
+## Account limits
+
+An account file holds one account's own settings on some virtual models: its
+realtime in-flight limits, its prices, and the scheduling priority and latency
+targets sent with its requests. The account is a user or an organisation,
+named by its username, and an organisation's settings cover every key the
+organisation owns. One file per account, mounted at
+`model_provisioning.account_limits_directory`:
+
+```yaml
+account: acme
+priority: 100                     # optional; default for every model
+models:
+  example/chat-model:
+    priority: 300                 # optional; overrides the account default
+    toleration_preset: no-overflow  # optional; overrides the account's preset
+    tariffs:                      # batch prices only, at model level
+      - {name: batch-24h, purpose: batch, completion_window: 24h,
+         input_per_million_tokens: "0.50", output_per_million_tokens: "1.50"}
+    classes:
+      standard:
+        realtime_inflight: 200
+        tariffs:                  # realtime and playground prices, per class
+          - {name: realtime, purpose: realtime,
+             input_per_million_tokens: "0.70", output_per_million_tokens: "1.40"}
+        cache_tariff: {read_multiplier: "0.2", write_multiplier_5m: "1",
+                       write_multiplier_1h: "1", write_multiplier_24h: "1"}
+        ttft_ms: 1000             # optional latency targets
+        itl_ms: 30
+        priority: 500             # optional; overrides the model's priority
+        toleration_preset: gpu-only  # optional; overrides the model's preset
+```
+
+The older shape is still accepted and means the same as
+`classes.standard.realtime_inflight`:
+
+```yaml
+account: acme
+realtime_inflight:
+  example/chat-model: 200
+```
+
+Rules:
+
+- `classes` may name only `standard` for now. A class the file omits keeps the
+  model's defaults.
+- Limits, realtime and playground prices, and the cache tariff are declared per
+  class; model-level `tariffs` take batch prices only.
+- Priority inherits class, then model, then account, then the default. It is
+  sent as the scheduling priority on the account's realtime requests to
+  `dynamo` serving members; batch and flex keep their deadline priority.
+  `ttft_ms` and `itl_ms` are sent as latency targets on the same realtime
+  requests. Neither changes the class the request is billed as. Priority
+  `-2147483648` is reserved for background work and rejected.
+- `toleration_preset` names one of `scheduling.toleration_presets` (see
+  [Account Scheduling](./configuration.md#account-scheduling-tolerations-and-provider-fallback)).
+  It inherits class, then model, then the account's own preset (set by a
+  platform manager), then none. It applies to realtime, flex and background
+  requests, and to batch lines by each line's model. A preset id the
+  deployment does not configure is logged at startup and fails closed to the
+  empty (most restrictive) list.
+- If a model appears in both shapes, the two limits must be equal.
+- An account/model pair may be configured in its account file or in an
+  [organisation overlay](#organisation-catalog-validation-and-ownership), not
+  both. The older limits shape may sit alongside an overlay.
+
+Startup applies the files after the model catalog and organisation overlays,
+in one transaction under one advisory lock:
+
+- **Limits** replace every stored per-account limit with what the files
+  declare. Removing a line or a file returns that account to the model's
+  default on the next start.
+- **Priorities, latency targets and prices** are owned row by row. Declaring
+  an account/model pair makes the file authoritative for its current prices
+  and policies, adopting matching rows written by hand. Omitted prices retire, and changed
+  prices are versioned without altering historical amounts. Rows that another
+  writer owns, such as the organisation catalog's prices, are refused, never
+  taken over.
+
+An empty directory clears everything the account files own. A missing
+directory changes nothing. An unknown account, or a model that is not a live
+virtual model, fails startup before any account-file setting is written; the
+model catalog and organisation overlays have already been applied by then.
+
+Run the same offline validation used by deployment CI:
+
+```sh
+dwctl-model-provisioning validate-account-limits ./account-limits.d \
+  --models ./model-provisioning.d --org-overlays ./org-overlays.d
+dwctl-model-provisioning account-schema
+```
+
+It rejects unknown fields and classes, limits and latency targets below 1, an
+account declared in two files, entries that configure nothing, prices at the
+wrong level, models absent from the model catalog and, with `--org-overlays`,
+pairs configured in both catalogs. Whether each account exists can only be
+checked against the database, at startup.
+
+`GET /admin/api/v1/models/{id}/realtime-inflight-limits` returns a virtual
+model's default and its per-account limits, for platform managers.

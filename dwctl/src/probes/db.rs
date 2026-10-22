@@ -725,7 +725,7 @@ mod tests {
         .unwrap()
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_create_and_get_probe(pool: PgPool) {
         let deployment_id = setup_test_deployment(&pool).await;
 
@@ -751,7 +751,7 @@ mod tests {
         assert_eq!(fetched.name, created.name);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_list_probes(pool: PgPool) {
         // Create separate deployment for each probe
         for i in 0..3 {
@@ -775,7 +775,7 @@ mod tests {
         assert_eq!(probes.len(), 3);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_list_active_probes(pool: PgPool) {
         // Create separate deployments for each probe
         let deployment_id1 = setup_test_deployment(&pool).await;
@@ -818,7 +818,7 @@ mod tests {
         assert_eq!(active[0].id, probe1.id);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_activate_deactivate_probe(pool: PgPool) {
         let deployment_id = setup_test_deployment(&pool).await;
 
@@ -847,7 +847,7 @@ mod tests {
         assert!(activated.active);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_update_probe(pool: PgPool) {
         let deployment_id = setup_test_deployment(&pool).await;
 
@@ -896,7 +896,7 @@ mod tests {
         assert_eq!(unchanged.interval_seconds, 120);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_delete_probe(pool: PgPool) {
         let deployment_id = setup_test_deployment(&pool).await;
 
@@ -921,7 +921,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_deployment_statuses(pool: PgPool) {
         let deployment_id = setup_test_deployment(&pool).await;
 
@@ -948,7 +948,7 @@ mod tests {
         assert_eq!(*interval, Some(60));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_statistics_empty(pool: PgPool) {
         let deployment_id = setup_test_deployment(&pool).await;
 
@@ -974,7 +974,7 @@ mod tests {
         assert_eq!(stats.success_rate, 0.0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_probe_results_empty(pool: PgPool) {
         let deployment_id = setup_test_deployment(&pool).await;
 
@@ -996,7 +996,7 @@ mod tests {
         assert_eq!(results.len(), 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_probe_notify_trigger(pool: PgPool) {
         use sqlx::postgres::PgListener;
         use tokio::time::{Duration, timeout};

@@ -439,7 +439,7 @@ jsonpath "$.tariffs[0].output_price_per_token" matches "^0\\.01"
 jsonpath "$.provider_pricing.input_price_per_token" matches "^0\\.0025"
 jsonpath "$.provider_pricing.output_price_per_token" matches "^0\\.005"
 
-# Admin updates rate limits - should succeed
+# Admin sends the retired rate-limit fields - accepted and ignored
 PATCH http://localhost:3001/admin/api/v1/models/{{user2_model_id}}
 [Cookies]
 dwctl_session: {{admin_jwt}}
@@ -450,8 +450,8 @@ dwctl_session: {{admin_jwt}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{user2_model_id}}"
-jsonpath "$.requests_per_second" == 500.0
-jsonpath "$.burst_size" == 1000
+jsonpath "$.requests_per_second" not exists
+jsonpath "$.burst_size" not exists
 
 # =============================================================================
 # Capacity Fields Permission Tests
@@ -477,7 +477,7 @@ HTTP 200
 [Captures]
 capacity_model_id: jsonpath "$.id"
 [Asserts]
-jsonpath "$.capacity" == 50
+jsonpath "$.capacity" not exists
 jsonpath "$.batch_capacity" == 10
 
 # Add to everyone group so users can access it
@@ -516,23 +516,22 @@ jsonpath "$.data[*].batch_capacity" count == 0
 # PlatformManager CAN see capacity fields
 # -----------------------------------------------------------------------------
 
-# Admin fetches model - should see capacity
+# Admin fetches model - should see batch capacity, and the retired capacity is ignored
 GET http://localhost:3001/admin/api/v1/models/{{capacity_model_id}}
 [Cookies]
 dwctl_session: {{admin_jwt}}
 HTTP 200
 [Asserts]
-jsonpath "$.capacity" == 50
+jsonpath "$.capacity" not exists
 jsonpath "$.batch_capacity" == 10
 
-# Admin lists models - should see capacity
+# Admin lists models - should see batch capacity
 GET http://localhost:3001/admin/api/v1/models
 [Cookies]
 dwctl_session: {{admin_jwt}}
 HTTP 200
 [Asserts]
-# Find the specific model and verify it has capacity fields
-jsonpath "$.data[?(@.id == '{{capacity_model_id}}')].capacity" nth 0 == 50
+jsonpath "$.data[*].capacity" count == 0
 jsonpath "$.data[?(@.id == '{{capacity_model_id}}')].batch_capacity" nth 0 == 10
 
 # Clean up capacity test model
@@ -736,9 +735,9 @@ jsonpath "$.groups" exists
 jsonpath "$.metrics" exists
 jsonpath "$.status" exists
 jsonpath "$.endpoint" exists
-# Rate limits visible to admin
-jsonpath "$.requests_per_second" exists
-jsonpath "$.burst_size" exists
+# The retired rate limits are no longer returned, even to admins
+jsonpath "$.requests_per_second" not exists
+jsonpath "$.burst_size" not exists
 
 # Admin fetches model with just endpoints (public info) - should work
 GET http://localhost:3001/admin/api/v1/models/{{public_model_id}}?include=endpoints
@@ -805,31 +804,31 @@ jsonpath "$.data[?(@.id == '{{user1_model_id}}')].tariffs" nth 0 exists
 jsonpath "$.data[?(@.id == '{{user1_model_id}}')].provider_pricing" nth 0 exists
 
 # =============================================================================
-# Rate Limits Visibility Confirmation
+# Retired Rate Limits
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# Explicit confirmation: PlatformManager CAN see rate limits
+# The retired rate limits are no longer returned, even to a PlatformManager
 # -----------------------------------------------------------------------------
 
-# Admin GET by ID - should see rate limits (has ModelRateLimits::ReadAll)
+# Admin GET by ID - no rate limits
 GET http://localhost:3001/admin/api/v1/models/{{user1_model_id}}
 [Cookies]
 dwctl_session: {{admin_jwt}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{user1_model_id}}"
-jsonpath "$.requests_per_second" == 100.0
-jsonpath "$.burst_size" == 200
+jsonpath "$.requests_per_second" not exists
+jsonpath "$.burst_size" not exists
 
-# Admin LIST - should see rate limits on all models
+# Admin LIST - no rate limits on any model
 GET http://localhost:3001/admin/api/v1/models
 [Cookies]
 dwctl_session: {{admin_jwt}}
 HTTP 200
 [Asserts]
-jsonpath "$.data[0].requests_per_second" exists
-jsonpath "$.data[0].burst_size" exists
+jsonpath "$.data[*].requests_per_second" count == 0
+jsonpath "$.data[*].burst_size" count == 0
 
 # =============================================================================
 # StandardUser Permissions Tests (LIST)
@@ -1061,9 +1060,9 @@ jsonpath "$.data[0].groups" exists
 jsonpath "$.data[0].metrics" exists
 jsonpath "$.data[0].status" exists
 jsonpath "$.data[0].endpoint" exists
-# Rate limits visible to admin
-jsonpath "$.data[0].requests_per_second" exists
-jsonpath "$.data[0].burst_size" exists
+# The retired rate limits are no longer returned, even to admins
+jsonpath "$.data[*].requests_per_second" count == 0
+jsonpath "$.data[*].burst_size" count == 0
 
 # -----------------------------------------------------------------------------
 # PlatformManager can see deleted models with deleted=true

@@ -44,21 +44,13 @@ pub struct OrganizationUpdate {
     /// organization, or by a platform manager holding UpdateAll on
     /// organizations — an org admin is refused. Omit to leave unchanged.
     pub zero_data_retention: Option<bool>,
-    /// Account setting: elevated serving classes this organisation holds
-    /// (`interactive`, `throughput`). A request naming a class not held is
-    /// refused. Platform managers only (UpdateAll on organizations): never
-    /// the organisation itself, whatever its role. Omit to leave unchanged;
-    /// an empty list revokes all.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub granted_serving_classes: Option<Vec<String>>,
-    /// Account setting: serving class this organisation's realtime requests
-    /// ask for when the request names none (`interactive` or `throughput`);
-    /// applies where the organisation holds it and the model offers it.
-    /// Platform managers only. Omit to leave unchanged; null clears it.
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
-    pub default_serving_class: Option<Option<String>>,
-    /// Account setting: never fall over to an external provider. Platform
-    /// managers only. Omit to leave unchanged.
+    /// Account setting: never fall over to an external provider. When on,
+    /// onwards restricts the organisation's requests to the composite's
+    /// self-hosted members — providers whose endpoint kind is not `external`
+    /// (the `inference_endpoints.kind` column). This is the gateway's
+    /// provider-fallback setting; it does not influence where the inference
+    /// backend places an accepted request, which is what `toleration_preset`
+    /// controls. Platform managers only. Omit to leave unchanged.
     pub self_hosted_only: Option<bool>,
     /// Admit signups from this workspace's claimed email domain as members
     /// automatically. Same gate as `zero_data_retention` above — an **owner**
@@ -73,6 +65,14 @@ pub struct OrganizationUpdate {
     /// Omit to leave unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled_modalities: Option<Vec<crate::modalities::Modality>>,
+    /// Account setting: the id of a scheduling-toleration preset
+    /// (`scheduling.toleration_presets` in config) pinned to every request from
+    /// this organization, written to `nvext.routing_constraints.tolerations`.
+    /// An unknown id is rejected with a 400. Platform managers only (UpdateAll
+    /// on organizations): never the organization itself, whatever its role.
+    /// Omit to leave unchanged; `null` clears the preset.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub toleration_preset: Option<Option<String>>,
 }
 
 /// Full organization details returned by the API.
@@ -102,6 +102,13 @@ pub struct OrganizationResponse {
     /// any member with access to the organization; only owners change it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_modalities: Option<Vec<crate::modalities::Modality>>,
+    /// Account setting: the id of the scheduling-toleration preset pinned to
+    /// every request from this organization, or `null` for the "Default"
+    /// setting (nothing pinned). Present only for platform managers (callers
+    /// with UpdateAll on organizations): an operator's routing decision, not
+    /// workspace data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub toleration_preset: Option<String>,
 }
 
 impl OrganizationResponse {
@@ -112,6 +119,7 @@ impl OrganizationResponse {
             pending_email_change: None,
             auto_join_enabled: None,
             disabled_modalities: None,
+            toleration_preset: None,
         }
     }
 
@@ -132,6 +140,13 @@ impl OrganizationResponse {
 
     pub fn with_disabled_modalities(mut self, disabled: crate::modalities::ModalitySet) -> Self {
         self.disabled_modalities = Some(disabled.to_vec());
+        self
+    }
+
+    /// Include the scheduling-toleration preset. Only the handlers that have
+    /// already checked the caller may see it (platform managers only).
+    pub fn with_toleration_preset(mut self, preset: Option<String>) -> Self {
+        self.toleration_preset = preset;
         self
     }
 }

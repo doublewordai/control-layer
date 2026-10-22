@@ -56,14 +56,12 @@ pub struct UserUpdateDBRequest {
     pub auto_topup_monthly_limit: Option<Option<f32>>,
     /// Account-wide zero-data-retention flag. `None` = don't change.
     pub zero_data_retention: Option<bool>,
-    /// Account setting: default serving class. `None` = don't change,
-    /// `Some(None)` = clear, `Some(Some(class))` = set.
-    pub default_serving_class: Option<Option<String>>,
     /// Account setting: never fall over to an external provider. `None` = don't change.
     pub self_hosted_only: Option<bool>,
-    /// Account setting: elevated serving classes held. `None` = don't change;
-    /// `Some(vec![])` = revoke all.
-    pub granted_serving_classes: Option<Vec<String>>,
+    /// Account setting: the scheduling-toleration preset id pinned to this
+    /// account's requests. `None` = don't change, `Some(None)` = clear (back to
+    /// the "Default" setting), `Some(Some(id))` = set the preset.
+    pub toleration_preset: Option<Option<String>>,
 }
 
 impl UserUpdateDBRequest {
@@ -79,9 +77,8 @@ impl UserUpdateDBRequest {
             auto_topup_threshold: update.auto_topup_threshold,
             auto_topup_monthly_limit: update.auto_topup_monthly_limit,
             zero_data_retention: update.zero_data_retention,
-            default_serving_class: update.default_serving_class,
             self_hosted_only: update.self_hosted_only,
-            granted_serving_classes: update.granted_serving_classes,
+            toleration_preset: update.toleration_preset,
         }
     }
 }
@@ -124,10 +121,9 @@ pub struct UserDBResponse {
     pub zero_data_retention: bool,
     /// Bill this account by emailed invoice rather than an immediate card charge.
     pub invoicing_enabled: bool,
-    /// Account setting: elevated serving classes this account holds.
-    pub granted_serving_classes: Vec<String>,
-    /// Account setting: serving class the account's requests ask for by default.
-    pub default_serving_class: Option<String>,
     /// Account setting: never fall over to an external provider.
     pub self_hosted_only: bool,
+    /// Account setting: the scheduling-toleration preset id pinned to this
+    /// account, or `None` for the "Default" setting.
+    pub toleration_preset: Option<String>,
 }

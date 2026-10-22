@@ -9,6 +9,7 @@ use crate::reasoning::ReasoningTranslationOverrides;
 use crate::types::{DeploymentId, InferenceEndpointId, UserId};
 use bon::Builder;
 use chrono::{DateTime, NaiveDate, Utc};
+use onwards::affinity::AffinityConfig as OnwardsAffinityConfig;
 use onwards::aimd::AimdConfig as OnwardsAimdConfig;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -408,6 +409,55 @@ impl Default for AimdConfig {
     }
 }
 
+/// Priority-only conversation affinity: the preferred provider keeps about
+/// `target_conversations` of the active conversations, decided per
+/// conversation rather than per request. Missing/null keeps per-request
+/// selection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct AffinityConfig {
+    pub enabled: bool,
+    /// Conversations to keep on the preferred provider. Size it to the
+    /// preferred provider's concurrency.
+    pub target_conversations: usize,
+    /// Drift allowed around the target before the share moves; defaults to a
+    /// tenth of the target.
+    pub margin: Option<usize>,
+    /// A conversation stays active this long after its last request.
+    pub active_window_ms: u64,
+    /// The share is recomputed at multiples of this much wall-clock time.
+    pub update_interval_ms: u64,
+    /// Upper bound on conversations tracked per gateway process.
+    pub max_tracked: usize,
+}
+
+impl From<AffinityConfig> for OnwardsAffinityConfig {
+    fn from(c: AffinityConfig) -> Self {
+        Self {
+            enabled: c.enabled,
+            target_conversations: c.target_conversations,
+            margin: c.margin,
+            active_window_ms: c.active_window_ms,
+            update_interval_ms: c.update_interval_ms,
+            max_tracked: c.max_tracked,
+        }
+    }
+}
+
+impl Default for AffinityConfig {
+    fn default() -> Self {
+        let c = OnwardsAffinityConfig::default();
+        Self {
+            enabled: c.enabled,
+            target_conversations: c.target_conversations,
+            margin: c.margin,
+            active_window_ms: c.active_window_ms,
+            update_interval_ms: c.update_interval_ms,
+            max_tracked: c.max_tracked,
+        }
+    }
+}
+
 /// Fallback configuration for composite models
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct FallbackConfig {
@@ -442,6 +492,8 @@ pub struct FallbackConfig {
     pub first_token_timeout_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aimd: Option<AimdConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affinity: Option<AffinityConfig>,
 }
 
 impl FallbackConfig {
@@ -457,6 +509,7 @@ impl FallbackConfig {
             max_total_backoff_ms: None,
             first_token_timeout_ms: None,
             aimd: None,
+            affinity: None,
         }
     }
 }
@@ -569,9 +622,7 @@ pub struct DeploymentCreateDBRequest {
     pub capabilities: Option<Vec<String>>,
     /// Inference endpoint for regular models. Must be None for composite models.
     pub hosted_on: Option<InferenceEndpointId>,
-    pub requests_per_second: Option<f32>,
-    pub burst_size: Option<i32>,
-    pub capacity: Option<i32>,
+    pub realtime_inflight_limit: Option<i32>,
     pub batch_capacity: Option<i32>,
     pub throughput: Option<f32>,
     // Provider/downstream pricing
@@ -604,6 +655,7 @@ pub struct DeploymentCreateDBRequest {
     pub backoff_max_total_ms: Option<i32>,
     pub first_token_timeout_ms: Option<i64>,
     pub aimd: Option<AimdConfig>,
+    pub affinity: Option<AffinityConfig>,
     /// Whether to sanitize/filter sensitive data from model responses (defaults to false)
     #[builder(default = false)]
     pub sanitize_responses: bool,
@@ -643,9 +695,6 @@ impl DeploymentCreateDBRequest {
                     .maybe_model_type(standard.model_type)
                     .maybe_capabilities(standard.capabilities)
                     .hosted_on(standard.hosted_on)
-                    .maybe_requests_per_second(standard.requests_per_second)
-                    .maybe_burst_size(standard.burst_size)
-                    .maybe_capacity(standard.capacity)
                     .maybe_batch_capacity(standard.batch_capacity)
                     .maybe_throughput(standard.throughput)
                     .maybe_provider_pricing(standard.provider_pricing)
@@ -676,9 +725,7 @@ impl DeploymentCreateDBRequest {
                 .maybe_description(composite.description)
                 .maybe_model_type(composite.model_type)
                 .maybe_capabilities(composite.capabilities)
-                .maybe_requests_per_second(composite.requests_per_second)
-                .maybe_burst_size(composite.burst_size)
-                .maybe_capacity(composite.capacity)
+                .maybe_realtime_inflight_limit(composite.realtime_inflight_limit)
                 .maybe_batch_capacity(composite.batch_capacity)
                 .maybe_throughput(composite.throughput)
                 .is_composite(true)
@@ -697,6 +744,7 @@ impl DeploymentCreateDBRequest {
                 .maybe_backoff_max_total_ms(composite.backoff_max_total_ms)
                 .maybe_first_token_timeout_ms(composite.first_token_timeout_ms)
                 .maybe_aimd(composite.aimd)
+                .maybe_affinity(composite.affinity)
                 .sanitize_responses(composite.sanitize_responses)
                 .trusted(composite.trusted.unwrap_or(false))
                 .maybe_allowed_batch_completion_windows(composite.allowed_batch_completion_windows)
@@ -718,9 +766,7 @@ pub struct DeploymentUpdateDBRequest {
     pub status: Option<ModelStatus>,
     pub last_sync: Option<Option<DateTime<Utc>>>,
     pub deleted: Option<bool>,
-    pub requests_per_second: Option<Option<f32>>,
-    pub burst_size: Option<Option<i32>>,
-    pub capacity: Option<Option<i32>>,
+    pub realtime_inflight_limit: Option<i32>,
     pub batch_capacity: Option<Option<i32>>,
     pub throughput: Option<Option<f32>>,
     // Provider pricing updates
@@ -745,6 +791,7 @@ pub struct DeploymentUpdateDBRequest {
     pub backoff_max_total_ms: Option<Option<i32>>,
     pub first_token_timeout_ms: Option<Option<i64>>,
     pub aimd: Option<Option<AimdConfig>>,
+    pub affinity: Option<Option<AffinityConfig>>,
     /// Whether to sanitize/filter sensitive data from model responses
     pub sanitize_responses: Option<bool>,
     /// Whether to mark provider as trusted in strict mode (bypasses sanitization)
@@ -765,9 +812,7 @@ impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
             .maybe_description(update.description)
             .maybe_model_type(update.model_type)
             .maybe_capabilities(update.capabilities)
-            .maybe_requests_per_second(update.requests_per_second)
-            .maybe_burst_size(update.burst_size)
-            .maybe_capacity(update.capacity)
+            .maybe_realtime_inflight_limit(update.realtime_inflight_limit)
             .maybe_batch_capacity(update.batch_capacity)
             .maybe_throughput(update.throughput)
             .maybe_provider_pricing(update.provider_pricing)
@@ -786,6 +831,7 @@ impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
             .maybe_backoff_max_total_ms(update.backoff_max_total_ms)
             .maybe_first_token_timeout_ms(update.first_token_timeout_ms)
             .maybe_aimd(update.aimd)
+            .maybe_affinity(update.affinity)
             .maybe_sanitize_responses(update.sanitize_responses)
             .maybe_trusted(update.trusted)
             .maybe_reasoning_translation_overrides(update.reasoning_translation_overrides)
@@ -831,9 +877,7 @@ pub struct DeploymentDBResponse {
     pub deleted: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    pub requests_per_second: Option<f32>,
-    pub burst_size: Option<i32>,
-    pub capacity: Option<i32>,
+    pub realtime_inflight_limit: i32,
     pub batch_capacity: Option<i32>,
     /// Throughput in requests/second for batch capacity calculations
     pub throughput: Option<f32>,
@@ -861,6 +905,7 @@ pub struct DeploymentDBResponse {
     pub backoff_max_total_ms: Option<i32>,
     pub first_token_timeout_ms: Option<i64>,
     pub aimd: Option<AimdConfig>,
+    pub affinity: Option<AffinityConfig>,
     /// Whether to sanitize/filter sensitive data from model responses
     pub sanitize_responses: bool,
     /// Whether to mark provider as trusted in strict mode (bypasses sanitization)
@@ -872,9 +917,6 @@ pub struct DeploymentDBResponse {
     pub metadata: serde_json::Value,
     /// Declarative source reapplied during startup, or None for manually managed rows.
     pub provisioning_source: Option<String>,
-    /// Serving classes this model offers, keyed by class name, each a preset
-    /// of targets (`{ttft_ms, itl_ms, priority}`; migration 149).
-    pub serving_classes: serde_json::Value,
 }
 
 /// DB action for a traffic routing rule (used at the repository layer)

@@ -31,6 +31,24 @@ pub struct ImageNormalizerConfig {
     /// Signed-URL TTL policy.
     #[serde(default)]
     pub signing: SigningConfig,
+
+    /// Store each ingest under its own object key.
+    ///
+    /// Off (the default): tokens are content-addressed (`dw-img://{sha256}`)
+    /// and ingest reuses an existing object, skipping the upload.
+    ///
+    /// On: each ingest gets a random upload ID (`dw-img://{sha256}.{upload_id}`)
+    /// and its own object, uploaded with a single PUT and no existence check.
+    /// The content hash stays the image's identity for access grants and the
+    /// prompt cache.
+    ///
+    /// Every version that ships this setting reads both token forms, but older
+    /// versions read only content-addressed tokens. Turn it on only once every
+    /// replica runs a version that has this setting, and turn it off before
+    /// rolling back past that version — otherwise queued requests holding
+    /// upload-ID tokens fail on the older replicas.
+    #[serde(default)]
+    pub unique_upload_keys: bool,
 }
 
 /// Object-store backend selection.
@@ -80,7 +98,9 @@ pub enum BackendConfig {
         #[serde(default = "default_true")]
         force_path_style: bool,
         /// Re-upload an object on a dedup hit once it is this old, in
-        /// seconds. `0` disables the check.
+        /// seconds. `0` disables the check. Applies only while
+        /// `unique_upload_keys` is off: with it on, every ingest uploads a
+        /// fresh object, so there are no dedup hits to refresh.
         ///
         /// Objects are content-addressed and deduplicated, so a customer who
         /// reuses an image has it uploaded once and referenced from then on.
@@ -309,6 +329,7 @@ mod tests {
                 dispatch_ttl_headroom_secs: 300,
                 dashboard_ttl_secs: 30,
             },
+            unique_upload_keys: true,
         };
         let json = serde_json::to_string(&cfg).expect("serialize");
         let back: ImageNormalizerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -321,6 +342,13 @@ mod tests {
         assert!(back.fetcher.mime_allowed("image/png"));
         assert!(!back.fetcher.mime_allowed("image/jpeg"));
         assert_eq!(back.signing.realtime_ttl().as_secs(), 60);
+        assert!(back.unique_upload_keys);
+    }
+
+    #[test]
+    fn unique_upload_keys_defaults_off() {
+        let c: ImageNormalizerConfig = serde_yaml::from_str("enabled: true\nbackend:\n  type: memory\n").unwrap();
+        assert!(!c.unique_upload_keys);
     }
 
     #[test]

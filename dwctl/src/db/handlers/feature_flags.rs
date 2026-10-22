@@ -48,7 +48,7 @@ mod tests {
     use sqlx::PgPool;
     use tokio::time::{Duration, timeout};
 
-    #[sqlx::test(fixtures(path = "../../sync/onwards_config/fixtures", scripts("cache_base")))]
+    #[dwctl_test_macros::test(fixtures(path = "../../sync/onwards_config/fixtures", scripts("cache_base")))]
     async fn test_feature_flags_lifecycle(pool: PgPool) {
         let account: uuid::Uuid = "00000000-0000-0000-0000-0000000000a1".parse().unwrap();
         let other: uuid::Uuid = "00000000-0000-0000-0000-0000000000b1".parse().unwrap();

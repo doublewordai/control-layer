@@ -1,0 +1,50 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT p.user_id, dm.alias, p.serving_class, p.priority, p.ttft_ms, p.itl_ms\n        FROM account_model_policies p\n        INNER JOIN deployed_models dm ON dm.id = p.deployed_model_id\n        INNER JOIN users u ON u.id = p.user_id\n        WHERE dm.deleted = FALSE\n          AND u.is_deleted = FALSE\n          AND (p.serving_class IS NULL OR p.serving_class = 'standard')\n        ORDER BY p.serving_class NULLS FIRST\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "serving_class",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "priority",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "ttft_ms",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "itl_ms",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "95bac76d1001d7010e8921cf4d531dc0de7b833f86ee0d35929c784990c7c0eb"
+}

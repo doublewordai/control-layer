@@ -29,6 +29,8 @@ use crate::{
     db::errors::DbError,
     db::handlers::{Credits, api_keys::ApiKeys},
     errors::Error,
+    inference::rejections::{Recorder, RejectionCode},
+    telemetry::span_account_name,
     types::UserId,
 };
 use axum::{
@@ -38,10 +40,12 @@ use axum::{
     middleware::Next,
     response::IntoResponse,
 };
+use onwards::{ErrorOrigin, RequestIdentity};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use sqlx::PgPool;
 use tracing::{debug, instrument};
+use uuid::Uuid;
 
 /// Request body structure for extracting model name
 #[derive(Debug, Deserialize)]
@@ -84,6 +88,12 @@ pub async fn error_enrichment_middleware(
     };
 
     let model_name = serde_json::from_slice::<ChatRequest>(&bytes).ok().map(|req| req.model);
+    // The model as a span label: only a configured alias, like onwards
+    // records, never arbitrary client input.
+    let span_model = model_name
+        .as_deref()
+        .and_then(|model| parts.extensions.get::<Recorder>()?.configured_alias(model))
+        .map(str::to_string);
 
     // Reconstruct the request with the body
     let reconstructed = Request::from_parts(parts, Body::from(bytes));
@@ -93,8 +103,12 @@ pub async fn error_enrichment_middleware(
 
     // Only enrich 403 errors when we have an API key
     // Note: This middleware is applied only to the onwards router (AI proxy paths),
-    // so no path filtering is needed here
+    // so no path filtering is needed here.
+    // A 403 a dwctl layer refused with its own code (the image normaliser's
+    // `image_token_forbidden`) already says what went wrong and was counted
+    // under that code, so it passes through unchanged.
     if response.status() == StatusCode::FORBIDDEN
+        && response.extensions().get::<RejectionCode>().is_none()
         && let Some(key) = api_key
     {
         debug!("Intercepted 403 response on AI proxy path, attempting enrichment");
@@ -103,6 +117,18 @@ pub async fn error_enrichment_middleware(
         // a 403 does not fan out into several by-secret queries. None for an
         // unknown/invalid token, in which case the checks fall through.
         let key_info = get_api_key_user_and_purpose(pools.write().into_inner(), &key).await.ok().flatten();
+
+        // Onwards never saw these keys (they are excluded from its key set), so
+        // its response carries no identity. Attach it here, with the refusal
+        // code, so the root request span records who was refused and why.
+        let identity = key_info.as_ref().map(|owner| owner.identity(span_model.clone()));
+        let tag = |mut response: Response<Body>, code: &str| {
+            if let Some(identity) = identity.clone() {
+                response.extensions_mut().insert(identity);
+            }
+            response.extensions_mut().insert(ErrorOrigin::Gateway { code: code.to_string() });
+            response
+        };
 
         // Order matters: the more fundamental the failure, the earlier it runs, so
         // when several conditions could explain the 403 we surface the one that's
@@ -123,7 +149,7 @@ pub async fn error_enrichment_middleware(
 
         // 0. Non-inference key: explain why an otherwise-valid key was rejected,
         //    rather than leaving onwards' generic "forbidden" body.
-        if let Some((_, purpose)) = key_info.as_ref()
+        if let Some(ApiKeyOwner { purpose, .. }) = key_info.as_ref()
             && !crate::db::models::api_keys::is_inference_purpose(purpose)
         {
             let body = serde_json::json!({
@@ -132,50 +158,62 @@ pub async fn error_enrichment_middleware(
                     "type": "invalid_request_error"
                 }
             });
-            return Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap_or_else(|_| StatusCode::FORBIDDEN.into_response());
+            return tag(
+                Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap_or_else(|_| StatusCode::FORBIDDEN.into_response()),
+                "non_inference_key",
+            );
         }
 
         // 1. Model access via group membership
         if let Some(model) = &model_name
-            && let Some((user_id, _)) = key_info.as_ref()
+            && let Some(ApiKeyOwner { user_id, .. }) = key_info.as_ref()
             && let Ok(has_access) = check_user_has_model_access(pools.write().into_inner(), *user_id, model).await
             && !has_access
         {
-            return Error::ModelAccessDenied {
-                model_name: model.clone(),
-                message: format!(
-                    "You do not have access to '{}'. Please contact your administrator to request access.",
-                    model
-                ),
-            }
-            .into_response();
+            return tag(
+                Error::ModelAccessDenied {
+                    model_name: model.clone(),
+                    message: format!(
+                        "You do not have access to '{}'. Please contact your administrator to request access.",
+                        model
+                    ),
+                }
+                .into_response(),
+                "model_access_denied",
+            );
         }
 
         // 2. Modality blocked by a traffic routing rule on this model.
         if let Some(model) = &model_name
             && let Ok(Some(purpose)) = check_modality_blocked(pools.write().into_inner(), &key, model).await
         {
-            return Error::ModalityAccessDenied {
-                model_name: model.clone(),
-                purpose: purpose.clone(),
-                message: modality_blocked_message(&purpose, model),
-            }
-            .into_response();
+            return tag(
+                Error::ModalityAccessDenied {
+                    model_name: model.clone(),
+                    purpose: purpose.clone(),
+                    message: modality_blocked_message(&purpose, model),
+                }
+                .into_response(),
+                "modality_blocked",
+            );
         }
 
         // 3. Insufficient balance.
         if let Ok(Some(balance)) = get_balance_of_api_key(pools.write().into_inner(), &key).await
             && balance <= Decimal::ZERO
         {
-            return Error::InsufficientCredits {
-                current_balance: balance,
-                message: "Account balance too low. Please add credits to continue.".to_string(),
-            }
-            .into_response();
+            return tag(
+                Error::InsufficientCredits {
+                    current_balance: balance,
+                    message: "Account balance too low. Please add credits to continue.".to_string(),
+                }
+                .into_response(),
+                "insufficient_credits",
+            );
         }
 
         // 4. Spending cap. Read-only against the same checkpoint state and
@@ -204,11 +242,14 @@ pub async fn error_enrichment_middleware(
                         "param": null
                     }
                 });
-                return Response::builder()
-                    .status(StatusCode::PAYMENT_REQUIRED)
-                    .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap_or_else(|_| StatusCode::PAYMENT_REQUIRED.into_response());
+                return tag(
+                    Response::builder()
+                        .status(StatusCode::PAYMENT_REQUIRED)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap_or_else(|_| StatusCode::PAYMENT_REQUIRED.into_response()),
+                    "spend_cap_exceeded",
+                );
             }
 
             // The window has ROLLED but the sync hasn't readmitted the scope
@@ -238,12 +279,15 @@ pub async fn error_enrichment_middleware(
                     "param": null
                 }
             });
-            return Response::builder()
-                .status(StatusCode::TOO_MANY_REQUESTS)
-                .header("content-type", "application/json")
-                .header("retry-after", "5")
-                .body(Body::from(body.to_string()))
-                .unwrap_or_else(|_| StatusCode::TOO_MANY_REQUESTS.into_response());
+            return tag(
+                Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header("content-type", "application/json")
+                    .header("retry-after", "5")
+                    .body(Body::from(body.to_string()))
+                    .unwrap_or_else(|_| StatusCode::TOO_MANY_REQUESTS.into_response()),
+                "spend_cap_reset_pending",
+            );
         }
     }
 
@@ -445,15 +489,47 @@ pub async fn get_user_id_of_api_key(pool: PgPool, api_key: &str) -> Result<UserI
 /// lookups keeps the 403 enrichment path (and the Flex check) to one by-secret
 /// query instead of fanning out.
 #[instrument(skip_all, name = "dwctl.get_api_key_user_and_purpose")]
-async fn get_api_key_user_and_purpose(pool: PgPool, api_key: &str) -> Result<Option<(UserId, String)>, DbError> {
+async fn get_api_key_user_and_purpose(pool: PgPool, api_key: &str) -> Result<Option<ApiKeyOwner>, DbError> {
     let mut conn = pool.acquire().await?;
     let row = sqlx::query!(
-        "SELECT user_id, purpose FROM api_keys WHERE secret = $1 AND is_deleted = false",
+        r#"
+        SELECT k.id, k.user_id, k.purpose, u.display_name, u.username
+        FROM api_keys k
+        JOIN users u ON u.id = k.user_id
+        WHERE k.secret = $1 AND k.is_deleted = false
+        "#,
         api_key
     )
     .fetch_optional(&mut *conn)
     .await?;
-    Ok(row.map(|r| (r.user_id, r.purpose)))
+    Ok(row.map(|r| ApiKeyOwner {
+        api_key_id: r.id,
+        user_id: r.user_id,
+        purpose: r.purpose,
+        account_name: span_account_name(r.display_name.as_deref(), &r.username),
+    }))
+}
+
+/// The key behind a request, and the account that owns it.
+struct ApiKeyOwner {
+    api_key_id: Uuid,
+    user_id: UserId,
+    purpose: String,
+    account_name: String,
+}
+
+impl ApiKeyOwner {
+    /// The caller's identity for the root request span, as onwards would have
+    /// attached it had the key been in its key set.
+    fn identity(&self, model: Option<String>) -> RequestIdentity {
+        RequestIdentity {
+            account_id: Some(self.user_id.to_string()),
+            account_name: Some(self.account_name.clone()),
+            api_key_id: Some(self.api_key_id),
+            key_purpose: Some(self.purpose.clone()),
+            model,
+        }
+    }
 }
 
 /// An exempt account must not get a misleading insufficient-credit error when
@@ -506,7 +582,7 @@ pub async fn check_user_has_model_access(pool: PgPool, user_id: UserId, model_al
 /// could send a Flex request and skip a deny rule onwards would have enforced.
 pub async fn validate_api_key_model_access(pool: PgPool, api_key: &str, model: &str) -> Result<(), String> {
     // One by-secret lookup of the key's owner + purpose, reused below.
-    let (user_id, purpose) = get_api_key_user_and_purpose(pool.clone(), api_key)
+    let ApiKeyOwner { user_id, purpose, .. } = get_api_key_user_and_purpose(pool.clone(), api_key)
         .await
         .map_err(|_| "Invalid API key".to_string())?
         .ok_or_else(|| "Invalid API key".to_string())?;
@@ -591,7 +667,7 @@ mod tests {
     }
 
     /// Integration test: Error enrichment middleware enriches 403 with balance info
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_error_enrichment_middleware_enriches_403_with_balance(pool: PgPool) {
         use crate::test::utils::{add_deployment_to_group, add_user_to_group, create_test_group};
@@ -607,8 +683,6 @@ mod tests {
                 name: "Test Key".to_string(),
                 description: None,
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -713,7 +787,7 @@ mod tests {
     /// `spend_cap_exceeded` envelope, the balance-supersedes-cap ordering,
     /// and the rolled-window fallthrough (no false "cap exceeded" during the
     /// post-boundary readmission lag).
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_error_enrichment_spend_cap_arms(pool: PgPool) {
         use crate::db::handlers::api_keys::ApiKeys as ApiKeysRepo;
@@ -736,8 +810,6 @@ mod tests {
                 name: "Capped Key".to_string(),
                 description: None,
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -934,7 +1006,7 @@ mod tests {
     }
 
     /// Integration test: Error enrichment middleware passes through 403 when user has access
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_error_enrichment_middleware_passes_through_legitimate_403(pool: PgPool) {
         use crate::test::utils::{add_deployment_to_group, add_user_to_group, create_test_group};
@@ -955,8 +1027,6 @@ mod tests {
                 name: "Test Key".to_string(),
                 description: None,
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -1025,8 +1095,118 @@ mod tests {
         assert!(!body.contains("access"));
     }
 
+    /// A 403 a dwctl layer refused with its own code keeps its body and code,
+    /// even when the caller would also fail the model-access and balance checks.
+    #[dwctl_test_macros::test]
+    async fn test_error_enrichment_middleware_keeps_dwctl_layer_refusals(pool: PgPool) {
+        use crate::inference::rejections::{self, RejectionCode};
+        use tower::ServiceExt;
+
+        // No credits and no group access to the model.
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let api_key = ApiKeys::new(&mut conn)
+            .create(&ApiKeyCreateDBRequest {
+                user_id: user.id,
+                name: "Test Key".to_string(),
+                description: None,
+                purpose: ApiKeyPurpose::Realtime,
+                created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
+            })
+            .await
+            .unwrap();
+
+        let router = axum::Router::new()
+            .route(
+                "/ai/v1/chat/completions",
+                axum::routing::post(|request: Request<Body>| async move {
+                    let response = (StatusCode::FORBIDDEN, "image token forbidden").into_response();
+                    rejections::refuse(&request, response, "image_token_forbidden", None, None)
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                sqlx_pool_router::DynPools::new(pool.clone()),
+                error_enrichment_middleware,
+            ));
+        let request = Request::post("/ai/v1/chat/completions")
+            .header("authorization", format!("Bearer {}", api_key.secret))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model": "some-model", "messages": []}"#))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let code = response.extensions().get::<RejectionCode>().map(RejectionCode::code);
+        assert_eq!(code, Some("image_token_forbidden"));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"image token forbidden");
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_error_enrichment_identity_labels_only_configured_models(pool: PgPool) {
+        use crate::inference::rejections::test_support::recorder;
+        use tower::ServiceExt;
+
+        // A blank display name falls back to the username, as key labels do.
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        sqlx::query("UPDATE users SET display_name = '   ' WHERE id = $1")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let api_key = ApiKeys::new(&mut conn)
+            .create(&ApiKeyCreateDBRequest {
+                user_id: user.id,
+                name: "Platform Key".to_string(),
+                description: None,
+                purpose: ApiKeyPurpose::Platform,
+                created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
+            })
+            .await
+            .unwrap();
+
+        let router = axum::Router::new()
+            .route(
+                "/ai/v1/chat/completions",
+                axum::routing::post(|| async { StatusCode::FORBIDDEN.into_response() }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                sqlx_pool_router::DynPools::new(pool.clone()),
+                error_enrichment_middleware,
+            ))
+            .layer(axum::Extension(recorder("gpt-4o")));
+        let identity = |model: &'static str| {
+            let router = router.clone();
+            let secret = api_key.secret.clone();
+            async move {
+                let request = Request::post("/ai/v1/chat/completions")
+                    .header("authorization", format!("Bearer {secret}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"model": "{model}", "messages": []}}"#)))
+                    .unwrap();
+                let response = router.oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                response.extensions().get::<RequestIdentity>().cloned().unwrap()
+            }
+        };
+
+        let known = identity("gpt-4o").await;
+        assert_eq!(known.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(known.account_name.as_deref(), Some(user.username.as_str()));
+        assert_eq!(known.key_purpose.as_deref(), Some("platform"));
+
+        // Client input that names no configured alias is not a span label.
+        assert_eq!(identity("anything-a-client-sends").await.model, None);
+    }
+
     /// Integration test: Error enrichment middleware only affects /ai/ paths
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_error_enrichment_middleware_ignores_non_ai_paths(pool: PgPool) {
         let router = axum::Router::new()
@@ -1054,7 +1234,7 @@ mod tests {
     }
 
     /// Integration test: Error enrichment middleware ignores non-403 responses
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_error_enrichment_middleware_ignores_non_403_errors(pool: PgPool) {
         let router = axum::Router::new()
@@ -1088,7 +1268,7 @@ mod tests {
 
     /// Integration test: Error enrichment middleware enriches 403 when a routing
     /// rule denies the API key's purpose (e.g. batch/realtime/playground) for the model.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_error_enrichment_middleware_enriches_403_with_modality_block(pool: PgPool) {
         use crate::test::utils::{add_deployment_to_group, add_user_to_group, create_test_group};
@@ -1104,8 +1284,6 @@ mod tests {
                 name: "Batch Key".to_string(),
                 description: None,
                 purpose: ApiKeyPurpose::Batch,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -1184,7 +1362,7 @@ mod tests {
     /// onwards and execute as `batch` (via the owner's hidden batch key), so this
     /// function must fail them fast — otherwise a Flex request could reach a model where
     /// batch/async access is denied, which onwards would have blocked on dispatch.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_validate_api_key_model_access_rejects_modality_blocked(pool: PgPool) {
         use crate::test::utils::{add_deployment_to_group, add_user_to_group, create_test_group};
@@ -1199,8 +1377,6 @@ mod tests {
                 name: "Batch Key".to_string(),
                 description: None,
                 purpose: ApiKeyPurpose::Batch,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -1243,7 +1419,7 @@ mod tests {
     /// executes as `batch` — so `validate_api_key_model_access` (the Flex pre-dispatch
     /// gate) must allow it. Previously the check matched the caller's own key purpose
     /// and wrongly returned "Real-time access ... is blocked by a routing rule".
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_validate_flex_allowed_despite_realtime_deny_rule(pool: PgPool) {
         use crate::test::utils::{add_deployment_to_group, add_user_to_group, create_test_group};
@@ -1258,8 +1434,6 @@ mod tests {
                 name: "Realtime Key".to_string(),
                 description: None,
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -1291,7 +1465,7 @@ mod tests {
     /// Companion to the regression test: a Flex request submitted with a **realtime**
     /// key IS blocked when the model carries a **batch** deny rule, because Flex runs
     /// as `batch`. This mirrors what onwards would enforce on daemon dispatch.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_validate_flex_blocked_by_batch_deny_rule_with_realtime_key(pool: PgPool) {
         use crate::test::utils::{add_deployment_to_group, add_user_to_group, create_test_group};
@@ -1306,8 +1480,6 @@ mod tests {
                 name: "Realtime Key".to_string(),
                 description: None,
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -1341,7 +1513,7 @@ mod tests {
 
     /// Direct unit test: `validate_api_key_model_access` rejects a non-inference
     /// (platform) key on the Flex path, before any model-access check.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_validate_api_key_model_access_rejects_platform_purpose(pool: PgPool) {
         let user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -1353,8 +1525,6 @@ mod tests {
                 name: "Platform Key".to_string(),
                 description: None,
                 purpose: ApiKeyPurpose::Platform,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -1373,7 +1543,7 @@ mod tests {
     /// The system key is purpose 'platform' but is exempt from the inference
     /// purpose gate on the Flex path (it is used internally for inference),
     /// mirroring the onwards key-sync exemption.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_validate_api_key_model_access_exempts_system_key_from_purpose_gate(pool: PgPool) {
         let mut api_key_conn = pool.acquire().await.unwrap();
         let mut api_keys_repo = ApiKeys::new(&mut api_key_conn);
@@ -1383,8 +1553,6 @@ mod tests {
                 name: "System Key".to_string(),
                 description: None,
                 purpose: ApiKeyPurpose::Platform,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: uuid::Uuid::nil(),
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -1404,7 +1572,7 @@ mod tests {
     }
 
     /// Integration test: Error enrichment middleware passes through when no auth header
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_error_enrichment_middleware_without_auth_header(pool: PgPool) {
         let router = axum::Router::new()

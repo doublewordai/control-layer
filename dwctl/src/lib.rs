@@ -99,7 +99,7 @@
 //!     let config = Config::load(&args)?;
 //!
 //!     // Initialize telemetry (structured logging and optional OpenTelemetry)
-//!     let tracer_provider = dwctl::telemetry::init_telemetry(config.enable_otel_export)?;
+//!     let tracer_provider = dwctl::telemetry::init_telemetry(config.enable_otel_export, config.log_format)?;
 //!
 //!     // Create and start the application
 //!     let app = Application::new(config, tracer_provider).await?;
@@ -140,6 +140,7 @@ fn install_crypto_provider() {
     rustls::crypto::aws_lc_rs::default_provider().install_default().ok();
 }
 
+pub mod account_limits;
 pub mod api;
 pub mod auth;
 pub mod clickhouse;
@@ -159,6 +160,8 @@ pub mod keystore;
 mod leader_election;
 pub mod limits;
 mod metrics;
+/// jemalloc statistics (re-exported for the memory validation harness).
+pub use metrics::allocator as allocator_metrics;
 pub mod migrations;
 pub mod modalities;
 pub mod model_provisioning;
@@ -169,17 +172,21 @@ mod payment_providers;
 pub mod prefix_chain;
 pub mod pricing;
 mod probes;
+pub mod profiling;
 pub mod prompt_cache;
+pub mod realtime_inflight;
 pub mod reasoning;
 mod recompute;
 mod request_logging;
 pub mod sample_files;
+pub mod scheduling;
 mod static_assets;
 mod sync;
 pub mod task_retention;
 pub mod tasks;
 pub mod telemetry;
 mod types;
+mod upload_compression;
 pub mod webhooks;
 
 // Test modules
@@ -210,6 +217,7 @@ use axum::response::Response;
 use axum::{
     Router, ServiceExt, http, middleware,
     routing::{delete, get, patch, post, put},
+    serve::ListenerExt,
 };
 use axum_prometheus::PrometheusMetricLayerBuilder;
 use bon::Builder;
@@ -324,6 +332,15 @@ where
     /// Request validation shared by the inference middleware and batch file
     /// upload, so both enforce the same rules. `None` when disabled.
     pub request_validation: Option<crate::inference::validation::ValidationStage>,
+    /// Per-key account policy map (ZDR, disabled modalities, toleration
+    /// preset), kept fresh by [`crate::sync::key_policy`]. The batch ingest
+    /// path reads an account's resolved tolerations from here (its hidden batch
+    /// key belongs to that account) so batch matches realtime.
+    pub key_policy_cache: crate::sync::key_policy::KeyPolicyCache,
+    /// The live onwards targets, which dwctl's own inference rejections are
+    /// labelled from (see [`crate::inference::rejections`]). `None` labels them
+    /// with neither model nor account.
+    pub onwards_targets: Option<onwards::target::Targets>,
 }
 
 impl<P> AppState<P>
@@ -378,7 +395,15 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
             // compliance ratios are only exact at a bucket edge.
             const SUBMISSION_LATENCY_BUCKETS: &[f64] = &[1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 900.0, 1800.0, 3600.0];
 
+            // Heap profile dump duration (1ms to 30s, the default dump timeout).
+            const HEAP_PROFILE_DUMP_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0];
+
             let handle = PrometheusBuilder::new()
+                .set_buckets_for_metric(
+                    Matcher::Full("dwctl_heap_profile_dump_duration_seconds".to_string()),
+                    HEAP_PROFILE_DUMP_BUCKETS,
+                )
+                .expect("Failed to set custom buckets for dwctl_heap_profile_dump_duration_seconds")
                 .set_buckets_for_metric(Matcher::Full("dwctl_analytics_lag_seconds".to_string()), ANALYTICS_LAG_BUCKETS)
                 .expect("Failed to set custom buckets for dwctl_analytics_lag_seconds")
                 .set_buckets_for_metric(Matcher::Full("dwctl_cache_sync_lag_seconds".to_string()), CACHE_SYNC_LAG_BUCKETS)
@@ -433,6 +458,7 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
                 .install_recorder()
                 .expect("Failed to install Prometheus recorder");
             initialize_database_error_metrics();
+            crate::metrics::describe_cache_info_metrics();
             handle
         })
         .clone()
@@ -604,9 +630,6 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
                             description: None,
                             model_type: None,
                             capabilities: None,
-                            requests_per_second: None,
-                            burst_size: None,
-                            capacity: None,
                             batch_capacity: None,
                             throughput: None,
                             tariffs: None,
@@ -964,6 +987,7 @@ mod pooled_schema_tests {
         );
     }
 
+    // This test exercises initial component migrations and ledger separation.
     #[sqlx::test]
     async fn pooled_component_endpoint_preserves_retained_response_lifecycle(pool: PgPool) {
         use fusillade_arsenal::manager::{RetainedResponseArchiveCutoffs, RetentionPolicy};
@@ -1589,14 +1613,32 @@ async fn setup_database(
     seed_database(&config.model_sources, &main.pooled.write()).await?;
 
     if config.model_provisioning.enabled {
-        // Both catalogs are parsed and validated before either is applied, so
+        // Every catalog is parsed and validated before any is applied, so
         // a malformed overlay file fails startup without a half-applied model
-        // catalog. Overlays reference the model catalog's aliases, so they are
-        // applied after it.
+        // catalog. Overlays and account limits reference the model catalog's
+        // aliases, so they are applied after it.
         let catalog = model_provisioning::Catalog::load(&config.model_provisioning.directory)?;
         let overlays = org_overlays::OrgCatalog::load(&config.model_provisioning.org_overlays_directory)?;
+        let account_limits = account_limits::AccountLimitsCatalog::load(&config.model_provisioning.account_limits_directory)?;
+        account_limits.validate_against_overlays(&overlays)?;
+        // An unconfigured id fails closed at request time; say so up front.
+        for preset in account_limits.toleration_presets() {
+            if !config
+                .scheduling
+                .toleration_presets
+                .iter()
+                .any(|configured| configured.id == preset)
+            {
+                tracing::warn!(
+                    preset,
+                    "account files name a toleration preset this deployment does not configure; \
+                     its requests get the empty (most restrictive) toleration list"
+                );
+            }
+        }
         model_provisioning::apply(&main.pooled.write(), &catalog).await?;
         org_overlays::apply(&main.pooled.write(), &overlays).await?;
+        account_limits::apply(&main.pooled.write(), &account_limits).await?;
     }
 
     Ok((
@@ -1610,7 +1652,12 @@ async fn setup_database(
 /// configuration. Origin/credential handling differs by mode — see [`apply_cors`].
 fn create_cors_layer(cors: &CorsConfig) -> anyhow::Result<CorsLayer> {
     // Parse exposed headers as HeaderName
-    let exposed: Vec<http::HeaderName> = cors.exposed_headers.iter().filter_map(|h| h.parse().ok()).collect();
+    let mut exposed: Vec<http::HeaderName> = cors.exposed_headers.iter().filter_map(|h| h.parse().ok()).collect();
+    // Always let browsers read the request ID so users can quote it in support requests.
+    let request_id_header = http::HeaderName::from_static(REQUEST_ID_HEADER);
+    if !exposed.contains(&request_id_header) {
+        exposed.push(request_id_header);
+    }
 
     let mut cors_layer = CorsLayer::new()
         .allow_methods([
@@ -1828,6 +1875,12 @@ pub async fn build_router(
                     .expect("Failed to create PostgresHandler for request logging")
                     .with_request_serializer(parse_ai_request)
                     .with_response_serializer(parse_ai_response);
+            // The Postgres handler stores every captured header; strip the
+            // credential-bearing ones (authorization, x-api-key, cookie, ...)
+            // before it sees them. This wraps the Postgres handler only: the
+            // analytics handler below still needs the bearer token to attribute
+            // the request to an API key.
+            let postgres_handler = request_logging::credential_scrubber::CredentialHeaderScrubber::new(postgres_handler);
             // TRANSITIONAL (dwctl ZDR): guard the analytics logger so plaintext
             // ZDR bodies (decrypted for the upstream call, captured on the
             // loopback) never land in http_requests / http_responses. The marker
@@ -1994,6 +2047,10 @@ pub async fn build_router(
         .route("/models/{id}", patch(api::handlers::deployments::update_deployed_model))
         .route("/models/{id}", delete(api::handlers::deployments::delete_deployed_model))
         .route("/models/{id}/overlays", get(api::handlers::serving::list_model_overlays))
+        .route(
+            "/models/{id}/realtime-inflight-limits",
+            get(api::handlers::realtime_inflight_limits::list_realtime_inflight_limits),
+        )
         .route("/models/{id}/cache-pricing", get(api::handlers::cache_pricing::get_cache_pricing))
         .route(
             "/models/{id}/cache-pricing",
@@ -2374,6 +2431,13 @@ pub async fn build_router(
             realtime_ttl,
             token_ttl,
             pool: Some(sqlx_pool_router::DynPools::new(state.db.clone())),
+            keystore: state.keystore.clone(),
+            // Same policy map the inference middleware decides ZDR from, so a
+            // realtime ZDR caller's images are inlined rather than stored.
+            key_policy_cache: inference_middleware_state
+                .as_ref()
+                .map(|s| s.key_policy_cache.clone())
+                .unwrap_or_else(crate::sync::key_policy::KeyPolicyCache::empty),
         };
         onwards_router.layer(middleware::from_fn_with_state(
             image_normalizer_state,
@@ -2544,8 +2608,12 @@ pub async fn build_router(
     // it captures the translated Responses object (the row `GET /v1/responses/{id}`
     // reads); INNER to inference_mw, so the correlation headers it relies on
     // (`x-onwards-response-id` / `x-fusillade-request-id`) are already set.
+    // Stream completion sits just inside outlet, so it tracks the body outlet
+    // hands to the client and can tell a disconnect from an early end.
     let onwards_router = if let Some(outlet_layer) = outlet_layer.clone() {
-        onwards_router.layer(outlet_layer)
+        onwards_router
+            .layer(middleware::from_fn(request_logging::stream_completion::track_stream_completion))
+            .layer(outlet_layer)
     } else {
         onwards_router
     };
@@ -2571,6 +2639,16 @@ pub async fn build_router(
         state.limiters.inference_body_size,
         crate::inference::body_limit::limit_inference_body,
     ));
+
+    // The root span records a batch request's completion window once the
+    // response names a batch key.
+    let onwards_router = onwards_router.layer(middleware::from_fn(crate::telemetry::carry_batch_completion_window));
+
+    // Outermost, so every layer above can count the requests it refuses
+    // alongside onwards' own (`onwards_rejections_total`).
+    let onwards_router = onwards_router.layer(axum::Extension(crate::inference::rejections::Recorder::new(
+        state.onwards_targets.clone().unwrap_or_default(),
+    )));
 
     // Build the app with admin API and onwards proxy nested. serve the (restricted) openai spec.
     // Strict mode requires different nesting:
@@ -2683,6 +2761,8 @@ pub async fn build_router(
                 .0
         };
 
+        crate::metrics::error_series::register_documented_routes();
+
         // Get the GenAI registry from the metrics recorder (already initialized earlier)
         let gen_ai_registry = if let Some(ref recorder) = state.metrics_recorder {
             recorder.registry().clone()
@@ -2715,14 +2795,23 @@ pub async fn build_router(
                     axum_metrics
                 }),
             )
-            .layer(prometheus_layer);
+            .layer(prometheus_layer)
+            .layer(middleware::from_fn(crate::metrics::error_series::register_error_series));
     }
 
     // Add tracing layer with OTel-compatible span names and HTTP semantic conventions.
-    // Only trace_id and otel.name are tracing span fields (visible in fmt log output).
-    // All other attributes are set via OpenTelemetrySpanExt::set_attribute() so they're
-    // exported to the trace backend but don't clutter log lines.
+    // Tracing span fields appear on every fmt log line in the request, so only the
+    // correlation keys are fields: trace_id, otel.name, x_request_id,
+    // edge_request_id and provider_request_id (the request IDs are what log
+    // queries match on: `|= "x_request_id=<id>"` on compact lines, and
+    // `| json | x_request_id="<id>"` on JSON lines, which repeat them at the
+    // top level; see `telemetry::CORRELATION_FIELDS`), plus otel.kind, which the
+    // tracing-opentelemetry layer only reads from a field (as a raw attribute it
+    // is ignored and the span exports as `internal`). All other attributes are
+    // set via OpenTelemetrySpanExt::set_attribute() so they're exported to the
+    // trace backend but don't clutter log lines.
     // Reference: https://opentelemetry.io/docs/specs/semconv/http/http-spans/
+    let router = router.layer(middleware::from_fn(record_provider_request_id));
     let router = router.layer(middleware::from_fn(inject_trace_id)).layer(
         TraceLayer::new_for_http()
             .make_span_with(|request: &http::Request<_>| {
@@ -2746,8 +2835,24 @@ pub async fn build_router(
                 let span = tracing::info_span!(
                     "request",
                     trace_id = tracing::field::Empty,
+                    x_request_id = tracing::field::Empty,
+                    edge_request_id = tracing::field::Empty,
+                    provider_request_id = tracing::field::Empty,
                     otel.name = %span_name,
+                    otel.kind = "server",
                 );
+
+                // IDs minted by `assign_request_id`, which runs outside this layer.
+                // Declared span fields are exported as OTel attributes by the
+                // tracing-opentelemetry layer, so no separate set_attribute is needed.
+                // Recorded with `display` so log lines read `x_request_id=<id>`
+                // unquoted, matching `trace_id` and the line filters we document.
+                if let Some(ids) = request.extensions().get::<RequestIds>() {
+                    span.record("x_request_id", tracing::field::display(&ids.x_request_id));
+                    if let Some(edge) = &ids.edge_request_id {
+                        span.record("edge_request_id", tracing::field::display(edge));
+                    }
+                }
 
                 // W3C Trace Context propagation (https://www.w3.org/TR/trace-context/)
                 //
@@ -2772,7 +2877,6 @@ pub async fn build_router(
                     let _ = span.set_parent(parent);
                 }
 
-                span.set_attribute("otel.kind", "Server");
                 span.set_attribute("api.type", api_type.to_string());
                 span.set_attribute("http.request.method", request.method().to_string());
                 span.set_attribute("http.route", route.unwrap_or_default());
@@ -2784,11 +2888,19 @@ pub async fn build_router(
             .on_response(|response: &http::Response<_>, latency: std::time::Duration, span: &tracing::Span| {
                 let status = response.status().as_u16();
                 span.set_attribute("http.response.status_code", i64::from(status));
+                crate::telemetry::record_ai_response_attributes(response, span, status);
                 if status >= 500 {
                     span.set_attribute("otel.status_code", "ERROR");
                     span.set_attribute("error.type", status.to_string());
                 } else if status >= 400 {
-                    span.set_attribute("error.type", status.to_string());
+                    // A dwctl layer that refused the request reports its
+                    // rejection code instead of the bare status, and has
+                    // already set it when it recorded on this span.
+                    match response.extensions().get::<crate::inference::rejections::RejectionCode>() {
+                        Some(rejection) if rejection.recorded_on(span) => {}
+                        Some(rejection) => span.set_attribute("error.type", rejection.code()),
+                        None => span.set_attribute("error.type", status.to_string()),
+                    }
                 }
                 tracing::info!(
                     http.response.status_code = status,
@@ -2812,6 +2924,51 @@ pub async fn build_router(
     Ok(router)
 }
 
+/// Header carrying the request ID, both on responses and towards providers.
+const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// Longest foreign `X-Request-ID` we keep (`edge_request_id`, `provider_request_id`).
+const MAX_INBOUND_REQUEST_ID_LEN: usize = 128;
+
+/// Request IDs attached to the request extensions by [`assign_request_id`].
+#[derive(Debug, Clone)]
+struct RequestIds {
+    /// Freshly minted UUIDv7; the only ID we log as `x_request_id`.
+    x_request_id: String,
+    /// Sanitised inbound `X-Request-ID` (e.g. set by an ingress), kept for correlation only.
+    edge_request_id: Option<String>,
+}
+
+/// Keep a request ID we did not mint (from the edge or a provider) only if it
+/// is short, visible ASCII.
+fn sanitise_inbound_request_id(value: &http::HeaderValue) -> Option<String> {
+    let s = value.to_str().ok()?;
+    (!s.is_empty() && s.len() <= MAX_INBOUND_REQUEST_ID_LEN && s.bytes().all(|b| b.is_ascii_graphic())).then(|| s.to_owned())
+}
+
+/// Middleware that mints a unique request ID for every request.
+///
+/// An inbound `X-Request-ID` is never trusted as our ID (clients and ingresses
+/// can set it, so it is not guaranteed unique). It is preserved as
+/// `edge_request_id` and overwritten with our own value, so that onwards
+/// forwards our ID to providers. The ID is echoed on every response.
+///
+/// Applied outside every other layer, including the admin AI proxy
+/// middleware, by [`Application::serve_with_listener`] and the test server.
+async fn assign_request_id(mut request: axum::extract::Request, next: middleware::Next) -> axum::response::Response {
+    let x_request_id = Uuid::now_v7().to_string();
+    let edge_request_id = request.headers().get(REQUEST_ID_HEADER).and_then(sanitise_inbound_request_id);
+    let value = http::HeaderValue::from_str(&x_request_id).expect("UUID is a valid header value");
+    request.headers_mut().insert(REQUEST_ID_HEADER, value.clone());
+    request.extensions_mut().insert(RequestIds {
+        x_request_id,
+        edge_request_id,
+    });
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(REQUEST_ID_HEADER, value);
+    response
+}
+
 /// Middleware that records the OpenTelemetry trace ID on the current span,
 /// making it visible in fmt log output for Loki → Tempo correlation.
 ///
@@ -2832,6 +2989,22 @@ async fn inject_trace_id(mut request: axum::extract::Request, next: middleware::
     next.run(request).await
 }
 
+/// Records a provider's own `X-Request-ID`, which onwards passes through on
+/// proxied responses, as `provider_request_id` on the request span.
+///
+/// `assign_request_id` replaces the response header with our ID on the way
+/// out, so this is the only place the provider's value is kept. It is
+/// recorded even when the provider echoes back the ID we sent, so queries can
+/// rely on the field being present whenever the provider returned one.
+async fn record_provider_request_id(request: axum::extract::Request, next: middleware::Next) -> axum::response::Response {
+    let span = tracing::Span::current();
+    let response = next.run(request).await;
+    if let Some(provider) = response.headers().get(REQUEST_ID_HEADER).and_then(sanitise_inbound_request_id) {
+        span.record("provider_request_id", tracing::field::display(provider));
+    }
+    response
+}
+
 /// Container for background services and their lifecycle management.
 ///
 /// This struct encapsulates all background tasks that run alongside the HTTP server,
@@ -2844,8 +3017,58 @@ async fn inject_trace_id(mut request: axum::extract::Request, next: middleware::
 /// # Graceful Shutdown
 ///
 /// The struct provides a [`shutdown`](BackgroundServices::shutdown) method to gracefully
-/// stop all background tasks. When dropped, the `drop_guard` will automatically cancel
-/// the shutdown token, signaling all tasks to stop.
+/// stop all background tasks. Most tasks share an eager token that fires when HTTP
+/// draining begins. The responses writer has a later token so accepted requests can
+/// persist their completion before the writer flushes and exits.
+#[derive(Clone)]
+struct BackgroundShutdownTokens {
+    /// Stops daemons and other background work as soon as HTTP draining begins.
+    services: tokio_util::sync::CancellationToken,
+    /// Stops the responses writer only after accepted HTTP requests have drained.
+    responses_writer: tokio_util::sync::CancellationToken,
+}
+
+const RESPONSES_WRITER_TASK_NAME: &str = "responses-writer";
+
+impl BackgroundShutdownTokens {
+    fn new(services: tokio_util::sync::CancellationToken) -> Self {
+        Self {
+            services,
+            responses_writer: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    fn services(&self) -> tokio_util::sync::CancellationToken {
+        self.services.clone()
+    }
+
+    fn responses_writer(&self) -> tokio_util::sync::CancellationToken {
+        self.responses_writer.clone()
+    }
+
+    /// Stop new background work while the HTTP server drains accepted requests.
+    fn begin_http_drain(&self) {
+        self.services.cancel();
+    }
+
+    /// Stop and flush the responses writer after every accepted request has finished.
+    fn finish_http_drain(&self) {
+        self.services.cancel();
+        self.responses_writer.cancel();
+    }
+
+    /// Whether a task's own shutdown phase has begun. The responses writer
+    /// remains supervised while HTTP requests drain because it is still
+    /// responsible for persisting their completion records.
+    fn task_is_shutting_down(&self, task_name: &str) -> bool {
+        if task_name == RESPONSES_WRITER_TASK_NAME {
+            self.responses_writer.is_cancelled()
+        } else {
+            self.services.is_cancelled()
+        }
+    }
+}
+
 pub struct BackgroundServices {
     request_manager: Arc<fusillade_arsenal::PostgresRequestManager<DbPools>>,
     /// The onwards-instance daemon id registered in the `daemons` table
@@ -2886,7 +3109,7 @@ pub struct BackgroundServices {
     background_tasks: tokio::task::JoinSet<anyhow::Result<()>>,
     // Map task IDs to names for logging
     task_names: std::collections::HashMap<tokio::task::Id, &'static str>,
-    shutdown_token: tokio_util::sync::CancellationToken,
+    shutdown_tokens: BackgroundShutdownTokens,
     // Pub so that we can disarm it if we want to
     pub drop_guard: Option<tokio_util::sync::DropGuard>,
     /// Connections encryption key, derived once at startup.
@@ -2904,6 +3127,11 @@ impl BackgroundServices {
         self.task_names.insert(abort_handle.id(), name);
     }
 
+    fn task_is_shutting_down(&self, task_id: tokio::task::Id) -> bool {
+        let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
+        self.shutdown_tokens.task_is_shutting_down(task_name)
+    }
+
     /// Wait for any background task to complete (indicating a failure)
     /// This method is cancel-safe - can be used in tokio::select! without losing tasks
     /// Returns an error with details about which task failed
@@ -2915,7 +3143,7 @@ impl BackgroundServices {
                     futures::future::pending::<()>().await;
                     unreachable!()
                 }
-                Some(Ok((task_id, Ok(())))) if self.shutdown_token.is_cancelled() => {
+                Some(Ok((task_id, Ok(())))) if self.task_is_shutting_down(task_id) => {
                     let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
                     tracing::debug!(task = task_name, "Background task completed during shutdown");
                 }
@@ -2930,7 +3158,7 @@ impl BackgroundServices {
                     );
                     anyhow::bail!("Background task '{}' completed early", task_name)
                 }
-                Some(Ok((task_id, Err(e)))) if self.shutdown_token.is_cancelled() => {
+                Some(Ok((task_id, Err(e)))) if self.task_is_shutting_down(task_id) => {
                     let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
                     tracing::debug!(task = task_name, error = %e, "Background task exited with error during shutdown");
                 }
@@ -2939,7 +3167,7 @@ impl BackgroundServices {
                     crate::background_error!(SUPERVISOR, "task_failed", Error, task = task_name, error = %e, "Background task failed");
                     anyhow::bail!("Background task '{}' failed: {}", task_name, e)
                 }
-                Some(Err(e)) if self.shutdown_token.is_cancelled() => {
+                Some(Err(e)) if self.task_is_shutting_down(e.id()) => {
                     let task_id = e.id();
                     let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
                     tracing::debug!(task = task_name, error = %e, "Background task panicked during shutdown");
@@ -2954,9 +3182,9 @@ impl BackgroundServices {
         }
     }
 
-    /// Get a clone of the shutdown token for coordinating early cancellation
+    /// Get the eager shutdown token used by services that stop during HTTP drain.
     pub fn shutdown_token(&self) -> tokio_util::sync::CancellationToken {
-        self.shutdown_token.clone()
+        self.shutdown_tokens.services()
     }
 
     /// Gracefully shutdown all background tasks.
@@ -2964,12 +3192,16 @@ impl BackgroundServices {
     /// Implements the SIGTERM drain protocol from
     /// `fusillade/docs/plans/2026-04-28-multi-step-responses.md`:
     ///
-    /// 1. Signal all in-process tasks to stop accepting new work
-    ///    (`shutdown_token.cancel()`). The fusillade batch daemon stops
+    /// 1. Signal all in-process tasks to stop accepting new work. The eager
+    ///    token normally fires when HTTP draining begins; cancellation here is
+    ///    idempotent. The fusillade batch daemon stops
     ///    claiming and waits for in-flight workers to finish their
     ///    current loop iteration; it then marks its own daemon row Dead
     ///    via the `Running -> Dead` typestate transition.
-    /// 2. Drain the **onwards-instance daemon** registration: this row
+    /// 2. Now that accepted HTTP requests have finished, stop the responses
+    ///    writer so it closes the channel, drains queued completion records,
+    ///    and flushes them to fusillade.
+    /// 3. Drain the **onwards-instance daemon** registration: this row
     ///    is created manually for realtime/inline-loop attribution and
     ///    is not managed by fusillade's daemon lifecycle, so we mark it
     ///    Dead explicitly + release any rows it owns back to pending.
@@ -2981,8 +3213,10 @@ impl BackgroundServices {
     /// shutdown — a slow/missing drain falls back to time-based
     /// reclaim, which is correct just slower.
     pub async fn shutdown(mut self) {
-        // Signal all background tasks to shutdown
-        self.shutdown_token.cancel();
+        // The HTTP server has finished draining, so no response handler can
+        // enqueue another completion. Stop the remaining background tasks and
+        // let the responses writer close its receiver and flush its buffer.
+        self.shutdown_tokens.finish_http_drain();
 
         // Drain the onwards-instance daemon registration before joining
         // tasks: this is the SIGTERM drain that gives the next pod
@@ -3077,9 +3311,7 @@ impl BackgroundServices {
 
         // Use the same load function as the automatic sync
         // Note: escalation_models is empty for tests - individual tests can set up their own
-        let new_targets =
-            crate::sync::onwards_config::load_targets_from_db(pool, &[], self.strict_mode, &crate::config::RateLimitTiersConfig::default())
-                .await?;
+        let new_targets = crate::sync::onwards_config::load_targets_from_db(pool, &[], self.strict_mode).await?;
 
         // Snapshot the routing table this update should produce, before the
         // config is handed to the channel.
@@ -3200,6 +3432,31 @@ struct BackgroundTaskBuilder {
 
 const FUSILLADE_LEADERSHIP_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
+fn supervise_elected_fusillade_daemon(
+    daemon_handle: tokio::task::JoinHandle<fusillade::Result<()>>,
+    failure_sender: tokio::sync::mpsc::UnboundedSender<String>,
+) -> tokio::task::JoinHandle<fusillade::Result<()>> {
+    // The leadership-loss timeout aborts this outer task. Make ownership of
+    // the inner daemon task cancellation-safe so aborting or dropping the
+    // wrapper cannot detach a still-running daemon.
+    let daemon_handle = tokio_util::task::AbortOnDropHandle::new(daemon_handle);
+    tokio::spawn(async move {
+        match daemon_handle.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                let message = format!("Fusillade daemon error: {error}");
+                let _ = failure_sender.send(message);
+                Err(error)
+            }
+            Err(error) => {
+                let message = format!("Fusillade daemon panic: {error}");
+                let _ = failure_sender.send(message.clone());
+                Err(fusillade::FusilladeError::Other(anyhow::anyhow!(message)))
+            }
+        }
+    })
+}
+
 async fn stop_leader_fusillade_daemon(
     leadership_shutdown: &tokio::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
     daemon_handle: &tokio::sync::Mutex<Option<tokio::task::JoinHandle<fusillade::Result<()>>>>,
@@ -3267,7 +3524,7 @@ async fn stop_leader_fusillade_daemon(
 
 #[cfg(test)]
 mod leadership_shutdown_tests {
-    use super::stop_leader_fusillade_daemon;
+    use super::{stop_leader_fusillade_daemon, supervise_elected_fusillade_daemon};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
@@ -3296,29 +3553,66 @@ mod leadership_shutdown_tests {
     }
 
     #[tokio::test]
-    async fn leadership_loss_aborts_and_awaits_after_explicit_grace() {
-        struct DropFlag(Arc<AtomicBool>);
-        impl Drop for DropFlag {
+    async fn leadership_loss_abort_propagates_through_supervisor_wrapper() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for DropSignal {
             fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
             }
         }
 
         let token_slot = tokio::sync::Mutex::new(Some(tokio_util::sync::CancellationToken::new()));
         let handle_slot = tokio::sync::Mutex::new(None);
-        let dropped = Arc::new(AtomicBool::new(false));
-        let guard = DropFlag(dropped.clone());
-        let handle = tokio::spawn(async move {
+        let (dropped_sender, dropped_receiver) = tokio::sync::oneshot::channel();
+        let guard = DropSignal(Some(dropped_sender));
+        let daemon_handle = tokio::spawn(async move {
             let _guard = guard;
             std::future::pending::<fusillade::Result<()>>().await
         });
+        let (failure_sender, _failure_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let handle = supervise_elected_fusillade_daemon(daemon_handle, failure_sender);
         *handle_slot.lock().await = Some(handle);
         tokio::task::yield_now().await;
 
         stop_leader_fusillade_daemon(&token_slot, &handle_slot, Duration::from_millis(1)).await;
 
-        assert!(dropped.load(Ordering::SeqCst));
+        tokio::time::timeout(Duration::from_secs(1), dropped_receiver)
+            .await
+            .expect("inner daemon should be aborted promptly when its wrapper is aborted")
+            .expect("inner daemon drop signal should be delivered");
         assert!(handle_slot.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn elected_daemon_failure_is_forwarded_to_process_supervisor() {
+        let daemon_handle = tokio::spawn(async { Err(fusillade::FusilladeError::Other(anyhow::anyhow!("heartbeat lease expired"))) });
+        let (failure_sender, mut failure_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let supervised = supervise_elected_fusillade_daemon(daemon_handle, failure_sender);
+
+        let error = supervised
+            .await
+            .expect("supervisor wrapper should not panic")
+            .expect_err("daemon failure must be preserved for leadership-loss cleanup");
+        assert!(error.to_string().contains("heartbeat lease expired"));
+        assert_eq!(
+            failure_receiver.recv().await.as_deref(),
+            Some("Fusillade daemon error: heartbeat lease expired")
+        );
+    }
+
+    #[tokio::test]
+    async fn elected_daemon_clean_shutdown_is_not_forwarded_as_failure() {
+        let daemon_handle = tokio::spawn(async { Ok(()) });
+        let (failure_sender, mut failure_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let supervised = supervise_elected_fusillade_daemon(daemon_handle, failure_sender);
+
+        supervised
+            .await
+            .expect("supervisor wrapper should not panic")
+            .expect("clean daemon shutdown should remain clean");
+        assert!(failure_receiver.recv().await.is_none());
     }
 }
 
@@ -3389,6 +3683,13 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         keystore,
     } = input;
 
+    // Most background work stops as soon as HTTP draining begins. The
+    // responses writer is deliberately independent: accepted streaming
+    // requests can still finish and enqueue completion records until Axum's
+    // graceful shutdown returns.
+    let shutdown_tokens = BackgroundShutdownTokens::new(shutdown_token);
+    let shutdown_token = shutdown_tokens.services();
+
     let db_pools = pools.main.pooled.clone();
     let fusillade_pools = pools.fusillade.pooled.clone();
     let outlet_pools = pools.outlet.clone();
@@ -3434,9 +3735,9 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
             direct_pools.clone(),
             Some(model_capacity_limits.clone()),
             config.background_services.batch_daemon.default_model_concurrency,
+            config.limits.batch_inflight.default_capacity,
             escalation_models,
             config.onwards.strict_mode,
-            config.auth.rate_limits.clone(),
         )
         .await?;
 
@@ -3482,13 +3783,16 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         (onwards::target::Targets::from_config(empty_config)?, None)
     };
 
-    // Per-key account policy map (ZDR flag, disabled modalities): an initial
-    // synchronous load ALWAYS runs, so the map is never empty under live
-    // traffic (an empty map reads every key as non-ZDR and would silently leak
-    // a ZDR account's body). The LISTEN/NOTIFY refresh loop has its own switch,
-    // independent of onwards routing sync: the realtime modality gate enforces
-    // from this map, so it must keep refreshing even where routing sync is off.
-    let key_policy_cache = crate::sync::key_policy::initial_cache(&db_pools.write()).await?;
+    // Per-key account policy map (ZDR flag, disabled modalities, toleration
+    // preset): an initial synchronous load ALWAYS runs, so the map is never
+    // empty under live traffic (an empty map reads every key as non-ZDR and
+    // would silently leak a ZDR account's body). The LISTEN/NOTIFY refresh loop
+    // has its own switch, independent of onwards routing sync: the realtime
+    // modality gate enforces from this map, so it must keep refreshing even
+    // where routing sync is off. The map also carries the config's resolved
+    // toleration presets, so a stored preset id resolves on the hot path.
+    let key_policy_cache =
+        crate::sync::key_policy::initial_cache(&db_pools.write(), crate::scheduling::TolerationPresets::new(&config.scheduling)).await?;
     if config.background_services.key_policy_sync.enabled {
         let policy_pool = dyn_pools.clone();
         let policy_listener_pool = direct_pools.clone();
@@ -3685,6 +3989,18 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         let leadership_shutdown_gain = leadership_shutdown.clone();
         let leadership_shutdown_lose = leadership_shutdown.clone();
 
+        // Elected daemons also need to participate in the process-level
+        // background supervisor. Keep a wrapper handle in the leadership
+        // slot for cooperative cleanup, while forwarding any unexpected
+        // daemon error or panic through this channel so the pod exits.
+        let (leader_daemon_failure_sender, mut leader_daemon_failure_receiver) = tokio::sync::mpsc::unbounded_channel::<String>();
+        background_tasks.spawn("leader-fusillade-daemon", async move {
+            match leader_daemon_failure_receiver.recv().await {
+                Some(message) => anyhow::bail!(message),
+                None => Ok(()),
+            }
+        });
+
         let leader_election_shutdown = shutdown_token.clone();
         background_tasks.spawn("leader-election", async move {
             leader_election::leader_election_task(
@@ -3702,6 +4018,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
                     let postgres_daemon = leader_election_postgres_daemon_gain.clone();
                     let daemon_handle = daemon_handle_gain.clone();
                     let leadership_shutdown = leadership_shutdown_gain.clone();
+                    let leader_daemon_failure_sender = leader_daemon_failure_sender.clone();
                     async move {
                         // Wait for the server to be fully up before starting probes
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -3737,6 +4054,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
                                 let handle = postgres_daemon
                                     .run(session_token.clone())
                                     .map_err(|e| anyhow::anyhow!("Failed to start fusillade daemon: {}", e))?;
+                                let handle = supervise_elected_fusillade_daemon(handle, leader_daemon_failure_sender);
 
                                 // Store the handle so we can abort it when losing leadership
                                 *daemon_handle.lock().await = Some(handle);
@@ -3873,6 +4191,26 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         });
     }
 
+    // jemalloc statistics gauges (Linux only; the sampler idles elsewhere).
+    if config.enable_metrics && config.background_services.allocator_metrics.enabled {
+        let allocator_config = config.background_services.allocator_metrics.clone();
+        let allocator_shutdown = shutdown_token.clone();
+        background_tasks.spawn("allocator-metrics-sampler", async move {
+            metrics::allocator::run_allocator_metrics_sampler(allocator_config, allocator_shutdown).await
+        });
+    }
+
+    // Opt-in heap profile listener. Serving is separate from sampling, which
+    // only happens when the process started with jemalloc `prof:true`.
+    profiling::log_heap_profiling_status();
+    if config.heap_profiling.enabled {
+        let profiling_config = config.heap_profiling.clone();
+        let profiling_shutdown = shutdown_token.clone();
+        background_tasks.spawn("heap-profiling-server", async move {
+            profiling::run_heap_profiling_server(profiling_config, profiling_shutdown).await
+        });
+    }
+
     // Start the usage-refresh daemon: incrementally folds new http_analytics rows into
     // user_model_usage_daily. The analytics batcher (below) nudges it after every flush;
     // this shares an in-process Notify with it rather than round-tripping through Postgres.
@@ -3897,6 +4235,19 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         let daemon_shutdown = shutdown_token.clone();
         background_tasks.spawn("task-retention", async move {
             task_retention::run_task_retention_daemon(daemon_pool, daemon_config, daemon_shutdown).await;
+            Ok(())
+        });
+    }
+
+    // Start the prompt-cache retention daemon: bounded, oldest-first deletion of entries
+    // that expired more than the recompute grace ago. Without it the table only grows.
+    if config.background_services.prompt_cache_retention.enabled {
+        // Retention holds a session advisory lock, which requires a direct connection.
+        let daemon_pool = direct_pools.clone();
+        let daemon_config = config.background_services.prompt_cache_retention.clone();
+        let daemon_shutdown = shutdown_token.clone();
+        background_tasks.spawn("prompt-cache-retention", async move {
+            prompt_cache::retention::run_prompt_cache_retention_daemon(daemon_pool, daemon_config, daemon_shutdown).await;
             Ok(())
         });
     }
@@ -3961,8 +4312,8 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
             request_manager.clone(),
             config.background_services.task_workers.response_writer_batch_size,
         );
-        let writer_shutdown = shutdown_token.clone();
-        background_tasks.spawn("responses-writer", async move {
+        let writer_shutdown = shutdown_tokens.responses_writer();
+        background_tasks.spawn(RESPONSES_WRITER_TASK_NAME, async move {
             writer.run(writer_shutdown).await;
             Ok(())
         });
@@ -4017,7 +4368,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         requests_writer_sender,
         background_tasks,
         task_names,
-        shutdown_token,
+        shutdown_tokens,
         drop_guard: Some(drop_guard),
         connections_encryption_key: encryption_key.clone(),
         keystore,
@@ -4149,10 +4500,18 @@ impl Application {
             .to_fusillade_config_with_limits(Some(model_capacity_limits.clone()));
         let retention_maintenance_config = config.background_services.batch_daemon.to_fusillade_retention_maintenance_config();
 
+        if let Some(value) = config.background_services.batch_daemon.template_generation_writes_enabled {
+            tracing::warn!(
+                template_generation_writes_enabled = value,
+                "batch_daemon.template_generation_writes_enabled is deprecated and ignored: \
+                 the weekly generation-2 template store is the only write path. Remove the key."
+            );
+        }
         let mut request_manager = fusillade_arsenal::PostgresRequestManager::new(
             fusillade_pools.clone(),
             fusillade_arsenal::PostgresStorageConfig::from(&fusillade_daemon_config),
         )
+        .with_maintenance_query_timeout(std::time::Duration::from_millis(fusillade_daemon_config.claim_query_timeout_ms))
         .with_retained_response_fence_seconds(config.background_services.batch_daemon.retention.max_late_writer_seconds)
         .with_realtime_retention_seconds(
             config
@@ -4170,7 +4529,6 @@ impl Application {
                 .retention
                 .batchless_retention_bounds_seconds(),
         )
-        .with_template_generation_writes(config.background_services.batch_daemon.template_generation_writes_enabled)
         .with_download_buffer_size(config.batches.files.download_buffer_size)
         .with_batch_insert_strategy(fusillade_arsenal::BatchInsertStrategy::Batched {
             batch_size: config.batches.files.batch_insert_size,
@@ -4365,6 +4723,7 @@ impl Application {
             keystore: bg_services.keystore.clone(),
             key_policy_cache: bg_services.key_policy_cache.clone(),
             validation: request_validation.clone(),
+            sse_buffer_limit: config.onwards.sse_buffer_limit,
         };
 
         // Build onwards router from targets with body transform + response sanitization.
@@ -4381,6 +4740,12 @@ impl Application {
         // No classifier is injected here.
         // Request-body edits (id-scrub, streaming usage flags) now live in dwctl's own
         // `outbound_request` middleware, so onwards needs no BodyTransformFn.
+        // One Redis connection for both in-flight limiters. The realtime
+        // per-account limit and the global batch cap share it; each has its own
+        // scope and switch. With no Redis URL it is `None` and both fall back to
+        // counting within this replica.
+        let limits_redis =
+            crate::realtime_inflight::RealtimeInflightLimiter::shared_redis(config.limits.realtime_inflight.redis_url.as_deref())?;
         let mut onwards_app_state = onwards::AppState::new(bg_services.onwards_targets.clone())
             .with_response_transform(onwards::create_openai_sanitizer())
             .with_upstream_rate_limit_message(config.onwards.upstream_rate_limit_message.clone())
@@ -4393,7 +4758,23 @@ impl Application {
             // Realtime traffic never carries it (the realtime path only adds
             // `x-fusillade-request-id`), so it exempts exactly the daemon
             // traffic, which tolerates latency and runs its own retries.
-            .with_first_token_timeout_exempt_header("x-fusillade-batch-created-at");
+            .with_first_token_timeout_exempt_header(crate::inference::rejections::DISPATCHED_HEADER)
+            .with_inflight_limiter(Arc::new(crate::realtime_inflight::RealtimeInflightLimiter::from_parts(
+                "realtime",
+                config.limits.realtime_inflight.enforce,
+                limits_redis.clone(),
+            )))
+            // The batch cap shares the realtime Redis but has its own switch and
+            // reserved count scope. Off, the handler never consults this
+            // limiter, so no shared count is touched.
+            .with_batch_inflight_limiter(Arc::new(crate::realtime_inflight::RealtimeInflightLimiter::from_parts(
+                "batch",
+                true,
+                limits_redis,
+            )))
+            .with_batch_inflight_enforce(config.limits.batch_inflight.enforce)
+            .with_rejected_params(&config.onwards.rejected_params)
+            .map_err(|error| anyhow::anyhow!("onwards.rejected_params: {error}"))?;
         if config.onwards.first_token_timeout_ms > 0 {
             onwards_app_state =
                 onwards_app_state.with_first_token_timeout(std::time::Duration::from_millis(config.onwards.first_token_timeout_ms));
@@ -4418,17 +4799,24 @@ impl Application {
             .task_runner(bg_services.task_runner.clone())
             .maybe_outlet_db(outlet_pools.clone())
             .limiters(limiters)
+            .key_policy_cache(bg_services.key_policy_cache.clone())
             .maybe_connections_encryption_key(bg_services.connections_encryption_key.clone())
             .maybe_keystore(bg_services.keystore.clone())
             .response_store(response_store)
             .image_normalizer(image_normalizer)
             .maybe_request_validation(request_validation)
+            .onwards_targets(bg_services.onwards_targets.clone())
             .build();
 
         if let Some(config_path) = config_path {
             bg_services.spawn(
                 "config-watcher",
-                config_watcher::watch_config_file(config_path, shared_config, bg_services.shutdown_token()),
+                config_watcher::watch_config_file(
+                    config_path,
+                    shared_config,
+                    bg_services.key_policy_cache.clone(),
+                    bg_services.shutdown_token(),
+                ),
             );
         }
 
@@ -4462,36 +4850,57 @@ impl Application {
     pub fn into_test_server(self) -> (axum_test::TestServer, BackgroundServices) {
         // Apply middleware before path matching for tests
         let middleware = middleware::from_fn_with_state(self.app_state, admin_ai_proxy_middleware);
-        let service = middleware.layer(self.router).into_make_service();
+        let service = middleware::from_fn(assign_request_id)
+            .layer(middleware.layer(self.router))
+            .into_make_service();
         let server = axum_test::TestServer::new(service).expect("Failed to create test server");
         (server, self.bg_services)
     }
 
-    /// Start serving the application
-    pub async fn serve<F>(mut self, shutdown: F) -> anyhow::Result<()>
+    /// Start serving the application on the configured host and port
+    pub async fn serve<F>(self, shutdown: F) -> anyhow::Result<()>
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        let bind_addr = self.config.bind_address();
-        let listener = TcpListener::bind(&bind_addr).await?;
+        let listener = TcpListener::bind(self.config.bind_address()).await?;
+        self.serve_with_listener(listener, shutdown).await
+    }
+
+    /// Start serving the application on an already-bound listener. The
+    /// listener's port should match `config.port`, which the application uses
+    /// to call itself.
+    pub async fn serve_with_listener<F>(mut self, listener: TcpListener, shutdown: F) -> anyhow::Result<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
         info!(
             "Control layer listening on http://{}, available at http://localhost:{}",
-            bind_addr, self.config.port
+            listener.local_addr()?,
+            self.config.port
         );
 
-        // Apply middleware before path matching
+        // Apply middleware before path matching. The request ID is outermost so
+        // that responses from the admin AI proxy middleware carry it too.
         let middleware = middleware::from_fn_with_state(self.app_state, admin_ai_proxy_middleware);
-        let service = middleware.layer(self.router);
+        let service = middleware::from_fn(assign_request_id).layer(middleware.layer(self.router));
 
         // Cancel shutdown token when SIGTERM arrives, BEFORE axum starts waiting
         // for in-flight connections to close. This lets background services (e.g.,
         // fusillade daemon) abort in-flight HTTP tasks immediately, allowing
         // proxy connections to close and axum's graceful shutdown to complete.
-        let shutdown_token = self.bg_services.shutdown_token();
+        let shutdown_tokens = self.bg_services.shutdown_tokens.clone();
         let shutdown = async move {
             shutdown.await;
-            shutdown_token.cancel();
+            shutdown_tokens.begin_http_drain();
         };
+
+        // Streamed responses are many small writes; send each one immediately
+        // rather than waiting for the client to acknowledge the previous one.
+        let listener = listener.tap_io(|tcp| {
+            if let Err(err) = tcp.set_nodelay(true) {
+                warn!(%err, "failed to set TCP_NODELAY on an accepted connection");
+            }
+        });
 
         // Race the server against background task failures (fail-fast)
         let server_error: Option<anyhow::Error> = tokio::select! {

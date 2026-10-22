@@ -68,8 +68,6 @@ pub struct ApiKeyCreateDBRequest {
     pub name: String,
     pub description: Option<String>,
     pub purpose: ApiKeyPurpose,
-    pub requests_per_second: Option<f32>,
-    pub burst_size: Option<i32>,
     /// The individual user who created this key
     pub created_by: UserId,
     /// Optional spending cap; see migration 122. Callers that set this must
@@ -85,8 +83,6 @@ impl ApiKeyCreateDBRequest {
             name: create.name,
             description: create.description,
             purpose: create.purpose,
-            requests_per_second: create.requests_per_second,
-            burst_size: create.burst_size,
             created_by,
             spend_limit: create.spend_limit,
             spend_limit_interval: create.spend_limit_interval,
@@ -99,8 +95,6 @@ impl ApiKeyCreateDBRequest {
 pub struct ApiKeyUpdateDBRequest {
     pub name: Option<String>,
     pub description: Option<String>,
-    pub requests_per_second: Option<Option<f32>>,
-    pub burst_size: Option<Option<i32>>,
 }
 
 /// Database response for an API key
@@ -116,8 +110,6 @@ pub struct ApiKeyDBResponse {
     pub created_at: DateTime<Utc>,
     pub last_used: Option<DateTime<Utc>>,
     pub model_access: Vec<DeploymentId>,
-    pub requests_per_second: Option<f32>,
-    pub burst_size: Option<i32>,
     /// Optional spending cap (credits) for this key's cap scope. NULL = uncapped.
     pub spend_limit: Option<Decimal>,
     /// Cap reset period: None = one-off, else daily/weekly/monthly on

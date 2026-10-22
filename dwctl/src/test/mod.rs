@@ -1,13 +1,19 @@
+pub mod ai_models;
 pub mod anthropic;
+pub mod batch_trace_attributes;
 pub mod cache_classifier;
 pub mod databases;
 pub mod modalities;
 pub mod request_validation;
+pub mod rejections;
+pub mod request_log_credentials;
 pub mod responses;
 pub mod serving_classes;
 pub mod sigterm_drain;
 pub mod sla;
 pub mod strict_mode;
+pub mod template;
+pub mod toleration_presets;
 pub mod utils;
 pub mod zdr_sentinel;
 
@@ -42,6 +48,7 @@ async fn setup_streaming_fixture(pool: &PgPool, mock_endpoint_url: String, model
     let mut config = crate::test::utils::create_test_config();
     config.background_services.onwards_sync.enabled = true;
     config.enable_request_logging = true;
+    config.onwards.strict_mode = true;
     // Batch traffic to these paths is forced to stream and reassembled on the way
     // back, which is what these fixtures exercise.
     config.background_services.batch_daemon.streamable_endpoints = vec!["/v1/chat/completions".to_string(), "/v1/completions".to_string()];
@@ -218,7 +225,7 @@ async fn create_standard_model_for_test(
     response.json()
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn ai_models_lists_group_accessible_paid_models_without_credits(pool: PgPool) {
     let mut config = crate::test::utils::create_test_config();
     config.background_services.onwards_sync.enabled = true;
@@ -344,7 +351,7 @@ async fn ai_models_lists_group_accessible_paid_models_without_credits(pool: PgPo
     );
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn ai_models_supports_optional_group_and_realtime_filters(pool: PgPool) {
     let config = crate::test::utils::create_test_config();
 
@@ -552,7 +559,7 @@ async fn ai_models_supports_optional_group_and_realtime_filters(pool: PgPool) {
     assert_eq!(invalid_capabilities_response.status_code(), 400);
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn ai_models_unknown_key_401_points_at_regional_endpoints_docs(pool: PgPool) {
     let config = crate::test::utils::create_test_config();
     let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
@@ -663,7 +670,7 @@ async fn cleanup_fixture(fixture: StreamingFixture) {
 /// header it stamps on every inbound request, so a client's `stream: true` came
 /// back as one `chat.completion` object. Nothing at this level covered it - both
 /// streaming fixtures sent the daemon's headers, so both took the daemon's path.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_e2e_ai_proxy_client_stream_is_not_reassembled(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -712,7 +719,96 @@ async fn test_e2e_ai_proxy_client_stream_is_not_reassembled(pool: PgPool) {
     cleanup_fixture(fixture).await;
 }
 
-#[sqlx::test]
+/// A client's stream follows OpenAI's `include_usage` contract and carries the
+/// gateway's id, while billing still reads the usage the gateway forced on.
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_e2e_ai_proxy_client_stream_usage_and_ids(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    let sse_response = concat!(
+        "data: {\"id\":\"chatcmpl-upstream\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello!\"}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"chatcmpl-upstream\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+        "data: {\"id\":\"chatcmpl-upstream\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo\",\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":12,\"total_tokens\":21}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    // The gateway always asks upstream for usage, whatever the client sent.
+    wiremock::Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(serde_json::json!({
+            "stream": true,
+            "stream_options": { "include_usage": true }
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse_response, "text/event-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo", "test-model").await;
+
+    // Missing first: billing must still see the usage the client never asked for.
+    for stream_options in [None, Some(false), Some(true)] {
+        let mut body = serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello from E2E test"}],
+            "stream": true
+        });
+        if let Some(include_usage) = stream_options {
+            body["stream_options"] = serde_json::json!({ "include_usage": include_usage });
+        }
+        let response = fixture
+            .server
+            .post("/ai/v1/chat/completions")
+            .add_header("authorization", format!("Bearer {}", fixture.api_key))
+            .json(&body)
+            .await;
+        assert_eq!(response.status_code().as_u16(), 200, "{stream_options:?}");
+
+        let text = response.text();
+        assert!(text.ends_with("data: [DONE]\n\n"), "{stream_options:?}: {text}");
+        let chunks: Vec<serde_json::Value> = text
+            .split("\n\n")
+            .filter_map(|event| event.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect();
+
+        let id = chunks[0]["id"].as_str().unwrap();
+        assert!(id.starts_with("resp_"), "{stream_options:?}: {id}");
+        assert!(chunks.iter().all(|chunk| chunk["id"] == id), "{stream_options:?}: {text}");
+
+        if stream_options == Some(true) {
+            assert_eq!(chunks.len(), 3, "{text}");
+            assert!(
+                chunks[..2].iter().all(|chunk| chunk.get("usage") == Some(&serde_json::Value::Null)),
+                "{text}"
+            );
+            assert_eq!(chunks[2]["choices"], serde_json::json!([]));
+            assert_eq!(chunks[2]["usage"]["total_tokens"], 21);
+        } else {
+            assert_eq!(chunks.len(), 2, "{stream_options:?}: {text}");
+            assert!(
+                chunks.iter().all(|chunk| chunk.get("usage").is_none()),
+                "{stream_options:?}: {text}"
+            );
+            assert!(
+                chunks.iter().all(|chunk| chunk["choices"][0].is_object()),
+                "{stream_options:?}: {text}"
+            );
+        }
+
+        if stream_options.is_none() {
+            assert_usage_recorded(&fixture, "http://localhost/chat/completions", 9, 12).await;
+        }
+    }
+
+    cleanup_fixture(fixture).await;
+}
+
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_e2e_ai_proxy_streaming_chat_completions_with_fusillade_header(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -735,6 +831,7 @@ async fn test_e2e_ai_proxy_streaming_chat_completions_with_fusillade_header(pool
 
     let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo", "test-model").await;
 
+    let request_id = uuid::Uuid::new_v4();
     let inference_response = fixture
         .server
         .post("/ai/v1/chat/completions")
@@ -743,7 +840,7 @@ async fn test_e2e_ai_proxy_streaming_chat_completions_with_fusillade_header(pool
         // sets for itself, and the correlation id the edge takes an early return
         // on so a dispatch does not create a second row.
         .add_header(crate::inference::outbound_request::STREAM_MARKER_HEADER, "1")
-        .add_header("x-fusillade-request-id", uuid::Uuid::new_v4().to_string())
+        .add_header("x-fusillade-request-id", request_id.to_string())
         .json(&serde_json::json!({
             "model": "test-model",
             "messages": [{"role": "user", "content": "Hello from E2E test"}]
@@ -752,13 +849,18 @@ async fn test_e2e_ai_proxy_streaming_chat_completions_with_fusillade_header(pool
 
     assert_eq!(inference_response.status_code().as_u16(), 200);
     let assembled: serde_json::Value = inference_response.json();
+    assert_eq!(
+        assembled["id"],
+        format!("resp_{request_id}"),
+        "the batch result carries the request's id"
+    );
     assert_eq!(assembled["choices"][0]["message"]["content"], "Hello! How can I help you today?");
     assert_eq!(assembled["usage"]["total_tokens"], 21);
     assert_usage_recorded(&fixture, "http://localhost/chat/completions", 9, 12).await;
     cleanup_fixture(fixture).await;
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_e2e_ai_proxy_streaming_completions_with_fusillade_header(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -781,6 +883,7 @@ async fn test_e2e_ai_proxy_streaming_completions_with_fusillade_header(pool: PgP
 
     let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo-instruct", "test-model").await;
 
+    let request_id = uuid::Uuid::new_v4();
     let inference_response = fixture
         .server
         .post("/ai/v1/completions")
@@ -789,7 +892,7 @@ async fn test_e2e_ai_proxy_streaming_completions_with_fusillade_header(pool: PgP
         // sets for itself, and the correlation id the edge takes an early return
         // on so a dispatch does not create a second row.
         .add_header(crate::inference::outbound_request::STREAM_MARKER_HEADER, "1")
-        .add_header("x-fusillade-request-id", uuid::Uuid::new_v4().to_string())
+        .add_header("x-fusillade-request-id", request_id.to_string())
         .json(&serde_json::json!({
             "model": "test-model",
             "prompt": "Hello from E2E test"
@@ -798,6 +901,11 @@ async fn test_e2e_ai_proxy_streaming_completions_with_fusillade_header(pool: PgP
 
     assert_eq!(inference_response.status_code().as_u16(), 200);
     let assembled: serde_json::Value = inference_response.json();
+    assert_eq!(
+        assembled["id"],
+        format!("resp_{request_id}"),
+        "the batch result carries the request's id"
+    );
     assert_eq!(assembled["usage"]["total_tokens"], 20);
     assert_usage_recorded(&fixture, "http://localhost/completions", 8, 12).await;
     cleanup_fixture(fixture).await;
@@ -817,7 +925,7 @@ async fn test_e2e_ai_proxy_streaming_completions_with_fusillade_header(pool: PgP
 
 /// End-to-end test: Traffic routing rules are enforced by onwards after sync.
 /// Covers three scenarios: baseline allow, deny by purpose, and redirect by purpose.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_e2e_traffic_routing_rules(pool: PgPool) {
     // Setup wiremock server to mock inference endpoint
@@ -1121,7 +1229,7 @@ async fn test_e2e_traffic_routing_rules(pool: PgPool) {
     bg_services.shutdown().await;
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_database_seeding_behavior(pool: PgPool) {
     use crate::config::ModelSource;
@@ -1234,7 +1342,7 @@ async fn test_database_seeding_behavior(pool: PgPool) {
     assert_eq!(final_count, Some(2), "Should still have 2 endpoints");
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_request_logging_enabled(pool: PgPool) {
     // Create test config with request logging enabled
@@ -1282,7 +1390,7 @@ async fn test_request_logging_enabled(pool: PgPool) {
 /// ones normally. Drives the handler directly against the real outlet tables so
 /// the assertion is at the DB layer, no Redis or proxy needed. Remove with
 /// `ZdrBodyScrubber`.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_outlet_suppresses_zdr_bodies(pool: PgPool) {
     use bytes::Bytes;
@@ -1290,11 +1398,12 @@ async fn test_outlet_suppresses_zdr_bodies(pool: PgPool) {
     use std::collections::HashMap;
     use std::time::{Duration, SystemTime};
 
-    // Create the outlet logging tables (http_requests / http_responses). Apply
-    // the DDL directly rather than via `.run()`: `#[sqlx::test]` already ran
-    // dwctl's migrations into this database's shared `_sqlx_migrations`, and
-    // outlet's migrator would reject that unknown history (in production outlet
-    // gets its own schema/DB with its own migration table).
+    // Create the outlet logging tables (http_requests / http_responses) in
+    // `public`, where this pool resolves unqualified names. The template's
+    // `outlet` schema is not on that search path. Apply the DDL directly rather
+    // than via `.run()`: `public._sqlx_migrations` already holds dwctl's
+    // history, which outlet's migrator would reject (in production outlet gets
+    // its own schema/DB with its own migration table).
     for migration in outlet_postgres::migrator().iter() {
         sqlx::raw_sql(migration.sql.as_ref())
             .execute(&pool)
@@ -1415,6 +1524,7 @@ async fn test_request_logging_disabled(pool: PgPool) {
         .response_store(response_store)
         .image_normalizer(std::sync::Arc::new(crate::image_normalizer::DisabledNormalizer)
             as std::sync::Arc<dyn crate::image_normalizer::ImageNormalizer>)
+        .key_policy_cache(crate::sync::key_policy::KeyPolicyCache::empty())
         .build();
     let onwards_router = axum::Router::new(); // Empty onwards router for testing
     let router = super::build_router(&mut app_state, onwards_router, None, None, None, false, None, None)
@@ -1638,7 +1748,7 @@ async fn test_dedicated_databases_for_components(pool: PgPool) {
     test_dbs.cleanup().await.expect("Failed to cleanup test databases");
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn test_create_initial_admin_user_new_user(pool: PgPool) {
     let test_email = "new-admin@example.com";
 
@@ -1677,7 +1787,7 @@ async fn test_create_initial_admin_user_new_user(pool: PgPool) {
     assert!(created_user.roles.contains(&Role::PlatformManager));
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn test_create_initial_admin_user_existing_user(pool: PgPool) {
     let test_email = "existing-admin@example.com";
 
@@ -1816,8 +1926,6 @@ mod openapi_access_control {
                 name: format!("{purpose:?} key"),
                 description: None,
                 purpose,
-                requests_per_second: None,
-                burst_size: None,
                 member_id: None,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -1828,7 +1936,7 @@ mod openapi_access_control {
         .secret
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn admin_spec_returns_404_when_disabled(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -1850,7 +1958,7 @@ mod openapi_access_control {
         assert_eq!(response.status_code().as_u16(), 404);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn admin_spec_rejects_unauthenticated(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool, true).await;
 
@@ -1861,7 +1969,7 @@ mod openapi_access_control {
         assert_eq!(response.status_code().as_u16(), 401);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn admin_spec_rejects_inference_api_key(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
@@ -1879,7 +1987,7 @@ mod openapi_access_control {
         assert_eq!(response.status_code().as_u16(), 403);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn admin_spec_rejects_standard_user_session(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
@@ -1895,7 +2003,7 @@ mod openapi_access_control {
         assert_eq!(response.status_code().as_u16(), 403);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn admin_spec_rejects_request_viewer(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
         let user = crate::test::utils::create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::RequestViewer]).await;
@@ -1910,7 +2018,7 @@ mod openapi_access_control {
         assert_eq!(response.status_code().as_u16(), 403);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn admin_spec_allows_platform_manager_session(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -1933,7 +2041,7 @@ mod openapi_access_control {
         assert_eq!(response.status_code().as_u16(), 200);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn admin_spec_allows_platform_api_key(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -1946,14 +2054,14 @@ mod openapi_access_control {
         assert_eq!(response.status_code().as_u16(), 200);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn ai_spec_rejects_unauthenticated(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool, true).await;
         let response = server.get("/ai/openapi.json").await;
         assert_eq!(response.status_code().as_u16(), 401);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn unknown_bearer_key_401_points_at_regional_endpoints_docs(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool, true).await;
 
@@ -1981,7 +2089,7 @@ mod openapi_access_control {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn ai_spec_error_example_matches_live_copy(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
@@ -2003,7 +2111,7 @@ mod openapi_access_control {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn ai_spec_allows_any_authenticated_identity(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
 
@@ -2037,7 +2145,7 @@ mod openapi_access_control {
     }
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn test_build_router_with_metrics_disabled(pool: PgPool) {
     let mut config = create_test_config();
     config.enable_metrics = false;
@@ -2084,6 +2192,7 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
         .response_store(response_store)
         .image_normalizer(std::sync::Arc::new(crate::image_normalizer::DisabledNormalizer)
             as std::sync::Arc<dyn crate::image_normalizer::ImageNormalizer>)
+        .key_policy_cache(crate::sync::key_policy::KeyPolicyCache::empty())
         .build();
 
     let onwards_router = axum::Router::new();
@@ -2099,7 +2208,7 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
     assert!(!metrics_content.contains("# HELP") && !metrics_content.contains("# TYPE"));
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn test_build_router_with_metrics_enabled(pool: PgPool) {
     let mut config = create_test_config();
     config.enable_metrics = true;
@@ -2146,6 +2255,7 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
         .response_store(response_store)
         .image_normalizer(std::sync::Arc::new(crate::image_normalizer::DisabledNormalizer)
             as std::sync::Arc<dyn crate::image_normalizer::ImageNormalizer>)
+        .key_policy_cache(crate::sync::key_policy::KeyPolicyCache::empty())
         .build();
 
     let onwards_router = axum::Router::new();
@@ -2167,7 +2277,7 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
 // ===== Composite Model Tests =====
 
 /// Test creating a composite model
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_create_composite_model(pool: PgPool) {
     let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
@@ -2197,7 +2307,7 @@ async fn test_create_composite_model(pool: PgPool) {
 }
 
 /// Test adding components to a composite model
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_add_component_to_composite_model(pool: PgPool) {
     let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
@@ -2268,7 +2378,7 @@ async fn test_add_component_to_composite_model(pool: PgPool) {
 }
 
 /// Test that adding a composite model as a component fails
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_cannot_add_composite_as_component(pool: PgPool) {
     let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
@@ -2317,7 +2427,7 @@ async fn test_cannot_add_composite_as_component(pool: PgPool) {
 }
 
 /// Test that adding components to a non-composite model fails
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_cannot_add_component_to_standard_model(pool: PgPool) {
     let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
@@ -2385,7 +2495,7 @@ async fn test_cannot_add_component_to_standard_model(pool: PgPool) {
 }
 
 /// Test updating a component's weight and enabled status
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_update_component(pool: PgPool) {
     let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
@@ -2465,7 +2575,7 @@ async fn test_update_component(pool: PgPool) {
 }
 
 /// Test removing a component from a composite model
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_remove_component(pool: PgPool) {
     let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
@@ -2546,7 +2656,7 @@ async fn test_remove_component(pool: PgPool) {
 }
 
 /// Test weight validation (must be 1-100)
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_component_weight_validation(pool: PgPool) {
     let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
@@ -2639,7 +2749,7 @@ async fn test_component_weight_validation(pool: PgPool) {
 /// This demonstrates sqlx_pool_router::TestDbPools' ability to catch pool routing violations.
 /// The replica pool is configured with `default_transaction_read_only = on`,
 /// so any write operations will fail with a PostgreSQL error.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn test_read_pool_enforces_readonly(pool: PgPool) {
     // Create test pools with read-only enforcement on replica using sqlx_pool_router
     let db_pools = sqlx_pool_router::TestDbPools::new(pool).await.unwrap();
@@ -2673,7 +2783,7 @@ async fn test_read_pool_enforces_readonly(pool: PgPool) {
 /// The components API round-trips a member's pool, and lets the SAME hosted
 /// model be a member of two pools with independent per-pool ordering — which is
 /// how the canary is wired (dynamo position 0 in both).
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_component_pool_round_trips_and_allows_dual_membership(pool: PgPool) {
     let (server, _bg) = utils::create_test_app(pool.clone(), false).await;

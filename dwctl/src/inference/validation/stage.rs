@@ -53,9 +53,12 @@ impl ExactCountBudget {
     }
 
     fn try_take(&self) -> bool {
-        self.0
+        #[allow(deprecated)] // `try_update` from Rust 1.99; see `continuation::try_acquire`.
+        let taken = self
+            .0
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
-            .is_ok()
+            .is_ok();
+        taken
     }
 }
 

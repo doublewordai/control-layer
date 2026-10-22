@@ -11,6 +11,19 @@ import { cn } from "@/lib/utils";
 // Format: { THEME_NAME: CSS_SELECTOR }
 const THEMES = { light: "", dark: ".dark" } as const;
 
+const SAFE_CSS_IDENTIFIER = /^[a-zA-Z0-9_-]+$/;
+
+function isSafeCssValue(value: string) {
+  return !Array.from(value).some((character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    return (
+      codePoint <= 0x1f ||
+      codePoint === 0x7f ||
+      ";{}<>".includes(character)
+    );
+  });
+}
+
 export type ChartConfig = {
   [k in string]: {
     label?: React.ReactNode;
@@ -45,7 +58,7 @@ const ChartContainer = React.forwardRef<
   }
 >(({ id, className, children, config, ...props }, ref) => {
   const uniqueId = React.useId();
-  const chartId = `chart-${id || uniqueId.replace(/:/g, "")}`;
+  const chartId = `chart-${(id || uniqueId).replace(/[^a-zA-Z0-9_-]/g, "")}`;
 
   return (
     <ChartContext.Provider value={{ config }}>
@@ -68,35 +81,34 @@ ChartContainer.displayName = "Chart";
 
 const ChartStyle = ({ id, config }: { id: string; config: ChartConfig }) => {
   const colorConfig = Object.entries(config).filter(
-    ([, config]) => config.theme || config.color,
+    ([key, config]) =>
+      SAFE_CSS_IDENTIFIER.test(key) && (config.theme || config.color),
   );
 
-  if (!colorConfig.length) {
+  if (!SAFE_CSS_IDENTIFIER.test(id) || !colorConfig.length) {
     return null;
   }
 
-  return (
-    <style
-      dangerouslySetInnerHTML={{
-        __html: Object.entries(THEMES)
-          .map(
-            ([theme, prefix]) => `
-${prefix} [data-chart=${id}] {
-${colorConfig
-  .map(([key, itemConfig]) => {
-    const color =
-      itemConfig.theme?.[theme as keyof typeof itemConfig.theme] ||
-      itemConfig.color;
-    return color ? `  --color-${key}: ${color};` : null;
-  })
-  .join("\n")}
-}
-`,
-          )
-          .join("\n"),
-      }}
-    />
-  );
+  const styles = Object.entries(THEMES)
+    .map(([theme, prefix]) => {
+      const declarations = colorConfig.flatMap(([key, itemConfig]) => {
+        const color =
+          itemConfig.theme?.[theme as keyof typeof itemConfig.theme] ||
+          itemConfig.color;
+
+        return color && isSafeCssValue(color)
+          ? [`  --color-${key}: ${color};`]
+          : [];
+      });
+
+      return declarations.length
+        ? `${prefix} [data-chart="${id}"] {\n${declarations.join("\n")}\n}`
+        : "";
+    })
+    .filter(Boolean)
+    .join("\n");
+
+  return styles ? <style>{styles}</style> : null;
 };
 
 const ChartTooltip = Tooltip;

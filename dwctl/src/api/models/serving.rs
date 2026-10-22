@@ -18,12 +18,12 @@ pub struct OverlayResponse {
     pub organization_id: UserId,
     /// The organisation's account username (what the catalog file names).
     pub organization_name: String,
+    /// Human-readable label; the account username remains the catalog identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub organization_display_name: Option<String>,
     #[schema(value_type = String, format = "uuid")]
     pub deployed_model_id: DeploymentId,
     pub alias: String,
-    /// Overrides the account's default class on this model.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub default_serving_class: Option<String>,
     /// Explicit targets `{ttft_ms, itl_ms, priority}` sent as-is (resolved as `custom`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub targets: Option<serde_json::Value>,
@@ -61,11 +61,6 @@ pub struct OrganizationCacheTariffResponse {
 pub struct OrganizationServingResponse {
     #[schema(value_type = String, format = "uuid")]
     pub organization_id: UserId,
-    /// Elevated classes the organisation holds.
-    pub granted_serving_classes: Vec<String>,
-    /// Class its requests ask for when the request names none.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub default_serving_class: Option<String>,
     /// Never fall over to an external provider.
     pub self_hosted_only: bool,
     /// Per-model overrides, one per model the organisation has a deal on.
@@ -85,9 +80,9 @@ pub struct OrganizationServingResponse {
 pub(crate) struct OverlayRow {
     pub organization_id: Uuid,
     pub organization_name: String,
+    pub organization_display_name: Option<String>,
     pub deployed_model_id: Uuid,
     pub alias: String,
-    pub default_serving_class: Option<String>,
     pub targets: Option<serde_json::Value>,
     pub self_hosted_only: Option<bool>,
     pub provisioning_source: Option<String>,
@@ -99,9 +94,9 @@ impl From<OverlayRow> for OverlayResponse {
         Self {
             organization_id: row.organization_id,
             organization_name: row.organization_name,
+            organization_display_name: row.organization_display_name,
             deployed_model_id: row.deployed_model_id,
             alias: row.alias,
-            default_serving_class: row.default_serving_class,
             targets: row.targets,
             self_hosted_only: row.self_hosted_only,
             provisioning_source: row.provisioning_source,

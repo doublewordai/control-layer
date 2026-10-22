@@ -22,7 +22,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
@@ -60,6 +60,10 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           sbom: true
           provenance: true
+          # Always rebuild the runtime stage so OS package updates (notably the
+          # ca-certificates trust store) reach every release instead of being
+          # served from a layer cached by an earlier build.
+          no-cache-filters: runtime
 
       - name: Record build time
         id: build-time-step
@@ -110,12 +114,12 @@ jobs:
 
     steps:
       - name: Checkout Onwards release
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
 
       - name: Checkout current release tooling
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.repository.default_branch }}
           path: .release-tools
@@ -140,7 +144,7 @@ jobs:
             })
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
 
       - uses: Swatinem/rust-cache@v2
 
@@ -176,12 +180,12 @@ jobs:
 
     steps:
       - name: Checkout Fusillade crate release
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
 
       - name: Checkout current release tooling
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.repository.default_branch }}
           path: .release-tools
@@ -206,7 +210,7 @@ jobs:
             })
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
 
       - uses: Swatinem/rust-cache@v2
 
@@ -237,7 +241,7 @@ jobs:
 
     steps:
       - name: Checkout Onwards release
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
 
@@ -282,6 +286,10 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           sbom: true
           provenance: true
+          # Always rebuild the runtime stage so OS package updates (notably the
+          # ca-certificates trust store) reach every release instead of being
+          # served from a layer cached by an earlier build.
+          no-cache-filters: runtime
 
   promote-onwards-image:
     needs: [onwards-image]
@@ -301,7 +309,7 @@ jobs:
 
     steps:
       - name: Checkout current release tooling
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.repository.default_branch }}
           sparse-checkout: .github/scripts/onwards-floating-tags.cjs

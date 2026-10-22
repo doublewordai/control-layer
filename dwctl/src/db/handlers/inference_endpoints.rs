@@ -78,7 +78,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
     type Id = InferenceEndpointId;
     type Filter = InferenceEndpointFilter;
 
-    #[instrument(skip(self, request), fields(name = %request.name, url = %request.url), err)]
+    #[instrument(level = "debug", skip(self, request), fields(name = %request.name, url = %request.url), err)]
     async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
         let reasoning_translation = request
             .reasoning_translation
@@ -112,7 +112,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
         Ok(endpoint.try_into()?)
     }
 
-    #[instrument(skip(self), fields(endpoint_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(endpoint_id = %abbrev_uuid(&id)), err)]
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let endpoint = sqlx::query_as!(InferenceEndpoint, "SELECT name, description, url, created_by, created_at, updated_at, model_filter, api_key, id, auth_header_name, auth_header_prefix, reasoning_translation, accepts_scheduling_priority, kind FROM inference_endpoints WHERE id = $1", id)
             .fetch_optional(&mut *self.db)
@@ -124,7 +124,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
         }
     }
 
-    #[instrument(skip(self, ids), fields(count = ids.len()), err)]
+    #[instrument(level = "debug", skip(self, ids), fields(count = ids.len()), err)]
     async fn get_bulk(&mut self, ids: Vec<Self::Id>) -> Result<std::collections::HashMap<Self::Id, Self::Response>> {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -162,7 +162,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
         Ok(result)
     }
 
-    #[instrument(skip(self), fields(endpoint_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(endpoint_id = %abbrev_uuid(&id)), err)]
     async fn delete(&mut self, id: Self::Id) -> Result<bool> {
         let result = sqlx::query!("DELETE FROM inference_endpoints WHERE id = $1", id)
             .execute(&mut *self.db)
@@ -171,7 +171,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
         Ok(result.rows_affected() > 0)
     }
 
-    #[instrument(skip(self, request), fields(endpoint_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self, request), fields(endpoint_id = %abbrev_uuid(&id)), err)]
     async fn update(&mut self, id: Self::Id, request: &Self::UpdateRequest) -> Result<Self::Response> {
         let reasoning_translation = request
             .reasoning_translation
@@ -231,7 +231,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
         Ok(endpoint.try_into()?)
     }
 
-    #[instrument(skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
+    #[instrument(level = "debug", skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
         let endpoints = sqlx::query_as!(
             InferenceEndpoint,
@@ -331,7 +331,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn persists_and_clears_reasoning_translation(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -378,7 +378,7 @@ mod tests {
         assert_eq!(cleared.reasoning_translation, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_empty_ids(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
@@ -387,7 +387,7 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_single_endpoint(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -417,7 +417,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_multiple_endpoints(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -446,7 +446,7 @@ mod tests {
         assert_eq!(result[&endpoint3.id].name, "bulk-endpoint-3");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_nonexistent_ids(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -467,7 +467,7 @@ mod tests {
         assert!(!result.contains_key(&fake_id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_existing_endpoint(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -491,7 +491,7 @@ mod tests {
         assert!(found_endpoint.is_none());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_nonexistent_endpoint(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
@@ -503,7 +503,7 @@ mod tests {
         assert!(!deleted);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_apply_update_all_fields(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -550,7 +550,7 @@ mod tests {
         assert_eq!(updated_endpoint.created_at, created_endpoint.created_at);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_endpoint_kind_round_trips_through_create_and_update(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -590,7 +590,7 @@ mod tests {
         assert_eq!(untouched.kind, EndpointKind::Hosted);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_apply_update_partial_fields(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -773,7 +773,7 @@ mod tests {
         assert!(updated_response.updated_at >= original_response.updated_at);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_nonexistent_endpoint_returns_not_found(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
@@ -804,7 +804,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_endpoint_name_conflict(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -827,7 +827,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_endpoint_name_unique(pool: PgPool) {
         let user = create_test_user(&pool).await;

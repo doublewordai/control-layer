@@ -14,7 +14,7 @@ use sqlx::postgres::{PgPool, PgRow};
 use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
 
-use super::{PoolProvider, PostgresRequestManager};
+use super::{PoolProvider, PostgresRequestManager, template_store};
 use crate::error::{FusilladeError, Result};
 use crate::manager::{
     RetainedResponseArchiveCutoffs, RetainedResponseArchiveOutcome,
@@ -450,7 +450,7 @@ impl fmt::Debug for RetainedRequestSnapshot {
     }
 }
 
-/// A complete immutable copy of a dedicated `request_templates` row.
+/// A complete immutable copy of a dedicated request template row.
 #[derive(Clone, PartialEq, Serialize)]
 pub(crate) struct RetainedTemplateSnapshot {
     pub(crate) id: Uuid,
@@ -1772,9 +1772,6 @@ pub(crate) async fn count_owner_flex_requests_since<P: PoolProvider>(
 }
 
 pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
-    WITH live_request_ids AS MATERIALIZED (
-        SELECT id FROM requests WHERE created_by IS NOT NULL
-    )
     SELECT model, service_tier, outcome, SUM(count)::BIGINT AS count
     FROM (
     SELECT
@@ -1845,9 +1842,17 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
     FROM retained_response_objects retained
     WHERE retained.object_kind = 'request'
       AND retained.state = 'completed'
-      -- Both identity columns are NOT NULL; NOT IN permits a hashed subplan
-      -- even when stale statistics underestimate the live identity count.
-      AND retained.object_id NOT IN (SELECT id FROM live_request_ids)
+      -- Live-preferred: a retained object whose identity is still live is
+      -- counted by the live arms above. Probe the requests primary key once
+      -- per retained candidate so the cost follows the window, not the size
+      -- of the live table. OFFSET 0 keeps this a per-row subplan: without it
+      -- the planner flattens NOT EXISTS into an anti-join that reads every
+      -- live request.
+      AND NOT EXISTS (
+          SELECT 1 FROM requests live
+          WHERE live.id = retained.object_id AND live.created_by IS NOT NULL
+          OFFSET 0
+      )
       AND retained.terminal_at >= $1
       AND retained.terminal_at < $2
       -- Partition-prune bounds. Sweep-landed rows satisfy
@@ -1866,9 +1871,7 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
       -- the same catalog identity checks every retained read applies:
       -- retiring/retired buckets and any partition that no longer matches
       -- its registered identity contribute nothing. This is a count, so the
-      -- route rows are unnecessary. Live identities are materialized once
-      -- above to preserve live-preferred reads even during repair overlaps,
-      -- without probing the broad user index for each retained object.
+      -- route rows are unnecessary.
       AND retained.delete_on IN (
           SELECT bucket.delete_on
           FROM retained_response_buckets bucket
@@ -1916,7 +1919,12 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
     FROM retained_response_objects retained
     WHERE retained.object_kind = 'request'
       AND retained.state = 'failed'
-      AND retained.object_id NOT IN (SELECT id FROM live_request_ids)
+      -- Live-preferred per-row primary-key probe, as in the completed arm.
+      AND NOT EXISTS (
+          SELECT 1 FROM requests live
+          WHERE live.id = retained.object_id AND live.created_by IS NOT NULL
+          OFFSET 0
+      )
       AND retained.terminal_at >= $1
       AND retained.terminal_at < $2
       -- Partition-prune bounds. Sweep-landed rows satisfy
@@ -1935,9 +1943,7 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
       -- the same catalog identity checks every retained read applies:
       -- retiring/retired buckets and any partition that no longer matches
       -- its registered identity contribute nothing. This is a count, so the
-      -- route rows are unnecessary. Live identities are materialized once
-      -- above to preserve live-preferred reads even during repair overlaps,
-      -- without probing the broad user index for each retained object.
+      -- route rows are unnecessary.
       AND retained.delete_on IN (
           SELECT bucket.delete_on
           FROM retained_response_buckets bucket
@@ -2058,6 +2064,8 @@ impl ByteBudget {
     /// always the head of the queue rather than whichever mover serialised
     /// its payload first; a large head can then never be starved by smaller
     /// siblings that keep winning the race.
+    // Rust 1.99 renames `fetch_update` to `try_update`, which older compilers lack.
+    #[allow(deprecated)]
     fn try_reserve(&self, bytes: u64, allow_oversized: bool) -> bool {
         self.reserved
             .fetch_update(
@@ -2257,7 +2265,17 @@ async fn lock_live_graph_for_erasure(
     template_ids.dedup();
     if !template_ids.is_empty() {
         let locked_templates: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM request_templates WHERE id = ANY($1) ORDER BY id FOR UPDATE",
+            r#"
+            SELECT template.id
+            FROM request_template_routes route
+            JOIN request_templates_g2 template
+              ON template.created_on >= route.week_start
+             AND template.created_on < route.week_start + 7
+             AND template.id = route.template_id
+            WHERE route.template_id = ANY($1)
+            ORDER BY template.id
+            FOR UPDATE OF template
+            "#,
         )
         .bind(&template_ids)
         .fetch_all(&mut **tx)
@@ -2765,17 +2783,13 @@ async fn delete_locked_response_group_in_transaction(
             .await
             .map_err(database_failure)?
             .rows_affected();
-        if !template_ids.is_empty() {
-            sqlx::query(
-                "DELETE FROM request_templates template \
-                 WHERE template.id = ANY($1) AND template.file_id IS NULL \
-                   AND NOT EXISTS (SELECT 1 FROM requests WHERE template_id = template.id)",
-            )
-            .bind(&template_ids)
-            .execute(&mut **tx)
-            .await
-            .map_err(database_failure)?;
-        }
+        template_store::delete_dedicated_templates(
+            tx,
+            &template_ids,
+            template_store::DedicatedDeleteScope::Unreferenced,
+        )
+        .await
+        .map_err(database_failure)?;
         if deleted_requests != topology.request_ids.len() as u64 {
             return Err(incomplete_graph());
         }
@@ -3037,7 +3051,10 @@ async fn lock_requests(
 fn canonical_payload_bytes(rows: &[RetainedResponseObjectRow]) -> MovementResult<Vec<u8>> {
     let mut bytes = Vec::new();
     for row in rows {
-        let payload = serde_json::to_vec(&row.payload)
+        // Sorted keys: a payload read back from `jsonb` comes back in jsonb's key order.
+        let mut payload = row.payload.clone();
+        payload.sort_all_objects();
+        let payload = serde_json::to_vec(&payload)
             .map_err(|_| RetainedResponseMovementError::IntegrityMismatch.into_fusillade_error())?;
         bytes.extend_from_slice(&(payload.len() as u64).to_be_bytes());
         bytes.extend_from_slice(&payload);
@@ -3585,12 +3602,18 @@ async fn move_graph<P: PoolProvider>(
     }
     let template_rows = sqlx::query(
         r#"
-        SELECT id, file_id, custom_id, endpoint, method, path, body, model,
-               api_key, line_number, body_byte_size, metadata, created_at, updated_at
-        FROM request_templates
-        WHERE id = ANY($1)
-        ORDER BY id
-        FOR UPDATE SKIP LOCKED
+        SELECT template.id, template.file_id, template.custom_id, template.endpoint,
+               template.method, template.path, template.body, template.model,
+               template.api_key, template.line_number, template.body_byte_size,
+               template.metadata, template.created_at, template.updated_at
+        FROM request_template_routes route
+        JOIN request_templates_g2 template
+          ON template.created_on >= route.week_start
+         AND template.created_on < route.week_start + 7
+         AND template.id = route.template_id
+        WHERE route.template_id = ANY($1)
+        ORDER BY template.id
+        FOR UPDATE OF template SKIP LOCKED
         "#,
     )
     .bind(&template_ids)
@@ -3598,12 +3621,9 @@ async fn move_graph<P: PoolProvider>(
     .await
     .map_err(database_failure)?;
     if template_rows.len() != template_ids.len() {
-        let existing: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM request_templates WHERE id = ANY($1)")
-                .bind(&template_ids)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(database_failure)?;
+        let existing = template_store::count_templates(&mut tx, &template_ids)
+            .await
+            .map_err(database_failure)?;
         if existing == template_ids.len() as i64 {
             return Ok(MoveGraphOutcome::SkippedLocked);
         }
@@ -3743,30 +3763,26 @@ async fn move_graph<P: PoolProvider>(
     if deleted_requests != request_ids.len() as u64 {
         return Err(RetainedResponseMovementError::IntegrityMismatch.into_fusillade_error());
     }
-    let deleted_templates =
-        sqlx::query("DELETE FROM request_templates WHERE id = ANY($1) AND file_id IS NULL")
-            .bind(&owned_template_ids)
-            .execute(&mut *tx)
-            .await
-            .map_err(database_failure)?
-            .rows_affected();
+    let deleted_templates = template_store::delete_dedicated_templates(
+        &mut tx,
+        &owned_template_ids,
+        template_store::DedicatedDeleteScope::Any,
+    )
+    .await
+    .map_err(database_failure)?;
     if deleted_templates != owned_template_ids.len() as u64 {
         return Err(RetainedResponseMovementError::IntegrityMismatch.into_fusillade_error());
     }
 
-    let live_members: i64 = sqlx::query_scalar(
-        r#"
-        SELECT
-            (SELECT COUNT(*) FROM requests WHERE id = ANY($1))
-          + (SELECT COUNT(*) FROM request_templates WHERE id = ANY($2))
-        "#,
-    )
-    .bind(&request_ids)
-    .bind(&owned_template_ids)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(database_failure)?;
-    if live_members != 0 {
+    let live_requests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests WHERE id = ANY($1)")
+        .bind(&request_ids)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(database_failure)?;
+    let live_templates = template_store::count_templates(&mut tx, &owned_template_ids)
+        .await
+        .map_err(database_failure)?;
+    if live_requests + live_templates != 0 {
         return Err(RetainedResponseMovementError::IntegrityMismatch.into_fusillade_error());
     }
     tx.commit().await.map_err(database_failure)?;
@@ -4606,6 +4622,138 @@ mod tests {
             relation_actual_loops(&trailing_plan, "retained_response_objects_d20260803"),
             0,
             "trailing plan must remove or avoid scanning the irrelevant daily child: {trailing_plan}"
+        );
+    }
+
+    /// Rows read from `relation_name` across the plan: emitted plus filtered
+    /// rows, times loops, so a scan that reads everything and keeps little
+    /// still counts in full.
+    fn relation_rows_read(plan: &serde_json::Value, relation_name: &str) -> f64 {
+        match plan {
+            serde_json::Value::Array(values) => values
+                .iter()
+                .map(|value| relation_rows_read(value, relation_name))
+                .sum(),
+            serde_json::Value::Object(fields) => {
+                let this_relation = if fields.get("Relation Name").and_then(|value| value.as_str())
+                    == Some(relation_name)
+                {
+                    let field = |name: &str| {
+                        fields
+                            .get(name)
+                            .and_then(|value| value.as_f64())
+                            .unwrap_or(0.0)
+                    };
+                    (field("Actual Rows")
+                        + field("Rows Removed by Filter")
+                        + field("Rows Removed by Index Recheck"))
+                        * field("Actual Loops")
+                } else {
+                    0.0
+                };
+                this_relation
+                    + fields
+                        .values()
+                        .map(|value| relation_rows_read(value, relation_name))
+                        .sum::<f64>()
+            }
+            _ => 0.0,
+        }
+    }
+
+    #[sqlx::test]
+    async fn trailing_demand_live_suppression_reads_only_window_candidates(pool: PgPool) {
+        // Many live requests unrelated to the window, a few retained requests
+        // inside it, and some retained requests whose identity is still live.
+        // The live-preferred exclusion must cost per retained candidate, not
+        // per live request.
+        let delete_on = NaiveDate::from_ymd_opt(2026, 8, 20).unwrap();
+        sqlx::query("SELECT ensure_retained_response_partition($1, NULL)")
+            .bind(delete_on)
+            .execute(&pool)
+            .await
+            .expect("fixture partition must be available");
+        sqlx::query(
+            r#"
+            INSERT INTO requests (id, model, state, created_by, created_at)
+            SELECT md5('live-' || i)::uuid, 'probe-model', 'pending', 'probe-owner',
+                   '2026-08-01T00:00:00Z'::timestamptz
+            FROM generate_series(1, 5000) i
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // 40 retained-only objects plus 10 whose identity is one of the live
+        // requests above.
+        sqlx::query(
+            r#"
+            INSERT INTO retained_response_objects (
+                delete_on, group_id, object_kind, object_id, request_id,
+                created_by, service_tier, state, model,
+                created_at, terminal_at, schema_version, payload
+            )
+            SELECT $1, md5('group-' || i)::uuid, 'request', object_id, object_id,
+                   'probe-owner', 'flex', 'completed', 'probe-model',
+                   '2026-08-12T09:00:00Z', '2026-08-12T10:00:00Z', 1, '{}'::jsonb
+            FROM (
+                SELECT i, CASE WHEN i <= 10 THEN md5('live-' || i)::uuid
+                               ELSE md5('retained-' || i)::uuid END AS object_id
+                FROM generate_series(1, 50) i
+            ) candidates
+            "#,
+        )
+        .bind(delete_on)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("ANALYZE requests")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let rows = sqlx::query(TRAILING_DEMAND_SQL)
+            .bind(timestamp("2026-08-10T00:00:00Z"))
+            .bind(timestamp("2026-08-15T00:00:00Z"))
+            .bind(vec!["probe-model".to_owned()])
+            .bind(vec!["flex".to_owned()])
+            .bind(false)
+            .bind("include")
+            .bind(Option::<NaiveDate>::None)
+            .bind(Option::<NaiveDate>::None)
+            .fetch_all(&pool)
+            .await
+            .expect("trailing-demand SQL must execute");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get::<String, _>("outcome"), "completed");
+        assert_eq!(
+            rows[0].get::<i64, _>("count"),
+            40,
+            "retained objects whose identity is live must not be counted"
+        );
+
+        let explain = format!("EXPLAIN (ANALYZE, FORMAT JSON) {TRAILING_DEMAND_SQL}");
+        let plan: serde_json::Value = sqlx::query_scalar(&explain)
+            .bind(timestamp("2026-08-10T00:00:00Z"))
+            .bind(timestamp("2026-08-15T00:00:00Z"))
+            .bind(vec!["probe-model".to_owned()])
+            .bind(vec!["flex".to_owned()])
+            .bind(false)
+            .bind("include")
+            .bind(Option::<NaiveDate>::None)
+            .bind(Option::<NaiveDate>::None)
+            .fetch_one(&pool)
+            .await
+            .expect("trailing-demand SQL must be explainable");
+        let live_rows_read = relation_rows_read(&plan, "requests");
+        assert!(
+            live_rows_read < 500.0,
+            "live-preferred suppression read {live_rows_read} requests rows for 50 retained \
+             candidates; it must probe per candidate, not read the live table: {plan}"
+        );
+        assert!(
+            plan_uses_index(&plan, "requests_pkey"),
+            "live-preferred suppression must probe the requests primary key: {plan}"
         );
     }
 

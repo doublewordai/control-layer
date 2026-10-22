@@ -119,27 +119,19 @@ fn background_capacity(ordinary_limit: usize, background_limit: usize, in_flight
         .saturating_sub(in_flight)
 }
 
-/// The error code onwards returns from its own concurrency limiter, alongside a
-/// 429. Distinguishes "too many at once", which lowering concurrency fixes, from
-/// a provider's token-per-minute quota, which it does not.
-const ONWARDS_CONCURRENCY_LIMIT_CODE: &str = "concurrency_limit_exceeded";
-
 /// Whether a failure means "the model had nowhere to put this request".
 ///
-/// Two shapes count. An exact 529 is the upstream provider saying it is
-/// overloaded. A 429 carrying `concurrency_limit_exceeded` is onwards' own
-/// limiter, which is the wall this daemon actually reaches first: onwards sits
-/// between fusillade and every provider and never emits 529 itself, so matching
-/// 529 alone leaves the controller with a brake that cannot fire.
+/// A 529 is onwards refusing for capacity: the model's providers are full or
+/// not placed.
 ///
 /// That matters because the increase side grows on *demand* - a model that fills
 /// every slot it is offered is raised - so without a working decrease signal the
 /// limit only ever ratchets up.
 ///
-/// A bare 429 without that code is deliberately excluded. It is a provider rate
-/// limit, usually tokens per minute, and fewer concurrent requests does not
-/// necessarily mean fewer tokens per minute; cutting on it would shrink the
-/// limit for a wall that concurrency does not control.
+/// A 429 is deliberately excluded. It is a provider rate limit, usually tokens
+/// per minute, and fewer concurrent requests does not necessarily mean fewer
+/// tokens per minute; cutting on it would shrink the limit for a wall that
+/// concurrency does not control.
 ///
 /// Timeouts and connection resets are also excluded: they happened to a request
 /// the model had already accepted, so they say nothing about how many more it
@@ -160,10 +152,6 @@ fn is_downstream_overload(reason: &FailureReason) -> bool {
         // that, and the limit re-grows multiplicatively once capacity returns.
         FailureReason::RetriableHttpStatus { status: 503, .. }
         | FailureReason::NonRetriableHttpStatus { status: 503, .. } => true,
-        FailureReason::RetriableHttpStatus { status: 429, body }
-        | FailureReason::NonRetriableHttpStatus { status: 429, body } => {
-            body.contains(ONWARDS_CONCURRENCY_LIMIT_CODE)
-        }
         _ => false,
     }
 }
@@ -359,6 +347,22 @@ fn renewed_heartbeat_lease_anchor(
     lease_duration: Duration,
 ) -> Option<std::time::Instant> {
     (completed_at < current_anchor + lease_duration).then_some(heartbeat_started_at)
+}
+
+fn scoped_daemon_shutdown_token(
+    parent: &tokio_util::sync::CancellationToken,
+) -> tokio_util::sync::CancellationToken {
+    parent.child_token()
+}
+
+fn daemon_shutdown_result(heartbeat_lease_lost: bool) -> Result<()> {
+    if heartbeat_lease_lost {
+        Err(FusilladeError::Other(anyhow::anyhow!(
+            "heartbeat lease expired; daemon process must restart"
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 /// Run maintenance work only while the daemon remains live. Dropping the
@@ -629,34 +633,53 @@ async fn run_retained_response_retirement_loop<S>(
     }
 }
 
+/// Due files examined by one file-content expiry statement. Each costs a batch
+/// lookup, so this bounds how long the statement holds its write lock on
+/// `files`.
+const FILE_EXPIRY_SCAN_LIMIT: i64 = 10_000;
+
+/// Minimum time between complete file-content expiry walks. Files mostly
+/// become eligible in bulk, when a batch-archive week retires and expires its
+/// batches, so re-examining every pinned file on each retirement pass would
+/// repeat the same work for little gain.
+const FILE_EXPIRY_WALK_INTERVAL: Duration = Duration::from_secs(3_600);
+
 async fn run_template_retirement_loop<S>(
     storage: Arc<S>,
     shutdown: tokio_util::sync::CancellationToken,
     query_timeout: Duration,
     select_new: bool,
     retention_days: i32,
-    expiry_batch_size: i64,
     period: Duration,
 ) where
     S: DaemonStorage + 'static,
 {
+    let mut last_expiry_walk: Option<tokio::time::Instant> = None;
     loop {
         // Phase 1: bounded file-content expiry unpins template windows. A
-        // failure here must not suppress retirement recovery below.
-        if select_new {
+        // failure here must not suppress retirement recovery below; a failed
+        // walk starts over on the next pass.
+        let expiry_due =
+            last_expiry_walk.is_none_or(|walked| walked.elapsed() >= FILE_EXPIRY_WALK_INTERVAL);
+        if select_new && expiry_due {
+            let mut after = None;
             loop {
                 match maintenance_query(
                     &shutdown,
                     "file content expiry",
                     query_timeout,
-                    storage.expire_file_content(retention_days, expiry_batch_size),
+                    storage.expire_file_content(retention_days, FILE_EXPIRY_SCAN_LIMIT, after),
                 )
                 .await
                 {
-                    Ok(Some(expired)) => {
-                        counter!("fusillade_file_content_expired_total").increment(expired);
-                        if (expired as i64) < expiry_batch_size {
-                            break;
+                    Ok(Some(step)) => {
+                        counter!("fusillade_file_content_expired_total").increment(step.expired);
+                        match step.next {
+                            Some(cursor) => after = Some(cursor),
+                            None => {
+                                last_expiry_walk = Some(tokio::time::Instant::now());
+                                break;
+                            }
                         }
                     }
                     Ok(None) => return,
@@ -1801,7 +1824,10 @@ where
             claim_mutex: Arc::new(tokio::sync::Mutex::new(())),
             requests_processed: Arc::new(AtomicU64::new(0)),
             requests_failed: Arc::new(AtomicU64::new(0)),
-            shutdown_token,
+            // The daemon may self-fence by cancelling its own work. Keep that
+            // cancellation below the caller's process-wide token so the
+            // supervisor can distinguish lease loss from operator shutdown.
+            shutdown_token: scoped_daemon_shutdown_token(&shutdown_token),
             cancellation_tokens: Arc::new(dashmap::DashMap::new()),
         }
     }
@@ -2631,17 +2657,28 @@ where
                         .increment(1.0);
                 }
 
+                // The customer-chosen id is bounded so it cannot bloat spans.
+                let span_custom_id: Option<String> = request
+                    .data
+                    .custom_id
+                    .as_deref()
+                    .map(|id| id.chars().take(128).collect());
                 let process_span = tracing::info_span!(
                     parent: tracing::Span::none(),
                     "fusillade.process_request",
                     trace_id = tracing::field::Empty,
                     otel.name = "fusillade.process_request",
+                    x_request_id = tracing::field::Empty,
                     request_id = %request_id,
                     batch_id = ?batch_id,
                     model = %model,
                     capacity_model = %capacity_model,
+                    doubleword.account_id = %user_id,
+                    completion_window = %completion_window,
+                    custom_id = span_custom_id.as_deref(),
                     outcome = tracing::field::Empty,
                 );
+                let process_ctx = crate::processor::ProcessContext::new(process_span.clone());
 
                 join_set.spawn(async move {
                     let span = tracing::Span::current();
@@ -2701,6 +2738,7 @@ where
                             storage.as_ref(),
                             should_retry.clone(),
                             cancellation,
+                            process_ctx,
                         )
                         .await;
 
@@ -2758,9 +2796,32 @@ where
                             let retry_attempt = failed.state.retry_attempt;
                             let reason_label = failed.state.reason.metric_label();
                             let status_code_label = failed.state.reason.status_code_label();
-                            if failed.state.reason.is_retriable() {
-                                match failed.can_retry(retry_attempt, retry_config.clone()) {
+                            // A batch-capacity refusal must always be rescheduled, even
+                            // when the configured `should_retry` predicate classifies
+                            // the 529 as non-retriable: it is admission control, not a
+                            // failed attempt, so rejecting it would persist the refusal as
+                            // a terminal failure.
+                            if failed.state.reason.is_retriable()
+                                || failed.state.reason.is_batch_capacity_exceeded()
+                            {
+                                // The gateway's per-model batch in-flight cap
+                                // refuses with a 529 carrying
+                                // `batch_capacity_exceeded`. That is admission
+                                // control, not a failed attempt: it still backs
+                                // off (and still counts as downstream overload
+                                // above), but must not spend a retry attempt.
+                                let spends_attempt = !failed.state.reason.is_batch_capacity_exceeded();
+                                let retry_result = if spends_attempt {
+                                    failed.can_retry(retry_attempt, retry_config.clone())
+                                } else {
+                                    failed.can_retry_without_spending_attempt(
+                                        retry_attempt,
+                                        retry_config.clone(),
+                                    )
+                                };
+                                match retry_result {
                                     Ok(pending) => {
+                                        let new_attempt = pending.state.retry_attempt;
                                         let rescheduled = storage
                                             .reschedule_for_retry(
                                                 request_id,
@@ -2785,7 +2846,7 @@ where
                                             counter!(
                                                 "fusillade_requests_retried_total",
                                                 "model" => model_clone.clone(),
-                                                "attempt" => (retry_attempt + 1).to_string(),
+                                                "attempt" => new_attempt.to_string(),
                                                 "reason" => reason_label,
                                                 "status_code" => status_code_label.clone()
                                             )
@@ -2793,7 +2854,7 @@ where
                                             tracing::info!(
                                                 request_id = %request_id,
                                                 batch_id = ?batch_id,
-                                                retry_attempt = retry_attempt + 1,
+                                                retry_attempt = new_attempt,
                                                 "request.retry_persisted"
                                             );
                                         } else {
@@ -2805,7 +2866,7 @@ where
                                             tracing::warn!(
                                                 request_id = %request_id,
                                                 batch_id = ?batch_id,
-                                                retry_attempt = retry_attempt + 1,
+                                                retry_attempt = new_attempt,
                                                 "request.retry_skipped_lost_ownership"
                                             );
                                         }
@@ -3008,9 +3069,7 @@ where
         // run_with_mode exists so split-fleet binaries override the config,
         // and per-role labels are what let one role's exit never zero
         // another's signal. Dashboards: `min by (pod) (fusillade_daemon_up)`
-        // catches any dead role. A hard process abort can still skip the
-        // final scrape, so alerting pairs this with heartbeat-rate
-        // (FusilladeDaemonDown family).
+        // catches any dead role while the process is still scrapeable.
         struct LivenessGaugeGuard {
             mode_label: &'static str,
         }
@@ -3042,12 +3101,15 @@ where
         );
         let heartbeat_lease_duration = Duration::from_millis(self.config.stale_daemon_threshold_ms);
         let shutdown_signal = self.shutdown_token.clone();
+        let heartbeat_lease_lost = Arc::new(AtomicBool::new(false));
+        let heartbeat_lease_lost_signal = heartbeat_lease_lost.clone();
 
         let heartbeat_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(heartbeat_interval_ms));
             let mut daemon_record = running_record;
             let mut lease_anchor = std::time::Instant::now();
             let handle_lease_loss = || {
+                heartbeat_lease_lost_signal.store(true, Ordering::Release);
                 counter!("fusillade_heartbeat_lease_lost_total").increment(1);
                 crate::background_error!(
                     "heartbeat_lease_lost", Error,
@@ -3526,7 +3588,6 @@ where
                     query_timeout,
                     template_select_new,
                     template_retention_days.unwrap_or(0),
-                    self.config.purge_batch_size.max(1),
                     Duration::from_secs(86_400),
                 ));
                 daemon_handles.push(("template_retirement", template_handle));
@@ -3757,7 +3818,7 @@ where
                 biased;
                 _ = self.shutdown_token.cancelled() => {
                     tracing::info!("Shutdown signal received, stopping daemon");
-                    break Ok(());
+                    break daemon_shutdown_result(heartbeat_lease_lost.load(Ordering::Acquire));
                 }
                 child_result = supervise_next_daemon_child(&mut daemon_children), if !daemon_children.is_empty() => {
                     self.shutdown_token.cancel();
@@ -3816,14 +3877,8 @@ mod tests {
     use super::*;
     use crate::request::FailureReason;
 
-    /// A 529 is a provider saying it is overloaded; a 429 carrying onwards'
-    /// concurrency code is onwards' own limiter, which is the wall this daemon
-    /// reaches first once the controller grows past a model's configured limit.
-    /// Matching 529 alone leaves the cut path unreachable in this deployment.
     #[test]
-    fn provider_529_and_onwards_concurrency_429_are_overload_signals() {
-        let onwards_429 =
-            r#"{"error":{"type":"rate_limit_error","code":"concurrency_limit_exceeded"}}"#;
+    fn provider_529_is_an_overload_signal() {
         for reason in [
             FailureReason::RetriableHttpStatus {
                 status: 529,
@@ -3832,14 +3887,6 @@ mod tests {
             FailureReason::NonRetriableHttpStatus {
                 status: 529,
                 body: String::new(),
-            },
-            FailureReason::RetriableHttpStatus {
-                status: 429,
-                body: onwards_429.to_string(),
-            },
-            FailureReason::NonRetriableHttpStatus {
-                status: 429,
-                body: onwards_429.to_string(),
             },
         ] {
             assert!(is_downstream_overload(&reason), "{reason:?}");
@@ -3866,6 +3913,38 @@ mod tests {
         }
     }
 
+    /// The gateway's per-model batch in-flight cap refuses with 529 and body
+    /// code `batch_capacity_exceeded`. That is a downstream overload signal, so
+    /// the dispatcher backs off rather than treating it as a per-key 429.
+    #[test]
+    fn batch_capacity_exceeded_529_is_an_overload_signal() {
+        for reason in [
+            FailureReason::RetriableHttpStatus {
+                status: 529,
+                body: r#"{"error":{"type":"overloaded_error","code":"batch_capacity_exceeded"}}"#
+                    .to_string(),
+            },
+            FailureReason::NonRetriableHttpStatus {
+                status: 529,
+                body: r#"{"error":{"type":"overloaded_error","code":"batch_capacity_exceeded"}}"#
+                    .to_string(),
+            },
+        ] {
+            assert!(is_downstream_overload(&reason), "{reason:?}");
+            assert!(
+                reason.is_batch_capacity_exceeded(),
+                "a batch_capacity_exceeded 529 must be recognised as admission control: {reason:?}"
+            );
+        }
+        // An ordinary 529 is overload but not admission control, so it still spends an attempt.
+        let plain = FailureReason::RetriableHttpStatus {
+            status: 529,
+            body: String::new(),
+        };
+        assert!(is_downstream_overload(&plain));
+        assert!(!plain.is_batch_capacity_exceeded());
+    }
+
     /// Everything else must leave the limit alone. A bare 429 is a provider rate
     /// limit, usually tokens per minute, which fewer concurrent requests does not
     /// necessarily reduce; timeouts and resets happened to a request the model had
@@ -3876,6 +3955,12 @@ mod tests {
             FailureReason::RetriableHttpStatus {
                 status: 429,
                 body: r#"{"error":{"code":"rate_limit_exceeded"}}"#.to_string(),
+            },
+            FailureReason::RetriableHttpStatus {
+                status: 429,
+                body:
+                    r#"{"error":{"type":"rate_limit_error","code":"concurrency_limit_exceeded"}}"#
+                        .to_string(),
             },
             FailureReason::RetriableHttpStatus {
                 status: 429,
@@ -4012,6 +4097,8 @@ mod tests {
         retained_contiguous_ahead: AtomicUsize,
         retained_required: AtomicUsize,
         batch_candidates: AtomicUsize,
+        expiry_steps: AtomicUsize,
+        expiry_walk_steps: AtomicUsize,
         events: std::sync::Mutex<Vec<&'static str>>,
     }
 
@@ -4045,6 +4132,8 @@ mod tests {
                 retained_contiguous_ahead: AtomicUsize::new(7),
                 retained_required: AtomicUsize::new(7),
                 batch_candidates: AtomicUsize::new(0),
+                expiry_steps: AtomicUsize::new(0),
+                expiry_walk_steps: AtomicUsize::new(1),
                 events: std::sync::Mutex::new(Vec::new()),
             }
         }
@@ -4204,9 +4293,27 @@ mod tests {
             Ok(crate::RetainedResponseRetirementOutcome::NoCandidate)
         }
 
-        async fn expire_file_content(&self, _retention_days: i32, _batch_size: i64) -> Result<u64> {
+        async fn expire_file_content(
+            &self,
+            _retention_days: i32,
+            _scan_limit: i64,
+            after: Option<crate::manager::FileExpiryCursor>,
+        ) -> Result<crate::manager::FileExpiryStep> {
             self.record("file_content_expiry");
-            Ok(0)
+            let step = self.expiry_steps.fetch_add(1, Ordering::SeqCst);
+            let walk_steps = self.expiry_walk_steps.load(Ordering::SeqCst).max(1);
+            // Each walk must resume from the previous step's cursor and
+            // restart from the oldest file once complete.
+            let position = step % walk_steps;
+            assert_eq!(after.is_none(), position == 0, "step {step}");
+            let next = (position + 1 < walk_steps).then(|| crate::manager::FileExpiryCursor {
+                created_at: chrono::DateTime::UNIX_EPOCH,
+                id: uuid::Uuid::from_u128(position as u128 + 1),
+            });
+            if let Some(cursor) = after {
+                assert_eq!(cursor.id, uuid::Uuid::from_u128(position as u128));
+            }
+            Ok(crate::manager::FileExpiryStep { expired: 0, next })
         }
 
         async fn cleanup_retired_template_routes(&self, _limit: i64) -> Result<u64> {
@@ -4413,6 +4520,52 @@ mod tests {
         shutdown.cancel();
         weekly_handle.await.unwrap();
         retained_handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn file_expiry_walks_in_steps_at_most_hourly() {
+        let storage = Arc::new(FakeMaintenanceStorage::default());
+        storage.expiry_walk_steps.store(3, Ordering::SeqCst);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let handle = tokio::spawn(run_template_retirement_loop(
+            storage.clone(),
+            shutdown.clone(),
+            Duration::from_secs(1),
+            true,
+            23,
+            Duration::from_secs(86_400),
+        ));
+        let count = |event: &str| {
+            storage
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|recorded| **recorded == event)
+                .count()
+        };
+
+        // The first pass walks the whole due range, one bounded step at a time.
+        tokio::task::yield_now().await;
+        assert_eq!(count("file_content_expiry"), 3);
+        assert_eq!(count("template_retirement"), 1);
+
+        // Retirement keeps its five-minute cadence without repeating the walk.
+        for pass in 1..12 {
+            tokio::time::advance(Duration::from_secs(300)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(count("template_retirement"), 1 + pass);
+            assert_eq!(count("file_content_expiry"), 3);
+        }
+
+        // An hour after the completed walk, the next pass walks again.
+        tokio::time::advance(Duration::from_secs(300)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(count("template_retirement"), 13);
+        assert_eq!(count("file_content_expiry"), 6);
+
+        shutdown.cancel();
+        handle.await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -5693,6 +5846,18 @@ mod tests {
     }
 
     #[test]
+    fn priority_injection_keeps_key_order() {
+        let mut body = r#"{"model":"m","response_format":{"type":"json_schema","json_schema":{"name":"n","schema":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"string"}}}}},"messages":[]}"#.to_string();
+
+        inject_dynamo_priority(&mut body, 7);
+
+        assert_eq!(
+            body,
+            r#"{"model":"m","response_format":{"type":"json_schema","json_schema":{"name":"n","schema":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"string"}}}}},"messages":[],"nvext":{"agent_hints":{"priority":7}}}"#
+        );
+    }
+
+    #[test]
     fn background_priority_is_reserved_and_preserves_nvext_siblings() {
         let mut body = serde_json::json!({
             "input": "hello",
@@ -5791,6 +5956,36 @@ mod tests {
             None,
             "a write completing at the old deadline must not renew ownership"
         );
+    }
+
+    #[test]
+    fn daemon_self_fence_does_not_cancel_its_caller() {
+        let caller_shutdown = tokio_util::sync::CancellationToken::new();
+        let daemon_shutdown = scoped_daemon_shutdown_token(&caller_shutdown);
+
+        daemon_shutdown.cancel();
+
+        assert!(daemon_shutdown.is_cancelled());
+        assert!(
+            !caller_shutdown.is_cancelled(),
+            "self-fencing one daemon must not disguise the failure as process shutdown"
+        );
+
+        let replacement_daemon_shutdown = scoped_daemon_shutdown_token(&caller_shutdown);
+        caller_shutdown.cancel();
+        assert!(
+            replacement_daemon_shutdown.is_cancelled(),
+            "operator shutdown must still propagate into the daemon"
+        );
+    }
+
+    #[test]
+    fn heartbeat_lease_loss_is_a_daemon_failure() {
+        assert!(daemon_shutdown_result(false).is_ok());
+
+        let error = daemon_shutdown_result(true)
+            .expect_err("lease loss must reach the process supervisor as a failure");
+        assert!(error.to_string().contains("heartbeat lease expired"));
     }
 
     #[tokio::test]

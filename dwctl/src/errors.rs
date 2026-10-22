@@ -141,6 +141,10 @@ pub enum Error {
     #[error("Payload too large: {message}")]
     PayloadTooLarge { message: String },
 
+    /// The request body is in a format or content type the endpoint doesn't read
+    #[error("Unsupported media type: {message}")]
+    UnsupportedMediaType { message: String },
+
     /// Insufficient credits to perform the requested operation
     #[error("Insufficient credits: {message}")]
     InsufficientCredits { current_balance: Decimal, message: String },
@@ -209,6 +213,7 @@ impl Error {
             Error::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Error::Conflict { .. } => StatusCode::CONFLICT,
             Error::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            Error::UnsupportedMediaType { .. } => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Error::InsufficientCredits { .. } => StatusCode::PAYMENT_REQUIRED,
             Error::SpendCapExceeded { .. } => StatusCode::PAYMENT_REQUIRED,
             Error::ModelAccessDenied { .. } => StatusCode::FORBIDDEN,
@@ -229,6 +234,7 @@ impl Error {
             Error::BadRequest { message } => message.clone(),
             Error::UnprocessableEntity { message } => message.clone(),
             Error::PayloadTooLarge { message } => message.clone(),
+            Error::UnsupportedMediaType { message } => message.clone(),
             Error::NotFound { resource, id } => {
                 format!("{resource} with ID {id} not found")
             }
@@ -304,7 +310,8 @@ impl IntoResponse for Error {
             | Error::UnprocessableEntity { .. }
             | Error::NotFound { .. }
             | Error::Gone { .. }
-            | Error::PayloadTooLarge { .. } => {
+            | Error::PayloadTooLarge { .. }
+            | Error::UnsupportedMediaType { .. } => {
                 tracing::debug!("Client error: {}", self);
             }
             Error::Conflict { .. } => {

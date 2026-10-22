@@ -13,11 +13,13 @@
 //!
 //! Pool-level configuration (keys, rate_limit) applies to all providers in the pool.
 //! Provider-level configuration (url, onwards_key, weight) is specific to each provider.
+use crate::affinity::AffinityConfig;
 use crate::aimd::AimdConfig;
 use crate::auth::KeySet;
+use crate::inflight::InflightLimits;
 use crate::load_balancer::{Provider, ProviderPool};
 use crate::reasoning::ReasoningTranslationConfig;
-use crate::serving::{AccountServing, ProviderKind, ServingOverlay, ServingPresets};
+use crate::serving::{AccountServing, ProviderKind, ServingOverlay};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use bon::Builder;
@@ -253,6 +255,11 @@ pub struct FallbackConfig {
     /// Priority-only share controller overrides. None uses defaults; enabled=false opts out.
     #[serde(default)]
     pub aimd: Option<AimdConfig>,
+    /// Priority-only conversation affinity: decide preferred-first once per
+    /// conversation rather than per request (see [`crate::affinity`]). None
+    /// keeps per-request selection.
+    #[serde(default)]
+    pub affinity: Option<AffinityConfig>,
 }
 
 impl FallbackConfig {
@@ -421,16 +428,24 @@ pub struct PoolSpec {
     #[serde(default)]
     pub routing_rules: Vec<RoutingRule>,
 
-    /// The serving classes this alias offers, each a preset of targets (see
-    /// [`crate::serving`]). Declared on the `default` pool: activation is a
-    /// property of the alias.
-    #[serde(default)]
-    pub serving_classes: ServingPresets,
-
     /// Per-account overrides on this alias, keyed by account id (the value of
     /// a key's `account` label). See [`crate::serving::ServingOverlay`].
     #[serde(default)]
     pub overlays: HashMap<String, ServingOverlay>,
+
+    #[serde(default)]
+    pub inflight_limit: Option<u32>,
+
+    /// The alias's global batch in-flight cap. Distinct from `inflight_limit`,
+    /// which applies to realtime traffic only: batch requests are counted on
+    /// the named alias across every replica, and over the cap are refused with
+    /// 529 so the batch dispatcher backs off.
+    #[serde(default)]
+    pub batch_inflight_limit: Option<u32>,
+
+    #[serde(default)]
+    #[builder(default)]
+    pub account_inflight_limits: HashMap<String, u32>,
 
     /// The list of providers to load balance across
     pub providers: Vec<ProviderSpec>,
@@ -552,8 +567,10 @@ pub struct PoolConfig {
     pub sanitize_response: bool,
     pub trusted: bool,
     pub routing_rules: Vec<RoutingRule>,
-    pub serving_classes: ServingPresets,
     pub overlays: HashMap<String, ServingOverlay>,
+    pub inflight_limit: Option<u32>,
+    pub batch_inflight_limit: Option<u32>,
+    pub account_inflight_limits: HashMap<String, u32>,
     pub providers: Vec<ProviderSpec>,
 }
 
@@ -569,8 +586,10 @@ impl From<PoolSpec> for PoolConfig {
             sanitize_response: pool.sanitize_response,
             trusted: pool.trusted,
             routing_rules: pool.routing_rules,
-            serving_classes: pool.serving_classes,
             overlays: pool.overlays,
+            inflight_limit: pool.inflight_limit,
+            batch_inflight_limit: pool.batch_inflight_limit,
+            account_inflight_limits: pool.account_inflight_limits,
             providers: pool.providers,
         }
     }
@@ -715,8 +734,10 @@ impl TargetSpecOrList {
                     sanitize_response: false,
                     trusted,
                     routing_rules: Vec::new(),
-                    serving_classes: ServingPresets::new(),
                     overlays: HashMap::new(),
+                    inflight_limit: None,
+                    batch_inflight_limit: None,
+                    account_inflight_limits: HashMap::new(),
                     providers,
                 })
             }
@@ -756,8 +777,10 @@ impl TargetSpecOrList {
                     sanitize_response,
                     trusted,
                     routing_rules: Vec::new(),
-                    serving_classes: ServingPresets::new(),
                     overlays: HashMap::new(),
+                    inflight_limit: None,
+                    batch_inflight_limit: None,
+                    account_inflight_limits: HashMap::new(),
                     providers: vec![provider],
                 })
             }
@@ -1098,13 +1121,6 @@ impl TargetPools {
         self.default.evaluate_routing_rules(labels)
     }
 
-    /// The serving classes this alias offers, with their presets. Declared on the
-    /// default pool: activation is a property of the alias, not of which
-    /// pool serves a request class.
-    pub fn active_serving_classes(&self) -> &ServingPresets {
-        self.default.serving_classes()
-    }
-
     /// Look a pool up by name.
     pub fn get(&self, name: &str) -> Option<&ProviderPool> {
         if name == DEFAULT_POOL {
@@ -1229,7 +1245,7 @@ pub struct ConfigFile {
 }
 
 /// The live-updating collection of targets.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Targets {
     /// Map of alias names to their named pools (supports load balancing, and
     /// per-request-class pools — see [`TargetPools`])
@@ -1367,6 +1383,18 @@ fn build_pool(
             enabled: false,
             ..crate::aimd::AimdConfig::default()
         });
+        fallback.affinity = None;
+    }
+    if let Some(fallback) = &pool_config.fallback
+        && let Some(config) = &fallback.affinity
+        && config.enabled
+    {
+        config.validate().map_err(|e| anyhow!(e))?;
+        if !fallback.enabled || pool_config.strategy != LoadBalanceStrategy::Priority {
+            return Err(anyhow!(
+                "affinity requires enabled fallback and priority strategy"
+            ));
+        }
     }
     if let Some(fallback) = &pool_config.fallback
         && let Some(config) = &fallback.aimd
@@ -1464,10 +1492,22 @@ fn build_pool(
         pool_config.trusted,
         pool_config.routing_rules,
     )
-    .with_serving(pool_config.serving_classes, pool_config.overlays))
+    .with_overlays(pool_config.overlays)
+    .with_inflight_limits(pool_config.inflight_limit.map(|default| InflightLimits {
+        default,
+        accounts: pool_config.account_inflight_limits,
+    }))
+    .with_batch_inflight_limit(pool_config.batch_inflight_limit))
 }
 
 impl Targets {
+    /// The configured alias `model` names. `None` when it names no configured
+    /// alias, so a caller can label by model without taking arbitrary client
+    /// input.
+    pub fn configured_alias<'m>(&self, model: &'m str) -> Option<&'m str> {
+        Some(model).filter(|alias| self.targets.contains_key(*alias))
+    }
+
     pub async fn from_config_file(config_path: &PathBuf) -> Result<Self, anyhow::Error> {
         let contents = tokio::fs::read_to_string(config_path).await.map_err(|e| {
             anyhow!(
@@ -2769,6 +2809,66 @@ mod tests {
     }
 
     #[test]
+    fn inflight_limits_parse_onto_the_alias() {
+        let config: ConfigFile = serde_json::from_value(serde_json::json!({
+            "auth": {
+                "global_keys": [],
+                "key_definitions": {
+                    "acme_backend": { "key": "sk-acme-1", "labels": { "account": "acme" } }
+                }
+            },
+            "targets": {
+                "gpt-4": {
+                    "inflight_limit": 20,
+                    "batch_inflight_limit": 7,
+                    "account_inflight_limits": { "acme": 200 },
+                    "providers": [{ "url": "https://api.openai.com", "onwards_key": "sk-upstream" }]
+                },
+                "unlimited": {
+                    "providers": [{ "url": "https://api.openai.com" }]
+                }
+            }
+        }))
+        .unwrap();
+        let targets = Targets::from_config(config).unwrap();
+
+        let limits = targets
+            .targets
+            .get("gpt-4")
+            .and_then(|pools| pools.default_pool().inflight_limits().cloned())
+            .unwrap();
+        assert_eq!(limits.for_account("acme"), 200);
+        assert_eq!(limits.for_account("someone-else"), 20);
+        assert_eq!(
+            targets
+                .targets
+                .get("gpt-4")
+                .unwrap()
+                .default_pool()
+                .batch_inflight_limit(),
+            Some(7)
+        );
+        assert!(
+            targets
+                .targets
+                .get("unlimited")
+                .unwrap()
+                .default_pool()
+                .inflight_limits()
+                .is_none()
+        );
+        assert!(
+            targets
+                .targets
+                .get("unlimited")
+                .unwrap()
+                .default_pool()
+                .batch_inflight_limit()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn test_trusted_field_preserved_in_pool_conversion() {
         // Test PoolSpec -> PoolConfig conversion
         let pool_spec = PoolSpec {
@@ -2799,8 +2899,10 @@ mod tests {
                 accepts_scheduling_priority: false,
                 kind: Default::default(),
             }],
-            serving_classes: Default::default(),
             overlays: Default::default(),
+            inflight_limit: None,
+            batch_inflight_limit: None,
+            account_inflight_limits: Default::default(),
         };
 
         let pool_config = TargetSpecOrList::Pool(pool_spec)
@@ -3555,6 +3657,38 @@ mod tests {
             Some(COMPLETIONS_POOL)
         );
         assert!(entry.resolved_name(RequestClass::Normal).is_none());
+    }
+
+    /// Affinity belongs to the default pool of a priority pool with fallback:
+    /// an invalid or misplaced block is a configuration error, and named pools
+    /// drop it.
+    #[test]
+    fn affinity_is_validated_and_kept_only_on_the_default_pool() {
+        let config = |strategy: &str, affinity: &str| {
+            let pool = format!(
+                r#"{{
+                    "strategy": "{strategy}",
+                    "fallback": {{"enabled": true, "on_status": [5], "affinity": {affinity}}},
+                    "providers": [
+                        {{"url": "https://hosted.example.com/"}},
+                        {{"url": "https://overflow.example.com/"}}
+                    ]
+                }}"#
+            );
+            format!(
+                r#"{{"targets": {{"m": {{"pools": {{"default": {pool}, "completions": {pool}}}}}}}}}"#
+            )
+        };
+        let build = |json: String| Targets::from_config(serde_json::from_str(&json).unwrap());
+
+        let targets = build(config("priority", r#"{"target_conversations": 10}"#)).unwrap();
+        let entry = targets.targets.get("m").unwrap();
+        assert!(entry.resolve(RequestClass::Normal).affinity_enabled());
+        assert!(!entry.resolve(RequestClass::Completions).affinity_enabled());
+
+        assert!(build(config("priority", r#"{"target_conversations": 0}"#)).is_err());
+        assert!(build(config("weighted_random", r#"{"target_conversations": 10}"#)).is_err());
+        assert!(build(config("weighted_random", r#"{"enabled": false}"#)).is_ok());
     }
 
     /// Access control belongs to the alias: a pool added for one request class

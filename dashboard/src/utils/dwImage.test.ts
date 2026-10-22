@@ -12,7 +12,7 @@ describe("splitDwImgTokens", () => {
   it("splits a token out of surrounding text", () => {
     expect(splitDwImgTokens(`"url": "dw-img://${SHA}"`)).toEqual([
       { kind: "text", value: '"url": "' },
-      { kind: "token", raw: `dw-img://${SHA}`, sha256: SHA },
+      { kind: "token", raw: `dw-img://${SHA}`, sha256: SHA, ref: SHA },
       { kind: "text", value: '"' },
     ]);
   });
@@ -21,16 +21,16 @@ describe("splitDwImgTokens", () => {
     const segs = splitDwImgTokens(`a dw-img://${SHA} b dw-img://${SHA2} c`);
     expect(segs).toEqual([
       { kind: "text", value: "a " },
-      { kind: "token", raw: `dw-img://${SHA}`, sha256: SHA },
+      { kind: "token", raw: `dw-img://${SHA}`, sha256: SHA, ref: SHA },
       { kind: "text", value: " b " },
-      { kind: "token", raw: `dw-img://${SHA2}`, sha256: SHA2 },
+      { kind: "token", raw: `dw-img://${SHA2}`, sha256: SHA2, ref: SHA2 },
       { kind: "text", value: " c" },
     ]);
   });
 
   it("handles a token at the very start and end", () => {
     expect(splitDwImgTokens(`dw-img://${SHA}`)).toEqual([
-      { kind: "token", raw: `dw-img://${SHA}`, sha256: SHA },
+      { kind: "token", raw: `dw-img://${SHA}`, sha256: SHA, ref: SHA },
     ]);
   });
 
@@ -42,7 +42,36 @@ describe("splitDwImgTokens", () => {
   it("lower-cases the captured hash", () => {
     const upper = "A".repeat(64);
     const segs = splitDwImgTokens(`dw-img://${upper}`);
-    expect(segs).toEqual([{ kind: "token", raw: `dw-img://${upper}`, sha256: SHA }]);
+    expect(segs).toEqual([{ kind: "token", raw: `dw-img://${upper}`, sha256: SHA, ref: SHA }]);
+  });
+
+  it("captures the upload ID in the reference", () => {
+    const uploadId = "c".repeat(32);
+    expect(splitDwImgTokens(`"url": "dw-img://${SHA}.${uploadId}"`)).toEqual([
+      { kind: "text", value: '"url": "' },
+      { kind: "token", raw: `dw-img://${SHA}.${uploadId}`, sha256: SHA, ref: `${SHA}.${uploadId}` },
+      { kind: "text", value: '"' },
+    ]);
+  });
+
+  it("links a valid token followed by punctuation", () => {
+    const uploadId = "c".repeat(32);
+    expect(splitDwImgTokens(`see dw-img://${SHA}.${uploadId}.`)).toEqual([
+      { kind: "text", value: "see " },
+      { kind: "token", raw: `dw-img://${SHA}.${uploadId}`, sha256: SHA, ref: `${SHA}.${uploadId}` },
+      { kind: "text", value: "." },
+    ]);
+    expect(splitDwImgTokens(`see dw-img://${SHA}.`)).toEqual([
+      { kind: "text", value: "see " },
+      { kind: "token", raw: `dw-img://${SHA}`, sha256: SHA, ref: SHA },
+      { kind: "text", value: "." },
+    ]);
+  });
+
+  it("leaves a token with a malformed upload ID as text", () => {
+    for (const bad of [`dw-img://${SHA}.abc`, `dw-img://${SHA}.${"c".repeat(33)}`, `dw-img://${SHA}a`]) {
+      expect(splitDwImgTokens(bad)).toEqual([{ kind: "text", value: bad }]);
+    }
   });
 });
 

@@ -109,10 +109,19 @@ pub async fn get_image<P: PoolProvider + Clone + Send + Sync>(
     // Re-creating it per request would re-init the GCS client + ADC signer
     // on every dashboard image load.
     let ttl = Duration::from_secs(config.image_normalizer.signing.dashboard_ttl_secs);
-    let signed = state.image_normalizer.sign(token, ttl).await.map_err(|e| {
-        warn!(error = %e, "image_normalizer.sign failed for dashboard view");
-        Error::Internal {
-            operation: format!("image signing failed: {e}"),
+    let signed = state.image_normalizer.sign(token, ttl).await.map_err(|e| match e {
+        // The grant covers the content hash, but this reference names a copy
+        // the store does not have (e.g. a mistyped upload ID): same answer as
+        // an image the caller cannot see.
+        crate::image_normalizer::NormalizeError::NotFound => Error::NotFound {
+            resource: "image".to_string(),
+            id: sha256_hex.clone(),
+        },
+        e => {
+            warn!(error = %e, "image_normalizer.sign failed for dashboard view");
+            Error::Internal {
+                operation: format!("image signing failed: {e}"),
+            }
         }
     })?;
 
@@ -291,10 +300,14 @@ pub async fn accessible_tokens(
     )
     .fetch_all(pool)
     .await?;
-    Ok(rows
+    // Grants are keyed on the content hash, so a grant covers every stored
+    // copy of the image: return the requested tokens (upload ID included) whose
+    // hash is granted.
+    let granted: std::collections::HashSet<[u8; 32]> = rows
         .into_iter()
-        .filter_map(|row| <[u8; 32]>::try_from(row.sha256.as_slice()).ok().map(ImageToken))
-        .collect())
+        .filter_map(|row| <[u8; 32]>::try_from(row.sha256.as_slice()).ok())
+        .collect();
+    Ok(tokens.iter().filter(|t| granted.contains(&t.0)).copied().collect())
 }
 
 /// Whether `viewer` — optionally acting in organization `active_org` — is
@@ -340,7 +353,7 @@ mod tests {
     use sqlx::PgPool;
 
     fn token(b: u8) -> ImageToken {
-        ImageToken([b; 32])
+        ImageToken([b; 32], None)
     }
 
     async fn can_view(pool: &PgPool, tok: ImageToken, viewer: uuid::Uuid, active_org: Option<uuid::Uuid>) -> bool {
@@ -355,8 +368,6 @@ mod tests {
             name: format!("Org key {}", uuid::Uuid::new_v4().simple()),
             description: None,
             purpose: ApiKeyPurpose::Realtime,
-            requests_per_second: None,
-            burst_size: None,
             member_id: None,
             spend_limit: None,
             spend_limit_interval: None,
@@ -370,7 +381,7 @@ mod tests {
     /// organizations' members can use it, and a later personal submission
     /// revokes neither. (Rows are keyed by the principal, so nothing is
     /// overwritten.)
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn the_same_image_submitted_under_two_organizations_grants_both(pool: PgPool) {
         let alice = create_test_user(&pool, Role::StandardUser).await;
         let bob = create_test_user(&pool, Role::StandardUser).await; // member of org A only
@@ -422,7 +433,7 @@ mod tests {
         assert!(!can_view(&pool, img, dave.id, None).await, "dave");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn personal_image_is_private_org_image_is_org_visible(pool: PgPool) {
         let p = create_test_user(&pool, Role::StandardUser).await; // submits personally
         let q = create_test_user(&pool, Role::StandardUser).await; // submits under the org key
@@ -495,7 +506,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn resolve_attribution_distinguishes_personal_and_org_keys(pool: PgPool) {
         // Personal key: created_by == user_id -> no org.
         let person = create_test_user(&pool, Role::StandardUser).await;

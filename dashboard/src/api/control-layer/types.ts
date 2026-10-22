@@ -123,9 +123,8 @@ export type Role =
 export type ApiKeyPurpose = "platform" | "realtime" | "batch" | "playground";
 export type TariffApiKeyPurpose = "realtime" | "batch" | "playground";
 
-// Serving classes (operator-only; customers only ever see the model suffix)
-export type ServingClassName = "interactive" | "throughput";
-/** A model's preset for one class: the router targets its requests ask for. */
+/** An organisation's explicit targets on one model: the router targets its
+ *  realtime requests ask for. Operator-only. */
 export interface ServingPreset {
   ttft_ms: number;
   itl_ms: number;
@@ -169,6 +168,12 @@ export interface ConfigResponse {
     /** Whether strict mode is enabled (uses trusted flag for providers) */
     strict_mode: boolean;
   };
+  /**
+   * The scheduling-toleration presets an account may be pinned to
+   * (`scheduling.toleration_presets`). The account settings control renders
+   * these; an empty list means no presets are configured.
+   */
+  scheduling_toleration_presets?: SchedulingTolerationPreset[];
 }
 
 // Model metrics time series point
@@ -211,7 +216,7 @@ export interface ModelTariff {
   is_active: boolean;
   /** Set on an organisation's own price (a deal); absent on the model's general price. */
   organization_id?: string | null;
-  serving_class?: ServingClassName | "standard" | "custom" | null;
+  serving_class?: string | null;
 }
 
 // Cache pricing (Anthropic-style prompt-cache multipliers). Multipliers are decimal
@@ -331,9 +336,7 @@ export interface Model {
   model_type?: ModelType | null;
   capabilities?: string[] | null;
   hosted_on?: string | null; // endpoint ID (UUID) - null for virtual models
-  requests_per_second?: number | null; // Global rate limiting: requests per second
-  burst_size?: number | null; // Global rate limiting: burst capacity
-  capacity?: number | null; // Maximum concurrent requests allowed
+  realtime_inflight_limit?: number | null; // Virtual models: default realtime requests in flight per account
   batch_capacity?: number | null; // Maximum concurrent batch requests allowed
   throughput?: number | null; // Throughput in requests/second for batch SLA capacity calculations
   groups?: Group[]; // array of group IDs - only present when include=groups
@@ -353,18 +356,15 @@ export interface Model {
   traffic_routing_rules?: TrafficRoutingRule[] | null;
   allowed_batch_completion_windows?: string[] | null;
   metadata?: ModelMetadata | null;
-  /** Serving classes the model offers, keyed by class, each a preset of router targets.
-   *  Only present for platform managers; declared in the model catalog. */
-  serving_classes?: Record<string, ServingPreset>;
 }
 
 /** One organisation's serving overrides on one model (platform managers only). */
 export interface ServingOverlay {
   organization_id: string;
   organization_name: string;
+  organization_display_name?: string | null;
   deployed_model_id: string;
   alias: string;
-  default_serving_class?: ServingClassName;
   targets?: ServingPreset;
   self_hosted_only?: boolean;
   provisioning_source?: string;
@@ -378,15 +378,13 @@ export interface OrganizationCacheTariff {
   write_multiplier_1h: string;
   write_multiplier_24h: string;
   read_multiplier: string;
-  serving_class?: ServingClassName | "standard" | "custom";
+  serving_class?: string;
   valid_from: string;
 }
 
 /** Everything serving-related about one organisation (platform managers only). */
 export interface OrganizationServing {
   organization_id: string;
-  granted_serving_classes: ServingClassName[];
-  default_serving_class?: ServingClassName;
   self_hosted_only: boolean;
   overlays: ServingOverlay[];
   tariffs: ModelTariff[];
@@ -405,9 +403,6 @@ export interface StandardModelCreate {
   description?: string;
   model_type?: ModelType;
   capabilities?: string[];
-  requests_per_second?: number;
-  burst_size?: number;
-  capacity?: number;
   batch_capacity?: number;
   throughput?: number;
   trusted?: boolean;
@@ -426,9 +421,7 @@ export interface VirtualModelCreate {
   description?: string;
   model_type?: ModelType;
   capabilities?: string[];
-  requests_per_second?: number;
-  burst_size?: number;
-  capacity?: number;
+  realtime_inflight_limit?: number;
   batch_capacity?: number;
   throughput?: number;
   lb_strategy?: LoadBalancingStrategy;
@@ -519,9 +512,11 @@ export interface User {
   auto_topup_monthly_limit: number | null; // Monthly spending limit for auto top-ups (null = no limit)
   zero_data_retention: boolean; // Account-wide zero-data-retention flag
   // Serving account settings (platform managers only)
-  granted_serving_classes?: ServingClassName[];
-  default_serving_class?: ServingClassName | null;
   self_hosted_only?: boolean;
+  // Scheduling-toleration preset the account is pinned to (platform managers
+  // only). null/absent = "Default" (nothing pinned); a string is a configured
+  // preset id.
+  toleration_preset?: string | null;
   user_type?: "individual" | "organization"; // User type
   organizations?: OrganizationSummary[]; // only present when include=organizations or for current user
   active_organization_id?: string; // only present for /users/current
@@ -542,8 +537,6 @@ export interface ApiKey {
   purpose: ApiKeyPurpose; // Purpose of the key; see ApiKeyPurpose for allowed values
   created_at: string; // ISO 8601 timestamp
   last_used?: string; // ISO 8601 timestamp
-  requests_per_second?: number | null; // Rate limiting: requests per second
-  burst_size?: number | null; // Rate limiting: burst capacity
   created_by: string; // UUID of the user who created the key (always present in API responses)
   spend_limit?: string | null; // Spending cap in credits (decimal string); null = no cap
   spend_limit_interval?: SpendLimitInterval | null; // null = one-off cap
@@ -659,8 +652,6 @@ export interface ApiKeyCreateRequest {
   name: string;
   description?: string;
   purpose: ApiKeyPurpose; // Required: purpose of the key
-  requests_per_second?: number | null;
-  burst_size?: number | null;
   spend_limit?: string | null; // Spending cap in credits (decimal string)
   spend_limit_interval?: SpendLimitInterval | null; // Requires spend_limit; null = one-off
   // Issue the key to another org member (org targets only; PlatformManager or
@@ -698,9 +689,10 @@ export interface UserUpdateRequest {
   auto_topup_monthly_limit?: number | null; // Set a limit to cap, null to remove limit
   zero_data_retention?: boolean; // Users may update this for their own account
   // Serving account settings: platform managers only (dwctl rejects the whole request otherwise)
-  granted_serving_classes?: ServingClassName[];
-  default_serving_class?: ServingClassName | null;
   self_hosted_only?: boolean;
+  // Scheduling-toleration preset to pin the account to: platform managers
+  // only. A preset id pins it; null clears the pin ("Default").
+  toleration_preset?: string | null;
 }
 
 export interface GroupUpdateRequest {
@@ -714,9 +706,7 @@ export interface ModelUpdateRequest {
   description?: string | null;
   model_type?: ModelType | null;
   capabilities?: string[] | null;
-  requests_per_second?: number | null;
-  burst_size?: number | null;
-  capacity?: number | null;
+  realtime_inflight_limit?: number | null;
   batch_capacity?: number | null;
   throughput?: number | null;
   tariffs?: TariffDefinition[];
@@ -1794,6 +1784,22 @@ export type OrgMemberRole = "owner" | "admin" | "member";
  */
 export type Modality = "realtime" | "batch";
 
+/**
+ * One operator-defined scheduling-toleration preset, declared in the
+ * deployment's `scheduling.toleration_presets`. An account stores only the
+ * preset's `id` (`toleration_preset`); the deployment resolves id to
+ * tolerations. `GET /admin/api/v1/config` exposes these for the account
+ * settings control.
+ */
+export interface SchedulingTolerationPreset {
+  /** Stable slug stored on the account. */
+  id: string;
+  /** Short human label for the control. */
+  label: string;
+  /** One or two sentences of help text (the tooltip). */
+  description: string;
+}
+
 export interface OrganizationSummary {
   id: string;
   name: string;
@@ -1831,6 +1837,11 @@ export interface Organization extends User {
    * organization owns. Empty (or absent) means everything is allowed.
    */
   disabled_modalities?: Modality[];
+  /**
+   * Scheduling-toleration preset every request from this organization is
+   * pinned to (platform managers only). null/absent = "Default".
+   */
+  toleration_preset?: string | null;
 }
 
 export interface OrganizationMember {
@@ -1858,11 +1869,12 @@ export interface OrganizationUpdateRequest {
   low_balance_threshold?: number | null;
   zero_data_retention?: boolean; // Account-wide zero-data-retention flag (admin-only)
   // Serving account settings: platform managers only
-  granted_serving_classes?: ServingClassName[];
-  default_serving_class?: ServingClassName | null;
   self_hosted_only?: boolean;
   /** Replaces the whole set; owner-only. An empty list re-enables everything. */
   disabled_modalities?: Modality[];
+  // Scheduling-toleration preset to pin the organization to: platform managers
+  // only. A preset id pins it; null clears the pin ("Default").
+  toleration_preset?: string | null;
 }
 
 export interface InviteMemberRequest {

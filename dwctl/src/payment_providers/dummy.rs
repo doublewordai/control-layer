@@ -362,7 +362,7 @@ mod tests {
         assert_eq!(provider.config.amount, Decimal::new(100, 0));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_dummy_full_payment_flow(pool: PgPool) {
         let config = crate::config::DummyConfig {
             amount: Decimal::new(5000, 2), // $50.00
@@ -426,7 +426,7 @@ mod tests {
         assert_eq!(transaction.description, Some("Dummy payment (test)".to_string()));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_dummy_idempotency(pool: PgPool) {
         let config = crate::config::DummyConfig {
             amount: Decimal::new(100, 0),

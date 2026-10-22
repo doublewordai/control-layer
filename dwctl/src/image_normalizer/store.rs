@@ -19,6 +19,8 @@
 //! in-memory store is meant for `cargo test` and local `cargo run`
 //! workflows where no bucket is configured.
 use async_trait::async_trait;
+use aws_sdk_s3::config::retry::RetryConfig;
+use aws_sdk_s3::config::timeout::TimeoutConfig;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use metrics::counter;
@@ -48,13 +50,15 @@ pub enum StoreError {
     Unimplemented,
 }
 
-/// Object-store backend for normalised image bytes. Content-addressed by
-/// SHA-256.
+/// Object-store backend for normalised image bytes, keyed by [`ImageToken`]:
+/// the content SHA-256, plus a per-ingest upload ID when
+/// `image_normalizer.unique_upload_keys` is on.
 #[async_trait]
 pub trait ImageStore: Send + Sync {
-    /// Idempotently store `bytes` under `token`. If the object already
-    /// exists, this is a no-op and returns `Ok(false)`. Otherwise stores
-    /// and returns `Ok(true)`.
+    /// Store `bytes` under `token`. Returns `Ok(true)` if written. Remote
+    /// backends write unconditionally — callers that may reuse an existing
+    /// object check [`exists`](Self::exists) first; [`MemoryStore`] returns
+    /// `Ok(false)` if the token is already present.
     async fn put(&self, token: ImageToken, mime: &str, bytes: Bytes) -> Result<bool, StoreError>;
 
     /// Generate a short-lived signed URL pointing at the bytes for `token`.
@@ -66,7 +70,8 @@ pub trait ImageStore: Send + Sync {
 
     /// True if an object with this token already exists AND will still be
     /// there for as long as a signed reference to it can stay in use. Cheap
-    /// check used by the ingest path to skip uploads on dedup hits.
+    /// check used by the ingest path to skip uploads on dedup hits when
+    /// tokens are content-addressed (`unique_upload_keys` off).
     ///
     /// The second half matters for backends with a bucket lifecycle rule:
     /// an object that exists today but is about to be expired by age must
@@ -117,6 +122,13 @@ impl MemoryStore {
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
+    }
+
+    /// Every stored object's raw bytes, for tests asserting what reached the store.
+    #[cfg(test)]
+    pub fn objects(&self) -> Vec<Bytes> {
+        let map = self.inner.lock().expect("MemoryStore mutex poisoned");
+        map.values().map(|(_, bytes)| bytes.clone()).collect()
     }
 }
 
@@ -245,10 +257,6 @@ impl GcsStore {
 #[async_trait]
 impl ImageStore for GcsStore {
     async fn put(&self, token: ImageToken, mime: &str, bytes: Bytes) -> Result<bool, StoreError> {
-        // Idempotency: short-circuit if the object already exists.
-        if self.exists(token).await? {
-            return Ok(false);
-        }
         let client = self.client().await?;
         let key = Self::key(token);
         client
@@ -352,6 +360,15 @@ fn head_last_modified_secs(head: &aws_sdk_s3::operation::head_object::HeadObject
 /// fail at runtime.
 const S3_MAX_PRESIGN: Duration = Duration::from_secs(7 * 24 * 60 * 60 - 60);
 
+/// Attempts per S3 call. Ingest runs inside the upload request, so a failed
+/// call fails the upload; five attempts with the SDK's jittered exponential
+/// backoff (1s base) ride out object-store blips of several seconds.
+const S3_MAX_ATTEMPTS: u32 = 5;
+
+/// Bound on one S3 call including retries, so a sustained outage returns a
+/// 503 instead of holding the upload open.
+const S3_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// S3-compatible object store backend (Cloudflare R2, MinIO, Backblaze B2,
 /// AWS S3) reached via a custom endpoint.
 ///
@@ -396,6 +413,8 @@ impl S3CompatStore {
             .endpoint_url(endpoint.clone())
             .force_path_style(force_path_style)
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .retry_config(RetryConfig::standard().with_max_attempts(S3_MAX_ATTEMPTS))
+            .timeout_config(TimeoutConfig::builder().operation_timeout(S3_OPERATION_TIMEOUT).build())
             .build();
         Self {
             bucket: bucket.into(),
@@ -423,10 +442,6 @@ impl S3CompatStore {
 #[async_trait]
 impl ImageStore for S3CompatStore {
     async fn put(&self, token: ImageToken, mime: &str, bytes: Bytes) -> Result<bool, StoreError> {
-        // Idempotency: short-circuit if the object already exists.
-        if self.exists(token).await? {
-            return Ok(false);
-        }
         let key = Self::key(token);
         self.client
             .put_object()
@@ -546,7 +561,7 @@ mod tests {
     use super::*;
 
     fn tok(b: u8) -> ImageToken {
-        ImageToken([b; 32])
+        ImageToken([b; 32], None)
     }
 
     #[tokio::test]
@@ -645,6 +660,18 @@ mod tests {
     fn s3_key_uses_two_level_prefix() {
         let key = S3CompatStore::key(tok(0xab));
         assert!(key.starts_with("images/ab/ab/abab"));
+    }
+
+    #[test]
+    fn copies_of_the_same_image_get_distinct_keys_under_its_prefix() {
+        let a = ImageToken::new_unique([0xab; 32]);
+        let b = ImageToken::new_unique([0xab; 32]);
+        let (ka, kb) = (S3CompatStore::key(a), S3CompatStore::key(b));
+        assert_ne!(ka, kb);
+        assert!(ka.starts_with(&format!("images/ab/ab/{}.", hex::encode([0xab; 32]))));
+        assert_eq!(GcsStore::key(a), ka);
+        // Content-addressed tokens keep resolving to the content-hash-only key.
+        assert_eq!(S3CompatStore::key(tok(0xab)), format!("images/ab/ab/{}", hex::encode([0xab; 32])));
     }
 
     #[test]

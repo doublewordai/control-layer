@@ -15,7 +15,7 @@ use std::{
 };
 
 use anyhow::{Context, anyhow};
-use axum::{Router, http::StatusCode, routing::get};
+use axum::{Router, http::StatusCode, routing::get, serve::ListenerExt};
 use onwards::config::Config;
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
@@ -75,11 +75,20 @@ pub async fn serve(
 
     let (stop_proxy, proxy_stopped) = oneshot::channel();
     let mut proxy = tokio::spawn(
-        axum::serve(listener, router)
-            .with_graceful_shutdown(async {
-                let _ = proxy_stopped.await;
-            })
-            .into_future(),
+        // Streamed responses are many small writes; send each one immediately
+        // rather than waiting for the client to acknowledge the previous one.
+        axum::serve(
+            listener.tap_io(|tcp| {
+                if let Err(err) = tcp.set_nodelay(true) {
+                    warn!(%err, "failed to set TCP_NODELAY on an accepted connection");
+                }
+            }),
+            router,
+        )
+        .with_graceful_shutdown(async {
+            let _ = proxy_stopped.await;
+        })
+        .into_future(),
     );
     let (stop_metrics, metrics_stopped) = oneshot::channel();
     let mut metrics = tokio::spawn(

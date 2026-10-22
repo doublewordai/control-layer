@@ -803,6 +803,9 @@ impl From<&DaemonConfig> for crate::request::transitions::RetryConfig {
             backoff_ms: config.backoff_ms,
             backoff_factor: config.backoff_factor,
             max_backoff_ms: config.max_backoff_ms,
+            max_capacity_reschedule_age_ms: Some(
+                crate::request::transitions::DEFAULT_MAX_CAPACITY_RESCHEDULE_AGE_MS,
+            ),
         }
     }
 }
@@ -813,6 +816,7 @@ mod tests {
 
     fn response(status: u16, body: &str) -> HttpResponse {
         HttpResponse {
+            x_request_id: None,
             status,
             body: body.to_string(),
         }

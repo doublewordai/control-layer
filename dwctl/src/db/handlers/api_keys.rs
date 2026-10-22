@@ -51,8 +51,6 @@ struct ApiKey {
     pub created_by: UserId,
     pub created_at: DateTime<Utc>,
     pub last_used: Option<DateTime<Utc>>,
-    pub requests_per_second: Option<f32>,
-    pub burst_size: Option<i32>,
     pub hidden: bool,
     pub is_deleted: bool,
     pub spend_limit: Option<Decimal>,
@@ -93,8 +91,6 @@ impl From<(Vec<DeploymentId>, ApiKey)> for ApiKeyDBResponse {
             created_at: api_key.created_at,
             last_used: api_key.last_used,
             model_access,
-            requests_per_second: api_key.requests_per_second,
-            burst_size: api_key.burst_size,
             spend_limit: api_key.spend_limit,
             spend_limit_interval: api_key.spend_limit_interval,
             parent_api_key_id: api_key.parent_api_key_id,
@@ -115,7 +111,7 @@ impl<'c> Repository for ApiKeys<'c> {
     type Id = ApiKeyId;
     type Filter = ApiKeyFilter;
 
-    #[instrument(skip(self, request), fields(name = %request.name), err)]
+    #[instrument(level = "debug", skip(self, request), fields(name = %request.name), err)]
     async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
         // Generate a secure API key
         let secret = generate_api_key();
@@ -132,9 +128,9 @@ impl<'c> Repository for ApiKeys<'c> {
         let api_key = sqlx::query_as!(
             ApiKey,
             r#"
-            INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, requests_per_second, burst_size, hidden, spend_limit, spend_limit_interval)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, $9, $10)
-            RETURNING id, name, description, secret, user_id, created_at, last_used, requests_per_second, burst_size, purpose, hidden, is_deleted, created_by, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at
+            INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden, spend_limit, spend_limit_interval)
+            VALUES ($1, $2, $3, $4, $5, $6, false, $7, $8)
+            RETURNING id, name, description, secret, user_id, created_at, last_used, purpose, hidden, is_deleted, created_by, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at
             "#,
             request.name,
             request.description,
@@ -142,8 +138,6 @@ impl<'c> Repository for ApiKeys<'c> {
             purpose_str,
             request.user_id,
             request.created_by,
-            request.requests_per_second,
-            request.burst_size,
             request.spend_limit,
             request.spend_limit_interval
         )
@@ -153,11 +147,11 @@ impl<'c> Repository for ApiKeys<'c> {
         Ok(ApiKeyDBResponse::from((self.get_api_key_deployments(api_key.id).await?, api_key)))
     }
 
-    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let api_key = sqlx::query_as!(
             ApiKey,
-            "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at FROM api_keys WHERE id = $1 AND is_deleted = false",
+            "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at FROM api_keys WHERE id = $1 AND is_deleted = false",
             id
         )
             .fetch_optional(&mut *self.db)
@@ -169,11 +163,11 @@ impl<'c> Repository for ApiKeys<'c> {
         }
     }
 
-    #[instrument(skip(self, ids), fields(count = ids.len()), err)]
+    #[instrument(level = "debug", skip(self, ids), fields(count = ids.len()), err)]
     async fn get_bulk(&mut self, ids: Vec<Self::Id>) -> Result<HashMap<Self::Id, Self::Response>> {
         let api_keys = sqlx::query_as!(
             ApiKey,
-            "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at FROM api_keys WHERE id = ANY($1) AND is_deleted = false",
+            "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at FROM api_keys WHERE id = ANY($1) AND is_deleted = false",
             &ids
         )
             .fetch_all(&mut *self.db)
@@ -187,11 +181,11 @@ impl<'c> Repository for ApiKeys<'c> {
         Ok(responses)
     }
 
-    #[instrument(skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
+    #[instrument(level = "debug", skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
         let api_keys = sqlx::query_as!(
             ApiKey,
-            r#"SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at
+            r#"SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at
             FROM api_keys
             WHERE hidden = false AND is_deleted = false
               AND ($1::uuid IS NULL OR user_id = $1)
@@ -215,7 +209,7 @@ impl<'c> Repository for ApiKeys<'c> {
         Ok(responses)
     }
 
-    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
     async fn delete(&mut self, id: Self::Id) -> Result<bool> {
         // Soft-deleting a visible key also soft-deletes its cap-scope children
         // (hidden batch keys with parent_api_key_id = id) in the same
@@ -240,7 +234,7 @@ impl<'c> Repository for ApiKeys<'c> {
         Ok(deleted)
     }
 
-    #[instrument(skip(self, request), fields(api_key_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self, request), fields(api_key_id = %abbrev_uuid(&id)), err)]
     async fn update(&mut self, id: Self::Id, request: &Self::UpdateRequest) -> Result<Self::Response> {
         // Atomic update with conditional field updates
         let api_key = sqlx::query_as!(
@@ -252,23 +246,13 @@ impl<'c> Repository for ApiKeys<'c> {
                 description = CASE
                     WHEN $3::text IS NOT NULL THEN $3
                     ELSE description
-                END,
-                requests_per_second = CASE
-                    WHEN $4::real IS NOT NULL THEN $4
-                    ELSE requests_per_second
-                END,
-                burst_size = CASE
-                    WHEN $5::integer IS NOT NULL THEN $5
-                    ELSE burst_size
                 END
             WHERE id = $1
-            RETURNING id, name, description, secret, user_id, created_at, last_used, requests_per_second, burst_size, purpose, hidden, is_deleted, created_by, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at
+            RETURNING id, name, description, secret, user_id, created_at, last_used, purpose, hidden, is_deleted, created_by, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at
             "#,
             id,
             request.name,
-            request.description,
-            request.requests_per_second.unwrap_or(None),
-            request.burst_size.unwrap_or(None)
+            request.description
         )
         .fetch_optional(&mut *self.db)
         .await?
@@ -284,7 +268,7 @@ impl<'c> ApiKeys<'c> {
     }
 
     /// Count total API keys matching the filter
-    #[instrument(skip(self, filter), err)]
+    #[instrument(level = "debug", skip(self, filter), err)]
     pub async fn count(&mut self, filter: &ApiKeyFilter) -> Result<i64> {
         let count = sqlx::query_scalar!(
             r#"SELECT COUNT(*) FROM api_keys
@@ -309,7 +293,7 @@ impl<'c> ApiKeys<'c> {
     ///
     /// # Returns
     /// Returns Some(user_id) if found, None if the key doesn't exist
-    #[instrument(skip(self, secret), err)]
+    #[instrument(level = "debug", skip(self, secret), err)]
     pub async fn get_user_id_by_secret(&mut self, secret: &str) -> Result<Option<UserId>> {
         let user_id = sqlx::query_scalar!(
             r#"
@@ -338,7 +322,7 @@ impl<'c> ApiKeys<'c> {
     ///
     /// # Returns
     /// Returns the secret of the hidden API key
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn get_or_create_hidden_key(&mut self, user_id: UserId, purpose: ApiKeyPurpose, created_by: UserId) -> Result<String> {
         // Convert purpose enum to string for database
         let purpose_str = match purpose {
@@ -397,7 +381,7 @@ impl<'c> ApiKeys<'c> {
 
     /// Get or create a hidden API key, returning both the secret and the key's UUID.
     /// Used when the caller needs to pass the key ID to fusillade for attribution.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn get_or_create_hidden_key_with_id(
         &mut self,
         user_id: UserId,
@@ -472,7 +456,7 @@ impl<'c> ApiKeys<'c> {
     /// Called eagerly at cap-set time so the child is in onwards' key set
     /// before the first batch/flex request fires (same race-avoidance as
     /// pre-creating shared hidden keys at user creation).
-    #[instrument(skip(self), fields(parent_api_key_id = %abbrev_uuid(&parent_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(parent_api_key_id = %abbrev_uuid(&parent_id)), err)]
     pub async fn get_or_create_child_hidden_key(&mut self, parent_id: ApiKeyId) -> Result<(String, ApiKeyId)> {
         let secret = generate_api_key();
 
@@ -534,7 +518,7 @@ impl<'c> ApiKeys<'c> {
     /// stamps the shared hidden batch key unchanged. Session-authenticated
     /// callers (`authenticating_key_id = None`) always get the shared key —
     /// dashboard flows are deliberately uncapped.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&target_user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&target_user_id)), err)]
     pub async fn resolve_batch_execution_key(
         &mut self,
         target_user_id: UserId,
@@ -573,7 +557,7 @@ impl<'c> ApiKeys<'c> {
     /// child; those are the cap-set path's responsibility (see
     /// `reset_spend_window` / `get_or_create_child_hidden_key` and the
     /// contract on `EnrichedRecord::cap_scope_root` in the batcher).
-    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
     pub async fn update_spend_cap(
         &mut self,
         id: ApiKeyId,
@@ -604,7 +588,7 @@ impl<'c> ApiKeys<'c> {
     /// cap transitions from unset to set (else the scope inherits spend
     /// accumulated before/between caps and can exhaust immediately), on
     /// interval changes, and for the explicit owner "re-arm" action.
-    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&scope_root_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&scope_root_id)), err)]
     pub async fn reset_spend_window(&mut self, scope_root_id: ApiKeyId) -> Result<()> {
         sqlx::query!(
             r#"
@@ -627,7 +611,7 @@ impl<'c> ApiKeys<'c> {
     /// window's counted spend — 0 when the calendar window has rolled but no
     /// request has folded yet, NULL when the key has never folded (uncapped
     /// keys are not folded at all).
-    #[instrument(skip(self, ids), fields(count = ids.len()), err)]
+    #[instrument(level = "debug", skip(self, ids), fields(count = ids.len()), err)]
     pub async fn get_spend_states(&mut self, ids: &[ApiKeyId]) -> Result<HashMap<ApiKeyId, ApiKeySpendState>> {
         if ids.is_empty() {
             return Ok(HashMap::new());
@@ -682,7 +666,7 @@ impl<'c> ApiKeys<'c> {
     /// Note the inverse is the useful property: rotating a VISIBLE key does
     /// NOT stop batches already submitted with it — they execute on the
     /// hidden child. Callers must surface that to users.
-    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
     pub async fn rotate_secret(&mut self, id: ApiKeyId) -> Result<String> {
         let secret = generate_api_key();
         let result = sqlx::query!(
@@ -706,7 +690,7 @@ impl<'c> ApiKeys<'c> {
     /// (see migration 131). Called only by the create handler when a manager
     /// issues a key to a different user — every other insert path leaves the
     /// column at its born-revealed default.
-    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
     pub async fn mark_secret_reveal_pending(&mut self, id: ApiKeyId) -> Result<()> {
         let result = sqlx::query!(
             "UPDATE api_keys SET secret_revealed_at = NULL WHERE id = $1 AND is_deleted = false",
@@ -726,7 +710,7 @@ impl<'c> ApiKeys<'c> {
     /// exactly one caller ever gets the secret; a concurrent second reveal
     /// matches zero rows and returns None (handler surfaces a conflict). The
     /// caller performs holder/authorization checks BEFORE calling this.
-    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
+    #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
     pub async fn reveal_secret_once(&mut self, id: ApiKeyId) -> Result<Option<String>> {
         let secret = sqlx::query_scalar!(
             r#"
@@ -749,7 +733,7 @@ impl<'c> ApiKeys<'c> {
     /// yanked until the periodic fallback sync (up to ~5 min). Cap-COLUMN
     /// changes don't need it (the api_keys UPDATE trigger covers those).
     /// Transactional: fires only if the surrounding transaction commits.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn notify_spend_cap_rearm(&mut self) -> Result<()> {
         let epoch_micros = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -768,7 +752,7 @@ impl<'c> ApiKeys<'c> {
     /// keys, minus the per-model free-tariff arm. Used by admission checks
     /// (batch creation pre-flight) to reject work that would only fail
     /// request-by-request at the proxy.
-    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&api_key_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&api_key_id)), err)]
     pub async fn is_scope_exhausted(&mut self, api_key_id: ApiKeyId) -> Result<bool> {
         let exhausted = sqlx::query_scalar!(
             r#"
@@ -798,7 +782,7 @@ impl<'c> ApiKeys<'c> {
     /// callers use this to translate a member into the hidden keys their
     /// batches/files are attributed to, and a member's capped-key work is
     /// stamped with the child's id, not the shared key's.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn find_hidden_key_ids(&mut self, user_id: UserId, purpose: ApiKeyPurpose, created_by: UserId) -> Result<Vec<ApiKeyId>> {
         let purpose_str = match purpose {
             ApiKeyPurpose::Platform => "platform",
@@ -829,7 +813,7 @@ impl<'c> ApiKeys<'c> {
     /// Find ALL hidden API key IDs created by a given user across all contexts (personal + orgs).
     /// This is used when a PM filters by member in personal mode — need to find all keys
     /// where `created_by = member_id` regardless of which user_id (org or personal) owns them.
-    #[instrument(skip(self), fields(created_by = %abbrev_uuid(&created_by)), err)]
+    #[instrument(level = "debug", skip(self), fields(created_by = %abbrev_uuid(&created_by)), err)]
     pub async fn find_all_hidden_key_ids_by_creator(&mut self, purpose: ApiKeyPurpose, created_by: UserId) -> Result<Vec<ApiKeyId>> {
         let purpose_str = match purpose {
             ApiKeyPurpose::Platform => "platform",
@@ -857,7 +841,7 @@ impl<'c> ApiKeys<'c> {
 
     /// Bulk lookup the `created_by` user IDs for a set of API key IDs.
     /// Returns a map from api_key_id to the user who created that key.
-    #[instrument(skip(self, key_ids), err)]
+    #[instrument(level = "debug", skip(self, key_ids), err)]
     pub async fn get_creators_by_key_ids(&mut self, key_ids: Vec<ApiKeyId>) -> Result<HashMap<ApiKeyId, UserId>> {
         if key_ids.is_empty() {
             return Ok(HashMap::new());
@@ -878,7 +862,7 @@ impl<'c> ApiKeys<'c> {
     }
 
     /// Get specific deployment IDs that an API key has access to
-    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&api_key_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&api_key_id)), err)]
     async fn get_api_key_deployments(&mut self, api_key_id: ApiKeyId) -> Result<Vec<DeploymentId>> {
         let deployment_ids = sqlx::query_scalar!(
             r#"
@@ -909,7 +893,7 @@ impl<'c> ApiKeys<'c> {
     /// unless their billing account allows negative balances.
     /// General free-model exemptions retain the legacy rule: positive open-ended
     /// general tariffs count as paid, including future and internal-purpose rows.
-    #[instrument(skip(self), fields(deployment_id = %abbrev_uuid(&deployment_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(deployment_id = %abbrev_uuid(&deployment_id)), err)]
     pub async fn get_api_keys_for_deployment_with_sufficient_credit(
         &mut self,
         deployment_id: DeploymentId,
@@ -927,8 +911,6 @@ impl<'c> ApiKeys<'c> {
                 ak.created_by as "created_by!",
                 ak.created_at as "created_at!",
                 ak.last_used,
-                ak.requests_per_second,
-                ak.burst_size,
                 ak.hidden as "hidden!",
                 ak.is_deleted as "is_deleted!",
                 ak.spend_limit,
@@ -950,8 +932,6 @@ impl<'c> ApiKeys<'c> {
                 ak.created_by as "created_by!",
                 ak.created_at as "created_at!",
                 ak.last_used,
-                ak.requests_per_second,
-                ak.burst_size,
                 ak.hidden as "hidden!",
                 ak.is_deleted as "is_deleted!",
                 ak.spend_limit,
@@ -977,7 +957,7 @@ impl<'c> ApiKeys<'c> {
                 )
                 OR (NOT EXISTS (
                     SELECT 1 FROM model_tariffs mt
-                    WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL
+                    WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL AND mt.serving_class IS NULL
                       AND mt.valid_until IS NULL
                       AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                 ) AND NOT EXISTS (
@@ -1000,8 +980,6 @@ impl<'c> ApiKeys<'c> {
                 ak.created_by as "created_by!",
                 ak.created_at as "created_at!",
                 ak.last_used,
-                ak.requests_per_second,
-                ak.burst_size,
                 ak.hidden as "hidden!",
                 ak.is_deleted as "is_deleted!",
                 ak.spend_limit,
@@ -1027,7 +1005,7 @@ impl<'c> ApiKeys<'c> {
                 )
                 OR (NOT EXISTS (
                     SELECT 1 FROM model_tariffs mt
-                    WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL
+                    WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL AND mt.serving_class IS NULL
                       AND mt.valid_until IS NULL
                       AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                 ) AND NOT EXISTS (
@@ -1106,7 +1084,7 @@ impl<'c> ApiKeys<'c> {
     ///
     /// # Returns
     /// Returns a tuple of (user_id, email, purpose) if found, or None if not found
-    #[instrument(skip(self, secret), err)]
+    #[instrument(level = "debug", skip(self, secret), err)]
     pub async fn get_user_info_by_secret(&mut self, secret: &str) -> Result<Option<(UserId, String, ApiKeyPurpose)>> {
         #[derive(Debug, FromRow)]
         struct UserInfo {
@@ -1153,7 +1131,7 @@ impl<'c> ApiKeys<'c> {
 
     /// Soft-delete all API keys created by a member for an organization.
     /// Returns the number of keys deleted.
-    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), member_id = %abbrev_uuid(&member_id)), err)]
+    #[instrument(level = "debug", skip(self), fields(org_id = %abbrev_uuid(&org_id), member_id = %abbrev_uuid(&member_id)), err)]
     pub async fn soft_delete_member_org_keys(&mut self, org_id: UserId, member_id: UserId) -> Result<u64> {
         let result = sqlx::query!(
             "UPDATE api_keys SET is_deleted = true WHERE user_id = $1 AND created_by = $2 AND is_deleted = false",
@@ -1188,7 +1166,7 @@ mod tests {
     use rust_decimal::Decimal;
     use sqlx::{Acquire, PgPool};
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_api_key(pool: PgPool) {
         let api_key;
@@ -1217,8 +1195,6 @@ mod tests {
                     name: "Test API Key".to_string(),
                     description: Some("Test description".to_string()),
                     purpose: ApiKeyPurpose::Realtime,
-                    requests_per_second: None,
-                    burst_size: None,
                     created_by: userid,
                     spend_limit: None,
                     spend_limit_interval: None,
@@ -1260,8 +1236,6 @@ mod tests {
                 name: format!("key-{}", &uuid::Uuid::new_v4().to_string()[..8]),
                 description: None,
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -1270,7 +1244,7 @@ mod tests {
             .unwrap()
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_child_hidden_key_upsert_and_scoping(pool: PgPool) {
         // Org-context shape: key owned by the org, created by the member.
@@ -1316,7 +1290,7 @@ mod tests {
         assert!(ids.contains(&child_id) && ids.contains(&shared_id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_resolve_batch_execution_key(pool: PgPool) {
         let user = create_user(&pool, "cap-resolve").await;
@@ -1348,7 +1322,7 @@ mod tests {
         assert_eq!(session_id, shared_id);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_parent_cascades_to_child(pool: PgPool) {
         let user = create_user(&pool, "cap-delete").await;
@@ -1368,7 +1342,7 @@ mod tests {
         assert!(!repo.delete(key.id).await.unwrap());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_child_creation_guard_rejects_non_root_parents(pool: PgPool) {
         let user = create_user(&pool, "cap-guard").await;
@@ -1393,7 +1367,7 @@ mod tests {
         ));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_user_api_keys(pool: PgPool) {
         let user;
@@ -1420,8 +1394,6 @@ mod tests {
                 name: "Key 1".to_string(),
                 description: None,
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -1431,8 +1403,6 @@ mod tests {
                 name: "Key 2".to_string(),
                 description: Some("Key 2 description".to_string()),
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -1463,7 +1433,7 @@ mod tests {
         assert!(keys.iter().any(|k| k.name == "Key 2"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_api_key(pool: PgPool) {
         let api_key;
@@ -1489,8 +1459,6 @@ mod tests {
                 name: "Delete Me".to_string(),
                 description: None,
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -1508,7 +1476,7 @@ mod tests {
         assert!(found_key.is_none());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_repository_trait_methods(pool: PgPool) {
         let api_key;
         let user;
@@ -1535,8 +1503,6 @@ mod tests {
                 name: "Trait Test Key".to_string(),
                 description: Some("Test trait description".to_string()),
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -1560,8 +1526,6 @@ mod tests {
         let update = ApiKeyUpdateDBRequest {
             name: Some("Updated Key Name".to_string()),
             description: Some("Updated description".to_string()),
-            requests_per_second: None,
-            burst_size: None,
         };
         let updated_key = api_repo.update(api_key.id, &update).await.unwrap();
         assert_eq!(updated_key.name, "Updated Key Name");
@@ -1574,7 +1538,7 @@ mod tests {
 
     // Tests for group-based API key access control
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_api_key_access_through_group_membership(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
         let admin_user;
@@ -1662,8 +1626,6 @@ mod tests {
                 name: "Test API Key".to_string(),
                 description: Some("API key for testing group access".to_string()),
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -1706,7 +1668,7 @@ mod tests {
         assert!(api_key.model_access.contains(&deployment.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_api_key_loses_access_when_removed_from_group(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -1795,8 +1757,6 @@ mod tests {
                 name: "Test API Key".to_string(),
                 description: Some("API key for testing access removal".to_string()),
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -1852,7 +1812,7 @@ mod tests {
         assert!(api_key_details.model_access.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_api_key_loses_access_when_deployment_removed_from_group(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -1942,8 +1902,6 @@ mod tests {
                 name: "Test API Key".to_string(),
                 description: Some("API key for testing deployment removal".to_string()),
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -1999,7 +1957,7 @@ mod tests {
         assert!(api_key_details.model_access.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_multiple_api_keys_same_deployment_through_different_groups(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -2115,8 +2073,6 @@ mod tests {
                 name: "User 1 Key".to_string(),
                 description: Some("API key for user 1".to_string()),
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user1.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -2128,8 +2084,6 @@ mod tests {
                 name: "User 2 Key".to_string(),
                 description: Some("API key for user 2".to_string()),
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user2.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -2201,7 +2155,7 @@ mod tests {
         assert_eq!(keys_for_deployment.len(), 3 + 1); // 3 keys for user2 + 1 system = 4
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_api_key_access_multiple_deployments_same_group(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -2305,8 +2259,6 @@ mod tests {
                 name: "Multi Access Key".to_string(),
                 description: Some("API key for multiple deployments".to_string()),
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -2379,7 +2331,7 @@ mod tests {
         assert_eq!(api_key_details.model_access.len(), 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_dynamic_api_key_access_after_group_membership_changes(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -2450,8 +2402,6 @@ mod tests {
                 name: "Dynamic Access Key".to_string(),
                 description: Some("API key for testing dynamic access".to_string()),
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -2539,7 +2489,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_api_key_access_through_everyone_group(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -2616,6 +2566,7 @@ mod tests {
             enable_analytics: true,
             analytics: Default::default(),
             enable_otel_export: false,
+            log_format: Default::default(),
             credits: Default::default(),
             batches: Default::default(),
             background_services: crate::config::BackgroundServicesConfig::default(),
@@ -2633,7 +2584,9 @@ mod tests {
             prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),
             continuation: Default::default(),
             request_validation: Default::default(),
+            heap_profiling: Default::default(),
             keystore: None,
+            scheduling: Default::default(),
         };
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
 
@@ -2674,8 +2627,6 @@ mod tests {
                 name: "Test API Key".to_string(),
                 description: Some("API key for testing Everyone group access".to_string()),
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -2734,7 +2685,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_api_keys_pagination_with_filter(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -2761,8 +2712,6 @@ mod tests {
                     name: format!("Pagination Key {i}"),
                     description: Some(format!("Key {i} for pagination testing")),
                     purpose: ApiKeyPurpose::Realtime,
-                    requests_per_second: None,
-                    burst_size: None,
                     created_by: user.id,
                     spend_limit: None,
                     spend_limit_interval: None,
@@ -2853,7 +2802,7 @@ mod tests {
 
     // Also add a test to exercise both arms of the static SQL query
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_api_keys_filter_arms(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -2896,8 +2845,6 @@ mod tests {
                 name: "User1 Key".to_string(),
                 description: None,
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user1.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -2907,8 +2854,6 @@ mod tests {
                 name: "User2 Key".to_string(),
                 description: None,
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user2.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -2953,7 +2898,7 @@ mod tests {
 
     // Tests for bulk API key operations
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_api_keys_with_valid_ids(pool: PgPool) {
         let mut user_conn = pool.acquire().await.unwrap();
@@ -2975,8 +2920,6 @@ mod tests {
             name: "Bulk Key 1".to_string(),
             description: Some("First bulk key".to_string()),
             purpose: ApiKeyPurpose::Realtime,
-            requests_per_second: None,
-            burst_size: None,
             created_by: user.id,
             spend_limit: None,
             spend_limit_interval: None,
@@ -2986,8 +2929,6 @@ mod tests {
             name: "Bulk Key 2".to_string(),
             description: Some("Second bulk key".to_string()),
             purpose: ApiKeyPurpose::Realtime,
-            requests_per_second: None,
-            burst_size: None,
             created_by: user.id,
             spend_limit: None,
             spend_limit_interval: None,
@@ -2997,8 +2938,6 @@ mod tests {
             name: "Bulk Key 3".to_string(),
             description: None,
             purpose: ApiKeyPurpose::Realtime,
-            requests_per_second: None,
-            burst_size: None,
             created_by: user.id,
             spend_limit: None,
             spend_limit_interval: None,
@@ -3036,7 +2975,7 @@ mod tests {
         assert_eq!(retrieved_key3.description, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_api_keys_with_some_invalid_ids(pool: PgPool) {
         let mut user_conn = pool.acquire().await.unwrap();
@@ -3057,8 +2996,6 @@ mod tests {
             name: "Valid Key".to_string(),
             description: Some("Only valid key".to_string()),
             purpose: ApiKeyPurpose::Realtime,
-            requests_per_second: None,
-            burst_size: None,
             created_by: user.id,
             spend_limit: None,
             spend_limit_interval: None,
@@ -3088,7 +3025,7 @@ mod tests {
         assert_eq!(retrieved_key.user_id, user.id);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_api_keys_with_empty_ids(pool: PgPool) {
         let mut pool_conn = pool.acquire().await.unwrap();
@@ -3103,7 +3040,7 @@ mod tests {
         assert!(bulk_results.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_api_keys_with_all_invalid_ids(pool: PgPool) {
         let mut pool_conn = pool.acquire().await.unwrap();
@@ -3118,7 +3055,7 @@ mod tests {
         assert!(bulk_results.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_api_keys_with_duplicate_ids(pool: PgPool) {
         let mut user_conn = pool.acquire().await.unwrap();
@@ -3139,8 +3076,6 @@ mod tests {
             name: "Duplicate Test Key".to_string(),
             description: Some("Key for testing duplicates".to_string()),
             purpose: ApiKeyPurpose::Realtime,
-            requests_per_second: None,
-            burst_size: None,
             created_by: user.id,
             spend_limit: None,
             spend_limit_interval: None,
@@ -3163,7 +3098,7 @@ mod tests {
         assert_eq!(retrieved_key.user_id, user.id);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_api_keys_includes_model_access(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -3230,8 +3165,6 @@ mod tests {
             name: "Bulk Access Key 1".to_string(),
             description: Some("First key with model access".to_string()),
             purpose: ApiKeyPurpose::Realtime,
-            requests_per_second: None,
-            burst_size: None,
             created_by: user.id,
             spend_limit: None,
             spend_limit_interval: None,
@@ -3241,8 +3174,6 @@ mod tests {
             name: "Bulk Access Key 2".to_string(),
             description: Some("Second key with model access".to_string()),
             purpose: ApiKeyPurpose::Realtime,
-            requests_per_second: None,
-            burst_size: None,
             created_by: user.id,
             spend_limit: None,
             spend_limit_interval: None,
@@ -3273,7 +3204,7 @@ mod tests {
         assert_eq!(retrieved_key2.model_access.len(), 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_api_keys_from_different_users(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -3304,8 +3235,6 @@ mod tests {
             name: "User1 Bulk Key".to_string(),
             description: Some("Key for user 1".to_string()),
             purpose: ApiKeyPurpose::Realtime,
-            requests_per_second: None,
-            burst_size: None,
             created_by: user1.id,
             spend_limit: None,
             spend_limit_interval: None,
@@ -3315,8 +3244,6 @@ mod tests {
             name: "User2 Bulk Key".to_string(),
             description: Some("Key for user 2".to_string()),
             purpose: ApiKeyPurpose::Realtime,
-            requests_per_second: None,
-            burst_size: None,
             created_by: user2.id,
             spend_limit: None,
             spend_limit_interval: None,
@@ -3446,7 +3373,7 @@ mod tests {
         CreditFilteringTestSetup { deployment, group }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_api_keys_filtered_by_insufficient_credits(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -3563,8 +3490,6 @@ mod tests {
                 name: "Key with credits".to_string(),
                 description: Some("Has sufficient credits".to_string()),
                 user_id: user_with_credits.id,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user_with_credits.id,
                 purpose: ApiKeyPurpose::Realtime,
                 spend_limit: None,
@@ -3578,8 +3503,6 @@ mod tests {
                 name: "Key without credits".to_string(),
                 description: Some("Has insufficient credits".to_string()),
                 user_id: user_without_credits.id,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user_without_credits.id,
                 purpose: ApiKeyPurpose::Realtime,
                 spend_limit: None,
@@ -3674,7 +3597,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_api_keys_filtered_by_credits(pool: PgPool) {
         let setup = setup_credit_filtering_test(&pool).await;
@@ -3709,8 +3632,6 @@ mod tests {
                     user_id: platform_manager.id,
                     name: "Platform Manager Key".to_string(),
                     description: None,
-                    requests_per_second: None,
-                    burst_size: None,
                     created_by: platform_manager.id,
                     purpose: ApiKeyPurpose::Realtime,
                     spend_limit: None,
@@ -3770,7 +3691,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_users_without_credit_transactions_excluded(pool: PgPool) {
         let setup = setup_credit_filtering_test(&pool).await;
@@ -3805,8 +3726,6 @@ mod tests {
                     user_id: user_no_transactions.id,
                     name: "No Transactions Key".to_string(),
                     description: None,
-                    requests_per_second: None,
-                    burst_size: None,
                     created_by: user_no_transactions.id,
                     purpose: ApiKeyPurpose::Realtime,
                     spend_limit: None,
@@ -3835,7 +3754,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_negative_balance_user_excluded(pool: PgPool) {
         let setup = setup_credit_filtering_test(&pool).await;
@@ -3870,8 +3789,6 @@ mod tests {
                     user_id: user_negative.id,
                     name: "Negative Balance Key".to_string(),
                     description: None,
-                    requests_per_second: None,
-                    burst_size: None,
                     created_by: user_negative.id,
                     purpose: ApiKeyPurpose::Realtime,
                     spend_limit: None,
@@ -3929,7 +3846,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_user_regains_access_after_adding_credits(pool: PgPool) {
         let setup = setup_credit_filtering_test(&pool).await;
@@ -3964,8 +3881,6 @@ mod tests {
                     user_id: user.id,
                     name: "Regains Access Key".to_string(),
                     description: None,
-                    requests_per_second: None,
-                    burst_size: None,
                     created_by: user.id,
                     purpose: ApiKeyPurpose::Realtime,
                     spend_limit: None,
@@ -4023,7 +3938,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_zero_credit_user_can_access_free_model(pool: PgPool) {
         // This test will FAIL initially - demonstrating that zero-credit users
@@ -4108,8 +4023,6 @@ mod tests {
                 name: "Zero Credits Key".to_string(),
                 description: Some("User with no credits".to_string()),
                 user_id: user_no_credits.id,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user_no_credits.id,
                 purpose: ApiKeyPurpose::Realtime,
                 spend_limit: None,
@@ -4143,7 +4056,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_zero_credit_user_cannot_access_paid_model(pool: PgPool) {
         // This test should PASS - demonstrating that zero-credit users
@@ -4248,8 +4161,6 @@ mod tests {
                 name: "Zero Credits Key".to_string(),
                 description: Some("User with no credits".to_string()),
                 user_id: user_no_credits.id,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user_no_credits.id,
                 purpose: ApiKeyPurpose::Realtime,
                 spend_limit: None,
@@ -4283,7 +4194,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_zero_credit_user_can_access_zero_price_model(pool: PgPool) {
         // This test verifies that models with explicit $0.00 pricing (not NULL)
@@ -4388,8 +4299,6 @@ mod tests {
                 name: "Zero Credits Key".to_string(),
                 description: Some("User with no credits".to_string()),
                 user_id: user_no_credits.id,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user_no_credits.id,
                 purpose: ApiKeyPurpose::Realtime,
                 spend_limit: None,
@@ -4423,7 +4332,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_user_id_by_secret_success(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -4452,8 +4361,6 @@ mod tests {
                 name: "Test Secret Key".to_string(),
                 description: Some("Key for testing secret lookup".to_string()),
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -4473,7 +4380,7 @@ mod tests {
         assert_eq!(result, Some(user.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_user_id_by_secret_not_found(pool: PgPool) {
         let mut pool_conn = pool.acquire().await.unwrap();
@@ -4488,7 +4395,7 @@ mod tests {
 
     // ── Soft-delete tests ─────────────────────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_is_soft_delete(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -4515,8 +4422,6 @@ mod tests {
                     name: "Soft Delete Key".to_string(),
                     description: None,
                     purpose: ApiKeyPurpose::Realtime,
-                    requests_per_second: None,
-                    burst_size: None,
                     created_by: user.id,
                     spend_limit: None,
                     spend_limit_interval: None,
@@ -4545,7 +4450,7 @@ mod tests {
         assert!(row.is_deleted);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_soft_deleted_key_excluded_from_list(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -4572,8 +4477,6 @@ mod tests {
                     name: "To Delete".to_string(),
                     description: None,
                     purpose: ApiKeyPurpose::Realtime,
-                    requests_per_second: None,
-                    burst_size: None,
                     created_by: user.id,
                     spend_limit: None,
                     spend_limit_interval: None,
@@ -4587,8 +4490,6 @@ mod tests {
                     name: "Keep Me".to_string(),
                     description: None,
                     purpose: ApiKeyPurpose::Realtime,
-                    requests_per_second: None,
-                    burst_size: None,
                     created_by: user.id,
                     spend_limit: None,
                     spend_limit_interval: None,
@@ -4616,7 +4517,7 @@ mod tests {
 
     // ── created_by tracking tests ─────────────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_created_by_stored_on_api_key(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -4656,8 +4557,6 @@ mod tests {
                 name: "Org Key".to_string(),
                 description: None,
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: member.id,
                 spend_limit: None,
                 spend_limit_interval: None,
@@ -4675,7 +4574,7 @@ mod tests {
 
     // ── Per-member hidden key tests ───────────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_hidden_key_per_member_isolation(pool: PgPool) {
         // Two members each get their own hidden key for the same org user
@@ -4744,7 +4643,7 @@ mod tests {
         assert_eq!(secret_a, secret_a_again);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_hidden_key_individual_user_backward_compatible(pool: PgPool) {
         // For individual users, created_by = user_id — should behave like before
@@ -4788,7 +4687,7 @@ mod tests {
         assert_ne!(secret1, secret_playground);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_soft_deleted_hidden_key_not_reused(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -4835,7 +4734,7 @@ mod tests {
 
     // ── created_by filter tests ───────────────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_filters_by_created_by(pool: PgPool) {
         // Simulate org scenario: two members create keys for the same org user_id
@@ -4885,8 +4784,6 @@ mod tests {
                     name: "A-Key-1".to_string(),
                     description: None,
                     purpose: ApiKeyPurpose::Realtime,
-                    requests_per_second: None,
-                    burst_size: None,
                     created_by: member_a.id,
                     spend_limit: None,
                     spend_limit_interval: None,
@@ -4899,8 +4796,6 @@ mod tests {
                     name: "A-Key-2".to_string(),
                     description: None,
                     purpose: ApiKeyPurpose::Realtime,
-                    requests_per_second: None,
-                    burst_size: None,
                     created_by: member_a.id,
                     spend_limit: None,
                     spend_limit_interval: None,
@@ -4914,8 +4809,6 @@ mod tests {
                     name: "B-Key-1".to_string(),
                     description: None,
                     purpose: ApiKeyPurpose::Realtime,
-                    requests_per_second: None,
-                    burst_size: None,
                     created_by: member_b.id,
                     spend_limit: None,
                     spend_limit_interval: None,
@@ -4967,7 +4860,7 @@ mod tests {
         assert_eq!(all_keys.len(), 3);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_count_filters_by_created_by(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
@@ -5016,8 +4909,6 @@ mod tests {
                         name: format!("A-Key-{i}"),
                         description: None,
                         purpose: ApiKeyPurpose::Realtime,
-                        requests_per_second: None,
-                        burst_size: None,
                         created_by: member_a.id,
                         spend_limit: None,
                         spend_limit_interval: None,
@@ -5031,8 +4922,6 @@ mod tests {
                     name: "B-Key".to_string(),
                     description: None,
                     purpose: ApiKeyPurpose::Realtime,
-                    requests_per_second: None,
-                    burst_size: None,
                     created_by: member_b.id,
                     spend_limit: None,
                     spend_limit_interval: None,

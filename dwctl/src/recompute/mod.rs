@@ -95,9 +95,10 @@
 //!
 //! Two bounds on that, both of which belong in any report built on it:
 //!
-//! - **Retention.** `prompt_cache_entries` currently retains expired rows, so all history is
-//!   available. Once the sweeper ships with its grace period (7 days), anything older cannot
-//!   be reconstructed.
+//! - **Retention.** The prompt-cache retention daemon deletes an entry once it has been
+//!   expired for longer than the configured grace (at least `CACHE_GRACE_DAYS`, 7 days).
+//!   Entries for requests older than the grace may already have been pruned, and the report
+//!   warns when a corpus reaches that far back.
 //! - **Accuracy before the episode-per-row cutover.** A post-expiry write revives the same
 //!   row in place and keeps the original `created_at`, so `[created_at, expires_at]` can
 //!   contain dead gaps and over-approximates liveness. Answers for that period classify some
@@ -135,6 +136,7 @@ pub async fn recompute_corpus(
     pool: &sqlx::PgPool,
     filter: &source::CorpusFilter,
     flat_tier: CreationTier,
+    cache_retention_grace: chrono::Duration,
     classifier: Option<&crate::prompt_cache::Classifier>,
     tokenizer: Option<&crate::prompt_cache::TokenizerClient>,
 ) -> Result<report::RecomputeReport, sqlx::Error> {
@@ -359,7 +361,7 @@ pub async fn recompute_corpus(
 
     let oldest = corpus.iter().map(|r| r.timestamp).min();
 
-    let mut warnings = report::corpus_warnings(oldest);
+    let mut warnings = report::corpus_warnings(oldest, cache_retention_grace);
     if rows_tariff_unresolvable > 0 {
         warnings.push(format!(
             "{rows_tariff_unresolvable} row(s) recorded cache tokens but no cache tariff resolves at their \

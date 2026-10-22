@@ -768,9 +768,7 @@ mod tests {
                 status: mock.status,
                 last_sync: mock.last_sync,
                 deleted: false,
-                requests_per_second: None,
-                burst_size: None,
-                capacity: None,
+                realtime_inflight_limit: 14,
                 batch_capacity: None,
                 throughput: None,
                 provider_pricing: None,
@@ -791,13 +789,13 @@ mod tests {
                 backoff_max_total_ms: None,
                 first_token_timeout_ms: None,
                 aimd: None,
+                affinity: None,
                 sanitize_responses: true,
                 trusted: false,
                 reasoning_translation_overrides: None,
                 allowed_batch_completion_windows: None,
                 metadata: serde_json::Value::Object(serde_json::Map::new()),
                 provisioning_source: mock.provisioning_source,
-                serving_classes: serde_json::json!({}),
             }
         }
     }

@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use rust_decimal::Decimal;
 use sqlx::{Connection, PgPool};
 use std::collections::HashMap;
-use stripe::{ApiErrorsCode, Client};
+use stripe::{ApiErrorsCode, Client, ClientBuilder};
 use stripe_billing::billing_portal_session::CreateBillingPortalSession;
 use stripe_checkout::checkout_session::{
     CreateCheckoutSessionConsentCollection, CreateCheckoutSessionConsentCollectionPaymentMethodReuseAgreement,
@@ -96,7 +96,12 @@ pub struct StripeProvider {
 
 impl From<crate::config::StripeConfig> for StripeProvider {
     fn from(config: crate::config::StripeConfig) -> Self {
-        let client = Client::new(&config.api_key);
+        let mut builder = ClientBuilder::new(&config.api_key);
+        // `Config::validate` rejects a bad base URL at startup.
+        if let Some(api_base) = config.api_base().expect("Stripe api_base_url is validated at config load") {
+            builder = builder.url(api_base);
+        }
+        let client = builder.build().expect("invalid Stripe API key or base URL");
         Self { config, client }
     }
 }
@@ -1167,6 +1172,9 @@ impl PaymentProvider for StripeProvider {
 }
 
 #[cfg(test)]
+mod mock_api_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rust_decimal::Decimal;
@@ -1319,6 +1327,7 @@ mod tests {
             auto_topup_terms_of_service_text: None,
             setup_terms_of_service_text: None,
             tax_code: None,
+            api_base_url: None,
         };
         let provider = StripeProvider::from(config);
 
@@ -1338,6 +1347,7 @@ mod tests {
             auto_topup_terms_of_service_text: None,
             setup_terms_of_service_text: None,
             tax_code: None,
+            api_base_url: None,
         };
         let provider = StripeProvider::from(config);
 
@@ -1374,7 +1384,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_stripe_idempotency_fast_path(pool: PgPool) {
         // Test the fast path: transaction already exists in DB
         let user_id = create_test_user(&pool).await;
@@ -1404,6 +1414,7 @@ mod tests {
             auto_topup_terms_of_service_text: None,
             setup_terms_of_service_text: None,
             tax_code: None,
+            api_base_url: None,
         };
         let provider = StripeProvider::from(config);
 
@@ -1501,7 +1512,7 @@ mod tests {
         assert_eq!(event.session_id, Some("cs_test_123".to_string()));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_payment_description_self(pool: PgPool) {
         // Test that when a user pays for themselves, description is just "Stripe payment"
         let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
@@ -1540,7 +1551,7 @@ mod tests {
         assert_eq!(description, "Stripe payment", "Self-payment should not include 'from' attribution");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_payment_description_other(pool: PgPool) {
         // Test that when a user pays for someone else, description includes "from {name}"
         let payer = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;

@@ -1,4 +1,3 @@
-use fusillade::PostgresDaemon;
 use fusillade::batch::{BackgroundBatchInput, BatchInput, RequestTemplateInput};
 use fusillade::daemon::{
     DaemonConfig, ModelEscalationConfig, RetentionMaintenanceConfig, default_should_retry,
@@ -8,6 +7,7 @@ use fusillade::manager::{ModelFilter, ModelFilterState, Storage};
 use fusillade::request::{
     CreateBackgroundInput, CreateFlexInput, Failed, ListRequestsFilter, Request, ServiceTierFilter,
 };
+use fusillade::{Daemon, DaemonMode, PostgresDaemon};
 use fusillade_arsenal::{PostgresRequestManager as PostgresStore, TestDbPools};
 use std::sync::Arc;
 use std::time::Duration;
@@ -104,6 +104,68 @@ async fn seed_leak_work(store: &TestStore) {
     }
 }
 
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+async fn heartbeat_lease_loss_fails_daemon_without_cancelling_caller(pool: sqlx::PgPool) {
+    let config = DaemonConfig {
+        mode: DaemonMode::RequestOnly,
+        heartbeat_interval_ms: 100,
+        stale_daemon_threshold_ms: 500,
+        claim_interval_ms: 1_000,
+        status_log_interval_ms: None,
+        throughput_log_interval_ms: None,
+        purge_interval_ms: 0,
+        ..Default::default()
+    };
+    let store = postgres_store(pool.clone(), &config).await;
+    let caller_shutdown = CancellationToken::new();
+    let daemon = Arc::new(Daemon::new(
+        store,
+        Arc::new(MockHttpClient::new()),
+        config,
+        caller_shutdown.clone(),
+    ));
+    let daemon_handle = tokio::spawn(daemon.run_with_mode(DaemonMode::RequestOnly));
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let running: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM daemons WHERE status = 'running')",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("daemon did not register as running");
+
+    // Block both heartbeat renewal and the best-effort dead-state write. The
+    // local lease must still expire and make the actual run loop return an
+    // error; cancellation must remain scoped below the caller's process token.
+    let mut lock = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE daemons IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+
+    let error = tokio::time::timeout(Duration::from_secs(3), daemon_handle)
+        .await
+        .expect("daemon did not self-fence after its heartbeat lease expired")
+        .expect("daemon task panicked")
+        .expect_err("heartbeat lease loss must fail the daemon run loop");
+    assert!(error.to_string().contains("heartbeat lease expired"));
+    assert!(
+        !caller_shutdown.is_cancelled(),
+        "self-fencing must not cancel the caller's process-wide token"
+    );
+
+    lock.rollback().await.unwrap();
+}
+
 /// Batch tokens must refill after actual dispatch while async still progresses.
 /// A 24h batch uses the fixed interval, not the legacy 24-minute refill.
 #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
@@ -123,6 +185,7 @@ async fn batch_fixed_leak_interval_eventually_refills(pool: sqlx::PgPool) {
         client.add_response(
             "POST /test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: "{}".into(),
             }),
@@ -177,6 +240,7 @@ async fn batch_leak_disabled_preserves_async_and_live_claims(pool: sqlx::PgPool)
             client.add_response(
                 "POST /test",
                 Ok(HttpResponse {
+                    x_request_id: None,
                     status: 200,
                     body: "{}".into(),
                 }),
@@ -333,6 +397,7 @@ async fn default_claims_start_while_weekly_partition_ddl_is_blocked(pool: sqlx::
     http_client.add_response(
         "POST /v1/ddl-independent",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 200,
             body: r#"{"result":"claimed"}"#.to_string(),
         }),
@@ -392,6 +457,7 @@ async fn background_tier_end_to_end(pool: sqlx::PgPool) {
             http_client.add_response_with_trigger(
                 "POST /v1/background-test",
                 Ok(HttpResponse {
+                    x_request_id: None,
                     status: 200,
                     body: format!(r#"{{"result":{index}}}"#),
                 }),
@@ -603,6 +669,7 @@ async fn test_daemon_claims_and_completes_request(pool: sqlx::PgPool) {
     http_client.add_response(
         "POST /v1/test",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 200,
             body: r#"{"result":"success"}"#.to_string(),
         }),
@@ -737,6 +804,7 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
     let trigger1 = http_client.add_response_with_trigger(
         "POST /v1/test",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 200,
             body: r#"{"result":"1"}"#.to_string(),
         }),
@@ -744,6 +812,7 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
     let trigger2 = http_client.add_response_with_trigger(
         "POST /v1/test",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 200,
             body: r#"{"result":"2"}"#.to_string(),
         }),
@@ -751,6 +820,7 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
     let trigger3 = http_client.add_response_with_trigger(
         "POST /v1/test",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 200,
             body: r#"{"result":"3"}"#.to_string(),
         }),
@@ -758,6 +828,7 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
     let trigger4 = http_client.add_response_with_trigger(
         "POST /v1/test",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 200,
             body: r#"{"result":"4"}"#.to_string(),
         }),
@@ -765,6 +836,7 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
     let trigger5 = http_client.add_response_with_trigger(
         "POST /v1/test",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 200,
             body: r#"{"result":"5"}"#.to_string(),
         }),
@@ -978,6 +1050,7 @@ async fn test_daemon_cuts_claim_capacity_after_escalated_model_529(pool: sqlx::P
         http_client.add_response_with_trigger(
             "POST /v1/test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 529,
                 body: r#"{"error":"model overloaded"}"#.to_string(),
             }),
@@ -985,6 +1058,7 @@ async fn test_daemon_cuts_claim_capacity_after_escalated_model_529(pool: sqlx::P
         http_client.add_response_with_trigger(
             "POST /v1/test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: r#"{"result":"success"}"#.to_string(),
             }),
@@ -992,6 +1066,7 @@ async fn test_daemon_cuts_claim_capacity_after_escalated_model_529(pool: sqlx::P
         http_client.add_response_with_trigger(
             "POST /v1/test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: r#"{"result":"success"}"#.to_string(),
             }),
@@ -999,6 +1074,7 @@ async fn test_daemon_cuts_claim_capacity_after_escalated_model_529(pool: sqlx::P
         http_client.add_response_with_trigger(
             "POST /v1/test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: r#"{"result":"success"}"#.to_string(),
             }),
@@ -1009,6 +1085,7 @@ async fn test_daemon_cuts_claim_capacity_after_escalated_model_529(pool: sqlx::P
             http_client.add_response_with_trigger(
                 "POST /v1/test",
                 Ok(HttpResponse {
+                    x_request_id: None,
                     status: 200,
                     body: r#"{"result":"success"}"#.to_string(),
                 }),
@@ -1162,6 +1239,7 @@ async fn adaptive_concurrency_grows_past_the_configured_limit(pool: sqlx::PgPool
             http_client.add_response_with_trigger(
                 "POST /v1/grow",
                 Ok(HttpResponse {
+                    x_request_id: None,
                     status: 200,
                     body: r#"{"result":"success"}"#.to_string(),
                 }),
@@ -1254,6 +1332,7 @@ async fn background_529_does_not_throttle_foreground_claims(pool: sqlx::PgPool) 
     let overload_trigger = http_client.add_response_with_trigger(
         "POST /v1/adaptive-shared",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 529,
             body: r#"{"error":"model overloaded"}"#.to_string(),
         }),
@@ -1263,6 +1342,7 @@ async fn background_529_does_not_throttle_foreground_claims(pool: sqlx::PgPool) 
             http_client.add_response_with_trigger(
                 "POST /v1/adaptive-shared",
                 Ok(HttpResponse {
+                    x_request_id: None,
                     status: 200,
                     body: r#"{"result":"success"}"#.to_string(),
                 }),
@@ -1420,6 +1500,7 @@ async fn test_daemon_retries_configured_and_default_statuses(pool: sqlx::PgPool)
     http_client.add_response(
         "POST /v1/test",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 499,
             body: r#"{"error":"arbitrary upstream cancellation"}"#.to_string(),
         }),
@@ -1429,6 +1510,7 @@ async fn test_daemon_retries_configured_and_default_statuses(pool: sqlx::PgPool)
     http_client.add_response(
         "POST /v1/test",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 503,
             body: r#"{"error":"service unavailable"}"#.to_string(),
         }),
@@ -1438,6 +1520,7 @@ async fn test_daemon_retries_configured_and_default_statuses(pool: sqlx::PgPool)
     http_client.add_response(
         "POST /v1/test",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 200,
             body: r#"{"result":"success after retries"}"#.to_string(),
         }),
@@ -1554,6 +1637,274 @@ async fn test_daemon_retries_configured_and_default_statuses(pool: sqlx::PgPool)
     );
 }
 
+/// A 529 carrying `batch_capacity_exceeded` is admission control, not a failed
+/// attempt: with `max_retries: Some(0)` the request would fail terminally on
+/// any ordinary failure, but the capacity refusals must be rescheduled until a
+/// slot opens.
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+async fn test_batch_capacity_529_does_not_spend_a_retry_attempt(pool: sqlx::PgPool) {
+    let http_client = Arc::new(MockHttpClient::new());
+
+    for _ in 0..3 {
+        http_client.add_response(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                x_request_id: None,
+                status: 529,
+                body: r#"{"error":{"message":"at capacity","type":"overloaded_error","code":"batch_capacity_exceeded"}}"#
+                    .to_string(),
+            }),
+        );
+    }
+    http_client.add_response(
+        "POST /v1/test",
+        Ok(HttpResponse {
+            x_request_id: None,
+            status: 200,
+            body: r#"{"result":"success after capacity refusals"}"#.to_string(),
+        }),
+    );
+
+    let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
+    model_concurrency_limits.insert("test-model".to_string(), 10);
+
+    let config = DaemonConfig {
+        claim_batch_size: 10,
+        claim_interval_ms: 10,
+        model_concurrency_limits,
+        // No retries for ordinary failures: only the non-spending path can
+        // keep going past a capacity refusal.
+        max_retries: Some(0),
+        stop_before_deadline_ms: None,
+        backoff_ms: 5,
+        backoff_factor: 1,
+        max_backoff_ms: 5,
+        status_log_interval_ms: None,
+        heartbeat_interval_ms: 10000,
+        should_retry: Arc::new(default_should_retry),
+        claim_timeout_ms: 60000,
+        processing_timeout_ms: 600000,
+        cancellation_poll_interval_ms: 100,
+        ..Default::default()
+    };
+
+    let manager = postgres_store(pool.clone(), &config).await;
+
+    let file_id = manager
+        .create_file(
+            "test-file".to_string(),
+            Some("batch capacity".to_string()),
+            vec![fusillade::RequestTemplateInput {
+                custom_id: None,
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/test".to_string(),
+                body: r#"{"prompt":"test"}"#.to_string(),
+                model: "test-model".to_string(),
+                api_key: "test-key".to_string(),
+            }],
+        )
+        .await
+        .expect("Failed to create file");
+
+    let batch = manager
+        .create_batch(fusillade::batch::BatchInput {
+            file_id,
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+            created_by: None,
+            api_key_id: None,
+            api_key: None,
+            total_requests: None,
+        })
+        .await
+        .expect("Failed to create batch");
+    mark_models_live_for_test(manager.as_ref(), &["test-model"]).await;
+
+    let requests = manager
+        .get_batch_requests(batch.id)
+        .await
+        .expect("Failed to get batch requests");
+    let request_id = requests[0].id();
+
+    let shutdown_token = CancellationToken::new();
+    postgres_daemon(manager.clone(), http_client.clone(), config)
+        .run(shutdown_token.clone())
+        .expect("Failed to start daemon");
+
+    let start = tokio::time::Instant::now();
+    let timeout = Duration::from_secs(5);
+    let mut completed = false;
+    while start.elapsed() < timeout {
+        let results = manager
+            .get_requests(vec![request_id])
+            .await
+            .expect("get requests");
+        if let Some(Ok(any_request)) = results.first() {
+            match any_request {
+                fusillade::AnyRequest::Completed(req) => {
+                    assert_eq!(req.state.response_status, 200);
+                    assert_eq!(
+                        req.state.response_body,
+                        r#"{"result":"success after capacity refusals"}"#
+                    );
+                    completed = true;
+                    break;
+                }
+                fusillade::AnyRequest::Failed(_) => {
+                    panic!("capacity refusal failed terminally instead of rescheduling");
+                }
+                _ => {}
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    shutdown_token.cancel();
+    assert!(
+        completed,
+        "Request should have completed after capacity opened"
+    );
+    assert_eq!(
+        http_client.call_count(),
+        4,
+        "three refusals plus the success are four dispatch attempts"
+    );
+}
+
+/// A `should_retry` predicate that rejects 529s (as a customer might configure)
+/// must not turn the gateway's `batch_capacity_exceeded` admission refusal into
+/// a terminal failure: it is rescheduled independently of the predicate.
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+async fn test_batch_capacity_529_reschedules_even_when_should_retry_rejects_529(
+    pool: sqlx::PgPool,
+) {
+    let http_client = Arc::new(MockHttpClient::new());
+
+    http_client.add_response(
+        "POST /v1/test",
+        Ok(HttpResponse {
+            x_request_id: None,
+            status: 529,
+            body: r#"{"error":{"message":"at capacity","type":"overloaded_error","code":"batch_capacity_exceeded"}}"#
+                .to_string(),
+        }),
+    );
+    http_client.add_response(
+        "POST /v1/test",
+        Ok(HttpResponse {
+            x_request_id: None,
+            status: 200,
+            body: r#"{"result":"success after capacity refusal"}"#.to_string(),
+        }),
+    );
+
+    let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
+    model_concurrency_limits.insert("test-model".to_string(), 10);
+
+    let config = DaemonConfig {
+        claim_batch_size: 10,
+        claim_interval_ms: 10,
+        model_concurrency_limits,
+        max_retries: Some(0),
+        stop_before_deadline_ms: None,
+        backoff_ms: 5,
+        backoff_factor: 1,
+        max_backoff_ms: 5,
+        status_log_interval_ms: None,
+        heartbeat_interval_ms: 10000,
+        // Reject everything, including the 529: admission control must not
+        // depend on the configured retry predicate.
+        should_retry: Arc::new(|_| false),
+        additional_retryable_statuses: vec![],
+        claim_timeout_ms: 60000,
+        processing_timeout_ms: 600000,
+        cancellation_poll_interval_ms: 100,
+        ..Default::default()
+    };
+
+    let manager = postgres_store(pool.clone(), &config).await;
+
+    let file_id = manager
+        .create_file(
+            "test-file".to_string(),
+            Some("batch capacity predicate".to_string()),
+            vec![fusillade::RequestTemplateInput {
+                custom_id: None,
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/test".to_string(),
+                body: r#"{"prompt":"test"}"#.to_string(),
+                model: "test-model".to_string(),
+                api_key: "test-key".to_string(),
+            }],
+        )
+        .await
+        .expect("Failed to create file");
+
+    let batch = manager
+        .create_batch(fusillade::batch::BatchInput {
+            file_id,
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+            created_by: None,
+            api_key_id: None,
+            api_key: None,
+            total_requests: None,
+        })
+        .await
+        .expect("Failed to create batch");
+    mark_models_live_for_test(manager.as_ref(), &["test-model"]).await;
+
+    let requests = manager
+        .get_batch_requests(batch.id)
+        .await
+        .expect("Failed to get batch requests");
+    let request_id = requests[0].id();
+
+    let shutdown_token = CancellationToken::new();
+    postgres_daemon(manager.clone(), http_client.clone(), config)
+        .run(shutdown_token.clone())
+        .expect("Failed to start daemon");
+
+    let start = tokio::time::Instant::now();
+    let timeout = Duration::from_secs(5);
+    let mut completed = false;
+    while start.elapsed() < timeout {
+        let results = manager
+            .get_requests(vec![request_id])
+            .await
+            .expect("get requests");
+        if let Some(Ok(any_request)) = results.first() {
+            match any_request {
+                fusillade::AnyRequest::Completed(req) => {
+                    assert_eq!(req.state.response_status, 200);
+                    assert_eq!(
+                        req.state.response_body,
+                        r#"{"result":"success after capacity refusal"}"#
+                    );
+                    completed = true;
+                    break;
+                }
+                fusillade::AnyRequest::Failed(_) => {
+                    panic!("admission refusal failed terminally despite the retry predicate");
+                }
+                _ => {}
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    shutdown_token.cancel();
+    assert!(
+        completed,
+        "Request should have completed after capacity opened"
+    );
+    assert_eq!(http_client.call_count(), 2, "one refusal plus the success");
+}
+
 #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
 async fn test_daemon_dynamically_updates_concurrency_limits(pool: sqlx::PgPool) {
     // Setup: Create HTTP client with triggered responses
@@ -1565,6 +1916,7 @@ async fn test_daemon_dynamically_updates_concurrency_limits(pool: sqlx::PgPool) 
         let trigger = http_client.add_response_with_trigger(
             "POST /v1/test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: format!(r#"{{"result":"{}"}}"#, i),
             }),
@@ -1728,6 +2080,7 @@ async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
         http_client.add_response(
             "POST /v1/test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 500,
                 body: r#"{"error":"server error"}"#.to_string(),
             }),
@@ -1876,6 +2229,7 @@ async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
         http_client.add_response(
             "POST /v1/test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 500,
                 body: r#"{"error":"server error"}"#.to_string(),
             }),
@@ -2024,6 +2378,7 @@ async fn test_route_at_claim_time_escalation(pool: sqlx::PgPool) {
     http_client.add_response(
         "POST /v1/test",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 200,
             body: r#"{"result":"escalated response"}"#.to_string(),
         }),
@@ -2172,6 +2527,7 @@ async fn test_route_at_claim_time_no_escalation_when_enough_time(pool: sqlx::PgP
     http_client.add_response(
         "POST /v1/test",
         Ok(HttpResponse {
+            x_request_id: None,
             status: 200,
             body: r#"{"result":"normal response"}"#.to_string(),
         }),
@@ -2318,6 +2674,7 @@ mod batch_results_stream {
         http_client.add_response(
             "POST /v1/test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: r#"{"result":"success1"}"#.to_string(),
             }),
@@ -2325,6 +2682,7 @@ mod batch_results_stream {
         http_client.add_response(
             "POST /v1/test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: r#"{"result":"success2"}"#.to_string(),
             }),
@@ -2440,6 +2798,7 @@ mod batch_results_stream {
         http_client.add_response(
             "POST /v1/test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: r#"{"result":"success"}"#.to_string(),
             }),
@@ -2552,13 +2911,15 @@ mod batch_results_stream {
     }
 
     #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
-    async fn test_output_file_streamable_after_batch_deleted(pool: sqlx::PgPool) {
-        // Test: Output files can still be streamed after the batch is soft-deleted
-        // This ensures users can download completed results even if the batch is deleted
+    async fn test_generated_files_unavailable_after_batch_deleted(pool: sqlx::PgPool) {
+        // Generated output and error files are part of the batch's associated
+        // data. They must become unavailable as soon as the batch is deleted,
+        // while the backing request rows can be purged asynchronously.
         let http_client = Arc::new(MockHttpClient::new());
         http_client.add_response(
             "POST /v1/test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: r#"{"result":"success"}"#.to_string(),
             }),
@@ -2625,13 +2986,25 @@ mod batch_results_stream {
         }
         shutdown_token.cancel();
 
-        // Get the output file ID
+        // Get the generated file IDs.
         let batch = manager.get_batch(batch.id).await.expect("get_batch failed");
         let output_file_id = batch
             .output_file_id
             .expect("Batch should have output_file_id");
+        let error_file_id = batch
+            .error_file_id
+            .expect("Batch should have error_file_id");
 
-        // Verify we can get output file content before deletion
+        // Both generated files are available before deletion. The error file
+        // is expected to be empty because the request completed successfully.
+        manager
+            .get_file(output_file_id)
+            .await
+            .expect("Output file should exist before deletion");
+        manager
+            .get_file(error_file_id)
+            .await
+            .expect("Error file should exist before deletion");
         let results_before = manager
             .get_file_content(output_file_id)
             .await
@@ -2641,7 +3014,13 @@ mod batch_results_stream {
             "Output file should have content before deletion"
         );
 
-        // Soft-delete the batch
+        manager
+            .get_file_content(error_file_id)
+            .await
+            .expect("Should be able to read error file content before deletion");
+
+        // Soft-delete the batch and its generated file metadata. Physical
+        // request-row deletion remains the purge worker's responsibility.
         manager
             .delete_batch(batch.id)
             .await
@@ -2654,15 +3033,11 @@ mod batch_results_stream {
             "Batch should not be found after deletion"
         );
 
-        // Verify we can STILL get the output file content after batch deletion
-        let results_after = manager
-            .get_file_content(output_file_id)
-            .await
-            .expect("Should still be able to get output file content after batch deletion");
-        assert!(
-            !results_after.is_empty(),
-            "Output file should still have content after batch deletion"
-        );
+        // Generated file metadata and content become unavailable immediately.
+        assert!(manager.get_file(output_file_id).await.is_err());
+        assert!(manager.get_file(error_file_id).await.is_err());
+        assert!(manager.get_file_content(output_file_id).await.is_err());
+        assert!(manager.get_file_content(error_file_id).await.is_err());
     }
 
     #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
@@ -2675,6 +3050,7 @@ mod batch_results_stream {
             http_client.add_response(
                 "POST /v1/test",
                 Ok(HttpResponse {
+                    x_request_id: None,
                     status: 200,
                     body: format!(r#"{{"result":"success{}"}}"#, i),
                 }),
@@ -2780,6 +3156,7 @@ mod batch_results_stream {
         http_client.add_response(
             "POST /v1/test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: r#"{"result":"success1"}"#.to_string(),
             }),
@@ -2787,6 +3164,7 @@ mod batch_results_stream {
         http_client.add_response(
             "POST /v1/test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 200,
                 body: r#"{"result":"success2"}"#.to_string(),
             }),
@@ -2794,6 +3172,7 @@ mod batch_results_stream {
         http_client.add_response(
             "POST /v1/test",
             Ok(HttpResponse {
+                x_request_id: None,
                 status: 500,
                 body: r#"{"error":"server error"}"#.to_string(),
             }),
@@ -2899,6 +3278,7 @@ mod batch_results_stream {
             http_client.add_response(
                 "POST /v1/test",
                 Ok(HttpResponse {
+                    x_request_id: None,
                     status: 200,
                     body: r#"{"result":"success"}"#.to_string(),
                 }),
@@ -3030,6 +3410,7 @@ mod batch_results_stream {
             http_client.add_response(
                 "POST /v1/test",
                 Ok(HttpResponse {
+                    x_request_id: None,
                     status: 429,
                     body: "rate limited".to_string(),
                 }),
@@ -3039,6 +3420,7 @@ mod batch_results_stream {
             http_client.add_response(
                 "POST /v1/test",
                 Ok(HttpResponse {
+                    x_request_id: None,
                     status: 400,
                     body: "bad request".to_string(),
                 }),
@@ -3050,6 +3432,7 @@ mod batch_results_stream {
             http_client.add_response(
                 "POST /v1/test",
                 Ok(HttpResponse {
+                    x_request_id: None,
                     status: 200,
                     body: r#"{"result":"success"}"#.to_string(),
                 }),

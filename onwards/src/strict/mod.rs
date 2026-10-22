@@ -20,7 +20,9 @@
 //! ```
 
 pub mod handlers;
+pub mod schema_mismatch;
 pub mod schemas;
+pub mod stream_end;
 
 use crate::AppState;
 use crate::client::HttpClient;
@@ -435,6 +437,87 @@ mod tests {
             !body_text.contains("\"reasoning\""),
             "the OpenRouter spelling should not survive in any chunk; got: {body_text}"
         );
+    }
+
+    /// Chat and legacy completion responses carry the caller's response ID,
+    /// streamed or not, instead of the upstream's.
+    #[tokio::test]
+    async fn strict_completions_carry_caller_response_id() {
+        let chat_stream = concat!(
+            "data: {\"id\":\"chatcmpl-upstream\",\"object\":\"chat.completion.chunk\",\"created\":1,",
+            "\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},",
+            "\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-upstream\",\"object\":\"chat.completion.chunk\",\"created\":1,",
+            "\"model\":\"gpt-4\",\"choices\":[],\"usage\":{\"prompt_tokens\":3,",
+            "\"completion_tokens\":1,\"total_tokens\":4}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let completion_stream = concat!(
+            "data: {\"id\":\"cmpl-upstream\",\"object\":\"text_completion\",\"created\":1,",
+            "\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"text\":\"hi\",\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let completion = r#"{"id":"cmpl-upstream","object":"text_completion","created":1,"model":"gpt-4","choices":[{"index":0,"text":"hi","finish_reason":"stop"}]}"#;
+
+        let cases = [
+            (
+                "/chat/completions",
+                r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+                chat_stream,
+            ),
+            (
+                "/completions",
+                r#"{"model":"gpt-4","prompt":"hi","stream":true}"#,
+                completion_stream,
+            ),
+            (
+                "/completions",
+                r#"{"model":"gpt-4","prompt":"hi"}"#,
+                completion,
+            ),
+        ];
+
+        for (path, request_body, upstream) in cases {
+            let state = create_reasoning_test_app_state(upstream)
+                .with_response_id_header("x-fusillade-request-id");
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .header(
+                    "x-fusillade-request-id",
+                    "11111111-2222-3333-4444-555555555555",
+                )
+                .body(Body::from(request_body))
+                .unwrap();
+
+            let response = build_strict_router(state).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path} {request_body}");
+            let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body_text = std::str::from_utf8(&body_bytes).unwrap();
+
+            let ids: Vec<String> = if request_body.contains("\"stream\":true") {
+                body_text
+                    .split("\n\n")
+                    .filter_map(|event| event.strip_prefix("data: "))
+                    .filter(|data| *data != "[DONE]")
+                    .map(|data| {
+                        let chunk: serde_json::Value = serde_json::from_str(data).unwrap();
+                        chunk["id"].as_str().unwrap().to_string()
+                    })
+                    .collect()
+            } else {
+                let body: serde_json::Value = serde_json::from_str(body_text).unwrap();
+                vec![body["id"].as_str().unwrap().to_string()]
+            };
+            assert!(!ids.is_empty(), "{path}: no chunks in {body_text}");
+            for id in ids {
+                assert_eq!(
+                    id, "resp_11111111-2222-3333-4444-555555555555",
+                    "{path} {request_body}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

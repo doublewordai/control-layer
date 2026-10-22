@@ -30,7 +30,8 @@ async fn require_current_platform_manager(conn: &mut sqlx::PgConnection, user_id
 
 const OVERLAY_COLUMNS: &str = r#"
     SELECT mo.user_id AS organization_id, u.username AS organization_name,
-           mo.deployed_model_id, dm.alias, mo.default_serving_class, mo.targets,
+           u.display_name AS organization_display_name,
+           mo.deployed_model_id, dm.alias, mo.targets,
            mo.self_hosted_only, mo.provisioning_source, mo.updated_at
     FROM model_overlays mo
     JOIN users u ON u.id = mo.user_id
@@ -112,8 +113,6 @@ pub async fn get_organization_serving<P: PoolProvider>(
 
     Ok(Json(OrganizationServingResponse {
         organization_id: id,
-        granted_serving_classes: org.granted_serving_classes,
-        default_serving_class: org.default_serving_class,
         self_hosted_only: org.self_hosted_only,
         overlays: overlays.into_iter().map(OverlayResponse::from).collect(),
         tariffs,
@@ -195,7 +194,7 @@ mod tests {
             .await
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn customers_see_their_effective_price_and_operators_see_every_scope(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -297,7 +296,7 @@ mod tests {
         assert_eq!(body["cache_pricing"]["read_multiplier"], "0.5000");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn serving_views_are_platform_manager_only(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -307,7 +306,7 @@ mod tests {
         let endpoint = create_test_endpoint(&pool, "ep", admin.id).await;
         let model_id = create_test_model(&pool, "m", "overlaid/model", endpoint, admin.id).await;
         sqlx::query(
-            "INSERT INTO model_overlays (user_id, deployed_model_id, default_serving_class, provisioning_source) VALUES ($1, $2, 'throughput', 'org-overlays:acme.yaml')",
+            "INSERT INTO model_overlays (user_id, deployed_model_id, targets, provisioning_source) VALUES ($1, $2, '{\"ttft_ms\": 800, \"itl_ms\": 30, \"priority\": 50}', 'org-overlays:acme.yaml')",
         )
         .bind(org.id)
         .bind(model_id)
@@ -330,7 +329,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query("UPDATE users SET granted_serving_classes = '{throughput}', self_hosted_only = TRUE WHERE id = $1")
+        sqlx::query("UPDATE users SET self_hosted_only = TRUE WHERE id = $1")
             .bind(org.id)
             .execute(&pool)
             .await
@@ -347,11 +346,10 @@ mod tests {
         let resp = get(&server, &format!("/admin/api/v1/organizations/{}/serving", org.id), &admin).await;
         resp.assert_status_ok();
         let body: Value = resp.json();
-        assert_eq!(body["granted_serving_classes"], json!(["throughput"]));
         assert_eq!(body["self_hosted_only"], json!(true));
         assert_eq!(body["overlays"].as_array().unwrap().len(), 1);
         assert_eq!(body["overlays"][0]["alias"], "overlaid/model");
-        assert_eq!(body["overlays"][0]["default_serving_class"], "throughput");
+        assert_eq!(body["overlays"][0]["targets"]["priority"], 50);
         assert_eq!(body["overlays"][0]["provisioning_source"], "org-overlays:acme.yaml");
         assert_eq!(body["tariffs"].as_array().unwrap().len(), 1);
         assert_eq!(body["tariffs"][0]["organization_id"], org.id.to_string());
@@ -365,12 +363,31 @@ mod tests {
         assert_eq!(body[0]["organization_id"], org.id.to_string());
         assert_eq!(body[0]["organization_name"], org.username);
 
+        // Labels may change without changing the catalog's stable account identifier.
+        for display_name in [Some("Example Workspace"), None] {
+            sqlx::query("UPDATE users SET display_name = $2 WHERE id = $1")
+                .bind(org.id)
+                .bind(display_name)
+                .execute(&pool)
+                .await
+                .unwrap();
+            let body: Value = get(&server, &format!("/admin/api/v1/models/{model_id}/overlays"), &admin)
+                .await
+                .json();
+            assert_eq!(body[0]["organization_name"], org.username);
+            assert_eq!(body[0]["organization_display_name"], json!(display_name));
+            let body: Value = get(&server, &format!("/admin/api/v1/organizations/{}/serving", org.id), &admin)
+                .await
+                .json();
+            assert_eq!(body["overlays"][0]["organization_display_name"], json!(display_name));
+        }
+
         // A personal account is not an organisation.
         get(&server, &format!("/admin/api/v1/organizations/{}/serving", member.id), &admin)
             .await
             .assert_status_not_found();
     }
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn new_models_and_token_only_deals_are_readable_together(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -406,17 +423,14 @@ mod tests {
         assert_eq!(response.json::<Value>()["model_aliases"], json!({}));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn organization_edits_are_visible_in_the_next_serving_read(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
         let member = create_test_user(&pool, Role::StandardUser).await;
         let org = create_test_org(&pool, member.id).await;
         let headers = add_auth_headers(&admin);
-        for settings in [
-            json!({"granted_serving_classes": ["interactive"], "default_serving_class": "interactive", "self_hosted_only": true}),
-            json!({"granted_serving_classes": [], "default_serving_class": null, "self_hosted_only": false}),
-        ] {
+        for settings in [json!({"self_hosted_only": true}), json!({"self_hosted_only": false})] {
             server
                 .patch(&format!("/admin/api/v1/organizations/{}", org.id))
                 .add_header(&headers[0].0, &headers[0].1)
@@ -427,16 +441,44 @@ mod tests {
             let response = get(&server, &format!("/admin/api/v1/organizations/{}/serving", org.id), &admin).await;
             response.assert_status_ok();
             let body: Value = response.json();
-            for field in ["granted_serving_classes", "default_serving_class", "self_hosted_only"] {
+            for field in ["self_hosted_only"] {
                 assert_eq!(
                     body[field], settings[field],
                     "{field} must reflect the completed edit without polling"
                 );
             }
         }
+
+        // The retired class fields are ignored on PATCH and never returned.
+        server
+            .patch(&format!("/admin/api/v1/organizations/{}", org.id))
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"granted_serving_classes": ["interactive"], "default_serving_class": "interactive", "self_hosted_only": true}))
+            .await
+            .assert_status_ok();
+        let serving: Value = get(&server, &format!("/admin/api/v1/organizations/{}/serving", org.id), &admin)
+            .await
+            .json();
+        assert_eq!(serving["self_hosted_only"], json!(true));
+        let organization: Value = get(&server, &format!("/admin/api/v1/organizations/{}", org.id), &admin)
+            .await
+            .json();
+        for body in [&serving, &organization] {
+            for field in ["granted_serving_classes", "default_serving_class"] {
+                assert!(body.get(field).is_none(), "{field} is retired: {body}");
+            }
+        }
+        let stored: (Vec<String>, Option<String>) =
+            sqlx::query_as("SELECT granted_serving_classes, default_serving_class FROM users WHERE id = $1")
+                .bind(org.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, (Vec::new(), None), "the retired columns are never written");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn pricing_lookup_errors_are_not_successful_empty_quotes(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;

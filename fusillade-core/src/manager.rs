@@ -339,6 +339,24 @@ pub enum RetainedResponseRetirementOutcome {
     Retired,
 }
 
+/// Position in the oldest-first walk over files due for content expiry: the
+/// `(created_at, id)` of the last file a step examined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileExpiryCursor {
+    pub created_at: DateTime<Utc>,
+    pub id: uuid::Uuid,
+}
+
+/// Content-free result of one bounded file-content expiry step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileExpiryStep {
+    /// Files tombstoned by this step.
+    pub expired: u64,
+    /// Where the next step continues, or `None` once the walk has reached
+    /// the retention horizon.
+    pub next: Option<FileExpiryCursor>,
+}
+
 #[cfg(test)]
 mod retention_policy_tests {
     use super::*;
@@ -960,7 +978,7 @@ pub trait Storage: Send + Sync {
     ///
     /// Removes the `requests` row and, if its template is batchless
     /// (`file_id IS NULL`, dedicated 1:1 to this request), the
-    /// `request_templates` row as well — batchless templates carry the
+    /// request template row as well — batchless templates carry the
     /// prompt body, so leaving them defeats the erasure. File-backed
     /// templates (shared across siblings in a batch) are not touched here;
     /// the orphan-purge daemon cleans those up after the parent file is
@@ -1030,14 +1048,14 @@ pub trait Storage: Send + Sync {
     ///
     /// Three categories, keyed on `created_by` / `uploaded_by = creator_id`:
     /// * **Batchless requests** (`batch_id IS NULL` — realtime/flex) are
-    ///   *hard*-deleted along with their batchless `request_templates` (which
+    ///   *hard*-deleted along with their batchless request templates (which
     ///   carry the prompt body). The orphan-purge daemon never reaches these
     ///   because they have no soft-deleted parent batch, so they must be
     ///   removed here or the erasure is incomplete.
     /// * **Batches** are soft-deleted (cancelled if active) with `metadata`
     ///   nullified (it can contain the user's email). Their child requests are
     ///   hard-deleted afterwards by the orphan-purge daemon (`purge_orphaned_rows`).
-    /// * **Files** are soft-deleted; their `request_templates` are likewise
+    /// * **Files** are soft-deleted; their request templates are likewise
     ///   reaped by the orphan-purge daemon once `files.deleted_at` is set.
     ///
     /// Note: completion is therefore eventually-consistent — when this returns
@@ -1720,7 +1738,7 @@ pub trait DaemonStorage: Send + Sync {
         status_filter: Option<DaemonStatus>,
     ) -> Result<Vec<AnyDaemonRecord>>;
 
-    /// Purge orphaned request_templates and requests whose parent (file or batch)
+    /// Purge orphaned request templates and requests whose parent (file or batch)
     /// has been soft-deleted or whose FK is NULL.
     ///
     /// Deletes at most `batch_size` rows from each table per call.
@@ -1858,9 +1876,19 @@ pub trait DaemonStorage: Send + Sync {
     }
 
     /// Tombstone aged-out input file metadata (content-free bounded update)
-    /// once every referencing batch's content is expired or erased. Storage
-    /// backends opt in explicitly; the default is disabled.
-    async fn expire_file_content(&self, _retention_days: i32, _batch_size: i64) -> Result<u64> {
+    /// once every referencing batch's content is expired or erased.
+    ///
+    /// One call examines at most `scan_limit` due files after `after`,
+    /// oldest first, so its cost stays bounded however many due files live
+    /// batches still pin. Callers walk the due range by passing each step's
+    /// `next` back in. Storage backends opt in explicitly; the default is
+    /// disabled.
+    async fn expire_file_content(
+        &self,
+        _retention_days: i32,
+        _scan_limit: i64,
+        _after: Option<FileExpiryCursor>,
+    ) -> Result<FileExpiryStep> {
         Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
     }
 

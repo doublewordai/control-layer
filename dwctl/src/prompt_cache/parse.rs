@@ -209,7 +209,7 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy, telemetry: &Tele
             // than silently caching an empty tool and undercounting its tokens.
             let text = serde_json::to_string(&stripped)?;
 
-            let canonical = canonical_block_bytes(TOOL_DEFINITION_ROLE, &stripped);
+            let canonical = canonical_block_bytes(TOOL_DEFINITION_ROLE, stripped);
             hasher.update(&canonical);
             cumulative_hashes.push(hasher.clone().finalize().to_vec());
 
@@ -258,7 +258,7 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy, telemetry: &Tele
             match msg.get("content") {
                 // String content: one implicit text block, no marker possible.
                 Some(serde_json::Value::String(s)) => {
-                    let canonical = canonical_block_bytes(&role, &serde_json::json!({ "type": "text", "text": s }));
+                    let canonical = canonical_block_bytes(&role, serde_json::json!({ "type": "text", "text": s }));
                     hasher.update(&canonical);
                     cumulative_hashes.push(hasher.clone().finalize().to_vec());
                     blocks.push(Block {
@@ -295,7 +295,7 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy, telemetry: &Tele
                         let stripped = strip_cache_control(block);
                         let text = stripped.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
 
-                        let canonical = canonical_block_bytes(&role, &stripped);
+                        let canonical = canonical_block_bytes(&role, stripped);
                         hasher.update(&canonical);
                         cumulative_hashes.push(hasher.clone().finalize().to_vec());
 
@@ -347,7 +347,7 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy, telemetry: &Tele
                     };
                     let stripped = strip_cache_control(call);
                     let text = serde_json::to_string(&stripped)?;
-                    let canonical = canonical_block_bytes(TOOL_CALL_ROLE, &stripped);
+                    let canonical = canonical_block_bytes(TOOL_CALL_ROLE, stripped);
                     hasher.update(&canonical);
                     cumulative_hashes.push(hasher.clone().finalize().to_vec());
 
@@ -614,7 +614,7 @@ pub fn validate_markers(body: &serde_json::Value, policy: &TierPolicy, telemetry
 fn strip_cache_control(block: &serde_json::Value) -> serde_json::Value {
     let mut b = block.clone();
     if let Some(obj) = b.as_object_mut() {
-        obj.remove("cache_control");
+        obj.shift_remove("cache_control");
     }
     b
 }
@@ -679,17 +679,50 @@ pub(crate) const TELEMETRY_ROLE: &str = "system";
 /// `role` + canonical JSON of the marker-stripped block. The role is included so the
 /// same text under different roles hashes differently.
 ///
-/// "Canonical" here relies on `serde_json` being built **without** the `preserve_order`
-/// feature: `Value::Object` is then a `BTreeMap`, so `to_vec` emits keys in sorted order
-/// and two blocks that differ only in key insertion order (common across SDKs/languages)
-/// hash identically. If a dependency ever enables `preserve_order` (→ `IndexMap`,
-/// insertion order), this would need explicit key-sorting to keep the cache-hit rate up.
-fn canonical_block_bytes(role: &str, stripped_block: &serde_json::Value) -> Vec<u8> {
+/// "Canonical" means every object's keys are sorted before serializing, so two blocks
+/// that differ only in key order (common across SDKs/languages) hash identically.
+///
+/// An image block whose URL is a stored image token (`dw-img://{sha256}.{upload_id}`) is hashed
+/// without the upload ID: the upload ID only picks which stored copy of the bytes to sign,
+/// so two requests carrying the same image must share the prefix. Only the image URL field
+/// is rewritten — token-shaped strings anywhere else hash as written.
+fn canonical_block_bytes(role: &str, mut stripped_block: serde_json::Value) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(role.as_bytes());
     out.push(0x00);
-    out.extend_from_slice(&serde_json::to_vec(stripped_block).unwrap_or_default());
+    if let Some(content_only) = image_block_without_upload_id(&stripped_block) {
+        stripped_block = content_only;
+    }
+    stripped_block.sort_all_objects();
+    out.extend_from_slice(&serde_json::to_vec(&stripped_block).unwrap_or_default());
     out
+}
+
+/// `block` with its stored-image token rewritten to the canonical content-only form
+/// (lowercase `dw-img://{sha256}`), if it is an image block whose URL is a token in any
+/// other form (an upload ID, uppercase hex); `None` for every other block (no clone, no
+/// scan).
+fn image_block_without_upload_id(block: &serde_json::Value) -> Option<serde_json::Value> {
+    use crate::image_normalizer::ImageToken;
+    // The two image shapes the image normalizer substitutes (chat `image_url.url`,
+    // responses `input_image.image_url`).
+    let pointer = match block.get("type")?.as_str()? {
+        "image_url" => "/image_url/url",
+        "input_image" => "/image_url",
+        _ => return None,
+    };
+    let url = block.pointer(pointer)?.as_str()?;
+    if !ImageToken::looks_like_token(url) {
+        return None;
+    }
+    let token: ImageToken = url.parse().ok()?;
+    let canonical = ImageToken(token.0, None).to_dw_img_uri();
+    if canonical == url {
+        return None;
+    }
+    let mut block = block.clone();
+    *block.pointer_mut(pointer)? = canonical.into();
+    Some(block)
 }
 
 #[cfg(test)]
@@ -1830,6 +1863,61 @@ mod tests {
     }
 
     #[test]
+    fn stored_image_tokens_hash_by_content_not_by_upload_id() {
+        // Each ingest stores its own copy of an image (`dw-img://{sha256}.{upload_id}`). Two
+        // requests carrying the same image through different stored copies must share the
+        // prefix; a different image must not.
+        use crate::image_normalizer::ImageToken;
+        let body = |token: ImageToken| {
+            parse(serde_json::json!({
+                "cache_control": {"type": "ephemeral"},
+                "messages": [
+                    {"role": "user", "content": [
+                        {"type": "text", "text": "what is this?"},
+                        {"type": "image_url", "image_url": {"url": token.to_dw_img_uri()}}
+                    ]}
+                ]
+            }))
+        };
+        let a = body(ImageToken::new_unique([7; 32]));
+        let b = body(ImageToken::new_unique([7; 32]));
+        let legacy = body(ImageToken([7; 32], None));
+        let different = body(ImageToken::new_unique([8; 32]));
+        assert_eq!(a.cumulative_hashes[1], b.cumulative_hashes[1]);
+        assert_eq!(a.cumulative_hashes[1], legacy.cumulative_hashes[1]);
+        // Hex case is not identity either.
+        let upper = parse(serde_json::json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image_url", "image_url": {"url": format!("dw-img://{}", hex::encode_upper([7u8; 32]))}}
+                ]}
+            ]
+        }));
+        assert_eq!(a.cumulative_hashes[1], upper.cumulative_hashes[1]);
+        assert_ne!(a.cumulative_hashes[1], different.cumulative_hashes[1]);
+    }
+
+    #[test]
+    fn token_shaped_text_outside_image_urls_hashes_as_written() {
+        // Only the image block's URL field is normalised. The same token-shaped string in a
+        // text block is ordinary prompt content: with and without the upload ID suffix it must
+        // hash differently, or two different prompts would share a cached prefix.
+        use crate::image_normalizer::ImageToken;
+        let text_body = |text: String| {
+            parse(serde_json::json!({
+                "cache_control": {"type": "ephemeral"},
+                "messages": [{"role": "user", "content": [{"type": "text", "text": text}]}]
+            }))
+        };
+        let with_upload_id = ImageToken::new_unique([7; 32]);
+        let a = text_body(format!("see {}", with_upload_id.to_dw_img_uri()));
+        let b = text_body(format!("see {}", ImageToken(with_upload_id.0, None).to_dw_img_uri()));
+        assert_ne!(a.cumulative_hashes[0], b.cumulative_hashes[0]);
+    }
+
+    #[test]
     fn automatic_with_trailing_blockless_message_marks_last_real_block() {
         // KNOWN SKEW, pinned: a trailing message that contributes no blocks (null/absent content,
         // no tool_calls) leaves the automatic marker on the LAST REAL block — but the breakpoint's
@@ -1930,5 +2018,26 @@ mod tests {
             candidates.contains(&turn1.cumulative_hashes[1]),
             "prior write reachable by walk-back"
         );
+    }
+
+    #[test]
+    fn canonical_block_bytes_sorts_object_keys() {
+        let block: serde_json::Value = serde_json::from_str(r#"{"type":"text","text":"hi","meta":{"z":1,"a":2}}"#).unwrap();
+        let mut expected = b"user\0".to_vec();
+        expected.extend_from_slice(br#"{"meta":{"a":2,"z":1},"text":"hi","type":"text"}"#);
+        assert_eq!(canonical_block_bytes("user", block), expected);
+    }
+
+    #[test]
+    fn key_order_does_not_change_hashes() {
+        let a = r#"{"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{"b":{"type":"string"},"a":{"type":"string"}}}}}],
+            "messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}]}"#;
+        let b = r#"{"messages":[{"content":[{"cache_control":{"type":"ephemeral"},"text":"hi","type":"text"}],"role":"user"}],
+            "tools":[{"function":{"parameters":{"properties":{"a":{"type":"string"},"b":{"type":"string"}},"type":"object"},"name":"f"},"type":"function"}]}"#;
+        let policy = TierPolicy::from_config(&["5m".to_string()], "5m");
+        let pa = parse_chat_completions(a.as_bytes(), &policy, &TelemetryPolicy::default()).unwrap();
+        let pb = parse_chat_completions(b.as_bytes(), &policy, &TelemetryPolicy::default()).unwrap();
+        assert_eq!(pa.cumulative_hashes.len(), 2);
+        assert_eq!(pa.cumulative_hashes, pb.cumulative_hashes);
     }
 }

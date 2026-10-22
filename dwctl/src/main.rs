@@ -1,3 +1,6 @@
+use std::process::ExitCode;
+
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use dwctl::config::Args;
 use dwctl::{Application, Config, migrations, telemetry};
@@ -79,14 +82,38 @@ async fn shutdown_signal() {
     }
 }
 
-fn main() -> anyhow::Result<()> {
-    tokio::runtime::Builder::new_multi_thread()
+fn main() -> ExitCode {
+    let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         // 8MB stack per worker thread — the default 2MB overflows with deep
         // tracing-opentelemetry span nesting during batch request processing
         .thread_stack_size(8 * 1024 * 1024)
-        .build()?
-        .block_on(async_main())
+        .build()
+        .map_err(anyhow::Error::from)
+        .and_then(|runtime| runtime.block_on(async_main()));
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            report_error(&error);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Reports the error `dwctl` exits with, once: through tracing when logging
+/// is installed, so it comes out in the configured format, and as plain text
+/// on stderr when it isn't (logging itself failed to start). Returning the
+/// error from `main` instead would print it a second time, as plain text,
+/// beside the log line.
+fn report_error(error: &anyhow::Error) {
+    if tracing::dispatcher::has_been_set() {
+        // `{:#}` prints the context chain (target, migration version) ahead
+        // of the underlying error, which is what an operator reading a failed
+        // pod or Job needs first.
+        tracing::error!(error = format!("{error:#}"), "dwctl exited with an error");
+    } else {
+        eprintln!("Error: {error:?}");
+    }
 }
 
 /// `dwctl` serves by default; `dwctl migrate` applies schema migrations and
@@ -121,20 +148,32 @@ async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let args = cli.args;
 
-    // Load configuration
-    let config = Config::load(&args)?;
+    // Load configuration. A config that fails to load still says how to log
+    // the failure, when `log_format` itself can be read from it.
+    let config = match Config::load(&args) {
+        Ok(config) => config,
+        Err(error) => {
+            let log_format = Config::figment(&args).extract_inner("log_format").unwrap_or_default();
+            let _ = telemetry::init_telemetry(false, log_format);
+            return Err(anyhow::Error::from(error).context("Failed to load configuration"));
+        }
+    };
+
+    // Initialize telemetry (tracing + optional OpenTelemetry) before anything
+    // logs: events emitted earlier have no subscriber and are discarded.
+    let tracer_provider = telemetry::init_telemetry(config.enable_otel_export, config.log_format)?;
 
     // Validate config consistency
     config.batches.validate();
 
     // If --validate flag is set, exit successfully after config validation
     if args.validate {
+        if let Some(provider) = tracer_provider {
+            let _ = provider.shutdown();
+        }
         println!("Configuration is valid.");
         return Ok(());
     }
-
-    // Initialize telemetry (tracing + optional OpenTelemetry)
-    let tracer_provider = telemetry::init_telemetry(config.enable_otel_export)?;
 
     tracing::debug!("{:?}", args);
 
@@ -143,16 +182,7 @@ async fn async_main() -> anyhow::Result<()> {
         if let Some(provider) = tracer_provider {
             let _ = provider.shutdown();
         }
-        return match result {
-            Ok(_) => Ok(()),
-            Err(error) => {
-                // `{:#}` prints the context chain (target, migration version)
-                // ahead of the driver error, which is what an operator reading
-                // a failed Job needs first.
-                tracing::error!(error = format!("{error:#}"), "dwctl migrate failed");
-                Err(error)
-            }
-        };
+        return result.map(|_| ()).context("dwctl migrate failed");
     }
 
     // Run the application with graceful shutdown on SIGTERM/Ctrl+C

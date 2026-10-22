@@ -726,7 +726,7 @@ mod tests {
 
     /// The inline part of `observe` filters without spawning: nothing reaches the sink
     /// for non-chat paths, filtered models, or missing pieces.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn observe_filters_before_spawning(pool: sqlx::PgPool) {
         let (rec, mut rx) = recorder_with(pool, key(1), ModelFilter::from_config(&Some(vec!["m".into()])));
         let b = body(&[("user", "hi")], 0);

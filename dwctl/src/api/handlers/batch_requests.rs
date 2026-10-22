@@ -575,7 +575,7 @@ mod tests {
     use crate::{api::models::users::Role, test::utils::*};
     use sqlx::PgPool;
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_batch_requests_requires_auth(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -584,7 +584,7 @@ mod tests {
         response.assert_status_unauthorized();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_batch_requests_empty(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -602,7 +602,7 @@ mod tests {
         assert!(body["data"].as_array().unwrap().is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_member_id_filter_rejected_for_non_pm(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -617,7 +617,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_batch_request_returns_404_for_missing(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -649,7 +649,7 @@ mod tests {
     /// With the fix:
     ///   - PM personal context → all three rows (PM bypass, intentional)
     ///   - PM in org context   → only the org's row (the contract we're testing)
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_batch_requests_pm_in_org_context_scopes_to_org(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -674,14 +674,18 @@ mod tests {
         for (_label, owner) in &owners {
             let template_id = uuid::Uuid::new_v4();
             let request_id = uuid::Uuid::new_v4();
-            sqlx::query(
-                "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, NULL, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $2, NULL, 'POST')",
+            crate::test::utils::insert_fusillade_template(
+                &pool,
+                template_id,
+                None,
+                "test-model",
+                "test-key",
+                "http://test",
+                "/v1/chat/completions",
+                &serde_json::to_string(&body).unwrap(),
+                None,
             )
-            .bind(template_id)
-            .bind(serde_json::to_string(&body).unwrap())
-            .execute(&pool)
-            .await
-            .expect("insert template");
+            .await;
             sqlx::query(
                 "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at, created_by) VALUES ($1, NULL, $2, 'test-model', 'pending', NOW(), $3)",
             )
@@ -729,7 +733,7 @@ mod tests {
         assert_eq!(org_rows.len(), 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_batch_request_populates_created_by_email(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -743,14 +747,18 @@ mod tests {
         let request_id = uuid::Uuid::new_v4();
         let body = serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}]});
 
-        sqlx::query(
-            "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, NULL, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $2, NULL, 'POST')",
+        crate::test::utils::insert_fusillade_template(
+            &pool,
+            template_id,
+            None,
+            "test-model",
+            "test-key",
+            "http://test",
+            "/v1/chat/completions",
+            &serde_json::to_string(&body).unwrap(),
+            None,
         )
-        .bind(template_id)
-        .bind(serde_json::to_string(&body).unwrap())
-        .execute(&pool)
-        .await
-        .expect("insert template");
+        .await;
 
         sqlx::query(
             "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at, created_by) VALUES ($1, NULL, $2, 'test-model', 'pending', NOW(), $3)",
@@ -788,7 +796,7 @@ mod tests {
     /// Also covers the cap-scope indirection: the request is billed to a
     /// hidden child key (migration 122), and the caller must still be told the
     /// *visible* parent's id and name, not "Internal batch key (cap scope …)".
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_responses_surface_api_key_holder_not_just_billing_owner(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -830,14 +838,18 @@ mod tests {
         let template_id = uuid::Uuid::new_v4();
         let request_id = uuid::Uuid::new_v4();
         let body = serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}]});
-        sqlx::query(
-            "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, NULL, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $2, NULL, 'POST')",
+        crate::test::utils::insert_fusillade_template(
+            &pool,
+            template_id,
+            None,
+            "test-model",
+            "test-key",
+            "http://test",
+            "/v1/chat/completions",
+            &serde_json::to_string(&body).unwrap(),
+            None,
         )
-        .bind(template_id)
-        .bind(serde_json::to_string(&body).unwrap())
-        .execute(&pool)
-        .await
-        .expect("insert template");
+        .await;
         sqlx::query(
             "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at, created_by) VALUES ($1, NULL, $2, 'test-model', 'pending', NOW(), $3)",
         )
@@ -901,7 +913,7 @@ mod tests {
     /// A response with no `http_analytics` row — never billed, or the row aged
     /// out of retention — must still render, with the key fields null rather
     /// than a 500 or a fabricated holder.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_response_without_analytics_row_has_null_api_key_fields(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -911,14 +923,18 @@ mod tests {
         let template_id = uuid::Uuid::new_v4();
         let request_id = uuid::Uuid::new_v4();
         let body = serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}]});
-        sqlx::query(
-            "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, NULL, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $2, NULL, 'POST')",
+        crate::test::utils::insert_fusillade_template(
+            &pool,
+            template_id,
+            None,
+            "test-model",
+            "test-key",
+            "http://test",
+            "/v1/chat/completions",
+            &serde_json::to_string(&body).unwrap(),
+            None,
         )
-        .bind(template_id)
-        .bind(serde_json::to_string(&body).unwrap())
-        .execute(&pool)
-        .await
-        .expect("insert template");
+        .await;
         sqlx::query(
             "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at, created_by) VALUES ($1, NULL, $2, 'test-model', 'pending', NOW(), $3)",
         )
@@ -941,7 +957,7 @@ mod tests {
         assert!(body["api_key_holder_email"].is_null());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_batch_request_removes_row(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -952,14 +968,18 @@ mod tests {
         let request_id = uuid::Uuid::new_v4();
         let body = serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}]});
 
-        sqlx::query(
-            "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, NULL, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $2, NULL, 'POST')",
+        crate::test::utils::insert_fusillade_template(
+            &pool,
+            template_id,
+            None,
+            "test-model",
+            "test-key",
+            "http://test",
+            "/v1/chat/completions",
+            &serde_json::to_string(&body).unwrap(),
+            None,
         )
-        .bind(template_id)
-        .bind(serde_json::to_string(&body).unwrap())
-        .execute(&pool)
-        .await
-        .expect("insert template");
+        .await;
 
         sqlx::query(
             "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at, created_by) VALUES ($1, NULL, $2, 'test-model', 'pending', NOW(), $3)",
@@ -986,7 +1006,7 @@ mod tests {
         assert_eq!(count.0, 0, "fusillade row should be hard-deleted");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_batch_request_404_for_other_users_row(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -998,14 +1018,18 @@ mod tests {
         let request_id = uuid::Uuid::new_v4();
         let body = serde_json::json!({"model": "test-model", "messages": []});
 
-        sqlx::query(
-            "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, NULL, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $2, NULL, 'POST')",
+        crate::test::utils::insert_fusillade_template(
+            &pool,
+            template_id,
+            None,
+            "test-model",
+            "test-key",
+            "http://test",
+            "/v1/chat/completions",
+            &serde_json::to_string(&body).unwrap(),
+            None,
         )
-        .bind(template_id)
-        .bind(serde_json::to_string(&body).unwrap())
-        .execute(&pool)
-        .await
-        .expect("insert template");
+        .await;
 
         sqlx::query(
             "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at, created_by) VALUES ($1, NULL, $2, 'test-model', 'pending', NOW(), $3)",

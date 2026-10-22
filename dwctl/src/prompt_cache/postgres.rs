@@ -133,14 +133,19 @@ impl PostgresIndex {
     }
 
     async fn refresh_once(&self, scope: &IndexScope, prefix_hash: &PrefixHash, new_expires_at: DateTime<Utc>) -> Result<(), sqlx::Error> {
-        // Slide the window forward (the sliding-TTL refresh). In pure Postgres this
-        // is a direct UPDATE per read; the Redis accelerator debounces it.
+        // Slide the window forward (the sliding-TTL refresh). Every request that reads
+        // a shared prefix refreshes the same row, so under load an unconditional UPDATE
+        // queues every caller on that row's lock. Only write when the expiry would move
+        // by more than 1% of the window: a refresh that would change almost nothing
+        // matches no row and takes no lock, and the window still slides with at most
+        // 1% lag.
         sqlx::query!(
             r#"
             UPDATE prompt_cache_entries
-            SET expires_at = $5
+            SET expires_at = $5::timestamptz
             WHERE principal_id = $1 AND virtual_model = $2 AND tokenizer_version = $3
               AND prefix_hash = $4
+              AND expires_at < $5::timestamptz - ($5::timestamptz - now()) / 100
             "#,
             scope.principal_id,
             scope.virtual_model,
@@ -219,7 +224,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn write_then_lookup_returns_match(pool: sqlx::PgPool) {
         let idx = PostgresIndex::new(pool, 1);
         let s = scope();
@@ -232,7 +237,7 @@ mod tests {
         assert_eq!(hits[0].ttl_tier, TtlTier::OneHour);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn lookup_excludes_expired_and_other_scopes(pool: sqlx::PgPool) {
         let idx = PostgresIndex::new(pool, 1);
         let s = scope();
@@ -252,7 +257,7 @@ mod tests {
         assert!(idx.lookup(&other, &[b"shared".to_vec()]).await.unwrap().is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn refresh_slides_expiry(pool: sqlx::PgPool) {
         let idx = PostgresIndex::new(pool, 1);
         let s = scope();
@@ -269,7 +274,30 @@ mod tests {
         assert!(hits[0].expires_at > Utc::now() + chrono::Duration::minutes(30));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
+    async fn refresh_skips_a_negligible_extension(pool: sqlx::PgPool) {
+        let idx = PostgresIndex::new(pool, 1);
+        let s = scope();
+        let written = Utc::now() + chrono::Duration::hours(1);
+        let mut e = entry(&s, b"hot-prefix", 7, TtlTier::OneHour);
+        e.expires_at = written;
+        idx.write(&e).await.unwrap();
+
+        // A refresh moving the expiry by far less than 1% of the hour is skipped.
+        idx.refresh(&s, &b"hot-prefix".to_vec(), written + chrono::Duration::seconds(5))
+            .await
+            .unwrap();
+        let hits = idx.lookup(&s, &[b"hot-prefix".to_vec()]).await.unwrap();
+        assert_eq!(hits[0].expires_at.timestamp_micros(), written.timestamp_micros());
+
+        // One that moves it by more than 1% is written.
+        let later = written + chrono::Duration::minutes(5);
+        idx.refresh(&s, &b"hot-prefix".to_vec(), later).await.unwrap();
+        let hits = idx.lookup(&s, &[b"hot-prefix".to_vec()]).await.unwrap();
+        assert_eq!(hits[0].expires_at.timestamp_micros(), later.timestamp_micros());
+    }
+
+    #[dwctl_test_macros::test]
     async fn write_upserts_on_conflict(pool: sqlx::PgPool) {
         let idx = PostgresIndex::new(pool, 1);
         let s = scope();

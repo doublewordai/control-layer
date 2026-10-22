@@ -180,6 +180,7 @@ where
         JOIN model_cache_tariffs mct ON mct.deployed_model_id = dm.id
         WHERE dm.alias = ANY($1)
           AND (mct.user_id IS NULL OR mct.user_id = ANY($2))
+          AND (mct.user_id IS NOT NULL OR mct.serving_class IS NULL)
         ORDER BY dm.alias, mct.valid_from DESC
         "#,
         aliases,
@@ -236,6 +237,7 @@ pub(crate) fn resolve_cache_multipliers(
                     .and_then(|class| valid(Some(a), Some(class)))
                     .or_else(|| valid(Some(a), None))
             })
+            .or_else(|| serving_class.and_then(|class| valid(None, Some(class))))
             .unwrap_or(general),
     )
     .map(|r| CacheMultipliers {
@@ -293,7 +295,8 @@ pub(crate) fn find_best_tariff(
             let scope_rank = match (t.account, t.serving_class.as_deref()) {
                 (Some(owner), Some(c)) if Some(owner) == account && Some(c) == class => 0,
                 (Some(owner), None) if Some(owner) == account => 1,
-                (None, None) => 2,
+                (None, Some(c)) if Some(c) == class => 2,
+                (None, None) => 3,
                 _ => return None,
             };
             // A general batch price wins over every realtime deal, including zero.

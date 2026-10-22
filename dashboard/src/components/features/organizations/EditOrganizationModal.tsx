@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
-import { useUpdateOrganization } from "@/api/control-layer/hooks";
-import type { Organization, ServingClassName } from "@/api/control-layer/types";
+import { useUpdateOrganization, useOrganization, useConfig } from "@/api/control-layer/hooks";
+import type { Organization } from "@/api/control-layer/types";
+import { SchedulingTolerations } from "@/components/features/scheduling/SchedulingTolerations";
 import {
   Dialog,
   DialogContent,
@@ -13,7 +14,6 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
-import { Checkbox } from "@/components/ui/checkbox";
 import { AlertBox } from "@/components/ui/alert-box";
 import { describeWaitingOn } from "./pendingEmailChange";
 import { toast } from "sonner";
@@ -38,21 +38,37 @@ export function EditOrganizationModal({
   const [email, setEmail] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [zeroDataRetention, setZeroDataRetention] = useState(false);
-  const [grantedClasses, setGrantedClasses] = useState<ServingClassName[]>([]);
-  const [defaultClass, setDefaultClass] = useState<ServingClassName | "standard">("standard");
   const [selfHostedOnly, setSelfHostedOnly] = useState(false);
+  const [tolerationPreset, setTolerationPreset] = useState<string | null>(null);
   const updateOrg = useUpdateOrganization();
+  const { data: config } = useConfig();
+  // List rows carry the pinned preset for platform managers, but a row from a
+  // projection that omits it would read as "Default" and clear the pin on any
+  // unrelated edit. While the modal is open, take the authoritative value from
+  // the detail endpoint. Disabled while closed so a mount with no organization
+  // does not fire a request for an empty id.
+  const { data: detail } = useOrganization(
+    organization?.id ?? "",
+    { enabled: isOpen && !!organization },
+  );
 
   useEffect(() => {
     if (isOpen && organization) {
       setEmail(organization.email || "");
       setDisplayName(organization.display_name || "");
       setZeroDataRetention(organization.zero_data_retention ?? false);
-      setGrantedClasses(organization.granted_serving_classes ?? []);
-      setDefaultClass(organization.default_serving_class ?? "standard");
       setSelfHostedOnly(organization.self_hosted_only ?? false);
+      setTolerationPreset(organization.toleration_preset ?? null);
     }
   }, [organization, isOpen]);
+
+  // The detail value wins once it arrives (and on every refetch), so the pin is
+  // only sent back as `null` when the operator actually cleared it.
+  useEffect(() => {
+    if (isOpen && detail) {
+      setTolerationPreset(detail.toleration_preset ?? null);
+    }
+  }, [detail, isOpen]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -77,10 +93,8 @@ export function EditOrganizationModal({
           // them as anyone else fails the whole request with a 403.
           ...(canEditServing
             ? {
-                granted_serving_classes: grantedClasses,
-                default_serving_class:
-                  defaultClass === "standard" ? null : defaultClass,
                 self_hosted_only: selfHostedOnly,
+                toleration_preset: tolerationPreset,
               }
             : {}),
         },
@@ -107,28 +121,45 @@ export function EditOrganizationModal({
 
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
-      <DialogContent className="sm:max-w-[425px]">
-        <DialogHeader>
+      {/* Header and footer stay put; only the form body scrolls, so the dialog
+          never grows past the viewport however many settings it shows. */}
+      <DialogContent className="sm:max-w-2xl max-h-[90vh] flex flex-col gap-0 p-0 overflow-hidden">
+        <DialogHeader className="px-6 pt-6 pb-4 border-b">
           <DialogTitle>Edit Organization</DialogTitle>
           <DialogDescription>
             Update organization details for {organization?.username}.
           </DialogDescription>
         </DialogHeader>
-        <form onSubmit={handleSubmit}>
-          <div className="grid gap-4 py-4">
-            <div className="grid gap-2">
-              <Label htmlFor="edit-email">Email</Label>
-              <Input
-                id="edit-email"
-                type="email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-              />
-              <p className="text-xs text-muted-foreground">
-                Changing the email sends a verification link to both the
-                current and the new address. The change only takes effect once
-                both are confirmed.
-              </p>
+        <form
+          id="edit-organization-form"
+          onSubmit={handleSubmit}
+          className="flex-1 min-h-0 overflow-y-auto px-6 py-4"
+          data-testid="edit-organization-form-body"
+        >
+          <div className="grid gap-4">
+            <div className="grid gap-4 sm:grid-cols-2 sm:items-start">
+              <div className="grid gap-2">
+                <Label htmlFor="edit-email">Email</Label>
+                <Input
+                  id="edit-email"
+                  type="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Changing the email sends a verification link to both the
+                  current and the new address. The change only takes effect once
+                  both are confirmed.
+                </p>
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="edit-displayName">Display Name</Label>
+                <Input
+                  id="edit-displayName"
+                  value={displayName}
+                  onChange={(e) => setDisplayName(e.target.value)}
+                />
+              </div>
             </div>
             {organization?.pending_email_change && (
               <AlertBox variant="warning">
@@ -146,14 +177,6 @@ export function EditOrganizationModal({
                 ). Saving a different email restarts the verification.
               </AlertBox>
             )}
-            <div className="grid gap-2">
-              <Label htmlFor="edit-displayName">Display Name</Label>
-              <Input
-                id="edit-displayName"
-                value={displayName}
-                onChange={(e) => setDisplayName(e.target.value)}
-              />
-            </div>
             {canEditZdr && (
               <div className="flex items-center justify-between gap-4">
                 <div className="grid gap-1">
@@ -172,80 +195,47 @@ export function EditOrganizationModal({
             )}
             {canEditServing && (
               <div className="grid gap-4 border-t pt-4">
-                <div className="grid gap-1">
-                  <Label>Serving classes held</Label>
-                  <p className="text-sm text-muted-foreground">
-                    A request may name one of these classes; the model must
-                    offer it too. Customers never edit this.
-                  </p>
-                  <div className="flex gap-4 pt-1">
-                    {(["interactive", "throughput"] as const).map((c) => (
-                      <label
-                        key={c}
-                        className="flex items-center gap-2 text-sm"
-                      >
-                        <Checkbox
-                          checked={grantedClasses.includes(c)}
-                          onCheckedChange={(checked) =>
-                            setGrantedClasses((prev) =>
-                              checked === true
-                                ? Array.from(new Set([...prev, c]))
-                                : prev.filter((x) => x !== c),
-                            )
-                          }
-                          aria-label={`Grant ${c}`}
-                        />
-                        {c}
-                      </label>
-                    ))}
-                  </div>
-                </div>
-                <div className="grid gap-1">
-                  <Label htmlFor="edit-default-class">Default class</Label>
-                  <p className="text-sm text-muted-foreground">
-                    What requests ask for when they name no class. Applies only
-                    where the class is held and the model offers it.
-                  </p>
-                  <select
-                    id="edit-default-class"
-                    className="h-9 rounded-md border border-input bg-transparent px-3 text-sm"
-                    value={defaultClass}
-                    onChange={(e) => setDefaultClass(e.target.value as ServingClassName | "standard")}
-                  >
-                    <option value="standard">standard</option>
-                    <option value="interactive">interactive</option>
-                    <option value="throughput">throughput</option>
-                  </select>
-                </div>
                 <div className="flex items-center justify-between gap-4">
                   <div className="grid gap-1">
                     <Label htmlFor="edit-self-hosted-only">
-                      Self-hosted only
+                      No external-provider fallback (gateway)
                     </Label>
                     <p className="text-sm text-muted-foreground">
-                      Never fall over to an external provider for this
-                      organisation's requests.
+                      Never fall over to a third-party (external) provider for
+                      this organisation's requests. Does not change where the
+                      inference backend places a request — that is the
+                      scheduling-tolerations setting below.
                     </p>
                   </div>
                   <Switch
                     id="edit-self-hosted-only"
                     checked={selfHostedOnly}
                     onCheckedChange={setSelfHostedOnly}
-                    aria-label="Toggle self-hosted only"
+                    aria-label="Toggle no external-provider fallback"
                   />
                 </div>
+                <SchedulingTolerations
+                  preset={tolerationPreset}
+                  presets={config?.scheduling_toleration_presets}
+                  canEdit={canEditServing}
+                  onChange={setTolerationPreset}
+                />
               </div>
             )}
           </div>
-          <DialogFooter>
-            <Button type="button" variant="outline" onClick={onClose}>
-              Cancel
-            </Button>
-            <Button type="submit" disabled={updateOrg.isPending}>
-              {updateOrg.isPending ? "Saving..." : "Save"}
-            </Button>
-          </DialogFooter>
         </form>
+        <DialogFooter className="px-6 py-4 border-t">
+          <Button type="button" variant="outline" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            type="submit"
+            form="edit-organization-form"
+            disabled={updateOrg.isPending}
+          >
+            {updateOrg.isPending ? "Saving..." : "Save"}
+          </Button>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
   );

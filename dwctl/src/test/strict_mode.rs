@@ -12,7 +12,7 @@ use sqlx::PgPool;
 
 /// Reject before inference parsing, logging, or daemon-header bypasses, with
 /// cache pricing disabled so enforcement cannot depend on its inner reader.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn test_inference_body_limit_precedes_processing_in_all_modes(pool: PgPool) {
     for strict_mode in [true, false] {
         let mut config = create_test_config();
@@ -53,8 +53,100 @@ async fn test_inference_body_limit_precedes_processing_in_all_modes(pool: PgPool
     }
 }
 
+/// A compressed realtime body is decoded before the inference stack reads it:
+/// the upstream receives plain JSON without `Content-Encoding`, and an
+/// encoding we don't decode is refused before it gets that far.
+async fn assert_compressed_bodies_reach_upstream_decoded(pool: PgPool, strict_mode: bool) {
+    use std::io::Write;
+
+    let mock = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-compressed",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })))
+        .mount(&mock)
+        .await;
+    let mut config = create_test_config();
+    config.onwards.strict_mode = strict_mode;
+    config.cache.enabled = false;
+    let (server, key, _services) = super::responses::setup_ai_test_with_config(pool, &mock, config).await;
+
+    let json = serde_json::to_vec(&serde_json::json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "compressed hello"}]
+    }))
+    .unwrap();
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gzip.write_all(&json).unwrap();
+    for (encoding, body) in [("gzip", gzip.finish().unwrap()), ("zstd", zstd::encode_all(&json[..], 3).unwrap())] {
+        let response = server
+            .post("/ai/v1/chat/completions")
+            .add_header("Authorization", format!("Bearer {key}"))
+            .add_header("Content-Type", "application/json")
+            .add_header("Content-Encoding", encoding)
+            .bytes(body.into())
+            .await;
+        response.assert_status_ok();
+    }
+
+    let received = mock.received_requests().await.unwrap();
+    assert_eq!(received.len(), 2, "strict_mode={strict_mode}");
+    for request in received {
+        assert!(request.headers.get("content-encoding").is_none(), "strict_mode={strict_mode}");
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["messages"][0]["content"], "compressed hello", "strict_mode={strict_mode}");
+    }
+
+    // Plain JSON under a coding it isn't in worked before compression was
+    // supported, and reaches the upstream plain.
+    let response = server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .add_header("Content-Type", "application/json")
+        .add_header("Content-Encoding", "utf-8")
+        .bytes(json.into())
+        .await;
+    response.assert_status_ok();
+    let received = mock.received_requests().await.unwrap();
+    assert_eq!(received.len(), 3, "strict_mode={strict_mode}");
+    assert!(received[2].headers.get("content-encoding").is_none(), "strict_mode={strict_mode}");
+
+    let response = server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .add_header("Content-Encoding", "lz4")
+        .bytes((&b"\x04\x22\x4d\x18 compressed bytes"[..]).into())
+        .await;
+    response.assert_status(axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(
+        response.json::<serde_json::Value>()["error"]["code"],
+        "unsupported_content_encoding"
+    );
+    assert_eq!(
+        mock.received_requests().await.unwrap().len(),
+        3,
+        "refused before reaching the upstream"
+    );
+}
+
+#[dwctl_test_macros::test]
+async fn test_compressed_bodies_reach_upstream_decoded_in_strict_mode(pool: PgPool) {
+    assert_compressed_bodies_reach_upstream_decoded(pool, true).await;
+}
+
+#[dwctl_test_macros::test]
+async fn test_compressed_bodies_reach_upstream_decoded_in_passthrough_mode(pool: PgPool) {
+    assert_compressed_bodies_reach_upstream_decoded(pool, false).await;
+}
+
 /// Test that strict mode rejects unknown endpoints with 404
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_strict_mode_rejects_unknown_endpoints(pool: PgPool) {
     // Setup wiremock server (won't be reached for unknown endpoints)
@@ -122,7 +214,7 @@ async fn test_strict_mode_rejects_unknown_endpoints(pool: PgPool) {
 }
 
 /// Test that strict mode allows GET /v1/models endpoint
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_strict_mode_allows_models_endpoint(pool: PgPool) {
     // Create test app with strict mode enabled
@@ -200,7 +292,7 @@ async fn test_strict_mode_allows_models_endpoint(pool: PgPool) {
 }
 
 /// Test that strict mode allows POST /v1/chat/completions with valid request
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_strict_mode_allows_chat_completions(pool: PgPool) {
     // Setup wiremock server to mock inference endpoint
@@ -413,7 +505,7 @@ async fn test_strict_mode_allows_chat_completions(pool: PgPool) {
 /// Test that strict mode enforces the configured request body limit rather
 /// than Axum's 2 MB default: a 3 MB body (over the old default) is accepted,
 /// while a body over the configured limit is rejected with 413.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_strict_mode_body_limit_uses_configured_max_body_size(pool: PgPool) {
     // Setup wiremock server to mock inference endpoint
@@ -625,7 +717,7 @@ async fn test_strict_mode_body_limit_uses_configured_max_body_size(pool: PgPool)
 }
 
 /// Test that strict mode allows POST /v1/completions (legacy completions endpoint)
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_strict_mode_allows_completions(pool: PgPool) {
     // Setup wiremock server to mock inference endpoint
@@ -795,7 +887,8 @@ async fn test_strict_mode_allows_completions(pool: PgPool) {
 
     // Verify response structure
     let body: serde_json::Value = serde_json::from_str(&body_text).expect("Response body should be valid JSON");
-    assert_eq!(body["id"].as_str(), Some("cmpl-strict-test"));
+    let id = body["id"].as_str().unwrap();
+    assert!(id.starts_with("resp_"), "the gateway's id replaces the upstream's, got {id}");
     assert_eq!(body["object"].as_str(), Some("text_completion"));
     assert_eq!(body["model"].as_str(), Some("gpt-4"));
     assert!(body["choices"].is_array());
@@ -803,7 +896,7 @@ async fn test_strict_mode_allows_completions(pool: PgPool) {
 }
 
 /// Test that strict mode allows POST /v1/embeddings with valid request
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_strict_mode_allows_embeddings(pool: PgPool) {
     // Setup wiremock server to mock inference endpoint
@@ -962,7 +1055,7 @@ async fn test_strict_mode_allows_embeddings(pool: PgPool) {
 }
 
 /// Test that strict mode rejects malformed requests
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_strict_mode_rejects_malformed_requests(pool: PgPool) {
     let mut config = create_test_config();
@@ -1036,7 +1129,7 @@ async fn test_strict_mode_rejects_malformed_requests(pool: PgPool) {
 // in this file.
 
 /// Test that errors from non-trusted providers are sanitized in strict mode
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_strict_mode_sanitizes_provider_errors(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -1198,7 +1291,7 @@ async fn test_strict_mode_sanitizes_provider_errors(pool: PgPool) {
 }
 
 /// Upstream 429s keep their status and use the public message, even for trusted providers.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_strict_mode_upstream_rate_limit_uses_custom_message(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -1355,7 +1448,7 @@ async fn test_strict_mode_upstream_rate_limit_uses_custom_message(pool: PgPool) 
 }
 
 /// Test various upstream error scenarios are handled correctly
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_strict_mode_handles_various_provider_errors(pool: PgPool) {
     // Test different error responses

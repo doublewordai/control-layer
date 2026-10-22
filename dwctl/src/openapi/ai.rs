@@ -105,8 +105,11 @@ fn embeddings() {}
 
 The response includes model IDs that can be used in chat completion and embedding requests.
 
-By default, this endpoint follows the OpenAI-compatible models-list shape. Doubleword also supports optional query-string extensions for model discovery: `group` filters to comma-separated group UUIDs, `available_for_realtime` filters by whether realtime traffic is allowed for the model, and `include_reasoning_capabilities=true` adds the reasoning efforts supported by every provider behind each model.",
+By default, this endpoint follows the OpenAI-compatible models-list shape. Doubleword also supports optional query-string extensions for model discovery: `group` filters to comma-separated group UUIDs, `available_for_realtime` filters by whether realtime traffic is allowed for the model, and `include_reasoning_capabilities=true` adds the reasoning efforts supported by every provider behind each model.
+
+Use `include=pricing` with an inference key to add `tariffs` and `cache_pricing` to each model. Tariffs contain decimal-string input and output prices per token, the API key purpose (realtime, batch, or playground), and the batch completion window where applicable. Prices reflect the key's billing account, including organization-specific prices with general prices as fallback. Only active customer prices are returned, excluding denied purposes and disabled batch windows. Cache pricing contains multipliers relative to input-token prices and reports `enabled: false` when unavailable. Provider costs, other accounts' prices, and serving-class details are never returned.",
     params(
+        ("include" = Option<String>, Query, description = "Doubleword extension. Comma-separated additions to the response. 'pricing' adds active customer tariffs and effective prompt-cache pricing for the inference key's billing account. Omitted by default; unknown values are ignored."),
         ("group" = Option<String>, Query, description = "Doubleword extension. Filter to models in one or more groups (comma-separated UUIDs). This is intersected with the API key's normal model access."),
         ("available_for_realtime" = Option<bool>, Query, description = "Doubleword extension. true returns models without a realtime deny rule; false returns models with one."),
         ("include_reasoning_capabilities" = Option<bool>, Query, description = "Doubleword extension, disabled by default. true adds supported_reasoning_efforts when reasoning support is known for every provider behind a model."),

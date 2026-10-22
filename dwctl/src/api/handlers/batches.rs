@@ -2413,7 +2413,7 @@ mod tests {
         ));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn batch_validation_releases_fusillade_before_waiting_for_control(pool: PgPool) {
         let migrated_fusillade_pool = setup_fusillade_pool(&pool).await;
@@ -2461,7 +2461,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn revalidates_reasoning_against_current_mapping_before_batch_creation(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2551,7 +2551,7 @@ mod tests {
         assert_eq!(batch_count, 0, "validation must happen before creating a batch record");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_with_default_24h_sla(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2597,16 +2597,15 @@ mod tests {
         resp.assert_status(StatusCode::CREATED);
     }
 
-    /// After the template write cutover a file's templates live in
-    /// `request_templates_g2`. The per-file model counts feed both the
-    /// batch-creation validation and the cached `dw_model` label, so they must
-    /// be read through the generation-transparent view or every cutover batch
-    /// is created with an empty model.
-    #[sqlx::test]
+    /// A file's templates live in the weekly `request_templates_g2` store.
+    /// The per-file model counts feed both the batch-creation validation and
+    /// the cached `dw_model` label, so they must be read through the
+    /// `request_templates_all` view or every batch is created with an empty
+    /// model.
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_labels_model_when_templates_are_generation_two(pool: PgPool) {
-        let mut config = create_test_config();
-        config.background_services.batch_daemon.template_generation_writes_enabled = true;
+        let config = create_test_config();
         let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
 
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
@@ -2649,7 +2648,7 @@ mod tests {
         assert_eq!(batch["model"], "gpt-4", "cutover batch must carry its model label: {batch}");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_in_org_context(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2703,7 +2702,7 @@ mod tests {
         resp.assert_status(StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_with_unsupported_sla(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2757,7 +2756,7 @@ mod tests {
     ///
     /// Also covers the spoof: provenance a caller can set is worthless, so a
     /// `dw_user_agent` in the submitted metadata must be dropped rather than merged.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn batch_creation_stores_the_submitters_user_agent_and_drops_a_supplied_one(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2863,7 +2862,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_with_custom_allowed_sla(pool: PgPool) {
         // Create app with custom config allowing multiple SLAs
@@ -2947,7 +2946,7 @@ mod tests {
         resp2.assert_status(StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_with_responses_endpoint(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2993,7 +2992,7 @@ mod tests {
         resp.assert_status(StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_sla_to_expiry_timestamp_24h(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3064,7 +3063,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_sla_to_expiry_timestamp_custom(pool: PgPool) {
         // Create app with custom config allowing 1h SLA
@@ -3139,7 +3138,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_batches_with_include_analytics(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3217,7 +3216,7 @@ mod tests {
         assert!(analytics["total_tokens"].is_number());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_batch_model_field(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3336,7 +3335,7 @@ mod tests {
         assert_eq!(mixed_detail["model"].as_str(), Some("mixed"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_errors_hidden_until_sla_expires(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3533,7 +3532,7 @@ mod tests {
     /// Requests are self-contained, so results must still be served: every request
     /// comes back with `input_body: null`, on both the paginated and the streaming
     /// paths, and in a stable creation order.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_batch_results_served_after_input_file_deleted(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3627,7 +3626,7 @@ mod tests {
     /// 410 (naming the deleted file) rather than serve the same rows anyway,
     /// on both the paginated and the streaming paths. The batch itself stays
     /// readable.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_batch_results_gone_after_results_file_deleted(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3717,7 +3716,7 @@ mod tests {
     /// 3. X-Incomplete reflects batch processing status
     /// 4. X-Last-Line is set correctly
     /// 5. Unlimited responses use streaming (no content-length header)
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_batch_results_streaming(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3763,16 +3762,18 @@ mod tests {
                 "choices": [{"message": {"content": format!("Response {}", i)}}]
             });
 
-            sqlx::query(
-                "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $3, $4, 'POST')",
+            crate::test::utils::insert_fusillade_template(
+                &pool,
+                template_id,
+                Some(file_id),
+                "test-model",
+                "test-key",
+                "http://test",
+                "/v1/chat/completions",
+                &serde_json::to_string(&body).unwrap(),
+                Some(&custom_id),
             )
-            .bind(template_id)
-            .bind(file_id)
-            .bind(serde_json::to_string(&body).unwrap())
-            .bind(&custom_id)
-            .execute(&pool)
-            .await
-            .expect("Failed to create template");
+            .await;
 
             sqlx::query(
                 "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, response_status, response_body, created_at, completed_at) VALUES ($1, $2, $3, 'test-model', 'completed', 200, $4, NOW(), NOW())",
@@ -3854,7 +3855,7 @@ mod tests {
     ///
     /// When a batch still has pending/in-progress requests, X-Incomplete should be
     /// true even on the last page of currently available results (or unlimited download).
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_batch_results_x_incomplete_while_still_processing(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3902,16 +3903,18 @@ mod tests {
                 "choices": [{"message": {"content": format!("Response {}", i)}}]
             });
 
-            sqlx::query(
-                "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $3, $4, 'POST')",
+            crate::test::utils::insert_fusillade_template(
+                &pool,
+                template_id,
+                Some(file_id),
+                "test-model",
+                "test-key",
+                "http://test",
+                "/v1/chat/completions",
+                &serde_json::to_string(&body).unwrap(),
+                Some(&custom_id),
             )
-            .bind(template_id)
-            .bind(file_id)
-            .bind(serde_json::to_string(&body).unwrap())
-            .bind(&custom_id)
-            .execute(&pool)
-            .await
-            .expect("Failed to create template");
+            .await;
 
             sqlx::query(
                 "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, response_status, response_body, created_at, completed_at) VALUES ($1, $2, $3, 'test-model', 'completed', 200, $4, NOW(), NOW())",
@@ -3932,16 +3935,18 @@ mod tests {
             let custom_id = format!("req-{}", i);
             let body = serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": format!("Test {}", i)}]});
 
-            sqlx::query(
-                "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $3, $4, 'POST')",
+            crate::test::utils::insert_fusillade_template(
+                &pool,
+                template_id,
+                Some(file_id),
+                "test-model",
+                "test-key",
+                "http://test",
+                "/v1/chat/completions",
+                &serde_json::to_string(&body).unwrap(),
+                Some(&custom_id),
             )
-            .bind(template_id)
-            .bind(file_id)
-            .bind(serde_json::to_string(&body).unwrap())
-            .bind(&custom_id)
-            .execute(&pool)
-            .await
-            .expect("Failed to create template");
+            .await;
 
             sqlx::query(
                 "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at) VALUES ($1, $2, $3, 'test-model', 'pending', NOW())",
@@ -3986,7 +3991,7 @@ mod tests {
         assert_eq!(lines.len(), total, "Should return all request results");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_reserve_capacity_for_batch_inserts_and_releases(pool: PgPool) {
         let config = create_test_config();
@@ -4034,7 +4039,7 @@ mod tests {
         assert!(row.released_at.is_some());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_reserve_capacity_for_batch_rejects_over_capacity(pool: PgPool) {
         let mut config = create_test_config();
@@ -4113,7 +4118,7 @@ mod tests {
             .expect("pin pending batch deadline");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_reserve_capacity_for_batch_ignores_pending_counts_when_disabled(pool: PgPool) {
         let mut config = create_test_config();
@@ -4143,7 +4148,7 @@ mod tests {
         assert_eq!(reservation_ids.len(), 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_reserve_capacity_for_batch_rejects_pending_counts_when_enabled(pool: PgPool) {
         let mut config = create_test_config();
@@ -4169,7 +4174,7 @@ mod tests {
         assert!(matches!(err, Error::TooManyRequests { .. }));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_reserve_capacity_for_batch_fails_open_when_pending_counts_query_fails(pool: PgPool) {
         let mut config = create_test_config();
@@ -4198,7 +4203,7 @@ mod tests {
         assert_eq!(reservation_ids.len(), 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_reserve_capacity_for_batch_ignores_flex_pending_counts_when_enabled(pool: PgPool) {
         let mut config = create_test_config();
@@ -4227,7 +4232,7 @@ mod tests {
     }
 
     /// Test that create_batch API accepts "high" priority name
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_with_high_priority(pool: PgPool) {
         // Create app with config allowing 1h window
@@ -4281,7 +4286,7 @@ mod tests {
     }
 
     /// Test that create_batch API accepts "standard" priority name
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_with_standard_priority(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4331,7 +4336,7 @@ mod tests {
     }
 
     /// Test that legacy "1h" format still works (backwards compatibility)
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_with_legacy_1h_format(pool: PgPool) {
         // Create app with config allowing 1h window
@@ -4385,7 +4390,7 @@ mod tests {
     }
 
     /// Test that invalid completion_window values are rejected
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_rejects_invalid_completion_window(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4433,7 +4438,7 @@ mod tests {
     }
 
     /// Test that PlatformManager can use completion windows not in the allowed list
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_can_use_any_completion_window(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4484,7 +4489,7 @@ mod tests {
     }
 
     /// Test that relaxation factor of 0.0 blocks all batches for that window
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_blocked_by_zero_relaxation_factor(pool: PgPool) {
         let mut config = create_test_config();
@@ -4537,7 +4542,7 @@ mod tests {
     }
 
     /// Test that relaxation factor > 1.0 allows accepting more requests than strict capacity
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_reserve_capacity_relaxation_factor_expands_acceptance(pool: PgPool) {
         let mut config = create_test_config();
@@ -4580,7 +4585,7 @@ mod tests {
 
     /// Test that relaxation factors are window-specific — relaxing one window
     /// does not affect another.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_reserve_capacity_relaxation_factor_is_window_specific(pool: PgPool) {
         let mut config = create_test_config();
@@ -4617,7 +4622,7 @@ mod tests {
     }
 
     /// Test that the relaxation_factor from config flows through the full API path
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_relaxation_factor_from_config(pool: PgPool) {
         let mut config = create_test_config();
@@ -4717,7 +4722,7 @@ mod tests {
             .await
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn background_batch_requires_background_inference_role(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4730,7 +4735,7 @@ mod tests {
         assert!(body.contains("BackgroundInferenceUser"), "unexpected response: {body}");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn background_batch_maps_completion_window_and_skips_sla_admission(pool: PgPool) {
         let mut config = create_test_config();
@@ -4773,7 +4778,7 @@ mod tests {
             .assert_status(StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_unverified_volume_limit_rejects_over_cap(pool: PgPool) {
         let mut config = create_test_config();
@@ -4801,7 +4806,7 @@ mod tests {
     /// Spending-cap pre-flight: creating a batch with an API key whose cap
     /// scope is exhausted is rejected up front with the explicit 402, instead
     /// of accepting a batch whose every request the proxy would refuse.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_rejected_when_spend_cap_exhausted(pool: PgPool) {
         use crate::db::handlers::Repository as _;
@@ -4821,8 +4826,6 @@ mod tests {
                 name: "capped-batch-key".to_string(),
                 description: None,
                 purpose: ApiKeyPurpose::Realtime,
-                requests_per_second: None,
-                burst_size: None,
                 created_by: user.id,
                 spend_limit: Some(rust_decimal::Decimal::from(10)),
                 spend_limit_interval: None,
@@ -4887,7 +4890,7 @@ mod tests {
         resp.assert_status(StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_verified_user_bypasses_volume_limit(pool: PgPool) {
         let mut config = create_test_config();
@@ -4907,7 +4910,7 @@ mod tests {
         submit_one_request_batch(&app, &user, "1h").await.assert_status(StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_unverified_limit_disabled_when_zero(pool: PgPool) {
         let mut config = create_test_config();
@@ -4923,7 +4926,7 @@ mod tests {
         submit_one_request_batch(&app, &user, "1h").await.assert_status(StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_rejected_with_negative_balance(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -4979,7 +4982,7 @@ mod tests {
         assert!(body.contains("balance too low"), "Expected balance too low message, got: {}", body);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_allowed_with_zero_balance(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -5028,7 +5031,7 @@ mod tests {
         resp.assert_status(StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_allowed_with_negative_balance_flag(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -5056,7 +5059,7 @@ mod tests {
             .assert_status(StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_negative_balance_org_flag_does_not_cover_personal_file(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -5124,7 +5127,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_in_org_context_checks_org_balance_not_user(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -5243,7 +5246,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_batches_member_id_rejected_outside_org_context(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -5265,7 +5268,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_batches_member_id_no_key_returns_empty(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -5288,7 +5291,7 @@ mod tests {
         assert_eq!(body["has_more"], false);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_batches_enrichment_in_org_context(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -5421,7 +5424,7 @@ mod tests {
 
     /// Test that batch results correctly include reasoning tokens in response bodies
     /// when the upstream model returns thinking/reasoning token usage.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_batch_results_with_reasoning_tokens(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -5538,16 +5541,18 @@ mod tests {
             let request_id = Uuid::new_v4();
             let body = serde_json::json!({"model": "thinking-model", "messages": [{"role": "user", "content": "Test"}], "thinking": {"type": "enabled", "budget_tokens": 4096}});
 
-            sqlx::query(
-                "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'thinking-model', 'test-key', 'http://test', '/v1/chat/completions', $3, $4, 'POST')",
+            crate::test::utils::insert_fusillade_template(
+                &pool,
+                template_id,
+                Some(file_id),
+                "thinking-model",
+                "test-key",
+                "http://test",
+                "/v1/chat/completions",
+                &serde_json::to_string(&body).unwrap(),
+                Some(custom_id),
             )
-            .bind(template_id)
-            .bind(file_id)
-            .bind(serde_json::to_string(&body).unwrap())
-            .bind(*custom_id)
-            .execute(&pool)
-            .await
-            .expect("Failed to create template");
+            .await;
 
             sqlx::query(
                 "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, response_status, response_body, created_at, completed_at) VALUES ($1, $2, $3, 'thinking-model', 'completed', 200, $4, NOW(), NOW())",
@@ -5632,7 +5637,7 @@ mod tests {
 
     /// Test that batch analytics surfaces folded reasoning tokens from the batch_aggregates
     /// read model (COR-524) — both on the direct endpoint and via include=analytics.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_batch_analytics_with_reasoning_tokens(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -5760,7 +5765,7 @@ mod tests {
     /// folded) returns 200 with a zero-valued payload from GET /batches/{id}/analytics. The read
     /// model is durable, so a missing row means "nothing folded yet", not "aged out" (COR-524) —
     /// platform managers still see (empty) metrics for any batch they can access.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_batch_analytics_missing_read_model_row_returns_zeros(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -5816,16 +5821,18 @@ mod tests {
             let request_id = Uuid::new_v4();
             let body = serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": format!("Test {}", i)}]});
 
-            sqlx::query(
-                "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $3, $4, 'POST')",
+            crate::test::utils::insert_fusillade_template(
+                pool,
+                template_id,
+                Some(file_id),
+                "test-model",
+                "test-key",
+                "http://test",
+                "/v1/chat/completions",
+                &serde_json::to_string(&body).unwrap(),
+                Some(&format!("req-{i}")),
             )
-            .bind(template_id)
-            .bind(file_id)
-            .bind(serde_json::to_string(&body).unwrap())
-            .bind(format!("req-{i}"))
-            .execute(pool)
-            .await
-            .expect("insert template");
+            .await;
 
             sqlx::query(
                 "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at) VALUES ($1, $2, $3, 'test-model', 'pending', NOW())",
@@ -5849,7 +5856,7 @@ mod tests {
     /// structural and visible in the handler code; testing the actual state
     /// transition avoids the pool-contention issues that background workers
     /// cause in CI's parallel test environment.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_cancel_batch_cascades_state_to_child_requests(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -5893,14 +5900,20 @@ mod tests {
         assert_eq!(canceled_count, 5, "all requests should now be canceled");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn test_delete_batch_cascades_state_to_child_requests(pool: PgPool) {
+    async fn test_delete_batch_removes_generated_files_and_cascades_state(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser, Role::PlatformManager]).await;
         let auth = add_auth_headers(&user);
 
         let (batch_id, request_ids) = insert_batch_with_pending_requests(&pool, user.id, 5).await;
+        let (output_file_id, error_file_id) = attach_results_files(&pool, batch_id).await;
+        let input_file_id: Uuid = sqlx::query_scalar("SELECT file_id FROM fusillade.batches WHERE id = $1")
+            .bind(batch_id)
+            .fetch_one(&pool)
+            .await
+            .expect("batch should retain its input file");
 
         // Delete the batch via the API (enqueues the cascade job)
         let resp = app
@@ -5909,6 +5922,22 @@ mod tests {
             .add_header(&auth[1].0, &auth[1].1)
             .await;
         resp.assert_status(StatusCode::NO_CONTENT);
+
+        for generated_file_id in [output_file_id, error_file_id] {
+            let response = app
+                .get(&format!("/ai/v1/files/{generated_file_id}"))
+                .add_header(&auth[0].0, &auth[0].1)
+                .add_header(&auth[1].0, &auth[1].1)
+                .await;
+            response.assert_status(StatusCode::NOT_FOUND);
+        }
+
+        let input_response = app
+            .get(&format!("/ai/v1/files/{input_file_id}"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        input_response.assert_status(StatusCode::OK);
 
         // Simulate what the background worker does
         let updated = _bg_services
@@ -5935,7 +5964,7 @@ mod tests {
     /// the retry re-pends zero rows. Before the `cancelling_at` guard, that
     /// zero count was treated as "nothing to retry" and returned 400 even
     /// though the retry had overturned the cancellation.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_retry_immediately_after_cancel_resumes_batch(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -6001,7 +6030,7 @@ mod tests {
     /// The true no-op retry still fails: nothing failed, nothing canceled,
     /// and the batch is not being cancelled — the `cancelling_at` guard must
     /// not turn every zero-count retry into a success.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_retry_with_nothing_to_retry_returns_400(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -6021,7 +6050,7 @@ mod tests {
     /// `retry-requests` only acts on requests in the path batch: ids from a
     /// different batch are ignored, leaving that request and its batch as
     /// they were.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_retry_requests_only_retries_requests_in_path_batch(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -6143,7 +6172,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_negative_balance_checks_execution_account_in_org_context(pool: PgPool) {
         let (app, _bg_services, owner, _member, org, file_id) = setup_org_batch_env(&pool).await;
@@ -6187,7 +6216,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_batch_with_selected_api_key(pool: PgPool) {
         let (app, _bg_services, owner, member, org, file_id) = setup_org_batch_env(&pool).await;
@@ -6304,7 +6333,7 @@ mod tests {
             .assert_status(StatusCode::NOT_FOUND);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_batch_creation_rejects_platform_key_auth(pool: PgPool) {
         let (app, _bg_services, owner, _member, org, file_id) = setup_org_batch_env(&pool).await;
@@ -6342,7 +6371,7 @@ mod tests {
             .assert_status(StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_member_without_manage_keys_must_select_batch_key(pool: PgPool) {
         let (app, _bg_services, owner, member, org, file_id) = setup_org_batch_env(&pool).await;

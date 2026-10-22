@@ -2,6 +2,7 @@
 
 use thiserror::Error;
 
+use crate::batch::FileId;
 use crate::types::RequestId;
 
 /// Result type alias using the fusillade error type.
@@ -37,6 +38,13 @@ pub enum FusilladeError {
     /// Cancelled request
     #[error("Request cancelled: {0}")]
     RequestCancelled(RequestId),
+
+    /// The file does not exist, or a concurrent writer already soft-deleted it.
+    ///
+    /// Distinct from [`Other`] so callers can map a lost create/delete race to
+    /// `404 Not Found` instead of a spurious `500`.
+    #[error("File not found: {0}")]
+    FileNotFound(FileId),
 
     /// Daemon is shutting down
     #[error("Daemon is shutting down")]

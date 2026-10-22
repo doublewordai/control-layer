@@ -444,7 +444,8 @@ jsonpath "$.endpoint" == "/v1/chat/completions"
 jsonpath "$.output_file_id" != null
 jsonpath "$.error_file_id" != null
 
-# Poll until the worker populates the batch and transitions to in_progress
+# Poll until the worker populates the batch and transitions out of validating.
+# A fast worker may complete the batch before this request observes in_progress.
 GET http://localhost:3001/ai/v1/batches/{{user1_batch_id}}
 [Options]
 retry: 10
@@ -453,7 +454,7 @@ retry-interval: 500
 dwctl_session: {{user_jwt}}
 HTTP 200
 [Asserts]
-jsonpath "$.status" == "in_progress"
+jsonpath "$.status" matches "^(in_progress|completed)$"
 jsonpath "$.request_counts.total" > 0
 
 # User1 CANNOT create batch from user2's file
@@ -1127,12 +1128,41 @@ jsonpath "$.filename" == "mixed.jsonl"
 # Revoke user1's access to mock-gpt-markdown model by removing from restricted_group
 # -----------------------------------------------------------------------------
 
-DELETE http://localhost:3001/admin/api/v1/groups/{{restricted_group_id}}/users/{{user1_id}}
+# Establish that the user's existing inference key is admitted before revocation.
+POST http://localhost:3001/admin/api/v1/ai/v1/chat/completions
 [Options]
-delay: 3s
+retry: 30
+retry-interval: 1000
+[Cookies]
+dwctl_session: {{user_jwt}}
+{
+  "model": "mock-gpt-markdown-permtest",
+  "messages": [{ "role": "user", "content": "hello" }],
+  "max_tokens": 8
+}
+HTTP 200
+
+DELETE http://localhost:3001/admin/api/v1/groups/{{restricted_group_id}}/users/{{user1_id}}
 [Cookies]
 dwctl_session: {{admin_jwt}}
 HTTP 204
+
+# Permission changes reach onwards asynchronously. Observe the revoked access
+# before dispatching the batch; a delay before DELETE does not wait for this sync.
+POST http://localhost:3001/admin/api/v1/ai/v1/chat/completions
+[Options]
+retry: 30
+retry-interval: 1000
+[Cookies]
+dwctl_session: {{user_jwt}}
+{
+  "model": "mock-gpt-markdown-permtest",
+  "messages": [{ "role": "user", "content": "hello" }],
+  "max_tokens": 8
+}
+HTTP 403
+[Asserts]
+body contains "You do not have access to 'mock-gpt-markdown-permtest'. Please contact your administrator to request access."
 
 # -----------------------------------------------------------------------------
 # User1 CAN still create batch from the file (permissions checked at upload time)
@@ -1189,8 +1219,8 @@ dwctl_session: {{user_jwt}}
 HTTP 200
 [Asserts]
 jsonpath "$.request_counts.total" == 2
-jsonpath "$.request_counts.completed" exists
-jsonpath "$.request_counts.failed" exists
+jsonpath "$.request_counts.completed" == 1
+jsonpath "$.request_counts.failed" == 1
 
 # -----------------------------------------------------------------------------
 # User1 CAN read the output file content

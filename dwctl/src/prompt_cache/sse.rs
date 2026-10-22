@@ -172,13 +172,17 @@ mod tests {
 
     #[tokio::test]
     async fn coalesced_complete_events_are_not_limited_as_one_buffer() {
-        let event = b"data: {\"a\":1}\n\n";
-        let data = event.repeat(10_000);
+        // Three individually valid frames still exceed the buffer limit when
+        // coalesced. Thousands of tiny frames only add repeated scanning work
+        // in debug builds; frame count is not the boundary this test exercises.
+        let event = format!("data: {{\"a\":\"{}\"}}\n\n", "x".repeat(onwards::sse::DEFAULT_SSE_BUFFER_LIMIT / 2)).into_bytes();
+        assert!(event.len() < onwards::sse::DEFAULT_SSE_BUFFER_LIMIT);
+        let data = event.repeat(3);
         assert!(data.len() > onwards::sse::DEFAULT_SSE_BUFFER_LIMIT);
         let input = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from(data))]);
         let out: Vec<_> = SseBufferedStream::new(input).collect().await;
-        assert_eq!(out.len(), 10_000);
-        assert!(out.iter().all(|x| x.as_ref().unwrap().as_ref() == event));
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|x| x.as_ref().unwrap().as_ref() == event.as_slice()));
     }
 
     #[tokio::test]

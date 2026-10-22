@@ -295,18 +295,6 @@ auth:
       # content_security_policy_report_only: ""        # roll a CSP out in report-only first
       # strict_transport_security: "max-age=31536000; includeSubDomains"  # usually set on whatever terminates TLS instead
 
-  # Default per-API-key rate limits, applied based on the owning user's
-  # `verified` flag (set true after a successful Stripe payment or auto-topup
-  # charge). Only used when the api_key has no explicit per-key override.
-  # Omit a tier (or the whole `rate_limits` block) to leave that tier
-  # unlimited.
-  #
-  # Both tiers are intentionally left unset: unverified users get full
-  # platform throughput — throttling it feels slow/unreliable — and are instead
-  # bounded by an upload-*volume* cap until they verify. See
-  # `batches.unverified_requests_per_completion_hour` below.
-  rate_limits: {}
-
 # Email configuration for password resets and notifications
 email:
   # Email transport - either 'file' (for development) or 'smtp' (for production)
@@ -343,10 +331,69 @@ credits:
   # target, and idempotent across the webhook/front-channel race.
   # Example: 25 gives a newly verified user 25 credits.
   verification_credits: 0
+  # Delay after a transient provider failure or first soft card decline before
+  # another automatic charge is eligible. Keep the 24h production default;
+  # staging can shorten this to exercise the complete decline lifecycle.
+  auto_topup_retry_delay: 24h
 
 # Optional feature toggles
 enable_metrics: true # Enable Prometheus metrics endpoint
 enable_request_logging: true # Enable request/response logging to database
+# Log output format: compact (human-readable lines) or json (one JSON object
+# per event, for log aggregators). Override with DWCTL_LOG_FORMAT.
+log_format: compact
+
+# Opt-in heap profile listener (GET /debug/pprof/heap, gzip pprof). Profiles exist
+# only if the process also starts with jemalloc sampling on, e.g.
+# _RJEM_MALLOC_CONF=prof:true,prof_active:true,lg_prof_sample:19.
+# The listener is unauthenticated: keep it on loopback (use port-forwarding) or,
+# for an in-cluster scraper, bind 0.0.0.0 behind a NetworkPolicy.
+# See docs/memory-observability.md. DWCTL_HEAP_PROFILING__ENABLED=true etc.
+heap_profiling:
+  enabled: false # Default: false
+  bind_address: "127.0.0.1:6060" # Default: 127.0.0.1:6060
+  dump_timeout: 30s # Default: 30s
+
+# Scheduling toleration presets.
+#
+# An operator can pin an account (a user or an organization) to one of these
+# presets through the admin API / dashboard. Every inference request from a
+# pinned account then carries the preset's toleration list at
+# `nvext.routing_constraints.tolerations` before it reaches the inference
+# backend, for realtime, flex and batch traffic alike, so a backend that
+# honours tolerations keeps the account's work on the capacity you intend.
+#
+# Pinning restricts where an account's requests can be placed, and can make
+# scheduling harder for accounts sharing the same capacity, depending on how
+# the backend treats tolerations. Pin as few accounts as possible and only
+# when a customer requires it.
+#
+# This is a distinct setting from `self_hosted_only` (the account's
+# `users.self_hosted_only` / `organizations.self_hosted_only` flag): that flag
+# is the *gateway's* provider-fallback control and decides whether onwards may
+# route a request to a third-party (`external`) provider at all. These presets
+# say nothing about which provider is chosen; they only constrain where the
+# chosen backend may place an accepted request.
+#
+# `tolerations` uses the same shape as the request field: a list of
+# Kubernetes-style entries, each `{key, operator?, value?, effect?}` where
+# `operator` is `Equal` (the default, needs a `value`) or `Exists`, and
+# `effect` is `NoSchedule` (the default) or `PreferNoSchedule`. An empty list
+# asks the backend to keep the account off any tainted capacity. Wording here
+# is deliberately backend-agnostic.
+#
+# An account stores only the preset's `id` (`users.toleration_preset`). An id
+# the config no longer defines is a misconfiguration: the request path logs it
+# and fails closed by applying the empty (most restrictive) list.
+scheduling:
+  toleration_presets:
+    - id: "no-overflow"
+      label: "No overflow capacity"
+      description: >-
+        Never placed on capacity the backend marks with any taint, such as
+        overflow capacity; requests may be refused when dedicated capacity is
+        full.
+      tolerations: []
 # Note: Environment variables can override top level setting, as long as they're supplied with the DWCTL_ prefix:
 # DWCTL_PORT=8080
 #
@@ -458,7 +505,9 @@ batches:
 # Controls file size, request count, and concurrency limits to prevent resource exhaustion
 # limits:
 #   files:
-#     # Maximum file size in bytes (default: 100MB)
+#     # Maximum file size in bytes (default: 100MB). Gzip and zstd files are
+#     # decoded as they upload, and this limit applies to the decoded size
+#     # (the compressed upload may not exceed it either).
 #     # Set to 0 for unlimited (not recommended for production)
 #     max_file_size: 104857600
 #     # Maximum number of requests (JSONL lines) per file
@@ -479,10 +528,30 @@ batches:
 #     # in batch JSONL files and to realtime request bodies on /ai/v1/*.
 #     # Inference bodies are bounded before parsing or request logging;
 #     # oversized bodies return HTTP 413. Multipart uploads use max_file_size.
+#     # Realtime bodies may be sent with Content-Encoding gzip, zstd or br;
+#     # the limit applies to the decoded size, and other codings get HTTP 415.
 #     # Set to 0 for unlimited (not recommended for production)
 #     # Default: 10MB (10485760)
 #     # Changing this limit requires a restart to rebuild all routing layers.
 #     max_body_size: 10485760
+#   realtime_inflight:
+#     # Refuse realtime requests over each account's in-flight limit (default: false)
+#     enforce: true
+#     # Redis that holds the realtime in-flight counts every replica shares.
+#     # Unset or unreachable: each replica counts only its own requests.
+#     redis_url: rediss://:password@limits-redis.example:6379
+#   batch_inflight:
+#     # Refuse batch requests over each virtual model's batch_capacity
+#     # (default: false). Off: every batch request is admitted and no shared
+#     # count is touched. Reuses the realtime_inflight.redis_url above; batch
+#     # and realtime counts use separate key spaces.
+#     enforce: true
+#     # Global batch in-flight cap for virtual models that do not set their own
+#     # positive batch_capacity (default: 200). Does not change fusillade's
+#     # per-daemon starting concurrency, which keeps using
+#     # background_services.batch_daemon.default_model_concurrency. Set to 0 or
+#     # null for no default. Raise it per model where batch runs higher.
+#     default_capacity: 200
 
 # External data source connections (S3, etc.)
 # Allows users to connect external storage and sync files for batch processing.
@@ -543,6 +612,13 @@ onwards:
   # Priority composites with fallback enabled use AIMD by default in strict mode.
   # Override through the model API's aimd object, or set aimd.enabled=false to opt out.
   # See onwards/docs/src/load-aware-failover.md for coverage and tuning.
+  # Strict-mode chat and legacy completions parameters refused with a 400
+  # instead of forwarded.
+  # Onwards counts and traces every parameter not every worker can serve
+  # (onwards_unsupported_params_total); only the ones listed here are refused.
+  # Names come from onwards::unsupported_params::params(), e.g. [n, logprobs].
+  # Set via environment: DWCTL_ONWARDS__REJECTED_PARAMS='[n,logprobs]'
+  rejected_params: []
 
 # Cached-input pricing (the dwctl-owned cache layer)
 cache:
@@ -678,6 +754,12 @@ continuation:
 # Background services configuration
 # Controls which background services run on this instance
 background_services:
+  # jemalloc statistics sampler (Linux) for the dwctl_jemalloc_* gauges. Runs off
+  # the request path when enable_metrics is true. See docs/memory-observability.md.
+  allocator_metrics:
+    enabled: true # Default: true
+    sample_interval: 15s # Default: 15s (minimum 1s)
+
   # Onwards config sync - syncs database changes to the AI proxy routing layer
   # Disabling this will prevent the AI proxy from receiving config updates
   onwards_sync:
@@ -837,15 +919,15 @@ background_services:
     # session-capable maintenance endpoint as response retirement.
     # batch_archive_retirement_enabled: false
     # batch_archive_retention_days: <positive days>
-    # Route NEW file-backed request templates into weekly generation-2
-    # partitions (reads stay generation-transparent). Prerequisite for the
-    # template retention lifecycle; the legacy heap freezes once enabled.
+    # DEPRECATED and ignored: request templates are always written to the
+    # weekly generation-2 partitions now that the generation-1 heap has been
+    # retired. The key still parses so existing values files keep loading,
+    # but it logs a warning at startup. Remove it.
     # template_generation_writes_enabled: false
     # File-content expiry + weekly template partition retirement. Tombstones
     # aged input-file metadata (rows survive) once every referencing batch's
     # content is expired, then drops whole template weeks that no live file
-    # references. Requires the generation-2 write cutover above and the same
-    # session-capable maintenance endpoint.
+    # references. Requires the same session-capable maintenance endpoint.
     # template_retirement_enabled: false
     # template_retention_days: <positive days>
     # Schema mode reuses the main direct credentials automatically. Override for
@@ -1005,7 +1087,13 @@ image_normalizer:
     #                               # 24h + the 7-day retry buffer after ingest,
     #                               # so a dedup hit older than this is re-uploaded
     #                               # rather than left to expire mid-batch.
-    #                               # 0 disables.
+    #                               # 0 disables. Ignored when
+    #                               # unique_upload_keys is on.
+  # Store each ingest under its own object key (dw-img://{sha256}.{upload_id})
+  # instead of reusing one object per content hash. Enable only once every
+  # replica runs a version that reads upload-ID tokens; disable before
+  # rolling back past it.
+  unique_upload_keys: false
   fetcher:
     max_bytes: 20971520        # 20 MiB
     timeout_secs: 30

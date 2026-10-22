@@ -1,4 +1,5 @@
-//! Regression tests across DWCTL ingress, strict Onwards and batch upload.
+//! Regression tests across DWCTL ingress, strict Onwards and batch upload:
+//! overlay targets, model suffixes and billed serving outcomes.
 use axum::http::StatusCode;
 use axum_test::multipart::{MultipartForm, Part};
 use axum_test::{TestResponse, TestServer};
@@ -87,13 +88,14 @@ impl Fixture {
             .fetch_one(pool)
             .await
             .unwrap();
-            let presets = if alias == "policy" {
-                json!({"interactive":{"ttft_ms":500,"itl_ms":20,"priority":200},"throughput":{"ttft_ms":5000,"itl_ms":100,"priority":100}})
-            } else {
-                json!({})
-            };
-            let model: Uuid = sqlx::query_scalar("INSERT INTO deployed_models (model_name,alias,created_by,type,is_composite,serving_classes) VALUES ($1,$1,$2,'CHAT',true,$3) RETURNING id")
-                .bind(alias).bind(user.id).bind(presets).fetch_one(pool).await.unwrap();
+            let model: Uuid = sqlx::query_scalar(
+                "INSERT INTO deployed_models (model_name,alias,created_by,type,is_composite) VALUES ($1,$1,$2,'CHAT',true) RETURNING id",
+            )
+            .bind(alias)
+            .bind(user.id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
             sqlx::query("INSERT INTO deployed_model_components (composite_model_id,deployed_model_id) VALUES ($1,$2)")
                 .bind(model)
                 .bind(member)
@@ -145,54 +147,66 @@ impl Fixture {
             .body_json()
             .unwrap()
     }
+
+    /// Give the test account an overlay with explicit targets on `policy`, or
+    /// remove it, and resync.
+    async fn set_overlay(&self, pool: &PgPool, targets: Option<Value>) {
+        sqlx::query("DELETE FROM model_overlays WHERE user_id=$1")
+            .bind(self.user)
+            .execute(pool)
+            .await
+            .unwrap();
+        if let Some(targets) = targets {
+            sqlx::query(
+                "INSERT INTO model_overlays (user_id,deployed_model_id,targets) SELECT $1,id,$2 FROM deployed_models WHERE alias='policy'",
+            )
+            .bind(self.user)
+            .bind(targets)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        self.services.sync_onwards_config(pool).await.unwrap();
+    }
 }
 
-#[sqlx::test]
-async fn serving_classes_survive_strict_and_translated_ingress(pool: PgPool) {
+#[dwctl_test_macros::test]
+async fn overlay_targets_survive_strict_and_translated_ingress(pool: PgPool) {
     let f = Fixture::new(&pool).await;
-    f.post("chat/completions", "policy:interactive", false)
-        .await
-        .assert_status(StatusCode::FORBIDDEN);
-    assert!(f.upstream.received_requests().await.unwrap().is_empty());
-    sqlx::query(
-        "UPDATE users SET granted_serving_classes=ARRAY['interactive','throughput'],default_serving_class='interactive' WHERE id=$1",
-    )
-    .bind(f.user)
-    .execute(&pool)
-    .await
-    .unwrap();
-    f.services.sync_onwards_config(&pool).await.unwrap();
+    f.set_overlay(&pool, Some(json!({"ttft_ms":5000,"itl_ms":100,"priority":100})))
+        .await;
     for path in ["chat/completions", "responses", "messages", "completions"] {
-        f.post(path, "policy:throughput", false).await.assert_status_ok();
+        f.post(path, "policy", false).await.assert_status_ok();
         let body = f.last_body().await;
         assert_eq!(body["model"], "upstream-policy", "{path}");
         assert_eq!(body["nvext"]["router"]["ttft_target"], 5000, "{path}");
         assert_eq!(body["nvext"]["agent_hints"]["priority"], 100, "{path}");
-        f.post(path, "policy:standard", false).await.assert_status_ok();
+        f.post(path, "no-offer", false).await.assert_status_ok();
         assert_eq!(
             f.last_body().await["nvext"],
             json!({"agent_hints": {"priority": 0}}),
-            "{path}: explicit standard opts down to realtime's priority alone"
+            "{path}: a model without an overlay sends realtime's priority alone"
         );
-        f.post(path, "no-offer:interactive", false)
-            .await
-            .assert_status(StatusCode::FORBIDDEN);
     }
-    let response = f.post("chat/completions", "policy:throughput", true).await;
+    let response = f.post("chat/completions", "policy", true).await;
     response.assert_status_ok();
     assert!(response.text().contains("[DONE]"));
     assert_eq!(f.last_body().await["nvext"]["agent_hints"]["priority"], 100);
-    f.post("chat/completions", "policy:unknown", false)
-        .await
-        .assert_status(StatusCode::BAD_REQUEST);
-    // Multiple suffixes are malformed even if each class is known.
-    f.post("chat/completions", "policy:throughput:interactive", false)
-        .await
-        .assert_status(StatusCode::BAD_REQUEST);
 }
 
-#[sqlx::test]
-async fn serving_classes_batch_upload_discards_suffixes(pool: PgPool) {
+#[dwctl_test_macros::test]
+async fn realtime_class_suffixes_are_not_parsed(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    for model in ["policy:interactive", "policy:standard", "policy:throughput:interactive"] {
+        let response = f.post("chat/completions", model, false).await;
+        assert!(response.status_code().is_client_error(), "{model}: {}", response.status_code());
+        assert_ne!(response.status_code(), StatusCode::FORBIDDEN, "{model}");
+    }
+    assert!(f.upstream.received_requests().await.unwrap().is_empty());
+}
+
+#[dwctl_test_macros::test]
+async fn batch_upload_discards_model_suffixes(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let headers = format!("Bearer {}", f.key);
     // No final newline exercises the final buffered-line parser as well.
@@ -262,7 +276,7 @@ async fn serving_classes_batch_upload_discards_suffixes(pool: PgPool) {
     }
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn model_override_cannot_split_routing_and_billing_identity(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     for path in ["chat/completions", "responses", "messages", "completions", "embeddings"] {
@@ -279,7 +293,7 @@ async fn model_override_cannot_split_routing_and_billing_identity(pool: PgPool) 
     assert!(f.upstream.received_requests().await.unwrap().is_empty());
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn dispatch_clears_stored_targets_but_preserves_deadline_priority(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     // Daemon loopback skips ingestion, as it does for an old stored template.
@@ -299,37 +313,106 @@ async fn dispatch_clears_stored_targets_but_preserves_deadline_priority(pool: Pg
     assert_eq!(body["nvext"]["cache_control"]["enabled"], true);
 }
 
-#[sqlx::test]
-async fn resolved_class_selects_the_billed_organisation_price(pool: PgPool) {
+#[dwctl_test_macros::test]
+async fn overlay_targets_change_neither_the_class_nor_the_price(pool: PgPool) {
+    // The account has a standard-class deal and a class-less one. Targets are
+    // scheduling hints: with or without them the request is standard and pays
+    // the standard deal.
     let f = Fixture::new(&pool).await;
-    sqlx::query(
-        "UPDATE users SET granted_serving_classes=ARRAY['interactive','throughput'],default_serving_class='interactive' WHERE id=$1",
-    )
-    .bind(f.user)
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query("INSERT INTO model_tariffs(deployed_model_id,user_id,serving_class,name,api_key_purpose,input_price_per_token,output_price_per_token) SELECT id,$1,c.class,'org-deal','realtime',c.price,c.price FROM deployed_models CROSS JOIN (VALUES (NULL::text,0.002::numeric),('interactive',0.003::numeric)) c(class,price) WHERE alias='policy'")
+    sqlx::query("INSERT INTO model_tariffs(deployed_model_id,user_id,serving_class,name,api_key_purpose,input_price_per_token,output_price_per_token) SELECT id,$1,c.class,'org-deal','realtime',c.price,c.price FROM deployed_models CROSS JOIN (VALUES (NULL::text,0.002::numeric),('standard',0.003::numeric)) c(class,price) WHERE alias='policy'")
         .bind(f.user).execute(&pool).await.unwrap();
-    f.services.sync_onwards_config(&pool).await.unwrap();
-    for model in ["policy", "policy:throughput", "policy:standard"] {
-        f.post("chat/completions", model, false).await.assert_status_ok();
-    }
+    f.set_overlay(&pool, Some(json!({"ttft_ms":800,"itl_ms":30,"priority":50}))).await;
+    f.post("chat/completions", "policy", false).await.assert_status_ok();
+    f.set_overlay(&pool, None).await;
+    f.post("chat/completions", "policy", false).await.assert_status_ok();
     let rows = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let rows: Vec<(String, String, Decimal)> = sqlx::query_as("SELECT model,resolved_serving_class,total_cost FROM http_analytics WHERE user_id=$1 AND model='policy' AND status_code=200 ORDER BY resolved_serving_class")
                 .bind(f.user).fetch_all(&pool).await.unwrap();
-            if rows.len() == 3 { break rows; }
+            if rows.len() == 2 { break rows; }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-    }).await.expect("three priced analytics rows must be persisted");
+    }).await.expect("two priced analytics rows must be persisted");
     assert_eq!(
         rows,
         vec![
-            ("policy".to_owned(), "interactive".to_owned(), Decimal::new(45, 3)),
-            ("policy".to_owned(), "standard".to_owned(), Decimal::new(30, 3)),
-            ("policy".to_owned(), "throughput".to_owned(), Decimal::new(30, 3)),
+            ("policy".to_owned(), "standard".to_owned(), Decimal::new(45, 3)),
+            ("policy".to_owned(), "standard".to_owned(), Decimal::new(45, 3)),
         ]
     );
     f.services.shutdown().await;
+}
+
+const ORDERED_SCHEMA: &str = r#"{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"string"}},"required":["zeta","alpha"],"additionalProperties":false}"#;
+const ORDERED_PARAMETERS: &str = r#"{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"],"additionalProperties":false}"#;
+
+#[dwctl_test_macros::test]
+async fn json_key_order_survives_ingress(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let (schema, parameters) = (ORDERED_SCHEMA, ORDERED_PARAMETERS);
+    let requests = [
+        (
+            "chat/completions",
+            format!(
+                r#"{{"model":"policy","messages":[{{"role":"user","content":"hi"}}],"stream":true,"response_format":{{"type":"json_schema","json_schema":{{"name":"n","strict":true,"schema":{schema}}}}},"tools":[{{"type":"function","function":{{"name":"lookup","parameters":{parameters}}}}}]}}"#
+            ),
+            vec![schema, parameters],
+        ),
+        (
+            "responses",
+            format!(
+                r#"{{"model":"policy","input":"hi","text":{{"format":{{"type":"json_schema","name":"n","strict":true,"schema":{schema}}}}},"tools":[{{"type":"function","name":"lookup","description":"d","parameters":{parameters}}}]}}"#
+            ),
+            vec![schema, parameters],
+        ),
+        (
+            "messages",
+            format!(
+                r#"{{"model":"policy","max_tokens":16,"messages":[{{"role":"user","content":"hi"}}],"tools":[{{"name":"lookup","description":"d","input_schema":{parameters}}}]}}"#
+            ),
+            vec![parameters],
+        ),
+    ];
+    for (path, body, expected) in requests {
+        f.server
+            .post(&format!("/ai/v1/{path}"))
+            .add_header("Authorization", format!("Bearer {}", f.key))
+            .content_type("application/json")
+            .bytes(body.into())
+            .await
+            .assert_status_ok();
+        let received = f.upstream.received_requests().await.unwrap();
+        let forwarded = String::from_utf8(received.last().unwrap().body.clone()).unwrap();
+        for fragment in expected {
+            assert!(forwarded.contains(fragment), "{path}: {forwarded}");
+        }
+    }
+}
+
+#[dwctl_test_macros::test]
+async fn json_key_order_survives_batch_upload(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let headers = format!("Bearer {}", f.key);
+    let line = format!(
+        r#"{{"custom_id":"r0","method":"POST","url":"/v1/chat/completions","body":{{"model":"policy","messages":[{{"role":"user","content":"hi"}}],"response_format":{{"type":"json_schema","json_schema":{{"name":"n","strict":true,"schema":{ORDERED_SCHEMA}}}}}}}}}"#
+    );
+    let response = f
+        .server
+        .post("/ai/v1/files")
+        .add_header("Authorization", &headers)
+        .multipart(
+            MultipartForm::new()
+                .add_text("purpose", "batch")
+                .add_part("file", Part::bytes(line.into_bytes()).file_name("ordered.jsonl")),
+        )
+        .await;
+    response.assert_status(StatusCode::CREATED);
+    let id = response.json::<Value>()["id"].as_str().unwrap().to_owned();
+    let content = f
+        .server
+        .get(&format!("/ai/v1/files/{id}/content"))
+        .add_header("Authorization", &headers)
+        .await;
+    content.assert_status_ok();
+    assert!(content.text().contains(ORDERED_SCHEMA), "{}", content.text());
 }

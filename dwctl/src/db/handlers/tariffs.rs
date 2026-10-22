@@ -24,7 +24,7 @@ impl<'c> Tariffs<'c> {
     }
 
     /// Create a new tariff for a deployed model
-    #[instrument(skip(self, request), fields(deployed_model_id = %request.deployed_model_id, name = %request.name), err)]
+    #[instrument(level = "debug", skip(self, request), fields(deployed_model_id = %request.deployed_model_id, name = %request.name), err)]
     pub async fn create(&mut self, request: &TariffCreateDBRequest) -> Result<TariffDBResponse> {
         // Convert ApiKeyPurpose enum to string for database
         let purpose_str = request.api_key_purpose.as_ref().map(|p| match p {
@@ -62,7 +62,7 @@ impl<'c> Tariffs<'c> {
     }
 
     /// Get a tariff by ID
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn get_by_id(&mut self, id: Uuid) -> Result<Option<TariffDBResponse>> {
         let tariff = sqlx::query_as!(
             ModelTariff,
@@ -82,7 +82,7 @@ impl<'c> Tariffs<'c> {
 
     /// List the current (active) GENERAL tariffs for a deployed model: the model's
     /// own price, without any organisation's rows.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn list_current_by_model(&mut self, deployed_model_id: DeploymentId) -> Result<Vec<TariffDBResponse>> {
         let tariffs = sqlx::query_as!(
             ModelTariff,
@@ -90,7 +90,7 @@ impl<'c> Tariffs<'c> {
             SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,
                    valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window, user_id, serving_class
             FROM model_tariffs
-            WHERE deployed_model_id = $1 AND (api_key_purpose IS NULL OR api_key_purpose IN ('realtime','batch','playground')) AND valid_from <= NOW() AND (valid_until IS NULL OR valid_until > NOW()) AND user_id IS NULL
+            WHERE deployed_model_id = $1 AND (api_key_purpose IS NULL OR api_key_purpose IN ('realtime','batch','playground')) AND valid_from <= NOW() AND (valid_until IS NULL OR valid_until > NOW()) AND user_id IS NULL AND serving_class IS NULL
             ORDER BY api_key_purpose ASC NULLS LAST, completion_window ASC NULLS LAST, name ASC
             "#,
             deployed_model_id
@@ -103,7 +103,7 @@ impl<'c> Tariffs<'c> {
 
     /// List every current (active) tariff for a deployed model, general and
     /// organisation-scoped alike. Operator views group them by `user_id`.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn list_current_by_model_all_scopes(&mut self, deployed_model_id: DeploymentId) -> Result<Vec<TariffDBResponse>> {
         let tariffs = sqlx::query_as!(
             ModelTariff,
@@ -137,7 +137,7 @@ impl<'c> Tariffs<'c> {
     }
 
     /// List one organisation's current (active) tariffs across every model.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn list_current_by_account(&mut self, user_id: Uuid) -> Result<Vec<TariffDBResponse>> {
         let tariffs = sqlx::query_as!(
             ModelTariff,
@@ -160,7 +160,7 @@ impl<'c> Tariffs<'c> {
     /// Customer catalogue prices: all-class account deal, then model price,
     /// per purpose/window. Class-specific deals remain internal until the public
     /// UX supports them. Actual billing still uses the resolved class.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn list_effective_for_account(
         &mut self,
         deployed_model_ids: &[DeploymentId],
@@ -214,7 +214,7 @@ impl<'c> Tariffs<'c> {
     }
 
     /// List all tariffs (including historical) for a deployed model
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn list_all_by_model(&mut self, deployed_model_id: DeploymentId) -> Result<Vec<TariffDBResponse>> {
         let tariffs = sqlx::query_as!(
             ModelTariff,
@@ -222,7 +222,7 @@ impl<'c> Tariffs<'c> {
             SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,
                    valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window, user_id, serving_class
             FROM model_tariffs
-            WHERE deployed_model_id = $1 AND user_id IS NULL
+            WHERE deployed_model_id = $1 AND user_id IS NULL AND serving_class IS NULL
             ORDER BY valid_from DESC, api_key_purpose ASC NULLS LAST, completion_window ASC NULLS LAST, name ASC
             "#,
             deployed_model_id
@@ -235,7 +235,7 @@ impl<'c> Tariffs<'c> {
 
     /// Compatibility wrapper: playground may fall back to realtime; batch stays
     /// within its purpose and window. All callers share the effective resolver.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn get_pricing_at_timestamp_with_fallback(
         &mut self,
         deployed_model_id: DeploymentId,
@@ -254,7 +254,7 @@ impl<'c> Tariffs<'c> {
     }
 
     /// Resolve the general model price at the request's original timestamp.
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn get_pricing_at_timestamp(
         &mut self,
         deployed_model_id: DeploymentId,
@@ -275,7 +275,7 @@ impl<'c> Tariffs<'c> {
 
     /// Close multiple tariffs by setting valid_until to the current time
     /// More efficient than calling close_tariff in a loop
-    #[instrument(skip(self), fields(count = ids.len()), err)]
+    #[instrument(level = "debug", skip(self), fields(count = ids.len()), err)]
     pub async fn close_tariffs_batch(&mut self, ids: &[Uuid]) -> Result<u64> {
         if ids.is_empty() {
             return Ok(0);
@@ -287,7 +287,7 @@ impl<'c> Tariffs<'c> {
     }
 
     /// Delete a tariff (hard delete - only use for mistakes, prefer close_tariff for normal operations)
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     pub async fn delete(&mut self, id: Uuid) -> Result<bool> {
         let result = sqlx::query!(
             r#"
@@ -312,7 +312,7 @@ mod tests {
     use sqlx::PgPool;
     use std::str::FromStr;
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_multiple_batch_tariffs_per_sla(pool: PgPool) {
         // Seed the database with test infrastructure
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -390,7 +390,7 @@ mod tests {
         assert_eq!(tariff_1h_found.name, "Batch 1h");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_duplicate_batch_tariff_same_sla_rejected(pool: PgPool) {
         // Seed the database with test infrastructure
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -450,7 +450,7 @@ mod tests {
         assert!(result.is_err(), "Should not allow duplicate batch tariff with same SLA");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_single_realtime_tariff_still_enforced(pool: PgPool) {
         // Seed the database with test infrastructure
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -510,7 +510,7 @@ mod tests {
         assert!(result.is_err(), "Should still enforce single realtime tariff per model");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_batch_tariff_without_completion_window_rejected(pool: PgPool) {
         // Seed the database with test infrastructure
         let base_url = url::Url::parse("http://localhost:8080").unwrap();

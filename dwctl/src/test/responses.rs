@@ -25,6 +25,15 @@ async fn setup_ai_test(
 ) -> (axum_test::TestServer, String, crate::BackgroundServices) {
     let mut config = create_test_config();
     config.onwards.strict_mode = strict_mode;
+    setup_ai_test_with_config(pool, mock_server, config).await
+}
+
+/// As [`setup_ai_test`], starting from `config`.
+pub(super) async fn setup_ai_test_with_config(
+    pool: PgPool,
+    mock_server: &wiremock::MockServer,
+    mut config: crate::config::Config,
+) -> (axum_test::TestServer, String, crate::BackgroundServices) {
     config.background_services.onwards_sync.enabled = true;
     // 1 record per flush keeps the test deterministic: each completed
     // realtime response lands in fusillade immediately rather than
@@ -155,7 +164,7 @@ async fn mount_chat_completions_mock(mock_server: &wiremock::MockServer) {
 
 /// Test that POST /v1/chat/completions with service_tier=priority creates a fusillade row
 /// and GET /v1/responses/{id} retrieves it.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_chat_completion_creates_retrievable_response(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -235,7 +244,7 @@ async fn test_chat_completion_creates_retrievable_response(pool: PgPool) {
 }
 
 /// Test that the blocking response ID returned to the client matches the fusillade ID.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_blocking_response_id_matches_fusillade_id(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -293,7 +302,7 @@ async fn test_blocking_response_id_matches_fusillade_id(pool: PgPool) {
 /// id resolves via GET. This is the POST-then-GET coverage the id/placement fix
 /// turns on - at the broken placement the client received `resp_<upstream chat
 /// id>` while the row was keyed by `resp_<uuid>`, so this GET 404'd.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_responses_post_then_get_by_client_id(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -347,7 +356,7 @@ async fn test_responses_post_then_get_by_client_id(pool: PgPool) {
 }
 
 /// Test that GET /v1/responses/{id} returns 404 for non-existent IDs.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_get_response_returns_404_for_unknown_id(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -450,7 +459,38 @@ async fn seed_archivable_response(pool: &PgPool, manager: &PostgresRequestManage
     .unwrap();
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
+async fn response_context_treats_zdr_ciphertext_as_unavailable(pool: PgPool) {
+    let user = create_test_user(&pool, Role::StandardUser).await;
+    let (_, manager) = response_lifecycle_manager(&pool).await;
+    let request_id = uuid::Uuid::new_v4();
+    manager
+        .create_realtime(fusillade::CreateRealtimeInput {
+            request_id,
+            body: "dwzdr1:request-key-already-shredded".to_owned(),
+            model: "store-test-model".to_owned(),
+            endpoint: "https://example.invalid".to_owned(),
+            method: "POST".to_owned(),
+            path: "/v1/responses".to_owned(),
+            api_key: "store-test-key".to_owned(),
+            created_by: user.id.to_string(),
+        })
+        .await
+        .unwrap();
+    manager
+        .complete_request(fusillade::RequestId(request_id), r#"{"id":"resp_test","output":[]}"#, 200)
+        .await
+        .unwrap();
+
+    let store = crate::inference::store::FusilladeResponseStore::new(std::sync::Arc::new(manager));
+    let context = crate::inference::response_store::ResponseStore::get_context(&store, &format!("resp_{request_id}"), &user.id.to_string())
+        .await
+        .expect("ZDR ciphertext should be treated as unavailable, not invalid JSON");
+
+    assert!(context.is_none());
+}
+
+#[dwctl_test_macros::test]
 async fn complete_response_treats_active_retained_graph_as_idempotent(pool: PgPool) {
     let user = create_test_user(&pool, Role::StandardUser).await;
     let key = create_test_api_key_for_user(&pool, user.id).await;
@@ -478,7 +518,7 @@ async fn complete_response_treats_active_retained_graph_as_idempotent(pool: PgPo
     assert_eq!(retained, 1);
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn complete_response_fails_closed_for_erased_identity_without_synthesis(pool: PgPool) {
     let user = create_test_user(&pool, Role::StandardUser).await;
     let key = create_test_api_key_for_user(&pool, user.id).await;
@@ -506,7 +546,7 @@ async fn complete_response_fails_closed_for_erased_identity_without_synthesis(po
         .await
         .unwrap();
     assert_eq!(live, 0);
-    let leaked_templates: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_templates WHERE body LIKE '%must_not_leak%'")
+    let leaked_templates: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_templates_all WHERE body LIKE '%must_not_leak%'")
         .fetch_one(&fusillade_pool)
         .await
         .unwrap();
@@ -535,7 +575,7 @@ async fn wait_for_api_key_lock_waiter(pool: &PgPool) {
     .expect("the attribution lookup must reach the deterministic table-lock gate");
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn complete_response_rechecks_a_fence_created_after_the_initial_miss(pool: PgPool) {
     let user = create_test_user(&pool, Role::StandardUser).await;
     let key = create_test_api_key_for_user(&pool, user.id).await;
@@ -587,7 +627,7 @@ async fn complete_response_rechecks_a_fence_created_after_the_initial_miss(pool:
         0
     );
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM request_templates WHERE body LIKE '%must_not_leak%'",)
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM request_templates_all WHERE body LIKE '%must_not_leak%'",)
             .fetch_one(&fusillade_pool)
             .await
             .unwrap(),
@@ -595,7 +635,7 @@ async fn complete_response_rechecks_a_fence_created_after_the_initial_miss(pool:
     );
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn complete_response_does_not_ignore_an_unproven_synthetic_create_error(pool: PgPool) {
     let user = create_test_user(&pool, Role::StandardUser).await;
     let key = create_test_api_key_for_user(&pool, user.id).await;
@@ -613,7 +653,7 @@ async fn complete_response_does_not_ignore_an_unproven_synthetic_create_error(po
     .await
     .unwrap();
     sqlx::query(
-        "CREATE TRIGGER reject_synthetic_template BEFORE INSERT ON request_templates \
+        "CREATE TRIGGER reject_synthetic_template BEFORE INSERT ON request_templates_g2 \
          FOR EACH ROW EXECUTE FUNCTION reject_synthetic_template()",
     )
     .execute(&fusillade_pool)
@@ -644,7 +684,7 @@ async fn complete_response_does_not_ignore_an_unproven_synthetic_create_error(po
     );
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn a_chain_can_extend_a_response_after_its_graph_moved_to_the_retained_store(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -702,9 +742,31 @@ async fn a_chain_can_extend_a_response_after_its_graph_moved_to_the_retained_sto
     let extended_json: serde_json::Value = extended.json();
     assert_eq!(extended_json["previous_response_id"], format!("resp_{id}"));
     assert_ne!(extended_json["id"], format!("resp_{id}"));
+
+    let upstream_requests = mock_server.received_requests().await.unwrap_or_default();
+    let continuation_requests: Vec<_> = upstream_requests
+        .iter()
+        .filter(|request| String::from_utf8_lossy(&request.body).contains("second turn"))
+        .collect();
+    assert_eq!(
+        continuation_requests.len(),
+        2,
+        "both the live and retained continuations must reach upstream"
+    );
+    for request in continuation_requests {
+        let body = String::from_utf8_lossy(&request.body);
+        assert!(
+            body.contains("first turn"),
+            "a continuation must include the original user turn; upstream body: {body}"
+        );
+        assert!(
+            body.contains("Hello from the test!"),
+            "a continuation must include the prior assistant answer; upstream body: {body}"
+        );
+    }
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn previous_response_id_of_another_users_response_is_rejected(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -774,7 +836,7 @@ async fn previous_response_id_of_another_users_response_is_rejected(pool: PgPool
     extend(api_key.clone()).await.assert_status_ok();
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn read_retained_singleton_preserves_response_and_fails_closed_after_drop(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -842,7 +904,7 @@ async fn read_retained_singleton_preserves_response_and_fails_closed_after_drop(
     dropped.assert_status_not_found();
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn read_retained_response_preserves_public_id_and_owner(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -907,7 +969,7 @@ async fn read_retained_response_preserves_public_id_and_owner(pool: PgPool) {
 
 /// Test that requests with X-Fusillade-Request-Id header don't create
 /// duplicate rows (batch deduplication).
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_fusillade_header_skips_row_creation(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -947,7 +1009,7 @@ async fn test_fusillade_header_skips_row_creation(pool: PgPool) {
 
 /// DELETE /ai/v1/responses/{id} hard-deletes the underlying fusillade row,
 /// and a subsequent GET returns 404.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_delete_response_removes_fusillade_row(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -1057,7 +1119,7 @@ async fn test_delete_response_removes_fusillade_row(pool: PgPool) {
 }
 
 /// DELETE /ai/v1/responses/{id} returns 404 for a non-existent id.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_delete_response_404_for_unknown_id(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -1090,7 +1152,7 @@ async fn enable_zdr_for_key(pool: &PgPool, bg: &crate::BackgroundServices, api_k
 
 /// Stateful continuation requires the prior response body, so a ZDR key must
 /// be rejected before hydration can turn an unavailable row into a store error.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_zdr_previous_response_id_returns_contract_400(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -1125,7 +1187,7 @@ async fn test_zdr_previous_response_id_returns_contract_400(pool: PgPool) {
 
 /// The supported logprobs projection must reach the translator instead of being
 /// silently ignored or rejected by the control plane.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_output_logprobs_include_is_accepted(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -1149,7 +1211,7 @@ async fn test_output_logprobs_include_is_accepted(pool: PgPool) {
 
 /// Clients may request encrypted reasoning as a compatibility projection even
 /// though this service does not emit encrypted state.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_encrypted_reasoning_include_is_a_noop(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -1195,7 +1257,7 @@ async fn test_encrypted_reasoning_include_is_a_noop(pool: PgPool) {
 
 /// Accepting the projection does not enable encrypted state replay. Client-carried
 /// encrypted reasoning must still fail before lifecycle creation.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_encrypted_reasoning_replay_returns_contract_400_before_lifecycle_creation(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -1236,7 +1298,7 @@ async fn test_encrypted_reasoning_replay_returns_contract_400_before_lifecycle_c
     assert_eq!(stored, 0);
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_unknown_include_returns_contract_400_before_lifecycle_creation(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -1299,7 +1361,7 @@ async fn response_body_len(pool: &PgPool, id: uuid::Uuid) -> i32 {
 async fn request_body_len(pool: &PgPool, id: uuid::Uuid) -> i32 {
     sqlx::query_scalar(
         "SELECT length(coalesce(t.body, '')) \
-         FROM fusillade.requests r JOIN fusillade.request_templates t ON t.id = r.template_id \
+         FROM fusillade.requests r JOIN fusillade.request_templates_all t ON t.id = r.template_id \
          WHERE r.id = $1",
     )
     .bind(id)
@@ -1311,7 +1373,7 @@ async fn request_body_len(pool: &PgPool, id: uuid::Uuid) -> i32 {
 /// A ZDR realtime request is non-persistence: it still round-trips and records a
 /// completion row, but the request and response bodies are suppressed at rest
 /// (blank in fusillade), while an identical non-ZDR request stores them.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_realtime_zdr_suppresses_stored_bodies(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -1372,4 +1434,6 @@ async fn test_realtime_zdr_suppresses_stored_bodies(pool: PgPool) {
     );
 }
 
+mod request_id;
+mod trace_attributes;
 mod trace_binding;

@@ -35,7 +35,8 @@ use axum::{
 use fusillade_arsenal::PostgresRequestManager;
 use sqlx_pool_router::PoolProvider;
 
-use super::image_normalizer_middleware::{normalize_error_response, normalize_value_to_tokens};
+use super::image_normalizer_middleware::{normalize_error_response, normalize_value_to_tokens, refuse_normalize_error};
+use super::rejections;
 use super::store::{self as response_store, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
 use super::streaming::{ReplayFrame, flex_stream_response};
 use super::validation::{Surface, envelope::malformed_body_response};
@@ -86,6 +87,9 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     /// request is rejected before it is forwarded or enqueued. `None` when
     /// disabled.
     pub validation: Option<super::validation::ValidationStage>,
+    /// Pending-byte limit for an unfinished SSE event (`onwards.sse_buffer_limit`),
+    /// used when applying the client's usage choice to a realtime stream.
+    pub sse_buffer_limit: usize,
 }
 
 /// Middleware that routes inference requests based on service_tier and background.
@@ -98,7 +102,9 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // Routing, cache identity and billing must all use the body's model.
     // Model-Override is a standalone Onwards feature, not a Control Layer API.
     if req.headers().contains_key("model-override") {
-        return invalid_request_response(
+        return invalid_request(
+            &req,
+            None,
             "Model-Override is not supported; select the model in the request body",
             "unsupported_header",
             "Model-Override",
@@ -124,7 +130,8 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::error!(error = %e, "Failed to read request body in inference middleware");
-            return invalid_request_response("Failed to read the request body", "body_read_failed", "body");
+            let response = invalid_request_response("Failed to read the request body", "body_read_failed", "body");
+            return rejections::refuse(&parts, response, "body_read_failed", None, None);
         }
     };
 
@@ -133,9 +140,17 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     let mut request_value: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
-            // A client error, not ours: warn rather than error.
-            tracing::warn!(error = %e, "Failed to parse request body in inference middleware");
-            return malformed_body_response(surface, &e.to_string());
+            // Only the category in our logs: serde's message can quote the body's
+            // values. The caller gets the full message about its own body.
+            let category = match e.classify() {
+                serde_json::error::Category::Io => "io",
+                serde_json::error::Category::Syntax => "syntax",
+                serde_json::error::Category::Data => "data",
+                serde_json::error::Category::Eof => "eof",
+            };
+            tracing::warn!(category, "Failed to parse request body in inference middleware");
+            let response = malformed_body_response(surface, &e.to_string());
+            return rejections::refuse(&parts, response, "invalid_json", None, None);
         }
     };
 
@@ -159,15 +174,26 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
 
     let scrubbed_scheduling = strip_scheduling_priority(&mut request_value);
 
-    // A serving-class suffix (`alias:interactive`) is a request for a class,
-    // not part of the model's identity: strip it here, at the outermost layer,
-    // so analytics, the prompt cache and billing all key on the bare alias,
-    // and hand the class to onwards as a request extension. An unknown class
-    // is a 400 (a typo must not silently change how a request is served).
-    let (requested_class, scrubbed_class) = match strip_serving_class_suffix(&mut request_value, is_daemon_processed) {
-        Ok(result) => result,
+    // The bearer token is needed below for ZDR, modality and toleration
+    // decisions. Read it now (it was earlier only parsed after the body was
+    // re-serialised) so the tolerations can be applied to `request_value`
+    // before the bytes are rebuilt.
+    let api_key = parts
+        .headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|s| s.to_string());
+
+    // Asynchronous requests are scheduled by their deadline, so a model
+    // suffix (`alias:suffix`) is discarded here, at the outermost layer, and
+    // analytics, the prompt cache and billing all key on the bare alias. A
+    // malformed selector is a 400. Realtime model names are passed through
+    // unchanged.
+    let scrubbed_suffix = match strip_async_model_suffix(&mut request_value, is_daemon_processed) {
+        Ok(changed) => changed,
         Err(err) => {
-            return Response::builder()
+            let response = Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .header("content-type", "application/json")
                 .body(Body::from(
@@ -175,15 +201,35 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                         .to_string(),
                 ))
                 .unwrap();
+            let model = request_value["model"].as_str();
+            return rejections::refuse(&parts, response, "invalid_model_selector", Some("model"), model);
         }
+    };
+
+    // An operator can pin an account to a scheduling-toleration preset, for
+    // all of its models or (through the account catalog) for one model: every
+    // such request then carries exactly the preset's list at
+    // `nvext.routing_constraints.tolerations`, replacing anything the client
+    // sent (stripped by `strip_scheduling_priority` above). Resolved after the
+    // suffix strip, so it keys on the bare alias, through the per-key policy
+    // map; this covers realtime, flex and background alike, and batch JSONL
+    // files are scrubbed and stamped at ingest. The "Default" setting and
+    // every unpinned account are unchanged.
+    let scrubbed_pinned = match pinned_tolerations(
+        &state.key_policy_cache,
+        api_key.as_deref(),
+        request_value["model"].as_str().unwrap_or_default(),
+    ) {
+        Some(tolerations) => set_routing_tolerations(&mut request_value, &tolerations),
+        None => false,
     };
 
     // The realtime path forwards `body_bytes` verbatim and onwards forwards the
     // bytes it receives (COR-522), so anything a scrubber removed from
     // `request_value` only stays removed if the bytes are rebuilt from it.
     // Every scrubber reports whether it changed something; the common case
-    // (nothing to scrub, no suffix) keeps the caller's bytes untouched.
-    let body_bytes = if scrubbed_class || scrubbed_ids || scrubbed_scheduling {
+    // (nothing to scrub, no suffix, no pin) keeps the caller's bytes untouched.
+    let mut body_bytes = if scrubbed_suffix || scrubbed_ids || scrubbed_scheduling || scrubbed_pinned {
         bytes::Bytes::from(request_value.to_string())
     } else {
         body_bytes
@@ -191,17 +237,13 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
 
     let model = request_value["model"].as_str().unwrap_or("unknown").to_string();
     let model = model.as_str();
+    // Refusals from here on, attributed to this request and its model.
+    let refuse =
+        |response: Response, code: &'static str, param: Option<&str>| rejections::refuse(&parts, response, code, param, Some(model));
+    let invalid = |message: &str, code: &'static str, param: &'static str| invalid_request(&parts, Some(model), message, code, param);
     // The router is nested at /ai/v1, so the path here is e.g. "/responses".
     // Prepend /v1 for the full API path used by the loopback and fusillade templates.
     let endpoint = format!("/v1{nested_path}");
-
-    // Extract bearer token for auth check and batch attribution
-    let api_key = parts
-        .headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .map(|s| s.to_string());
 
     // Stateful continuation requires the prior response body. Realtime ZDR
     // deliberately never retains that body, while queued ZDR crypto-shreds it,
@@ -222,14 +264,18 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             .disabled_modalities(key)
             .contains(crate::modalities::Modality::Realtime)
     {
-        return modality_disabled_response(crate::modalities::Modality::Realtime);
+        return refuse(
+            modality_disabled_response(crate::modalities::Modality::Realtime),
+            "modality_disabled",
+            None,
+        );
     }
     if is_responses_api {
         if let Some(include) = request_value.get("include")
             && !include.is_null()
         {
             let Ok(_) = serde_json::from_value::<Vec<crate::inference::translation::responses::types::Include>>(include.clone()) else {
-                return invalid_request_response(
+                return invalid(
                     "include must contain only supported Responses API projection values",
                     "invalid_parameter",
                     "include",
@@ -250,15 +296,27 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 })
             });
         if has_encrypted_reasoning_replay {
-            return invalid_request_response(
+            return invalid(
                 "encrypted reasoning item replay is not supported by this Responses API implementation",
                 "unsupported_parameter",
                 "input",
             );
         }
+
+        // The edge translation refuses provider-native thinking fields, but
+        // queued and background requests are accepted before it runs. Refuse
+        // them here so the caller gets the 400 instead of a failed response later.
+        if let Err(error) = onwards::reasoning::validate_canonical_reasoning(nested_path, &request_value) {
+            let param = error.param().unwrap_or_default();
+            return refuse(
+                invalid_request_response(error.message(), error.code(), param),
+                error.code(),
+                error.param(),
+            );
+        }
     }
     if is_responses_api && zdr && request_value.get("previous_response_id").is_some_and(|id| !id.is_null()) {
-        return invalid_request_response(
+        return invalid(
             "previous_response_id is not supported when zero-data retention is enabled",
             "zdr_state_not_supported",
             "previous_response_id",
@@ -305,14 +363,22 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             } else {
                 "server_error"
             };
-            return Response::builder()
+            let response = Response::builder()
                 .status(status)
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::json!({"error": {"message": message, "type": err_type}}).to_string(),
                 ))
                 .unwrap();
+            if status.is_client_error() {
+                return refuse(response, "previous_response_not_found", Some("previous_response_id"));
+            }
+            return response;
         }
+        // Realtime dispatch otherwise forwards the original caller bytes. The
+        // hydrated request must become the body sent through translation as
+        // well as the body retained for a later continuation.
+        body_bytes = bytes::Bytes::from(request_value.to_string());
     }
 
     // Validate on the bare alias (serving-class suffix already stripped), after
@@ -360,13 +426,15 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // (has_tools / warm_path_branch / try_warm_path_*) was removed on this branch, so
     // only the tier validation survives.
     if let Some(message) = background_contract_error(service_tier, is_responses_api, background) {
-        return Response::builder()
+        let response = Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::json!({"error": {"message": message, "type": "invalid_request_error"}}).to_string(),
             ))
             .unwrap();
+        let param = if is_responses_api { "background" } else { "service_tier" };
+        return refuse(response, "invalid_parameter", Some(param));
     }
     tracing::debug!(
         model = %model,
@@ -389,25 +457,27 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     if is_daemon_processed {
         match api_key.as_deref() {
             None => {
-                return Response::builder()
+                let response = Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({"error": {"message": "API key required", "type": "invalid_request_error"}}).to_string(),
                     ))
                     .unwrap();
+                return refuse(response, "unauthenticated", None);
             }
             Some(key) => {
                 if let Err(msg) =
                     crate::error_enrichment::validate_api_key_model_access(state.dwctl_pool.write().into_inner(), key, model).await
                 {
-                    return Response::builder()
+                    let response = Response::builder()
                         .status(StatusCode::FORBIDDEN)
                         .header("content-type", "application/json")
                         .body(Body::from(
                             serde_json::json!({"error": {"message": msg, "type": "invalid_request_error"}}).to_string(),
                         ))
                         .unwrap();
+                    return refuse(response, "forbidden", None);
                 }
             }
         }
@@ -417,7 +487,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         match api_key_creator_can_run_background(&state.dwctl_pool.write(), api_key.as_deref()).await {
             Ok(Some(true)) => {}
             Ok(Some(false)) => {
-                return Response::builder()
+                let response = Response::builder()
                     .status(StatusCode::FORBIDDEN)
                     .header("content-type", "application/json")
                     .body(Body::from(
@@ -430,15 +500,17 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                         .to_string(),
                     ))
                     .unwrap();
+                return refuse(response, "forbidden", None);
             }
             Ok(None) => {
-                return Response::builder()
+                let response = Response::builder()
                     .status(StatusCode::FORBIDDEN)
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({"error": {"message": "Invalid API key", "type": "invalid_request_error"}}).to_string(),
                     ))
                     .unwrap();
+                return refuse(response, "invalid_api_key", None);
             }
             Err(e) => {
                 tracing::error!(error = %e, "Failed to resolve background-inference role");
@@ -466,13 +538,14 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             Ok(Some(key)) => Some(key),
             Ok(None) => {
                 tracing::warn!(service_tier = %service_tier, "Queued API key disappeared before hidden batch-key resolution");
-                return Response::builder()
+                let response = Response::builder()
                     .status(StatusCode::FORBIDDEN)
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({"error": {"message": "Invalid API key", "type": "invalid_request_error"}}).to_string(),
                     ))
                     .unwrap();
+                return refuse(response, "invalid_api_key", None);
             }
             Err(e) => {
                 tracing::error!(error = %e, service_tier = %service_tier, "Failed to resolve queued hidden batch key");
@@ -518,13 +591,17 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         )
         .await
     {
-        return Response::builder()
+        let response = Response::builder()
             .status(err.status_code())
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::json!({"error": {"message": err.user_message(), "type": "invalid_request_error"}}).to_string(),
             ))
             .unwrap();
+        if response.status().is_client_error() {
+            return refuse(response, "unverified_volume_limit", None);
+        }
+        return response;
     }
 
     match service_tier {
@@ -545,19 +622,15 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 api_key: api_key.clone().unwrap_or_default(),
                 created_by: created_by.unwrap_or_default(),
             };
-            handle_realtime(
-                &state,
-                realtime_input,
-                &resp_id,
-                model,
-                background,
-                zdr,
-                requested_class,
-                parts,
-                body_bytes,
-                next,
-            )
-            .await
+            let client_usage = super::stream_usage::requested_usage(&endpoint, &request_value);
+            // The parsed JSON is no longer needed on the realtime path. Release
+            // its strings before the upstream request is held open.
+            drop(request_value);
+            let response = handle_realtime(&state, realtime_input, &resp_id, model, background, zdr, parts, body_bytes, next).await;
+            match client_usage {
+                Some(usage) => super::stream_usage::apply(response, usage, state.sse_buffer_limit),
+                None => response,
+            }
         }
         ServiceTier::Flex | ServiceTier::Background => {
             let is_background_tier = matches!(service_tier, ServiceTier::Background);
@@ -580,6 +653,11 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                     ))
                     .unwrap();
             }
+            // ZDR keys exist before anything is stored: the request key seals
+            // the request's images on their way into the object store below, as
+            // well as the body further down, so no ZDR image is ever written in
+            // plaintext and shredding the key shreds the images with the body.
+            let zdr_keys = zdr.then(crate::inference::zdr::FlexKeys::generate);
             // Flex is persisted now and dispatched later by the daemon, so —
             // unlike realtime — this leg does NOT pass through the
             // image-normaliser layer. Normalise image inputs to `dw-img://`
@@ -612,7 +690,8 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                     None => None,
                 };
                 let access_pool = Some(state.dwctl_pool.write().into_inner());
-                match normalize_value_to_tokens(&mut request_value, &state.image_normalizer, access_pool, attribution).await {
+                let seal_key = zdr_keys.as_ref().map(|keys| &keys.request[..]);
+                match normalize_value_to_tokens(&mut request_value, &state.image_normalizer, access_pool, attribution, seal_key).await {
                     Ok(n) => {
                         if n > 0 {
                             tracing::debug!(substituted = n, service_tier = %service_tier, "Queued image normalisation replaced image inputs with tokens");
@@ -620,7 +699,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, service_tier = %service_tier, "Queued image normalisation failed");
-                        return normalize_error_response(e);
+                        return refuse_normalize_error(&parts, e, Some(model));
                     }
                 }
             }
@@ -648,13 +727,13 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             let flex_stream_include_usage =
                 flex_stream && is_chat_completions_api && request_value["stream_options"]["include_usage"].as_bool().unwrap_or(false);
             if flex_stream && let Some(obj) = request_value.as_object_mut() {
-                obj.remove("stream");
-                obj.remove("stream_options");
+                obj.shift_remove("stream");
+                obj.shift_remove("stream_options");
             }
 
             // For ZDR, encrypt the body and store the per-request keys; any
             // failure fails the request rather than falling back to plaintext.
-            let flex_body = if zdr {
+            let flex_body = if let Some(keys) = zdr_keys.as_ref() {
                 let zdr_store_error = || {
                     Response::builder()
                         .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -668,7 +747,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                     tracing::error!("ZDR enabled but keystore missing; refusing to store plaintext");
                     return zdr_store_error();
                 };
-                match crate::inference::zdr::prepare_flex_submit(keystore, &request_id, &mut request_value).await {
+                match crate::inference::zdr::prepare_flex_submit(keystore, &request_id, keys, &mut request_value).await {
                     Ok(body) => body,
                     Err(e) => {
                         tracing::error!(error = %e, "ZDR submit failed; refusing to store plaintext");
@@ -925,7 +1004,6 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     model: &str,
     background: bool,
     zdr: bool,
-    requested_class: Option<onwards::ServingClass>,
     parts: axum::http::request::Parts,
     body_bytes: bytes::Bytes,
     next: Next,
@@ -954,9 +1032,6 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     // Strip the "resp_" prefix — onwards re-adds it.
     let raw_id = resp_id.strip_prefix("resp_").unwrap_or(resp_id);
     let mut req = Request::from_parts(parts, Body::from(body_bytes));
-    if let Some(class) = requested_class {
-        req.extensions_mut().insert(onwards::RequestedServingClass(class));
-    }
     req.headers_mut()
         .insert("x-fusillade-request-id", raw_id.parse().expect("response_id is valid header value"));
     req.headers_mut().insert(
@@ -1061,7 +1136,7 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
 
         match response_store::poll_until_complete(&state.request_manager, resp_id, poll_interval, timeout, state.keystore.as_ref()).await {
             Ok(response_obj) => {
-                let status_code = if response_obj["status"].as_str() == Some("completed") {
+                let status_code = if matches!(response_obj["status"].as_str(), Some("completed" | "incomplete")) {
                     StatusCode::OK
                 } else {
                     // Extract the real HTTP status from the error's code field,
@@ -1245,8 +1320,8 @@ async fn handle_chat_completion_flex_streaming<P: PoolProvider + Clone + Send + 
 /// Symmetric with [`handle_chat_completion_flex_streaming`]: respond-first,
 /// then replay the finished Responses object as the `response.*` SSE event
 /// sequence the live warm path also emits — `response.created` →
-/// `response.completed` on success, `response.created` → `response.failed` on
-/// error. There is no `[DONE]` sentinel on this surface; the terminal event
+/// `response.completed` on success (`response.incomplete` when the answer was
+/// cut short), `response.created` → `response.failed` on error. There is no `[DONE]` sentinel on this surface; the terminal event
 /// is the terminator.
 async fn handle_responses_flex_streaming<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &InferenceMiddlewareState<P>,
@@ -1262,7 +1337,7 @@ async fn handle_responses_flex_streaming<P: PoolProvider + Clone + Send + Sync +
         move |result| match result {
             Ok(detail) => {
                 let response = response_store::detail_to_response_object(detail);
-                if response["status"] == "completed" {
+                if matches!(response["status"].as_str(), Some("completed" | "incomplete")) {
                     response_store::response_object_to_stream_events(&response)
                         .into_iter()
                         .map(|(event, data)| ReplayFrame::named(event, data))
@@ -1354,6 +1429,17 @@ fn validation_key<'a>(surface: Surface, bearer: Option<&'a str>, headers: &'a ax
     })
 }
 
+/// A 400 naming `param`, counted as refused for `code`.
+fn invalid_request<'a>(
+    origin: impl Into<rejections::Origin<'a>>,
+    model: Option<&str>,
+    message: &str,
+    code: &'static str,
+    param: &'static str,
+) -> Response {
+    rejections::refuse(origin, invalid_request_response(message, code, param), code, Some(param), model)
+}
+
 fn invalid_request_response(message: &str, code: &str, param: &str) -> Response {
     Response::builder()
         .status(StatusCode::BAD_REQUEST)
@@ -1386,7 +1472,7 @@ fn scrub_request_id_fields(value: &mut serde_json::Value) -> bool {
     let mut scrubbed = false;
     if let Some(obj) = value.as_object_mut() {
         for key in SCRUB_ID_KEYS {
-            scrubbed |= obj.remove(key).is_some();
+            scrubbed |= obj.shift_remove(key).is_some();
         }
     }
     scrubbed
@@ -1418,7 +1504,7 @@ fn scrub_request_id_fields(value: &mut serde_json::Value) -> bool {
 pub(crate) fn strip_scheduling_priority(value: &mut serde_json::Value) -> bool {
     let mut scrubbed = false;
     if let Some(obj) = value.as_object_mut() {
-        scrubbed |= obj.remove("priority").is_some();
+        scrubbed |= obj.shift_remove("priority").is_some();
         // The carrier the dynamo frontend ACTUALLY honours is
         // `nvext.agent_hints.priority` (a top-level `priority` is rejected by
         // its validation) — remove exactly that key so an external caller
@@ -1427,40 +1513,138 @@ pub(crate) fn strip_scheduling_priority(value: &mut serde_json::Value) -> bool {
         if let Some(nvext) = obj.get_mut("nvext").and_then(|n| n.as_object_mut()) {
             scrubbed |= onwards::serving::scrub_router_targets(nvext);
             if let Some(hints) = nvext.get_mut("agent_hints").and_then(|h| h.as_object_mut()) {
-                scrubbed |= hints.remove("priority").is_some();
+                scrubbed |= hints.shift_remove("priority").is_some();
+            }
+            // Scheduling tolerations are the operator's to pin, never the
+            // caller's: strip any client-supplied list the same way priority
+            // is stripped. A pinned account's preset list is written back
+            // afterwards by `set_routing_tolerations`, so the only surviving
+            // value is the operator's.
+            if let Some(routing) = nvext.get_mut("routing_constraints").and_then(|r| r.as_object_mut()) {
+                scrubbed |= routing.shift_remove("tolerations").is_some();
             }
         }
     }
     scrubbed
 }
 
-/// Strip a serving-class suffix (`alias:class`) from the request's `model`,
-/// in place, returning the requested class. A model without a suffix is left
-/// untouched; an unknown class is an error listing the valid set.
-fn strip_serving_class_suffix(
+/// The toleration list an account is pinned to, resolved through the per-key
+/// policy map, or `None` when the account is on "Default". Hot-path safe.
+pub(crate) fn pinned_tolerations(
+    cache: &crate::sync::key_policy::KeyPolicyCache,
+    api_key: Option<&str>,
+    model: &str,
+) -> Option<std::sync::Arc<serde_json::Value>> {
+    api_key.and_then(|secret| cache.tolerations(secret, model))
+}
+
+/// Write `tolerations` to `nvext.routing_constraints.tolerations`, in place,
+/// returning whether the body changed. Creates `nvext` and
+/// `routing_constraints` when absent, and leaves any other key (including
+/// other `routing_constraints` siblings) untouched. An existing identical
+/// value is a no-op so the common path keeps the caller's bytes.
+pub(crate) fn set_routing_tolerations(value: &mut serde_json::Value, tolerations: &serde_json::Value) -> bool {
+    let Some(obj) = value.as_object_mut() else {
+        return false;
+    };
+    let nvext = obj.entry("nvext").or_insert_with(|| serde_json::json!({}));
+    if !nvext.is_object() {
+        *nvext = serde_json::json!({});
+    }
+    let Some(nvext) = nvext.as_object_mut() else {
+        return false;
+    };
+    let routing = nvext.entry("routing_constraints").or_insert_with(|| serde_json::json!({}));
+    if !routing.is_object() {
+        *routing = serde_json::json!({});
+    }
+    let Some(routing) = routing.as_object_mut() else {
+        return false;
+    };
+    if routing.get("tolerations") == Some(tolerations) {
+        return false;
+    }
+    routing.insert("tolerations".to_string(), tolerations.clone());
+    true
+}
+
+/// Discard a model suffix on an asynchronous request, returning whether the
+/// body changed. Realtime requests are left alone.
+fn strip_async_model_suffix(
     value: &mut serde_json::Value,
     asynchronous: bool,
-) -> Result<(Option<onwards::ServingClass>, bool), onwards::serving::InvalidModelSelector> {
+) -> Result<bool, super::model_selector::InvalidModelSelector> {
+    if !asynchronous {
+        return Ok(false);
+    }
     let Some(model) = value.get("model").and_then(|m| m.as_str()) else {
-        return Ok((None, false));
+        return Ok(false);
     };
-    let (alias, suffix) = onwards::serving::split_model_suffix(model)?;
-    let class = if asynchronous {
-        None
-    } else {
-        onwards::serving::split_class_suffix(model)?.1
-    };
+    let (alias, suffix) = super::model_selector::split_model_suffix(model)?;
     let changed = suffix.is_some();
     if changed {
         let alias = alias.to_string();
         value["model"] = serde_json::Value::String(alias);
     }
-    Ok((class, changed))
+    Ok(changed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_routing_tolerations_writes_the_preset_list_and_preserves_the_rest() {
+        // The preset replaces a client's nvext wholesale-safely: it is written
+        // verbatim into routing_constraints.tolerations, and every sibling
+        // (other nvext keys, other routing_constraints keys) survives.
+        let mut body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "nvext": {
+                "agent_hints": {"max_batch_size": 8},
+                "routing_constraints": {"region": "eu", "tolerations": [{"operator": "Exists"}]}
+            }
+        });
+        let empty = serde_json::json!([]);
+        assert!(set_routing_tolerations(&mut body, &empty), "a changed value rebuilds the body");
+        assert_eq!(body["nvext"]["routing_constraints"]["tolerations"], empty);
+        assert_eq!(body["nvext"]["routing_constraints"]["region"], "eu");
+        assert_eq!(body["nvext"]["agent_hints"]["max_batch_size"], 8);
+
+        // Writing the same value again is a no-op, so the common path keeps the
+        // caller's bytes.
+        assert!(!set_routing_tolerations(&mut body, &empty));
+
+        // A non-empty preset list is written verbatim.
+        let list = serde_json::json!([{"key": "dedicated", "value": "only"}]);
+        let mut fresh = serde_json::json!({"model": "m"});
+        assert!(set_routing_tolerations(&mut fresh, &list));
+        assert_eq!(fresh["nvext"]["routing_constraints"]["tolerations"], list);
+
+        // A non-object nvext is replaced rather than panicking.
+        let mut broken = serde_json::json!({"model": "m", "nvext": "not-an-object"});
+        assert!(set_routing_tolerations(&mut broken, &serde_json::json!([])));
+        assert_eq!(broken["nvext"]["routing_constraints"]["tolerations"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn pinned_tolerations_reads_the_key_policy_cache() {
+        let presets = crate::scheduling::TolerationPresets::new(&crate::config::SchedulingConfig::default());
+        let cache = crate::sync::key_policy::KeyPolicyCache::from_policies_with_presets(
+            presets,
+            [(
+                "sk-pinned".to_string(),
+                crate::sync::key_policy::KeyPolicy {
+                    toleration_preset: Some("no-overflow".into()),
+                    ..Default::default()
+                },
+            )],
+        );
+        assert!(pinned_tolerations(&cache, Some("sk-pinned"), "any/model").is_some());
+        assert!(pinned_tolerations(&cache, Some("sk-other"), "any/model").is_none());
+        assert!(pinned_tolerations(&cache, None, "any/model").is_none());
+    }
 
     #[test]
     fn strip_scheduling_priority_removes_only_the_top_level_field() {
@@ -1498,33 +1682,25 @@ mod tests {
     }
 
     #[test]
-    fn serving_class_suffix_is_stripped_and_returned() {
-        let mut body = serde_json::json!({"model": "zai-org/GLM-5.2:interactive", "messages": []});
-        let class = strip_serving_class_suffix(&mut body, false).unwrap();
-        assert_eq!(class, (Some(onwards::ServingClass::Interactive), true));
-        assert_eq!(body["model"], "zai-org/GLM-5.2", "layers above onwards key on the bare alias");
-
-        let mut body = serde_json::json!({"model": "zai-org/GLM-5.2", "messages": []});
-        assert_eq!(strip_serving_class_suffix(&mut body, false).unwrap(), (None, false));
-        assert_eq!(body["model"], "zai-org/GLM-5.2");
-
-        let mut body = serde_json::json!({"model": "zai-org/GLM-5.2:fast"});
-        let err = strip_serving_class_suffix(&mut body, false).unwrap_err();
-        assert!(err.to_string().contains("'fast'"));
-        assert_eq!(body["model"], "zai-org/GLM-5.2:fast", "an invalid request is left as sent");
-
-        // No model at all (Model-Override header path): nothing to do.
-        let mut body = serde_json::json!({"messages": []});
-        assert_eq!(strip_serving_class_suffix(&mut body, false).unwrap(), (None, false));
+    fn realtime_model_names_are_passed_through_unchanged() {
+        let mut body = serde_json::json!({"model": "org/model:suffix", "messages": []});
+        assert_eq!(strip_async_model_suffix(&mut body, false), Ok(false));
+        assert_eq!(body["model"], "org/model:suffix");
     }
 
     #[test]
-    fn async_suffixes_are_discarded_without_class_validation() {
+    fn async_suffixes_are_discarded_after_a_shape_check() {
         let mut body = serde_json::json!({"model":"m:x-fast"});
-        assert_eq!(strip_serving_class_suffix(&mut body, true).unwrap(), (None, true));
+        assert_eq!(strip_async_model_suffix(&mut body, true), Ok(true));
         assert_eq!(body["model"], "m");
-        let mut body = serde_json::json!({"model":"m:throughput:interactive"});
-        assert!(strip_serving_class_suffix(&mut body, true).is_err());
+        let mut body = serde_json::json!({"model":"m"});
+        assert_eq!(strip_async_model_suffix(&mut body, true), Ok(false));
+        let mut body = serde_json::json!({"model":"m:a:b"});
+        assert!(strip_async_model_suffix(&mut body, true).is_err());
+        assert_eq!(body["model"], "m:a:b", "an invalid request is left as sent");
+        // No model at all (Model-Override header path): nothing to do.
+        let mut body = serde_json::json!({"messages": []});
+        assert_eq!(strip_async_model_suffix(&mut body, true), Ok(false));
     }
 
     #[test]
@@ -1540,6 +1716,26 @@ mod tests {
 
         let mut body = serde_json::json!({"model": "m", "nvext": {"cache_control": {"enabled": true}}});
         assert!(!strip_scheduling_priority(&mut body), "nothing to re-serialise for");
+    }
+
+    #[test]
+    fn strip_scheduling_priority_also_scrubs_client_tolerations() {
+        // A caller's toleration list is the operator's to pin, never theirs:
+        // it is removed like priority, and other nvext keys survive.
+        let mut body = serde_json::json!({
+            "model": "m",
+            "nvext": {
+                "routing_constraints": {"tolerations": [{"operator": "Exists"}], "region": "eu"},
+                "cache_control": {"enabled": true}
+            }
+        });
+        assert!(strip_scheduling_priority(&mut body), "the tolerations were present and removed");
+        assert!(body["nvext"]["routing_constraints"].get("tolerations").is_none());
+        assert_eq!(body["nvext"]["routing_constraints"]["region"], "eu", "siblings survive");
+        assert_eq!(body["nvext"]["cache_control"]["enabled"], true);
+
+        let mut clean = serde_json::json!({"model": "m", "nvext": {"routing_constraints": {"region": "eu"}}});
+        assert!(!strip_scheduling_priority(&mut clean), "nothing removed, nothing to rebuild");
     }
 
     #[test]
@@ -1696,7 +1892,7 @@ mod tests {
         assert_eq!(background_contract_error(ServiceTier::Realtime, false, false), None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn resolve_flex_batch_key_uses_hidden_batch_key_for_key_owner(pool: sqlx::PgPool) {
         use crate::api::models::{api_keys::ApiKeyCreate, users::Role};
         use crate::db::{
@@ -1716,8 +1912,6 @@ mod tests {
                     name: "Org realtime key".to_string(),
                     description: None,
                     purpose: ApiKeyPurpose::Realtime,
-                    requests_per_second: None,
-                    burst_size: None,
                     member_id: None,
                     spend_limit: None,
                     spend_limit_interval: None,
@@ -1759,7 +1953,7 @@ mod tests {
         assert!(row_hidden);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn background_role_is_resolved_from_organization_key_creator(pool: sqlx::PgPool) {
         use crate::api::models::{api_keys::ApiKeyCreate, users::Role};
         use crate::db::{
@@ -1779,8 +1973,6 @@ mod tests {
                         name: "Org background key".to_string(),
                         description: None,
                         purpose: ApiKeyPurpose::Realtime,
-                        requests_per_second: None,
-                        burst_size: None,
                         member_id: None,
                         spend_limit: None,
                         spend_limit_interval: None,
@@ -1810,7 +2002,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn background_role_rejects_api_key_creator_without_capability(pool: sqlx::PgPool) {
         use crate::api::models::{api_keys::ApiKeyCreate, users::Role};
         use crate::db::{
@@ -1829,8 +2021,6 @@ mod tests {
                         name: "Foreground-only key".to_string(),
                         description: None,
                         purpose: ApiKeyPurpose::Realtime,
-                        requests_per_second: None,
-                        burst_size: None,
                         member_id: None,
                         spend_limit: None,
                         spend_limit_interval: None,
@@ -1853,5 +2043,48 @@ mod tests {
                 .expect("resolve unknown key"),
             None
         );
+    }
+
+    #[dwctl_test_macros::test]
+    async fn responses_refuse_native_thinking_fields_before_acceptance(pool: sqlx::PgPool) {
+        use crate::api::models::users::Role;
+        use crate::test::utils::{create_test_api_key_for_user, create_test_app, create_test_user};
+
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let key = create_test_api_key_for_user(&pool, user.id).await;
+
+        // Realtime with `background: true` is accepted with a 202 before translation too.
+        let tiers = [
+            (Some("flex"), false),
+            (Some("flex"), true),
+            (Some("background"), true),
+            (None, true),
+            (Some("auto"), true),
+            (Some("priority"), true),
+        ];
+        for (tier, background) in tiers {
+            let mut request = serde_json::json!({
+                "model": "gpt-4",
+                "input": "hi",
+                "background": background,
+                "chat_template_kwargs": {"enable_thinking": false}
+            });
+            if let Some(tier) = tier {
+                request["service_tier"] = tier.into();
+            }
+            let response = server
+                .post("/ai/v1/responses")
+                .add_header("Authorization", &format!("Bearer {}", key.secret))
+                .json(&request)
+                .await;
+
+            assert_eq!(response.status_code().as_u16(), 400, "{tier:?}/{background}: {}", response.text());
+            let body: serde_json::Value = response.json();
+            assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
+            assert_eq!(body["error"]["code"], "unsupported_parameter", "{body}");
+            assert_eq!(body["error"]["param"], "chat_template_kwargs.enable_thinking", "{body}");
+            assert!(body["error"]["message"].as_str().unwrap().contains("reasoning.effort"), "{body}");
+        }
     }
 }

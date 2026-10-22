@@ -8,29 +8,69 @@ on:
 
 jobs:
   changes:
-    name: release-only changes
+    name: change classification
     runs-on: ubuntu-latest
     outputs:
       run-ci: ${{ steps.classify.outputs.run-ci }}
+      run-backend: ${{ steps.classify.outputs.run-backend }}
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 2
 
       - name: Classify changes
         id: classify
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
         run: |
           run_ci=true
           changed_files=$(git diff --name-only HEAD^1...HEAD) || changed_files=
 
+          # A release changes version numbers only: in Cargo files, `version`
+          # fields and the versions on path dependencies between workspace
+          # crates. Any other Cargo change adds, bumps or repoints a dependency,
+          # which changes what is built, so it runs the full suite.
+          versions_only() {
+            local lines normalize='s/"[0-9]+\.[0-9]+\.[0-9]+[^"]*"/"VERSION"/g'
+            lines=$(git diff -U0 HEAD^1...HEAD -- "$1" | grep -E '^[-+]' | grep -Ev '^(\+\+\+|---) ') || return 0
+            if grep -Evq '^[-+](version = |.*path = )' <<< "$lines"; then
+              return 1
+            fi
+            [[ "$(grep '^-' <<< "$lines" | cut -c2- | sed -E "$normalize" | sort)" == \
+               "$(grep '^+' <<< "$lines" | cut -c2- | sed -E "$normalize" | sort)" ]]
+          }
+
           if [[ -n "$changed_files" ]] && ! grep -Evq '^(\.release-please-manifest\.json|(.+/)?CHANGELOG\.md|(.+/)?Cargo\.(toml|lock))$' <<< "$changed_files"; then
             run_ci=false
+            while read -r file; do
+              if [[ "$file" =~ Cargo\.(toml|lock)$ ]] && ! versions_only "$file"; then
+                run_ci=true
+              fi
+            done <<< "$changed_files"
+          fi
+
+          # The dashboard CI already installs from the frozen lockfile, runs
+          # type checking, linting and tests, and produces the release bundle.
+          # Pure dashboard changes do not affect the Rust workspace, images or
+          # API compliance surfaces. Preview branches remain full builds because
+          # their deployment contract publishes the dwctl image from this run.
+          # Merge groups also retain backend validation: they do not expose the
+          # source branch through github.head_ref, so the preview exception
+          # cannot be classified safely without an API lookup.
+          run_backend=$run_ci
+          if [[ "$run_ci" == true && -n "$changed_files" ]] &&
+             [[ "$EVENT_NAME" == pull_request ]] &&
+             ! grep -Evq '^dashboard/' <<< "$changed_files" &&
+             [[ "$HEAD_REF" != preview/* ]]; then
+            run_backend=false
           fi
 
           echo "run-ci=$run_ci" >> "$GITHUB_OUTPUT"
+          echo "run-backend=$run_backend" >> "$GITHUB_OUTPUT"
 
   frontend-test:
     if: needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
@@ -40,15 +80,15 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v5
+        uses: pnpm/action-setup@v6
         with:
-          version: 10
+          version: 10.34.7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
           cache: "pnpm"
@@ -59,9 +99,9 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Install just
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
         with:
-          just-version: "1.46.0"
+          just-version: "1.59.0"
 
       - name: Run frontend CI pipeline
         id: ci-step
@@ -127,7 +167,7 @@ jobs:
           curl -X POST "https://charts.somnial.co/doubleword-control-layer/gzipped-bundle-size?value=${GZIPPED_SIZE}" || true
 
   backend-dwctl-test-shard:
-    if: needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+    if: needs.changes.outputs.run-backend == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
     needs: changes
     name: dwctl / test (${{ matrix.partition }}/4)
     strategy:
@@ -138,10 +178,12 @@ jobs:
 
     # Each partition has an isolated PostgreSQL instance. SQLx tests create
     # their own databases, pools, and listeners, so retain the raised
-    # connection limit from the unpartitioned job.
+    # connection limit from the unpartitioned job. Durability is disabled, as
+    # in `just db-start`: every template clone uses `STRATEGY FILE_COPY`, whose
+    # checkpoints are cheap without fsync and slower than `WAL_LOG` with it.
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Start Postgres
         run: |
@@ -152,14 +194,17 @@ jobs:
             -e POSTGRES_HOST_AUTH_METHOD=trust \
             -p 5432:5432 \
             postgres:latest \
-            -c max_connections=300
+            -c max_connections=300 \
+            -c fsync=off \
+            -c full_page_writes=off \
+            -c synchronous_commit=off
           for _ in $(seq 1 30); do
             docker exec postgres pg_isready -U postgres && break
             sleep 1
           done
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: llvm-tools-preview
 
@@ -170,9 +215,9 @@ jobs:
           cache-on-failure: true
 
       - name: Install just
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
         with:
-          just-version: "1.46.0"
+          just-version: "1.59.0"
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
@@ -200,9 +245,15 @@ jobs:
           source <(cargo llvm-cov show-env --export-prefix)
           export LLVM_PROFILE_FILE="$PWD/target/dwctl-${{ matrix.partition }}-%32m.profraw"
 
+          BUILD_START=$(date +%s)
+          cargo nextest run --package dwctl --cargo-profile ci --no-run
+          BUILD_END=$(date +%s)
+          echo "dwctl compile/link: $((BUILD_END - BUILD_START))s"
           cargo nextest run --package dwctl \
             --cargo-profile ci \
             --partition "count:${{ matrix.partition }}/4"
+          TEST_END=$(date +%s)
+          echo "dwctl test execution: $((TEST_END - BUILD_END))s"
           cargo llvm-cov report --profile ci \
             --lcov \
             --output-path "lcov-dwctl-${{ matrix.partition }}.info"
@@ -213,6 +264,15 @@ jobs:
           curl -X POST \
             "https://charts.somnial.co/doubleword-control-layer/backend-dwctl-partition-${{ matrix.partition }}-ci-duration?value=${CI_DURATION}" || true
 
+      - name: Upload dwctl partition ${{ matrix.partition }} timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-test-timings-dwctl-${{ matrix.partition }}
+          path: target/nextest/default/junit.xml
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Upload dwctl partition ${{ matrix.partition }} coverage
         uses: actions/upload-artifact@v4
         with:
@@ -222,7 +282,7 @@ jobs:
           retention-days: 1
 
   backend-dwctl-test:
-    if: always() && needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+    if: always() && needs.changes.outputs.run-backend == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
     needs: [changes, backend-dwctl-test-shard]
     runs-on: ubuntu-latest
     name: dwctl / test
@@ -263,23 +323,23 @@ jobs:
             cargo_args: --all-features
     runs-on: ${{ matrix.runner }}
     env:
-      RUN_CI: ${{ needs.changes.outputs.run-ci }}
+      RUN_BACKEND: ${{ needs.changes.outputs.run-backend }}
 
     # Postgres is started manually below (not via `services:`) so we can pass
     # `-c max_connections=300`. SQLx tests open their own pools and underway
     # PgListener connections, so the default 100 is insufficient.
 
     steps:
-      - name: Skip crate tests for release-only changes
-        if: env.RUN_CI != 'true'
-        run: echo "Skipping crate tests because this pull request only contains release metadata."
+      - name: Skip crate tests when backend is unchanged
+        if: env.RUN_BACKEND != 'true'
+        run: echo "Skipping crate tests because this pull request does not change the backend."
 
       - name: Checkout code
-        if: env.RUN_CI == 'true'
-        uses: actions/checkout@v6
+        if: env.RUN_BACKEND == 'true'
+        uses: actions/checkout@v7
 
       - name: Start Postgres
-        if: env.RUN_CI == 'true' && matrix.database
+        if: env.RUN_BACKEND == 'true' && matrix.database
         run: |
           docker run -d --name postgres \
             -e POSTGRES_DB=test \
@@ -295,25 +355,25 @@ jobs:
           done
 
       - name: Install Rust
-        if: env.RUN_CI == 'true'
-        uses: dtolnay/rust-toolchain@stable
+        if: env.RUN_BACKEND == 'true'
+        uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: llvm-tools-preview
 
       - name: Cache Rust build
-        if: env.RUN_CI == 'true'
+        if: env.RUN_BACKEND == 'true'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: backend-test-${{ matrix.package }}
 
       - name: Install just
-        if: env.RUN_CI == 'true'
-        uses: extractions/setup-just@v3
+        if: env.RUN_BACKEND == 'true'
+        uses: extractions/setup-just@v4
         with:
-          just-version: "1.46.0"
+          just-version: "1.59.0"
 
       - name: Install sqlx-cli and cargo-llvm-cov
-        if: env.RUN_CI == 'true'
+        if: env.RUN_BACKEND == 'true'
         run: |
           cargo install cargo-llvm-cov --locked
           if [[ "${{ matrix.database }}" == "true" ]]; then
@@ -322,13 +382,13 @@ jobs:
           fi
 
       - name: Set up test databases
-        if: env.RUN_CI == 'true' && matrix.database
+        if: env.RUN_BACKEND == 'true' && matrix.database
         env:
           DB_PASS: postgres
         run: just db-setup
 
       - name: Compile and test ${{ matrix.package }}
-        if: env.RUN_CI == 'true'
+        if: env.RUN_BACKEND == 'true'
         run: |
           START_TIME=$(date +%s)
           cargo llvm-cov --package "${{ matrix.package }}" \
@@ -342,7 +402,7 @@ jobs:
             "https://charts.somnial.co/doubleword-control-layer/backend-${{ matrix.package }}-ci-duration?value=${CI_DURATION}" || true
 
       - name: Upload ${{ matrix.package }} coverage
-        if: env.RUN_CI == 'true'
+        if: env.RUN_BACKEND == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: rust-coverage-${{ matrix.package }}
@@ -351,14 +411,14 @@ jobs:
           retention-days: 1
 
   backend-lint:
-    if: needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+    if: needs.changes.outputs.run-backend == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
     needs: changes
     name: workspace / rust lint
     runs-on: depot-ubuntu-24.04-16
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Start Postgres
         run: |
@@ -376,7 +436,12 @@ jobs:
           done
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        # Every workflow pins this same Rust release (search for
+        # `rust-toolchain@`). A new stable can add lints that fail
+        # `-D warnings`, so upgrade them together, deliberately.
+        uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: rustfmt, clippy
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
@@ -384,9 +449,9 @@ jobs:
           shared-key: backend-lint
 
       - name: Install just
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
         with:
-          just-version: "1.46.0"
+          just-version: "1.59.0"
 
       - name: Install sqlx-cli
         run: cargo install sqlx-cli --version '^0.8' --no-default-features --features native-tls,postgres --locked
@@ -409,7 +474,7 @@ jobs:
         run: cargo package --locked --package onwards --all-features
 
   backend-test:
-    if: always() && needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+    if: always() && needs.changes.outputs.run-backend == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
     needs: [changes, backend-crate-test, backend-dwctl-test, backend-lint, frontend-test, build, pooled-e2e]
     runs-on: ubuntu-latest
     name: workspace / rust gate
@@ -418,7 +483,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Validate preview workflow contract
         run: ruby scripts/tests/preview_workflow_test.rb
@@ -512,7 +577,7 @@ jobs:
   # Image builds are first-wave jobs after change classification. Both depend
   # only on `changes`, so the independently published images build in parallel.
   onwards-pr-image:
-    if: needs.changes.outputs.run-ci == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'
+    if: needs.changes.outputs.run-backend == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'
     needs: changes
     name: onwards / image
     runs-on: depot-ubuntu-24.04
@@ -524,7 +589,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
@@ -546,7 +611,7 @@ jobs:
 
   # Sibling image build to `onwards-pr-image`; both start after classification.
   build:
-    if: needs.changes.outputs.run-ci == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'
+    if: needs.changes.outputs.run-backend == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'
     needs: changes
     name: dwctl / image
     runs-on: depot-ubuntu-24.04
@@ -558,7 +623,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
@@ -619,7 +684,8 @@ jobs:
     # Runs unconditionally so the matrix expands and BOTH legs report under their
     # static check names. A job skipped at this level reports once as the
     # unexpanded `matrix.check`, which never satisfies the required contexts on
-    # release-only pull requests. The steps gate on RUN_COMPLIANCE instead.
+    # pull requests where backend checks are not required. The steps gate on
+    # RUN_COMPLIANCE instead.
     if: always()
     runs-on: ubuntu-latest
     needs: [changes, build]
@@ -665,7 +731,7 @@ jobs:
 
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/dwctl
-      RUN_COMPLIANCE: ${{ needs.changes.outputs.run-ci == 'true' && needs.build.result == 'success' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') }}
+      RUN_COMPLIANCE: ${{ needs.changes.outputs.run-backend == 'true' && needs.build.result == 'success' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') }}
       TEST_API_KEY: sk-openresponses-compliance
       TEST_MODEL: gemini-2.5-flash
       COMPLIANCE_BASE_URL: ${{ matrix.base_url }}
@@ -675,9 +741,9 @@ jobs:
       OPENRESPONSES_COMPLIANCE_FILTER: basic-response,assistant-phase,response-output-phase-schema,streaming-response,system-prompt,tool-calling,image-input,multi-turn
 
     steps:
-      - name: Skip compliance for release-only changes
+      - name: Skip compliance when backend is unchanged
         if: env.RUN_COMPLIANCE != 'true'
-        run: echo "Skipping Open Responses compliance because this event has no code changes."
+        run: echo "Skipping Open Responses compliance because this event does not change the backend."
 
       - name: Log in to GitHub Container Registry
         if: env.RUN_COMPLIANCE == 'true'
@@ -972,11 +1038,11 @@ jobs:
 
       - name: Checkout code
         if: env.RUN_COMPLIANCE == 'true'
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install Rust
         if: env.RUN_COMPLIANCE == 'true' && matrix.surface == 'onwards-passthrough'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
 
       - name: Build onwards
         if: env.RUN_COMPLIANCE == 'true' && matrix.surface == 'onwards-passthrough'
@@ -1209,7 +1275,7 @@ jobs:
         run: docker rm -f dwctl-openresponses-compliance || true
 
   security-scan:
-    if: needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+    if: needs.changes.outputs.run-backend == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
     name: dwctl / security
     runs-on: depot-ubuntu-24.04
     needs: [changes, build]
@@ -1221,7 +1287,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
@@ -1285,7 +1351,7 @@ jobs:
           curl -X POST "https://charts.somnial.co/doubleword-control-layer/high-vulnerabilities?value=${HIGH}" || echo "Failed to report high vulnerabilities"
 
   e2e-test-docker:
-    if: needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+    if: needs.changes.outputs.run-backend == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
     name: workspace / e2e
     runs-on: depot-ubuntu-24.04
     needs: [changes, build]
@@ -1298,22 +1364,22 @@ jobs:
       # The image is built from the PR head, so mount config and run tests
       # from that same revision rather than GitHub's synthetic merge commit.
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
       - name: Install just
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
         with:
-          just-version: "1.46.0"
+          just-version: "1.59.0"
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v5
+        uses: pnpm/action-setup@v6
         with:
-          version: 10
+          version: 10.34.7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
           cache: "pnpm"
@@ -1372,7 +1438,7 @@ jobs:
           curl -X POST "https://charts.somnial.co/doubleword-control-layer/e2e-docker-duration?value=${E2E_DURATION}" || true
 
   pooled-e2e:
-    if: always() && needs.changes.outputs.run-ci == 'true' && (needs.build.result == 'success' || needs.build.result == 'skipped') && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+    if: always() && needs.changes.outputs.run-backend == 'true' && (needs.build.result == 'success' || needs.build.result == 'skipped') && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
     name: dwctl / pooled database e2e (${{ matrix.schema-mode }})
     strategy:
       fail-fast: false
@@ -1398,10 +1464,10 @@ jobs:
           --health-retries 10
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -1424,7 +1490,7 @@ jobs:
       # the checked-out application locally without registry write privileges.
       - name: Install Rust for unpublished builds
         if: needs.build.result == 'skipped'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
 
       - name: Cache unpublished application build
         if: needs.build.result == 'skipped'

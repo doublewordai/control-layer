@@ -1060,7 +1060,7 @@ async fn adds_retained_response_parent_without_rewriting_live_heaps(pool: sqlx::
         .execute(&pool)
         .await
         .unwrap();
-    MIGRATOR
+    through_retention
         .run(&pool)
         .await
         .expect("the migration must reapply after rollback");
@@ -1075,7 +1075,7 @@ async fn adds_retained_response_parent_without_rewriting_live_heaps(pool: sqlx::
         .execute(&pool)
         .await
         .unwrap();
-    MIGRATOR
+    through_retention
         .run(&pool)
         .await
         .expect("the empty up/down cycle must remain reversible");
@@ -1142,6 +1142,55 @@ async fn preflight_script_verifies_index_partitions_and_journal_state(pool: sqlx
             .to_string()
             .contains("not described by a lifecycle bucket"),
         "unexpected preflight failure: {error}"
+    );
+}
+
+const FILES_AUTOVACUUM_DOWN: &str =
+    include_str!("../migrations/20260930160000_tune_files_autovacuum.down.sql");
+
+async fn files_reloptions(pool: &sqlx::PgPool) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT array_to_string(reloptions, ',') \
+         FROM pg_class \
+         WHERE relname = 'files' AND relnamespace = current_schema()::regnamespace",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// `files` keeps every file for the retention window while expiry and batch
+/// completion keep updating recent rows, so it carries absolute autovacuum
+/// thresholds, and the rollback restores the server defaults.
+#[sqlx::test]
+async fn files_use_absolute_autovacuum_thresholds(pool: sqlx::PgPool) {
+    let options = files_reloptions(&pool)
+        .await
+        .expect("files must carry storage parameters");
+    for expected in [
+        "autovacuum_vacuum_scale_factor=0.0",
+        "autovacuum_vacuum_threshold=20000",
+        "autovacuum_analyze_scale_factor=0.0",
+        "autovacuum_analyze_threshold=20000",
+        "autovacuum_vacuum_insert_scale_factor=0.0",
+        "autovacuum_vacuum_insert_threshold=20000",
+    ] {
+        assert!(
+            options.split(',').any(|option| option == expected),
+            "files must set {expected}, found {options}"
+        );
+    }
+
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::raw_sql(FILES_AUTOVACUUM_DOWN)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+    assert_eq!(
+        files_reloptions(&pool).await,
+        None,
+        "files must return to the server defaults after rollback"
     );
 }
 

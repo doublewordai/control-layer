@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Result, ensure};
 use clap::{Parser, Subcommand};
-use dwctl::{model_provisioning::Catalog, org_overlays::OrgCatalog};
+use dwctl::{account_limits::AccountLimitsCatalog, model_provisioning::Catalog, org_overlays::OrgCatalog};
 
 #[derive(Debug, Parser)]
 #[command(about = "Validate and describe dwctl model provisioning catalogs")]
@@ -21,8 +21,19 @@ enum Command {
         #[arg(long)]
         models: PathBuf,
     },
+    #[command(about = "Validate account limits and their model references against the complete model catalog, without a database")]
+    ValidateAccountLimits {
+        directory: PathBuf,
+        #[arg(long)]
+        models: PathBuf,
+        /// Also check that no account/model pair is configured in both catalogs.
+        #[arg(long)]
+        org_overlays: Option<PathBuf>,
+    },
     /// Print the JSON Schema for one organisation document.
     OrgSchema,
+    /// Print the JSON Schema for one account document.
+    AccountSchema,
     /// Print the JSON Schema for one model document.
     Schema,
 }
@@ -40,7 +51,25 @@ fn main() -> Result<()> {
             overlays.validate_models(&Catalog::load(&models)?)?;
             println!("org overlay catalog is valid: {}", directory.display());
         }
+        Command::ValidateAccountLimits {
+            directory,
+            models,
+            org_overlays,
+        } => {
+            ensure!(
+                directory.is_dir(),
+                "account limits directory does not exist: {}",
+                directory.display()
+            );
+            let accounts = AccountLimitsCatalog::load(&directory)?;
+            accounts.validate_models(&Catalog::load(&models)?)?;
+            if let Some(org_overlays) = org_overlays {
+                accounts.validate_against_overlays(&OrgCatalog::load(&org_overlays)?)?;
+            }
+            println!("account limits are valid: {}", directory.display());
+        }
         Command::OrgSchema => println!("{}", OrgCatalog::json_schema()?),
+        Command::AccountSchema => println!("{}", AccountLimitsCatalog::json_schema()?),
         Command::Schema => println!("{}", Catalog::json_schema()?),
     }
     Ok(())

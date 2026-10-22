@@ -1,9 +1,11 @@
 //! OpenAI-compatible model listing for inference API keys.
 
+use std::collections::HashMap;
+
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Query, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
@@ -11,7 +13,17 @@ use serde_json::json;
 use sqlx::{QueryBuilder, Row};
 use sqlx_pool_router::PoolProvider;
 
-use crate::{AppState, db::handlers::Deployments, reasoning::SupportedReasoningEfforts};
+use crate::{
+    AppState,
+    api::models::{
+        cache_pricing::CachePricingResponse,
+        deployments::{DeployedModelResponse, enrichment::DeployedModelEnricher},
+        tariffs::TariffResponse,
+    },
+    db::handlers::{Deployments, Repository},
+    inference::rejections::{self, Origin, Recorder, bearer_token},
+    reasoning::SupportedReasoningEfforts,
+};
 
 const EVERYONE_GROUP_ID: uuid::Uuid = uuid::Uuid::nil();
 
@@ -23,6 +35,7 @@ pub struct ModelsListResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct ModelsListQuery {
+    include: Option<String>,
     group: Option<String>,
     available_for_realtime: Option<String>,
     include_reasoning_capabilities: Option<String>,
@@ -34,20 +47,26 @@ enum ModelsListQueryError {
 }
 
 impl ModelsListQueryError {
-    fn into_response(self) -> Response {
+    fn refuse(self, origin: Origin) -> Response {
         match self {
-            Self::InvalidGroup => openai_error(
-                StatusCode::BAD_REQUEST,
-                "Invalid group query parameter. Expected comma-separated UUIDs.",
-                "invalid_request_error",
-                "invalid_group",
-            ),
-            Self::InvalidBoolean { param } => openai_error(
-                StatusCode::BAD_REQUEST,
-                &format!("Invalid {param} query parameter. Expected true or false."),
-                "invalid_request_error",
-                "invalid_query_parameter",
-            ),
+            Self::InvalidGroup => {
+                let response = openai_error(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid group query parameter. Expected comma-separated UUIDs.",
+                    "invalid_request_error",
+                    "invalid_group",
+                );
+                rejections::refuse(origin, response, "invalid_group", Some("group"), None)
+            }
+            Self::InvalidBoolean { param } => {
+                let response = openai_error(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid {param} query parameter. Expected true or false."),
+                    "invalid_request_error",
+                    "invalid_query_parameter",
+                );
+                rejections::refuse(origin, response, "invalid_query_parameter", Some(param), None)
+            }
         }
     }
 }
@@ -60,6 +79,10 @@ struct ModelObject {
     owned_by: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     supported_reasoning_efforts: Option<SupportedReasoningEfforts>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tariffs: Option<Vec<TariffResponse>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_pricing: Option<CachePricingResponse>,
 }
 
 fn openai_error(status: StatusCode, message: &str, error_type: &str, code: &str) -> Response {
@@ -75,15 +98,6 @@ fn openai_error(status: StatusCode, message: &str, error_type: &str, code: &str)
         })),
     )
         .into_response()
-}
-
-fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?.trim();
-    let (scheme, token) = value.split_once(char::is_whitespace)?;
-    scheme
-        .eq_ignore_ascii_case("bearer")
-        .then_some(token.trim())
-        .filter(|token| !token.is_empty())
 }
 
 fn database_error(operation: &str, error: impl std::fmt::Display) -> Response {
@@ -131,27 +145,37 @@ fn parse_optional_bool(param: &'static str, value: Option<&str>) -> Result<Optio
 // would add an allocation on every error path and make this handler's signature
 // differ from every other one for no benefit.
 #[allow(clippy::result_large_err)]
+#[tracing::instrument(skip_all)]
 pub async fn list_ai_models<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Query(query): Query<ModelsListQuery>,
+    recorder: Option<Extension<Recorder>>,
+    uri: Uri,
     headers: HeaderMap,
 ) -> Result<Json<ModelsListResponse>, Response> {
+    let origin = Origin::new(recorder.as_ref().map(|Extension(recorder)| recorder), &headers, uri.path());
     let Some(token) = bearer_token(&headers) else {
-        return Err(openai_error(
+        let response = openai_error(
             StatusCode::UNAUTHORIZED,
             "Missing Authorization header",
             "authentication_error",
             "missing_authorization",
-        ));
+        );
+        return Err(rejections::refuse(origin, response, "missing_authorization", None, None));
     };
 
-    let group_ids = parse_group_filter(query.group.as_deref()).map_err(ModelsListQueryError::into_response)?;
-    let available_for_realtime = parse_optional_bool("available_for_realtime", query.available_for_realtime.as_deref())
-        .map_err(ModelsListQueryError::into_response)?;
+    let refuse_query = |error: ModelsListQueryError| error.refuse(origin);
+    let group_ids = parse_group_filter(query.group.as_deref()).map_err(refuse_query)?;
+    let available_for_realtime =
+        parse_optional_bool("available_for_realtime", query.available_for_realtime.as_deref()).map_err(refuse_query)?;
     let include_reasoning_capabilities =
         parse_optional_bool("include_reasoning_capabilities", query.include_reasoning_capabilities.as_deref())
-            .map_err(ModelsListQueryError::into_response)?
+            .map_err(refuse_query)?
             .unwrap_or(false);
+    let include_pricing = query
+        .include
+        .as_deref()
+        .is_some_and(|includes| includes.split(',').any(|include| include.trim() == "pricing"));
 
     let mut conn = state
         .db
@@ -180,17 +204,19 @@ pub async fn list_ai_models<P: PoolProvider>(
     let Some(user_id) = user_id else {
         // See INVALID_API_KEY_MESSAGE: a wrong-region key looks identical to an
         // invalid one, so the copy nudges users to check their regional endpoint.
-        return Err(openai_error(
+        let response = openai_error(
             StatusCode::UNAUTHORIZED,
             crate::errors::INVALID_API_KEY_MESSAGE,
             "authentication_error",
             "invalid_api_key",
-        ));
+        );
+        return Err(rejections::refuse(origin, response, "invalid_api_key", None, None));
     };
 
     let mut models_query = QueryBuilder::new(
         r#"
         SELECT DISTINCT
+            dm.id,
             dm.alias,
             EXTRACT(EPOCH FROM dm.created_at)::BIGINT AS created
         FROM deployed_models dm
@@ -262,6 +288,53 @@ pub async fn list_ai_models<P: PoolProvider>(
         Default::default()
     };
 
+    // Reuse the customer catalogue's effective account prices, cache multipliers,
+    // and disabled-purpose/window filters. An inference key never gets the
+    // operator pricing view, even when its creator is a platform manager.
+    let mut pricing_models = if include_pricing && !rows.is_empty() {
+        let model_ids = rows.iter().map(|row| row.get("id")).collect::<Vec<_>>();
+        let mut repo = Deployments::new(&mut conn);
+        let models = repo
+            .get_bulk(model_ids.clone())
+            .await
+            .map_err(|e| database_error("load_priced_models", e))?;
+        let mut rules = repo
+            .get_traffic_rules_bulk(&model_ids)
+            .await
+            .map_err(|e| database_error("load_pricing_traffic_rules", e))?;
+        let models = models
+            .into_values()
+            .map(|model| {
+                let traffic_rules = rules.remove(&model.id).unwrap_or_default();
+                DeployedModelResponse::from(model).with_traffic_rules(traffic_rules)
+            })
+            .collect();
+        // Enrichment acquires its own read connections.
+        drop(conn);
+        DeployedModelEnricher {
+            db: &state.db.read(),
+            include_groups: false,
+            include_metrics: false,
+            include_status: false,
+            include_pricing: true,
+            include_endpoints: false,
+            include_components: false,
+            can_read_pricing: false,
+            can_read_rate_limits: false,
+            can_read_users: false,
+            pricing_account: Some(user_id),
+            can_read_composite_info: false,
+        }
+        .enrich_many(models)
+        .await
+        .map_err(|e| database_error("load_customer_pricing", e))?
+        .into_iter()
+        .map(|model| (model.alias.clone(), model))
+        .collect::<HashMap<_, _>>()
+    } else {
+        Default::default()
+    };
+
     Ok(Json(ModelsListResponse {
         object: "list".to_string(),
         data: rows
@@ -271,12 +344,18 @@ pub async fn list_ai_models<P: PoolProvider>(
                 let supported_reasoning_efforts = include_reasoning_capabilities
                     .then(|| reasoning_policies.get(&id).and_then(|policy| policy.supported_efforts()))
                     .flatten();
+                let (tariffs, cache_pricing) = pricing_models
+                    .remove(&id)
+                    .map(|model| (model.tariffs, model.cache_pricing))
+                    .unwrap_or_default();
                 ModelObject {
                     id,
                     object: "model".to_string(),
                     created: row.get::<Option<i64>, _>("created").unwrap_or_default(),
                     owned_by: "None".to_string(),
                     supported_reasoning_efforts,
+                    tariffs,
+                    cache_pricing,
                 }
             })
             .collect(),

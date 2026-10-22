@@ -631,6 +631,65 @@ pub enum Tool {
         /// Name of the server-side tool to enable for this request.
         name: String,
     },
+
+    /// A named group of tools (`{"type": "namespace", ...}`). Codex wraps its
+    /// function tools in one; the handler flattens the group into ordinary
+    /// function tools before forwarding (see `flatten_tool_namespaces`).
+    #[serde(rename = "namespace")]
+    Namespace {
+        /// Namespace name (e.g. `functions`).
+        #[allow(dead_code)]
+        name: String,
+        /// Namespace description; empty for the default `functions` namespace.
+        /// Only serialized when present, so a group that omitted it does not
+        /// come back with an invented `"description": null`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[allow(dead_code)]
+        description: Option<String>,
+        /// Grouped tools. `function` members are flattened; `custom` members
+        /// (freeform tools) are dropped.
+        #[allow(dead_code)]
+        tools: Vec<NamespaceTool>,
+    },
+}
+
+/// A tool nested inside a [`Tool::Namespace`] group.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum NamespaceTool {
+    #[serde(rename = "function")]
+    Function {
+        #[allow(dead_code)]
+        name: String,
+        description: String,
+        parameters: serde_json::Value,
+        /// Optional rather than defaulted to `true`: the request echo must not
+        /// invent a value the caller omitted. Treated as strict when flattening.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[allow(dead_code)]
+        strict: Option<bool>,
+        /// Deferred-loading hint; not forwarded, but kept for a faithful echo.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[allow(dead_code)]
+        defer_loading: Option<bool>,
+    },
+
+    /// Freeform tool (grammar-defined input rather than a JSON Schema). Not
+    /// forwarded, but its definition is kept intact for a faithful echo.
+    #[serde(rename = "custom")]
+    Custom {
+        #[allow(dead_code)]
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[allow(dead_code)]
+        description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[allow(dead_code)]
+        format: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[allow(dead_code)]
+        defer_loading: Option<bool>,
+    },
 }
 
 /// Tool choice specification
@@ -886,6 +945,34 @@ pub struct OutputTokensDetails {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_namespace_group_round_trips_without_inventing_fields() {
+        // A namespace group that omitted `description`/`strict` must come back
+        // exactly as sent: re-serialization is what feeds any request echo.
+        let sent = serde_json::json!([{
+            "type": "namespace",
+            "name": "functions",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "description": "Runs a command.",
+                    "parameters": {"type": "object", "properties": {}}
+                },
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"}
+                }
+            ]
+        }]);
+
+        let tools: Vec<Tool> = serde_json::from_value(sent.clone()).unwrap();
+        let echoed = serde_json::to_value(&tools).unwrap();
+
+        assert_eq!(echoed, sent);
+    }
 
     #[test]
     fn test_deserialize_simple_request() {

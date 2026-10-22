@@ -1,0 +1,16 @@
+[profile.default]
+# Report slow tests without killing legitimate long-running integration tests.
+slow-timeout = { period = "10s" }
+
+[profile.default.junit]
+path = "junit.xml"
+
+[[profile.default.overrides]]
+# These load generators measure heap budgets under backpressure. Give each
+# measurement the machine, matching the serial execution in its native harness.
+filter = 'binary(memory_budget)'
+threads-required = "num-cpus"
+
+[profile.timings.junit]
+path = "junit.xml"
+store-success-output = true
