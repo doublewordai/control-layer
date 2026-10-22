@@ -53,7 +53,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 // Note: We import multer directly to get typed error matching for body limit errors.
 // axum's multipart wraps multer, and checking error variants is more robust than string matching.
-use crate::limits::MULTIPART_OVERHEAD;
+use crate::limits::{MULTIPART_OVERHEAD, UploadLimiter, UploadPermit};
 use axum::extract::rejection::LengthLimitError;
 
 /// Check if the current user "owns" a resource, considering org context.
@@ -553,10 +553,12 @@ const UPLOAD_REJECTIONS: &str = "dwctl_file_upload_rejections_total";
 /// variant, and the refusals `upload_file` makes before it reads the file.
 const UPLOAD_REJECTION_CODES: &[&str] = &[
     "not_multipart",
+    "upload_capacity",
+    "batch_disabled",
     "invalid_multipart",
     "stream_interrupted",
     "file_too_large",
-    "too_many_requests",
+    "too_many_lines",
     "invalid_json",
     "invalid_utf8",
     "invalid_compression",
@@ -589,13 +591,26 @@ fn refuse_upload(code: &'static str, error: Error) -> Error {
     error
 }
 
+/// An upload slot, when uploads are limited. A refusal (the queue is full, or
+/// no slot came free in time) is counted as `upload_capacity`.
+async fn acquire_upload_slot(limiter: Option<&UploadLimiter>) -> Result<Option<UploadPermit>> {
+    match limiter {
+        Some(limiter) => limiter
+            .acquire()
+            .await
+            .map(Some)
+            .map_err(|error| refuse_upload("upload_capacity", error)),
+        None => Ok(None),
+    }
+}
+
 impl FileUploadError {
     /// The bounded code this refusal is counted under.
     fn code(&self) -> &'static str {
         match self {
             FileUploadError::StreamInterrupted { .. } => "stream_interrupted",
             FileUploadError::FileTooLarge { .. } => "file_too_large",
-            FileUploadError::TooManyRequests { .. } => "too_many_requests",
+            FileUploadError::TooManyRequests { .. } => "too_many_lines",
             FileUploadError::InvalidJson { .. } => "invalid_json",
             FileUploadError::InvalidUtf8 { .. } => "invalid_utf8",
             FileUploadError::InvalidCompression { .. } => "invalid_compression",
@@ -1277,11 +1292,7 @@ pub async fn upload_file<P: PoolProvider>(
 
     // Acquire upload permit (if limiter is configured)
     // The permit is held for the duration of the upload to limit concurrency
-    let _permit = if let Some(ref limiter) = state.limiters.file_uploads {
-        Some(limiter.acquire().await?)
-    } else {
-        None
-    };
+    let _permit = acquire_upload_slot(state.limiters.file_uploads.as_deref()).await?;
 
     let config = state.current_config();
     let max_file_size = config.limits.files.max_file_size;
@@ -1323,7 +1334,12 @@ pub async fn upload_file<P: PoolProvider>(
         let mut conn = state.db.write().acquire().await.map_err(|e| Error::Internal {
             operation: format!("get db connection for modality check: {}", e),
         })?;
-        crate::api::handlers::modalities::ensure_batch_enabled(&mut conn, target_user_id).await?;
+        crate::api::handlers::modalities::ensure_batch_enabled(&mut conn, target_user_id)
+            .await
+            .map_err(|error| match error {
+                Error::ModalityDisabled { .. } => refuse_upload("batch_disabled", error),
+                error => error,
+            })?;
     }
 
     // Re-use the AppState-bound normaliser singleton (built once at
@@ -2587,16 +2603,6 @@ mod tests {
         }
     }
 
-    /// The process-wide count of uploads refused for `code`.
-    fn upload_rejections(code: &str) -> u64 {
-        let series = format!(r#"dwctl_file_upload_rejections_total{{code="{code}"}} "#);
-        crate::get_or_install_prometheus_handle()
-            .render()
-            .lines()
-            .find_map(|line| line.strip_prefix(&series))
-            .map_or(0, |count| count.parse().unwrap())
-    }
-
     #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_broken_or_unsupported_compression_names_the_problem(pool: PgPool) {
@@ -2619,7 +2625,7 @@ mod tests {
                 "unsupported_compression",
             ),
         ] {
-            let before = upload_rejections(code);
+            let before = crate::test::utils::upload_rejections(code);
             let upload_response = app
                 .post("/ai/v1/files")
                 .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
@@ -2634,7 +2640,7 @@ mod tests {
             upload_response.assert_status(status);
             let body = upload_response.text();
             assert!(body.contains(expected), "{body}");
-            assert_eq!(upload_rejections(code), before + 1, "{code} is counted");
+            assert_eq!(crate::test::utils::upload_rejections(code), before + 1, "{code} is counted");
         }
     }
 
@@ -2644,6 +2650,7 @@ mod tests {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
         let line = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4"}}"#;
+        let upload_rejections = crate::test::utils::upload_rejections;
         let (not_multipart, invalid_multipart) = (upload_rejections("not_multipart"), upload_rejections("invalid_multipart"));
 
         for content_type in [Some("application/jsonl"), Some("application/x-www-form-urlencoded"), None] {
@@ -4349,6 +4356,39 @@ mod tests {
                 "{code}"
             );
         }
+    }
+
+    #[test]
+    fn test_upload_capacity_refusals_are_counted() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let config = crate::config::FileLimitsConfig {
+                        max_concurrent_uploads: 1,
+                        max_upload_wait_secs: 0,
+                        ..Default::default()
+                    };
+                    let limiter = crate::limits::UploadLimiter::new(&config).unwrap();
+                    assert!(super::acquire_upload_slot(None).await.unwrap().is_none(), "unlimited");
+                    let _held = super::acquire_upload_slot(Some(&limiter)).await.unwrap();
+                    let Err(refused) = super::acquire_upload_slot(Some(&limiter)).await else {
+                        panic!("the only slot is held");
+                    };
+                    assert_eq!(refused.status_code(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+                });
+        });
+        let rendered = handle.render();
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line == r#"dwctl_file_upload_rejections_total{code="upload_capacity"} 1"#),
+            "{rendered}"
+        );
     }
 
     #[test]
