@@ -74,7 +74,13 @@ impl ModelConfigResolver {
              AND mct.user_id IS NULL AND mct.serving_class IS NULL
              AND mct.valid_from <= now()
              AND (mct.valid_until IS NULL OR mct.valid_until > now())
-            WHERE dm.alias = $1 AND dm.deleted = false
+            WHERE dm.deleted = false
+              AND (dm.alias = $1
+                   -- A class route (`alias:<class>`) inherits its model's
+                   -- enablement; its cache entries are scoped by that name.
+                   OR (dm.routing_mode = 'class_routes' AND EXISTS (
+                       SELECT 1 FROM model_serving_classes c
+                       WHERE c.deployed_model_id = dm.id AND dm.alias || ':' || c.class_key = $1)))
             "#,
             virtual_model,
         )

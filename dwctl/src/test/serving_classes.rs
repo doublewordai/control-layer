@@ -451,6 +451,17 @@ async fn class_routes_serve_realtime_by_class_and_bill_the_class(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     activate_policy_classes(&f, &pool).await;
 
+    // Discovery lists the class beside the model.
+    let models: Value = f
+        .server
+        .get("/ai/v1/models")
+        .add_header("Authorization", format!("Bearer {}", f.key))
+        .await
+        .json();
+    let ids: Vec<&str> = models["data"].as_array().unwrap().iter().filter_map(|m| m["id"].as_str()).collect();
+    assert!(ids.contains(&"policy") && ids.contains(&"policy:fast"), "{ids:?}");
+    assert!(!ids.contains(&"policy:standard"));
+
     // Realtime: the alias reaches standard's upstream, alias:fast reaches fast's.
     f.post("chat/completions", "policy", false).await.assert_status_ok();
     assert_eq!(f.last_body().await["model"], "pool-standard");

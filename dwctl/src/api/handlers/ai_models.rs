@@ -278,6 +278,22 @@ pub async fn list_ai_models<P: PoolProvider>(
         .await
         .map_err(|e| database_error("list_accessible_models", e))?;
 
+    // A class-routed model also answers to `alias:<class>` for each class
+    // other than standard; list those beside the model.
+    let class_routes: Vec<(String, String)> = {
+        let model_ids = rows.iter().map(|row| row.get::<uuid::Uuid, _>("id")).collect::<Vec<_>>();
+        sqlx::query_as(
+            "SELECT dm.alias, c.class_key FROM model_serving_classes c
+             JOIN deployed_models dm ON dm.id = c.deployed_model_id
+             WHERE dm.routing_mode = 'class_routes' AND c.class_key <> 'standard' AND dm.id = ANY($1)
+             ORDER BY dm.alias, c.class_key",
+        )
+        .bind(&model_ids)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| database_error("list_class_routes", e))?
+    };
+
     let reasoning_policies = if include_reasoning_capabilities {
         let aliases = rows.iter().map(|row| row.get("alias")).collect::<Vec<String>>();
         Deployments::new(&mut conn)
@@ -335,29 +351,50 @@ pub async fn list_ai_models<P: PoolProvider>(
         Default::default()
     };
 
+    let mut data: Vec<ModelObject> = rows
+        .into_iter()
+        .map(|row| {
+            let id: String = row.get("alias");
+            let supported_reasoning_efforts = include_reasoning_capabilities
+                .then(|| reasoning_policies.get(&id).and_then(|policy| policy.supported_efforts()))
+                .flatten();
+            let (tariffs, cache_pricing) = pricing_models
+                .remove(&id)
+                .map(|model| (model.tariffs, model.cache_pricing))
+                .unwrap_or_default();
+            ModelObject {
+                id,
+                object: "model".to_string(),
+                created: row.get::<Option<i64>, _>("created").unwrap_or_default(),
+                owned_by: "None".to_string(),
+                supported_reasoning_efforts,
+                tariffs,
+                cache_pricing,
+            }
+        })
+        .collect();
+    // Class entries share the model's metadata; their prices are not listed
+    // here yet.
+    let classes: Vec<ModelObject> = class_routes
+        .into_iter()
+        .filter_map(|(alias, class)| {
+            let model = data.iter().find(|model| model.id == alias)?;
+            Some(ModelObject {
+                id: format!("{alias}:{class}"),
+                object: "model".to_string(),
+                created: model.created,
+                owned_by: model.owned_by.clone(),
+                supported_reasoning_efforts: model.supported_reasoning_efforts.clone(),
+                tariffs: None,
+                cache_pricing: None,
+            })
+        })
+        .collect();
+    data.extend(classes);
+    data.sort_by(|a, b| a.id.cmp(&b.id));
+
     Ok(Json(ModelsListResponse {
         object: "list".to_string(),
-        data: rows
-            .into_iter()
-            .map(|row| {
-                let id: String = row.get("alias");
-                let supported_reasoning_efforts = include_reasoning_capabilities
-                    .then(|| reasoning_policies.get(&id).and_then(|policy| policy.supported_efforts()))
-                    .flatten();
-                let (tariffs, cache_pricing) = pricing_models
-                    .remove(&id)
-                    .map(|model| (model.tariffs, model.cache_pricing))
-                    .unwrap_or_default();
-                ModelObject {
-                    id,
-                    object: "model".to_string(),
-                    created: row.get::<Option<i64>, _>("created").unwrap_or_default(),
-                    owned_by: "None".to_string(),
-                    supported_reasoning_efforts,
-                    tariffs,
-                    cache_pricing,
-                }
-            })
-            .collect(),
+        data,
     }))
 }
