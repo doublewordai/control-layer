@@ -487,7 +487,7 @@ pub async fn target_message_handler<T: HttpClient>(
         http.response.status_code = tracing::field::Empty,
         onwards.serving.resolved = tracing::field::Empty,
         onwards.serving.priority = tracing::field::Empty,
-        onwards.serving.targets = tracing::field::Empty,
+        onwards.serving.targets_configured = tracing::field::Empty,
     );
 
     // Extract W3C trace context (traceparent + tracestate) from inbound headers
@@ -736,13 +736,14 @@ pub async fn target_message_handler<T: HttpClient>(
         );
         let span = tracing::Span::current();
         span.record("onwards.serving.resolved", resolution.resolved.as_str());
-        // Customer scheduling hints, recorded apart from the class: the
-        // priority, and whether latency targets were sent.
+        // The customer's configured scheduling hints, recorded apart from
+        // the class. Whether an attempt actually carried them is recorded on
+        // its `onwards.provider_attempt` span (`onwards.hints_sent`).
         if let Some(priority) = resolution.hints.priority {
             span.record("onwards.serving.priority", priority);
         }
         span.record(
-            "onwards.serving.targets",
+            "onwards.serving.targets_configured",
             resolution.hints.ttft_ms.is_some() || resolution.hints.itl_ms.is_some(),
         );
         metrics::counter!(
@@ -1181,6 +1182,7 @@ pub async fn target_message_handler<T: HttpClient>(
             http.response.status_code = tracing::field::Empty,
             onwards.fallback = tracing::field::Empty,
             onwards.pool = tracing::field::Empty,
+            onwards.hints_sent = tracing::field::Empty,
         );
         // Recorded only when a non-default pool served the request, so the
         // field's presence answers "did per-class routing engage here?".
@@ -1347,6 +1349,9 @@ pub async fn target_message_handler<T: HttpClient>(
             && let Some(object) = body.as_object_mut()
         {
             serving_resolution.hints.stamp(object);
+            if !serving_resolution.hints.is_empty() {
+                tracing::Span::current().record("onwards.hints_sent", true);
+            }
             serving::stamp_default_priority(object);
             attempt_body = match serde_json::to_vec(&body) {
                 Ok(bytes) => axum::body::Bytes::from(bytes),

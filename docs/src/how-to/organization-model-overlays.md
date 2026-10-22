@@ -124,8 +124,8 @@ standard; flex uses the batch `1h` tariff. Prefer putting batch prices in the
 all-class `tariffs` list.
 
 `targets` are scheduling hints for this organisation on this model: the priority
-and the time-to-first-token and inter-token-latency targets are sent to
-self-hosted serving members on realtime requests. They change neither the
+and the time-to-first-token and inter-token-latency targets are sent on realtime
+requests to members of kind `dynamo` that accept scheduling fields. They change neither the
 request's class nor its price. The targets are labels the serving stack may use
 for alerting; nothing routes on them.
 

@@ -102,8 +102,9 @@ pub struct OrgModelOverlay {
     /// A virtual model alias from the model catalog.
     pub alias: String,
     /// Scheduling hints for this organisation on this model: priority and
-    /// latency targets sent to self-hosted serving members on realtime
-    /// requests. They change neither the request's class nor its price.
+    /// latency targets sent on realtime requests to `dynamo` members that
+    /// accept scheduling fields. They change neither the request's class nor
+    /// its price.
     #[serde(default)]
     pub targets: Option<ServingPreset>,
     /// Overrides the account's `self_hosted_only` setting on this model.
@@ -1012,6 +1013,53 @@ models:
         let org: Uuid=sqlx::query_scalar("INSERT INTO users (username,email,auth_source,user_type) VALUES ('review-org','review@example.com','test','organization') RETURNING id").fetch_one(pool).await.unwrap();
         let model: Uuid=sqlx::query_scalar("INSERT INTO deployed_models (model_name,alias,is_composite,created_by) VALUES ('review-model','review-model',true,$1) RETURNING id").bind(org).fetch_one(pool).await.unwrap();
         (org, model)
+    }
+
+    #[dwctl_test_macros::test]
+    async fn legacy_custom_class_prices_are_retired_on_a_still_declared_model(pool: PgPool) {
+        let (org, model) = review_org_model(&pool).await;
+        // Prices this catalog wrote under `custom` before it was retired.
+        for table in ["model_tariffs", "model_cache_tariffs"] {
+            let insert = if table == "model_tariffs" {
+                "INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,input_price_per_token,output_price_per_token,api_key_purpose,provisioning_source) VALUES ($1,$2,'custom','legacy',1,1,'realtime','org-overlays')"
+            } else {
+                "INSERT INTO model_cache_tariffs (deployed_model_id,user_id,serving_class,read_multiplier,write_multiplier_5m,write_multiplier_1h,write_multiplier_24h,min_prefix_tokens,provisioning_source) VALUES ($1,$2,'custom',0.1,1,1,1,1024,'org-overlays')"
+            };
+            sqlx::query(insert).bind(model).bind(org).execute(&pool).await.unwrap();
+        }
+        let directory = tempdir().unwrap();
+        write(
+            directory.path(),
+            "org.yaml",
+            "org: review-org\nmodels:\n  - alias: review-model\n    class_pricing:\n      standard:\n        tariffs:\n          - {name: deal, purpose: realtime, input_per_million_tokens: '1', output_per_million_tokens: '2'}\n",
+        );
+        apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();
+        for table in ["model_tariffs", "model_cache_tariffs"] {
+            let active: Vec<Option<String>> = sqlx::query_scalar(&format!(
+                "SELECT serving_class FROM {table} WHERE user_id = $1 AND valid_until IS NULL ORDER BY serving_class"
+            ))
+            .bind(org)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            let expected: Vec<Option<String>> = if table == "model_tariffs" {
+                vec![Some("standard".into())]
+            } else {
+                vec![]
+            };
+            assert_eq!(
+                active, expected,
+                "{table}: the legacy custom price is retired, the declared one kept"
+            );
+            let retired: i64 = sqlx::query_scalar(&format!(
+                "SELECT count(*) FROM {table} WHERE user_id = $1 AND serving_class = 'custom' AND valid_until IS NOT NULL"
+            ))
+            .bind(org)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(retired, 1, "{table}: history is kept");
+        }
     }
 
     #[dwctl_test_macros::test]

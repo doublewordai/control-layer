@@ -216,9 +216,15 @@ async fn load_overlays_from_db(db: &PgPool) -> Result<OverlaysByAlias, anyhow::E
         if row.priority.is_some() {
             overlay.priority = row.priority;
         }
+        // Only set values override, so a priority-only policy keeps any
+        // targets already on the overlay.
         if row.serving_class.is_some() {
-            overlay.ttft_ms = row.ttft_ms.and_then(|v| u32::try_from(v).ok());
-            overlay.itl_ms = row.itl_ms.and_then(|v| u32::try_from(v).ok());
+            if let Some(ttft) = row.ttft_ms.and_then(|v| u32::try_from(v).ok()) {
+                overlay.ttft_ms = Some(ttft);
+            }
+            if let Some(itl) = row.itl_ms.and_then(|v| u32::try_from(v).ok()) {
+                overlay.itl_ms = Some(itl);
+            }
         }
     }
     Ok(overlays)
