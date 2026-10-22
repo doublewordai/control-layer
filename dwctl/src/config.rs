@@ -242,6 +242,11 @@ pub struct Config {
     /// shadow mode. See [`crate::inference::validation::ValidationConfig`].
     #[serde(default)]
     pub request_validation: crate::inference::validation::ValidationConfig,
+    /// Product-level defaults applied to inference requests that leave a
+    /// field unset, such as the output cap. See
+    /// [`crate::inference::validation::DefaultsConfig`].
+    #[serde(default)]
+    pub request_defaults: crate::inference::validation::DefaultsConfig,
     /// Opt-in sampled jemalloc heap profiling, served on a separate
     /// cluster-internal listener. Off by default. See
     /// [`crate::profiling::HeapProfilingConfig`].
@@ -3501,6 +3506,7 @@ impl Default for Config {
             prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),
             continuation: ContinuationConfig::default(),
             request_validation: Default::default(),
+            request_defaults: Default::default(),
             heap_profiling: crate::profiling::HeapProfilingConfig::default(),
             scheduling: SchedulingConfig::default(),
         }

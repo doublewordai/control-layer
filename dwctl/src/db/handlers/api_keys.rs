@@ -2584,6 +2584,7 @@ mod tests {
             prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),
             continuation: Default::default(),
             request_validation: Default::default(),
+            request_defaults: Default::default(),
             heap_profiling: Default::default(),
             keystore: None,
             scheduling: Default::default(),

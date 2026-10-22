@@ -332,6 +332,9 @@ where
     /// Request validation shared by the inference middleware and batch file
     /// upload, so both enforce the same rules. `None` when disabled.
     pub request_validation: Option<crate::inference::validation::ValidationStage>,
+    /// The product-level output cap given to requests and batch lines that
+    /// set none. `None` when `request_defaults` is disabled.
+    pub output_cap_defaults: Option<crate::inference::validation::OutputCapDefaults>,
     /// Per-key account policy map (ZDR, disabled modalities, toleration
     /// preset), kept fresh by [`crate::sync::key_policy`]. The batch ingest
     /// path reads an account's resolved tolerations from here (its hidden batch
@@ -3807,9 +3810,10 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
     }
 
     // Model metadata for ingress request validation. Unlike the ZDR map, an
-    // empty cache is safe (every rule fails open), so a failed initial load
-    // degrades validation rather than blocking startup.
-    let model_metadata_cache = if config.request_validation.enabled {
+    // empty cache is safe (every rule fails open, and no output cap is
+    // defaulted), so a failed initial load degrades validation rather than
+    // blocking startup.
+    let model_metadata_cache = if config.request_validation.enabled || config.request_defaults.enabled {
         let cache = match crate::sync::model_metadata::initial_cache(&db_pools.write()).await {
             Ok(cache) => cache,
             Err(e) => {
@@ -4702,6 +4706,22 @@ impl Application {
             )
         });
 
+        // Product-level defaults (the output cap), shared by inference requests
+        // and batch file lines.
+        let output_cap_defaults = config.request_defaults.enabled.then(|| {
+            let exact = (config.request_defaults.exact_count_enabled && !config.cache.tokenizer_url.is_empty()).then(|| {
+                crate::inference::validation::exact::ExactCounter::new(
+                    Arc::new(crate::prompt_cache::TokenizerClient::new(config.cache.tokenizer_url.clone())),
+                    std::time::Duration::from_millis(config.request_validation.exact_count_deadline_ms),
+                )
+            });
+            crate::inference::validation::OutputCapDefaults::new(
+                config.request_defaults.clone(),
+                Arc::new(bg_services.model_metadata_cache.clone()),
+                exact,
+            )
+        });
+
         let inference_middleware_state = crate::inference::middleware::InferenceMiddlewareState {
             request_manager: bg_services.request_manager.clone(),
             daemon_id: crate::inference::store::OnwardsDaemonId(onwards_daemon_id),
@@ -4723,6 +4743,7 @@ impl Application {
             keystore: bg_services.keystore.clone(),
             key_policy_cache: bg_services.key_policy_cache.clone(),
             validation: request_validation.clone(),
+            output_cap_defaults: output_cap_defaults.clone(),
             sse_buffer_limit: config.onwards.sse_buffer_limit,
         };
 
@@ -4805,6 +4826,7 @@ impl Application {
             .response_store(response_store)
             .image_normalizer(image_normalizer)
             .maybe_request_validation(request_validation)
+            .maybe_output_cap_defaults(output_cap_defaults)
             .onwards_targets(bg_services.onwards_targets.clone())
             .build();
 

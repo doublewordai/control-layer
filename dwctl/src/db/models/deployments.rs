@@ -241,7 +241,8 @@ pub enum ModelDisplayCategory {
 pub const MODEL_CATALOG_METADATA_MAX_BYTES: usize = 16_384;
 /// Maximum number of keys allowed in the `extra` object.
 pub const MODEL_CATALOG_METADATA_MAX_EXTRA_KEYS: usize = 50;
-/// Upper bound accepted for the `context_window` / `max_output_tokens`
+/// Upper bound accepted for the `context_window` / `max_output_tokens` /
+/// `default_max_tokens`
 /// metadata token counts: a sanity bound that catches typos and unit
 /// mistakes, far above any real model limit.
 pub const MODEL_TOKEN_LIMIT_MAX: i64 = 100_000_000;
@@ -270,6 +271,12 @@ pub struct ModelCatalogMetadata {
     /// the rule.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<i64>,
+
+    /// Output cap given to a request that sets none, overriding the
+    /// product-wide `request_defaults.max_tokens` for this model. It is
+    /// shrunk to fit the room a request's prompt leaves in the context window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_max_tokens: Option<i64>,
 
     /// When the model was released by its provider
     #[serde(skip_serializing_if = "Option::is_none")]

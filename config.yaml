@@ -1045,6 +1045,35 @@ request_validation:
   # so shadow metrics under-count context violations for such files).
   exact_count_max_per_batch_file: 1000
 
+# Product-level request defaults.
+#
+# A chat, completions or responses request that sets no output cap
+# (`max_tokens`, `max_completion_tokens`, `max_output_tokens`) is given
+# `max_tokens`, or the model's catalog `metadata.default_max_tokens`, capped by
+# `metadata.max_output_tokens`. Clients that want longer answers set a higher
+# cap themselves. The default is ours, so it is shrunk to the room the prompt
+# leaves in `metadata.context_window`; a request whose fit cannot be shown (no
+# context window, media input, or a prompt too large to bound without a count
+# that is off or unavailable) is forwarded without a cap, as before. Messages
+# requests always carry `max_tokens`. Outcomes are counted in
+# dwctl_default_max_tokens_total{surface,outcome}.
+request_defaults:
+  # Set via environment: DWCTL_REQUEST_DEFAULTS__ENABLED=false
+  enabled: true
+  # DWCTL_REQUEST_DEFAULTS__MAX_TOKENS; null leaves models without their own
+  # `default_max_tokens` uncapped.
+  max_tokens: 65536
+  # Added to a prompt's byte count for the chat template when deciding without
+  # a count whether the default fits (byte-level BPE never yields more tokens
+  # than bytes).
+  prompt_overhead_tokens: 2048
+  # Left unused when the default is shrunk to an exactly counted prompt.
+  fit_slack_tokens: 256
+  # Count prompts too large to bound by bytes with tokenizer-svc
+  # (cache.tokenizer_url, request_validation.exact_count_deadline_ms) and shrink
+  # the default to fit; off, those requests are left without a cap.
+  exact_count_enabled: false
+
 # Image input normalisation.
 #
 # When enabled, image references in `/v1/chat/completions` and

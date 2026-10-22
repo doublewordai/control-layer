@@ -87,6 +87,10 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     /// request is rejected before it is forwarded or enqueued. `None` when
     /// disabled.
     pub validation: Option<super::validation::ValidationStage>,
+    /// The product-level output cap given to a request that sets none
+    /// (`request_defaults`). Applied after validation, so a client's own
+    /// out-of-range cap is still rejected. `None` when disabled.
+    pub output_cap_defaults: Option<super::validation::OutputCapDefaults>,
     /// Pending-byte limit for an unfinished SSE event (`onwards.sse_buffer_limit`),
     /// used when applying the client's usage choice to a realtime stream.
     pub sse_buffer_limit: usize,
@@ -390,6 +394,14 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             .await
     {
         return rejection;
+    }
+
+    // Give an uncapped request the product default, shrunk to the room its
+    // prompt leaves, so it ends at the same point whichever backend serves it.
+    if let (Some(defaults), Some(surface)) = (&state.output_cap_defaults, surface)
+        && defaults.apply(surface, &mut request_value, None).await.changed()
+    {
+        body_bytes = bytes::Bytes::from(request_value.to_string());
     }
 
     // Parse `service_tier` and `background` from the body.

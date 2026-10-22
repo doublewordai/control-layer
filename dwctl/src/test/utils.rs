@@ -436,6 +436,7 @@ pub fn create_test_config() -> crate::config::Config {
         cache: Default::default(),
         continuation: Default::default(),
         request_validation: Default::default(),
+        request_defaults: Default::default(),
         heap_profiling: Default::default(),
         keystore: None,
     }
