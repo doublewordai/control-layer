@@ -1,6 +1,6 @@
 # Build from the control-layer repository root so Onwards resolves the local
 # workspace crates used by the application.
-FROM rust:1.97.1-slim AS builder
+FROM rust:1.99.1-slim AS builder
 
 RUN apt-get update && apt-get install -y \
     pkg-config \
