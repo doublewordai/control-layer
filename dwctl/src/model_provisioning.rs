@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
 use crate::db::handlers::ModelProvisioning;
-use crate::db::models::deployments::MODEL_TOKEN_LIMIT_MAX;
 use crate::db::models::deployments::AffinityConfig;
+use crate::db::models::deployments::MODEL_TOKEN_LIMIT_MAX;
 
 const PER_MILLION: i64 = 1_000_000;
 

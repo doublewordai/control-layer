@@ -5,8 +5,7 @@ use sqlx_pool_router::PoolProvider;
 use crate::api::models::deployments::{ModelFacets, ModelListResponse, TariffDefinition, TrafficRoutingAction, TrafficRoutingRule};
 use crate::db::models::deployments::{
     AffinityConfig, AimdConfig, LoadBalancingStrategy, MODEL_CATALOG_METADATA_MAX_BYTES, MODEL_CATALOG_METADATA_MAX_EXTRA_KEYS,
-    MODEL_TOKEN_LIMIT_MAX,
-    ModelCatalogMetadata, TrafficRuleAction,
+    MODEL_TOKEN_LIMIT_MAX, ModelCatalogMetadata, TrafficRuleAction,
 };
 use crate::db::models::tariffs::TariffCreateDBRequest;
 use crate::{
