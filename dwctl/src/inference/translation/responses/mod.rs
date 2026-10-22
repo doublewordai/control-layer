@@ -55,6 +55,7 @@ impl ProtocolTranslator for OpenResponses {
 
     fn translate_request(&self, parts: &Parts, body: Bytes) -> Result<TranslatedRequest, TranslationError> {
         let req: ResponsesRequest = parse_request(&body, DECLARED_FIELDS, "OpenAI Responses")?;
+        validate_reasoning_controls(&req)?;
 
         let chat = request::to_chat_request(&req);
         let new_body = serde_json::to_vec(&chat).map_err(|e| TranslationError::Internal(e.to_string()))?;
@@ -113,12 +114,34 @@ impl ProtocolTranslator for OpenResponses {
     }
 
     fn error_for_param(&self, status: StatusCode, message: &str, param: Option<&str>) -> (StatusCode, Bytes) {
-        (status, openai_error(status, message, param))
+        (status, openai_error(status, message, param, None))
+    }
+
+    fn error_for_code(&self, status: StatusCode, message: &str, param: Option<&str>, code: &str) -> (StatusCode, Bytes) {
+        (status, openai_error(status, message, param, Some(code)))
     }
 
     fn stream_reframer(&self, request: &Bytes, response_id: Option<&str>) -> Box<dyn StreamReframer> {
         Box::new(ResponsesStreamReframer::new(request, response_id))
     }
+}
+
+/// Refuse provider-native thinking fields and malformed `reasoning.effort`
+/// against the Responses surface. Conversion keeps only `reasoning.effort` and
+/// `nvext`, so onwards, which sees the Chat Completions body, can no longer
+/// tell that a native field was sent.
+fn validate_reasoning_controls(req: &ResponsesRequest) -> Result<(), TranslationError> {
+    let mut controls = match &req.extra {
+        Some(Value::Object(extra)) => extra.clone(),
+        _ => serde_json::Map::new(),
+    };
+    if let Some(reasoning) = &req.reasoning {
+        let reasoning = serde_json::to_value(reasoning).map_err(|e| TranslationError::Internal(e.to_string()))?;
+        controls.insert("reasoning".to_string(), reasoning);
+    }
+    onwards::reasoning::validate_canonical_reasoning("/responses", &Value::Object(controls))
+        .map(|_| ())
+        .map_err(TranslationError::Reasoning)
 }
 
 /// Rewrite a `.../responses` path to `.../chat/completions`, preserving any
@@ -232,9 +255,9 @@ const DECLARED_FIELDS: &[&str] = &[
     "web_search_preview",
 ];
 
-/// Build an OpenAI-shaped error envelope (`{"error": {"message", "type", "param"}}`),
-/// the same shape the Responses API returns.
-fn openai_error(status: StatusCode, message: &str, param: Option<&str>) -> Bytes {
+/// Build an OpenAI-shaped error envelope (`{"error": {"message", "type", "param"}}`,
+/// plus `code` when given), the same shape the Responses API returns.
+fn openai_error(status: StatusCode, message: &str, param: Option<&str>, code: Option<&str>) -> Bytes {
     let err_type = match status.as_u16() {
         400 => "invalid_request_error",
         401 => "authentication_error",
@@ -245,14 +268,17 @@ fn openai_error(status: StatusCode, message: &str, param: Option<&str>) -> Bytes
         s if s >= 500 => "server_error",
         _ => "invalid_request_error",
     };
-    let body = serde_json::json!({ "error": { "message": message, "type": err_type, "param": param } });
+    let mut body = serde_json::json!({ "error": { "message": message, "type": err_type, "param": param } });
+    if let Some(code) = code {
+        body["error"]["code"] = Value::from(code);
+    }
     Bytes::from(serde_json::to_vec(&body).unwrap_or_default())
 }
 
 /// Wraps the (dwctl-owned) [`streaming::StreamingState`] in the [`StreamReframer`]
 /// interface: each upstream Chat Completions chunk is fed through `process_chunk`
 /// and the resulting Responses SSE events are serialised out; `finish` flushes
-/// `finalize` (which emits `response.completed`).
+/// `finalize` (which emits `response.completed` or `response.incomplete`).
 struct ResponsesStreamReframer {
     /// `None` only if the (already validated) request failed to re-parse; we then
     /// emit a single terminal error rather than a stream.
@@ -674,6 +700,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["object"], "response");
         assert_eq!(v["status"], "incomplete", "length-capped replies surface as incomplete");
+        assert_eq!(v["incomplete_details"]["reason"], "max_output_tokens");
         assert_eq!(v["model"], "m", "model backfilled from the request");
         assert_eq!(v["output"][0]["role"], "assistant", "missing role defaults to assistant");
         assert_eq!(v["output"][0]["content"][0]["text"], "Hello");
@@ -713,6 +740,49 @@ mod tests {
         assert!(text.contains("Hi"), "missing text delta in:\n{text}");
     }
 
+    /// A stream the output cap ends inside the reasoning (the shape pi used to
+    /// end silently on) must close with `response.incomplete` and a reason.
+    #[tokio::test]
+    async fn length_cut_stream_ends_with_response_incomplete() {
+        async fn fake_chat_sse(_req: Request) -> Response {
+            let sse = concat!(
+                "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"Let me think\"}}]}\n\n",
+                "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+                "data: [DONE]\n\n",
+            );
+            let mut r = Response::new(Body::from(sse));
+            r.headers_mut()
+                .insert(header::CONTENT_TYPE, header::HeaderValue::from_static("text/event-stream"));
+            r
+        }
+
+        let registry = TranslationRegistry::new(vec![Arc::new(OpenResponses::new())]);
+        let inner = Router::new()
+            .route("/responses", post(fake_chat_sse))
+            .layer(axum::middleware::from_fn_with_state(registry, translation_middleware));
+        let server = axum_test::TestServer::new(Router::new().nest("/ai/v1", inner)).expect("test server");
+
+        let response = server
+            .post("/ai/v1/responses")
+            .json(&serde_json::json!({ "model": "m", "input": "hi", "stream": true, "max_output_tokens": 16 }))
+            .await;
+
+        assert_eq!(response.status_code().as_u16(), 200);
+        let text = response.text();
+        assert!(!text.contains("response.completed"), "{text}");
+        let terminal = text
+            .split("\n\n")
+            .filter_map(|frame| frame.lines().find_map(|line| line.strip_prefix("data: ")))
+            .last()
+            .expect("a terminal event");
+        let terminal: serde_json::Value = serde_json::from_str(terminal).unwrap();
+        assert_eq!(terminal["type"], "response.incomplete", "{text}");
+        assert_eq!(terminal["response"]["status"], "incomplete");
+        assert_eq!(terminal["response"]["incomplete_details"]["reason"], "max_output_tokens");
+        assert_eq!(terminal["response"]["output"][0]["type"], "reasoning");
+        assert_eq!(terminal["response"]["output"][0]["status"], "incomplete");
+    }
+
     /// A 2xx body the translator genuinely cannot translate must surface as a
     /// status the batch daemon will NOT retry (it retries >=500, 429, 408 and
     /// 404): the upstream succeeded, so every retry fails identically.
@@ -739,5 +809,73 @@ mod tests {
         assert_eq!(response.status_code().as_u16(), 422);
         let body: serde_json::Value = response.json();
         assert_eq!(body["error"]["message"], "response translation failed");
+    }
+
+    /// The Chat Completions body onwards receives keeps only `reasoning.effort`,
+    /// so provider-native thinking fields must be refused here, with the same
+    /// envelope Chat Completions uses for them.
+    #[tokio::test]
+    async fn native_thinking_fields_are_refused_before_translation() {
+        async fn unreachable_upstream(_req: Request) -> Response {
+            panic!("a refused request must not reach onwards");
+        }
+        let registry = TranslationRegistry::new(vec![Arc::new(OpenResponses::new())]);
+        let inner = Router::new()
+            .route("/responses", post(unreachable_upstream))
+            .layer(axum::middleware::from_fn_with_state(registry, translation_middleware));
+        let server = axum_test::TestServer::new(Router::new().nest("/ai/v1", inner)).expect("test server");
+
+        let cases = [
+            ("reasoning_effort", serde_json::json!("none")),
+            (
+                "chat_template_kwargs.enable_thinking",
+                serde_json::json!({"enable_thinking": false}),
+            ),
+            ("chat_template_kwargs.thinking", serde_json::json!({"thinking": false})),
+            ("chat_template_kwargs", serde_json::json!({"reasoning_effort": "low"})),
+            ("thinking", serde_json::json!({"type": "disabled"})),
+            ("thinking_token_budget", serde_json::json!(128)),
+        ];
+        for (param, value) in cases {
+            let field = param.split('.').next().unwrap();
+            let mut request = serde_json::json!({"model": "gpt-4o", "input": "hello", "reasoning": {"effort": "low"}});
+            request[field] = value;
+
+            let response = server.post("/ai/v1/responses").json(&request).await;
+
+            assert_eq!(response.status_code().as_u16(), 400, "{param}");
+            let body: serde_json::Value = response.json();
+            assert_eq!(body["error"]["type"], "invalid_request_error", "{param}: {body}");
+            assert_eq!(body["error"]["code"], "unsupported_parameter", "{param}: {body}");
+            assert_eq!(body["error"]["param"], param, "{body}");
+            assert_eq!(
+                body["error"]["message"],
+                format!("Unsupported parameter '{param}'; use 'reasoning.effort'."),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_invalid_reasoning_effort_is_named_by_its_responses_path() {
+        let error = match refusal(br#"{"model":"gpt-4o","input":"hello","reasoning":{"effort":"ultra"}}"#) {
+            TranslationError::Reasoning(error) => error,
+            other => panic!("expected a reasoning refusal, got {other:?}"),
+        };
+        assert_eq!(error.param(), Some("reasoning.effort"));
+        assert_eq!(error.code(), "invalid_value");
+    }
+
+    #[test]
+    fn canonical_reasoning_and_nvext_still_translate() {
+        let (parts, ()) = axum::http::Request::builder().uri("/v1/responses").body(()).unwrap().into_parts();
+        let body =
+            br#"{"model":"gpt-4o","input":"hello","reasoning":{"effort":"none","summary":"auto"},"nvext":{"routing_constraints":{}}}"#;
+
+        let out = OpenResponses::new().translate_request(&parts, Bytes::from_static(body)).unwrap();
+
+        let chat: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(chat["reasoning_effort"], "none");
+        assert!(chat.get("nvext").is_some(), "{chat}");
     }
 }

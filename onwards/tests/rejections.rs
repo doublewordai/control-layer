@@ -162,28 +162,6 @@ async fn completions_parameter_refusals_are_counted() {
 }
 
 #[tokio::test]
-async fn serving_class_suffixes_are_counted_under_the_alias() {
-    let alias = "suffixed-rejection-model";
-    let mock = MockHttpClient::new(StatusCode::OK, COMPLETION);
-    let server = strict_server(alias, mock.clone());
-
-    let response = server
-        .post("/completions")
-        .json(&json!({
-            "model": format!("{alias}:interactive"),
-            "prompt": "Hi",
-            "reasoning_effort": "low"
-        }))
-        .await;
-
-    response.assert_status(StatusCode::BAD_REQUEST);
-    assert_eq!(
-        count(&[("model", alias), ("code", "unsupported_parameter")]),
-        Some(1.0)
-    );
-}
-
-#[tokio::test]
 async fn responses_schema_errors_keep_the_model() {
     let alias = "responses-schema-model";
     let mock = MockHttpClient::new(StatusCode::OK, "{}");
@@ -213,7 +191,7 @@ async fn responses_bodies_not_sent_as_json_are_counted_as_such() {
         .text(json!({"model": alias, "input": "Hello"}).to_string())
         .await;
 
-    response.assert_status(StatusCode::BAD_REQUEST);
+    response.assert_status(StatusCode::UNSUPPORTED_MEDIA_TYPE);
     assert!(mock.get_requests().is_empty());
     assert_eq!(
         count(&[("model", alias), ("code", "invalid_content_type")]),

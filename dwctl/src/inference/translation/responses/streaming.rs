@@ -14,7 +14,8 @@
 //! 5. `response.output_item.done` - Item finished
 //!
 //! At the end of the response:
-//! 6. `response.completed` - Full response complete
+//! 6. `response.completed` - Full response complete, or `response.incomplete`
+//!    when the answer was cut short (output cap or content filter)
 
 use onwards::strict::schemas::chat_completions::{ChatCompletionChunk, ChunkChoice};
 use serde::{Deserialize, Serialize};
@@ -23,10 +24,11 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::types::{
-    ContentPart, FunctionCallItem, Include, Item, ItemStatus, MessageContent, MessageItem, ReasoningContent, ReasoningItem, ResponseStatus,
-    ResponseUsage, ResponsesRequest, ResponsesResponse, SummaryContent, TextConfig, TextFormat, TruncationStrategy,
+    ContentPart, FunctionCallItem, Include, IncompleteDetails, Item, ItemStatus, MessageContent, MessageItem, ReasoningContent,
+    ReasoningItem, ResponseStatus, ResponseUsage, ResponsesRequest, ResponsesResponse, SummaryContent, TextConfig, TextFormat,
+    TruncationStrategy,
 };
-use super::util::{cache_write_tokens, chat_usage_to_response_usage, merge_reasoning_text};
+use super::util::{cache_write_tokens, chat_usage_to_response_usage, incomplete_reason, merge_reasoning_text};
 
 /// State machine for tracking streaming response state
 #[derive(Debug, Clone)]
@@ -57,6 +59,8 @@ pub struct StreamingState {
     fn_call_item_for: HashMap<(usize, usize), usize>,
     /// Maps choice_index → items-vec index for reasoning items
     reasoning_item_for_choice: HashMap<usize, usize>,
+    /// Why the current iteration's answer was cut short, if it was
+    incomplete_reason: Option<&'static str>,
 }
 
 /// The inner content of a streaming output item
@@ -128,6 +132,7 @@ impl StreamingState {
             msg_item_for_choice: HashMap::new(),
             fn_call_item_for: HashMap::new(),
             reasoning_item_for_choice: HashMap::new(),
+            incomplete_reason: None,
         }
     }
 
@@ -160,7 +165,14 @@ impl StreamingState {
         // Check for finish_reason to emit done events
         for choice in &chunk.choices {
             if choice.finish_reason.is_some() {
-                let done_events = self.finalize_for_choice(choice.index as usize);
+                let reason = incomplete_reason(choice.finish_reason.as_deref());
+                self.incomplete_reason = self.incomplete_reason.or(reason);
+                let status = if reason.is_some() {
+                    ItemStatus::Incomplete
+                } else {
+                    ItemStatus::Completed
+                };
+                let done_events = self.finalize_for_choice(choice.index as usize, status);
                 events.extend(done_events);
             }
         }
@@ -176,20 +188,19 @@ impl StreamingState {
         }
     }
 
-    /// Finalize the response and emit completion event
+    /// Finalize the response and emit the terminal event
     pub fn finalize(&mut self) -> Vec<StreamingEvent> {
         let mut events = Vec::new();
 
         // Finalize any remaining items
         for i in 0..self.items.len() {
             if self.items[i].status == ItemStatus::InProgress {
-                let done_events = self.finalize_item(i);
+                let done_events = self.finalize_item(i, ItemStatus::Completed);
                 events.extend(done_events);
             }
         }
 
-        // Emit response.completed
-        events.push(self.create_response_completed_event());
+        events.push(self.create_response_terminal_event());
 
         events
     }
@@ -225,6 +236,7 @@ impl StreamingState {
         self.msg_item_for_choice.clear();
         self.fn_call_item_for.clear();
         self.reasoning_item_for_choice.clear();
+        self.incomplete_reason = None;
     }
 
     /// Process a single choice from a chunk
@@ -411,7 +423,7 @@ impl StreamingState {
     }
 
     /// Finalize all items associated with a choice and emit done events
-    fn finalize_for_choice(&mut self, choice_index: usize) -> Vec<StreamingEvent> {
+    fn finalize_for_choice(&mut self, choice_index: usize, status: ItemStatus) -> Vec<StreamingEvent> {
         let mut indices: Vec<usize> = Vec::new();
         if let Some(&idx) = self.reasoning_item_for_choice.get(&choice_index) {
             indices.push(idx);
@@ -431,17 +443,17 @@ impl StreamingState {
 
         let mut events = Vec::new();
         for idx in indices {
-            events.extend(self.finalize_item(idx));
+            events.extend(self.finalize_item(idx, status));
         }
         events
     }
 
     /// Finalize a single item by index and emit done events
-    fn finalize_item(&mut self, index: usize) -> Vec<StreamingEvent> {
+    fn finalize_item(&mut self, index: usize, status: ItemStatus) -> Vec<StreamingEvent> {
         if index >= self.items.len() || self.items[index].status != ItemStatus::InProgress {
             return vec![];
         }
-        self.items[index].status = ItemStatus::Completed;
+        self.items[index].status = status;
 
         match &self.items[index].kind {
             StreamingItemKind::Message { content_part_started, .. } => {
@@ -602,14 +614,14 @@ impl StreamingState {
                     annotations: vec![],
                     logprobs: logprobs.clone(),
                 }]),
-                status: Some(ItemStatus::Completed),
+                status: Some(item.status),
             }),
             StreamingItemKind::FunctionCall { call_id, name, arguments } => Item::FunctionCall(FunctionCallItem {
                 id: Some(item.id.clone()),
                 call_id: call_id.clone(),
                 name: name.clone(),
                 arguments: arguments.clone(),
-                status: Some(ItemStatus::Completed),
+                status: Some(item.status),
             }),
             StreamingItemKind::Reasoning { summary_text, .. } => Item::Reasoning(ReasoningItem {
                 id: Some(item.id.clone()),
@@ -620,7 +632,7 @@ impl StreamingState {
                 summary: Some(vec![SummaryContent::Text {
                     text: summary_text.clone(),
                 }]),
-                status: Some(ItemStatus::Completed),
+                status: Some(item.status),
             }),
         };
         StreamingEvent {
@@ -721,9 +733,14 @@ impl StreamingState {
         }
     }
 
-    fn create_response_completed_event(&mut self) -> StreamingEvent {
+    fn create_response_terminal_event(&mut self) -> StreamingEvent {
+        let event_type = if self.incomplete_reason.is_some() {
+            "response.incomplete"
+        } else {
+            "response.completed"
+        };
         StreamingEvent {
-            event_type: "response.completed".to_string(),
+            event_type: event_type.to_string(),
             data: StreamingEventData::ResponseCompleted {
                 response: self.build_final_response(),
             },
@@ -827,7 +844,16 @@ impl StreamingState {
             })
             .collect();
 
-        self.build_response_snapshot(ResponseStatus::Completed, output, self.usage.clone())
+        let status = if self.incomplete_reason.is_some() {
+            ResponseStatus::Incomplete
+        } else {
+            ResponseStatus::Completed
+        };
+        let mut response = self.build_response_snapshot(status, output, self.usage.clone());
+        response.incomplete_details = self.incomplete_reason.map(|reason| IncompleteDetails {
+            reason: reason.to_string(),
+        });
+        response
     }
 }
 
@@ -1407,6 +1433,70 @@ mod tests {
         } else {
             panic!("Expected ResponseCompleted");
         }
+    }
+
+    /// The output cap ends the turn inside the reasoning, so no message item exists.
+    #[test]
+    fn length_cut_reasoning_only_stream_ends_incomplete() {
+        let mut state = StreamingState::new(&test_request("deepseek-r1"), None);
+        state.process_chunk(&create_reasoning_chunk(
+            "c1",
+            Some("Let me think"),
+            None,
+            None,
+            Some("assistant"),
+            None,
+        ));
+
+        let done_events = state.process_chunk(&create_reasoning_chunk("c2", None, None, None, None, Some("length")));
+        let item_done = done_events
+            .iter()
+            .find(|e| e.event_type == "response.output_item.done")
+            .expect("item done");
+        let StreamingEventData::OutputItemDone {
+            item: Item::Reasoning(reasoning),
+            ..
+        } = &item_done.data
+        else {
+            panic!("expected a reasoning item, got {:?}", item_done.data);
+        };
+        assert_eq!(reasoning.status, Some(ItemStatus::Incomplete));
+
+        let final_events = state.finalize();
+        assert!(final_events.iter().all(|e| e.event_type != "response.completed"));
+        let terminal = final_events.last().expect("terminal event");
+        assert_eq!(terminal.event_type, "response.incomplete");
+        let StreamingEventData::ResponseCompleted { response } = &terminal.data else {
+            panic!("expected a response snapshot, got {:?}", terminal.data);
+        };
+        assert_eq!(response.status, ResponseStatus::Incomplete);
+        assert_eq!(
+            response.incomplete_details.as_ref().map(|d| d.reason.as_str()),
+            Some("max_output_tokens")
+        );
+        assert_eq!(response.completed_at, None);
+    }
+
+    #[test]
+    fn tool_call_stream_ends_completed() {
+        let mut state = StreamingState::new(&test_request("gpt-4"), None);
+        state.process_chunk(&create_tool_call_chunk(
+            "c1",
+            Some("assistant"),
+            Some("call_1"),
+            Some("get_weather"),
+            Some("{}"),
+            None,
+        ));
+        state.process_chunk(&create_tool_call_chunk("c2", None, None, None, None, Some("tool_calls")));
+
+        let terminal = state.finalize().pop().expect("terminal event");
+        assert_eq!(terminal.event_type, "response.completed");
+        let StreamingEventData::ResponseCompleted { response } = &terminal.data else {
+            panic!("expected a response snapshot, got {:?}", terminal.data);
+        };
+        assert_eq!(response.status, ResponseStatus::Completed);
+        assert!(response.incomplete_details.is_none());
     }
 
     #[test]

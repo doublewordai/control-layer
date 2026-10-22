@@ -144,7 +144,7 @@ impl<'c> Organizations<'c> {
                    is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,
                    low_balance_notification_sent, low_balance_threshold,
                    auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, invoicing_enabled, zero_data_retention,
-                   granted_serving_classes, default_serving_class, self_hosted_only, toleration_preset
+                   self_hosted_only, toleration_preset
             FROM users
             WHERE (username = $1 OR username LIKE $1 || '~%')
               AND user_type = 'organization'
@@ -214,8 +214,6 @@ impl<'c> Organizations<'c> {
                     verified: r.verified,
                     invoicing_enabled: r.invoicing_enabled,
                     zero_data_retention: r.zero_data_retention,
-                    granted_serving_classes: r.granted_serving_classes,
-                    default_serving_class: r.default_serving_class,
                     self_hosted_only: r.self_hosted_only,
                     toleration_preset: r.toleration_preset,
                 }))
@@ -332,7 +330,7 @@ impl<'c> Organizations<'c> {
                       is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,
                       low_balance_notification_sent, low_balance_threshold,
                       auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, invoicing_enabled, zero_data_retention,
-                   granted_serving_classes, default_serving_class, self_hosted_only, toleration_preset
+                   self_hosted_only, toleration_preset
             "#,
             org_id,
             request.name,
@@ -393,8 +391,6 @@ impl<'c> Organizations<'c> {
             verified: row.verified,
             invoicing_enabled: row.invoicing_enabled,
             zero_data_retention: row.zero_data_retention,
-            granted_serving_classes: row.granted_serving_classes,
-            default_serving_class: row.default_serving_class,
             self_hosted_only: row.self_hosted_only,
             toleration_preset: row.toleration_preset,
         })
@@ -434,14 +430,9 @@ impl<'c> Organizations<'c> {
                     ELSE low_balance_notification_sent
                 END,
                 zero_data_retention = COALESCE($8, zero_data_retention),
-                default_serving_class = CASE
-                    WHEN $9::boolean THEN $10
-                    ELSE default_serving_class
-                END,
-                self_hosted_only = COALESCE($11, self_hosted_only),
-                granted_serving_classes = COALESCE($12, granted_serving_classes),
+                self_hosted_only = COALESCE($9, self_hosted_only),
                 toleration_preset = CASE
-                    WHEN $13::boolean THEN $14
+                    WHEN $10::boolean THEN $11
                     ELSE toleration_preset
                 END,
                 updated_at = NOW()
@@ -451,7 +442,7 @@ impl<'c> Organizations<'c> {
                       batch_notifications_enabled, first_batch_email_sent,
                       low_balance_notification_sent, low_balance_threshold,
                       auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, invoicing_enabled, zero_data_retention,
-                   granted_serving_classes, default_serving_class, self_hosted_only, toleration_preset
+                   self_hosted_only, toleration_preset
             "#,
             id,
             request.display_name,
@@ -461,10 +452,7 @@ impl<'c> Organizations<'c> {
             request.low_balance_threshold.is_some() as bool,
             request.low_balance_threshold.flatten(),
             request.zero_data_retention,
-            request.default_serving_class.is_some(),
-            request.default_serving_class.clone().flatten(),
             request.self_hosted_only,
-            request.granted_serving_classes.as_deref(),
             request.toleration_preset.is_some() as bool,
             request.toleration_preset.clone().flatten(),
         )
@@ -502,8 +490,6 @@ impl<'c> Organizations<'c> {
             verified: row.verified,
             invoicing_enabled: row.invoicing_enabled,
             zero_data_retention: row.zero_data_retention,
-            granted_serving_classes: row.granted_serving_classes,
-            default_serving_class: row.default_serving_class,
             self_hosted_only: row.self_hosted_only,
             toleration_preset: row.toleration_preset,
         })
@@ -1593,9 +1579,7 @@ mod tests {
                     batch_notifications_enabled: None,
                     low_balance_threshold: None,
                     zero_data_retention: None,
-                    default_serving_class: None,
                     self_hosted_only: None,
-                    granted_serving_classes: Default::default(),
                     toleration_preset: Default::default(),
                 },
             )
@@ -1640,9 +1624,7 @@ mod tests {
                     batch_notifications_enabled: None,
                     low_balance_threshold: None,
                     zero_data_retention: None,
-                    default_serving_class: None,
                     self_hosted_only: None,
-                    granted_serving_classes: Default::default(),
                     toleration_preset: Default::default(),
                 },
             )
@@ -1690,9 +1672,7 @@ mod tests {
                     batch_notifications_enabled: Some(true),
                     low_balance_threshold: Some(Some(10.0)),
                     zero_data_retention: None,
-                    default_serving_class: None,
                     self_hosted_only: None,
-                    granted_serving_classes: Default::default(),
                     toleration_preset: Default::default(),
                 },
             )
@@ -1714,9 +1694,7 @@ mod tests {
                     batch_notifications_enabled: None,
                     low_balance_threshold: Some(Some(25.0)),
                     zero_data_retention: None,
-                    default_serving_class: None,
                     self_hosted_only: None,
-                    granted_serving_classes: Default::default(),
                     toleration_preset: Default::default(),
                 },
             )
@@ -1739,9 +1717,7 @@ mod tests {
                     batch_notifications_enabled: None,
                     low_balance_threshold: Some(None),
                     zero_data_retention: None,
-                    default_serving_class: None,
                     self_hosted_only: None,
-                    granted_serving_classes: Default::default(),
                     toleration_preset: Default::default(),
                 },
             )
@@ -1762,9 +1738,7 @@ mod tests {
                     batch_notifications_enabled: None,
                     low_balance_threshold: None,
                     zero_data_retention: None,
-                    default_serving_class: None,
                     self_hosted_only: None,
-                    granted_serving_classes: Default::default(),
                     toleration_preset: Default::default(),
                 },
             )

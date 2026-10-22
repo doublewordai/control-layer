@@ -89,24 +89,9 @@ export function ModelPricing({
   const orgCache = (organization ? (own.data?.cache_tariffs ?? []) : []).filter(
     (row) => row.deployed_model_id === model.id,
   );
-  const selectedOverlay = own.data?.overlays.find(
-    (row) => row.deployed_model_id === model.id,
-  );
-  const classes = organization
-    ? [
-        ...new Set([
-          "standard",
-          ...Object.keys(model.serving_classes ?? {}),
-          ...(selectedOverlay?.targets ? ["custom"] : []),
-          ...rows
-            .filter((row) => row.organization_id === organization)
-            .flatMap((row) => (row.serving_class ? [row.serving_class] : [])),
-          ...orgCache.flatMap((row) =>
-            row.serving_class ? [row.serving_class] : [],
-          ),
-        ]),
-      ]
-    : ["standard"];
+  // Requests are priced by the class they are routed to; every model has
+  // `standard`, and prices under any other class name are never selected.
+  const classes = ["standard"];
   const windows = [
     ...new Set([
       ...(model.allowed_batch_completion_windows ?? []),
@@ -137,20 +122,6 @@ export function ModelPricing({
               : "All classes"
         }
         source={`${priceSource(row, !!organization)}${purpose !== "realtime" && row?.api_key_purpose === "realtime" ? " · realtime fallback" : ""}`}
-        note={
-          purpose !== "batch" &&
-          cls !== "standard" &&
-          cls !== "custom" &&
-          own.data
-            ? !model.serving_classes?.[cls]
-              ? "Not offered by this model"
-              : !own.data.granted_serving_classes.includes(
-                    cls as "interactive" | "throughput",
-                  )
-                ? "Not granted to this organisation"
-                : undefined
-            : undefined
-        }
       />
     );
   };
@@ -354,31 +325,6 @@ export function ModelPricing({
           </section>
           <section
             className="border-t pt-6 space-y-3"
-            aria-label="Serving classes"
-          >
-            <h3 className="text-sm font-medium">Serving classes</h3>
-            {Object.keys(model.serving_classes ?? {}).length ? (
-              <div className="grid gap-3 sm:grid-cols-3">
-                {Object.entries(model.serving_classes ?? {}).map(
-                  ([name, preset]) => (
-                    <div key={name} className="rounded-lg border p-3 text-sm">
-                      <p className="font-medium">{name}</p>
-                      <p className="text-xs text-muted-foreground mt-1">
-                        TTFT {preset.ttft_ms} ms · ITL {preset.itl_ms} ms ·
-                        priority {preset.priority ?? 0}
-                      </p>
-                    </div>
-                  ),
-                )}
-              </div>
-            ) : (
-              <p className="text-sm text-muted-foreground">
-                None offered (standard only).
-              </p>
-            )}
-          </section>
-          <section
-            className="border-t pt-6 space-y-3"
             aria-label="Organisation overlays"
           >
             <h3 className="text-sm font-medium">Organisation overlays</h3>
@@ -479,8 +425,7 @@ function ModelOverlay({
         {name}{" "}
         <span className="font-normal text-muted-foreground">
           ·{" "}
-          {overlay?.default_serving_class ??
-            (overlay?.targets ? "custom targets" : "account defaults")}
+          {overlay?.targets ? "custom targets" : "account defaults"}
         </span>
       </summary>
       {open && (

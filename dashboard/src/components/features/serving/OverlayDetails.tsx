@@ -24,14 +24,8 @@ export function OverlayDetails({
     <div className="space-y-4 text-sm">
       <dl className="grid gap-3 sm:grid-cols-2">
         <div>
-          <dt className="text-muted-foreground">Default class</dt>
-          <dd>
-            {overlay?.targets
-              ? "Custom targets"
-              : overlay?.default_serving_class
-                ? `${overlay.default_serving_class} · model override`
-                : `Inherit account · ${serving.default_serving_class ?? "standard"}`}
-          </dd>
+          <dt className="text-muted-foreground">Scheduling hints</dt>
+          <dd>{overlay?.targets ? "Set (see below)" : "None"}</dd>
         </div>
         <div>
           <dt className="text-muted-foreground">Self-hosted only</dt>
@@ -42,12 +36,6 @@ export function OverlayDetails({
           </dd>
         </div>
         <div>
-          <dt className="text-muted-foreground">Account class grants</dt>
-          <dd>
-            {serving.granted_serving_classes.join(", ") || "Standard only"}
-          </dd>
-        </div>
-        <div>
           <dt className="text-muted-foreground">Configuration source</dt>
           <dd className="break-all">
             {overlay?.provisioning_source ?? "Not catalog managed"}
@@ -55,7 +43,7 @@ export function OverlayDetails({
         </div>
         {overlay?.targets && (
           <div>
-            <dt className="text-muted-foreground">Explicit targets</dt>
+            <dt className="text-muted-foreground">Priority and latency targets</dt>
             <dd>
               TTFT {overlay.targets.ttft_ms} ms · ITL {overlay.targets.itl_ms}{" "}
               ms · priority {overlay.targets.priority ?? 0}

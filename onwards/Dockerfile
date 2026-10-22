@@ -1,6 +1,6 @@
 # Build from the control-layer repository root so Onwards resolves the local
 # workspace crates used by the application.
-FROM rust:1.97.1-slim AS builder
+FROM rust:1.99.1-slim AS builder
 
 RUN apt-get update && apt-get install -y \
     pkg-config \
@@ -19,9 +19,15 @@ COPY openai-reassembler/ openai-reassembler/
 
 RUN cargo build --locked --release --package onwards
 
-FROM ubuntu:26.04
+FROM ubuntu:26.04 AS runtime
 
+# The ca-certificates version guard fails the build if the apt mirror would
+# install a CA bundle older than USN-8944-1 (October 2026), which removed the
+# "emSign ECC Root CA - G3" root after eMudhra intermediate CA keys were
+# compromised. Onwards verifies every upstream model provider against this
+# bundle. Newer versions pass the check unchanged.
 RUN apt-get update && apt-get install -y ca-certificates \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20260816ubuntu0.26.04.1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

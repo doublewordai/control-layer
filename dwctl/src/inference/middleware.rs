@@ -177,26 +177,13 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(|s| s.to_string());
 
-    // An operator can pin an account to a scheduling-toleration preset: every
-    // request from the account then carries exactly the preset's list at
-    // `nvext.routing_constraints.tolerations`, replacing anything the client
-    // sent (stripped by `strip_scheduling_priority` above). The preset id is
-    // resolved against config through the per-key policy map, so this covers
-    // realtime, flex and background alike; batch JSONL files are scrubbed and
-    // stamped at ingest. The "Default" setting and every unpinned account are
+    // Asynchronous requests are scheduled by their deadline, so a model
+    // suffix (`alias:suffix`) is discarded here, at the outermost layer, and
+    // analytics, the prompt cache and billing all key on the bare alias. A
+    // malformed selector is a 400. Realtime model names are passed through
     // unchanged.
-    let scrubbed_pinned = match pinned_tolerations(&state.key_policy_cache, api_key.as_deref()) {
-        Some(tolerations) => set_routing_tolerations(&mut request_value, &tolerations),
-        None => false,
-    };
-
-    // A serving-class suffix (`alias:interactive`) is a request for a class,
-    // not part of the model's identity: strip it here, at the outermost layer,
-    // so analytics, the prompt cache and billing all key on the bare alias,
-    // and hand the class to onwards as a request extension. An unknown class
-    // is a 400 (a typo must not silently change how a request is served).
-    let (requested_class, scrubbed_class) = match strip_serving_class_suffix(&mut request_value, is_daemon_processed) {
-        Ok(result) => result,
+    let scrubbed_suffix = match strip_async_model_suffix(&mut request_value, is_daemon_processed) {
+        Ok(changed) => changed,
         Err(err) => {
             let response = Response::builder()
                 .status(StatusCode::BAD_REQUEST)
@@ -207,8 +194,26 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 ))
                 .unwrap();
             let model = request_value["model"].as_str();
-            return rejections::refuse(&parts, response, "invalid_serving_class", Some("model"), model);
+            return rejections::refuse(&parts, response, "invalid_model_selector", Some("model"), model);
         }
+    };
+
+    // An operator can pin an account to a scheduling-toleration preset, for
+    // all of its models or (through the account catalog) for one model: every
+    // such request then carries exactly the preset's list at
+    // `nvext.routing_constraints.tolerations`, replacing anything the client
+    // sent (stripped by `strip_scheduling_priority` above). Resolved after the
+    // suffix strip, so it keys on the bare alias, through the per-key policy
+    // map; this covers realtime, flex and background alike, and batch JSONL
+    // files are scrubbed and stamped at ingest. The "Default" setting and
+    // every unpinned account are unchanged.
+    let scrubbed_pinned = match pinned_tolerations(
+        &state.key_policy_cache,
+        api_key.as_deref(),
+        request_value["model"].as_str().unwrap_or_default(),
+    ) {
+        Some(tolerations) => set_routing_tolerations(&mut request_value, &tolerations),
+        None => false,
     };
 
     // The realtime path forwards `body_bytes` verbatim and onwards forwards the
@@ -216,7 +221,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // `request_value` only stays removed if the bytes are rebuilt from it.
     // Every scrubber reports whether it changed something; the common case
     // (nothing to scrub, no suffix, no pin) keeps the caller's bytes untouched.
-    let mut body_bytes = if scrubbed_class || scrubbed_ids || scrubbed_scheduling || scrubbed_pinned {
+    let mut body_bytes = if scrubbed_suffix || scrubbed_ids || scrubbed_scheduling || scrubbed_pinned {
         bytes::Bytes::from(request_value.to_string())
     } else {
         body_bytes
@@ -287,6 +292,18 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 "encrypted reasoning item replay is not supported by this Responses API implementation",
                 "unsupported_parameter",
                 "input",
+            );
+        }
+
+        // The edge translation refuses provider-native thinking fields, but
+        // queued and background requests are accepted before it runs. Refuse
+        // them here so the caller gets the 400 instead of a failed response later.
+        if let Err(error) = onwards::reasoning::validate_canonical_reasoning(nested_path, &request_value) {
+            let param = error.param().unwrap_or_default();
+            return refuse(
+                invalid_request_response(error.message(), error.code(), param),
+                error.code(),
+                error.param(),
             );
         }
     }
@@ -590,19 +607,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             // The parsed JSON is no longer needed on the realtime path. Release
             // its strings before the upstream request is held open.
             drop(request_value);
-            let response = handle_realtime(
-                &state,
-                realtime_input,
-                &resp_id,
-                model,
-                background,
-                zdr,
-                requested_class,
-                parts,
-                body_bytes,
-                next,
-            )
-            .await;
+            let response = handle_realtime(&state, realtime_input, &resp_id, model, background, zdr, parts, body_bytes, next).await;
             match client_usage {
                 Some(usage) => super::stream_usage::apply(response, usage, state.sse_buffer_limit),
                 None => response,
@@ -980,7 +985,6 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     model: &str,
     background: bool,
     zdr: bool,
-    requested_class: Option<onwards::ServingClass>,
     parts: axum::http::request::Parts,
     body_bytes: bytes::Bytes,
     next: Next,
@@ -1009,9 +1013,6 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     // Strip the "resp_" prefix — onwards re-adds it.
     let raw_id = resp_id.strip_prefix("resp_").unwrap_or(resp_id);
     let mut req = Request::from_parts(parts, Body::from(body_bytes));
-    if let Some(class) = requested_class {
-        req.extensions_mut().insert(onwards::RequestedServingClass(class));
-    }
     req.headers_mut()
         .insert("x-fusillade-request-id", raw_id.parse().expect("response_id is valid header value"));
     req.headers_mut().insert(
@@ -1116,7 +1117,7 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
 
         match response_store::poll_until_complete(&state.request_manager, resp_id, poll_interval, timeout, state.keystore.as_ref()).await {
             Ok(response_obj) => {
-                let status_code = if response_obj["status"].as_str() == Some("completed") {
+                let status_code = if matches!(response_obj["status"].as_str(), Some("completed" | "incomplete")) {
                     StatusCode::OK
                 } else {
                     // Extract the real HTTP status from the error's code field,
@@ -1300,8 +1301,8 @@ async fn handle_chat_completion_flex_streaming<P: PoolProvider + Clone + Send + 
 /// Symmetric with [`handle_chat_completion_flex_streaming`]: respond-first,
 /// then replay the finished Responses object as the `response.*` SSE event
 /// sequence the live warm path also emits — `response.created` →
-/// `response.completed` on success, `response.created` → `response.failed` on
-/// error. There is no `[DONE]` sentinel on this surface; the terminal event
+/// `response.completed` on success (`response.incomplete` when the answer was
+/// cut short), `response.created` → `response.failed` on error. There is no `[DONE]` sentinel on this surface; the terminal event
 /// is the terminator.
 async fn handle_responses_flex_streaming<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &InferenceMiddlewareState<P>,
@@ -1317,7 +1318,7 @@ async fn handle_responses_flex_streaming<P: PoolProvider + Clone + Send + Sync +
         move |result| match result {
             Ok(detail) => {
                 let response = response_store::detail_to_response_object(detail);
-                if response["status"] == "completed" {
+                if matches!(response["status"].as_str(), Some("completed" | "incomplete")) {
                     response_store::response_object_to_stream_events(&response)
                         .into_iter()
                         .map(|(event, data)| ReplayFrame::named(event, data))
@@ -1502,8 +1503,9 @@ pub(crate) fn strip_scheduling_priority(value: &mut serde_json::Value) -> bool {
 pub(crate) fn pinned_tolerations(
     cache: &crate::sync::key_policy::KeyPolicyCache,
     api_key: Option<&str>,
+    model: &str,
 ) -> Option<std::sync::Arc<serde_json::Value>> {
-    api_key.and_then(|secret| cache.tolerations(secret))
+    api_key.and_then(|secret| cache.tolerations(secret, model))
 }
 
 /// Write `tolerations` to `nvext.routing_constraints.tolerations`, in place,
@@ -1536,25 +1538,25 @@ pub(crate) fn set_routing_tolerations(value: &mut serde_json::Value, tolerations
     true
 }
 
-fn strip_serving_class_suffix(
+/// Discard a model suffix on an asynchronous request, returning whether the
+/// body changed. Realtime requests are left alone.
+fn strip_async_model_suffix(
     value: &mut serde_json::Value,
     asynchronous: bool,
-) -> Result<(Option<onwards::ServingClass>, bool), onwards::serving::InvalidModelSelector> {
+) -> Result<bool, super::model_selector::InvalidModelSelector> {
+    if !asynchronous {
+        return Ok(false);
+    }
     let Some(model) = value.get("model").and_then(|m| m.as_str()) else {
-        return Ok((None, false));
+        return Ok(false);
     };
-    let (alias, suffix) = onwards::serving::split_model_suffix(model)?;
-    let class = if asynchronous {
-        None
-    } else {
-        onwards::serving::split_class_suffix(model)?.1
-    };
+    let (alias, suffix) = super::model_selector::split_model_suffix(model)?;
     let changed = suffix.is_some();
     if changed {
         let alias = alias.to_string();
         value["model"] = serde_json::Value::String(alias);
     }
-    Ok((class, changed))
+    Ok(changed)
 }
 
 #[cfg(test)]
@@ -1609,9 +1611,9 @@ mod tests {
                 },
             )],
         );
-        assert!(pinned_tolerations(&cache, Some("sk-pinned")).is_some());
-        assert!(pinned_tolerations(&cache, Some("sk-other")).is_none());
-        assert!(pinned_tolerations(&cache, None).is_none());
+        assert!(pinned_tolerations(&cache, Some("sk-pinned"), "any/model").is_some());
+        assert!(pinned_tolerations(&cache, Some("sk-other"), "any/model").is_none());
+        assert!(pinned_tolerations(&cache, None, "any/model").is_none());
     }
 
     #[test]
@@ -1650,33 +1652,25 @@ mod tests {
     }
 
     #[test]
-    fn serving_class_suffix_is_stripped_and_returned() {
-        let mut body = serde_json::json!({"model": "zai-org/GLM-5.2:interactive", "messages": []});
-        let class = strip_serving_class_suffix(&mut body, false).unwrap();
-        assert_eq!(class, (Some(onwards::ServingClass::Interactive), true));
-        assert_eq!(body["model"], "zai-org/GLM-5.2", "layers above onwards key on the bare alias");
-
-        let mut body = serde_json::json!({"model": "zai-org/GLM-5.2", "messages": []});
-        assert_eq!(strip_serving_class_suffix(&mut body, false).unwrap(), (None, false));
-        assert_eq!(body["model"], "zai-org/GLM-5.2");
-
-        let mut body = serde_json::json!({"model": "zai-org/GLM-5.2:fast"});
-        let err = strip_serving_class_suffix(&mut body, false).unwrap_err();
-        assert!(err.to_string().contains("'fast'"));
-        assert_eq!(body["model"], "zai-org/GLM-5.2:fast", "an invalid request is left as sent");
-
-        // No model at all (Model-Override header path): nothing to do.
-        let mut body = serde_json::json!({"messages": []});
-        assert_eq!(strip_serving_class_suffix(&mut body, false).unwrap(), (None, false));
+    fn realtime_model_names_are_passed_through_unchanged() {
+        let mut body = serde_json::json!({"model": "org/model:suffix", "messages": []});
+        assert_eq!(strip_async_model_suffix(&mut body, false), Ok(false));
+        assert_eq!(body["model"], "org/model:suffix");
     }
 
     #[test]
-    fn async_suffixes_are_discarded_without_class_validation() {
+    fn async_suffixes_are_discarded_after_a_shape_check() {
         let mut body = serde_json::json!({"model":"m:x-fast"});
-        assert_eq!(strip_serving_class_suffix(&mut body, true).unwrap(), (None, true));
+        assert_eq!(strip_async_model_suffix(&mut body, true), Ok(true));
         assert_eq!(body["model"], "m");
-        let mut body = serde_json::json!({"model":"m:throughput:interactive"});
-        assert!(strip_serving_class_suffix(&mut body, true).is_err());
+        let mut body = serde_json::json!({"model":"m"});
+        assert_eq!(strip_async_model_suffix(&mut body, true), Ok(false));
+        let mut body = serde_json::json!({"model":"m:a:b"});
+        assert!(strip_async_model_suffix(&mut body, true).is_err());
+        assert_eq!(body["model"], "m:a:b", "an invalid request is left as sent");
+        // No model at all (Model-Override header path): nothing to do.
+        let mut body = serde_json::json!({"messages": []});
+        assert_eq!(strip_async_model_suffix(&mut body, true), Ok(false));
     }
 
     #[test]
@@ -2003,5 +1997,48 @@ mod tests {
                 .expect("resolve unknown key"),
             None
         );
+    }
+
+    #[dwctl_test_macros::test]
+    async fn responses_refuse_native_thinking_fields_before_acceptance(pool: sqlx::PgPool) {
+        use crate::api::models::users::Role;
+        use crate::test::utils::{create_test_api_key_for_user, create_test_app, create_test_user};
+
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let key = create_test_api_key_for_user(&pool, user.id).await;
+
+        // Realtime with `background: true` is accepted with a 202 before translation too.
+        let tiers = [
+            (Some("flex"), false),
+            (Some("flex"), true),
+            (Some("background"), true),
+            (None, true),
+            (Some("auto"), true),
+            (Some("priority"), true),
+        ];
+        for (tier, background) in tiers {
+            let mut request = serde_json::json!({
+                "model": "gpt-4",
+                "input": "hi",
+                "background": background,
+                "chat_template_kwargs": {"enable_thinking": false}
+            });
+            if let Some(tier) = tier {
+                request["service_tier"] = tier.into();
+            }
+            let response = server
+                .post("/ai/v1/responses")
+                .add_header("Authorization", &format!("Bearer {}", key.secret))
+                .json(&request)
+                .await;
+
+            assert_eq!(response.status_code().as_u16(), 400, "{tier:?}/{background}: {}", response.text());
+            let body: serde_json::Value = response.json();
+            assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
+            assert_eq!(body["error"]["code"], "unsupported_parameter", "{body}");
+            assert_eq!(body["error"]["param"], "chat_template_kwargs.enable_thinking", "{body}");
+            assert!(body["error"]["message"].as_str().unwrap().contains("reasoning.effort"), "{body}");
+        }
     }
 }

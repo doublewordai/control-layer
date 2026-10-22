@@ -75,8 +75,7 @@ use handlers::{models as models_handler, target_message_handler};
 use models::ExtractedModel;
 pub use rejections::RequestIdentity;
 pub use serving::{
-    AccountServing, ProviderKind, RequestedServingClass, ServingClass, ServingClassOutcome,
-    ServingOverlay, ServingPresets, ServingTargets,
+    AccountServing, ProviderKind, ServingClass, ServingClassOutcome, ServingHints, ServingOverlay,
 };
 
 /// Type alias for response transformation function

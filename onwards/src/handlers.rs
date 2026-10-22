@@ -11,9 +11,7 @@ use crate::errors::{ErrorResponseBody, OnwardsErrorResponse};
 use crate::inflight::{BATCH_INFLIGHT_SCOPE, InflightSlot};
 use crate::models::ListModelResponse;
 use crate::rejections::RejectionContext;
-use crate::serving::{
-    self, ProviderKind, RequestedServingClass, ServingClassOutcome, ServingResolution,
-};
+use crate::serving::{self, ProviderKind, ServingClassOutcome, ServingResolution};
 use crate::sse::SseBufferedStream;
 use crate::target::{ConcurrencyGuard, RequestClass, RoutingAction, Target};
 use axum::{
@@ -356,24 +354,6 @@ pub(crate) struct UpstreamFailureLabels {
     pub(crate) served_by: String,
 }
 
-/// Rewrite the request body's `model` to the bare alias after a class suffix
-/// was stripped. Bodies that do not parse (or carry no `model`) are returned
-/// untouched: the `Model-Override` header path has no body model to rewrite.
-fn rewrite_body_model(body: axum::body::Bytes, alias: &str) -> axum::body::Bytes {
-    if body.is_empty() {
-        return body;
-    }
-    let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body) else {
-        return body;
-    };
-    match parsed.get_mut("model") {
-        Some(model) if model.is_string() => {
-            *model = serde_json::Value::String(alias.to_string());
-            serde_json::to_vec(&parsed).map(Into::into).unwrap_or(body)
-        }
-        _ => body,
-    }
-}
 /// Stable identity of the API key accepted for this request. This is carried
 /// only in the in-process response extensions and is never sent to the client.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -505,8 +485,9 @@ pub async fn target_message_handler<T: HttpClient>(
         otel.name = "onwards.request",
         gen_ai.request.model = tracing::field::Empty,
         http.response.status_code = tracing::field::Empty,
-        onwards.serving.requested = tracing::field::Empty,
         onwards.serving.resolved = tracing::field::Empty,
+        onwards.serving.priority = tracing::field::Empty,
+        onwards.serving.targets_configured = tracing::field::Empty,
     );
 
     // Extract W3C trace context (traceparent + tracestate) from inbound headers
@@ -561,35 +542,6 @@ pub async fn target_message_handler<T: HttpClient>(
                 "Could not parse onwards model from request. 'model' parameter must be supplied in either the body or in the Model-Override header.",
                 Some("model"),
             ));
-        }
-    };
-
-    // A class suffix requests a serving class on the base alias. DWCTL strips
-    // it and hands it over as an extension; standalone callers are parsed here.
-    // Unknown class suffixes are a 400.
-    let suffix_class = req.extensions().get::<RequestedServingClass>().map(|c| c.0);
-    // DWCTL has already split the body selector once. Do not reinterpret its
-    // base alias (e.g. turn nonexistent `model:interactive` into `model`). A
-    // Model-Override header is a separate selector and still needs resolution.
-    let has_model_override = req.headers().get("model-override").and_then(|value| value.to_str().ok()).is_some();
-    let selected_model = if suffix_class.is_some() && !has_model_override {
-        Ok((model_name.as_str(), None))
-    } else {
-        serving::split_class_suffix(&model_name)
-    };
-    let (model_name, suffix_class, body_bytes) = match selected_model {
-        Ok((_, None)) => (model_name, suffix_class, body_bytes),
-        Ok((alias, Some(class))) => {
-            let alias = alias.to_string();
-            let body_bytes = rewrite_body_model(body_bytes, &alias);
-            // The suffix on the selected model string wins over the
-            // extension: the string is the source that took precedence
-            // (a `Model-Override` header over the body), so its class does too.
-            (alias, Some(class), body_bytes)
-        }
-        Err(unknown) => {
-            record_response_status(400);
-            return Err(OnwardsErrorResponse::bad_request(&unknown.to_string(), Some("model")));
         }
     };
 
@@ -755,13 +707,10 @@ pub async fn target_message_handler<T: HttpClient>(
         // If no bearer token, no labels to match — rules are skipped (allow by default)
     }
 
-    // Resolve the serving class: one flat field from the request's suffix,
-    // the owning account's settings (found through the key's `account`
-    // label), the account's overlay on THIS alias and the classes the alias
-    // offers. Done after routing rules so a redirected request is resolved
-    // against the pool that will serve it. Strict: a class named on the
-    // request that the account does not hold, or the alias does not offer,
-    // is refused rather than quietly downgraded.
+    // Resolve the serving policy from the owning account's settings (found
+    // through the key's `account` label) and the account's overlay on THIS
+    // alias. Done after routing rules so a redirected request is resolved
+    // against the pool that will serve it.
     let (account_id, account_name, key_purpose) = bearer_token
         .as_ref()
         .and_then(|token| state.targets.key_labels.get(token))
@@ -780,43 +729,27 @@ pub async fn target_message_handler<T: HttpClient>(
         let overlay = account_id
             .as_deref()
             .and_then(|id| alias_serving.overlays().get(id).cloned());
-        let resolution = match serving::resolve(
-            suffix_class,
+        let resolution = serving::resolve(
             account.as_ref(),
             overlay.as_ref(),
-            &model_name,
-            alias_serving.presets(),
             key_purpose.as_deref(),
-        ) {
-            Ok(resolution) => resolution,
-            Err(rejection) => {
-                debug!("Serving class refused for model '{}': {}", model_name, rejection);
-                metrics::counter!(
-                    "onwards_serving_class_rejections_total",
-                    "model" => model_name.to_string(),
-                )
-                .increment(1);
-                record_response_status(403);
-                return Err(OnwardsErrorResponse::builder()
-                    .body(ErrorResponseBody {
-                        message: rejection.to_string(),
-                        r#type: "invalid_request_error".to_string(),
-                        param: Some("model".to_string()),
-                        code: "serving_class_unavailable".to_string(),
-                    })
-                    .status(StatusCode::FORBIDDEN)
-                    .build());
-            }
-        };
+        );
         let span = tracing::Span::current();
-        if let Some(requested) = resolution.requested {
-            span.record("onwards.serving.requested", requested.as_str());
-        }
         span.record("onwards.serving.resolved", resolution.resolved.as_str());
+        // The customer's configured scheduling hints, recorded apart from
+        // the class. Whether an attempt actually carried them is recorded on
+        // its `onwards.provider_attempt` span (`onwards.hints_sent`).
+        if let Some(priority) = resolution.hints.priority {
+            span.record("onwards.serving.priority", priority);
+        }
+        span.record(
+            "onwards.serving.targets_configured",
+            resolution.hints.ttft_ms.is_some() || resolution.hints.itl_ms.is_some(),
+        );
         metrics::counter!(
             "onwards_serving_class_requests_total",
             "model" => model_name.to_string(),
-            "requested" => resolution.requested.map(|c| c.as_str()).unwrap_or(""),
+            "requested" => "",
             "resolved" => resolution.resolved.as_str(),
         )
         .increment(1);
@@ -1249,6 +1182,7 @@ pub async fn target_message_handler<T: HttpClient>(
             http.response.status_code = tracing::field::Empty,
             onwards.fallback = tracing::field::Empty,
             onwards.pool = tracing::field::Empty,
+            onwards.hints_sent = tracing::field::Empty,
         );
         // Recorded only when a non-default pool served the request, so the
         // field's presence answers "did per-class routing engage here?".
@@ -1394,46 +1328,35 @@ pub async fn target_message_handler<T: HttpClient>(
             };
         }
 
-        // Send the resolved serving targets to a member of kind `dynamo`, the
-        // only serving stack that reads them, as `nvext.router` targets plus
-        // (when the preset carries one) `nvext.agent_hints.priority`. Every
-        // JSON request to a `dynamo` member also carries a priority (unless
-        // the capability strip above refused scheduling fields for it): when
-        // neither the body nor the preset sets one, realtime's 0, so the
-        // dynamo frontend is never left to pick a value for a missing one.
-        // A priority already present is kept, and targets overwrite rather
-        // than remove: this same crate runs again as the hop inside the
-        // serving namespace, with no key policy of its own, and must forward
-        // what the first hop set. Client-supplied targets are scrubbed at
-        // dwctl's ingress, alongside the body priority (the same perimeter
-        // the priority strip relies on).
-        if target.kind == ProviderKind::Dynamo && !attempt_body.is_empty() {
-            match serde_json::from_slice::<serde_json::Value>(&attempt_body) {
-                Ok(mut body) => {
-                    if let Some(object) = body.as_object_mut() {
-                        if let Some(targets) = serving_resolution.targets {
-                            targets.stamp(object);
-                        }
-                        if !scheduling_fields_refused {
-                            serving::stamp_default_priority(object);
-                        }
-                        attempt_body = match serde_json::to_vec(&body) {
-                            Ok(bytes) => axum::body::Bytes::from(bytes),
-                            Err(_) => return LoopAction::Done(Err(OnwardsErrorResponse::internal())),
-                        };
-                    }
-                }
-                // Targets must reach the member; a body that cannot carry
-                // them is refused. Without targets a non-JSON body (a
-                // multipart upload) is forwarded as it came.
-                Err(_) if serving_resolution.targets.is_some() => {
-                    return LoopAction::Done(Err(OnwardsErrorResponse::bad_request(
-                        "Request body must be valid JSON.",
-                        None,
-                    )))
-                }
-                Err(_) => {}
+        // Send the resolved scheduling hints (priority, latency targets) to a
+        // member of kind `dynamo`, the only serving stack that reads them.
+        // They never change the request's class. Every JSON request to a
+        // `dynamo` member also carries a priority (unless the capability strip
+        // above refused scheduling fields for it): when neither the body nor
+        // the hints set one, realtime's 0, so the dynamo frontend is never left
+        // to pick a value for a missing one. A priority already present is
+        // kept, and hints overwrite rather than remove: this same crate runs
+        // again as the hop inside the serving namespace, with no key policy of
+        // its own, and must forward what the first hop set. Client-supplied
+        // values are scrubbed at dwctl's ingress, alongside the body priority
+        // (the same perimeter the priority strip relies on).
+        // A non-JSON body (a multipart upload) carries no hints and is
+        // forwarded as it came.
+        if target.kind == ProviderKind::Dynamo
+            && !scheduling_fields_refused
+            && !attempt_body.is_empty()
+            && let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(&attempt_body)
+            && let Some(object) = body.as_object_mut()
+        {
+            serving_resolution.hints.stamp(object);
+            if !serving_resolution.hints.is_empty() {
+                tracing::Span::current().record("onwards.hints_sent", true);
             }
+            serving::stamp_default_priority(object);
+            attempt_body = match serde_json::to_vec(&body) {
+                Ok(bytes) => axum::body::Bytes::from(bytes),
+                Err(_) => return LoopAction::Done(Err(OnwardsErrorResponse::internal())),
+            };
         }
 
         // Build the upstream URI for this target

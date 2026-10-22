@@ -38,7 +38,6 @@ fn create_test_target(model_name: &str, alias: &str, endpoint_url: &str) -> Onwa
         reasoning_translation: None,
         endpoint_url: url::Url::parse(endpoint_url).unwrap(),
         routing_rules: Vec::new(),
-        serving_classes: Default::default(),
         fallback_enabled: false,
         fallback_on_rate_limit: false,
         fallback_on_status: Vec::new(),
@@ -1928,30 +1927,20 @@ async fn test_cache_shape_component_pool_becomes_a_named_pool(pool: sqlx::PgPool
 }
 
 #[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
-async fn test_cache_shape_serving_accounts_overlays_and_offered_classes(pool: sqlx::PgPool) {
-    use onwards::{AccountServing, ProviderKind, ServingClass, ServingOverlay, ServingTargets};
+async fn test_cache_shape_serving_accounts_and_overlays(pool: sqlx::PgPool) {
+    use onwards::{AccountServing, ProviderKind, ServingOverlay};
 
-    // The model offers both elevated classes; user A holds account settings and
-    // an overlay on the model; user B has a bespoke-targets overlay and nothing
-    // else. The default endpoint is marked dynamo, the custom one stays external.
+    // User A holds the self-hosted restriction and an overlay lifting it on the
+    // model; user B has a bespoke-targets overlay and nothing else. The default
+    // endpoint is marked dynamo, the custom one stays external.
+    sqlx::query!("UPDATE users SET self_hosted_only = true WHERE id = '00000000-0000-0000-0000-0000000000a1'")
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query!(
-        r#"UPDATE deployed_models
-           SET serving_classes = '{"interactive": {"ttft_ms": 500, "itl_ms": 20, "priority": 200}, "throughput": {"ttft_ms": 5000, "itl_ms": 100}}'
-           WHERE alias = 'regular-public'"#
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query!(
-        "UPDATE users SET granted_serving_classes = '{interactive}', default_serving_class = 'throughput', self_hosted_only = true WHERE id = '00000000-0000-0000-0000-0000000000a1'"
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query!(
-        r#"INSERT INTO model_overlays (user_id, deployed_model_id, default_serving_class, targets, self_hosted_only)
-           VALUES ('00000000-0000-0000-0000-0000000000a1', '40000000-0000-0000-0000-000000000001', 'interactive', NULL, false),
-                  ('00000000-0000-0000-0000-0000000000b1', '40000000-0000-0000-0000-000000000001', NULL, '{"ttft_ms": 800, "itl_ms": 30}', NULL)"#
+        r#"INSERT INTO model_overlays (user_id, deployed_model_id, targets, self_hosted_only)
+           VALUES ('00000000-0000-0000-0000-0000000000a1', '40000000-0000-0000-0000-000000000001', NULL, false),
+                  ('00000000-0000-0000-0000-0000000000b1', '40000000-0000-0000-0000-000000000001', '{"ttft_ms": 800, "itl_ms": 30}', NULL)"#
     )
     .execute(&pool)
     .await
@@ -1981,52 +1970,36 @@ async fn test_cache_shape_serving_accounts_overlays_and_offered_classes(pool: sq
     assert_eq!(
         *account_a.value(),
         AccountServing {
-            granted: vec![ServingClass::Interactive],
-            default_class: Some(ServingClass::Throughput),
             self_hosted_only: true,
+            ..Default::default()
         }
     );
     assert!(
         targets.accounts.get("00000000-0000-0000-0000-0000000000b1").is_none(),
-        "an account with nothing set is not synced, so its config is byte-identical to before"
+        "an account with nothing set is not synced"
     );
 
-    // Offered presets and the overlays sit on the alias's default pool.
+    // The overlays sit on the alias's default pool.
     let public = targets.targets.get("regular-public").unwrap();
-    let presets = public.value().active_serving_classes();
-    assert_eq!(
-        presets[&ServingClass::Interactive],
-        ServingTargets {
-            ttft_ms: 500,
-            itl_ms: 20,
-            priority: 200
-        }
-    );
-    assert_eq!(presets[&ServingClass::Throughput].priority, 0, "priority defaults to 0");
-    assert_eq!(presets.len(), 2);
     let overlays = public.value().default_pool().overlays();
     assert_eq!(
         overlays["00000000-0000-0000-0000-0000000000a1"],
         ServingOverlay {
-            default_class: Some(ServingClass::Interactive),
-            targets: None,
             self_hosted_only: Some(false),
+            ..Default::default()
         }
     );
     assert_eq!(
         overlays["00000000-0000-0000-0000-0000000000b1"],
+        // Stored targets are scheduling hints, not a class.
         ServingOverlay {
-            default_class: None,
-            targets: Some(ServingTargets {
-                ttft_ms: 800,
-                itl_ms: 30,
-                priority: 0
-            }),
             self_hosted_only: None,
+            priority: Some(0),
+            ttft_ms: Some(800),
+            itl_ms: Some(30),
         }
     );
     let private = targets.targets.get("regular-private").unwrap();
-    assert!(private.value().active_serving_classes().is_empty());
     assert!(private.value().default_pool().overlays().is_empty());
 
     // Provider kind follows the endpoint.
@@ -2035,25 +2008,15 @@ async fn test_cache_shape_serving_accounts_overlays_and_offered_classes(pool: sq
 }
 
 #[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
-async fn test_cache_shape_composite_offered_classes_and_kinds_sit_on_the_default_pool(pool: sqlx::PgPool) {
-    use onwards::{ProviderKind, ServingClass};
+async fn test_cache_shape_composite_kinds_sit_on_the_default_pool(pool: sqlx::PgPool) {
+    use onwards::ProviderKind;
 
-    sqlx::query!(
-        r#"UPDATE deployed_models SET serving_classes = '{"throughput": {"ttft_ms": 5000, "itl_ms": 100}}' WHERE alias = 'composite-priority'"#
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
     sqlx::query!("UPDATE inference_endpoints SET kind = 'dynamo' WHERE id = '30000000-0000-0000-0000-000000000002'")
         .execute(&pool)
         .await
         .unwrap();
     let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
     let composite = targets.targets.get("composite-priority").unwrap();
-    assert_eq!(
-        composite.value().active_serving_classes().keys().copied().collect::<Vec<_>>(),
-        vec![ServingClass::Throughput]
-    );
     let kinds: Vec<ProviderKind> = composite.value().default_pool().providers().iter().map(|p| p.target.kind).collect();
     assert!(
         kinds.contains(&ProviderKind::Dynamo) && kinds.contains(&ProviderKind::External),
@@ -2727,4 +2690,41 @@ async fn batch_capacity_non_positive_falls_back_to_the_default(pool: sqlx::PgPoo
             "batch_capacity={invalid} must fall back to the default"
         );
     }
+}
+
+#[dwctl_test_macros::test]
+async fn a_priority_only_policy_keeps_overlay_targets(pool: sqlx::PgPool) {
+    let user: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO users (username,email,auth_source,user_type) VALUES ('hint-org','hint-org@example.com','test','organization') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let model: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO deployed_models (model_name,alias,is_composite,created_by) VALUES ('hint-model','hint-model',true,$1) RETURNING id",
+    )
+    .bind(user)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO model_overlays (user_id, deployed_model_id, targets) VALUES ($1, $2, '{\"ttft_ms\": 800, \"itl_ms\": 30, \"priority\": 50}')")
+        .bind(user)
+        .bind(model)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO account_model_policies (user_id, deployed_model_id, serving_class, priority) VALUES ($1, $2, 'standard', 400)",
+    )
+    .bind(user)
+    .bind(model)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let overlays = super::load_overlays_from_db(&pool).await.unwrap();
+    let overlay = &overlays["hint-model"][&user.to_string()];
+    assert_eq!(
+        (overlay.priority, overlay.ttft_ms, overlay.itl_ms),
+        (Some(400), Some(800), Some(30))
+    );
 }

@@ -123,9 +123,8 @@ export type Role =
 export type ApiKeyPurpose = "platform" | "realtime" | "batch" | "playground";
 export type TariffApiKeyPurpose = "realtime" | "batch" | "playground";
 
-// Serving classes (operator-only; customers only ever see the model suffix)
-export type ServingClassName = "interactive" | "throughput";
-/** A model's preset for one class: the router targets its requests ask for. */
+/** An organisation's explicit targets on one model: the router targets its
+ *  realtime requests ask for. Operator-only. */
 export interface ServingPreset {
   ttft_ms: number;
   itl_ms: number;
@@ -356,9 +355,6 @@ export interface Model {
   traffic_routing_rules?: TrafficRoutingRule[] | null;
   allowed_batch_completion_windows?: string[] | null;
   metadata?: ModelMetadata | null;
-  /** Serving classes the model offers, keyed by class, each a preset of router targets.
-   *  Only present for platform managers; declared in the model catalog. */
-  serving_classes?: Record<string, ServingPreset>;
 }
 
 /** One organisation's serving overrides on one model (platform managers only). */
@@ -368,7 +364,6 @@ export interface ServingOverlay {
   organization_display_name?: string | null;
   deployed_model_id: string;
   alias: string;
-  default_serving_class?: ServingClassName;
   targets?: ServingPreset;
   self_hosted_only?: boolean;
   provisioning_source?: string;
@@ -389,8 +384,6 @@ export interface OrganizationCacheTariff {
 /** Everything serving-related about one organisation (platform managers only). */
 export interface OrganizationServing {
   organization_id: string;
-  granted_serving_classes: ServingClassName[];
-  default_serving_class?: ServingClassName;
   self_hosted_only: boolean;
   overlays: ServingOverlay[];
   tariffs: ModelTariff[];
@@ -518,8 +511,6 @@ export interface User {
   auto_topup_monthly_limit: number | null; // Monthly spending limit for auto top-ups (null = no limit)
   zero_data_retention: boolean; // Account-wide zero-data-retention flag
   // Serving account settings (platform managers only)
-  granted_serving_classes?: ServingClassName[];
-  default_serving_class?: ServingClassName | null;
   self_hosted_only?: boolean;
   // Scheduling-toleration preset the account is pinned to (platform managers
   // only). null/absent = "Default" (nothing pinned); a string is a configured
@@ -697,8 +688,6 @@ export interface UserUpdateRequest {
   auto_topup_monthly_limit?: number | null; // Set a limit to cap, null to remove limit
   zero_data_retention?: boolean; // Users may update this for their own account
   // Serving account settings: platform managers only (dwctl rejects the whole request otherwise)
-  granted_serving_classes?: ServingClassName[];
-  default_serving_class?: ServingClassName | null;
   self_hosted_only?: boolean;
   // Scheduling-toleration preset to pin the account to: platform managers
   // only. A preset id pins it; null clears the pin ("Default").
@@ -1879,8 +1868,6 @@ export interface OrganizationUpdateRequest {
   low_balance_threshold?: number | null;
   zero_data_retention?: boolean; // Account-wide zero-data-retention flag (admin-only)
   // Serving account settings: platform managers only
-  granted_serving_classes?: ServingClassName[];
-  default_serving_class?: ServingClassName | null;
   self_hosted_only?: boolean;
   /** Replaces the whole set; owner-only. An empty list re-enables everything. */
   disabled_modalities?: Modality[];

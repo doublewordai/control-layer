@@ -1,5 +1,67 @@
 # Changelog
 
+## [15.4.0](https://github.com/doublewordai/control-layer/compare/v15.3.0...v15.4.0) (2026-10-22)
+
+
+### Features
+
+* overlay targets are scheduling hints, not a serving class ([#2087](https://github.com/doublewordai/control-layer/issues/2087)) ([4723cfa](https://github.com/doublewordai/control-layer/commit/4723cfa5453762d1f40e4afe3e6bdf8ffd68e31e))
+
+
+### Bug Fixes
+
+* report truncated Responses output as incomplete (DW-976) ([#2079](https://github.com/doublewordai/control-layer/issues/2079)) ([43e6729](https://github.com/doublewordai/control-layer/commit/43e6729f96e3f2623979e290aa78413e7b747be0))
+
+
+### Miscellaneous
+
+* **deps:** update npm non-major dependencies ([#2066](https://github.com/doublewordai/control-layer/issues/2066)) ([d12f0f9](https://github.com/doublewordai/control-layer/commit/d12f0f9a422d3edd0c71b167e3a7e36364843fab))
+* **deps:** update rust crate rust_decimal to v1.43.0 ([#2063](https://github.com/doublewordai/control-layer/issues/2063)) ([758a753](https://github.com/doublewordai/control-layer/commit/758a7531f880ae88c2378122c641d95c74186a75))
+* **deps:** update rust crate rust-embed to v8.13.0 ([#2064](https://github.com/doublewordai/control-layer/issues/2064)) ([ed7ecfd](https://github.com/doublewordai/control-layer/commit/ed7ecfd1032995819a55c1094f747a64d155378c))
+* **deps:** update rust crate tokio to v1.54.1 ([#2069](https://github.com/doublewordai/control-layer/issues/2069)) ([ee9a165](https://github.com/doublewordai/control-layer/commit/ee9a1651f96cd2b9269110041bd162154ccf194a))
+* **deps:** update rust crate uuid to v1.28.0 ([#2070](https://github.com/doublewordai/control-layer/issues/2070)) ([6a02d72](https://github.com/doublewordai/control-layer/commit/6a02d724f2250fb2064e6be28cbfe16f56b09959))
+* **deps:** update rust docker tag to v1.99.1 ([#2072](https://github.com/doublewordai/control-layer/issues/2072)) ([a07b9de](https://github.com/doublewordai/control-layer/commit/a07b9de12b2dfff14835b96b4f1bd27a472446fa))
+
+## [15.3.0](https://github.com/doublewordai/control-layer/compare/v15.2.0...v15.3.0) (2026-10-22)
+
+
+### Features
+
+* **dwctl:** accept gzip, zstd and br request bodies and compressed batch files (DW-985) ([#2082](https://github.com/doublewordai/control-layer/issues/2082)) ([673a64c](https://github.com/doublewordai/control-layer/commit/673a64c471e3026336803b29e45e228713f87ff2))
+
+
+### Bug Fixes
+
+* answer unreadable request formats with 415, and count content types (DW-985) ([#2083](https://github.com/doublewordai/control-layer/issues/2083)) ([58e3a52](https://github.com/doublewordai/control-layer/commit/58e3a527a892c9a3be0c6b2f20c7b8671babac76))
+* **build:** refresh the image CA bundle after eMudhra intermediate compromise ([#2077](https://github.com/doublewordai/control-layer/issues/2077)) ([ae3442c](https://github.com/doublewordai/control-layer/commit/ae3442c03c4a2ea7c42771499039febc20932a57))
+* **deps:** bump webpki-roots to 1.0.10 to drop the compromised emSign root ([#2078](https://github.com/doublewordai/control-layer/issues/2078)) ([552993e](https://github.com/doublewordai/control-layer/commit/552993e14111f07619e387d68a27d423ff62e34c))
+* **dwctl:** store /v1/messages request bodies as sent (DW-984) ([#2085](https://github.com/doublewordai/control-layer/issues/2085)) ([c4bb16f](https://github.com/doublewordai/control-layer/commit/c4bb16f299f44fe0f3bf900613d22f985862ac5d))
+
+## [15.2.0](https://github.com/doublewordai/control-layer/compare/v15.1.0...v15.2.0) (2026-10-21)
+
+
+### Features
+
+* per-model and per-class toleration presets in account files ([#2081](https://github.com/doublewordai/control-layer/issues/2081)) ([d916973](https://github.com/doublewordai/control-layer/commit/d916973cd77971e79e7088edbc4a3d46b90fd1a0))
+
+## [15.1.0](https://github.com/doublewordai/control-layer/compare/v15.0.0...v15.1.0) (2026-10-21)
+
+
+### Features
+
+* account files carry priority, latency targets and prices ([#2075](https://github.com/doublewordai/control-layer/issues/2075)) ([a2f91a6](https://github.com/doublewordai/control-layer/commit/a2f91a6e2bfad9f67af1a47116aa9e613c1d29dc))
+
+## [15.0.0](https://github.com/doublewordai/control-layer/compare/v14.5.0...v15.0.0) (2026-10-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* retire the serving-class presets, grants and default classes ([#2068](https://github.com/doublewordai/control-layer/issues/2068))
+
+### Code Refactoring
+
+* retire the serving-class presets, grants and default classes ([#2068](https://github.com/doublewordai/control-layer/issues/2068)) ([a28e3b3](https://github.com/doublewordai/control-layer/commit/a28e3b345dad73a30820d3b8498357e9a7d97a94))
+
 ## [14.5.0](https://github.com/doublewordai/control-layer/compare/v14.4.0...v14.5.0) (2026-10-21)
 
 

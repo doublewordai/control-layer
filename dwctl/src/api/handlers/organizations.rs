@@ -2,7 +2,6 @@
 
 use crate::{
     AppState,
-    api::handlers::validate_elevated_serving_class,
     api::models::{
         organizations::{
             AddMemberRequest, ApproveJoinRequestRequest, InviteDetailsResponse, InviteMemberRequest, InviteMemberResponse,
@@ -646,17 +645,11 @@ pub async fn update_organization<P: PoolProvider>(
             resource: format!("zero data retention for organization {id}"),
         });
     }
-    // SECURITY: the serving account settings (granted classes, default class,
-    // routing preference) decide how the organisation's traffic is placed and
-    // prioritised fleet-wide. They are operated by platform managers only,
-    // never by the organisation itself, whatever its role: customers meet
-    // serving classes only as a model suffix. Same rule as the users endpoint.
-    if !can_all
-        && (data.granted_serving_classes.is_some()
-            || data.default_serving_class.is_some()
-            || data.self_hosted_only.is_some()
-            || data.toleration_preset.is_some())
-    {
+    // SECURITY: the serving account settings (routing preference, toleration
+    // preset) decide how the organisation's traffic is placed fleet-wide.
+    // They are operated by platform managers only, never by the organisation
+    // itself, whatever its role. Same rule as the users endpoint.
+    if !can_all && (data.self_hosted_only.is_some() || data.toleration_preset.is_some()) {
         return Err(Error::InsufficientPermissions {
             required: Permission::Allow(Resource::Organizations, Operation::UpdateAll),
             action: Operation::UpdateAll,
@@ -667,14 +660,6 @@ pub async fn update_organization<P: PoolProvider>(
     // rather than silently pinning the workspace to nothing.
     if let Some(Some(preset)) = &data.toleration_preset {
         super::validate_toleration_preset(&state, preset)?;
-    }
-    if let Some(Some(class)) = &data.default_serving_class {
-        validate_elevated_serving_class(class)?;
-    }
-    if let Some(classes) = &data.granted_serving_classes {
-        for class in classes {
-            validate_elevated_serving_class(class)?;
-        }
     }
 
     // SECURITY: same owner-only gate, for the same kind of reason. Auto-join
@@ -865,9 +850,7 @@ pub async fn update_organization<P: PoolProvider>(
         batch_notifications_enabled: data.batch_notifications_enabled,
         low_balance_threshold: data.low_balance_threshold,
         zero_data_retention: data.zero_data_retention,
-        default_serving_class: data.default_serving_class,
         self_hosted_only: data.self_hosted_only,
-        granted_serving_classes: data.granted_serving_classes,
         toleration_preset: data.toleration_preset,
     };
     debug_assert!(
@@ -2978,9 +2961,7 @@ pub async fn confirm_email_change<P: PoolProvider>(
             batch_notifications_enabled: None,
             low_balance_threshold: None,
             zero_data_retention: None,
-            default_serving_class: None,
             self_hosted_only: None,
-            granted_serving_classes: Default::default(),
             toleration_preset: Default::default(),
         };
         org_repo.update(pending.organization_id, &update).await?;
@@ -3657,8 +3638,6 @@ mod tests {
         // Every serving setting is refused to the owner, alone or mixed with
         // an ordinary field; the ordinary field is not applied either.
         for body in [
-            json!({ "granted_serving_classes": ["interactive"] }),
-            json!({ "default_serving_class": "throughput" }),
             json!({ "self_hosted_only": true }),
             json!({ "display_name": "Renamed", "self_hosted_only": true }),
         ] {
@@ -3678,25 +3657,17 @@ mod tests {
         resp.assert_status(axum::http::StatusCode::OK);
         let body = resp.json::<serde_json::Value>();
         assert_ne!(body["display_name"].as_str(), Some("Renamed"), "a refused patch applies nothing");
-        assert_eq!(body["granted_serving_classes"].as_array().map(Vec::len), Some(0));
-        assert_eq!(body["default_serving_class"], serde_json::Value::Null);
         assert_eq!(body["self_hosted_only"].as_bool(), Some(false));
 
-        // A platform manager operates all three.
+        // A platform manager operates it.
         let resp = server
             .patch(&format!("/admin/api/v1/organizations/{org_id}"))
             .add_header(&pm_headers[0].0, &pm_headers[0].1)
             .add_header(&pm_headers[1].0, &pm_headers[1].1)
-            .json(&json!({
-                "granted_serving_classes": ["interactive", "throughput"],
-                "default_serving_class": "throughput",
-                "self_hosted_only": true
-            }))
+            .json(&json!({ "self_hosted_only": true }))
             .await;
         resp.assert_status(axum::http::StatusCode::OK);
         let body = resp.json::<serde_json::Value>();
-        assert_eq!(body["granted_serving_classes"], json!(["interactive", "throughput"]));
-        assert_eq!(body["default_serving_class"].as_str(), Some("throughput"));
         assert_eq!(body["self_hosted_only"].as_bool(), Some(true));
     }
 

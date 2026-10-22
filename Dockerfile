@@ -54,14 +54,22 @@ ENV SQLX_OFFLINE=true
 RUN cargo build --release -p dwctl
 
 # Runtime stage
-FROM ubuntu:24.04
+FROM ubuntu:24.04 AS runtime
 
-# Install runtime dependencies
+# Install runtime dependencies.
+#
+# The ca-certificates version guard fails the build if the apt mirror would
+# install a CA bundle older than USN-8944-1 (October 2026), which removed the
+# "emSign ECC Root CA - G3" root after eMudhra intermediate CA keys were
+# compromised. Every outbound TLS connection from this image (model providers,
+# webhooks, object storage, OTLP) trusts this bundle, so shipping an older one
+# must not be possible. Newer versions pass the check unchanged.
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     curl \
     libxml2 \
     tzdata \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20260816ubuntu0.24.04.1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
