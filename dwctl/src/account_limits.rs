@@ -35,8 +35,6 @@ const ACCOUNT_LIMITS_LOCK: i64 = 0x4457_4143_4354_4c4d;
 /// Ownership marker on policy rows written by this catalog.
 const POLICY_SOURCE: &str = "account-catalog";
 
-/// Classes an account file may configure. Only `standard` exists until
-/// models gain further serving classes.
 /// A class key: lowercase, as the model catalog's `class_routes` keys.
 fn is_class_key(key: &str) -> bool {
     key.bytes().next().is_some_and(|c| c.is_ascii_lowercase())
