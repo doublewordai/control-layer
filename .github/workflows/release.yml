@@ -60,6 +60,10 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           sbom: true
           provenance: true
+          # Always rebuild the runtime stage so OS package updates (notably the
+          # ca-certificates trust store) reach every release instead of being
+          # served from a layer cached by an earlier build.
+          no-cache-filters: runtime
 
       - name: Record build time
         id: build-time-step
@@ -282,6 +286,10 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           sbom: true
           provenance: true
+          # Always rebuild the runtime stage so OS package updates (notably the
+          # ca-certificates trust store) reach every release instead of being
+          # served from a layer cached by an earlier build.
+          no-cache-filters: runtime
 
   promote-onwards-image:
     needs: [onwards-image]
