@@ -47,19 +47,25 @@ pub struct KeyPolicy {
     /// allocating a fresh `String`.
     pub toleration_preset: Option<Arc<str>>,
     /// Per-model preset ids from the account catalog (`account_model_policies`),
-    /// keyed by model alias, each overriding `toleration_preset` for requests to
-    /// that model. A class policy has already been folded over its model's.
-    /// Shared by every key of the account.
+    /// keyed by the model's gateway target (its alias for the standard class,
+    /// `alias:<class>` for any other), each overriding `toleration_preset` for
+    /// requests to it. A model-wide policy is folded under the alias and also
+    /// applies to the model's other classes. Shared by every key of the account.
     pub model_toleration_presets: Option<Arc<HashMap<String, Arc<str>>>>,
 }
 
 impl KeyPolicy {
-    /// The preset id that applies to a request for `model`: the model's (or
-    /// its class's) from the account catalog, else the account's own.
+    /// The preset id that applies to a request for `model` (a model alias,
+    /// or `alias:<class>`): that class's from the account catalog, else the
+    /// model's, else the account's own.
     pub fn toleration_preset_for(&self, model: &str) -> Option<&str> {
-        self.model_toleration_presets
-            .as_ref()
+        let presets = self.model_toleration_presets.as_ref();
+        presets
             .and_then(|presets| presets.get(model))
+            .or_else(|| {
+                let (alias, _class) = model.rsplit_once(':')?;
+                presets.and_then(|presets| presets.get(&model_wide_key(alias)))
+            })
             .or(self.toleration_preset.as_ref())
             .map(|preset| &**preset)
     }
@@ -246,6 +252,13 @@ async fn load(pool: &PgPool) -> Result<HashMap<String, KeyPolicy>, sqlx::Error> 
         .collect())
 }
 
+/// The map key of a model-wide preset, kept apart from the standard target's
+/// so a standard-class preset never leaks to the model's other classes. A
+/// model alias cannot contain a NUL.
+fn model_wide_key(alias: &str) -> String {
+    format!("{alias}\0")
+}
+
 /// Per-model preset ids from the account catalog, for every account or for
 /// one, each account's map shared by `Arc` across its keys. A class row
 /// (`standard`, the only class a request resolves to today) overrides its
@@ -256,12 +269,11 @@ async fn load_model_presets<'c>(
 ) -> Result<HashMap<crate::types::UserId, Arc<HashMap<String, Arc<str>>>>, sqlx::Error> {
     let rows = sqlx::query!(
         r#"
-        SELECT p.user_id, dm.alias, p.toleration_preset AS "toleration_preset!"
+        SELECT p.user_id, dm.alias, p.serving_class, p.toleration_preset AS "toleration_preset!"
         FROM account_model_policies p
         JOIN deployed_models dm ON dm.id = p.deployed_model_id
         WHERE p.toleration_preset IS NOT NULL
           AND dm.deleted = FALSE
-          AND (p.serving_class IS NULL OR p.serving_class = 'standard')
           AND ($1::uuid IS NULL OR p.user_id = $1)
         ORDER BY p.serving_class NULLS FIRST
         "#,
@@ -272,10 +284,21 @@ async fn load_model_presets<'c>(
 
     let mut presets: HashMap<crate::types::UserId, HashMap<String, Arc<str>>> = HashMap::new();
     for row in rows {
-        presets
-            .entry(row.user_id)
-            .or_default()
-            .insert(row.alias, Arc::from(row.toleration_preset));
+        let preset: Arc<str> = Arc::from(row.toleration_preset);
+        let account = presets.entry(row.user_id).or_default();
+        match row.serving_class.as_deref() {
+            // Model-wide: the standard target, and the fallback for other classes.
+            None => {
+                account.insert(model_wide_key(&row.alias), preset.clone());
+                account.insert(row.alias, preset);
+            }
+            Some("standard") => {
+                account.insert(row.alias, preset);
+            }
+            Some(class) => {
+                account.insert(format!("{}:{class}", row.alias), preset);
+            }
+        }
     }
     Ok(presets.into_iter().map(|(account, presets)| (account, Arc::new(presets))).collect())
 }
@@ -612,5 +635,30 @@ mod tests {
             cache.tolerations("sk-retired", "any/model").as_deref(),
             Some(&serde_json::json!([]))
         );
+    }
+
+    #[test]
+    fn class_presets_fall_back_to_the_model_wide_preset_not_the_standard_one() {
+        let policy = |entries: &[(&str, &str)]| KeyPolicy {
+            toleration_preset: Some("account".into()),
+            model_toleration_presets: Some(Arc::new(
+                entries.iter().map(|(k, v)| (k.to_string(), Arc::<str>::from(*v))).collect(),
+            )),
+            ..Default::default()
+        };
+        let wide = model_wide_key("m");
+        let p = policy(&[(wide.as_str(), "wide"), ("m", "wide"), ("m:fast", "fast-only")]);
+        assert_eq!(p.toleration_preset_for("m"), Some("wide"));
+        assert_eq!(p.toleration_preset_for("m:fast"), Some("fast-only"));
+        assert_eq!(
+            p.toleration_preset_for("m:other"),
+            Some("wide"),
+            "a model-wide preset covers every class"
+        );
+        assert_eq!(p.toleration_preset_for("n:fast"), Some("account"));
+        // A standard-class preset stays on standard.
+        let p = policy(&[("m", "standard-only")]);
+        assert_eq!(p.toleration_preset_for("m"), Some("standard-only"));
+        assert_eq!(p.toleration_preset_for("m:fast"), Some("account"));
     }
 }
