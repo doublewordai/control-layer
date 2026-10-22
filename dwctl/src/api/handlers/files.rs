@@ -544,7 +544,82 @@ fn map_batch_normalize_error(e: BatchNormalizeError, line: u64) -> FileUploadErr
     }
 }
 
+/// Counts refused uploads by why they were refused. File uploads don't pass
+/// through the inference stack, so `onwards_rejections_total` never sees them,
+/// and `dwctl_http_requests_total` only has their status.
+const UPLOAD_REJECTIONS: &str = "dwctl_file_upload_rejections_total";
+
+/// Every code [`UPLOAD_REJECTIONS`] counts under: one per [`FileUploadError`]
+/// variant, and the refusals `upload_file` makes before it reads the file.
+const UPLOAD_REJECTION_CODES: &[&str] = &[
+    "not_multipart",
+    "invalid_multipart",
+    "stream_interrupted",
+    "file_too_large",
+    "too_many_requests",
+    "invalid_json",
+    "invalid_utf8",
+    "invalid_compression",
+    "unsupported_compression",
+    "no_file",
+    "empty_file",
+    "model_access_denied",
+    "validation_error",
+    "unprocessable_line",
+    "image_transient",
+    "image_store_failed",
+    "image_access_unavailable",
+    "image_unfetchable",
+    "image_fetch_failed",
+    "invalid_purpose",
+];
+
+/// Describes [`UPLOAD_REJECTIONS`] and registers each code at zero, so the
+/// first refusal of a kind is a visible step for `increase()`.
+pub(crate) fn initialize_upload_rejection_metrics() {
+    metrics::describe_counter!(UPLOAD_REJECTIONS, "File uploads refused, by the reason they were refused");
+    for &code in UPLOAD_REJECTION_CODES {
+        metrics::counter!(UPLOAD_REJECTIONS, "code" => code).increment(0);
+    }
+}
+
+/// Counts an upload refused for `code` and returns `error`.
+fn refuse_upload(code: &'static str, error: Error) -> Error {
+    metrics::counter!(UPLOAD_REJECTIONS, "code" => code).increment(1);
+    error
+}
+
 impl FileUploadError {
+    /// The bounded code this refusal is counted under.
+    fn code(&self) -> &'static str {
+        match self {
+            FileUploadError::StreamInterrupted { .. } => "stream_interrupted",
+            FileUploadError::FileTooLarge { .. } => "file_too_large",
+            FileUploadError::TooManyRequests { .. } => "too_many_requests",
+            FileUploadError::InvalidJson { .. } => "invalid_json",
+            FileUploadError::InvalidUtf8 { .. } => "invalid_utf8",
+            FileUploadError::InvalidCompression { .. } => "invalid_compression",
+            FileUploadError::UnsupportedCompression { .. } => "unsupported_compression",
+            FileUploadError::NoFile => "no_file",
+            FileUploadError::EmptyFile => "empty_file",
+            FileUploadError::ModelAccessDenied { .. } => "model_access_denied",
+            FileUploadError::ValidationError { .. } => "validation_error",
+            FileUploadError::UnprocessableValidationError { .. } => "unprocessable_line",
+            FileUploadError::ImageTransient { .. } => "image_transient",
+            FileUploadError::ImageStoreFailed { .. } => "image_store_failed",
+            FileUploadError::ImageAccessUnavailable { .. } => "image_access_unavailable",
+            FileUploadError::ImageUnfetchable { .. } => "image_unfetchable",
+            FileUploadError::ImageFetchFailed { .. } => "image_fetch_failed",
+            FileUploadError::InvalidPurpose { .. } => "invalid_purpose",
+        }
+    }
+
+    /// Counts the refusal by its code and converts it to its HTTP error.
+    fn into_refusal(self) -> Error {
+        let code = self.code();
+        refuse_upload(code, self.into_http_error())
+    }
+
     /// Convert to the appropriate HTTP error type
     fn into_http_error(self) -> Error {
         match self {
@@ -705,7 +780,7 @@ fn resolve_upload_stream_result(
             };
             if let Some(upload_err) = upload_err {
                 tracing::warn!("File upload aborted with error: {:?}", upload_err);
-                return Err(upload_err.into_http_error());
+                return Err(upload_err.into_refusal());
             }
 
             Err(Error::Internal {
@@ -1194,9 +1269,10 @@ pub async fn upload_file<P: PoolProvider>(
     // Refuse a body that isn't a multipart form before it takes an upload slot.
     // A malformed form (a bad boundary, say) is still a 400 below.
     if !is_multipart_form(request.headers()) {
-        return Err(Error::UnsupportedMediaType {
+        let error = Error::UnsupportedMediaType {
             message: "File uploads must be sent as multipart/form-data, with the file in a `file` field".to_string(),
-        });
+        };
+        return Err(refuse_upload("not_multipart", error));
     }
 
     // Acquire upload permit (if limiter is configured)
@@ -1222,14 +1298,18 @@ pub async fn upload_file<P: PoolProvider>(
         && let Ok(length) = length_str.parse::<u64>()
         && length > max_file_size.saturating_add(MULTIPART_OVERHEAD)
     {
-        return Err(Error::PayloadTooLarge {
+        let error = Error::PayloadTooLarge {
             message: format!("File exceeds the maximum allowed size of {} bytes", max_file_size),
-        });
+        };
+        return Err(refuse_upload("file_too_large", error));
     }
 
     // Extract multipart from request body
-    let multipart = Multipart::from_request(request, &state).await.map_err(|e| Error::BadRequest {
-        message: format!("Invalid multipart request: {}", e),
+    let multipart = Multipart::from_request(request, &state).await.map_err(|e| {
+        let error = Error::BadRequest {
+            message: format!("Invalid multipart request: {}", e),
+        };
+        refuse_upload("invalid_multipart", error)
     })?;
 
     // When in org context, attribute file ownership to the org (not the individual user).
@@ -1377,7 +1457,7 @@ pub async fn upload_file<P: PoolProvider>(
         };
         if let Some(upload_err) = upload_err {
             tracing::warn!("File upload aborted with error: {:?}", upload_err);
-            return upload_err.into_http_error();
+            return upload_err.into_refusal();
         }
 
         // Otherwise it's a fusillade error
@@ -2507,6 +2587,16 @@ mod tests {
         }
     }
 
+    /// The process-wide count of uploads refused for `code`.
+    fn upload_rejections(code: &str) -> u64 {
+        let series = format!(r#"dwctl_file_upload_rejections_total{{code="{code}"}} "#);
+        crate::get_or_install_prometheus_handle()
+            .render()
+            .lines()
+            .find_map(|line| line.strip_prefix(&series))
+            .map_or(0, |count| count.parse().unwrap())
+    }
+
     #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_upload_broken_or_unsupported_compression_names_the_problem(pool: PgPool) {
@@ -2515,10 +2605,21 @@ mod tests {
 
         let truncated_gzip = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xab\x56".to_vec();
         let xz = b"\xfd7zXZ\x00\x00\x04\xe6\xd6\xb4\x46".to_vec();
-        for (content, status, expected) in [
-            (truncated_gzip, axum::http::StatusCode::BAD_REQUEST, "not valid gzip data"),
-            (xz, axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE, "compressed with xz"),
+        for (content, status, expected, code) in [
+            (
+                truncated_gzip,
+                axum::http::StatusCode::BAD_REQUEST,
+                "not valid gzip data",
+                "invalid_compression",
+            ),
+            (
+                xz,
+                axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "compressed with xz",
+                "unsupported_compression",
+            ),
         ] {
+            let before = upload_rejections(code);
             let upload_response = app
                 .post("/ai/v1/files")
                 .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
@@ -2533,6 +2634,7 @@ mod tests {
             upload_response.assert_status(status);
             let body = upload_response.text();
             assert!(body.contains(expected), "{body}");
+            assert_eq!(upload_rejections(code), before + 1, "{code} is counted");
         }
     }
 
@@ -2542,6 +2644,7 @@ mod tests {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
         let line = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4"}}"#;
+        let (not_multipart, invalid_multipart) = (upload_rejections("not_multipart"), upload_rejections("invalid_multipart"));
 
         for content_type in [Some("application/jsonl"), Some("application/x-www-form-urlencoded"), None] {
             let mut request = app
@@ -2566,6 +2669,9 @@ mod tests {
             .bytes(line.as_bytes().to_vec().into())
             .await;
         upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+
+        assert_eq!(upload_rejections("not_multipart"), not_multipart + 3);
+        assert_eq!(upload_rejections("invalid_multipart"), invalid_multipart + 1);
     }
 
     #[dwctl_test_macros::test]
@@ -4184,6 +4290,74 @@ mod tests {
                 assert!(operation.contains("fusillade returned Aborted without an upload error"));
             }
             other => panic!("Expected Internal error, got {other:?}"),
+        }
+    }
+
+    /// The `dwctl_file_upload_rejections_total` lines rendered while `f` ran.
+    fn upload_rejection_lines(f: impl FnOnce()) -> Vec<String> {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, f);
+        handle
+            .render()
+            .lines()
+            .filter(|line| line.starts_with("dwctl_file_upload_rejections_total{"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn test_every_upload_refusal_is_counted_by_its_code() {
+        use super::FileUploadError::*;
+        let s = || "x".to_string();
+        let refusals = [
+            StreamInterrupted { message: s() },
+            FileTooLarge { max: 1 },
+            TooManyRequests { count: 2, max: 1 },
+            InvalidJson { line: 1, error: s() },
+            InvalidUtf8 {
+                line: 1,
+                byte_offset: 0,
+                error: s(),
+            },
+            InvalidCompression {
+                format: "gzip",
+                message: s(),
+            },
+            UnsupportedCompression { format: "xz" },
+            NoFile,
+            EmptyFile,
+            ModelAccessDenied { model: s(), line: 1 },
+            ValidationError { line: 1, message: s() },
+            UnprocessableValidationError { line: 1, message: s() },
+            ImageTransient { line: 1, message: s() },
+            ImageStoreFailed { line: 1, message: s() },
+            ImageAccessUnavailable { line: 1 },
+            ImageUnfetchable { line: 1, message: s() },
+            ImageFetchFailed { line: 1, message: s() },
+            InvalidPurpose { purpose: s() },
+        ];
+        for refusal in refusals {
+            let code = refusal.code();
+            assert!(super::UPLOAD_REJECTION_CODES.contains(&code), "{code} is registered at startup");
+            let lines = upload_rejection_lines(|| {
+                refusal.into_refusal();
+            });
+            assert_eq!(
+                lines,
+                [format!(r#"dwctl_file_upload_rejections_total{{code="{code}"}} 1"#)],
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_upload_rejection_codes_start_at_zero() {
+        let lines = upload_rejection_lines(super::initialize_upload_rejection_metrics);
+        assert_eq!(lines.len(), super::UPLOAD_REJECTION_CODES.len(), "{lines:?}");
+        for code in super::UPLOAD_REJECTION_CODES {
+            let line = format!(r#"dwctl_file_upload_rejections_total{{code="{code}"}} 0"#);
+            assert!(lines.contains(&line), "{line} in {lines:?}");
         }
     }
 
