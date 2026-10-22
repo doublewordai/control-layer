@@ -89,25 +89,9 @@ export function ModelPricing({
   const orgCache = (organization ? (own.data?.cache_tariffs ?? []) : []).filter(
     (row) => row.deployed_model_id === model.id,
   );
-  const selectedOverlay = own.data?.overlays.find(
-    (row) => row.deployed_model_id === model.id,
-  );
-  // Billing resolves to `standard`, or `custom` when the overlay's explicit
-  // targets apply; prices under any other class name are never selected.
-  const classes = organization
-    ? [
-        "standard",
-        ...(selectedOverlay?.targets ||
-        rows.some(
-          (row) =>
-            row.organization_id === organization &&
-            row.serving_class === "custom",
-        ) ||
-        orgCache.some((row) => row.serving_class === "custom")
-          ? ["custom"]
-          : []),
-      ]
-    : ["standard"];
+  // Requests are priced by the class they are routed to; every model has
+  // `standard`, and prices under any other class name are never selected.
+  const classes = ["standard"];
   const windows = [
     ...new Set([
       ...(model.allowed_batch_completion_windows ?? []),

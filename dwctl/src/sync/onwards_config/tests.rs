@@ -1928,7 +1928,7 @@ async fn test_cache_shape_component_pool_becomes_a_named_pool(pool: sqlx::PgPool
 
 #[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_cache_shape_serving_accounts_and_overlays(pool: sqlx::PgPool) {
-    use onwards::{AccountServing, ProviderKind, ServingOverlay, ServingTargets};
+    use onwards::{AccountServing, ProviderKind, ServingOverlay};
 
     // User A holds the self-hosted restriction and an overlay lifting it on the
     // model; user B has a bespoke-targets overlay and nothing else. The default
@@ -1985,21 +1985,18 @@ async fn test_cache_shape_serving_accounts_and_overlays(pool: sqlx::PgPool) {
     assert_eq!(
         overlays["00000000-0000-0000-0000-0000000000a1"],
         ServingOverlay {
-            targets: None,
             self_hosted_only: Some(false),
             ..Default::default()
         }
     );
     assert_eq!(
         overlays["00000000-0000-0000-0000-0000000000b1"],
+        // Stored targets are scheduling hints, not a class.
         ServingOverlay {
-            targets: Some(ServingTargets {
-                ttft_ms: 800,
-                itl_ms: 30,
-                priority: 0
-            }),
             self_hosted_only: None,
-            ..Default::default()
+            priority: Some(0),
+            ttft_ms: Some(800),
+            itl_ms: Some(30),
         }
     );
     let private = targets.targets.get("regular-private").unwrap();

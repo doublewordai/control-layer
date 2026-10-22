@@ -62,28 +62,27 @@ pub struct OrgDocument {
     pub models: Vec<OrgModelOverlay>,
 }
 
-/// Billing follows the resolved outcome: `custom` when the overlay's explicit
-/// targets applied, otherwise `standard`.
+/// A serving class the model routes to. An override prices one of the model's
+/// classes; until models carry more, that is `standard`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PricingClass {
     Standard,
-    Custom,
 }
 impl PricingClass {
-    pub(crate) const ALL: [PricingClass; 2] = [PricingClass::Standard, PricingClass::Custom];
+    pub(crate) const ALL: [PricingClass; 1] = [PricingClass::Standard];
 
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Standard => "standard",
-            Self::Custom => "custom",
         }
     }
 }
 
-/// Class names this catalog may have priced before the serving-class presets
-/// were retired. Rows it owns under them are retired on the next apply.
-const RETIRED_PRICING_CLASSES: [&str; 2] = ["interactive", "throughput"];
+/// Class names this catalog may have priced before they were retired: the
+/// serving-class presets, and `custom`, which overlay targets used to select.
+/// Rows it owns under them are retired on the next apply.
+const RETIRED_PRICING_CLASSES: [&str; 3] = ["interactive", "throughput", "custom"];
 
 pub use crate::model_provisioning::CachePrices;
 
@@ -102,8 +101,9 @@ pub struct ClassPrices {
 pub struct OrgModelOverlay {
     /// A virtual model alias from the model catalog.
     pub alias: String,
-    /// Explicit targets for a bespoke deal on this model, sent as-is to
-    /// self-hosted serving members on realtime requests.
+    /// Scheduling hints for this organisation on this model: priority and
+    /// latency targets sent to self-hosted serving members on realtime
+    /// requests. They change neither the request's class nor its price.
     #[serde(default)]
     pub targets: Option<ServingPreset>,
     /// Overrides the account's `self_hosted_only` setting on this model.
@@ -119,7 +119,8 @@ pub struct OrgModelOverlay {
     /// changes the multipliers this organisation pays.
     #[serde(default)]
     pub cache_tariff: Option<CachePrices>,
-    /// Optional prices for a resolved class, falling back to the general deal.
+    /// Optional prices for one of the model's serving classes, falling back to
+    /// the general deal.
     #[serde(default)]
     pub class_pricing: BTreeMap<PricingClass, ClassPrices>,
 }
@@ -227,14 +228,6 @@ impl OrgCatalog {
                         class.as_str()
                     );
                     validate_tariffs(&prices.tariffs, &context)?;
-                    ensure!(
-                        *class == PricingClass::Standard
-                            || prices
-                                .tariffs
-                                .iter()
-                                .all(|t| !matches!(t.purpose, crate::model_provisioning::TariffPurpose::Batch)),
-                        "{source}: batch prices can only specialize standard"
-                    );
                     if let Some(cache) = &prices.cache_tariff {
                         validate_cache_tariff(&cache.as_tariff(), &context)?;
                     }
@@ -465,11 +458,22 @@ mod tests {
                 "input_per_million_tokens":"1", "output_per_million_tokens":"2"});
             for model in [
                 serde_json::json!({"alias":"m", "tariffs":[tariff.clone()]}),
-                serde_json::json!({"alias":"m", "class_pricing":{"custom":{"tariffs":[tariff.clone()]}}}),
+                serde_json::json!({"alias":"m", "class_pricing":{"standard":{"tariffs":[tariff.clone()]}}}),
             ] {
                 assert!(serde_json::from_value::<OrgDocument>(serde_json::json!({"org":"acme","models":[model]})).is_err());
             }
         }
+    }
+
+    #[test]
+    fn custom_is_not_a_pricing_class() {
+        let tariff = serde_json::json!({"name":"deal", "purpose":"realtime",
+            "input_per_million_tokens":"1", "output_per_million_tokens":"2"});
+        let model = serde_json::json!({"alias":"m", "class_pricing":{"custom":{"tariffs":[tariff]}}});
+        let error = serde_json::from_value::<OrgDocument>(serde_json::json!({"org":"acme","models":[model]}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("custom"), "{error}");
     }
 
     #[test]
@@ -755,7 +759,7 @@ mod tests {
 models:
   - alias: class-model
     class_pricing:
-      custom:
+      standard:
         tariffs:
           - {name: custom, purpose: realtime, input_per_million_tokens: '0', output_per_million_tokens: '1'}
         cache_tariff: {write_multiplier_5m: '1', write_multiplier_1h: '1', write_multiplier_24h: '1', read_multiplier: '0'}
@@ -775,7 +779,7 @@ models:
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(class, "custom");
+        assert_eq!(class, "standard");
         // A missing mount is a no-op, distinct from an explicitly empty mounted catalog.
         apply(&pool, &OrgCatalog::load(directory.path().join("missing")).unwrap())
             .await
@@ -815,7 +819,7 @@ models:
     async fn catalog_rejects_future_manual_price_collisions_atomically(pool: PgPool) {
         let org: Uuid = sqlx::query_scalar("INSERT INTO users (username,email,auth_source,user_type) VALUES ('future-org','future@example.com','test','organization') RETURNING id").fetch_one(&pool).await.unwrap();
         let directory = tempdir().unwrap();
-        for class in [None, Some("custom")] {
+        for class in [None, Some("standard")] {
             for finite in [false, true] {
                 for cache in [false, true] {
                     let alias = format!("future-{}-{finite}-{cache}", class.unwrap_or("all"));
@@ -886,7 +890,7 @@ models:
                         "tariffs:\n  - {name: replacement, purpose: realtime, input_per_million_tokens: '3', output_per_million_tokens: '4'}".to_owned()
                     };
                     let scope = if class.is_some() {
-                        "    class_pricing:\n      custom:\n"
+                        "    class_pricing:\n      standard:\n"
                     } else {
                         ""
                     };
@@ -1086,7 +1090,7 @@ models:
                 directory.path(),
                 "org.yaml",
                 &format!(
-                    "org: review-org\nmodels:\n  - alias: review-model\n    class_pricing:\n      custom:\n        tariffs:\n          - {{name: deal, purpose: realtime, input_per_million_tokens: '{input}', output_per_million_tokens: '2'}}\n"
+                    "org: review-org\nmodels:\n  - alias: review-model\n    class_pricing:\n      standard:\n        tariffs:\n          - {{name: deal, purpose: realtime, input_per_million_tokens: '{input}', output_per_million_tokens: '2'}}\n"
                 ),
             );
             apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();

@@ -1,30 +1,28 @@
-//! Per-request serving policy: overlay targets, scheduling priority and the
-//! self-hosted restriction.
+//! Per-request serving policy: scheduling hints and the self-hosted
+//! restriction.
 //!
-//! An organisation's **overlay** on an alias may carry explicit objective
-//! targets for a bespoke deal: a time-to-first-token target, an
-//! inter-token-latency target and a scheduling priority. When present they are
-//! sent to members of kind `dynamo` and the request resolves as
-//! [`ServingClass::Custom`]; otherwise it resolves as
-//! [`ServingClass::Standard`] and sends no targets.
+//! A request's **serving class** is where it is routed: today every request
+//! resolves as [`ServingClass::Standard`]. A class is a destination on the
+//! model, never a customer setting.
 //!
-//! Separately, an account may carry a scheduling **priority** (account-wide,
-//! or per model on an overlay) and per-model latency targets. These are sent
-//! the same way but leave the request [`ServingClass::Standard`]: they change
-//! scheduling, not the price.
+//! On top of the class, an account may carry **scheduling hints**: a priority
+//! (account-wide, or per alias) and per-alias time-to-first-token and
+//! inter-token-latency targets, from an organisation overlay or the account
+//! catalog. They are sent to members of kind `dynamo` but change neither the
+//! class nor the price. The targets are labels the serving stack may use for
+//! alerting and diagnostics; nothing routes on them.
 //!
 //! Daemon legs (batch and flex on the batch-purpose key, continuation resume
-//! legs) never receive overlay targets or priorities and keep their own:
-//! batch and flex carry deadline-derived priorities, background dispatch the
-//! reserved `i32::MIN`, and continuation resumes their fixed priority.
+//! legs) never receive hints and keep their own priorities: batch and flex
+//! carry deadline-derived priorities, background dispatch the reserved
+//! `i32::MIN`, and continuation resumes their fixed priority.
 //!
 //! The targets travel in the request body as `nvext.router.{ttft_target,
-//! itl_target}` and, when non-zero, the priority as
-//! `nvext.agent_hints.priority`, on members of kind `dynamo` only. A request
-//! to a `dynamo` member that carries no priority is sent
-//! [`DEFAULT_PRIORITY`], so every priority is relative to realtime's 0.
-//! Everything a client could send to steer this itself is scrubbed at dwctl's
-//! ingress; only the resolver sets them.
+//! itl_target}` and the priority as `nvext.agent_hints.priority`, on members
+//! of kind `dynamo` only. A request to a `dynamo` member that carries no
+//! priority is sent [`DEFAULT_PRIORITY`], so every priority is relative to
+//! realtime's 0. Everything a client could send to steer this itself is
+//! scrubbed at dwctl's ingress; only the resolver sets them.
 
 use std::fmt;
 use std::str::FromStr;
@@ -56,22 +54,18 @@ pub const ACCOUNT_NAME_LABEL: &str = "account_name";
 /// [`ACCOUNT_NAME_LABEL`] is used when it is absent.
 pub const ACCOUNT_DISPLAY_NAME_LABEL: &str = "account_display_name";
 
-/// How a request was served, for analytics and tariff selection.
+/// Where a request was routed, for analytics and tariff selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ServingClass {
-    /// No overlay targets applied.
+    /// The model's default destination.
     Standard,
-    /// Explicit targets from an overlay: a bespoke deal on one alias. An
-    /// outcome only, never configuration.
-    Custom,
 }
 
 impl ServingClass {
     pub fn as_str(self) -> &'static str {
         match self {
             ServingClass::Standard => "standard",
-            ServingClass::Custom => "custom",
         }
     }
 }
@@ -82,64 +76,10 @@ impl fmt::Display for ServingClass {
     }
 }
 
-/// The objective targets one request is served to. An overlay may carry them
-/// explicitly for a bespoke deal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ServingTargets {
-    /// Time-to-first-token target, milliseconds.
-    pub ttft_ms: u32,
-    /// Inter-token-latency target, milliseconds.
-    pub itl_ms: u32,
-    /// Scheduling priority on the serving stack (higher wins; 0 is the
-    /// realtime value, sent by [`stamp_default_priority`] instead).
-    #[serde(default)]
-    pub priority: i32,
-}
-
-impl ServingTargets {
-    /// Write the targets into a request body: `nvext.router.{ttft_target,
-    /// itl_target}` always, `nvext.agent_hints.priority` only when non-zero.
-    /// Existing values are overwritten; the rest of `nvext` is kept.
-    pub fn stamp(&self, body: &mut serde_json::Map<String, serde_json::Value>) {
-        let nvext = body
-            .entry(NVEXT_FIELD)
-            .or_insert_with(|| serde_json::Value::Object(Default::default()));
-        if !nvext.is_object() {
-            *nvext = serde_json::Value::Object(Default::default());
-        }
-        let nvext = nvext
-            .as_object_mut()
-            .expect("nvext was just made an object");
-        let router = nvext
-            .entry(NVEXT_ROUTER_FIELD)
-            .or_insert_with(|| serde_json::Value::Object(Default::default()));
-        if !router.is_object() {
-            *router = serde_json::Value::Object(Default::default());
-        }
-        let router = router
-            .as_object_mut()
-            .expect("router was just made an object");
-        router.insert(TTFT_TARGET_FIELD.to_string(), self.ttft_ms.into());
-        router.insert(ITL_TARGET_FIELD.to_string(), self.itl_ms.into());
-        if self.priority != 0 {
-            let hints = nvext
-                .entry(NVEXT_AGENT_HINTS_FIELD)
-                .or_insert_with(|| serde_json::Value::Object(Default::default()));
-            if !hints.is_object() {
-                *hints = serde_json::Value::Object(Default::default());
-            }
-            hints
-                .as_object_mut()
-                .expect("agent_hints was just made an object")
-                .insert(PRIORITY_FIELD.to_string(), self.priority.into());
-        }
-    }
-}
-
 /// Write [`DEFAULT_PRIORITY`] as `nvext.agent_hints.priority` unless the body
 /// already carries a priority. One already present was set by someone
-/// entitled to: the daemon (batch deadline, continuation resume), resolved overlay
-/// targets, or the first hop when this crate runs again inside the serving
+/// entitled to: the daemon (batch deadline, continuation resume), the
+/// resolved hints, or the first hop when this crate runs again inside the serving
 /// namespace; callers' own are scrubbed at dwctl's ingress. The rest of
 /// `nvext` is kept.
 pub fn stamp_default_priority(body: &mut serde_json::Map<String, serde_json::Value>) {
@@ -185,7 +125,7 @@ pub fn scrub_router_targets(nvext: &mut serde_json::Map<String, serde_json::Valu
     removed.iter().any(Option::is_some)
 }
 
-/// What kind of server a provider is. Decides who receives the targets and
+/// What kind of server a provider is. Decides who receives the hints and
 /// who counts as external for a self-hosted-only organisation. Deliberately
 /// its own fact rather than a reading of some other flag (`trusted`,
 /// `accepts_scheduling_priority`): those correlate with it today and mean
@@ -194,11 +134,11 @@ pub fn scrub_router_targets(nvext: &mut serde_json::Map<String, serde_json::Valu
 #[serde(rename_all = "lowercase")]
 pub enum ProviderKind {
     /// Self-hosted, behind the dynamo frontend. The only kind that receives
-    /// the serving targets.
+    /// the scheduling hints.
     Dynamo,
     /// Self-hosted, not behind dynamo.
     Hosted,
-    /// A third-party provider. Never receives the targets; skipped for
+    /// A third-party provider. Never receives the hints; skipped for
     /// self-hosted-only organisations.
     #[default]
     External,
@@ -259,13 +199,10 @@ impl AccountServing {
     }
 }
 
-/// An organisation's per-alias overrides of its account settings. Lives on
-/// the alias's pool spec, keyed by account id.
+/// An account's per-alias overrides of its account settings. Lives on the
+/// alias's pool spec, keyed by account id.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServingOverlay {
-    /// Explicit targets for a bespoke deal on this alias.
-    #[serde(default)]
-    pub targets: Option<ServingTargets>,
     /// Overrides the account's `self_hosted_only` on this alias.
     #[serde(default)]
     pub self_hosted_only: Option<bool>,
@@ -280,8 +217,8 @@ pub struct ServingOverlay {
     pub itl_ms: Option<u32>,
 }
 
-/// Scheduling hints for one request that do not change how it is billed:
-/// each field is written into the body only when set.
+/// Scheduling hints for one request. They change neither its class nor its
+/// price; each field is written into the body only when set.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ServingHints {
     pub priority: Option<i32>,
@@ -343,17 +280,14 @@ impl ServingHints {
 
 /// Key purposes whose requests are daemon legs: the ordering already travels
 /// as a deadline-derived (batch, flex) or fixed (continuation resume)
-/// priority in the body, and no targets are sent.
+/// priority in the body, and no hints are sent.
 const DAEMON_PURPOSES: [&str; 2] = ["batch", "continuation"];
 
 /// The outcome of resolving one request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServingResolution {
     pub resolved: ServingClass,
-    /// What a `dynamo` member is told to serve to; `None` sends nothing.
-    pub targets: Option<ServingTargets>,
-    /// Priority and latency targets that leave the class unchanged. Empty
-    /// whenever `targets` is set.
+    /// Priority and latency targets sent to `dynamo` members.
     pub hints: ServingHints,
     /// Restrict the composite to its non-external members.
     pub self_hosted_only: bool,
@@ -372,7 +306,7 @@ impl ServingResolution {
 ///
 /// * `account` — the owning organisation's settings, if it has any.
 /// * `overlay` — the organisation's overrides on this alias, if any.
-/// * `purpose` — the key's purpose label; daemon purposes get no targets.
+/// * `purpose` — the key's purpose label; daemon purposes get no hints.
 pub fn resolve(
     account: Option<&AccountServing>,
     overlay: Option<&ServingOverlay>,
@@ -383,29 +317,20 @@ pub fn resolve(
         .unwrap_or_else(|| account.is_some_and(|a| a.self_hosted_only));
 
     let daemon = purpose.is_some_and(|p| DAEMON_PURPOSES.contains(&p));
-    match overlay.and_then(|o| o.targets) {
-        Some(targets) if !daemon => ServingResolution {
-            resolved: ServingClass::Custom,
-            targets: Some(targets),
-            hints: ServingHints::default(),
-            self_hosted_only,
+    ServingResolution {
+        resolved: ServingClass::Standard,
+        hints: if daemon {
+            ServingHints::default()
+        } else {
+            ServingHints {
+                priority: overlay
+                    .and_then(|o| o.priority)
+                    .or(account.and_then(|a| a.priority)),
+                ttft_ms: overlay.and_then(|o| o.ttft_ms),
+                itl_ms: overlay.and_then(|o| o.itl_ms),
+            }
         },
-        _ => ServingResolution {
-            resolved: ServingClass::Standard,
-            targets: None,
-            hints: if daemon {
-                ServingHints::default()
-            } else {
-                ServingHints {
-                    priority: overlay
-                        .and_then(|o| o.priority)
-                        .or(account.and_then(|a| a.priority)),
-                    ttft_ms: overlay.and_then(|o| o.ttft_ms),
-                    itl_ms: overlay.and_then(|o| o.itl_ms),
-                }
-            },
-            self_hosted_only,
-        },
+        self_hosted_only,
     }
 }
 
@@ -413,45 +338,52 @@ pub fn resolve(
 mod tests {
     use super::*;
 
-    const DEAL: ServingTargets = ServingTargets {
-        ttft_ms: 500,
-        itl_ms: 20,
-        priority: 200,
-    };
-
-    fn overlay_with(targets: ServingTargets) -> ServingOverlay {
+    fn deal() -> ServingOverlay {
         ServingOverlay {
-            targets: Some(targets),
+            priority: Some(200),
+            ttft_ms: Some(500),
+            itl_ms: Some(20),
             ..Default::default()
         }
     }
 
     #[test]
-    fn nothing_set_resolves_to_standard_with_no_targets() {
+    fn nothing_set_resolves_to_standard_with_no_hints() {
         let r = resolve(None, None, Some("realtime"));
         assert_eq!(r.resolved, ServingClass::Standard);
-        assert_eq!(r.targets, None);
+        assert!(r.hints.is_empty());
         assert!(!r.self_hosted_only);
         assert_eq!(r.outcome().requested, None);
     }
 
     #[test]
-    fn overlay_targets_resolve_as_custom_for_realtime() {
-        let o = overlay_with(DEAL);
+    fn overlay_targets_are_hints_on_the_standard_class() {
+        let o = deal();
         let r = resolve(None, Some(&o), Some("realtime"));
-        assert_eq!(r.resolved, ServingClass::Custom);
-        assert_eq!(r.targets, Some(DEAL));
+        assert_eq!(
+            r.resolved,
+            ServingClass::Standard,
+            "targets never change the class"
+        );
+        assert_eq!(
+            r.hints,
+            ServingHints {
+                priority: Some(200),
+                ttft_ms: Some(500),
+                itl_ms: Some(20)
+            }
+        );
         // a key without a purpose label is treated as realtime
-        assert_eq!(resolve(None, Some(&o), None).targets, Some(DEAL));
+        assert_eq!(resolve(None, Some(&o), None).hints, r.hints);
     }
 
     #[test]
-    fn daemon_legs_never_receive_overlay_targets() {
-        let o = overlay_with(DEAL);
+    fn daemon_legs_never_receive_hints() {
+        let o = deal();
         for purpose in ["batch", "continuation"] {
             let r = resolve(None, Some(&o), Some(purpose));
             assert_eq!(r.resolved, ServingClass::Standard, "{purpose}");
-            assert_eq!(r.targets, None, "{purpose}");
+            assert!(r.hints.is_empty(), "{purpose}");
         }
     }
 
@@ -472,12 +404,14 @@ mod tests {
     }
 
     #[test]
-    fn targets_are_stamped_into_nvext_and_scrubbed_from_it() {
+    fn hints_are_stamped_into_nvext_and_targets_scrubbed_from_it() {
         let mut body = serde_json::json!({
             "model": "m",
             "nvext": {"cache_control": {"enabled": true}, "router": {"ttft_target": 1}, "agent_hints": {"max_batch_size": 8}}
         });
-        DEAL.stamp(body.as_object_mut().unwrap());
+        resolve(None, Some(&deal()), Some("realtime"))
+            .hints
+            .stamp(body.as_object_mut().unwrap());
         assert_eq!(body["nvext"]["router"]["ttft_target"], 500, "overwritten");
         assert_eq!(body["nvext"]["router"]["itl_target"], 20);
         assert_eq!(body["nvext"]["agent_hints"]["priority"], 200);
@@ -487,12 +421,11 @@ mod tests {
         );
         assert_eq!(body["nvext"]["cache_control"]["enabled"], true);
 
-        // priority 0 sends no priority at all; a body with no nvext gets one
         let mut body = serde_json::json!({"model": "m"});
-        ServingTargets {
-            ttft_ms: 1,
-            itl_ms: 2,
-            priority: 0,
+        ServingHints {
+            ttft_ms: Some(1),
+            itl_ms: Some(2),
+            ..Default::default()
         }
         .stamp(body.as_object_mut().unwrap());
         assert_eq!(
@@ -574,7 +507,7 @@ mod tests {
         assert_eq!(
             r.resolved,
             ServingClass::Standard,
-            "hints never change the billed class"
+            "hints never change the class"
         );
         assert_eq!(
             r.hints,
@@ -591,16 +524,6 @@ mod tests {
                 .hints
                 .is_empty()
         );
-
-        // Explicit overlay targets still win and carry their own priority.
-        let legacy = ServingOverlay {
-            targets: Some(DEAL),
-            priority: Some(1),
-            ..Default::default()
-        };
-        let r = resolve(Some(&account), Some(&legacy), Some("realtime"));
-        assert_eq!(r.resolved, ServingClass::Custom);
-        assert!(r.hints.is_empty());
     }
 
     #[test]
@@ -646,8 +569,8 @@ mod tests {
         assert!("cloud".parse::<ProviderKind>().is_err());
         assert_eq!(ServingClass::Standard.as_str(), "standard");
         assert_eq!(
-            serde_json::to_string(&ServingClass::Custom).unwrap(),
-            "\"custom\""
+            serde_json::to_string(&ServingClass::Standard).unwrap(),
+            "\"standard\""
         );
     }
 
@@ -661,14 +584,10 @@ mod tests {
         .unwrap();
         assert!(a.self_hosted_only);
         let o: ServingOverlay = serde_json::from_str(
-            r#"{"default_class": "interactive", "targets": {"ttft_ms": 800, "itl_ms": 30}}"#,
+            r#"{"default_class": "interactive", "targets": {"ttft_ms": 800, "itl_ms": 30}, "priority": 5}"#,
         )
         .unwrap();
-        assert_eq!(
-            o.targets.map(|t| (t.ttft_ms, t.itl_ms, t.priority)),
-            Some((800, 30, 0)),
-            "priority defaults to 0"
-        );
+        assert_eq!(o.priority, Some(5));
         assert_eq!(
             serde_json::to_string(&ProviderKind::Dynamo).unwrap(),
             "\"dynamo\""
@@ -723,16 +642,12 @@ mod handler_tests {
         }
     }
 
-    const DEAL: ServingTargets = ServingTargets {
-        ttft_ms: 500,
-        itl_ms: 20,
-        priority: 200,
-    };
-
     fn with_deal(members: &[Member]) -> Setup {
         let mut s = setup(members);
         s.overlay = Some(ServingOverlay {
-            targets: Some(DEAL),
+            priority: Some(200),
+            ttft_ms: Some(500),
+            itl_ms: Some(20),
             ..Default::default()
         });
         s
@@ -846,7 +761,7 @@ mod handler_tests {
     }
 
     #[tokio::test]
-    async fn strict_handlers_send_overlay_targets() {
+    async fn strict_handlers_send_overlay_hints() {
         for (path, payload) in [
             ("/chat/completions", json!({"model":ALIAS,"messages":[]})),
             ("/completions", json!({"model":ALIAS,"prompt":"hi"})),
@@ -897,13 +812,13 @@ mod handler_tests {
         assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             error.serving_outcome.unwrap().resolved,
-            ServingClass::Custom
+            ServingClass::Standard
         );
         assert!(mock.get_requests().is_empty());
     }
 
     #[tokio::test]
-    async fn only_dynamo_members_receive_the_targets() {
+    async fn only_dynamo_members_receive_the_hints() {
         for member in [EXTERNAL, HOSTED] {
             let s = with_deal(&[member]);
             let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
@@ -967,29 +882,6 @@ mod handler_tests {
     }
 
     #[tokio::test]
-    async fn explicit_overlay_targets_are_sent_as_is() {
-        let mut s = setup(&[DYNAMO]);
-        s.overlay = Some(ServingOverlay {
-            targets: Some(ServingTargets {
-                ttft_ms: 800,
-                itl_ms: 30,
-                priority: 50,
-            }),
-            ..Default::default()
-        });
-        let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
-        let srv = server(&s, &mock);
-        assert_eq!(post(&srv, ALIAS, json!({})).await.status_code(), 200);
-        let req = &mock.get_requests()[0];
-        assert_eq!(sent(req), Some((800, 30, Some(50))));
-        assert_eq!(
-            body(req)["messages"][0]["content"],
-            "hi",
-            "the rest of the body is untouched"
-        );
-    }
-
-    #[tokio::test]
     async fn no_policy_at_all_sends_only_realtimes_priority() {
         let s = setup(&[DYNAMO]);
         let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
@@ -1002,8 +894,8 @@ mod handler_tests {
 
     #[tokio::test]
     async fn a_non_json_body_reaches_a_dynamo_member_untouched() {
-        // Multipart uploads carry no hints; without targets to deliver they
-        // are forwarded as they came, never refused.
+        // Multipart uploads carry no hints: they are forwarded as they came,
+        // never refused.
         let s = setup(&[DYNAMO]);
         let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
         let srv = server(&s, &mock);
@@ -1054,12 +946,12 @@ mod handler_tests {
         assert_eq!(
             sent(&mock.get_requests()[0]),
             Some((500, 20, Some(200))),
-            "the targets are overwritten"
+            "the hints are overwritten"
         );
     }
 
     #[tokio::test]
-    async fn daemon_purpose_keys_get_no_overlay_targets() {
+    async fn daemon_purpose_keys_get_no_hints() {
         let mut s = with_deal(&[DYNAMO]);
         s.purpose = "batch";
         let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
@@ -1105,7 +997,7 @@ mod handler_tests {
             .copied()
             .expect("the outcome rides on error responses too, for analytics");
         assert_eq!(outcome.requested, None);
-        assert_eq!(outcome.resolved, ServingClass::Custom);
+        assert_eq!(outcome.resolved, ServingClass::Standard);
     }
 
     #[tokio::test]
@@ -1201,6 +1093,7 @@ mod handler_tests {
                 Target::builder()
                     .url("https://dynamo-completions.example.com/".parse().unwrap())
                     .kind(ProviderKind::Dynamo)
+                    .accepts_scheduling_priority(true)
                     .build(),
                 1,
             )],
@@ -1284,8 +1177,8 @@ mod handler_tests {
 
     #[test]
     fn accounts_and_overlays_round_trip_through_config_json() {
-        // Retired class fields (`serving_classes`, `granted`, `default_class`)
-        // in a stored config are ignored rather than rejected.
+        // Retired fields (`serving_classes`, `granted`, `default_class`,
+        // overlay `targets`) in a stored config are ignored rather than rejected.
         let json = json!({
             "targets": {
                 "gpt-4": {
@@ -1293,7 +1186,7 @@ mod handler_tests {
                     "serving_classes": {"interactive": {"ttft_ms": 500, "itl_ms": 20, "priority": 200}},
                     "overlays": {
                         "org-1": {"default_class": "interactive", "self_hosted_only": false},
-                        "org-2": {"targets": {"ttft_ms": 800, "itl_ms": 30}}
+                        "org-2": {"targets": {"ttft_ms": 800, "itl_ms": 30}, "priority": 300, "ttft_ms": 800, "itl_ms": 30}
                     }
                 }
             },
@@ -1308,10 +1201,12 @@ mod handler_tests {
         let overlays = pools.default_pool().overlays();
         assert_eq!(overlays["org-1"].self_hosted_only, Some(false));
         assert_eq!(
-            overlays["org-2"]
-                .targets
-                .map(|t| (t.ttft_ms, t.itl_ms, t.priority)),
-            Some((800, 30, 0))
+            (
+                overlays["org-2"].priority,
+                overlays["org-2"].ttft_ms,
+                overlays["org-2"].itl_ms
+            ),
+            (Some(300), Some(800), Some(30))
         );
         assert_eq!(
             pools.default_pool().providers()[0].target.kind,

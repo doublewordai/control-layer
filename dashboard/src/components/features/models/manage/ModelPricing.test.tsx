@@ -53,7 +53,7 @@ const serving: OrganizationServing = {
     }),
     tariff("custom", {
       organization_id: "org-a",
-      serving_class: "custom",
+      serving_class: "standard",
       input_price_per_token: "0",
       output_price_per_token: "0",
     }),
@@ -62,7 +62,7 @@ const serving: OrganizationServing = {
     {
       deployed_model_id: "model",
       alias: "example-model",
-      serving_class: "custom",
+      serving_class: "standard",
       read_multiplier: "0.25",
       write_multiplier_5m: "1",
       write_multiplier_1h: "2",
@@ -188,9 +188,10 @@ describe("model pricing selector", () => {
   it("shows effective playground prices when only realtime is configured", () => {
     const { container } = mount(true, "org-a");
     const playground = within(within(container).getByRole("region", { name: "Playground prices" }));
-    expect(playground.getByText("Bespoke · custom · realtime fallback")).toBeInTheDocument();
+    expect(playground.getByText("Bespoke · standard · realtime fallback")).toBeInTheDocument();
     expect(playground.getAllByText("$0")).toHaveLength(2);
-    expect(playground.getAllByText("$2.00")).toHaveLength(1);
+    // The standard-class deal wins over the organisation's all-class price.
+    expect(playground.queryByText("$2.00")).not.toBeInTheDocument();
   });
 
   it("starts general then shows effective class prices and inherited batch/cache values", async () => {
@@ -212,14 +213,14 @@ describe("model pricing selector", () => {
       }),
     );
     const rt = within(page.getByRole("region", { name: "Realtime prices" }));
-    expect(rt.getByText("Bespoke · custom")).toBeInTheDocument();
+    expect(rt.getByText("Bespoke · standard")).toBeInTheDocument();
     expect(rt.getAllByText("$0")).toHaveLength(2);
-    expect(rt.getAllByText("$2.00")).toHaveLength(1);
+    expect(rt.queryByText("$2.00")).not.toBeInTheDocument();
     const batch = within(
       page.getByRole("region", { name: "Batch and flex prices" }),
     );
     expect(batch.getByText("Inherited · general model")).toBeInTheDocument();
-    expect(batch.getByText("Bespoke · all classes · realtime fallback")).toBeInTheDocument();
+    expect(batch.getByText("Bespoke · standard · realtime fallback")).toBeInTheDocument();
     expect(
       page.queryByRole("button", { name: "Manage Tariffs" }),
     ).not.toBeInTheDocument();
@@ -228,7 +229,7 @@ describe("model pricing selector", () => {
     ).not.toBeInTheDocument();
     const cache = within(page.getByRole("region", { name: "Cache pricing" }));
     expect(cache.getByText("0.25×")).toBeInTheDocument();
-    expect(cache.getAllByText("Inherited · general model")).toHaveLength(1);
+    expect(cache.queryByText("Inherited · general model")).not.toBeInTheDocument();
     const sections = [...container.querySelectorAll("section[aria-label]")].map(
       (x) => x.getAttribute("aria-label"),
     );
@@ -271,7 +272,7 @@ describe("model pricing selector", () => {
     expect(rt.queryByText("interactive")).not.toBeInTheDocument();
     expect(rt.getByText("standard")).toBeInTheDocument();
   });
-  it("shows custom target pricing even without a class-specific tariff", () => {
+  it("never adds a pricing class for overlay targets", () => {
     vi.mocked(useOrganizationServing).mockReturnValue({
       data: {
         ...serving,
@@ -286,11 +287,11 @@ describe("model pricing selector", () => {
       isError: false,
     } as unknown as ReturnType<typeof useOrganizationServing>);
     const { container } = mount(true, "org-a");
-    expect(
-      within(
-        within(container).getByRole("region", { name: "Realtime prices" }),
-      ).getByText("custom"),
-    ).toBeInTheDocument();
+    const rt = within(
+      within(container).getByRole("region", { name: "Realtime prices" }),
+    );
+    expect(rt.queryByText("custom")).not.toBeInTheDocument();
+    expect(rt.getByText("standard")).toBeInTheDocument();
   });
   it.each(["loading", "error"])(
     "never disguises %s organisation data as general prices",

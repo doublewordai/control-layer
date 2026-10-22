@@ -73,7 +73,7 @@ retires all catalog-owned entries; a missing/unconfigured catalog is not a clean
 request. Future-dated prices must be resolved before catalog adoption or editing:
 startup reconciliation applies immediately and does not author schedules.
 
-## Example: batch/flex and custom-target prices
+## Example: batch/flex prices, a standard-class deal and scheduling hints
 
 The organization, model alias and prices below are fictional. Token prices are
 expressed per million tokens:
@@ -104,9 +104,9 @@ models:
       write_multiplier_24h: "2"
       read_multiplier: "0.10"
     class_pricing:
-      custom:
+      standard:
         tariffs:
-          - name: custom-realtime
+          - name: standard-realtime
             purpose: realtime
             input_per_million_tokens: "3.00"
             output_per_million_tokens: "9.00"
@@ -117,11 +117,17 @@ models:
           read_multiplier: "0.15"
 ```
 
-Realtime requests to which the overlay's explicit `targets` apply resolve as
-`custom`; everything else resolves as `standard`. Batch and flex use standard;
-flex uses the batch `1h` tariff. Prefer putting batch prices in the all-class
-`tariffs` list. `class_pricing.standard` also supports batch; `custom` batch
-prices are rejected by validation.
+A request's serving class is where it is routed, and `class_pricing` prices one
+of the model's classes (`standard` until models carry more). A class price wins
+over the all-class `tariffs` for requests in that class. Batch and flex use
+standard; flex uses the batch `1h` tariff. Prefer putting batch prices in the
+all-class `tariffs` list.
+
+`targets` are scheduling hints for this organisation on this model: the priority
+and the time-to-first-token and inter-token-latency targets are sent to
+self-hosted serving members on realtime requests. They change neither the
+request's class nor its price. The targets are labels the serving stack may use
+for alerting; nothing routes on them.
 
 ## Billing, display and admission
 

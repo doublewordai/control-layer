@@ -486,6 +486,8 @@ pub async fn target_message_handler<T: HttpClient>(
         gen_ai.request.model = tracing::field::Empty,
         http.response.status_code = tracing::field::Empty,
         onwards.serving.resolved = tracing::field::Empty,
+        onwards.serving.priority = tracing::field::Empty,
+        onwards.serving.targets = tracing::field::Empty,
     );
 
     // Extract W3C trace context (traceparent + tracestate) from inbound headers
@@ -732,7 +734,17 @@ pub async fn target_message_handler<T: HttpClient>(
             overlay.as_ref(),
             key_purpose.as_deref(),
         );
-        tracing::Span::current().record("onwards.serving.resolved", resolution.resolved.as_str());
+        let span = tracing::Span::current();
+        span.record("onwards.serving.resolved", resolution.resolved.as_str());
+        // Customer scheduling hints, recorded apart from the class: the
+        // priority, and whether latency targets were sent.
+        if let Some(priority) = resolution.hints.priority {
+            span.record("onwards.serving.priority", priority);
+        }
+        span.record(
+            "onwards.serving.targets",
+            resolution.hints.ttft_ms.is_some() || resolution.hints.itl_ms.is_some(),
+        );
         metrics::counter!(
             "onwards_serving_class_requests_total",
             "model" => model_name.to_string(),
@@ -1314,49 +1326,32 @@ pub async fn target_message_handler<T: HttpClient>(
             };
         }
 
-        // Send the resolved serving targets to a member of kind `dynamo`, the
-        // only serving stack that reads them, as `nvext.router` targets plus
-        // (when the preset carries one) `nvext.agent_hints.priority`. Every
-        // JSON request to a `dynamo` member also carries a priority (unless
-        // the capability strip above refused scheduling fields for it): when
-        // neither the body nor the preset sets one, realtime's 0, so the
-        // dynamo frontend is never left to pick a value for a missing one.
-        // Account and model policy hints (priority, latency targets) travel
-        // the same way but leave the request billed as its own class.
-        // A priority already present is kept, and targets overwrite rather
-        // than remove: this same crate runs again as the hop inside the
-        // serving namespace, with no key policy of its own, and must forward
-        // what the first hop set. Client-supplied targets are scrubbed at
-        // dwctl's ingress, alongside the body priority (the same perimeter
-        // the priority strip relies on).
-        if target.kind == ProviderKind::Dynamo && !attempt_body.is_empty() {
-            match serde_json::from_slice::<serde_json::Value>(&attempt_body) {
-                Ok(mut body) => {
-                    if let Some(object) = body.as_object_mut() {
-                        if let Some(targets) = serving_resolution.targets {
-                            targets.stamp(object);
-                        }
-                        if !scheduling_fields_refused {
-                            serving_resolution.hints.stamp(object);
-                            serving::stamp_default_priority(object);
-                        }
-                        attempt_body = match serde_json::to_vec(&body) {
-                            Ok(bytes) => axum::body::Bytes::from(bytes),
-                            Err(_) => return LoopAction::Done(Err(OnwardsErrorResponse::internal())),
-                        };
-                    }
-                }
-                // Targets must reach the member; a body that cannot carry
-                // them is refused. Without targets a non-JSON body (a
-                // multipart upload) is forwarded as it came.
-                Err(_) if serving_resolution.targets.is_some() => {
-                    return LoopAction::Done(Err(OnwardsErrorResponse::bad_request(
-                        "Request body must be valid JSON.",
-                        None,
-                    )))
-                }
-                Err(_) => {}
-            }
+        // Send the resolved scheduling hints (priority, latency targets) to a
+        // member of kind `dynamo`, the only serving stack that reads them.
+        // They never change the request's class. Every JSON request to a
+        // `dynamo` member also carries a priority (unless the capability strip
+        // above refused scheduling fields for it): when neither the body nor
+        // the hints set one, realtime's 0, so the dynamo frontend is never left
+        // to pick a value for a missing one. A priority already present is
+        // kept, and hints overwrite rather than remove: this same crate runs
+        // again as the hop inside the serving namespace, with no key policy of
+        // its own, and must forward what the first hop set. Client-supplied
+        // values are scrubbed at dwctl's ingress, alongside the body priority
+        // (the same perimeter the priority strip relies on).
+        // A non-JSON body (a multipart upload) carries no hints and is
+        // forwarded as it came.
+        if target.kind == ProviderKind::Dynamo
+            && !scheduling_fields_refused
+            && !attempt_body.is_empty()
+            && let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(&attempt_body)
+            && let Some(object) = body.as_object_mut()
+        {
+            serving_resolution.hints.stamp(object);
+            serving::stamp_default_priority(object);
+            attempt_body = match serde_json::to_vec(&body) {
+                Ok(bytes) => axum::body::Bytes::from(bytes),
+                Err(_) => return LoopAction::Done(Err(OnwardsErrorResponse::internal())),
+            };
         }
 
         // Build the upstream URI for this target

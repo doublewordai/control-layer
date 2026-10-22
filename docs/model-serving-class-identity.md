@@ -99,7 +99,7 @@ resolvers indefinitely:
 | --- | --- |
 | `deployed_models.serving_classes` JSON presets; `model_provisioning.rs` | Class catalog configuration replaces numeric target presets; retain shared model metadata. |
 | `users.granted_serving_classes`, `default_serving_class`; sync account snapshots | Explicit class selection replaces grants and implicit defaults. Preserve routing preferences such as `self_hosted_only`. |
-| `model_overlays.default_serving_class`, `targets`; `org_overlays.rs`, serving API | Replace target/default selection with class overrides. Retain account/model ownership, catalog versioning and prices. |
+| `model_overlays.default_serving_class`, `targets`; `org_overlays.rs`, serving API | Default selection is retired. `targets` are scheduling hints (priority, latency targets) that never select a class; overlay and account prices override one of the model's classes. Retain account/model ownership, catalog versioning and prices. |
 | `inference/middleware.rs`, `onwards/src/serving.rs`, `onwards/src/handlers.rs` | Replace suffix/default resolution and numeric target injection; preserve ingress scrubbing and trusted priority handling. |
 | `sync/onwards_config` and composite member rows | Keep legacy routing until all live consumers have migrated; new classes remain dormant until explicit activation. |
 | Tariff ledgers, analytics, queued billing records | Retain historical class keys and compatible readers; introducing class UUIDs does not rewrite history. |
