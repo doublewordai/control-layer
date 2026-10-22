@@ -364,7 +364,7 @@ batches:
 |-------|------|---------|-------------|
 | `enabled` | boolean | `true` | Enable `/ai/v1/files` and `/ai/v1/batches` endpoints. |
 | `allowed_completion_windows` | list | `["24h"]` | SLA options users can select. |
-| `files.max_file_size` | integer | `104857600` | Maximum upload size in bytes. |
+| `files.max_file_size` | integer | `104857600` | Maximum upload size in bytes. A gzip or zstd file is decoded as it uploads, and the limit applies to its decoded size; the compressed upload itself may not exceed the limit either. |
 | `files.default_expiry_seconds` | integer | `86400` | Default file retention. |
 
 ## Background Services
