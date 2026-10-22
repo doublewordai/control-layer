@@ -409,7 +409,7 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         Err(e) => {
             let model = extract_model_from_request(&headers, &body_bytes);
             let message = format!("Invalid request: {e}");
-            let code = match e {
+            let (status, code) = match e {
                 JsonRejection::JsonDataError(_) => {
                     return refused_mismatch(
                         &state,
@@ -420,17 +420,14 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
                         &message,
                     );
                 }
-                JsonRejection::MissingJsonContentType(_) => "invalid_content_type",
-                _ => "invalid_json",
+                // RFC 9110 §15.5.16: a body not declared as JSON is an
+                // unsupported media type, not a malformed request.
+                JsonRejection::MissingJsonContentType(_) => {
+                    (StatusCode::UNSUPPORTED_MEDIA_TYPE, "invalid_content_type")
+                }
+                _ => (StatusCode::BAD_REQUEST, "invalid_json"),
             };
-            return refused_invalid(
-                &state,
-                &headers,
-                model.as_deref(),
-                StatusCode::BAD_REQUEST,
-                code,
-                &message,
-            );
+            return refused_invalid(&state, &headers, model.as_deref(), status, code, &message);
         }
     };
 

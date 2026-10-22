@@ -584,7 +584,7 @@ impl FileUploadError {
             FileUploadError::InvalidCompression { format, message } => Error::BadRequest {
                 message: format!("File is not valid {format} data: {message}"),
             },
-            FileUploadError::UnsupportedCompression { format } => Error::BadRequest {
+            FileUploadError::UnsupportedCompression { format } => Error::UnsupportedMediaType {
                 message: format!(
                     "File is compressed with {format}, which is not supported. Upload it uncompressed, or compressed with gzip or zstd."
                 ),
@@ -635,6 +635,15 @@ impl FileUploadError {
 
 /// Check if an error (or any error in its source chain) is a body/stream length limit error.
 /// Uses typed error matching via downcasting, with string-based fallback for wrapped errors.
+/// Whether the request declares a `multipart/form-data` body, parameters aside.
+fn is_multipart_form(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("multipart/form-data"))
+}
+
 fn is_length_limit_error(err: &(dyn std::error::Error + 'static)) -> bool {
     // Check for axum's LengthLimitError directly
     if err.downcast_ref::<LengthLimitError>().is_some() {
@@ -1169,6 +1178,7 @@ Each line must be a valid JSON object containing `custom_id`, `method`, `url`, a
         (status = 400, description = "Invalid file format, malformed JSON, missing required fields, etc."),
         (status = 403, description = "Model referenced in the file is not configured or not accessible to your account."),
         (status = 413, description = "File exceeds the maximum allowed size."),
+        (status = 415, description = "The request is not `multipart/form-data`, or the file is compressed in a format other than gzip or zstd."),
         (status = 422, description = "A referenced image URL could not be retrieved because its origin refused access (e.g. 403/404). The file is well-formed but references an image that is forbidden, gated, or missing."),
         (status = 429, description = "Too many concurrent uploads. Retry after a short delay."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists."),
@@ -1181,6 +1191,14 @@ pub async fn upload_file<P: PoolProvider>(
     current_user: RequiresPermission<resource::Files, operation::CreateOwn>,
     request: axum::http::Request<axum::body::Body>,
 ) -> Result<(StatusCode, Json<FileResponse>)> {
+    // Refuse a body that isn't a multipart form before it takes an upload slot.
+    // A malformed form (a bad boundary, say) is still a 400 below.
+    if !is_multipart_form(request.headers()) {
+        return Err(Error::UnsupportedMediaType {
+            message: "File uploads must be sent as multipart/form-data, with the file in a `file` field".to_string(),
+        });
+    }
+
     // Acquire upload permit (if limiter is configured)
     // The permit is held for the duration of the upload to limit concurrency
     let _permit = if let Some(ref limiter) = state.limiters.file_uploads {
@@ -2497,7 +2515,10 @@ mod tests {
 
         let truncated_gzip = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xab\x56".to_vec();
         let xz = b"\xfd7zXZ\x00\x00\x04\xe6\xd6\xb4\x46".to_vec();
-        for (content, expected) in [(truncated_gzip, "not valid gzip data"), (xz, "compressed with xz")] {
+        for (content, status, expected) in [
+            (truncated_gzip, axum::http::StatusCode::BAD_REQUEST, "not valid gzip data"),
+            (xz, axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE, "compressed with xz"),
+        ] {
             let upload_response = app
                 .post("/ai/v1/files")
                 .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
@@ -2509,10 +2530,42 @@ mod tests {
                 )
                 .await;
 
-            upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+            upload_response.assert_status(status);
             let body = upload_response.text();
             assert!(body.contains(expected), "{body}");
         }
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_upload_that_is_not_a_multipart_form_returns_415(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let line = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4"}}"#;
+
+        for content_type in [Some("application/jsonl"), Some("application/x-www-form-urlencoded"), None] {
+            let mut request = app
+                .post("/ai/v1/files")
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1);
+            if let Some(content_type) = content_type {
+                request = request.content_type(content_type);
+            }
+            let upload_response = request.bytes(line.as_bytes().to_vec().into()).await;
+
+            upload_response.assert_status(axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+            assert!(upload_response.text().contains("multipart/form-data"), "{content_type:?}");
+        }
+
+        // A multipart content type with a broken form is still malformed, not unsupported.
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .content_type("multipart/form-data")
+            .bytes(line.as_bytes().to_vec().into())
+            .await;
+        upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[dwctl_test_macros::test]

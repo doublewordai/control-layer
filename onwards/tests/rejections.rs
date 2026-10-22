@@ -191,7 +191,7 @@ async fn responses_bodies_not_sent_as_json_are_counted_as_such() {
         .text(json!({"model": alias, "input": "Hello"}).to_string())
         .await;
 
-    response.assert_status(StatusCode::BAD_REQUEST);
+    response.assert_status(StatusCode::UNSUPPORTED_MEDIA_TYPE);
     assert!(mock.get_requests().is_empty());
     assert_eq!(
         count(&[("model", alias), ("code", "invalid_content_type")]),

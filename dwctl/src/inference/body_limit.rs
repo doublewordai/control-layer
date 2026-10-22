@@ -11,8 +11,8 @@ use axum::{
     body::{Body, Bytes, to_bytes},
     extract::State,
     http::{
-        HeaderMap, HeaderValue, Request, StatusCode,
-        header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH},
+        HeaderMap, HeaderValue, Method, Request, StatusCode,
+        header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE},
     },
     middleware::Next,
     response::{IntoResponse, Response},
@@ -51,6 +51,10 @@ static DECODE_SLOTS: LazyLock<Arc<Semaphore>> =
 /// body under a wrong or meaningless `Content-Encoding` worked. Such a body
 /// still does: it is passed on as it is and counted, rather than refused.
 pub async fn limit_inference_body(State(max_bytes): State<usize>, request: Request<Body>, next: Next) -> Response {
+    if request.method() == Method::POST {
+        metrics::counter!("dwctl_inference_request_content_types_total", "content_type" => content_type_class(request.headers()))
+            .increment(1);
+    }
     let declared = content_encoding(request.headers());
     if max_bytes == 0 && declared == Ok(None) {
         return next.run(request).await;
@@ -190,6 +194,30 @@ fn unsupported_encoding(path: &str) -> Response {
         .headers_mut()
         .insert(ACCEPT_ENCODING, HeaderValue::from_static(ACCEPTED_ENCODINGS));
     response
+}
+
+/// The declared `Content-Type` of an inference body, as a bounded metric
+/// label. The JSON endpoints parse the body whatever it declares (only strict
+/// `/responses` checks), and clients such as `curl -d` declare a form body;
+/// this counts how many do before anything starts refusing them.
+fn content_type_class(headers: &HeaderMap) -> &'static str {
+    let Some(value) = headers.get(CONTENT_TYPE) else {
+        return "none";
+    };
+    let mime = value
+        .to_str()
+        .ok()
+        .and_then(|value| value.split(';').next())
+        .map(|mime| mime.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    match mime.as_str() {
+        "application/json" => "json",
+        mime if mime.ends_with("+json") => "json",
+        "application/x-www-form-urlencoded" => "form",
+        mime if mime.starts_with("multipart/") => "multipart",
+        mime if mime.starts_with("text/") => "text",
+        _ => "other",
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -763,6 +791,25 @@ mod tests {
         assert_eq!(content_encoding(&headers(&["identity, br"])), Ok(Some(Encoding::Brotli)));
         assert_eq!(content_encoding(&headers(&["gzip", "gzip"])), Err(UnsupportedEncoding));
         assert_eq!(content_encoding(&headers(&["deflate"])), Err(UnsupportedEncoding));
+    }
+
+    #[test]
+    fn classifies_declared_content_types() {
+        let class = |value: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = value {
+                headers.insert(CONTENT_TYPE, value.parse().unwrap());
+            }
+            content_type_class(&headers)
+        };
+        assert_eq!(class(None), "none");
+        assert_eq!(class(Some("application/json")), "json");
+        assert_eq!(class(Some("Application/JSON; charset=utf-8")), "json");
+        assert_eq!(class(Some("application/vnd.api+json")), "json");
+        assert_eq!(class(Some("application/x-www-form-urlencoded")), "form");
+        assert_eq!(class(Some("multipart/form-data; boundary=x")), "multipart");
+        assert_eq!(class(Some("text/plain")), "text");
+        assert_eq!(class(Some("application/octet-stream")), "other");
     }
 
     #[tokio::test]
