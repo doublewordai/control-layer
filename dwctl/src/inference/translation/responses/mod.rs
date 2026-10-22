@@ -553,7 +553,7 @@ mod tests {
         for (tool, expected_type) in cases {
             let body = serde_json::to_vec(&serde_json::json!({"model": "m", "input": "hi", "tools": [tool]})).unwrap();
             match refusal(&body) {
-                TranslationError::InvalidParameter { param: "tools", message } => {
+                TranslationError::UnsupportedParameter { param: "tools", message } => {
                     assert!(message.contains(expected_type), "{message}");
                     assert!(message.contains("server-side tool"), "{message}");
                 }
@@ -809,6 +809,7 @@ mod tests {
         let body: serde_json::Value = response.json();
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["error"]["param"], "tools");
+        assert_eq!(body["error"]["code"], "unsupported_parameter");
         assert!(body["error"]["message"].as_str().unwrap().contains("web_search_preview"));
     }
 

@@ -69,6 +69,11 @@ pub enum TranslationError {
     /// 400 naming the field).
     #[error("{message}")]
     InvalidParameter { param: &'static str, message: String },
+    /// A valid protocol parameter asks for behavior this gateway does not
+    /// implement (maps to a 400 naming the field and, where supported by the
+    /// protocol, the `unsupported_parameter` error code).
+    #[error("{message}")]
+    UnsupportedParameter { param: &'static str, message: String },
     /// A reasoning control the protocol refuses (maps to the error's own
     /// status, param and code).
     #[error("{0}")]
@@ -83,7 +88,7 @@ pub enum TranslationError {
 /// a provider-side tool loop, so forwarding one of these tools would either
 /// drop it or incorrectly ask the client to execute it.
 pub(crate) fn unsupported_server_tool(tool_type: &str) -> TranslationError {
-    TranslationError::InvalidParameter {
+    TranslationError::UnsupportedParameter {
         param: "tools",
         message: format!("server-side tool '{tool_type}' is not supported; remove it from 'tools' or use a client-executed tool"),
     }

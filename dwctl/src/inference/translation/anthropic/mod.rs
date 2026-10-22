@@ -256,7 +256,7 @@ mod tests {
             }))
             .unwrap();
             match refusal(&body) {
-                TranslationError::InvalidParameter { param: "tools", message } => {
+                TranslationError::UnsupportedParameter { param: "tools", message } => {
                     assert!(message.contains(tool_type), "{message}");
                     assert!(message.contains("server-side tool"), "{message}");
                 }
