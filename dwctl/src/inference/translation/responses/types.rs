@@ -589,6 +589,14 @@ pub enum Tool {
         search_context_size: Option<String>,
     },
 
+    /// Current web search tool sent by Codex by default. dwctl does not execute
+    /// it, but the Responses translator accepts and drops it for compatibility.
+    #[serde(rename = "web_search")]
+    WebSearchCurrent {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        external_web_access: Option<bool>,
+    },
+
     /// MCP tool
     #[serde(rename = "mcp")]
     Mcp {

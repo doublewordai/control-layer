@@ -11,7 +11,7 @@ pub mod streaming;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header, request::Parts};
 use bytes::Bytes;
 
-use super::{ProtocolTranslator, StreamReframer, TranslatedRequest, TranslationError, parse_request};
+use super::{ProtocolTranslator, StreamReframer, TranslatedRequest, TranslationError, parse_request, unsupported_server_tool};
 use model::MessagesRequest;
 use streaming::AnthropicStreamReframer;
 
@@ -41,6 +41,7 @@ impl ProtocolTranslator for AnthropicMessages {
 
     fn translate_request(&self, parts: &Parts, body: Bytes) -> Result<TranslatedRequest, TranslationError> {
         let req: MessagesRequest = parse_request(&body, DECLARED_FIELDS, "Anthropic Messages")?;
+        validate_server_tools(&req)?;
 
         let chat = request::to_chat_completions(req, self.cache_enabled)?;
         let new_body = serde_json::to_vec(&chat).map_err(|e| TranslationError::Internal(e.to_string()))?;
@@ -77,6 +78,37 @@ impl ProtocolTranslator for AnthropicMessages {
     fn stream_reframer(&self, _request: &Bytes, _response_id: Option<&str>) -> Box<dyn StreamReframer> {
         Box::new(AnthropicStreamReframer::new())
     }
+}
+
+/// Anthropic distinguishes provider-executed tools from provider-defined
+/// client tools through the versioned `type` field. Keep client tools flowing
+/// through the existing function-tool translation, but refuse every known
+/// server-side family before it can be converted into a client `tool_use`.
+fn validate_server_tools(req: &MessagesRequest) -> Result<(), TranslationError> {
+    let unsupported = req
+        .tools
+        .iter()
+        .flatten()
+        .filter_map(|tool| tool.r#type.as_deref())
+        .find(|tool_type| is_server_tool_type(tool_type));
+
+    match unsupported {
+        Some(tool_type) => Err(unsupported_server_tool(tool_type)),
+        None => Ok(()),
+    }
+}
+
+fn is_server_tool_type(tool_type: &str) -> bool {
+    [
+        "web_search_",
+        "web_fetch_",
+        "code_execution_",
+        "tool_search_tool_",
+        "advisor_",
+        "mcp_toolset_",
+    ]
+    .iter()
+    .any(|prefix| tool_type.starts_with(prefix))
 }
 
 /// The field names and renames the request types in [`model`] declare,
@@ -160,12 +192,18 @@ mod tests {
     use onwards::strict::schema_mismatch::SchemaMismatch;
     use serde_json::{Value, json};
 
-    fn located(body: &[u8]) -> Option<SchemaMismatch> {
+    fn refusal(body: &[u8]) -> TranslationError {
         let (parts, ()) = axum::http::Request::builder().uri("/v1/messages").body(()).unwrap().into_parts();
         match AnthropicMessages::new(true).translate_request(&parts, Bytes::copy_from_slice(body)) {
-            Err(TranslationError::SchemaMismatch { mismatch, .. }) => mismatch,
-            Err(other) => panic!("expected a schema mismatch, got {other:?}"),
+            Err(error) => error,
             Ok(_) => panic!("the body should not translate"),
+        }
+    }
+
+    fn located(body: &[u8]) -> Option<SchemaMismatch> {
+        match refusal(body) {
+            TranslationError::SchemaMismatch { mismatch, .. } => mismatch,
+            other => panic!("expected a schema mismatch, got {other:?}"),
         }
     }
 
@@ -200,6 +238,31 @@ mod tests {
         )
         .expect("located");
         assert_eq!(found.path.as_deref(), Some("tool_choice"));
+    }
+
+    #[test]
+    fn server_side_tools_are_rejected_by_versioned_type() {
+        for tool_type in [
+            "web_search_20250305",
+            "web_fetch_20250910",
+            "code_execution_20250825",
+            "tool_search_tool_regex_20251119",
+            "advisor_20260301",
+            "mcp_toolset_20251120",
+        ] {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "model": "m", "max_tokens": 16, "messages": [],
+                "tools": [{"type": tool_type, "name": "provider_tool"}]
+            }))
+            .unwrap();
+            match refusal(&body) {
+                TranslationError::InvalidParameter { param: "tools", message } => {
+                    assert!(message.contains(tool_type), "{message}");
+                    assert!(message.contains("server-side tool"), "{message}");
+                }
+                other => panic!("expected {tool_type} to be rejected clearly, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -267,6 +330,27 @@ mod tests {
         assert_eq!(msgs[1]["role"], "tool");
         assert_eq!(msgs[1]["tool_call_id"], "tu_1");
         assert_eq!(msgs[1]["content"], "sunny");
+    }
+
+    #[test]
+    fn anthropic_defined_client_tools_still_translate_as_functions() {
+        let out = translate(json!({
+            "model": "claude-x",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "help"}],
+            "tools": [
+                {"type": "computer_20250124", "name": "computer"},
+                {"type": "bash_20250124", "name": "bash"},
+                {"type": "text_editor_20250728", "name": "str_replace_based_edit_tool"}
+            ]
+        }));
+
+        let tools = out["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 3);
+        assert_eq!(tools[0]["function"]["name"], "computer");
+        assert_eq!(tools[1]["function"]["name"], "bash");
+        assert_eq!(tools[2]["function"]["name"], "str_replace_based_edit_tool");
+        assert!(tools.iter().all(|tool| tool["type"] == "function"));
     }
 
     #[test]

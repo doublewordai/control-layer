@@ -19,14 +19,15 @@ pub mod util;
 use axum::http::{HeaderMap, StatusCode, Uri, header, request::Parts};
 use bytes::Bytes;
 use serde_json::Value;
+use tracing::warn;
 
 use onwards::strict::schemas::chat_completions::{
     ChatCompletionChunk, ChatCompletionResponse, normalize_chat_completion_chunk_value, normalize_chat_completion_response_value,
 };
 
-use self::types::ResponsesRequest;
+use self::types::{ResponsesRequest, Tool};
 
-use super::{ProtocolTranslator, StreamReframer, TranslatedRequest, TranslationError, parse_request};
+use super::{ProtocolTranslator, StreamReframer, TranslatedRequest, TranslationError, parse_request, unsupported_server_tool};
 
 /// Translator for the OpenAI Responses API. Pure and stateless; see module docs.
 pub struct OpenResponses;
@@ -54,7 +55,21 @@ impl ProtocolTranslator for OpenResponses {
     }
 
     fn translate_request(&self, parts: &Parts, body: Bytes) -> Result<TranslatedRequest, TranslationError> {
-        let req: ResponsesRequest = parse_request(&body, DECLARED_FIELDS, "OpenAI Responses")?;
+        let mut req: ResponsesRequest = match parse_request(&body, DECLARED_FIELDS, "OpenAI Responses") {
+            Ok(req) => req,
+            Err(error) => {
+                // Keep the normal schema-mismatch detail for malformed client
+                // tools. A newer server tool may not exist in our typed union
+                // yet, so recognise it from the raw `type` and return the same
+                // useful refusal as the variants we already model.
+                if let Some(tool_type) = unsupported_server_tool_in_raw_request(&body) {
+                    return Err(unsupported_server_tool(&tool_type));
+                }
+                return Err(error);
+            }
+        };
+        drop_compatible_web_search(&mut req, true);
+        validate_server_tools(&req)?;
         validate_reasoning_controls(&req)?;
 
         let chat = request::to_chat_request(&req);
@@ -79,8 +94,9 @@ impl ProtocolTranslator for OpenResponses {
     fn translate_response(&self, request: &Bytes, response_id: Option<&str>, body: Bytes) -> Result<Bytes, TranslationError> {
         // Re-parse the original inbound request: the Responses object echoes many
         // request-only fields (model, tools, instructions, previous_response_id).
-        let req: ResponsesRequest =
+        let mut req: ResponsesRequest =
             serde_json::from_slice(request).map_err(|e| TranslationError::Internal(format!("re-parsing Responses request: {e}")))?;
+        drop_compatible_web_search(&mut req, false);
         // Backends differ on which optional-per-spec fields they omit (Dynamo
         // omits `role` on streamed deltas, which the reassembled batch/flex body
         // inherits), so relax the payload with onwards' sanitizer before the
@@ -124,6 +140,77 @@ impl ProtocolTranslator for OpenResponses {
     fn stream_reframer(&self, request: &Bytes, response_id: Option<&str>) -> Box<dyn StreamReframer> {
         Box::new(ResponsesStreamReframer::new(request, response_id))
     }
+}
+
+fn validate_server_tools(req: &ResponsesRequest) -> Result<(), TranslationError> {
+    let unsupported = req.tools.iter().flatten().find_map(server_tool_type);
+    match unsupported {
+        Some(tool_type) => Err(unsupported_server_tool(tool_type)),
+        None => Ok(()),
+    }
+}
+
+/// Codex currently includes the unversioned `web_search` tool in otherwise
+/// ordinary Responses requests. Until dwctl can execute provider-side tools,
+/// accept that exact compatibility shape but do not advertise it downstream.
+/// Other server-side tools still receive the explicit unsupported-tool error.
+fn drop_compatible_web_search(req: &mut ResponsesRequest, emit_warning: bool) {
+    let Some(tools) = req.tools.as_mut() else {
+        return;
+    };
+
+    let before = tools.len();
+    tools.retain(|tool| !matches!(tool, Tool::WebSearchCurrent { .. }));
+    let dropped = before - tools.len();
+    if dropped == 0 {
+        return;
+    }
+
+    if tools.is_empty() {
+        req.tools = None;
+    }
+    if matches!(req.tool_choice.as_ref(), Some(types::ToolChoice::Specific { tool_type, .. }) if tool_type == "web_search") {
+        req.tool_choice = Some(types::ToolChoice::Mode("auto".to_string()));
+    }
+    if emit_warning {
+        warn!(
+            tool_type = "web_search",
+            dropped_tools = dropped,
+            "ignoring unsupported server-side web search tool for Codex compatibility"
+        );
+    }
+}
+
+fn server_tool_type(tool: &Tool) -> Option<&'static str> {
+    match tool {
+        Tool::CodeInterpreter { .. } => Some("code_interpreter"),
+        Tool::FileSearch { .. } => Some("file_search"),
+        Tool::WebSearch { .. } => Some("web_search_preview"),
+        Tool::Mcp { .. } => Some("mcp"),
+        Tool::HostedTool { .. } => Some("hosted_tool"),
+        Tool::Function { .. } | Tool::WebSearchCurrent { .. } | Tool::ComputerUse { .. } | Tool::Namespace { .. } => None,
+    }
+}
+
+/// Identify server tool variants added after our typed Responses schema. This
+/// is only used when typed deserialisation has already failed, so ordinary
+/// requests are not parsed twice.
+fn unsupported_server_tool_in_raw_request(body: &[u8]) -> Option<String> {
+    let request: Value = serde_json::from_slice(body).ok()?;
+    request
+        .get("tools")?
+        .as_array()?
+        .iter()
+        .filter_map(|tool| tool.get("type").and_then(Value::as_str))
+        .find(|tool_type| is_server_tool_type(tool_type))
+        .map(str::to_string)
+}
+
+fn is_server_tool_type(tool_type: &str) -> bool {
+    matches!(
+        tool_type,
+        "code_interpreter" | "file_search" | "image_generation" | "mcp" | "hosted_tool"
+    ) || tool_type.starts_with("web_search_")
 }
 
 /// Refuse provider-native thinking fields and malformed `reasoning.effort`
@@ -189,6 +276,7 @@ const DECLARED_FIELDS: &[&str] = &[
     "effort",
     "encrypted_content",
     "environment",
+    "external_web_access",
     "extra",
     "file_id",
     "file_search",
@@ -252,6 +340,7 @@ const DECLARED_FIELDS: &[&str] = &[
     "user",
     "user_location",
     "vector_store_ids",
+    "web_search",
     "web_search_preview",
 ];
 
@@ -292,7 +381,10 @@ struct ResponsesStreamReframer {
 
 impl ResponsesStreamReframer {
     fn new(request: &Bytes, response_id: Option<&str>) -> Self {
-        let req = serde_json::from_slice::<ResponsesRequest>(request).ok();
+        let mut req = serde_json::from_slice::<ResponsesRequest>(request).ok();
+        if let Some(req) = req.as_mut() {
+            drop_compatible_web_search(req, false);
+        }
         let model = req.as_ref().map(|r| r.model.clone()).unwrap_or_default();
         let state = req.map(|req| streaming::StreamingState::new(&req, response_id));
         let fallback_id = response_id
@@ -442,6 +534,88 @@ mod tests {
     }
 
     #[test]
+    fn server_side_tools_are_rejected_by_type() {
+        let cases = [
+            (serde_json::json!({"type": "code_interpreter"}), "code_interpreter"),
+            (serde_json::json!({"type": "file_search"}), "file_search"),
+            (serde_json::json!({"type": "web_search_preview"}), "web_search_preview"),
+            (
+                serde_json::json!({"type": "mcp", "server_label": "docs", "server_url": "https://example.test"}),
+                "mcp",
+            ),
+            (serde_json::json!({"type": "hosted_tool", "name": "web_search"}), "hosted_tool"),
+            // These current server tools are deliberately recognised even
+            // before the typed request union learns their full schema.
+            (serde_json::json!({"type": "web_search_2025_08_26"}), "web_search_2025_08_26"),
+            (serde_json::json!({"type": "image_generation"}), "image_generation"),
+        ];
+
+        for (tool, expected_type) in cases {
+            let body = serde_json::to_vec(&serde_json::json!({"model": "m", "input": "hi", "tools": [tool]})).unwrap();
+            match refusal(&body) {
+                TranslationError::InvalidParameter { param: "tools", message } => {
+                    assert!(message.contains(expected_type), "{message}");
+                    assert!(message.contains("server-side tool"), "{message}");
+                }
+                other => panic!("expected {expected_type} to be rejected clearly, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn codex_web_search_is_dropped_while_client_tools_are_preserved() {
+        let body = serde_json::json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [
+                {"type": "web_search", "external_web_access": true},
+                {
+                    "type": "function", "name": "lookup", "description": "Look up data",
+                    "parameters": {"type": "object"}
+                }
+            ],
+            "tool_choice": {"type": "web_search"}
+        });
+        let (parts, ()) = axum::http::Request::builder().uri("/v1/responses").body(()).unwrap().into_parts();
+
+        let translated = OpenResponses::new()
+            .translate_request(&parts, Bytes::from(serde_json::to_vec(&body).unwrap()))
+            .expect("Codex web_search should be ignored");
+        let chat: Value = serde_json::from_slice(&translated.body).unwrap();
+
+        assert_eq!(chat["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(chat["tools"][0]["function"]["name"], "lookup");
+        assert_eq!(chat["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn client_executed_tool_types_are_not_rejected() {
+        let cases = [
+            serde_json::json!({
+                "type": "function", "name": "lookup", "description": "Look up data",
+                "parameters": {"type": "object"}
+            }),
+            serde_json::json!({
+                "type": "computer_use_preview", "environment": "browser",
+                "display_width": 1024, "display_height": 768
+            }),
+            serde_json::json!({
+                "type": "namespace", "name": "functions", "tools": [{
+                    "type": "custom", "name": "apply_patch"
+                }]
+            }),
+        ];
+
+        for tool in cases {
+            let body = serde_json::to_vec(&serde_json::json!({"model": "m", "input": "hi", "tools": [tool]})).unwrap();
+            let (parts, ()) = axum::http::Request::builder().uri("/v1/responses").body(()).unwrap().into_parts();
+            OpenResponses::new()
+                .translate_request(&parts, Bytes::from(body))
+                .expect("client-executed tool should remain accepted");
+        }
+    }
+
+    #[test]
     fn errors_name_the_param() {
         let (_, body) = OpenResponses::new().error_for_param(StatusCode::BAD_REQUEST, "bad", Some("input"));
         let body: Value = serde_json::from_slice(&body).unwrap();
@@ -559,6 +733,10 @@ mod tests {
         // Proof it was translated: no Responses `input`, and a chat `messages` array.
         assert!(received.get("input").is_none(), "input should be gone, got: {received}");
         assert_eq!(received["messages"][0]["content"], "hello");
+        assert!(
+            received.get("tools").is_none(),
+            "ignored web_search should be gone, got: {received}"
+        );
 
         let resp = serde_json::json!({
             "id": "chatcmpl-1",
@@ -590,7 +768,8 @@ mod tests {
             .post("/ai/v1/responses")
             .json(&serde_json::json!({
                 "model": "gpt-4o",
-                "input": "hello"
+                "input": "hello",
+                "tools": [{"type": "web_search", "external_web_access": true}]
             }))
             .await;
 
@@ -604,6 +783,33 @@ mod tests {
         assert_eq!(body["output"][0]["content"][0]["text"], "hi back");
         assert_eq!(body["usage"]["input_tokens"], 4);
         assert_eq!(body["usage"]["output_tokens"], 2);
+    }
+
+    #[tokio::test]
+    async fn server_side_tool_returns_openai_400_before_downstream() {
+        async fn must_not_run(_req: Request) -> Response {
+            panic!("unsupported server tool reached downstream")
+        }
+
+        let registry = TranslationRegistry::new(vec![Arc::new(OpenResponses::new())]);
+        let inner = Router::new()
+            .route("/responses", post(must_not_run))
+            .layer(axum::middleware::from_fn_with_state(registry, translation_middleware));
+        let server = axum_test::TestServer::new(Router::new().nest("/ai/v1", inner)).expect("test server");
+
+        let response = server
+            .post("/ai/v1/responses")
+            .json(&serde_json::json!({
+                "model": "gpt-4o", "input": "hello",
+                "tools": [{"type": "web_search_preview"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code().as_u16(), 400);
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["param"], "tools");
+        assert!(body["error"]["message"].as_str().unwrap().contains("web_search_preview"));
     }
 
     /// End-to-end streaming: the handler returns a Chat Completions SSE stream and

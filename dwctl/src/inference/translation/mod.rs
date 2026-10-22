@@ -78,6 +78,17 @@ pub enum TranslationError {
     Internal(String),
 }
 
+/// Build the common refusal for tools whose execution belongs to the API
+/// provider. dwctl translates requests into Chat Completions and does not run
+/// a provider-side tool loop, so forwarding one of these tools would either
+/// drop it or incorrectly ask the client to execute it.
+pub(crate) fn unsupported_server_tool(tool_type: &str) -> TranslationError {
+    TranslationError::InvalidParameter {
+        param: "tools",
+        message: format!("server-side tool '{tool_type}' is not supported; remove it from 'tools' or use a client-executed tool"),
+    }
+}
+
 /// Parses a foreign request body as `T`. A body that is JSON but doesn't match
 /// `T` is a [`TranslationError::SchemaMismatch`] located with `declared`, the
 /// sorted field names `T`'s schema declares; see [`locate_declared`]. The
