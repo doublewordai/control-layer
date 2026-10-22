@@ -45,6 +45,12 @@ impl Recorder {
     pub fn configured_alias<'m>(&self, model: &'m str) -> Option<&'m str> {
         self.targets.configured_alias(model)
     }
+
+    /// Whether `model` names a class route of a class-routed model
+    /// (`alias:<class>`), which serves realtime requests only.
+    pub fn is_class_route(&self, model: &str) -> bool {
+        model.contains(':') && self.targets.targets.contains_key(model)
+    }
 }
 
 /// The code a dwctl layer refused a response's request with, and the span it

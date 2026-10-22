@@ -541,6 +541,23 @@ where
             .into_iter()
             .collect();
 
+        // A request to a class route names `alias:<class>`; it is recorded and
+        // priced as the model's alias in that class.
+        let class_routes = self.batch_lookup_class_routes(tx, buffer).await?;
+        let buffer: Vec<RawAnalyticsRecord> = buffer
+            .iter()
+            .cloned()
+            .map(|mut raw| {
+                if let Some((alias, class)) = raw.request_model.as_deref().and_then(|model| class_routes.get(model)) {
+                    raw.request_model = Some(alias.clone());
+                    raw.requested_serving_class = Some(class.clone());
+                    raw.resolved_serving_class = Some(class.clone());
+                }
+                raw
+            })
+            .collect();
+        let buffer = buffer.as_slice();
+
         // Collect unique model aliases
         let models: Vec<&str> = buffer
             .iter()
@@ -786,7 +803,7 @@ where
             LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id
             LEFT JOIN model_tariffs mt ON mt.deployed_model_id = dm.id
                 AND (mt.user_id IS NULL OR mt.user_id = ANY($2))
-                AND (mt.user_id IS NOT NULL OR mt.serving_class IS NULL)
+                AND (mt.user_id IS NOT NULL OR mt.serving_class IS NULL OR dm.routing_mode = 'class_routes')
             WHERE dm.alias = ANY($1)
             ORDER BY dm.alias, mt.valid_from DESC
             "#,
@@ -828,6 +845,42 @@ where
 
         trace!(count = map.len(), "Batch lookup models completed");
         Ok(map)
+    }
+
+    /// The class routes (`alias:<class>` of a class-routed model) among the
+    /// buffer's request models, mapped to (alias, class).
+    async fn batch_lookup_class_routes(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        buffer: &[RawAnalyticsRecord],
+    ) -> Result<HashMap<String, (String, String)>, sqlx::Error> {
+        let names: Vec<String> = buffer
+            .iter()
+            .filter_map(|r| r.request_model.clone())
+            .filter(|model| model.contains(':'))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        if names.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows = sqlx::query!(
+            r#"
+            SELECT dm.alias, c.class_key
+            FROM model_serving_classes c
+            JOIN deployed_models dm ON dm.id = c.deployed_model_id
+            WHERE dm.routing_mode = 'class_routes'
+              AND c.class_key <> 'standard'
+              AND dm.alias || ':' || c.class_key = ANY($1)
+            "#,
+            &names
+        )
+        .fetch_all(&mut **tx)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (format!("{}:{}", row.alias, row.class_key), (row.alias, row.class_key)))
+            .collect())
     }
 
     /// Batch lookup cache tariffs (per model, per tier) for the given aliases.
@@ -3184,7 +3237,9 @@ mod integration_tests {
             }
             let key = create_api_key_for_user(&pool, account, ApiKeyPurpose::Playground).await;
             let mut record = create_raw_record(alias, Some(key), 1000, 500);
-            record.resolved_serving_class = Some("interactive".to_string());
+            // An account's class-less deal covers the standard class.
+            let served_class = class.unwrap_or("standard");
+            record.resolved_serving_class = Some(served_class.to_string());
             run_batcher_with_records(&pool, vec![record]).await;
             let expected = input * Decimal::from(1000) + output * Decimal::from(500);
             let mut conn = pool.acquire().await.unwrap();
@@ -3201,7 +3256,7 @@ mod integration_tests {
             assert_eq!(cost, Some(expected), "zero is a price, not unresolved: {alias}");
             let mut repo = Tariffs::new(&mut conn);
             assert_eq!(
-                repo.get_effective_pricing_at_timestamp(model, Some(account), "playground", None, Some("interactive"), Utc::now())
+                repo.get_effective_pricing_at_timestamp(model, Some(account), "playground", None, Some(served_class), Utc::now())
                     .await
                     .unwrap(),
                 Some((input, output))

@@ -182,6 +182,24 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // analytics, the prompt cache and billing all key on the bare alias. A
     // malformed selector is a 400. Realtime model names are passed through
     // unchanged.
+    // A class other than standard (`alias:<class>` on a class-routed model)
+    // serves realtime only: asynchronous work is scheduled on the standard
+    // class by its deadline.
+    if is_daemon_processed
+        && let Some(model) = request_value["model"].as_str()
+        && parts
+            .extensions
+            .get::<rejections::Recorder>()
+            .is_some_and(|recorder| recorder.is_class_route(model))
+    {
+        let model = model.to_owned();
+        let message = format!(
+            "Model '{model}' is available for realtime requests only; send flex and background requests to '{}'.",
+            model.split_once(':').map_or(model.as_str(), |(alias, _)| alias)
+        );
+        return invalid_request(&parts, Some(&model), &message, "serving_class_realtime_only", "model");
+    }
+
     let scrubbed_suffix = match strip_async_model_suffix(&mut request_value, is_daemon_processed) {
         Ok(changed) => changed,
         Err(err) => {

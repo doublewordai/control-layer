@@ -157,10 +157,16 @@ fn cache_class_deals_require_a_general_enablement_row_and_respect_history() {
             .read,
         Decimal::ZERO
     );
+    // The account's class-less deal covers standard only; another class
+    // without its own deal falls to the general row.
     assert_eq!(
         resolve_cache_multipliers(&rows, now, Some(account), Some("throughput"))
             .unwrap()
             .read,
+        Decimal::ONE
+    );
+    assert_eq!(
+        resolve_cache_multipliers(&rows, now, Some(account), Some("standard")).unwrap().read,
         Decimal::new(5, 1)
     );
     assert_eq!(
@@ -451,6 +457,8 @@ async fn playground_exhausts_each_customer_scope_before_general_prices(pool: PgP
                         mask & (1 << index) != 0
                             && (scope.is_none() || *scope == owner)
                             && (c.is_none() || *c == class)
+                            // An account's class-less deal covers the standard class only.
+                            && !(scope.is_some() && c.is_none() && class.is_some_and(|k| k != "standard"))
                             && (purpose == ApiKeyPurpose::Playground || *p == ApiKeyPurpose::Realtime)
                     })
                     .map(|(_, (_, _, _, price))| (Decimal::from(*price), Decimal::from(*price)));
@@ -872,9 +880,15 @@ fn public_class_cache_multipliers_inherit_enablement_and_follow_account_deals() 
         resolve_cache_multipliers(&rows, now, None, Some("fast")).unwrap().read,
         Decimal::from(2)
     );
+    // A class-less account deal does not reach the fast class...
     rows.push(row(Some(account), None, 1));
     assert_eq!(
         resolve_cache_multipliers(&rows, now, Some(account), Some("fast")).unwrap().read,
+        Decimal::from(2)
+    );
+    // ...it covers standard.
+    assert_eq!(
+        resolve_cache_multipliers(&rows, now, Some(account), Some("standard")).unwrap().read,
         Decimal::ONE
     );
     rows.push(row(Some(account), Some("fast"), 0));
