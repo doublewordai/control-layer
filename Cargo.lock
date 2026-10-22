@@ -2031,7 +2031,7 @@ dependencies = [
  "tower",
  "tower-http 0.6.10",
  "tracing",
- "tracing-opentelemetry 0.33.0",
+ "tracing-opentelemetry 0.34.0",
  "tracing-subscriber",
  "underway",
  "url",
@@ -2456,7 +2456,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tracing",
- "tracing-opentelemetry 0.33.0",
+ "tracing-opentelemetry 0.34.0",
  "tracing-subscriber",
  "uuid",
 ]
@@ -4475,7 +4475,7 @@ dependencies = [
  "tokio-stream",
  "tower",
  "tracing",
- "tracing-opentelemetry 0.33.0",
+ "tracing-opentelemetry 0.34.0",
  "tracing-subscriber",
  "url",
  "uuid",
@@ -7365,8 +7365,10 @@ checksum = "0a904802a1b902f43638b677ff2a650847e3b4404101b6c586d648e8c1e3e8fe"
 dependencies = [
  "js-sys",
  "opentelemetry 0.33.1",
+ "smallvec",
  "tracing",
  "tracing-core",
+ "tracing-log",
  "tracing-subscriber",
  "web-time",
 ]
