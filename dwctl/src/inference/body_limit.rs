@@ -1,7 +1,10 @@
 //! Bound inference bodies before middleware parses, copies, or logs them, and
 //! decode compressed ones so every layer behind this one sees plain JSON.
 
-use std::{io::Read, sync::LazyLock};
+use std::{
+    io::Read,
+    sync::{Arc, LazyLock},
+};
 
 use axum::{
     Json,
@@ -33,8 +36,8 @@ const ZSTD_WINDOW_LOG_MAX: u32 = 23;
 /// anonymous requests could hold hundreds of those at once. Requests over the
 /// bound wait for a slot rather than being refused, so legitimate traffic is
 /// only ever delayed; uncompressed bodies never take one.
-static DECODE_SLOTS: LazyLock<Semaphore> =
-    LazyLock::new(|| Semaphore::new(std::thread::available_parallelism().map_or(1, |cpus| cpus.get())));
+static DECODE_SLOTS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(std::thread::available_parallelism().map_or(1, |cpus| cpus.get()))));
 
 /// Install outside all inference middleware, including request logging and
 /// daemon dispatch bypasses. File uploads use a separate router and limit.
@@ -242,13 +245,24 @@ enum DecodeError {
 /// passes `max_bytes`, so a small body that inflates without bound costs at
 /// most the limit. Runs on a blocking thread: inflating a full-size body takes
 /// tens of milliseconds.
-async fn decode(slots: &Semaphore, encoding: Encoding, bytes: Bytes, max_bytes: usize) -> Result<Bytes, DecodeError> {
-    let Ok(_slot) = slots.acquire().await else {
-        return Err(DecodeError::Invalid);
-    };
-    tokio::task::spawn_blocking(move || decode_blocking(encoding, &bytes, max_bytes))
+async fn decode(slots: &Arc<Semaphore>, encoding: Encoding, bytes: Bytes, max_bytes: usize) -> Result<Bytes, DecodeError> {
+    in_slot(slots, move || decode_blocking(encoding, &bytes, max_bytes))
         .await
         .unwrap_or(Err(DecodeError::Invalid))
+}
+
+/// Runs `work` on a blocking thread once one of `slots` is free. The slot
+/// moves into the thread with the work: a request dropped mid-decode (the
+/// client went away) stops waiting for the result, but the work runs on and
+/// must keep counting against the bound until it ends.
+async fn in_slot<T: Send + 'static>(slots: &Arc<Semaphore>, work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let slot = slots.clone().acquire_owned().await.ok()?;
+    tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        work()
+    })
+    .await
+    .ok()
 }
 
 fn decode_blocking(encoding: Encoding, bytes: &[u8], max_bytes: usize) -> Result<Bytes, DecodeError> {
@@ -552,7 +566,7 @@ mod tests {
 
     #[tokio::test]
     async fn decodes_wait_for_a_free_slot() {
-        let slots = Semaphore::new(1);
+        let slots = Arc::new(Semaphore::new(1));
         let compressed = Bytes::from(compress(Encoding::Gzip, b"{}"));
         let busy = slots.acquire().await.unwrap();
         let mut waiting = Box::pin(decode(&slots, Encoding::Gzip, compressed, 1024));
@@ -563,6 +577,19 @@ mod tests {
         drop(busy);
         assert_eq!(waiting.await.unwrap(), &b"{}"[..]);
         assert_eq!(slots.available_permits(), 1, "the slot is returned after decoding");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_request_keeps_its_slot_until_the_decode_ends() {
+        let slots = Arc::new(Semaphore::new(1));
+        let (finish, finished) = std::sync::mpsc::channel::<()>();
+        let mut running = Box::pin(in_slot(&slots, move || finished.recv().unwrap()));
+        assert!(futures::poll!(&mut running).is_pending(), "the work is running");
+        drop(running);
+        assert_eq!(slots.available_permits(), 0, "the abandoned work still holds its slot");
+        finish.send(()).unwrap();
+        // Returned once the work ends: this waits for exactly that.
+        drop(slots.acquire().await.unwrap());
     }
 
     #[tokio::test]
