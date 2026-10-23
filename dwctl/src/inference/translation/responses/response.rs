@@ -91,7 +91,7 @@ pub fn to_responses_response(
         service_tier: chat_response.service_tier.clone().unwrap_or_else(|| "default".to_string()),
         metadata: request.metadata.clone(),
         safety_identifier: None,
-        prompt_cache_key: None,
+        prompt_cache_key: request.prompt_cache_key.clone(),
     }
 }
 
