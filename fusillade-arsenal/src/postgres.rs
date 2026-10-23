@@ -39,10 +39,9 @@ use crate::daemon::{
 };
 use crate::error::{FusilladeError, Result};
 use crate::manager::{
-    FileExpiryCursor, FileExpiryStep, RetainedResponseArchiveCutoffs,
-    RetainedResponseArchiveOutcome, RetainedResponsePartitionRunway,
-    RetainedResponseRetirementOutcome, RetainedResponseWriteError, RetentionPolicy,
-    TrailingDemandCount,
+    RetainedResponseArchiveCutoffs, RetainedResponseArchiveOutcome,
+    RetainedResponsePartitionRunway, RetainedResponseRetirementOutcome, RetainedResponseWriteError,
+    RetentionPolicy, TrailingDemandCount,
 };
 use crate::request::{
     Canceled, CascadeTargetState, Claimed, Completed, CreateBackgroundInput, CreateFlexInput,
@@ -835,7 +834,8 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
 
         // Serialize against file deletion/expiry and reject inaccessible
         // sources before creating the batch or its virtual files. An FK alone
-        // only proves the soft-deleted file row still exists.
+        // only proves the soft-deleted file row still exists, and a file past
+        // its template week's retirement has no content left to run.
         let source_available = sqlx::query_scalar::<_, bool>(
             r#"SELECT EXISTS(
                 SELECT 1 FROM files
@@ -843,6 +843,11 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                   AND deleted_at IS NULL
                   AND status = 'processed'
                   AND (expires_at IS NULL OR expires_at > NOW())
+                  AND EXISTS (
+                      SELECT 1 FROM request_template_buckets bucket
+                      WHERE bucket.state = 'active'
+                        AND bucket.week_start = date_trunc('week', files.created_at AT TIME ZONE 'UTC')::date
+                  )
                 FOR UPDATE
             )"#,
         )
@@ -852,7 +857,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to lock source file: {e}")))?;
         if !source_available {
             return Err(FusilladeError::ValidationError(
-                "source file is deleted or expired".to_string(),
+                "source file is deleted, expired, or its content has been retired".to_string(),
             ));
         }
 
@@ -5816,6 +5821,11 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                       AND deleted_at IS NULL
                       AND status = 'processed'
                       AND (expires_at IS NULL OR expires_at > NOW())
+                      AND EXISTS (
+                          SELECT 1 FROM request_template_buckets bucket
+                          WHERE bucket.state = 'active'
+                            AND bucket.week_start = date_trunc('week', files.created_at AT TIME ZONE 'UTC')::date
+                      )
                     ORDER BY id
                     FOR UPDATE
                     "#,
@@ -6046,6 +6056,11 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                   AND deleted_at IS NULL
                   AND status = 'processed'
                   AND (expires_at IS NULL OR expires_at > NOW())
+                  AND EXISTS (
+                      SELECT 1 FROM request_template_buckets bucket
+                      WHERE bucket.state = 'active'
+                        AND bucket.week_start = date_trunc('week', files.created_at AT TIME ZONE 'UTC')::date
+                  )
                 FOR UPDATE
             )"#,
         )
@@ -6057,7 +6072,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         })?;
         if !source_available {
             return Err(FusilladeError::ValidationError(
-                "batch source file is deleted or expired".to_string(),
+                "batch source file is deleted, expired, or its content has been retired"
+                    .to_string(),
             ));
         }
 
@@ -8781,15 +8797,6 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
     ) -> Result<RetainedResponseRetirementOutcome> {
         template_retirement::retire_expired_template_partition(self, select_new, retention_days)
             .await
-    }
-
-    async fn expire_file_content(
-        &self,
-        retention_days: i32,
-        scan_limit: i64,
-        after: Option<FileExpiryCursor>,
-    ) -> Result<FileExpiryStep> {
-        template_retirement::expire_file_content(self, retention_days, scan_limit, after).await
     }
 
     async fn cleanup_retired_template_routes(&self, limit: i64) -> Result<u64> {

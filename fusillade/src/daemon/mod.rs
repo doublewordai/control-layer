@@ -633,17 +633,6 @@ async fn run_retained_response_retirement_loop<S>(
     }
 }
 
-/// Due files examined by one file-content expiry statement. Each costs a batch
-/// lookup, so this bounds how long the statement holds its write lock on
-/// `files`.
-const FILE_EXPIRY_SCAN_LIMIT: i64 = 10_000;
-
-/// Minimum time between complete file-content expiry walks. Files mostly
-/// become eligible in bulk, when a batch-archive week retires and expires its
-/// batches, so re-examining every pinned file on each retirement pass would
-/// repeat the same work for little gain.
-const FILE_EXPIRY_WALK_INTERVAL: Duration = Duration::from_secs(3_600);
-
 async fn run_template_retirement_loop<S>(
     storage: Arc<S>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -654,49 +643,8 @@ async fn run_template_retirement_loop<S>(
 ) where
     S: DaemonStorage + 'static,
 {
-    let mut last_expiry_walk: Option<tokio::time::Instant> = None;
     loop {
-        // Phase 1: bounded file-content expiry unpins template windows. A
-        // failure here must not suppress retirement recovery below; a failed
-        // walk starts over on the next pass.
-        let expiry_due =
-            last_expiry_walk.is_none_or(|walked| walked.elapsed() >= FILE_EXPIRY_WALK_INTERVAL);
-        if select_new && expiry_due {
-            let mut after = None;
-            loop {
-                match maintenance_query(
-                    &shutdown,
-                    "file content expiry",
-                    query_timeout,
-                    storage.expire_file_content(retention_days, FILE_EXPIRY_SCAN_LIMIT, after),
-                )
-                .await
-                {
-                    Ok(Some(step)) => {
-                        counter!("fusillade_file_content_expired_total").increment(step.expired);
-                        match step.next {
-                            Some(cursor) => after = Some(cursor),
-                            None => {
-                                last_expiry_walk = Some(tokio::time::Instant::now());
-                                break;
-                            }
-                        }
-                    }
-                    Ok(None) => return,
-                    Err(error) => {
-                        crate::background_error!(
-                            "file_content_expiry_failed",
-                            Error,
-                            error_class = %maintenance_error_class(&error),
-                            "Failed to expire aged file content"
-                        );
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Phase 2: at most one weekly template partition per pass.
+        // At most one weekly template partition per pass.
         let outcome = maintenance_query(
             &shutdown,
             "template partition retirement",
@@ -4097,8 +4045,6 @@ mod tests {
         retained_contiguous_ahead: AtomicUsize,
         retained_required: AtomicUsize,
         batch_candidates: AtomicUsize,
-        expiry_steps: AtomicUsize,
-        expiry_walk_steps: AtomicUsize,
         events: std::sync::Mutex<Vec<&'static str>>,
     }
 
@@ -4132,8 +4078,6 @@ mod tests {
                 retained_contiguous_ahead: AtomicUsize::new(7),
                 retained_required: AtomicUsize::new(7),
                 batch_candidates: AtomicUsize::new(0),
-                expiry_steps: AtomicUsize::new(0),
-                expiry_walk_steps: AtomicUsize::new(1),
                 events: std::sync::Mutex::new(Vec::new()),
             }
         }
@@ -4291,29 +4235,6 @@ mod tests {
         ) -> Result<crate::RetainedResponseRetirementOutcome> {
             self.record("template_retirement");
             Ok(crate::RetainedResponseRetirementOutcome::NoCandidate)
-        }
-
-        async fn expire_file_content(
-            &self,
-            _retention_days: i32,
-            _scan_limit: i64,
-            after: Option<crate::manager::FileExpiryCursor>,
-        ) -> Result<crate::manager::FileExpiryStep> {
-            self.record("file_content_expiry");
-            let step = self.expiry_steps.fetch_add(1, Ordering::SeqCst);
-            let walk_steps = self.expiry_walk_steps.load(Ordering::SeqCst).max(1);
-            // Each walk must resume from the previous step's cursor and
-            // restart from the oldest file once complete.
-            let position = step % walk_steps;
-            assert_eq!(after.is_none(), position == 0, "step {step}");
-            let next = (position + 1 < walk_steps).then(|| crate::manager::FileExpiryCursor {
-                created_at: chrono::DateTime::UNIX_EPOCH,
-                id: uuid::Uuid::from_u128(position as u128 + 1),
-            });
-            if let Some(cursor) = after {
-                assert_eq!(cursor.id, uuid::Uuid::from_u128(position as u128));
-            }
-            Ok(crate::manager::FileExpiryStep { expired: 0, next })
         }
 
         async fn cleanup_retired_template_routes(&self, _limit: i64) -> Result<u64> {
@@ -4520,52 +4441,6 @@ mod tests {
         shutdown.cancel();
         weekly_handle.await.unwrap();
         retained_handle.await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn file_expiry_walks_in_steps_at_most_hourly() {
-        let storage = Arc::new(FakeMaintenanceStorage::default());
-        storage.expiry_walk_steps.store(3, Ordering::SeqCst);
-        let shutdown = tokio_util::sync::CancellationToken::new();
-        let handle = tokio::spawn(run_template_retirement_loop(
-            storage.clone(),
-            shutdown.clone(),
-            Duration::from_secs(1),
-            true,
-            23,
-            Duration::from_secs(86_400),
-        ));
-        let count = |event: &str| {
-            storage
-                .events
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|recorded| **recorded == event)
-                .count()
-        };
-
-        // The first pass walks the whole due range, one bounded step at a time.
-        tokio::task::yield_now().await;
-        assert_eq!(count("file_content_expiry"), 3);
-        assert_eq!(count("template_retirement"), 1);
-
-        // Retirement keeps its five-minute cadence without repeating the walk.
-        for pass in 1..12 {
-            tokio::time::advance(Duration::from_secs(300)).await;
-            tokio::task::yield_now().await;
-            assert_eq!(count("template_retirement"), 1 + pass);
-            assert_eq!(count("file_content_expiry"), 3);
-        }
-
-        // An hour after the completed walk, the next pass walks again.
-        tokio::time::advance(Duration::from_secs(300)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(count("template_retirement"), 13);
-        assert_eq!(count("file_content_expiry"), 6);
-
-        shutdown.cancel();
-        handle.await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
