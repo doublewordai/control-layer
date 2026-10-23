@@ -3871,6 +3871,35 @@ impl Config {
                     .to_string(),
             });
         }
+        // A week drops N days after it ends, so its newest content lives
+        // exactly N days. A file whose expires_at reaches further than that
+        // shows a date its content will not reach. Warn rather than refuse:
+        // content going before the shown date is the safe direction.
+        let seconds_per_day = 24 * 60 * 60;
+        if owns_archive_maintenance
+            && daemon.template_retirement_enabled
+            && let Some(days) = daemon.template_retention_days
+            && i64::from(days) * seconds_per_day < self.batches.files.max_expiry_seconds
+        {
+            tracing::warn!(
+                template_retention_days = days,
+                max_expiry_seconds = self.batches.files.max_expiry_seconds,
+                "template_retention_days is shorter than the longest expires_at an upload may request; \
+                 input content can be dropped before the date the API shows for it"
+            );
+        }
+        if owns_archive_maintenance
+            && daemon.batch_archive_retirement_enabled
+            && let Some(days) = daemon.batch_archive_retention_days
+            && i64::from(days) * seconds_per_day < self.batches.files.default_expiry_seconds
+        {
+            tracing::warn!(
+                batch_archive_retention_days = days,
+                default_expiry_seconds = self.batches.files.default_expiry_seconds,
+                "batch_archive_retention_days is shorter than the expires_at given to results files; \
+                 completions can be dropped before the date the API shows for them"
+            );
+        }
         if owns_archive_maintenance
             && batchless_movement_enabled
             && (daemon.batchless_archive_groups_per_tick <= 0 || daemon.batchless_archive_bytes_per_tick <= 0)
