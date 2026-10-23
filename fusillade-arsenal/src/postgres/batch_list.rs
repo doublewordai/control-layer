@@ -29,8 +29,24 @@ pub(super) fn push_query<'a>(
     cursor: Option<BatchCursor>,
 ) -> Result<()> {
     let active_first = filter.active_first;
-    let include_active = active_first && cursor.is_none_or(|c| c.priority == 0);
     let limit = filter.limit.unwrap_or(100);
+
+    // The active and terminal arms partition `batches`. A status filter decides
+    // which group can match: `in_progress` is exactly ACTIVE, so the terminal
+    // arm (`NOT(ACTIVE)`) can never match it, and completed/failed/cancelled are
+    // all terminal, so the active arm can never match them. Emitting an arm the
+    // filter excludes is not free - the arm is a contradiction, so the planner
+    // has no early exit and walks the owner's whole `created_at` history before
+    // returning nothing. On a large owner that exceeds the page statement
+    // budget and the list endpoint answers 500. `expired` can match rows in
+    // both groups, so it keeps both arms.
+    let status = filter.status.as_deref();
+    let status_is_active_only = status == Some("in_progress");
+    let status_is_terminal_only = matches!(status, Some("completed" | "failed" | "cancelled"));
+    let want_active = !status_is_terminal_only;
+    let want_terminal = !status_is_active_only;
+
+    let include_active = active_first && want_active && cursor.is_none_or(|c| c.priority == 0);
     query_builder.push("WITH ");
     if include_active {
         // Fence the active set before applying ordering and page limits.
@@ -53,6 +69,7 @@ pub(super) fn push_query<'a>(
     query_builder.push("filtered AS MATERIALIZED (");
     if active_first {
         query_builder.push("SELECT * FROM (");
+        let mut wrote_arm = false;
         if include_active {
             push_arm(
                 query_builder,
@@ -62,18 +79,30 @@ pub(super) fn push_query<'a>(
                 cursor,
                 limit,
             )?;
-            query_builder.push(" UNION ALL ");
+            wrote_arm = true;
         }
-        // A cursor in the active group must not constrain terminal timestamps:
-        // even newer terminal batches follow every active batch.
-        push_arm(
-            query_builder,
-            filter,
-            "batches",
-            true,
-            cursor.filter(|c| c.priority == 1),
-            limit,
-        )?;
+        if want_terminal {
+            if wrote_arm {
+                query_builder.push(" UNION ALL ");
+            }
+            // A cursor in the active group must not constrain terminal
+            // timestamps: even newer terminal batches follow every active batch.
+            push_arm(
+                query_builder,
+                filter,
+                "batches",
+                true,
+                cursor.filter(|c| c.priority == 1),
+                limit,
+            )?;
+            wrote_arm = true;
+        }
+        if !wrote_arm {
+            // Active-only status after a cursor in the terminal group: nothing
+            // can follow it. Emit an explicitly empty arm rather than an arm the
+            // status filter turns into a contradiction.
+            query_builder.push("(SELECT b.*, 0 AS priority FROM batches b WHERE FALSE)");
+        }
         query_builder.push(") candidates ORDER BY priority, created_at DESC, id DESC LIMIT ");
         query_builder.push_bind(limit);
     } else {
@@ -333,6 +362,78 @@ mod tests {
             }
             _ => 0.0,
         }
+    }
+
+    fn page_sql(filter: &ListBatchesFilter) -> String {
+        let mut query = QueryBuilder::new("");
+        push_query(&mut query, filter, None).unwrap();
+        query.sql().to_owned()
+    }
+
+    #[test]
+    fn status_filter_skips_the_arm_it_cannot_match() {
+        // The active and terminal arms partition `batches`. `in_progress` is
+        // exactly ACTIVE, so the terminal arm is `NOT(ACTIVE) AND ACTIVE` - a
+        // contradiction the planner still scans the owner's whole history to
+        // reject. Terminal statuses are the reverse. Skipping the empty arm is
+        // what keeps a filtered page inside the statement budget.
+        let active_only = page_sql(&ListBatchesFilter {
+            active_first: true,
+            status: Some("in_progress".into()),
+            limit: Some(12),
+            ..Default::default()
+        });
+        assert!(active_only.contains("active_batches AS MATERIALIZED"));
+        assert!(!active_only.contains("1 AS priority"));
+
+        for terminal in ["completed", "failed", "cancelled"] {
+            let sql = page_sql(&ListBatchesFilter {
+                active_first: true,
+                status: Some(terminal.into()),
+                limit: Some(12),
+                ..Default::default()
+            });
+            assert!(
+                !sql.contains("active_batches AS MATERIALIZED"),
+                "{terminal} must not build the active arm: {sql}"
+            );
+            assert!(sql.contains("1 AS priority"), "{terminal}: {sql}");
+        }
+
+        // `expired` matches overdue active rows and late terminal rows, so both
+        // arms are real and stay.
+        let expired = page_sql(&ListBatchesFilter {
+            active_first: true,
+            status: Some("expired".into()),
+            limit: Some(12),
+            ..Default::default()
+        });
+        assert!(expired.contains("active_batches AS MATERIALIZED"));
+        assert!(expired.contains("1 AS priority"));
+    }
+
+    #[test]
+    fn active_only_status_after_terminal_cursor_returns_an_empty_arm() {
+        // A terminal cursor advances past the whole active group, so an
+        // `in_progress` page after it has nothing to return. The old shape still
+        // emitted the contradictory terminal arm and scanned for it.
+        let cursor = BatchCursor {
+            created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            id: Uuid::new_v4(),
+            priority: 1,
+        };
+        let filter = ListBatchesFilter {
+            active_first: true,
+            status: Some("in_progress".into()),
+            limit: Some(12),
+            ..Default::default()
+        };
+        let mut query = QueryBuilder::new("");
+        push_query(&mut query, &filter, Some(cursor)).unwrap();
+        let sql = query.sql();
+        assert!(!sql.contains("active_batches AS MATERIALIZED"), "{sql}");
+        assert!(!sql.contains("1 AS priority"), "{sql}");
+        assert!(sql.contains("WHERE FALSE"), "{sql}");
     }
 
     #[sqlx::test]
