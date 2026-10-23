@@ -441,7 +441,8 @@ batches:
   # When disabled, these endpoints will not be available (default: true)
   enabled: true
 
-  # TTL for batch capacity reservations (seconds)
+  # TTL for batch capacity reservations (seconds). Must not exceed
+  # background_services.capacity_reservation_retention.retention_seconds.
   reservation_ttl_secs: 600
 
   # Upload-volume cap for UNVERIFIED creditors, in requests per hour of
@@ -1014,6 +1015,19 @@ background_services:
     ingest_workers: 4 # Concurrent file ingestion workers
     activate_workers: 1 # Batch activation workers (low to avoid capacity contention)
     discovery_workers: 1 # Sync discovery workers
+
+  # Batch capacity reservation retention - deletes admission reservations released, or
+  # (if never released) expired, more than retention_seconds ago. Runs on every instance;
+  # an advisory lock collapses concurrent sweeps to one.
+  capacity_reservation_retention:
+    enabled: true # Default: true
+    interval_seconds: 3600 # Default: 3600 (seconds between sweeps)
+    # Default: 3600. Must be at least batches.reservation_ttl_secs, or config loading fails.
+    retention_seconds: 3600
+    batch_size: 10000 # Default: 10000 rows per delete statement (one short transaction each)
+    batch_pause_milliseconds: 250 # Default: 250
+    # Default: 2000000. A larger backlog drains over several sweeps.
+    max_rows_per_sweep: 2000000
 
 # Image input normalisation.
 #

@@ -2942,6 +2942,8 @@ pub struct BackgroundServicesConfig {
     pub task_retention: TaskRetentionConfig,
     /// Bounded deletion of long-expired prompt-cache entries
     pub prompt_cache_retention: PromptCacheRetentionConfig,
+    /// Bounded deletion of released or expired batch capacity reservations
+    pub capacity_reservation_retention: CapacityReservationRetentionConfig,
 }
 
 /// Underway task retention daemon configuration.
@@ -3060,6 +3062,82 @@ impl PromptCacheRetentionConfig {
         }
         if self.grace_days > Self::MAX_GRACE_DAYS {
             return Err(format!("grace_days must be at most {}", Self::MAX_GRACE_DAYS));
+        }
+        Ok(())
+    }
+}
+
+/// Batch capacity reservation retention daemon configuration.
+///
+/// `POST /batches` writes one `batch_capacity_reservations` row per model and releases it
+/// when the submission finishes. Admission only reads unexpired rows that are unreleased or
+/// were released moments ago, but nothing deleted them, so the ledger kept every
+/// reservation ever made. This daemon deletes rows released or expired more than
+/// `retention_seconds` ago, in bounded batches with a per-sweep cap.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CapacityReservationRetentionConfig {
+    /// Enable the retention daemon (default: true).
+    pub enabled: bool,
+    /// Seconds between sweeps (default: 3600).
+    pub interval_seconds: u64,
+    /// Seconds a reservation is kept after it was released or, if never released, after
+    /// it expired (default: 3600). Must be at least `batches.reservation_ttl_secs`: admission
+    /// reads reservations released within that window.
+    pub retention_seconds: u64,
+    /// Rows deleted per statement (default: 10000). Each batch is its own transaction.
+    pub batch_size: u32,
+    /// Pause between consecutive batches of one sweep in milliseconds (default: 250).
+    pub batch_pause_milliseconds: u64,
+    /// Maximum rows one sweep deletes (default: 2000000). A larger backlog drains over
+    /// several sweeps.
+    pub max_rows_per_sweep: u64,
+}
+
+impl Default for CapacityReservationRetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_seconds: 3600,
+            retention_seconds: 3600,
+            batch_size: 10_000,
+            batch_pause_milliseconds: 250,
+            max_rows_per_sweep: 2_000_000,
+        }
+    }
+}
+
+impl CapacityReservationRetentionConfig {
+    /// Upper bound on `retention_seconds` (a century): keeps the retention representable as
+    /// an `interval` and catches a unit mistake in configuration.
+    pub const MAX_RETENTION_SECONDS: u64 = 36_500 * 86_400;
+
+    /// The retention as a duration. `retention_seconds` is bounded by [`Self::validate`].
+    pub fn retention(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.retention_seconds.min(Self::MAX_RETENTION_SECONDS))
+    }
+
+    /// Validate against the reservation TTL (`batches.reservation_ttl_secs`).
+    pub fn validate(&self, reservation_ttl_secs: i64) -> Result<(), String> {
+        if self.interval_seconds == 0 {
+            return Err("interval_seconds must be at least 1".to_string());
+        }
+        if self.batch_size == 0 {
+            return Err("batch_size must be at least 1".to_string());
+        }
+        if self.max_rows_per_sweep == 0 {
+            return Err("max_rows_per_sweep must be at least 1".to_string());
+        }
+        let minimum = u64::try_from(reservation_ttl_secs).unwrap_or(0);
+        if self.retention_seconds < minimum {
+            return Err(format!(
+                "retention_seconds ({}) must be at least batches.reservation_ttl_secs ({minimum}): \
+                 batch admission reads reservations released within that window",
+                self.retention_seconds
+            ));
+        }
+        if self.retention_seconds > Self::MAX_RETENTION_SECONDS {
+            return Err(format!("retention_seconds must be at most {}", Self::MAX_RETENTION_SECONDS));
         }
         Ok(())
     }
@@ -3789,6 +3867,15 @@ impl Config {
         if let Err(error) = self.background_services.prompt_cache_retention.validate() {
             return Err(Error::Internal {
                 operation: format!("Config validation: prompt-cache retention is invalid: {error}"),
+            });
+        }
+        if let Err(error) = self
+            .background_services
+            .capacity_reservation_retention
+            .validate(self.batches.reservation_ttl_secs)
+        {
+            return Err(Error::Internal {
+                operation: format!("Config validation: capacity reservation retention is invalid: {error}"),
             });
         }
         if let Some(name) = self
@@ -6231,6 +6318,97 @@ background_services:
         assert!(shorter.validate().unwrap_err().contains("at least"));
         let longer = PromptCacheRetentionConfig { grace_days: 30, ..config };
         assert!(longer.validate().is_ok());
+    }
+
+    #[test]
+    fn capacity_reservation_retention_defaults_are_valid() {
+        let config = Config::default();
+        let retention = &config.background_services.capacity_reservation_retention;
+        assert!(retention.enabled);
+        assert_eq!(retention.interval_seconds, 3600);
+        assert_eq!(retention.retention_seconds, 3600);
+        assert_eq!(retention.batch_size, 10_000);
+        assert_eq!(retention.max_rows_per_sweep, 2_000_000);
+        assert!(retention.validate(config.batches.reservation_ttl_secs).is_ok());
+    }
+
+    #[test]
+    fn capacity_reservation_retention_is_never_below_the_reservation_ttl() {
+        let config = CapacityReservationRetentionConfig {
+            retention_seconds: 600,
+            ..CapacityReservationRetentionConfig::default()
+        };
+        // Equal to the TTL is the floor and is allowed.
+        assert!(config.validate(600).is_ok());
+        let error = config.validate(601).unwrap_err();
+        assert!(error.contains("reservation_ttl_secs"), "{error}");
+    }
+
+    #[test]
+    fn capacity_reservation_retention_rejects_degenerate_settings() {
+        let base = CapacityReservationRetentionConfig::default();
+        for (config, field) in [
+            (
+                CapacityReservationRetentionConfig {
+                    batch_size: 0,
+                    ..base.clone()
+                },
+                "batch_size",
+            ),
+            (
+                CapacityReservationRetentionConfig {
+                    max_rows_per_sweep: 0,
+                    ..base.clone()
+                },
+                "max_rows_per_sweep",
+            ),
+            (
+                CapacityReservationRetentionConfig {
+                    interval_seconds: 0,
+                    ..base.clone()
+                },
+                "interval_seconds",
+            ),
+            (
+                CapacityReservationRetentionConfig {
+                    retention_seconds: CapacityReservationRetentionConfig::MAX_RETENTION_SECONDS + 1,
+                    ..base.clone()
+                },
+                "retention_seconds",
+            ),
+        ] {
+            let error = config.validate(600).unwrap_err();
+            assert!(error.contains(field), "{field}: {error}");
+        }
+    }
+
+    #[test]
+    fn capacity_reservation_retention_below_ttl_fails_config_load() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  reservation_ttl_secs: 7200
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            // The default retention (1 hour) is below a 2-hour TTL.
+            let error = Config::load(&args).unwrap_err().to_string();
+            assert!(error.contains("capacity reservation retention is invalid"), "{error}");
+
+            jail.set_env(
+                "DWCTL_BACKGROUND_SERVICES__CAPACITY_RESERVATION_RETENTION__RETENTION_SECONDS",
+                "7200",
+            );
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.capacity_reservation_retention.retention_seconds, 7200);
+            Ok(())
+        });
     }
 
     #[test]
