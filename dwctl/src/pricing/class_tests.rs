@@ -804,6 +804,9 @@ async fn public_class_prices_follow_account_deals_and_preserve_exact_batch_windo
             .await
             .unwrap();
     let model:Uuid=sqlx::query_scalar("INSERT INTO deployed_models (model_name,alias,is_composite,created_by,routing_mode) VALUES ('public-class-test','public-class-test',true,$1,'class_routes') RETURNING id").bind(account).fetch_one(&pool).await.unwrap();
+    // An active activation has a standard class.
+    sqlx::query("WITH ep AS (INSERT INTO inference_endpoints (name,url,created_by) VALUES ('public-class-ep','http://localhost:8080',$2) RETURNING id) INSERT INTO model_serving_classes (deployed_model_id,class_key,display_name,inference_endpoint_id,upstream_model_name) SELECT $1,'standard','Standard',id,'upstream' FROM ep")
+        .bind(model).bind(account).execute(&pool).await.unwrap();
     let now = Utc::now();
     let mut rows = Vec::new();
     for (owner, class, purpose, window, price) in [
