@@ -58,15 +58,15 @@ tracing = "0.1"
 # It is a default feature, listed so it survives `default-features = false`.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "tracing-log"] }
 # OpenTelemetry
-opentelemetry = "0.32.0"
-opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+opentelemetry = "0.33.0"
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = [
   "http-proto",
   "http-json",
   "reqwest-blocking-client",
   "reqwest-rustls",
 ] }
-tracing-opentelemetry = "0.33.0"
+tracing-opentelemetry = "0.34.0"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs", "set-header", "trace"] }
 async-trait = "0.1"
@@ -105,7 +105,7 @@ axum-prometheus = "0.10"
 # Metrics facade and exporter (same versions as axum-prometheus uses)
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
-outlet = "0.11.0"
+outlet = "0.11.1"
 outlet-postgres = "0.8.0"
 brotli = "8.0"
 flate2 = "1"
