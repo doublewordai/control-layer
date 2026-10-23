@@ -3,8 +3,8 @@
 //! Uses AES-256-GCM with a random nonce per encryption. The ciphertext format is:
 //! `nonce (12 bytes) || ciphertext || tag (16 bytes)`, stored as BYTEA in PostgreSQL.
 
-use aes_gcm::aead::{Aead, KeyInit, OsRng};
-use aes_gcm::{AeadCore, Aes256Gcm, Key, Nonce};
+use aes_gcm::aead::{Aead, Generate, KeyInit};
+use aes_gcm::{Aes256Gcm, Key, Nonce};
 use base64::{Engine as _, engine::general_purpose};
 
 /// Errors from encryption/decryption operations.
@@ -30,7 +30,7 @@ pub enum EncryptionError {
 pub fn encrypt(key_bytes: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, EncryptionError> {
     let key = parse_key(key_bytes)?;
     let cipher = Aes256Gcm::new(&key);
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let nonce = Nonce::generate();
 
     let ciphertext = cipher.encrypt(&nonce, plaintext).map_err(|_| EncryptionError::EncryptionFailed)?;
 
@@ -49,9 +49,9 @@ pub fn decrypt(key_bytes: &[u8], blob: &[u8]) -> Result<Vec<u8>, EncryptionError
     let cipher = Aes256Gcm::new(&key);
 
     let (nonce_bytes, ciphertext) = blob.split_at(12);
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce = Nonce::try_from(nonce_bytes).map_err(|_| EncryptionError::DecryptionFailed)?;
 
-    cipher.decrypt(nonce, ciphertext).map_err(|_| EncryptionError::DecryptionFailed)
+    cipher.decrypt(&nonce, ciphertext).map_err(|_| EncryptionError::DecryptionFailed)
 }
 
 /// Encrypt a JSON value, returning the blob as raw bytes for BYTEA storage.
@@ -91,10 +91,7 @@ pub fn derive_encryption_key(secret: &str) -> Vec<u8> {
 }
 
 fn parse_key(key_bytes: &[u8]) -> Result<Key<Aes256Gcm>, EncryptionError> {
-    if key_bytes.len() != 32 {
-        return Err(EncryptionError::InvalidKeyLength(key_bytes.len()));
-    }
-    Ok(*Key::<Aes256Gcm>::from_slice(key_bytes))
+    Key::<Aes256Gcm>::try_from(key_bytes).map_err(|_| EncryptionError::InvalidKeyLength(key_bytes.len()))
 }
 
 #[cfg(test)]

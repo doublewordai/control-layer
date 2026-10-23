@@ -2,7 +2,7 @@
 
 use argon2::{
     Algorithm, Argon2, Params, Version,
-    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng},
+    password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash},
 };
 use base64::{Engine as _, engine::general_purpose};
 use rand::prelude::RngExt;
@@ -44,14 +44,13 @@ impl Default for Argon2Params {
 ///
 /// Uses the provided parameters or secure defaults if None.
 pub fn hash_string_with_params(input: &str, params: Option<Argon2Params>) -> Result<String, Error> {
-    let salt = SaltString::generate(&mut OsRng);
     let argon2 = if let Some(p) = params {
         p.to_argon2()?
     } else {
         Argon2Params::default().to_argon2()?
     };
 
-    let hash = argon2.hash_password(input.as_bytes(), &salt).map_err(|e| Error::Internal {
+    let hash = argon2.hash_password(input.as_bytes()).map_err(|e| Error::Internal {
         operation: format!("hash string: {e}"),
     })?;
 

@@ -39,6 +39,46 @@ const ZSTD_WINDOW_LOG_MAX: u32 = 23;
 static DECODE_SLOTS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(std::thread::available_parallelism().map_or(1, |cpus| cpus.get()))));
 
+/// Seconds a compressed body waited for a decode slot.
+pub(crate) const DECODE_SLOT_WAIT_SECONDS: &str = "dwctl_inference_decode_slot_wait_seconds";
+
+/// Compressed bodies waiting for a decode slot right now.
+const DECODES_WAITING: &str = "dwctl_inference_decodes_waiting";
+
+/// Bucket edges for [`DECODE_SLOT_WAIT_SECONDS`]. A free slot is taken at
+/// once, so most waits fall in the first bucket; 0.25 is an edge so a
+/// p99-above-250ms alert reads an exact bucket.
+pub(crate) const DECODE_SLOT_WAIT_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0];
+
+/// Describes the decode-slot metrics, with the waiting gauge at zero so it is
+/// scraped before the first wait.
+pub(crate) fn describe_decode_slot_metrics() {
+    metrics::describe_histogram!(
+        DECODE_SLOT_WAIT_SECONDS,
+        metrics::Unit::Seconds,
+        "Time a compressed inference body waited for a decode slot"
+    );
+    metrics::describe_gauge!(DECODES_WAITING, "Compressed inference bodies waiting for a decode slot");
+    metrics::gauge!(DECODES_WAITING).set(0.0);
+}
+
+/// One decode in [`DECODES_WAITING`] while it lives.
+struct Waiting(metrics::Gauge);
+
+impl Waiting {
+    fn new() -> Self {
+        let gauge = metrics::gauge!(DECODES_WAITING);
+        gauge.increment(1.0);
+        Self(gauge)
+    }
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        self.0.decrement(1.0);
+    }
+}
+
 /// Install outside all inference middleware, including request logging and
 /// daemon dispatch bypasses. File uploads use a separate router and limit.
 /// A zero limit retains the configured unlimited behavior.
@@ -283,8 +323,17 @@ async fn decode(slots: &Arc<Semaphore>, encoding: Encoding, bytes: Bytes, max_by
 /// moves into the thread with the work: a request dropped mid-decode (the
 /// client went away) stops waiting for the result, but the work runs on and
 /// must keep counting against the bound until it ends.
+///
+/// The time to get a slot is recorded in [`DECODE_SLOT_WAIT_SECONDS`], and
+/// [`DECODES_WAITING`] counts the decodes still waiting for one: a request
+/// dropped while waiting leaves the gauge but records no wait.
 async fn in_slot<T: Send + 'static>(slots: &Arc<Semaphore>, work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
-    let slot = slots.clone().acquire_owned().await.ok()?;
+    let requested = tokio::time::Instant::now();
+    let slot = {
+        let _waiting = Waiting::new();
+        slots.clone().acquire_owned().await.ok()?
+    };
+    metrics::histogram!(DECODE_SLOT_WAIT_SECONDS).record(requested.elapsed().as_secs_f64());
     tokio::task::spawn_blocking(move || {
         let _slot = slot;
         work()
@@ -605,6 +654,70 @@ mod tests {
         drop(busy);
         assert_eq!(waiting.await.unwrap(), &b"{}"[..]);
         assert_eq!(slots.available_permits(), 1, "the slot is returned after decoding");
+    }
+
+    /// Runs `test` on a current-thread runtime with its clock paused, under a
+    /// fresh recorder it can render, and returns what that rendered at the end.
+    fn metered<F: std::future::Future<Output = ()>>(test: impl FnOnce(metrics_exporter_prometheus::PrometheusHandle) -> F) -> String {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new()
+            .set_buckets_for_metric(
+                metrics_exporter_prometheus::Matcher::Full(DECODE_SLOT_WAIT_SECONDS.to_string()),
+                DECODE_SLOT_WAIT_BUCKETS,
+            )
+            .unwrap()
+            .build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .start_paused(true)
+                .build()
+                .unwrap()
+                .block_on(test(handle.clone()))
+        });
+        handle.render()
+    }
+
+    fn has_line(rendered: &str, line: &str) -> bool {
+        rendered.lines().any(|l| l == line)
+    }
+
+    #[test]
+    fn records_how_long_a_decode_waited_for_its_slot() {
+        let rendered = metered(|handle| async move {
+            let slots = Arc::new(Semaphore::new(1));
+            in_slot(&slots, || ()).await.unwrap();
+
+            let busy = slots.acquire().await.unwrap();
+            let mut waiting = Box::pin(in_slot(&slots, || ()));
+            assert!(futures::poll!(&mut waiting).is_pending(), "every slot is taken");
+            let during = handle.render();
+            assert!(has_line(&during, "dwctl_inference_decodes_waiting 1"), "{during}");
+            tokio::time::advance(std::time::Duration::from_millis(300)).await;
+            drop(busy);
+            waiting.await.unwrap();
+        });
+        let wait = |le: &str, count: u32| format!(r#"dwctl_inference_decode_slot_wait_seconds_bucket{{le="{le}"}} {count}"#);
+        assert!(has_line(&rendered, &wait("0.001", 1)), "a free slot is taken at once: {rendered}");
+        assert!(has_line(&rendered, &wait("0.25", 1)), "{rendered}");
+        assert!(has_line(&rendered, &wait("0.5", 2)), "the held slot's wait is recorded: {rendered}");
+        assert!(has_line(&rendered, "dwctl_inference_decodes_waiting 0"), "{rendered}");
+    }
+
+    #[test]
+    fn a_request_dropped_while_waiting_leaves_the_queue() {
+        let rendered = metered(|_| async {
+            let slots = Arc::new(Semaphore::new(1));
+            let _busy = slots.acquire().await.unwrap();
+            let mut waiting = Box::pin(in_slot(&slots, || ()));
+            assert!(futures::poll!(&mut waiting).is_pending());
+            drop(waiting);
+        });
+        assert!(has_line(&rendered, "dwctl_inference_decodes_waiting 0"), "{rendered}");
+        assert!(
+            !rendered.contains("dwctl_inference_decode_slot_wait_seconds_count"),
+            "an abandoned wait records no duration: {rendered}"
+        );
     }
 
     #[tokio::test]
