@@ -203,8 +203,10 @@ fn reasoning_effort(thinking: Option<&Value>, output_config: Option<&Value>) -> 
 const RESPONSE_FORMAT_NAME: &str = "output";
 
 /// Anthropic `output_config.format` -> OpenAI `response_format`. Anthropic's
-/// only format is `json_schema`, and it is always enforced, so it becomes a
-/// strict schema. Any other format is refused rather than left unconstrained.
+/// only format is `json_schema`; any other is refused rather than left
+/// unconstrained. `strict` is not set: the engines constrain decoding to a
+/// `json_schema` without it, and OpenAI-style strict mode would refuse the
+/// optional properties Anthropic schemas may have.
 fn response_format(output_config: Option<&Value>) -> Result<Option<Value>, TranslationError> {
     let Some(format) = output_config.and_then(|config| config.get("format")).filter(|v| !v.is_null()) else {
         return Ok(None);
@@ -213,7 +215,7 @@ fn response_format(output_config: Option<&Value>) -> Result<Option<Value>, Trans
         Some("json_schema") => match format.get("schema") {
             Some(schema) if schema.is_object() => Ok(Some(json!({
                 "type": "json_schema",
-                "json_schema": { "name": RESPONSE_FORMAT_NAME, "schema": schema, "strict": true },
+                "json_schema": { "name": RESPONSE_FORMAT_NAME, "schema": schema },
             }))),
             _ => Err(TranslationError::InvalidParameter {
                 param: "output_config.format.schema",
@@ -823,22 +825,23 @@ mod tests {
     }
 
     #[test]
-    fn output_config_format_becomes_a_strict_response_format() {
-        // The shape `messages.parse` sends.
+    fn output_config_format_becomes_a_response_format() {
+        // The shape `messages.parse` sends. `note` is optional, which Anthropic allows
+        // and OpenAI-style strict mode would refuse, so the schema goes through as sent.
         let out = translate(json!({
             "model": "m", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}],
             "output_config": {"effort": "low", "format": {"type": "json_schema", "schema": {
                 "type": "object",
-                "properties": {"name": {"type": "string"}},
+                "properties": {"name": {"type": "string"}, "note": {"type": "string"}},
                 "required": ["name"],
                 "additionalProperties": false
             }}}
         }));
         assert_eq!(
             out["response_format"],
-            json!({"type": "json_schema", "json_schema": {"name": "output", "strict": true, "schema": {
+            json!({"type": "json_schema", "json_schema": {"name": "output", "schema": {
                 "type": "object",
-                "properties": {"name": {"type": "string"}},
+                "properties": {"name": {"type": "string"}, "note": {"type": "string"}},
                 "required": ["name"],
                 "additionalProperties": false
             }}})

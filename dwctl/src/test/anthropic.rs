@@ -284,7 +284,7 @@ async fn anthropic_structured_output_and_replayed_thinking_reach_the_upstream(po
     let upstream: serde_json::Value = serde_json::from_slice(&received.last().unwrap().body).unwrap();
     assert_eq!(
         upstream["response_format"],
-        serde_json::json!({ "type": "json_schema", "json_schema": { "name": "output", "schema": schema, "strict": true } })
+        serde_json::json!({ "type": "json_schema", "json_schema": { "name": "output", "schema": schema } })
     );
     assert_eq!(upstream["messages"][1]["reasoning_content"], "A capital will do.");
     assert_eq!(upstream["messages"][1]["content"], "Paris.");
