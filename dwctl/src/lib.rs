@@ -4480,6 +4480,10 @@ impl Application {
                 .batchless_retention_bounds_seconds(),
         )
         .with_download_buffer_size(config.batches.files.download_buffer_size)
+        .with_file_expiry(fusillade_arsenal::FileExpiry {
+            default: chrono::Duration::seconds(config.batches.files.default_expiry_seconds),
+            max: chrono::Duration::seconds(config.batches.files.max_expiry_seconds),
+        })
         .with_batch_insert_strategy(fusillade_arsenal::BatchInsertStrategy::Batched {
             batch_size: config.batches.files.batch_insert_size,
         });

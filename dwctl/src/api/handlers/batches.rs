@@ -641,6 +641,37 @@ pub async fn create_batch<P: PoolProvider>(
         });
     }
 
+    // The input must outlive the batch: a file that expires inside the
+    // completion window would lose its templates while requests still need
+    // them. Background batches have no window, so only the present counts.
+    if file.status != fusillade::batch::FileStatus::Processed {
+        return Err(Error::BadRequest {
+            message: format!("Input file {} is {} and cannot be used for a batch", req.input_file_id, file.status),
+        });
+    }
+    let window = if is_background {
+        chrono::Duration::zero()
+    } else {
+        let parsed = humantime::parse_duration(&req.completion_window).map_err(|e| Error::BadRequest {
+            message: format!("Invalid completion_window '{}': {e}", req.completion_window),
+        })?;
+        chrono::Duration::from_std(parsed).map_err(|_| Error::BadRequest {
+            message: format!("completion_window '{}' is too long", req.completion_window),
+        })?
+    };
+    if let Some(expires_at) = file.expires_at
+        && expires_at <= chrono::Utc::now() + window
+    {
+        return Err(Error::BadRequest {
+            message: format!(
+                "Input file {} expires at {}, before a {} completion window would end; upload it again",
+                req.input_file_id,
+                expires_at.to_rfc3339(),
+                req.completion_window
+            ),
+        });
+    }
+
     // Check that the file owner (whose API key is embedded in the request templates)
     // has sufficient balance. This catches cases where an admin creates a batch from
     // a file owned by another user/org that has negative balance.
@@ -907,8 +938,11 @@ pub async fn create_batch<P: PoolProvider>(
                 total_requests: Some(total_requests),
             })
             .await
-            .map_err(|e| Error::Internal {
-                operation: format!("create background batch record: {e}"),
+            .map_err(|e| match e {
+                fusillade::FusilladeError::ValidationError(message) => Error::BadRequest { message },
+                e => Error::Internal {
+                    operation: format!("create background batch record: {e}"),
+                },
             })?
     } else {
         // Bound how much an unverified creditor can queue. Checked before
@@ -962,13 +996,12 @@ pub async fn create_batch<P: PoolProvider>(
             });
         });
 
-        state
-            .request_manager
-            .create_batch_record(batch_input)
-            .await
-            .map_err(|e| Error::Internal {
+        state.request_manager.create_batch_record(batch_input).await.map_err(|e| match e {
+            fusillade::FusilladeError::ValidationError(message) => Error::BadRequest { message },
+            e => Error::Internal {
                 operation: format!("create batch record: {e}"),
-            })?
+            },
+        })?
     };
 
     // Enqueue background job to populate requests from templates.
@@ -3498,6 +3531,133 @@ mod tests {
         // Note: We can't easily verify the exact failed count since we didn't actually
         // create failed requests in the DB (just set the errors field). But we verified
         // it was hidden before, so the logic is working.
+    }
+
+    /// Upload a one-line `gpt-4` batch file for a user who can use the model.
+    async fn upload_input_file(app: &axum_test::TestServer, pool: &PgPool) -> (crate::api::models::users::UserResponse, String) {
+        let user = create_test_user_with_roles(pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(pool).await;
+        add_user_to_group(pool, user.id, group.id).await;
+        let deployment = create_test_deployment(pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(pool, deployment.id, group.id, user.id).await;
+
+        let jsonl = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let upload = app
+            .post("/ai/v1/files")
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", axum_test::multipart::Part::bytes(jsonl.as_bytes()).file_name("batch.jsonl")),
+            )
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload.json();
+        (user, file["id"].as_str().unwrap().to_string())
+    }
+
+    fn create_batch_request(input_file_id: &str, completion_window: &str) -> CreateBatchRequest {
+        CreateBatchRequest {
+            input_file_id: input_file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: completion_window.to_string(),
+            metadata: None,
+            api_key_id: None,
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn create_batch_refuses_an_input_that_expires_inside_the_window(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let (user, file_id) = upload_input_file(&app, &pool).await;
+
+        // Twelve hours of life left: not enough for a 24h window.
+        sqlx::query("UPDATE fusillade.files SET expires_at = NOW() + INTERVAL '12 hours' WHERE id = $1")
+            .bind(Uuid::parse_str(&file_id).unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let response = app
+            .post("/ai/v1/batches")
+            .json(&create_batch_request(&file_id, "24h"))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body = response.text();
+        assert!(body.contains("expires at"), "unexpected response: {body}");
+        let batches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fusillade.batches")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(batches, 0);
+
+        // With the window covered, the same file is accepted.
+        sqlx::query("UPDATE fusillade.files SET expires_at = NOW() + INTERVAL '25 hours' WHERE id = $1")
+            .bind(Uuid::parse_str(&file_id).unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let response = app
+            .post("/ai/v1/batches")
+            .json(&create_batch_request(&file_id, "24h"))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        response.assert_status(StatusCode::CREATED);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn create_batch_rejects_an_expired_input_with_400(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let (user, file_id) = upload_input_file(&app, &pool).await;
+        sqlx::query("UPDATE fusillade.files SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+            .bind(Uuid::parse_str(&file_id).unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let response = app
+            .post("/ai/v1/batches")
+            .json(&create_batch_request(&file_id, "24h"))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+        assert!(response.text().contains("expired"), "unexpected response: {}", response.text());
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn results_files_show_an_expiry(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let (user, file_id) = upload_input_file(&app, &pool).await;
+
+        let response = app
+            .post("/ai/v1/batches")
+            .json(&create_batch_request(&file_id, "24h"))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        response.assert_status(StatusCode::CREATED);
+        let batch: crate::api::models::batches::BatchResponse = response.json();
+        let default_seconds = crate::config::FilesConfig::default().default_expiry_seconds;
+
+        for results_file_id in [batch.output_file_id.unwrap(), batch.error_file_id.unwrap()] {
+            let file = app
+                .get(&format!("/ai/v1/files/{results_file_id}"))
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                .await;
+            file.assert_status_ok();
+            let file: serde_json::Value = file.json();
+            let expires_at = file["expires_at"].as_i64().expect("results files carry an expiry");
+            assert_eq!(expires_at, batch.created_at + default_seconds);
+        }
     }
 
     /// Give a hand-inserted batch the virtual output and error files that
