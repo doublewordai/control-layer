@@ -230,3 +230,62 @@ async fn anthropic_messages_streaming_end_to_end(pool: PgPool) {
     assert!(text.contains(r#""text":"Hello""#), "{text}");
     assert!(text.contains(r#""stop_reason":"end_turn""#), "{text}");
 }
+
+#[dwctl_test_macros::test]
+async fn anthropic_structured_output_and_replayed_thinking_reach_the_upstream(pool: PgPool) {
+    let mock = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-1", "object": "chat.completion", "created": 1, "model": "gpt-4",
+            "choices": [ { "index": 0, "message": { "role": "assistant", "content": "{\"name\":\"Paris\"}" }, "finish_reason": "stop" } ],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14 }
+        })))
+        .mount(&mock)
+        .await;
+
+    let mut config = create_test_config();
+    config.onwards.strict_mode = true;
+    config.background_services.onwards_sync.enabled = true;
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        .await
+        .expect("app");
+    let (server, bg) = app.into_test_server();
+
+    let api_key = seed_model_and_key(&server, &pool, &mock.uri()).await;
+    bg.sync_onwards_config(&pool).await.unwrap();
+    wait_for_model(&server, &api_key).await;
+
+    let schema = serde_json::json!({
+        "type": "object", "properties": { "name": { "type": "string" } },
+        "required": ["name"], "additionalProperties": false
+    });
+    let resp = server
+        .post("/ai/v1/messages")
+        .add_header("x-api-key", &api_key)
+        .add_header("anthropic-version", "2023-06-01")
+        .json(&serde_json::json!({
+            "model": "gpt-4",
+            "max_tokens": 64,
+            "output_config": { "format": { "type": "json_schema", "schema": schema } },
+            "messages": [
+                { "role": "user", "content": "Name a city." },
+                { "role": "assistant", "content": [
+                    { "type": "thinking", "thinking": "A capital will do.", "signature": "sig" },
+                    { "type": "text", "text": "Paris." }
+                ]},
+                { "role": "user", "content": "As JSON, please." }
+            ]
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+
+    let received = mock.received_requests().await.unwrap();
+    let upstream: serde_json::Value = serde_json::from_slice(&received.last().unwrap().body).unwrap();
+    assert_eq!(
+        upstream["response_format"],
+        serde_json::json!({ "type": "json_schema", "json_schema": { "name": "output", "schema": schema, "strict": true } })
+    );
+    assert_eq!(upstream["messages"][1]["reasoning_content"], "A capital will do.");
+    assert_eq!(upstream["messages"][1]["content"], "Paris.");
+}

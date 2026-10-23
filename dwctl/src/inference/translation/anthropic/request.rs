@@ -58,6 +58,9 @@ pub fn to_chat_completions(req: MessagesRequest, cache_enabled: bool) -> Result<
     if let Some(effort) = reasoning_effort(req.thinking.as_ref(), req.output_config.as_ref())? {
         out.insert("reasoning_effort".into(), json!(effort));
     }
+    if let Some(format) = response_format(req.output_config.as_ref())? {
+        out.insert("response_format".into(), format);
+    }
     // Only forward `service_tier` to engage dwctl's flex tier. Anthropic's
     // standard values (`auto`, `standard_only`) describe priority-vs-standard,
     // which dwctl routing ignores - and `standard_only` is not a valid OpenAI
@@ -195,6 +198,38 @@ fn reasoning_effort(thinking: Option<&Value>, output_config: Option<&Value>) -> 
     }
 }
 
+/// The schema name in `response_format`. OpenAI requires one and Anthropic has
+/// none; backends only use it as a label.
+const RESPONSE_FORMAT_NAME: &str = "output";
+
+/// Anthropic `output_config.format` -> OpenAI `response_format`. Anthropic's
+/// only format is `json_schema`, and it is always enforced, so it becomes a
+/// strict schema. Any other format is refused rather than left unconstrained.
+fn response_format(output_config: Option<&Value>) -> Result<Option<Value>, TranslationError> {
+    let Some(format) = output_config.and_then(|config| config.get("format")).filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    match format.get("type").and_then(Value::as_str) {
+        Some("json_schema") => match format.get("schema") {
+            Some(schema) if schema.is_object() => Ok(Some(json!({
+                "type": "json_schema",
+                "json_schema": { "name": RESPONSE_FORMAT_NAME, "schema": schema, "strict": true },
+            }))),
+            _ => Err(TranslationError::InvalidParameter {
+                param: "output_config.format.schema",
+                message: "output_config.format.schema: expected a JSON schema object".into(),
+            }),
+        },
+        _ => Err(TranslationError::InvalidParameter {
+            param: "output_config.format.type",
+            message: format!(
+                "output_config.format.type: expected json_schema, got {}",
+                format.get("type").unwrap_or(&Value::Null)
+            ),
+        }),
+    }
+}
+
 /// System content (the top-level `system` field, or a `role: "system"` entry in
 /// `messages`) -> an OpenAI system message. Text blocks keep `cache_control` by
 /// emitting array-form content parts.
@@ -231,7 +266,9 @@ fn convert_message(m: &InputMessage, out: &mut Vec<Value>) -> Result<(), Transla
     Ok(())
 }
 
-/// Assistant turn: text -> `content`, `tool_use` blocks -> `tool_calls`.
+/// Assistant turn: text -> `content`, `tool_use` blocks -> `tool_calls`,
+/// `thinking` blocks -> `reasoning_content`, joined by newlines as the Responses
+/// translation does.
 ///
 /// A `cache_control` marker on an assistant text block is PRESERVED: the SDK advances a breakpoint
 /// onto recent turns, so dropping it here (as we used to) meant the growing conversation never
@@ -242,6 +279,7 @@ fn convert_message(m: &InputMessage, out: &mut Vec<Value>) -> Result<(), Transla
 /// message on the next turn — the read chain keeps matching.
 fn convert_assistant(content: &Content) -> Value {
     let mut text = String::new();
+    let mut reasoning = String::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     // The last `cache_control` seen on a text block (the breakpoint to preserve).
     let mut marker: Option<Value> = None;
@@ -288,6 +326,12 @@ fn convert_assistant(content: &Content) -> Value {
                         }
                         tool_calls.push(call);
                     }
+                    ContentBlock::Thinking { thinking } if !thinking.is_empty() => {
+                        if !reasoning.is_empty() {
+                            reasoning.push('\n');
+                        }
+                        reasoning.push_str(thinking);
+                    }
                     // Images / tool_results are not expected on an assistant turn.
                     _ => {}
                 }
@@ -304,6 +348,9 @@ fn convert_assistant(content: &Content) -> Value {
         msg.insert("content".into(), json!([{ "type": "text", "text": text, "cache_control": cc }]));
     } else {
         msg.insert("content".into(), json!(text));
+    }
+    if !reasoning.is_empty() {
+        msg.insert("reasoning_content".into(), json!(reasoning));
     }
     if !tool_calls.is_empty() {
         msg.insert("tool_calls".into(), Value::Array(tool_calls));
@@ -740,7 +787,7 @@ mod tests {
             None
         );
         assert_eq!(
-            effort_for(json!({"thinking": null, "output_config": {"format": {}}})).unwrap(),
+            effort_for(json!({"thinking": null, "output_config": {"format": {"type": "json_schema", "schema": {}}}})).unwrap(),
             None
         );
     }
@@ -773,5 +820,138 @@ mod tests {
                 "{extra}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn output_config_format_becomes_a_strict_response_format() {
+        // The shape `messages.parse` sends.
+        let out = translate(json!({
+            "model": "m", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"effort": "low", "format": {"type": "json_schema", "schema": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+                "additionalProperties": false
+            }}}
+        }));
+        assert_eq!(
+            out["response_format"],
+            json!({"type": "json_schema", "json_schema": {"name": "output", "strict": true, "schema": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+                "additionalProperties": false
+            }}})
+        );
+        assert_eq!(out["reasoning_effort"], "low", "effort still applies next to a format");
+    }
+
+    #[test]
+    fn output_config_format_keeps_schema_key_order() {
+        let schema = r#"{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"string"}}}"#;
+        let req: MessagesRequest = serde_json::from_str(&format!(
+            r#"{{"model":"m","max_tokens":16,"messages":[],"output_config":{{"format":{{"type":"json_schema","schema":{schema}}}}}}}"#
+        ))
+        .unwrap();
+        let out = serde_json::to_string(&to_chat_completions(req, true).unwrap()).unwrap();
+        assert!(out.contains(&format!(r#""schema":{schema}"#)), "{out}");
+    }
+
+    #[test]
+    fn no_output_format_sets_no_response_format() {
+        for extra in [
+            json!({}),
+            json!({"output_config": {"effort": "high"}}),
+            json!({"output_config": {"format": null}}),
+        ] {
+            let mut body = json!({"model": "m", "max_tokens": 16, "messages": []});
+            body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            assert!(translate(body).get("response_format").is_none(), "{extra}");
+        }
+    }
+
+    #[test]
+    fn rejects_output_formats_it_cannot_enforce() {
+        for (format, field) in [
+            (json!({"type": "json_object"}), "output_config.format.type"),
+            (json!({"schema": {"type": "object"}}), "output_config.format.type"),
+            (json!("json_schema"), "output_config.format.type"),
+            (json!({"type": "json_schema"}), "output_config.format.schema"),
+            (json!({"type": "json_schema", "schema": "{}"}), "output_config.format.schema"),
+        ] {
+            let req = serde_json::from_value::<MessagesRequest>(json!({
+                "model": "m", "max_tokens": 16, "messages": [], "output_config": {"format": format}
+            }))
+            .unwrap();
+            let err = to_chat_completions(req, true).unwrap_err();
+            assert!(
+                matches!(&err, TranslationError::InvalidParameter { param, message } if *param == field && message.contains(field)),
+                "{format}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn earlier_thinking_is_replayed_as_reasoning_content() {
+        // Claude Code sends each earlier turn back with its thinking and signature.
+        let out = translate(json!({
+            "model": "m", "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": "weather in SF?"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "I need the tool.", "signature": "sig-a"},
+                    {"type": "text", "text": "Checking."},
+                    {"type": "thinking", "thinking": "Call it for SF.", "signature": "sig-b"},
+                    {"type": "tool_use", "id": "tu_1", "name": "wx", "input": {"city": "SF"}}
+                ]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tu_1", "content": "sunny"}]}
+            ]
+        }));
+        let assistant = &out["messages"][1];
+        assert_eq!(assistant["reasoning_content"], "I need the tool.\nCall it for SF.");
+        assert_eq!(assistant["content"], "Checking.");
+        assert_eq!(assistant["tool_calls"][0]["id"], "tu_1");
+        assert!(!out.to_string().contains("sig-"), "signatures are not forwarded");
+    }
+
+    #[test]
+    fn thinking_only_turn_keeps_its_reasoning() {
+        let out = translate(json!({
+            "model": "m", "max_tokens": 16,
+            "messages": [{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm", "signature": "s"}]}]
+        }));
+        assert_eq!(
+            out["messages"][0],
+            json!({"role": "assistant", "content": null, "reasoning_content": "hmm"})
+        );
+    }
+
+    #[test]
+    fn empty_and_redacted_thinking_add_no_reasoning() {
+        let out = translate(json!({
+            "model": "m", "max_tokens": 16,
+            "messages": [{"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "", "signature": "s"},
+                {"type": "thinking", "signature": "s"},
+                {"type": "redacted_thinking", "data": "encrypted"},
+                {"type": "text", "text": "answer"}
+            ]}]
+        }));
+        assert_eq!(out["messages"][0], json!({"role": "assistant", "content": "answer"}));
+    }
+
+    #[test]
+    fn thinking_in_a_user_turn_is_ignored() {
+        let out = translate(json!({
+            "model": "m", "max_tokens": 16,
+            "messages": [{"role": "user", "content": [
+                {"type": "thinking", "thinking": "not ours", "signature": "s"},
+                {"type": "text", "text": "hi"}
+            ]}]
+        }));
+        assert_eq!(
+            out["messages"][0],
+            json!({"role": "user", "content": [{"type": "text", "text": "hi"}]})
+        );
     }
 }
