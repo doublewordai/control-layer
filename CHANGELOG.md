@@ -1,5 +1,28 @@
 # Changelog
 
+## [15.5.0](https://github.com/doublewordai/control-layer/compare/v15.4.0...v15.5.0) (2026-10-23)
+
+
+### Features
+
+* **dwctl:** count upload refusals by code and measure decode-slot waits ([#2096](https://github.com/doublewordai/control-layer/issues/2096)) ([a901412](https://github.com/doublewordai/control-layer/commit/a9014125a4b21b2b0f1b750da53673bb02218d4c))
+
+
+### Bug Fixes
+
+* **deps:** update rust crate aes-gcm to 0.11.0 ([#2091](https://github.com/doublewordai/control-layer/issues/2091)) ([ba03d73](https://github.com/doublewordai/control-layer/commit/ba03d73e1242180c9e6a6956b08a400432577250))
+* **deps:** update rust crate argon2 to 0.6 ([#2092](https://github.com/doublewordai/control-layer/issues/2092)) ([87e0e6f](https://github.com/doublewordai/control-layer/commit/87e0e6f80bca1977a85a195980a9e4e0d9adaa44))
+* **deps:** update rust crate base64 to 0.23 ([#2093](https://github.com/doublewordai/control-layer/issues/2093)) ([a33f0c4](https://github.com/doublewordai/control-layer/commit/a33f0c4762763d4542aec3d31e82a85b55efa950))
+* **dwctl:** pass CORS preflights through the admin AI proxy ([#2109](https://github.com/doublewordai/control-layer/issues/2109)) ([f0abf9c](https://github.com/doublewordai/control-layer/commit/f0abf9c6e5d386e5ab143cb6f325189372a402c4))
+
+
+### Miscellaneous
+
+* **deps:** update google-cloud-rust monorepo ([#2090](https://github.com/doublewordai/control-layer/issues/2090)) ([7088a7c](https://github.com/doublewordai/control-layer/commit/7088a7c9a78b43c19c883954252c38797a0de107))
+* **deps:** update rust crate aws-sdk-s3 to v1.154.0 ([#2062](https://github.com/doublewordai/control-layer/issues/2062)) ([920df6f](https://github.com/doublewordai/control-layer/commit/920df6ff8736d65f0e7984e83520b27ebeb5ffbb))
+* **deps:** update rust crate serde_with to v3.24.0 ([#2065](https://github.com/doublewordai/control-layer/issues/2065)) ([00859d9](https://github.com/doublewordai/control-layer/commit/00859d92119415d088fe5dd7ce94ab1779fd573f))
+* **deps:** update rust crate serial_test to v3.5.0 ([#2067](https://github.com/doublewordai/control-layer/issues/2067)) ([cc10d16](https://github.com/doublewordai/control-layer/commit/cc10d1627b6687091336c1ce966a82b8003615c4))
+
 ## [15.4.0](https://github.com/doublewordai/control-layer/compare/v15.3.0...v15.4.0) (2026-10-22)
 
 
