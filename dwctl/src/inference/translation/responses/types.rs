@@ -201,6 +201,12 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
 
+    /// Client-chosen cache key (typically a session ID). Carried onto the
+    /// translated Chat Completions body, where onwards uses it for affinity
+    /// and upstream prompt caching, and echoed in the response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+
     /// Reasoning configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ReasoningConfig>,
