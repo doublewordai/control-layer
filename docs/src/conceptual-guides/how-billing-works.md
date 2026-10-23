@@ -62,7 +62,7 @@ or class. The remaining scopes rank in this order:
 
 1. **Account + class**: the account's deal for the resolved class.
 2. **Account all-class**: the account's class-less deal. It covers the `standard`
-   class (and models without classes) only; another class falls through to the
+   class and models without classes only; another class falls through to the
    next scope.
 3. **Public class**: the model's own price for the class, read only for models
    with `routing_mode: class_routes` (see [model provisioning][classes]).
@@ -142,8 +142,8 @@ rolls back atomically. Historical org token/cache prices prevent hard account
 deletion; normal soft deletion retains them. Released migrations are immutable.
 
 Cache multipliers are selected independently by account + resolved class →
-account all-class (standard only) → public class → general model, at the same
-timestamp. They have no
+account all-class (the `standard` class, or a model without classes) → public
+class → general model, at the same timestamp. They have no
 purpose/window dimension. A general cache tariff is required for Control Layer
 cache pricing to apply; an organisation override alone cannot enable it.
 Applicable cache-read/write multipliers adjust the selected input token rate.

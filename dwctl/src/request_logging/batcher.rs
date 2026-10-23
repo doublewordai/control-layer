@@ -803,7 +803,7 @@ where
             LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id
             LEFT JOIN model_tariffs mt ON mt.deployed_model_id = dm.id
                 AND (mt.user_id IS NULL OR mt.user_id = ANY($2))
-                AND (mt.user_id IS NOT NULL OR mt.serving_class IS NULL OR dm.routing_mode = 'class_routes')
+                AND (mt.user_id IS NOT NULL OR mt.serving_class IS NULL OR class_routes_active(dm.id))
             WHERE dm.alias = ANY($1)
             ORDER BY dm.alias, mt.valid_from DESC
             "#,
@@ -847,7 +847,7 @@ where
         Ok(map)
     }
 
-    /// The class routes (`alias:<class>` of a class-routed model) among the
+    /// The class routes (`alias:<class>` of a model with that class) among the
     /// buffer's request models, mapped to (alias, class).
     async fn batch_lookup_class_routes(
         &self,
@@ -869,9 +869,13 @@ where
             SELECT dm.alias, c.class_key
             FROM model_serving_classes c
             JOIN deployed_models dm ON dm.id = c.deployed_model_id
-            WHERE dm.routing_mode = 'class_routes'
-              AND c.class_key <> 'standard'
+            -- Regardless of the model's current mode: a record queued before a
+            -- rollback still names its class. A model of that exact name wins.
+            WHERE c.class_key <> 'standard'
               AND dm.alias || ':' || c.class_key = ANY($1)
+              AND NOT EXISTS (
+                  SELECT 1 FROM deployed_models named
+                  WHERE named.alias = dm.alias || ':' || c.class_key AND named.deleted = false)
             "#,
             &names
         )
@@ -2311,6 +2315,38 @@ mod integration_tests {
         }
 
         while batcher.project_outbox_batch().await.unwrap() > 0 {}
+    }
+
+    #[dwctl_test_macros::test]
+    async fn class_route_records_resolve_after_a_rollback(pool: sqlx::PgPool) {
+        // Records queued while a model was class-routed still name `alias:<class>`
+        // when they are enriched after the model went back to legacy. A model
+        // whose own alias is `alias:<class>` keeps its records.
+        let routed = create_test_model(&pool, "routed").await;
+        let named = create_test_model(&pool, "named").await;
+        create_test_model(&pool, "named:fast").await;
+        for model in [routed, named] {
+            sqlx::query(
+                "INSERT INTO model_serving_classes (deployed_model_id, class_key, display_name, inference_endpoint_id, upstream_model_name)
+                 SELECT id, 'fast', 'Fast', hosted_on, 'upstream-fast' FROM deployed_models WHERE id = $1",
+            )
+            .bind(model)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let config = crate::test::utils::create_test_config();
+        let (batcher, _writer) = AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
+        let buffer = vec![
+            create_raw_record("routed:fast", None, 1, 1),
+            create_raw_record("named:fast", None, 1, 1),
+        ];
+        let mut tx = pool.begin().await.unwrap();
+        let routes = batcher.batch_lookup_class_routes(&mut tx, &buffer).await.unwrap();
+        assert_eq!(
+            routes,
+            HashMap::from([("routed:fast".to_owned(), ("routed".to_owned(), "fast".to_owned()))])
+        );
     }
 
     #[dwctl_test_macros::test]

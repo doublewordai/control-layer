@@ -78,7 +78,7 @@ impl ModelConfigResolver {
               AND (dm.alias = $1
                    -- A class route (`alias:<class>`) inherits its model's
                    -- enablement; its cache entries are scoped by that name.
-                   OR (dm.routing_mode = 'class_routes' AND EXISTS (
+                   OR (class_routes_active(dm.id) AND EXISTS (
                        SELECT 1 FROM model_serving_classes c
                        WHERE c.deployed_model_id = dm.id AND dm.alias || ':' || c.class_key = $1)))
             "#,

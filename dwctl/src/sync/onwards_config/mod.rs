@@ -995,7 +995,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     NOT EXISTS (
                         SELECT 1 FROM model_tariffs mt
                         WHERE mt.deployed_model_id = cm.id AND mt.user_id IS NULL
-                          AND (mt.serving_class IS NULL OR cm.routing_mode = 'class_routes')
+                          AND (mt.serving_class IS NULL OR class_routes_active(cm.id))
                           AND mt.valid_until IS NULL
                           AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                     ) AND NOT EXISTS (
@@ -1032,7 +1032,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                       AND (EXISTS (
                         SELECT 1 FROM model_tariffs mt
                         WHERE mt.deployed_model_id = cm.id AND mt.user_id IS NULL
-                          AND (mt.serving_class IS NULL OR cm.routing_mode = 'class_routes')
+                          AND (mt.serving_class IS NULL OR class_routes_active(cm.id))
                           AND mt.valid_until IS NULL
                           AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                       ) OR EXISTS (
@@ -1463,6 +1463,8 @@ fn convert_class_routes(
                 batch_inflight_limit: standard
                     .then(|| effective_batch_inflight_limit(composite.batch_capacity, default_batch_inflight_capacity, &composite.alias))
                     .flatten(),
+                // `alias` itself is the model; only `alias:<class>` is a class route.
+                class_route_of: (!standard).then(|| composite.alias.clone()),
                 account_inflight_limits: inflight_overrides.get(&target.alias).cloned().unwrap_or_default(),
             };
             debug!(alias = %target.alias, upstream = %target.model_name, "Class route configured");
@@ -1641,6 +1643,7 @@ fn convert_composite_to_target_spec(
         } else {
             None
         },
+        class_route_of: None,
         account_inflight_limits: if pool_name == DEFAULT_COMPONENT_POOL {
             inflight_overrides.get(&composite.alias).cloned().unwrap_or_default()
         } else {
@@ -1788,6 +1791,7 @@ fn convert_to_config_file(
                 overlays: overlays.by_target.get(&target.alias).cloned().unwrap_or_default(),
                 inflight_limit: None,
                 batch_inflight_limit: None,
+                class_route_of: None,
                 account_inflight_limits: HashMap::new(),
             };
 

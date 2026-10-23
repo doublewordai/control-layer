@@ -285,7 +285,7 @@ pub async fn list_ai_models<P: PoolProvider>(
         sqlx::query_as(
             "SELECT dm.alias, c.class_key FROM model_serving_classes c
              JOIN deployed_models dm ON dm.id = c.deployed_model_id
-             WHERE dm.routing_mode = 'class_routes' AND c.class_key <> 'standard' AND dm.id = ANY($1)
+             WHERE class_routes_active(dm.id) AND c.class_key <> 'standard' AND dm.id = ANY($1)
              ORDER BY dm.alias, c.class_key",
         )
         .bind(&model_ids)
@@ -295,7 +295,11 @@ pub async fn list_ai_models<P: PoolProvider>(
     };
 
     let reasoning_policies = if include_reasoning_capabilities {
-        let aliases = rows.iter().map(|row| row.get("alias")).collect::<Vec<String>>();
+        let aliases = rows
+            .iter()
+            .map(|row| row.get("alias"))
+            .chain(class_routes.iter().map(|(alias, class)| format!("{alias}:{class}")))
+            .collect::<Vec<String>>();
         Deployments::new(&mut conn)
             .get_reasoning_policies(&aliases)
             .await
@@ -373,18 +377,22 @@ pub async fn list_ai_models<P: PoolProvider>(
             }
         })
         .collect();
-    // Class entries share the model's metadata; their prices are not listed
-    // here yet.
+    // Class entries share the model's metadata, with reasoning efforts from
+    // their own upstream; their prices are not listed here yet.
     let classes: Vec<ModelObject> = class_routes
         .into_iter()
         .filter_map(|(alias, class)| {
             let model = data.iter().find(|model| model.id == alias)?;
+            let id = format!("{alias}:{class}");
+            let supported_reasoning_efforts = include_reasoning_capabilities
+                .then(|| reasoning_policies.get(&id).and_then(|policy| policy.supported_efforts()))
+                .flatten();
             Some(ModelObject {
-                id: format!("{alias}:{class}"),
+                id,
                 object: "model".to_string(),
                 created: model.created,
                 owned_by: model.owned_by.clone(),
-                supported_reasoning_efforts: model.supported_reasoning_efforts.clone(),
+                supported_reasoning_efforts,
                 tariffs: None,
                 cache_pricing: None,
             })

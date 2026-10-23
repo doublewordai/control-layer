@@ -1542,6 +1542,7 @@ impl<'c> Deployments<'c> {
                     requested.hosted_on,
                     requested.reasoning_translation_overrides
                 WHERE requested.is_composite = FALSE
+                  AND NOT class_routes_active(requested.id)
 
                 UNION ALL
 
@@ -1551,13 +1552,40 @@ impl<'c> Deployments<'c> {
                 FROM deployed_model_components link
                 INNER JOIN deployed_models component ON component.id = link.deployed_model_id
                 WHERE requested.is_composite = TRUE
+                  AND NOT class_routes_active(requested.id)
                   AND link.composite_model_id = requested.id
                   AND component.deleted = FALSE
+
+                UNION ALL
+
+                -- A class-routed model's name is served by its standard class.
+                SELECT
+                    class.inference_endpoint_id,
+                    requested.reasoning_translation_overrides
+                FROM model_serving_classes class
+                WHERE class_routes_active(requested.id)
+                  AND class.deployed_model_id = requested.id
+                  AND class.class_key = 'standard'
             ) provider ON TRUE
             INNER JOIN inference_endpoints endpoint ON endpoint.id = provider.hosted_on
             WHERE requested.alias = ANY($1)
               AND requested.deleted = FALSE
-            ORDER BY requested.alias
+
+            UNION ALL
+
+            -- A class route (`alias:<class>`) is served by its class's endpoint.
+            SELECT
+                model.alias || ':' || class.class_key AS routing_alias,
+                endpoint.reasoning_translation AS endpoint_reasoning_translation,
+                model.reasoning_translation_overrides AS model_reasoning_translation_overrides
+            FROM model_serving_classes class
+            INNER JOIN deployed_models model ON model.id = class.deployed_model_id
+            INNER JOIN inference_endpoints endpoint ON endpoint.id = class.inference_endpoint_id
+            WHERE class.class_key <> 'standard'
+              AND model.alias || ':' || class.class_key = ANY($1)
+              AND model.deleted = FALSE
+              AND class_routes_active(model.id)
+            ORDER BY routing_alias
             "#,
         )
         .bind(aliases)
@@ -4836,6 +4864,66 @@ mod tests {
         assert_eq!(
             supported.chat_completions,
             Some(vec![ReasoningEffort::Medium, ReasoningEffort::High])
+        );
+    }
+
+    #[dwctl_test_macros::test]
+    async fn a_class_routed_model_takes_reasoning_efforts_from_its_class_endpoints(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite_id, _) = create_composite_and_components(&pool, user.id, 1).await;
+        let alias: String = sqlx::query_scalar("SELECT alias FROM deployed_models WHERE id = $1")
+            .bind(composite_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let efforts = |supported: &[&str]| {
+            let all = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+            serde_json::json!({
+                "chat_completions": {
+                    "unsupported_efforts": all.iter().filter(|e| !supported.contains(e)).collect::<Vec<_>>(),
+                    "writes": [{"target_path": "/reasoning_effort",
+                                "values": supported.iter().map(|e| (e.to_string(), serde_json::json!(e))).collect::<serde_json::Map<_, _>>()}]
+                }
+            })
+        };
+        for (class, supported) in [("standard", vec!["low", "medium", "high"]), ("fast", vec!["high"])] {
+            let endpoint = crate::test::utils::create_test_endpoint(&pool, &format!("class-{class}"), user.id).await;
+            sqlx::query("UPDATE inference_endpoints SET reasoning_translation = $1 WHERE id = $2")
+                .bind(efforts(&supported))
+                .bind(endpoint)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO model_serving_classes (deployed_model_id, class_key, display_name, inference_endpoint_id, upstream_model_name)
+                 VALUES ($1, $2, $2, $3, 'upstream')",
+            )
+            .bind(composite_id)
+            .bind(class)
+            .bind(endpoint)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("UPDATE deployed_models SET routing_mode = 'class_routes' WHERE id = $1")
+            .bind(composite_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let fast = format!("{alias}:fast");
+        let mut conn = pool.acquire().await.unwrap();
+        let policies = Deployments::new(&mut conn)
+            .get_reasoning_policies(&[alias.clone(), fast.clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            policies[&alias].supported_efforts().unwrap().chat_completions,
+            Some(vec![ReasoningEffort::Low, ReasoningEffort::Medium, ReasoningEffort::High])
+        );
+        assert_eq!(
+            policies[&fast].supported_efforts().unwrap().chat_completions,
+            Some(vec![ReasoningEffort::High])
         );
     }
 

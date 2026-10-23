@@ -49,6 +49,17 @@ pub struct ModelDocument {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+// Mirrors validation: activation needs class routes, and classes need `standard`.
+#[schemars(extend("allOf" = [
+    {
+        "if": {"required": ["routing_mode"], "properties": {"routing_mode": {"const": "class_routes"}}},
+        "then": {"required": ["class_routes"], "properties": {"class_routes": {"required": ["standard"]}}}
+    },
+    {
+        "if": {"required": ["class_routes"], "properties": {"class_routes": {"minProperties": 1}}},
+        "then": {"properties": {"class_routes": {"required": ["standard"]}}}
+    }
+]))]
 pub struct ClayModel {
     pub alias: String,
     /// Defaults to the document's top-level `model` value.

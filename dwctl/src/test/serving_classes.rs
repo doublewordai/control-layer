@@ -477,6 +477,20 @@ async fn class_routes_serve_realtime_by_class_and_bill_the_class(pool: PgPool) {
         .await;
     response.assert_status(StatusCode::BAD_REQUEST);
     assert!(response.text().contains("serving_class_realtime_only"), "{}", response.text());
+    assert!(
+        response.text().contains("'policy'"),
+        "the refusal names the standard route: {}",
+        response.text()
+    );
+    // Not even where the endpoint would serve flex as realtime.
+    let response = f
+        .server
+        .post("/ai/v1/embeddings")
+        .add_header("Authorization", format!("Bearer {}", f.key))
+        .json(&json!({"model": "policy:fast", "input": "hi", "service_tier": "flex"}))
+        .await;
+    response.assert_status(StatusCode::BAD_REQUEST);
+    assert!(response.text().contains("serving_class_realtime_only"), "{}", response.text());
 
     // Both realtime requests are recorded as the model, in their class, at
     // their class's price.
@@ -510,6 +524,41 @@ async fn class_routes_serve_realtime_by_class_and_bill_the_class(pool: PgPool) {
             ),
         ]
     );
+    f.services.shutdown().await;
+}
+
+#[dwctl_test_macros::test]
+async fn an_activation_without_standard_serves_and_prices_the_legacy_route(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    activate_policy_classes(&f, &pool).await;
+    sqlx::query("DELETE FROM model_serving_classes WHERE class_key = 'standard'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    f.services.sync_onwards_config(&pool).await.unwrap();
+
+    // No class route is listed or served, and the model takes its legacy route.
+    let models: Value = f
+        .server
+        .get("/ai/v1/models")
+        .add_header("Authorization", format!("Bearer {}", f.key))
+        .await
+        .json();
+    let ids: Vec<&str> = models["data"].as_array().unwrap().iter().filter_map(|m| m["id"].as_str()).collect();
+    assert!(ids.contains(&"policy") && !ids.contains(&"policy:fast"), "{ids:?}");
+    f.post("chat/completions", "policy", false).await.assert_status_ok();
+    assert_ne!(f.last_body().await["model"], "pool-standard");
+
+    // Billing reads no class price for the model while its classes don't serve.
+    let class_prices: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM deployed_models dm,
+             effective_model_tariff(dm.id, NULL, 'realtime', NULL, 'fast', now()) t
+         WHERE dm.alias = 'policy' AND t.serving_class IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(class_prices, 0);
     f.services.shutdown().await;
 }
 

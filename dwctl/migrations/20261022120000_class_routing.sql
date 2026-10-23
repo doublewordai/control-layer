@@ -36,6 +36,18 @@ CREATE TRIGGER realtime_inflight_class_overrides_notify
     AFTER INSERT OR UPDATE OR DELETE ON realtime_inflight_class_overrides
     EXECUTE FUNCTION notify_config_change();
 
+-- Whether a model serves its class routes: set to class_routes, with a
+-- standard class and no redirect rule. Otherwise the gateway serves its
+-- legacy route, and every reader of class data must agree.
+CREATE FUNCTION class_routes_active(model_id UUID) RETURNS BOOLEAN LANGUAGE SQL STABLE AS $$
+    SELECT EXISTS (SELECT 1 FROM deployed_models dm WHERE dm.id = model_id AND dm.routing_mode = 'class_routes')
+       AND EXISTS (SELECT 1 FROM model_serving_classes c WHERE c.deployed_model_id = model_id AND c.class_key = 'standard')
+       AND NOT EXISTS (SELECT 1 FROM model_traffic_rules r WHERE r.deployed_model_id = model_id AND r.action = 'redirect')
+$$;
+
+COMMENT ON FUNCTION class_routes_active(UUID) IS
+  'True when the gateway serves the model''s class routes; false when it serves the legacy route.';
+
 -- An account's class-less deal covers the standard class only: any other
 -- class is priced by the account's deal for that class, else the model's.
 CREATE OR REPLACE FUNCTION effective_model_tariff(
@@ -47,8 +59,7 @@ CREATE OR REPLACE FUNCTION effective_model_tariff(
     WHERE COALESCE(purpose, 'realtime') IN ('realtime','batch','playground')
       AND mt.deployed_model_id = model_id
       AND (mt.user_id = account_id OR mt.user_id IS NULL)
-      AND (mt.user_id IS NOT NULL OR mt.serving_class IS NULL OR EXISTS (
-          SELECT 1 FROM deployed_models dm WHERE dm.id=model_id AND dm.routing_mode='class_routes'))
+      AND (mt.user_id IS NOT NULL OR mt.serving_class IS NULL OR class_routes_active(model_id))
       AND (mt.serving_class = CASE WHEN purpose = 'batch' THEN 'standard' ELSE resolved_class END OR mt.serving_class IS NULL)
       AND NOT (mt.user_id IS NOT NULL AND mt.serving_class IS NULL
                AND COALESCE(CASE WHEN purpose = 'batch' THEN 'standard' ELSE resolved_class END, 'standard') <> 'standard')

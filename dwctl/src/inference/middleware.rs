@@ -184,19 +184,18 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // unchanged.
     // A class other than standard (`alias:<class>` on a class-routed model)
     // serves realtime only: asynchronous work is scheduled on the standard
-    // class by its deadline.
-    if is_daemon_processed
+    // class by its deadline. Checked on the requested tier, so an endpoint that
+    // serves flex as realtime still refuses it.
+    if matches!(requested_tier, ServiceTier::Flex | ServiceTier::Background)
         && let Some(model) = request_value["model"].as_str()
-        && parts
+        && let Some(standard) = parts
             .extensions
             .get::<rejections::Recorder>()
-            .is_some_and(|recorder| recorder.is_class_route(model))
+            .and_then(|recorder| recorder.class_route_of(model))
     {
         let model = model.to_owned();
-        let message = format!(
-            "Model '{model}' is available for realtime requests only; send flex and background requests to '{}'.",
-            model.split_once(':').map_or(model.as_str(), |(alias, _)| alias)
-        );
+        let message =
+            format!("Model '{model}' is available for realtime requests only; send flex and background requests to '{standard}'.");
         return invalid_request(&parts, Some(&model), &message, "serving_class_realtime_only", "model");
     }
 

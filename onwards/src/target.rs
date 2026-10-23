@@ -443,6 +443,12 @@ pub struct PoolSpec {
     #[serde(default)]
     pub batch_inflight_limit: Option<u32>,
 
+    /// The model this alias is a serving-class route of (`model:<class>`
+    /// names the `<class>` route of `model`), when it is one. Set by the
+    /// config writer; onwards routes the alias like any other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class_route_of: Option<String>,
+
     #[serde(default)]
     #[builder(default)]
     pub account_inflight_limits: HashMap<String, u32>,
@@ -570,6 +576,7 @@ pub struct PoolConfig {
     pub overlays: HashMap<String, ServingOverlay>,
     pub inflight_limit: Option<u32>,
     pub batch_inflight_limit: Option<u32>,
+    pub class_route_of: Option<String>,
     pub account_inflight_limits: HashMap<String, u32>,
     pub providers: Vec<ProviderSpec>,
 }
@@ -589,6 +596,7 @@ impl From<PoolSpec> for PoolConfig {
             overlays: pool.overlays,
             inflight_limit: pool.inflight_limit,
             batch_inflight_limit: pool.batch_inflight_limit,
+            class_route_of: pool.class_route_of,
             account_inflight_limits: pool.account_inflight_limits,
             providers: pool.providers,
         }
@@ -737,6 +745,7 @@ impl TargetSpecOrList {
                     overlays: HashMap::new(),
                     inflight_limit: None,
                     batch_inflight_limit: None,
+                    class_route_of: None,
                     account_inflight_limits: HashMap::new(),
                     providers,
                 })
@@ -780,6 +789,7 @@ impl TargetSpecOrList {
                     overlays: HashMap::new(),
                     inflight_limit: None,
                     batch_inflight_limit: None,
+                    class_route_of: None,
                     account_inflight_limits: HashMap::new(),
                     providers: vec![provider],
                 })
@@ -1497,7 +1507,8 @@ fn build_pool(
         default,
         accounts: pool_config.account_inflight_limits,
     }))
-    .with_batch_inflight_limit(pool_config.batch_inflight_limit))
+    .with_batch_inflight_limit(pool_config.batch_inflight_limit)
+    .with_class_route_of(pool_config.class_route_of))
 }
 
 impl Targets {
@@ -1506,6 +1517,14 @@ impl Targets {
     /// input.
     pub fn configured_alias<'m>(&self, model: &'m str) -> Option<&'m str> {
         Some(model).filter(|alias| self.targets.contains_key(*alias))
+    }
+
+    /// The model `alias` is a serving-class route of, when it is a configured
+    /// class route (see [`PoolSpec::class_route_of`]).
+    pub fn class_route_of(&self, alias: &str) -> Option<String> {
+        self.targets
+            .get(alias)
+            .and_then(|pools| pools.default_pool().class_route_of().map(str::to_owned))
     }
 
     pub async fn from_config_file(config_path: &PathBuf) -> Result<Self, anyhow::Error> {
@@ -2902,6 +2921,7 @@ mod tests {
             overlays: Default::default(),
             inflight_limit: None,
             batch_inflight_limit: None,
+            class_route_of: None,
             account_inflight_limits: Default::default(),
         };
 

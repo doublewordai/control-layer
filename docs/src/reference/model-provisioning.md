@@ -202,8 +202,9 @@ Rules:
 
 With `routing_mode: class_routes`, the gateway serves one route per class: `model`
 for `standard` and `model:<class>` for the rest. Each route forwards to its class's
-endpoint and upstream name, without the composite's members, fallback or stream
-continuation. `self_hosted_only` does not apply: the class names its upstream.
+endpoint and upstream name, without the composite's members or stream
+continuation. The model's fallback settings still apply as retries against that
+one upstream. `self_hosted_only` does not apply: the class names its upstream.
 Every route shares the model's deny rules, and only `standard` carries the
 model's batch capacity.
 
@@ -211,7 +212,8 @@ model's batch capacity.
   class. A flex or background request naming `model:<class>` is refused with
   400 `serving_class_realtime_only`; a batch line naming it is refused at upload.
 - **Discovery.** `/v1/models` lists `model:<class>` beside the model for each
-  class other than `standard`. Class entries carry no prices yet.
+  class other than `standard`, with the reasoning efforts its upstream supports.
+  Class entries carry no prices yet.
 - **Analytics and billing.** A request to `model:<class>` is recorded under the
   model's name with `requested_serving_class` and `resolved_serving_class` set to
   the class, and is priced as that class ([how billing works][billing]).
@@ -227,10 +229,18 @@ An activation the gateway cannot serve (no `standard` class, or redirect rules
 added outside the catalogue) falls back to the legacy route and is logged as
 `invalid_class_activation`.
 
-To roll back, set `routing_mode: legacy` and redeploy. Keep the legacy
-`deployments`, `routing` and `tariffs` in place while a model is activated so the
-rollback has a route to return to. The catalogue owns the column: it is written
-on every reconcile, and a model omitted from the catalogue keeps its last value.
+To roll back on a release that supports class routing, set `routing_mode: legacy`
+and redeploy. Keep the legacy `deployments`, `routing`, `tariffs` and
+`cache_tariff` in place while a model is activated, so the rollback has a route
+and prices to return to; class caching also inherits the model's `cache_tariff`.
+The catalogue owns the column: it is written on every reconcile, and a model
+omitted from the catalogue keeps its last value.
+
+To roll back to an older release, first deploy the catalogue with
+`routing_mode: legacy` on every model. Then remove the `routing_mode` and
+`class_routes.<class>.realtime_inflight_limit` fields, and any `class_routes`
+without a `fast` class, before deploying the older image: older releases reject
+those at startup.
 
 ### Ownership
 

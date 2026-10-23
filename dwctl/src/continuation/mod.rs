@@ -282,7 +282,7 @@ impl ContinuationRoutes {
               AND dmc.enabled = true
               AND cm.deleted = false
               -- A class-routed model's targets have no completions pool.
-              AND cm.routing_mode <> 'class_routes'
+              AND NOT class_routes_active(cm.id)
               AND dm.deleted = false
             ORDER BY
                 cm.alias,
@@ -577,6 +577,21 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        routes.refresh(&pool).await.unwrap();
+        assert!(
+            routes.is_enabled("alias-resumable"),
+            "an activation without a standard class serves the legacy route, continuation included"
+        );
+
+        sqlx::query!(
+            "INSERT INTO model_serving_classes (deployed_model_id, class_key, display_name, inference_endpoint_id, upstream_model_name)
+             VALUES ($1, 'standard', 'Standard', $2, 'upstream')",
+            resumable,
+            endpoint
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         routes.refresh(&pool).await.unwrap();
         assert!(!routes.is_enabled("alias-resumable"), "class routes have no completions pool");
     }

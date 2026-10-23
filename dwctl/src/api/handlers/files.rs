@@ -1482,7 +1482,7 @@ pub async fn upload_file<P: PoolProvider>(
                     targets
                         .targets
                         .iter()
-                        .filter(|entry| entry.key().contains(':'))
+                        .filter(|entry| entry.value().default_pool().class_route_of().is_some())
                         .map(|entry| entry.key().clone())
                         .collect()
                 })

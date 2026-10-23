@@ -182,6 +182,53 @@
       "additionalProperties": false,
       "required": [
         "alias"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "routing_mode": {
+                "const": "class_routes"
+              }
+            },
+            "required": [
+              "routing_mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "class_routes": {
+                "required": [
+                  "standard"
+                ]
+              }
+            },
+            "required": [
+              "class_routes"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "class_routes": {
+                "minProperties": 1
+              }
+            },
+            "required": [
+              "class_routes"
+            ]
+          },
+          "then": {
+            "properties": {
+              "class_routes": {
+                "required": [
+                  "standard"
+                ]
+              }
+            }
+          }
+        }
       ]
     },
     "ModelKind": {

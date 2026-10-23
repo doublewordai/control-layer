@@ -180,7 +180,7 @@ where
         JOIN model_cache_tariffs mct ON mct.deployed_model_id = dm.id
         WHERE dm.alias = ANY($1)
           AND (mct.user_id IS NULL OR mct.user_id = ANY($2))
-          AND (mct.user_id IS NOT NULL OR mct.serving_class IS NULL OR dm.routing_mode = 'class_routes')
+          AND (mct.user_id IS NOT NULL OR mct.serving_class IS NULL OR class_routes_active(dm.id))
         ORDER BY dm.alias, mct.valid_from DESC
         "#,
         aliases,
