@@ -133,6 +133,11 @@ pub enum ToolResultContent {
 /// An Anthropic tool definition.
 #[derive(Debug, Deserialize)]
 pub struct Tool {
+    /// Anthropic-defined tools carry a versioned type. Some are executed by
+    /// the client (computer, bash, text editor), while server tools such as web
+    /// search are executed by Anthropic. User-defined tools omit this field.
+    #[serde(default)]
+    pub r#type: Option<String>,
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
