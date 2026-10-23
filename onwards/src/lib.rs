@@ -735,6 +735,10 @@ pub mod test_utils {
         pub body: Vec<u8>,
     }
 
+    /// A canned `(status, headers, body)` answer for
+    /// [`MockHttpClient::new_status_sequence`].
+    pub type MockResponse = (StatusCode, Vec<(&'static str, &'static str)>, &'static str);
+
     impl MockHttpClient {
         pub fn new(status: StatusCode, body: &str) -> Self {
             let body = body.to_string();
@@ -748,6 +752,36 @@ pub mod test_utils {
                         .unwrap()
                 }),
                 custom_headers: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        /// Answer each successive call with the next `(status, headers, body)`
+        /// in `responses`; calls past the end get the last entry again. The
+        /// content type is JSON unless `headers` sets another.
+        pub fn new_status_sequence(responses: Vec<MockResponse>) -> Self {
+            let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            Self {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                custom_headers: Arc::new(Mutex::new(Vec::new())),
+                response_builder: Arc::new(move || {
+                    let idx = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let (status, headers, body) = responses
+                        .get(idx)
+                        .or(responses.last())
+                        .cloned()
+                        .expect("at least one response");
+                    let mut response = axum::response::Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap();
+                    for (name, value) in headers {
+                        response
+                            .headers_mut()
+                            .insert(name, axum::http::HeaderValue::from_static(value));
+                    }
+                    response
+                }),
             }
         }
 
@@ -2787,6 +2821,148 @@ mod tests {
         let body: serde_json::Value = response.json();
         assert_eq!(body["error"]["code"], "no_capacity");
         assert!(mock.get_requests().is_empty());
+    }
+
+    /// A two-member chain that fails over on `on_status`, its members answering
+    /// `statuses` in order, asked with `body`.
+    async fn exhausted_chain(
+        on_status: Vec<u16>,
+        statuses: Vec<(u16, Vec<(&'static str, &'static str)>)>,
+        body: serde_json::Value,
+    ) -> (axum_test::TestResponse, MockHttpClient) {
+        let mock = MockHttpClient::new_status_sequence(
+            statuses
+                .into_iter()
+                .map(|(status, headers)| {
+                    (
+                        StatusCode::from_u16(status).unwrap(),
+                        headers,
+                        r#"{"error":{"message":"upstream detail"}}"#,
+                    )
+                })
+                .collect(),
+        );
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 2, on_status), mock.clone());
+        let response = TestServer::new(build_router(app_state))
+            .unwrap()
+            .post("/v1/chat/completions")
+            .json(&body)
+            .await;
+        (response, mock)
+    }
+
+    fn chat_body(stream: bool) -> serde_json::Value {
+        json!({
+            "model": "gpt-4",
+            "stream": stream,
+            "messages": [{"role": "user", "content": "Hello"}]
+        })
+    }
+
+    #[tokio::test]
+    async fn test_exhausted_chain_reports_capacity_refusal_over_a_later_404() {
+        // The first member is full; the second does not serve the model (yet).
+        // The caller must be told to retry shortly, not handed the second
+        // member's failure as a 502.
+        for stream in [false, true] {
+            let (response, mock) = exhausted_chain(
+                vec![404, 503, 529],
+                vec![(529, vec![("retry-after", "120")]), (404, vec![])],
+                chat_body(stream),
+            )
+            .await;
+
+            assert_eq!(
+                mock.get_requests().len(),
+                2,
+                "stream={stream}: both members asked"
+            );
+            assert_eq!(response.status_code(), 529, "stream={stream}");
+            assert_eq!(response.header("retry-after"), "1", "stream={stream}");
+            let body: serde_json::Value = response.json();
+            assert_eq!(body["error"]["code"], "overloaded", "stream={stream}");
+            assert_eq!(body["error"]["type"], "overloaded_error", "stream={stream}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_exhausted_chain_of_404s_still_reports_the_last_failure() {
+        // No member had anything better to say: unchanged from before precedence.
+        let (response, mock) = exhausted_chain(
+            vec![404, 503, 529],
+            vec![(404, vec![]), (404, vec![])],
+            chat_body(false),
+        )
+        .await;
+
+        assert_eq!(mock.get_requests().len(), 2);
+        assert_eq!(response.status_code(), 502);
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["error"]["code"], "internal_error");
+    }
+
+    #[tokio::test]
+    async fn test_exhausted_chain_reports_503_capacity_over_a_500_in_either_order() {
+        // An upstream 503 is a capacity refusal, a 500 a failure: whichever
+        // came last, the caller gets the retryable 529.
+        for statuses in [vec![503, 500], vec![500, 503]] {
+            let (response, mock) = exhausted_chain(
+                vec![500, 503],
+                statuses.iter().map(|s| (*s, vec![])).collect(),
+                chat_body(false),
+            )
+            .await;
+
+            assert_eq!(mock.get_requests().len(), 2, "{statuses:?}");
+            assert_eq!(response.status_code(), 529, "{statuses:?}");
+            assert_eq!(response.header("retry-after"), "1", "{statuses:?}");
+            let body: serde_json::Value = response.json();
+            assert_eq!(body["error"]["code"], "overloaded", "{statuses:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_exhausted_chain_reports_rate_limit_over_a_later_generic_failure() {
+        let (response, mock) = exhausted_chain(
+            vec![429, 500],
+            vec![(429, vec![]), (500, vec![])],
+            chat_body(false),
+        )
+        .await;
+
+        assert_eq!(mock.get_requests().len(), 2);
+        assert_eq!(response.status_code(), 429);
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["error"]["code"], "upstream_rate_limit");
+    }
+
+    #[tokio::test]
+    async fn test_exhausted_chain_reports_embedded_capacity_refusal_over_a_later_404() {
+        // A streamed 200 whose first frame embeds a 529 is the same refusal as
+        // a 529 status line, so it too outranks the second member's 404.
+        let mock = MockHttpClient::new_status_sequence(vec![
+            (
+                StatusCode::OK,
+                vec![("content-type", "text/event-stream")],
+                "data: {\"error\":{\"code\":529,\"message\":\"overloaded\"}}\n\n",
+            ),
+            (StatusCode::NOT_FOUND, vec![], "{}"),
+        ]);
+        let app_state = AppState::with_client(
+            fallback_targets("gpt-4", 2, vec![404, 503, 529]),
+            mock.clone(),
+        );
+        let response = TestServer::new(build_router(app_state))
+            .unwrap()
+            .post("/v1/chat/completions")
+            .json(&chat_body(true))
+            .await;
+
+        assert_eq!(mock.get_requests().len(), 2);
+        assert_eq!(response.status_code(), 529);
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["error"]["code"], "overloaded");
     }
 
     #[tokio::test]
