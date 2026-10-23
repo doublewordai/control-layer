@@ -234,7 +234,9 @@ and redeploy. Keep the legacy `deployments`, `routing`, `tariffs` and
 `cache_tariff` in place while a model is activated, so the rollback has a route
 and prices to return to; class caching also inherits the model's `cache_tariff`.
 The catalogue owns the column: it is written on every reconcile, and a model
-omitted from the catalogue keeps its last value.
+omitted from the catalogue keeps its last value. Class prices apply only while
+class routes serve, so a class request still waiting to be billed when the model
+rolls back is recorded in its class but priced at the model's price.
 
 To roll back to an older release, first deploy the catalogue with
 `routing_mode: legacy` on every model. Then remove the `routing_mode` and

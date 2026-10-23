@@ -201,6 +201,20 @@
                 "required": [
                   "standard"
                 ]
+              },
+              "traffic_rules": {
+                "items": {
+                  "not": {
+                    "properties": {
+                      "action": {
+                        "const": "redirect"
+                      }
+                    },
+                    "required": [
+                      "action"
+                    ]
+                  }
+                }
               }
             },
             "required": [

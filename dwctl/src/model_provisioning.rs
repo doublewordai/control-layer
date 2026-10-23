@@ -49,11 +49,18 @@ pub struct ModelDocument {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-// Mirrors validation: activation needs class routes, and classes need `standard`.
+// Mirrors validation: activation needs class routes with `standard` and no
+// redirect rule, and classes need `standard`.
 #[schemars(extend("allOf" = [
     {
         "if": {"required": ["routing_mode"], "properties": {"routing_mode": {"const": "class_routes"}}},
-        "then": {"required": ["class_routes"], "properties": {"class_routes": {"required": ["standard"]}}}
+        "then": {
+            "required": ["class_routes"],
+            "properties": {
+                "class_routes": {"required": ["standard"]},
+                "traffic_rules": {"items": {"not": {"required": ["action"], "properties": {"action": {"const": "redirect"}}}}}
+            }
+        }
     },
     {
         "if": {"required": ["class_routes"], "properties": {"class_routes": {"minProperties": 1}}},

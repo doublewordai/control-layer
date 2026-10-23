@@ -870,7 +870,9 @@ where
             FROM model_serving_classes c
             JOIN deployed_models dm ON dm.id = c.deployed_model_id
             -- Regardless of the model's current mode: a record queued before a
-            -- rollback still names its class. A model of that exact name wins.
+            -- rollback is still recorded under its model and class (and priced
+            -- at the model's price, as class prices apply only while class
+            -- routes serve). A model of that exact name wins.
             WHERE c.class_key <> 'standard'
               AND dm.alias || ':' || c.class_key = ANY($1)
               AND NOT EXISTS (
