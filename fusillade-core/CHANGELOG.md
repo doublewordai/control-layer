@@ -1,5 +1,28 @@
 # Changelog
 
+## [6.1.0](https://github.com/doublewordai/control-layer/compare/fusillade-core-v6.0.0...fusillade-core-v6.1.0) (2026-10-23)
+
+
+### Features
+
+* correlate requests end to end with x_request_id ([#1970](https://github.com/doublewordai/control-layer/issues/1970)) ([f61e00f](https://github.com/doublewordai/control-layer/commit/f61e00fe5c898b4bf3fda97eef2f34578e059c23))
+* **limits:** cap batch requests in flight per model in onwards ([#1924](https://github.com/doublewordai/control-layer/issues/1924)) ([834827d](https://github.com/doublewordai/control-layer/commit/834827dbc2b09604e9759f8b715eb85b3e2c1e22))
+
+
+### Bug Fixes
+
+* **batches:** scope per-request retry to its batch ([#1847](https://github.com/doublewordai/control-layer/issues/1847)) ([695112e](https://github.com/doublewordai/control-layer/commit/695112e9c932aec65a46a43681f360b717114b82))
+* **files:** return 404 when a file delete loses the race ([#1887](https://github.com/doublewordai/control-layer/issues/1887)) ([5d41b2a](https://github.com/doublewordai/control-layer/commit/5d41b2ad86fc776751850fe9f9df6b1ebf04fee6))
+* **fusillade:** fence reclaimed request ownership ([#1804](https://github.com/doublewordai/control-layer/issues/1804)) ([14a53f9](https://github.com/doublewordai/control-layer/commit/14a53f9cfe6efc02051467ec33f08b622c967a5e))
+* **fusillade:** stop daemon maintenance from stalling writes to files ([#1986](https://github.com/doublewordai/control-layer/issues/1986)) ([fc5b7f7](https://github.com/doublewordai/control-layer/commit/fc5b7f7f6b3e74c0a208243641307442ae0f9c5a))
+* **fusillade:** write terminal realtime responses directly to retained storage ([#1797](https://github.com/doublewordai/control-layer/issues/1797)) ([1e2adec](https://github.com/doublewordai/control-layer/commit/1e2adec40985a7ffc33b184278b59254326bdd3e))
+* write new request templates to generation two ([6c26427](https://github.com/doublewordai/control-layer/commit/6c264272d0f301f810e06af2a6a65531fc86880f))
+
+
+### Miscellaneous
+
+* **deps:** bump cmov from 0.5.3 to 0.5.4 ([#1228](https://github.com/doublewordai/control-layer/issues/1228)) ([4f328f6](https://github.com/doublewordai/control-layer/commit/4f328f616c9171216a63da9d308a1aaf28a69bed))
+
 ## [6.0.0](https://github.com/doublewordai/control-layer/compare/fusillade-core-v5.0.0...fusillade-core-v6.0.0) (2026-09-15)
 
 
