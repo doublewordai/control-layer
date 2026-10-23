@@ -1,5 +1,62 @@
 # Changelog
 
+## [5.0.0](https://github.com/doublewordai/control-layer/compare/fusillade-arsenal-v4.1.0...fusillade-arsenal-v5.0.0) (2026-10-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* retire the generation-1 request template heap ([#1575](https://github.com/doublewordai/control-layer/issues/1575))
+
+### Features
+
+* correlate requests end to end with x_request_id ([#1970](https://github.com/doublewordai/control-layer/issues/1970)) ([f61e00f](https://github.com/doublewordai/control-layer/commit/f61e00fe5c898b4bf3fda97eef2f34578e059c23))
+* **limits:** cap batch requests in flight per model in onwards ([#1924](https://github.com/doublewordai/control-layer/issues/1924)) ([834827d](https://github.com/doublewordai/control-layer/commit/834827dbc2b09604e9759f8b715eb85b3e2c1e22))
+* retire the generation-1 request template heap ([#1575](https://github.com/doublewordai/control-layer/issues/1575)) ([ebe9807](https://github.com/doublewordai/control-layer/commit/ebe980704bc29f751e425b86ff3df259fa841ed3))
+* **tracing:** customer attributes on request and batch spans ([#1972](https://github.com/doublewordai/control-layer/issues/1972)) ([60db3ec](https://github.com/doublewordai/control-layer/commit/60db3ec246429061cc153b9b5bfea07abc218ca2))
+
+
+### Bug Fixes
+
+* autovacuum large churning tables on a fixed row count ([#1883](https://github.com/doublewordai/control-layer/issues/1883)) ([43e1aae](https://github.com/doublewordai/control-layer/commit/43e1aae14904af4d333dd25e716f2d61462b74a4))
+* **batch:** delete generated files with batch ([#1997](https://github.com/doublewordai/control-layer/issues/1997)) ([45aeaa1](https://github.com/doublewordai/control-layer/commit/45aeaa1676427f26768c7a4cd06ac37bec137221))
+* **batches:** scope per-request retry to its batch ([#1847](https://github.com/doublewordai/control-layer/issues/1847)) ([695112e](https://github.com/doublewordai/control-layer/commit/695112e9c932aec65a46a43681f360b717114b82))
+* **files:** return 404 when a file delete loses the race ([#1887](https://github.com/doublewordai/control-layer/issues/1887)) ([5d41b2a](https://github.com/doublewordai/control-layer/commit/5d41b2ad86fc776751850fe9f9df6b1ebf04fee6))
+* **fusillade:** bound maintenance transactions on the server ([#1878](https://github.com/doublewordai/control-layer/issues/1878)) ([e5b76af](https://github.com/doublewordai/control-layer/commit/e5b76af02688470048f6d56808ffdcc12b33ebb4))
+* **fusillade:** fence reclaimed request ownership ([#1804](https://github.com/doublewordai/control-layer/issues/1804)) ([14a53f9](https://github.com/doublewordai/control-layer/commit/14a53f9cfe6efc02051467ec33f08b622c967a5e))
+* **fusillade:** index batches that finished after their deadline ([#1969](https://github.com/doublewordai/control-layer/issues/1969)) ([04beeb4](https://github.com/doublewordai/control-layer/commit/04beeb4760a6cca460091c67ac9119ea598100e7))
+* **fusillade:** stop daemon maintenance from stalling writes to files ([#1986](https://github.com/doublewordai/control-layer/issues/1986)) ([fc5b7f7](https://github.com/doublewordai/control-layer/commit/fc5b7f7f6b3e74c0a208243641307442ae0f9c5a))
+* **fusillade:** write terminal realtime responses directly to retained storage ([#1797](https://github.com/doublewordai/control-layer/issues/1797)) ([1e2adec](https://github.com/doublewordai/control-layer/commit/1e2adec40985a7ffc33b184278b59254326bdd3e))
+* preserve JSON key order in forwarded request bodies ([#1930](https://github.com/doublewordai/control-layer/issues/1930)) ([a8721a8](https://github.com/doublewordai/control-layer/commit/a8721a8ca8886b2437648131488a833e9461be0f))
+* remove two lock races behind flaky CI tests ([#1982](https://github.com/doublewordai/control-layer/issues/1982)) ([2163e35](https://github.com/doublewordai/control-layer/commit/2163e3541137332aeb22c167a78355aeb6a53b32))
+* **retention:** use indexed probes for startup and purge route queries ([#1783](https://github.com/doublewordai/control-layer/issues/1783)) ([364cf42](https://github.com/doublewordai/control-layer/commit/364cf42636935d8d3c1ad1799f3225e392d48d3c))
+* write new request templates to generation two ([6c26427](https://github.com/doublewordai/control-layer/commit/6c264272d0f301f810e06af2a6a65531fc86880f))
+
+
+### Performance Improvements
+
+* **fusillade:** index cancelling batches for the cancellation poll ([#1877](https://github.com/doublewordai/control-layer/issues/1877)) ([04763b7](https://github.com/doublewordai/control-layer/commit/04763b7406743210a17bdff3ed928c4be83e50a9))
+* **fusillade:** index deleted batches and files awaiting purge ([#1884](https://github.com/doublewordai/control-layer/issues/1884)) ([1a748c3](https://github.com/doublewordai/control-layer/commit/1a748c38ba7af880d5ecf7168ea7fb4f9c515859))
+* **fusillade:** index file-content expiry candidates ([#1882](https://github.com/doublewordai/control-layer/issues/1882)) ([7c2ce88](https://github.com/doublewordai/control-layer/commit/7c2ce8822f7a48dae7db5b899dd4c0ae945f172e))
+* **fusillade:** index pending batch notifications ([#1876](https://github.com/doublewordai/control-layer/issues/1876)) ([57738ae](https://github.com/doublewordai/control-layer/commit/57738aea3abf9f5660b3ec8e91fbc449f57caf9a))
+* **fusillade:** probe live requests by id in trailing demand ([#1889](https://github.com/doublewordai/control-layer/issues/1889)) ([4e6209b](https://github.com/doublewordai/control-layer/commit/4e6209b50867dc2e54952f949b4c869f46e92b2f))
+* **fusillade:** skip batches with live requests before finalizer counts ([#1879](https://github.com/doublewordai/control-layer/issues/1879)) ([79193b3](https://github.com/doublewordai/control-layer/commit/79193b39dfe91ab68de8e832087e22f586ffab90))
+* **tracing:** filter and slim the spans sent to the trace backend (DW-931) ([#1984](https://github.com/doublewordai/control-layer/issues/1984)) ([4a07bb1](https://github.com/doublewordai/control-layer/commit/4a07bb1199d8aaf25cec7a6c19f3815d63b5a3b7))
+
+
+### Build System
+
+* keep clippy clean on Rust 1.99 ([#1900](https://github.com/doublewordai/control-layer/issues/1900)) ([9d14bee](https://github.com/doublewordai/control-layer/commit/9d14beec7ecadbba51a0e8e18ac3d3556d34bcd8))
+
+
+### Miscellaneous
+
+* **deps:** bump cmov from 0.5.3 to 0.5.4 ([#1228](https://github.com/doublewordai/control-layer/issues/1228)) ([4f328f6](https://github.com/doublewordai/control-layer/commit/4f328f616c9171216a63da9d308a1aaf28a69bed))
+
+
+### Tests
+
+* **fusillade:** pin batch index plans to production statements ([#1886](https://github.com/doublewordai/control-layer/issues/1886)) ([301e131](https://github.com/doublewordai/control-layer/commit/301e131050ff46a77d6820a7c37f0a9325da75c1))
+
 ## [4.1.0](https://github.com/doublewordai/control-layer/compare/fusillade-arsenal-v4.0.0...fusillade-arsenal-v4.1.0) (2026-09-15)
 
 
