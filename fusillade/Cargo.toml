@@ -38,7 +38,7 @@ async-trait = "0.1"
 futures = "0.3"
 eventsource-stream = "0.2"
 openai-reassembler = { path = "../openai-reassembler" }
-parking_lot = "0.12"
+parking_lot = "0.13"
 scopeguard = "1"
 humantime = "2"
 hostname = "0.4"
