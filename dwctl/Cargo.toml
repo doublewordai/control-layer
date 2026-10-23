@@ -105,7 +105,7 @@ axum-prometheus = "0.10"
 # Metrics facade and exporter (same versions as axum-prometheus uses)
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
-outlet = "0.11.0"
+outlet = "0.11.1"
 outlet-postgres = "0.8.0"
 brotli = "8.0"
 flate2 = "1"
