@@ -9,7 +9,7 @@ use anyhow::Context;
 use axum::{
     body::Body,
     extract::{FromRequestParts, Request, State},
-    http::{HeaderValue, Uri},
+    http::{HeaderValue, Method, Uri},
     middleware::Next,
     response::Response,
 };
@@ -24,8 +24,9 @@ pub(crate) async fn admin_ai_proxy<P: sqlx_pool_router::PoolProvider + Clone>(
     let uri = request.uri().clone();
     let path = uri.path();
 
-    // Only intercept requests to /admin/api/v1/ai/*
-    if !path.starts_with("/admin/api/v1/ai/") {
+    // Only intercept requests to /admin/api/v1/ai/*. CORS preflights carry no
+    // credentials and are answered by the CORS layer, so pass them through.
+    if !path.starts_with("/admin/api/v1/ai/") || request.method() == Method::OPTIONS {
         return Ok(request);
     }
     debug!("Intercepted admin AI proxy request: {}", path);
@@ -334,6 +335,22 @@ mod tests {
         // No error on making request - user has access
         let err = admin_ai_proxy(state, request).await.unwrap_err();
         assert_eq!(err.status_code().as_u16(), 401);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_preflight_passes_through(pool: PgPool) {
+        let config = create_test_config();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+        let request = axum::http::Request::builder()
+            .method("OPTIONS")
+            .uri("/admin/api/v1/ai/v1/chat/completions")
+            .header("x-doubleword-user", "preflight@example.org")
+            .header("x-doubleword-email", "preflight@example.org")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let request = admin_ai_proxy(state, request).await.unwrap();
+        assert_eq!(request.uri().path(), "/admin/api/v1/ai/v1/chat/completions");
+        assert!(request.headers().get("authorization").is_none());
     }
 
     #[dwctl_test_macros::test]
