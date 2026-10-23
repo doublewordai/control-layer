@@ -222,6 +222,7 @@ const DECLARED_FIELDS: &[&str] = &[
     "parallel_tool_calls",
     "parameters",
     "previous_response_id",
+    "prompt_cache_key",
     "reasoning",
     "reasoning.encrypted_content",
     "reasoning_text",
@@ -877,5 +878,36 @@ mod tests {
         let chat: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
         assert_eq!(chat["reasoning_effort"], "none");
         assert!(chat.get("nvext").is_some(), "{chat}");
+    }
+
+    #[test]
+    fn prompt_cache_key_reaches_chat_and_is_echoed() {
+        let (parts, ()) = axum::http::Request::builder().uri("/v1/responses").body(()).unwrap().into_parts();
+        let request = Bytes::from_static(br#"{"model":"m","input":"hi","prompt_cache_key":"session-123"}"#);
+
+        let out = OpenResponses::new().translate_request(&parts, request.clone()).unwrap();
+        let chat: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(chat["prompt_cache_key"], "session-123", "{chat}");
+
+        let body = serde_json::json!({
+            "id": "c1", "object": "chat.completion", "created": 0, "model": "m",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}]
+        });
+        let translated = OpenResponses::new()
+            .translate_response(&request, None, Bytes::from(body.to_string()))
+            .unwrap();
+        let response: Value = serde_json::from_slice(&translated).unwrap();
+        assert_eq!(response["prompt_cache_key"], "session-123");
+
+        // Without a key, the chat body has none and the response echoes null.
+        let plain = Bytes::from_static(br#"{"model":"m","input":"hi"}"#);
+        let out = OpenResponses::new().translate_request(&parts, plain.clone()).unwrap();
+        let chat: Value = serde_json::from_slice(&out.body).unwrap();
+        assert!(chat.get("prompt_cache_key").is_none(), "{chat}");
+        let translated = OpenResponses::new()
+            .translate_response(&plain, None, Bytes::from(body.to_string()))
+            .unwrap();
+        let response: Value = serde_json::from_slice(&translated).unwrap();
+        assert_eq!(response["prompt_cache_key"], Value::Null);
     }
 }
