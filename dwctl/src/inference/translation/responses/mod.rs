@@ -168,8 +168,8 @@ fn drop_compatible_web_search(req: &mut ResponsesRequest, emit_warning: bool) {
 
     if tools.is_empty() {
         req.tools = None;
-    }
-    if matches!(req.tool_choice.as_ref(), Some(types::ToolChoice::Specific { tool_type, .. }) if tool_type == "web_search") {
+        req.tool_choice = None;
+    } else if matches!(req.tool_choice.as_ref(), Some(types::ToolChoice::Specific { tool_type, .. }) if tool_type == "web_search") {
         req.tool_choice = Some(types::ToolChoice::Mode("auto".to_string()));
     }
     if emit_warning {
@@ -209,7 +209,7 @@ fn unsupported_server_tool_in_raw_request(body: &[u8]) -> Option<String> {
 fn is_server_tool_type(tool_type: &str) -> bool {
     matches!(
         tool_type,
-        "code_interpreter" | "file_search" | "image_generation" | "mcp" | "hosted_tool"
+        "code_interpreter" | "file_search" | "image_generation" | "mcp" | "hosted_tool" | "shell"
     ) || tool_type.starts_with("web_search_")
 }
 
@@ -548,6 +548,7 @@ mod tests {
             // before the typed request union learns their full schema.
             (serde_json::json!({"type": "web_search_2025_08_26"}), "web_search_2025_08_26"),
             (serde_json::json!({"type": "image_generation"}), "image_generation"),
+            (serde_json::json!({"type": "shell"}), "shell"),
         ];
 
         for (tool, expected_type) in cases {
@@ -586,6 +587,25 @@ mod tests {
         assert_eq!(chat["tools"].as_array().unwrap().len(), 1);
         assert_eq!(chat["tools"][0]["function"]["name"], "lookup");
         assert_eq!(chat["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn codex_web_search_is_dropped_with_its_tool_choice_when_no_tools_remain() {
+        let body = serde_json::json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [{"type": "web_search", "external_web_access": true}],
+            "tool_choice": "auto"
+        });
+        let (parts, ()) = axum::http::Request::builder().uri("/v1/responses").body(()).unwrap().into_parts();
+
+        let translated = OpenResponses::new()
+            .translate_request(&parts, Bytes::from(serde_json::to_vec(&body).unwrap()))
+            .expect("Codex web_search should be ignored");
+        let chat: Value = serde_json::from_slice(&translated.body).unwrap();
+
+        assert!(chat.get("tools").is_none());
+        assert!(chat.get("tool_choice").is_none());
     }
 
     #[test]

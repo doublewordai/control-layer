@@ -40,7 +40,18 @@ impl ProtocolTranslator for AnthropicMessages {
     }
 
     fn translate_request(&self, parts: &Parts, body: Bytes) -> Result<TranslatedRequest, TranslationError> {
-        let req: MessagesRequest = parse_request(&body, DECLARED_FIELDS, "Anthropic Messages")?;
+        let req: MessagesRequest = match parse_request(&body, DECLARED_FIELDS, "Anthropic Messages") {
+            Ok(req) => req,
+            Err(error) => {
+                // Some provider-executed tools do not share the required
+                // fields of a client tool, so recognise their raw `type`
+                // before returning a generic schema mismatch.
+                if let Some(tool_type) = unsupported_server_tool_in_raw_request(&body) {
+                    return Err(unsupported_server_tool(&tool_type));
+                }
+                return Err(error);
+            }
+        };
         validate_server_tools(&req)?;
 
         let chat = request::to_chat_completions(req, self.cache_enabled)?;
@@ -99,16 +110,30 @@ fn validate_server_tools(req: &MessagesRequest) -> Result<(), TranslationError> 
 }
 
 fn is_server_tool_type(tool_type: &str) -> bool {
-    [
-        "web_search_",
-        "web_fetch_",
-        "code_execution_",
-        "tool_search_tool_",
-        "advisor_",
-        "mcp_toolset_",
-    ]
-    .iter()
-    .any(|prefix| tool_type.starts_with(prefix))
+    tool_type == "mcp_toolset"
+        || [
+            "web_search_",
+            "web_fetch_",
+            "code_execution_",
+            "tool_search_tool_",
+            "advisor_",
+            "mcp_toolset_",
+        ]
+        .iter()
+        .any(|prefix| tool_type.starts_with(prefix))
+}
+
+/// Identify server tool variants whose shape cannot deserialize as a client
+/// tool. This is only used after typed request parsing has failed.
+fn unsupported_server_tool_in_raw_request(body: &[u8]) -> Option<String> {
+    let request: serde_json::Value = serde_json::from_slice(body).ok()?;
+    request
+        .get("tools")?
+        .as_array()?
+        .iter()
+        .filter_map(|tool| tool.get("type").and_then(serde_json::Value::as_str))
+        .find(|tool_type| is_server_tool_type(tool_type))
+        .map(str::to_string)
 }
 
 /// The field names and renames the request types in [`model`] declare,
@@ -262,6 +287,23 @@ mod tests {
                 }
                 other => panic!("expected {tool_type} to be rejected clearly, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn unversioned_mcp_toolset_is_rejected_before_client_tool_deserialization() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "m", "max_tokens": 16, "messages": [],
+            "tools": [{"type": "mcp_toolset", "mcp_server_name": "docs"}]
+        }))
+        .unwrap();
+
+        match refusal(&body) {
+            TranslationError::UnsupportedParameter { param: "tools", message } => {
+                assert!(message.contains("mcp_toolset"), "{message}");
+                assert!(message.contains("server-side tool"), "{message}");
+            }
+            other => panic!("expected mcp_toolset to be rejected clearly, got {other:?}"),
         }
     }
 
