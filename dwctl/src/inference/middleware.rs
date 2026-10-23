@@ -39,6 +39,7 @@ use super::image_normalizer_middleware::{normalize_error_response, normalize_val
 use super::rejections;
 use super::store::{self as response_store, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
 use super::streaming::{ReplayFrame, flex_stream_response};
+use super::validation::{Surface, envelope::malformed_body_response};
 use crate::db::{errors::DbError, handlers::api_keys::ApiKeys, models::api_keys::ApiKeyPurpose};
 use crate::image_normalizer::ImageNormalizer;
 
@@ -81,6 +82,11 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     /// Read by [`super::zdr::is_zdr_request`] on the submit path. Defaults to
     /// empty (every key reads as non-ZDR) when the sync is not wired.
     pub key_policy_cache: crate::sync::key_policy::KeyPolicyCache,
+    /// Ingress request validation (`request_validation`). Runs once per
+    /// intercepted request, before the realtime/queued split, so a doomed
+    /// request is rejected before it is forwarded or enqueued. `None` when
+    /// disabled.
+    pub validation: Option<super::validation::ValidationStage>,
     /// Pending-byte limit for an unfinished SSE event (`onwards.sse_buffer_limit`),
     /// used when applying the client's usage choice to a realtime stream.
     pub sse_buffer_limit: usize,
@@ -124,28 +130,30 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::error!(error = %e, "Failed to read request body in inference middleware");
-            let response = Response::builder().status(StatusCode::BAD_REQUEST).body(Body::empty()).unwrap();
+            let response = invalid_request_response("Failed to read the request body", "body_read_failed", "body");
             return rejections::refuse(&parts, response, "body_read_failed", None, None);
         }
     };
 
+    let nested_path = parts.uri.path();
+    let surface = Surface::from_path(nested_path);
     let mut request_value: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
-            // Only the category: serde's message can quote the body's values.
+            // Only the category in our logs: serde's message can quote the body's
+            // values. The caller gets the full message about its own body.
             let category = match e.classify() {
                 serde_json::error::Category::Io => "io",
                 serde_json::error::Category::Syntax => "syntax",
                 serde_json::error::Category::Data => "data",
                 serde_json::error::Category::Eof => "eof",
             };
-            tracing::error!(category, "Failed to parse request body in inference middleware");
-            let response = Response::builder().status(StatusCode::BAD_REQUEST).body(Body::empty()).unwrap();
+            tracing::warn!(category, "Failed to parse request body in inference middleware");
+            let response = malformed_body_response(surface, &e.to_string());
             return rejections::refuse(&parts, response, "invalid_json", None, None);
         }
     };
 
-    let nested_path = parts.uri.path();
     let is_responses_api = nested_path.ends_with("/responses");
     let is_chat_completions_api = nested_path.ends_with("/chat/completions");
     let requested_tier = resolve_service_tier(request_value["service_tier"].as_str());
@@ -371,6 +379,17 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         // hydrated request must become the body sent through translation as
         // well as the body retained for a later continuation.
         body_bytes = bytes::Bytes::from(request_value.to_string());
+    }
+
+    // Validate on the bare alias (serving-class suffix already stripped), after
+    // `previous_response_id` hydration so the prior turn counts toward the
+    // context window, and before anything is persisted, forwarded or enqueued.
+    if let (Some(validation), Some(surface)) = (&state.validation, surface)
+        && let Some(rejection) = validation
+            .check(surface, &request_value, validation_key(surface, api_key.as_deref(), &parts.headers))
+            .await
+    {
+        return rejection;
     }
 
     // Parse `service_tier` and `background` from the body.
@@ -1399,6 +1418,17 @@ fn modality_disabled_response(modality: crate::modalities::Modality) -> Response
         .unwrap()
 }
 
+/// The key to authorise request validation with: the bearer token, or on the
+/// Anthropic Messages surface (the only one that accepts it) the `x-api-key`
+/// header, which the translation layer only promotes to a bearer token further
+/// in. A bearer token always takes precedence.
+fn validation_key<'a>(surface: Surface, bearer: Option<&'a str>, headers: &'a axum::http::HeaderMap) -> Option<&'a str> {
+    bearer.or_else(|| match surface {
+        Surface::Messages => headers.get("x-api-key").and_then(|v| v.to_str().ok()),
+        _ => None,
+    })
+}
+
 /// A 400 naming `param`, counted as refused for `code`.
 fn invalid_request<'a>(
     origin: impl Into<rejections::Origin<'a>>,
@@ -1753,6 +1783,22 @@ mod tests {
     #[test]
     fn test_should_not_intercept_files() {
         assert!(!should_intercept(&axum::http::Method::POST, "/v1/files"));
+    }
+
+    #[test]
+    fn validation_key_uses_x_api_key_only_on_messages() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-api-key", "anthropic-key".parse().unwrap());
+        assert_eq!(validation_key(Surface::Messages, None, &headers), Some("anthropic-key"));
+        assert_eq!(validation_key(Surface::Messages, Some("bearer"), &headers), Some("bearer"));
+        for surface in [
+            Surface::ChatCompletions,
+            Surface::Responses,
+            Surface::Embeddings,
+            Surface::Completions,
+        ] {
+            assert_eq!(validation_key(surface, None, &headers), None, "{surface:?}");
+        }
     }
 
     #[test]

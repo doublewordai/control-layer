@@ -567,6 +567,7 @@ mod tests {
             response_store: state.response_store,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
+            request_validation: None,
             key_policy_cache: state.key_policy_cache.clone(),
             onwards_targets: None,
         };
@@ -684,6 +685,7 @@ mod tests {
             response_store: state.response_store,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
+            request_validation: None,
             key_policy_cache: state.key_policy_cache.clone(),
             onwards_targets: None,
         };
@@ -803,6 +805,7 @@ mod tests {
             response_store: state.response_store,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
+            request_validation: None,
             key_policy_cache: state.key_policy_cache.clone(),
             onwards_targets: None,
         };
@@ -991,6 +994,7 @@ mod tests {
             response_store: state.response_store,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
+            request_validation: None,
             key_policy_cache: state.key_policy_cache.clone(),
             onwards_targets: None,
         };
@@ -1110,6 +1114,7 @@ mod tests {
             response_store: state.response_store,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
+            request_validation: None,
             key_policy_cache: state.key_policy_cache.clone(),
             onwards_targets: None,
         };

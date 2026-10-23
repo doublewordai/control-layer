@@ -6,6 +6,7 @@ pub mod databases;
 pub mod modalities;
 pub mod rejections;
 pub mod request_log_credentials;
+pub mod request_validation;
 pub mod responses;
 pub mod serving_classes;
 pub mod sigterm_drain;
