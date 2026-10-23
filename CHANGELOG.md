@@ -1,5 +1,21 @@
 # Changelog
 
+## [15.5.1](https://github.com/doublewordai/control-layer/compare/v15.5.0...v15.5.1) (2026-10-23)
+
+
+### Bug Fixes
+
+* **deps:** update redis to 0.32 and deadpool-redis to 0.22 ([#2104](https://github.com/doublewordai/control-layer/issues/2104)) ([59b55f1](https://github.com/doublewordai/control-layer/commit/59b55f1be5660304377f843622b3184ffafa742d))
+* **deps:** update rust crate parking_lot to 0.13 ([#2101](https://github.com/doublewordai/control-layer/issues/2101)) ([0d2bdbb](https://github.com/doublewordai/control-layer/commit/0d2bdbbb4bf5a2ea313d81740ee0c4bfa44fdeb3))
+* **dwctl:** carry prompt_cache_key through the Responses translation ([#2112](https://github.com/doublewordai/control-layer/issues/2112)) ([c8274db](https://github.com/doublewordai/control-layer/commit/c8274db739307b38f37dc45c6523842f949ca344))
+* **inference:** reject unsupported server-side tools ([#2095](https://github.com/doublewordai/control-layer/issues/2095)) ([f8dfb35](https://github.com/doublewordai/control-layer/commit/f8dfb359d9419a534847620624e93285f8ffeba2))
+* **tests:** stabilise underway plan assertion ([#2117](https://github.com/doublewordai/control-layer/issues/2117)) ([eeaaf93](https://github.com/doublewordai/control-layer/commit/eeaaf93d05f6a69fee0ff50b70fee901a40808b0))
+
+
+### Miscellaneous
+
+* **deps:** update rust crate uuid to v1.29.0 ([#2118](https://github.com/doublewordai/control-layer/issues/2118)) ([094cdb3](https://github.com/doublewordai/control-layer/commit/094cdb3e9ffcd10ccf71b6b7448362ee5f52ec44))
+
 ## [15.5.0](https://github.com/doublewordai/control-layer/compare/v15.4.0...v15.5.0) (2026-10-23)
 
 
