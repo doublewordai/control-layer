@@ -797,7 +797,7 @@ impl StreamingState {
             service_tier: "default".to_string(),
             metadata: req.metadata.clone(),
             safety_identifier: None,
-            prompt_cache_key: None,
+            prompt_cache_key: req.prompt_cache_key.clone(),
         }
     }
 
@@ -985,6 +985,7 @@ mod tests {
             parallel_tool_calls: None,
             truncation: None,
             user: None,
+            prompt_cache_key: None,
             reasoning: None,
             text: None,
             background: None,
@@ -1117,6 +1118,28 @@ mod tests {
 
         // Should emit response.completed
         assert!(events.iter().any(|e| e.event_type == "response.completed"));
+    }
+
+    #[test]
+    fn streamed_snapshots_echo_prompt_cache_key() {
+        let mut request = test_request("gpt-4");
+        request.prompt_cache_key = Some("session-123".to_string());
+        let mut state = StreamingState::new(&request, None);
+
+        let mut events = state.process_chunk(&create_test_chunk("chunk_1", Some("Hello"), Some("assistant"), Some("stop")));
+        events.extend(state.finalize());
+
+        let snapshots: Vec<&ResponsesResponse> = events
+            .iter()
+            .filter_map(|event| match &event.data {
+                StreamingEventData::ResponseCreated { response } | StreamingEventData::ResponseCompleted { response } => Some(response),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(snapshots.len(), 2, "created and completed snapshots");
+        for response in snapshots {
+            assert_eq!(response.prompt_cache_key.as_deref(), Some("session-123"));
+        }
     }
 
     #[test]

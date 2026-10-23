@@ -93,13 +93,21 @@ pub fn to_chat_request(request: &ResponsesRequest) -> ChatCompletionRequest {
         // equivalent, so this flat converter must carry it across explicitly:
         // the translator sits inner to the inference middleware, and onwards
         // reads the tolerations off the Chat Completions body this produces.
-        // Every other Responses-only field is left out, as before.
-        extra: request
-            .extra
-            .as_ref()
-            .and_then(|value| value.get("nvext"))
-            .map(|nvext| serde_json::json!({ "nvext": nvext })),
+        // `prompt_cache_key` has no typed Chat Completions field, so it rides
+        // in `extra` too. Every other Responses-only field is left out.
+        extra: chat_extra(request),
     }
+}
+
+fn chat_extra(request: &ResponsesRequest) -> Option<serde_json::Value> {
+    let mut extra = serde_json::Map::new();
+    if let Some(nvext) = request.extra.as_ref().and_then(|value| value.get("nvext")) {
+        extra.insert("nvext".to_string(), nvext.clone());
+    }
+    if let Some(key) = &request.prompt_cache_key {
+        extra.insert("prompt_cache_key".to_string(), serde_json::Value::String(key.clone()));
+    }
+    (!extra.is_empty()).then_some(serde_json::Value::Object(extra))
 }
 
 /// Convert Responses API input to Chat Completions messages.
