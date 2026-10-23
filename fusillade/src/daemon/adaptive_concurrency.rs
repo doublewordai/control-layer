@@ -191,6 +191,41 @@ impl AdaptiveConcurrencyController {
         })
     }
 
+    /// The stamp a held dispatch (one sent with the daemon's dispatch hold)
+    /// going out now should carry, without counting it toward the evidence
+    /// the next raise needs.
+    ///
+    /// A held dispatch may be refused for the capacity the hold allows. That
+    /// is not an overload, so it cuts nothing, and so it must not earn a raise
+    /// either: a model whose held work is refused would fill every slot each
+    /// cycle, earn a raise each cycle, and with nothing cutting climb toward
+    /// its whole backlog. Counting the dispatch when it is sent and taking it
+    /// back when the refusal arrives is not enough: the claim loop can raise
+    /// the limit while the dispatch is still in flight, and the raise opens a
+    /// new generation the late refusal can no longer take anything from. So a
+    /// held dispatch counts only once its outcome is known and is not a held
+    /// refusal ([`Self::record_held_dispatch`]).
+    pub(super) fn stamp_held(&self, model: &str, configured: usize) -> Generation {
+        let state = self
+            .states
+            .entry(model.to_owned())
+            .or_insert_with(|| ModelState::new(configured));
+        Generation(state.generation)
+    }
+
+    /// A held dispatch stamped with `generation` finished with something
+    /// other than a held refusal: count it toward the next raise, as an
+    /// unheld dispatch is counted when sent. Dropped if the limit moved since
+    /// it was sent: it is evidence about a limit we have already moved away
+    /// from, and dropping it errs toward not raising.
+    pub(super) fn record_held_dispatch(&self, model: &str, generation: Generation) {
+        if let Some(mut state) = self.states.get_mut(model)
+            && state.generation == generation.0
+        {
+            state.dispatched = state.dispatched.saturating_add(1);
+        }
+    }
+
     /// Raise the limit.
     ///
     /// Only call this for a model that used every slot it was offered on the
@@ -328,6 +363,66 @@ mod tests {
         }
 
         assert_eq!(limit, 1, "sustained rejection should walk the limit down");
+    }
+
+    #[test]
+    fn a_model_whose_held_work_is_refused_does_not_climb() {
+        // Held refusals do not cut (the hold causes them by design), so they
+        // must not earn raises either: every cycle fills every slot with held
+        // work that is refused, and nothing would stop the climb.
+        let controller = controller();
+        let start = controller.limit("m", 150);
+        for _ in 0..200 {
+            let limit = controller.limit("m", 150);
+            // Raises are tried while the held dispatches are still in flight
+            // as well as after their refusals arrive: neither earns one.
+            for _ in 0..limit {
+                controller.stamp_held("m", 150);
+            }
+            assert_eq!(controller.try_grow("m"), None, "in flight");
+            assert_eq!(controller.try_grow("m"), None, "refused");
+            assert_eq!(controller.limit("m", 150), start, "neither cut nor raised");
+        }
+
+        // Held work that completes, and unheld work, still earn raises.
+        let raise = (start as f64 * GROWTH).ceil() as usize - start;
+        let generation = controller.stamp_held("m", 150);
+        for _ in 0..raise - 1 {
+            controller.record_held_dispatch("m", generation);
+        }
+        assert_eq!(controller.try_grow("m"), None, "one short of the raise");
+        controller.stamp("m", 150);
+        assert!(controller.try_grow("m").is_some());
+    }
+
+    #[test]
+    fn a_late_held_outcome_does_not_count_toward_a_newer_limit() {
+        // Held dispatches go out under one limit; unheld work earns a raise
+        // while they are in flight. When they finish, they say nothing about
+        // the new limit, so they do not count toward the next raise.
+        let controller = controller();
+        let held = controller.stamp_held("m", 100);
+        for _ in 0..50 {
+            controller.stamp("m", 100);
+        }
+        assert!(controller.try_grow("m").is_some(), "earned by unheld work");
+        assert_eq!(controller.limit("m", 100), 150);
+
+        for _ in 0..1_000 {
+            controller.record_held_dispatch("m", held);
+        }
+        assert_eq!(
+            controller.try_grow("m"),
+            None,
+            "outcomes from the old limit earn nothing"
+        );
+
+        // Held outcomes under the current limit do.
+        let current = controller.stamp_held("m", 100);
+        for _ in 0..75 {
+            controller.record_held_dispatch("m", current);
+        }
+        assert!(controller.try_grow("m").is_some());
     }
 
     #[test]

@@ -322,6 +322,73 @@ impl RetentionMaintenanceConfig {
     }
 }
 
+/// Hold the dispatches of opted-in models on capacity a scheduling-toleration
+/// list allows; see [`crate::Daemon::with_dispatch_hold`].
+///
+/// The list is opaque to fusillade: it is written verbatim to
+/// `nvext.routing_constraints.tolerations` for the upstream inference backend
+/// to interpret (the caller validates its shape).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DispatchHold {
+    /// The hold list, e.g. `[]` (tolerate no taint).
+    pub tolerations: serde_json::Value,
+    /// Models (as claimed, before any escalation) whose dispatches are held.
+    pub models: std::collections::HashSet<String>,
+    /// How often each daemon recomputes the release decisions. Default 60s.
+    pub refresh_interval: std::time::Duration,
+    /// Trailing window of held completions and refusals the decisions are
+    /// computed from, between [`Self::MIN_WINDOW`] and [`Self::MAX_WINDOW`].
+    /// Default 15 minutes.
+    pub window: std::time::Duration,
+    /// Fraction of a deadline's projected work added as margin. Default 0.2.
+    pub safety_margin: f64,
+    /// Decisions older than this release every held request (the refresh is
+    /// failing). Default 5 minutes.
+    pub stale_after: std::time::Duration,
+}
+
+impl DispatchHold {
+    /// The shortest supported [`Self::window`]: the counters are kept per
+    /// minute, so a window must span several minutes for "held, and refused,
+    /// throughout the window" to mean more than one minute's counts.
+    pub const MIN_WINDOW: std::time::Duration =
+        std::time::Duration::from_secs(fusillade_core::release::MIN_WINDOW_SECS);
+    /// The longest supported [`Self::window`]: one day.
+    pub const MAX_WINDOW: std::time::Duration =
+        std::time::Duration::from_secs(fusillade_core::release::MAX_WINDOW_SECS);
+
+    /// Check the tuning the daemon cannot run with: a window outside
+    /// [`Self::MIN_WINDOW`]..=[`Self::MAX_WINDOW`].
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if !(Self::MIN_WINDOW..=Self::MAX_WINDOW).contains(&self.window) {
+            return Err(format!(
+                "window must be between {}s and {}s, got {}s",
+                Self::MIN_WINDOW.as_secs(),
+                Self::MAX_WINDOW.as_secs(),
+                self.window.as_secs_f64()
+            ));
+        }
+        Ok(())
+    }
+
+    /// A hold with the default tuning.
+    pub fn new(tolerations: serde_json::Value, models: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            tolerations,
+            models: models.into_iter().collect(),
+            refresh_interval: std::time::Duration::from_secs(60),
+            window: std::time::Duration::from_secs(900),
+            safety_margin: 0.2,
+            stale_after: std::time::Duration::from_secs(300),
+        }
+    }
+
+    /// [`Self::stale_after`] as a chrono duration.
+    pub(crate) fn stale_after_duration(&self) -> chrono::Duration {
+        chrono::Duration::from_std(self.stale_after).unwrap_or(chrono::Duration::MAX)
+    }
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct DaemonConfig {
     /// Claim-loop mode for this daemon process.
