@@ -11,7 +11,9 @@ use crate::db::handlers::repository::Repository;
 use crate::db::handlers::{Organizations, api_keys::ApiKeys};
 use crate::db::models::api_keys::{ApiKeyCreateDBRequest, ApiKeyPurpose};
 use crate::modalities::Modality;
-use crate::test::utils::{add_auth_headers, create_test_app, create_test_org, create_test_user, create_test_user_with_roles};
+use crate::test::utils::{
+    add_auth_headers, create_test_app, create_test_org, create_test_user, create_test_user_with_roles, upload_rejections,
+};
 use crate::types::UserId;
 use serde_json::json;
 use sqlx::PgPool;
@@ -206,6 +208,7 @@ async fn batch_entry_points_refuse_an_org_with_batch_disabled(pool: PgPool) {
     set_disabled(&pool, org.id, &[Modality::Batch]).await;
 
     // In org context: files and batches are refused with the owner's message.
+    let refused = upload_rejections("batch_disabled");
     let resp = server
         .post("/ai/v1/files")
         .add_header(&h[0].0, &h[0].1)
@@ -214,6 +217,7 @@ async fn batch_entry_points_refuse_an_org_with_batch_disabled(pool: PgPool) {
         .multipart(jsonl_upload())
         .await;
     assert_modality_disabled(&resp, "batch API is disabled for this organization");
+    assert_eq!(upload_rejections("batch_disabled"), refused + 1, "the refused upload is counted");
 
     let resp = server
         .post("/ai/v1/batches")

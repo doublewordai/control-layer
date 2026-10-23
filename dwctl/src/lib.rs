@@ -452,10 +452,17 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
                     onwards::FIRST_TOKEN_SECONDS_BUCKETS,
                 )
                 .expect("Failed to set custom buckets for onwards_first_token_seconds")
+                .set_buckets_for_metric(
+                    Matcher::Full(crate::inference::body_limit::DECODE_SLOT_WAIT_SECONDS.to_string()),
+                    crate::inference::body_limit::DECODE_SLOT_WAIT_BUCKETS,
+                )
+                .expect("Failed to set custom buckets for dwctl_inference_decode_slot_wait_seconds")
                 .install_recorder()
                 .expect("Failed to install Prometheus recorder");
             initialize_database_error_metrics();
             crate::metrics::describe_cache_info_metrics();
+            crate::inference::body_limit::describe_decode_slot_metrics();
+            crate::api::handlers::files::initialize_upload_rejection_metrics();
             handle
         })
         .clone()
