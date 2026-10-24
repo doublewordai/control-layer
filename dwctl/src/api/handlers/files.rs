@@ -45,7 +45,7 @@ use futures::StreamExt;
 use futures::stream::Stream;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -180,6 +180,7 @@ impl OpenAIBatchRequest {
         accessible_models: &HashMap<String, AccessibleBatchModel>,
         allowed_url_paths: &[String],
         tolerations: &AccountTolerations,
+        class_routes: &HashSet<String>,
     ) -> Result<fusillade::RequestTemplateInput> {
         // Validate custom_id is safe for HTTP headers
         validate_custom_id(&self.custom_id)?;
@@ -199,6 +200,15 @@ impl OpenAIBatchRequest {
                 message: "Missing 'model' field in request body".to_string(),
             })?
             .to_string();
+
+        // A class other than standard serves realtime only; batch work runs
+        // on the model's standard class.
+        if class_routes.contains(&model) {
+            let alias = model.split_once(':').map_or(model.as_str(), |(alias, _)| alias);
+            return Err(Error::BadRequest {
+                message: format!("Model '{model}' is available for realtime requests only; use '{alias}' in batch files."),
+            });
+        }
 
         // Batches use deadline scheduling, so a model suffix is ignored.
         // Resolve the base model before validating access.
@@ -811,6 +821,9 @@ struct FileRequestContext {
     api_key: String,
     accessible_models: HashMap<String, AccessibleBatchModel>,
     allowed_url_paths: Vec<String>,
+    /// Class routes (`alias:<class>`) of class-routed models, refused in
+    /// batch lines.
+    class_routes: HashSet<String>,
     /// The toleration presets of the account that owns this upload, resolved
     /// per line by its model. A pinned line's list is written verbatim to
     /// `nvext.routing_constraints.tolerations` on its template body.
@@ -855,6 +868,7 @@ fn create_file_stream(
         accessible_models,
         allowed_url_paths,
         tolerations,
+        class_routes,
     } = req_ctx;
     let normalizer = config.normalizer.clone();
     let normalizer_mode = config.normalizer_mode;
@@ -1065,6 +1079,7 @@ fn create_file_stream(
                                                 &accessible_models,
                                                 &allowed_url_paths,
                                                 &tolerations,
+                                                &class_routes,
                                             ) {
                                                 Ok(mut template) => {
                                                     // Normalise image URLs in the per-template body
@@ -1168,6 +1183,7 @@ fn create_file_stream(
                                         &accessible_models,
                                         &allowed_url_paths,
                                         &tolerations,
+                                        &class_routes,
                                     ) {
                                         Ok(mut template) => {
                                             // Normalise image URLs in the trailing line as well.
@@ -1459,6 +1475,18 @@ pub async fn upload_file<P: PoolProvider>(
             accessible_models,
             allowed_url_paths: config.batches.allowed_url_paths.clone(),
             tolerations,
+            class_routes: state
+                .onwards_targets
+                .as_ref()
+                .map(|targets| {
+                    targets
+                        .targets
+                        .iter()
+                        .filter(|entry| entry.value().default_pool().class_route_of().is_some())
+                        .map(|entry| entry.key().clone())
+                        .collect()
+                })
+                .unwrap_or_default(),
         },
         Some(api_key_id),
     );

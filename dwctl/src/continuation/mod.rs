@@ -281,6 +281,8 @@ impl ContinuationRoutes {
             WHERE dmc.pool = 'completions'
               AND dmc.enabled = true
               AND cm.deleted = false
+              -- A class-routed model's targets have no completions pool.
+              AND NOT class_routes_active(cm.id)
               AND dm.deleted = false
             ORDER BY
                 cm.alias,
@@ -556,6 +558,42 @@ mod tests {
         .unwrap();
         routes.refresh(&pool).await.unwrap();
         assert!(routes.is_empty());
+    }
+
+    #[dwctl_test_macros::test]
+    async fn class_routed_models_are_not_resumable(pool: PgPool) {
+        let user = create_test_user(&pool, Role::PlatformManager).await;
+        let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
+        let resumable = create_composite(&pool, "alias-resumable", user.id).await;
+        let dynamo = create_test_model(&pool, "m-dynamo", "dynamo", endpoint, user.id).await;
+        add_component(&pool, resumable, dynamo, "default").await;
+        add_component_at(&pool, resumable, dynamo, "completions", 0).await;
+
+        let routes = ContinuationRoutes::new();
+        routes.refresh(&pool).await.unwrap();
+        assert!(routes.is_enabled("alias-resumable"));
+
+        sqlx::query!("UPDATE deployed_models SET routing_mode = 'class_routes' WHERE id = $1", resumable)
+            .execute(&pool)
+            .await
+            .unwrap();
+        routes.refresh(&pool).await.unwrap();
+        assert!(
+            routes.is_enabled("alias-resumable"),
+            "an activation without a standard class serves the legacy route, continuation included"
+        );
+
+        sqlx::query!(
+            "INSERT INTO model_serving_classes (deployed_model_id, class_key, display_name, inference_endpoint_id, upstream_model_name)
+             VALUES ($1, 'standard', 'Standard', $2, 'upstream')",
+            resumable,
+            endpoint
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        routes.refresh(&pool).await.unwrap();
+        assert!(!routes.is_enabled("alias-resumable"), "class routes have no completions pool");
     }
 
     #[dwctl_test_macros::test]

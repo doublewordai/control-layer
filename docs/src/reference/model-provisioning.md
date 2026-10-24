@@ -139,24 +139,24 @@ its pools; repeating the deployment declaration would be an alias collision.
 Every virtual model requires a non-empty `routing.pools.default`. The only pool
 names currently supported are `default` and `completions`.
 
-## Staging class destinations and public prices
+## Serving classes and class routing
 
-`clay.class_routes` stages explicit destinations on the existing model UUID. This
-is preparatory storage: this release continues using the legacy route, general
-price, cache configuration and model discovery. Public class prices are deliberately
-excluded from runtime tariff/cache histories and existing dashboard price panels;
-customer-specific class deals retain their established billing and credit checks.
-This release does not accept new inference names or enable class routing. Keep the existing `deployments`, `routing`,
-`tariffs` and `cache_tariff` definitions while staging classes.
+A model can offer more than one serving class. `model` routes to its `standard`
+class and `model:<class>` to any other class it declares, each with its own
+upstream, realtime prices and default realtime limit. Classes are declared in
+`clay.class_routes`; they take effect only once the model sets
+`routing_mode: class_routes`. Until then the model keeps its legacy route
+(`deployments`, `routing`, `tariffs`), and declared classes are stored but unused.
 
 ```yaml
 # Merge into the existing clay block, retaining its other fields:
 clay:
+  routing_mode: class_routes   # default: legacy
   class_routes:
     standard:
       display_name: Standard
       endpoint: gateway
-      upstream_model_name: dynamo-example/model:throughput
+      upstream_model_name: example/model
       tariffs:
         - name: Standard realtime
           purpose: realtime
@@ -165,8 +165,8 @@ clay:
     fast:
       display_name: Fast
       endpoint: gateway
-      upstream_model_name: dynamo-example/model:fast
-      aliases: [example/model-fast]
+      upstream_model_name: example/model-fast
+      realtime_inflight_limit: 20
       tariffs:
         - name: Fast realtime
           purpose: realtime
@@ -179,51 +179,90 @@ clay:
         read_multiplier: "0.1"
 ```
 
-The endpoint must exist. Upstream names are configurable, endpoint-scoped strings
-that must be nonempty and contain no whitespace. Classes may share a destination.
-Class keys retain their IDs when a display name,
-destination or price changes. Nonempty class configuration requires `standard`
-and `fast`, each with a realtime tariff. Additional keys may use lowercase letters,
-digits, hyphens and underscores, starting with a letter. The retired numeric-target
-`serving_classes` declaration is accepted only as an empty map; remove it.
+Rules:
 
-Batch tariffs are allowed only under `standard`: batch always resolves to that
-class regardless of the submitted name. Other classes cannot declare batch prices
-that would never be selected. Model-level batch tariffs remain supported.
+- `standard` is required whenever `class_routes` is nonempty, and
+  `routing_mode: class_routes` requires a declared `standard` class. Other classes
+  are optional. Keys use lowercase letters, digits, hyphens and underscores,
+  starting with a letter. Every class needs a realtime tariff.
+- The endpoint must exist. Upstream names are endpoint-scoped strings, nonempty
+  and without whitespace. Classes may share a destination.
+- `realtime_inflight_limit` caps one account's concurrent realtime requests to
+  that class. It must be positive; omitted, the class uses the model's
+  `settings.realtime_inflight_limit`. Each class counts separately.
+- Batch tariffs are allowed only under `standard`. Model-level batch tariffs
+  remain supported.
+- `aliases` must be empty: class names are generated (`model`, `model:<class>`),
+  and synonyms are not supported. The retired numeric-target `serving_classes`
+  declaration is accepted only as an empty map.
+- An activated model cannot carry redirect traffic rules. Deny rules apply to
+  every class.
 
-Optional aliases are exact synonyms, not discovery entries or extra model rows.
-Do not list the primary bare name or generated `:fast` name as synonyms. Validation
-reserves primary class names and rejects collisions with existing models and other
-synonyms. Ordinary model creates/renames share the catalog lock and collision check.
-Synonyms cannot be rebound to another model/class by a catalog edit; deliberate
-private-name migration requires a later, separately validated procedure.
+### What activation changes
 
-For a model present in the catalog, class routes and synonyms are complete desired
-state. Omitted synonyms are removed; omitted classes are removed and their public
-prices retired, preserving tariff history. An unchanged declaration preserves IDs,
-timestamps and price versions. A whole model omitted from the catalog follows the
-existing ownership-release rule below, rather than deleting its classes.
+With `routing_mode: class_routes`, the gateway serves one route per class: `model`
+for `standard` and `model:<class>` for the rest. Each route forwards to its class's
+endpoint and upstream name, without the composite's members or stream
+continuation. The model's fallback settings still apply as retries against that
+one upstream. `self_hosted_only` does not apply: the class names its upstream.
+Every route shares the model's deny rules, and only `standard` carries the
+model's batch capacity.
+
+- **Realtime only.** Flex, background and batch requests use the `standard`
+  class. A flex or background request naming `model:<class>` is refused with
+  400 `serving_class_realtime_only`; a batch line naming it is refused at upload.
+- **Discovery.** `/v1/models` lists `model:<class>` beside the model for each
+  class other than `standard`, with the reasoning efforts its upstream supports.
+  Class entries carry no prices yet.
+- **Analytics and billing.** A request to `model:<class>` is recorded under the
+  model's name with `requested_serving_class` and `resolved_serving_class` set to
+  the class, and is priced as that class ([how billing works][billing]).
+- **Prompt caching.** A class route inherits its model's cache enablement and
+  minimum prefix. `standard` keeps the model's cache scope; other classes use
+  their own, because they reach different engines.
+- **Account settings.** Account files can set priority, scheduling hints,
+  toleration presets, realtime limits and prices for any class the model declares.
+  A setting without a class applies to the model as a whole; a class's own setting
+  wins for that class.
+
+An activation the gateway cannot serve (no `standard` class, or redirect rules
+added outside the catalogue) falls back to the legacy route and is logged as
+`invalid_class_activation`.
+
+To roll back on a release that supports class routing, set `routing_mode: legacy`
+and redeploy. Keep the legacy `deployments`, `routing`, `tariffs` and
+`cache_tariff` in place while a model is activated, so the rollback has a route
+and prices to return to; class caching also inherits the model's `cache_tariff`.
+The catalogue owns the column: it is written on every reconcile, and a model
+omitted from the catalogue keeps its last value. Class prices apply only while
+class routes serve, so a class request still waiting to be billed when the model
+rolls back is recorded in its class but priced at the model's price.
+
+To roll back to an older release, first deploy the catalogue with
+`routing_mode: legacy` on every model. Then remove the `routing_mode` and
+`class_routes.<class>.realtime_inflight_limit` fields, and any `class_routes`
+without a `fast` class, before deploying the older image: older releases reject
+those at startup.
+
+### Ownership
+
+For a model present in the catalogue, `class_routes` is complete desired state.
+Omitted classes are removed and their public prices retired, preserving tariff
+history. An unchanged declaration preserves IDs, timestamps and price versions.
+Class keys keep their IDs when a display name, destination, limit or price
+changes. A whole model omitted from the catalogue follows the existing
+ownership-release rule below rather than deleting its classes.
 
 Public class tariffs use the existing ledger with `user_id = NULL` and a class
-key. The future resolver order is account/class, account/all-classes, public/class,
-then general compatibility price. Batch still exhausts exact completion-window
-prices before its standard realtime fallback; zero is a price. Class cache tariffs
-contain multipliers, not token prices. They inherit model-level cache enablement
-and minimum prefix length; omission inherits the model's multipliers. Declaring
-class multipliers requires a model-level `cache_tariff`.
+key, and are read only for models with `routing_mode: class_routes`. Class cache
+tariffs contain multipliers, not token prices; omission inherits the model's
+multipliers, and declaring them requires a model-level `cache_tariff`.
 
-The database's `routing_mode` defaults to `legacy` and is outside catalog ownership;
-putting it in YAML is rejected. This release is **not activation-ready**: request
-resolution, billing snapshots, reactive forwarding and writer support must land
-before switching any model. The catalog refuses edits to models already set to
-`class_routes`, instead of overwriting an active route with a composite definition.
-The class-aware SQL resolver is not an activation mechanism: switching this flag
-manually would bypass the supported rollout boundary. Class-aware admission,
-durable billing/cache context and dashboard readers must be integrated together
-before enabling it. Do not enable individual public-price readers in this release.
-Deploy this support release and update the catalog validator before publishing
-catalogs containing the new field. Do not run an older binary against staged public
-class prices: its readers do not distinguish them from general prices.
+Deploy a release that supports these fields, and update the catalogue validator,
+before publishing catalogues that use them: older releases reject the
+`routing_mode` field and refuse to start.
+
+[billing]: ../conceptual-guides/how-billing-works.md#organisation-and-serving-class-price-precedence
 
 ## Authoritative behavior
 
@@ -413,8 +452,15 @@ realtime_inflight:
 
 Rules:
 
-- `classes` may name only `standard` for now. A class the file omits keeps the
-  model's defaults.
+- `classes` may name `standard` and any class the model declares in its
+  catalogue [`class_routes`](#serving-classes-and-class-routing). A class the
+  file omits keeps the model's defaults. Settings for a class other than
+  `standard` take effect once the model is activated (`routing_mode:
+  class_routes`); its limit counts that class's requests only.
+- Model-level `priority` and `toleration_preset` apply to every class; class-level
+  ones override them for that class. Prices do not carry across classes: a class
+  without its own `tariffs` in the file is billed at the model's price for that
+  class.
 - Limits, realtime and playground prices, and the cache tariff are declared per
   class; model-level `tariffs` take batch prices only.
 - Priority inherits class, then model, then account, then the default. It is
@@ -461,7 +507,7 @@ dwctl-model-provisioning validate-account-limits ./account-limits.d \
 dwctl-model-provisioning account-schema
 ```
 
-It rejects unknown fields and classes, limits and latency targets below 1, an
+It rejects unknown fields, classes the model does not declare, limits and latency targets below 1, an
 account declared in two files, entries that configure nothing, prices at the
 wrong level, models absent from the model catalog and, with `--org-overlays`,
 pairs configured in both catalogs. Whether each account exists can only be

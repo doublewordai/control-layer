@@ -117,9 +117,11 @@ models:
           read_multiplier: "0.15"
 ```
 
-A request's serving class is where it is routed, and `class_pricing` prices one
-of the model's classes (`standard` until models carry more). A class price wins
-over the all-class `tariffs` for requests in that class. Batch and flex use
+A request's serving class is where it is routed, and `class_pricing` prices the
+model's `standard` class. A class price wins over the all-class `tariffs` for
+requests in that class. The all-class `tariffs` cover `standard` only: other
+classes of a class-routed model are billed at the model's price for that class,
+or at a price set in the account file. Batch and flex use
 standard; flex uses the batch `1h` tariff. Prefer putting batch prices in the
 all-class `tariffs` list.
 
@@ -131,8 +133,9 @@ for alerting; nothing routes on them.
 
 ## Billing, display and admission
 
-Billing selects the key owner's class-specific price, then its all-class price,
-then the general model price. Each scope must match the purpose and, for batch,
+Billing selects the key owner's class-specific price, then its all-class price
+(for the `standard` class only), then the model's price for the class, then the
+general model price. Each scope must match the purpose and, for batch,
 the exact completion window. Playground may fall back to realtime within the
 same scope. Batch first exhausts exact-window prices across standard-class,
 all-class organization and general model scopes. Only if none matches does it

@@ -58,20 +58,30 @@ access to a class. An existing private alias keeps its own prices; there is no
 implicit pricing fallback between model aliases.
 
 First discard tariffs outside their validity interval or for another account
-or class. Then choose the first eligible purpose/window entry below:
+or class. The remaining scopes rank in this order:
+
+1. **Account + class**: the account's deal for the resolved class.
+2. **Account all-class**: the account's class-less deal. It covers the `standard`
+   class and models without classes only; another class falls through to the
+   next scope.
+3. **Public class**: the model's own price for the class, read only for models
+   with `routing_mode: class_routes` (see [model provisioning][classes]).
+4. **General model**: the model-level price.
+
+Then choose the first eligible purpose/window entry:
 
 | Priority | Realtime | Playground | Batch/flex, completion window W |
 |---|---|---|---|
-| 1 | Account + class, realtime | Account + class, playground | Account + standard, batch W |
-| 2 | Account all-class, realtime | Account + class, realtime | Account all-class, batch W |
-| 3 | General model, realtime | Account all-class, playground | General model, batch W |
-| 4 | — | Account all-class, realtime | Account + standard, realtime |
-| 5 | — | General model, playground | Account all-class, realtime |
-| 6 | — | General model, realtime | General model, realtime |
+| 1 | Each scope in order, realtime | Account + class: playground, then realtime | Each scope in order, batch W (class `standard`) |
+| 2 | — | Account all-class: playground, then realtime | Each scope in order, realtime (class `standard`) |
+| 3 | — | Public class: playground, then realtime | — |
+| 4 | — | General model: playground, then realtime | — |
+
+[classes]: ../reference/model-provisioning.md#serving-classes-and-class-routing
 
 Playground's realtime fallback is evaluated **within each scope** before moving
 to the next scope. An organisation's realtime deal therefore beats a general
-playground price. Batch/flex exhausts all three exact-window batch scopes before
+playground price. Batch/flex exhausts every exact-window batch scope before
 trying realtime prices in the same scope order, using only the standard class.
 A 1h batch price never substitutes for 24h. Realtime/playground use no completion
 window.
@@ -132,7 +142,8 @@ rolls back atomically. Historical org token/cache prices prevent hard account
 deletion; normal soft deletion retains them. Released migrations are immutable.
 
 Cache multipliers are selected independently by account + resolved class →
-account all-class → general model, at the same timestamp. They have no
+account all-class (the `standard` class, or a model without classes) → public
+class → general model, at the same timestamp. They have no
 purpose/window dimension. A general cache tariff is required for Control Layer
 cache pricing to apply; an organisation override alone cannot enable it.
 Applicable cache-read/write multipliers adjust the selected input token rate.
