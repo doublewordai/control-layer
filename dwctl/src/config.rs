@@ -1267,11 +1267,15 @@ pub enum EmailTransportConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FilesConfig {
-    /// Default expiration time in seconds (default: 24 hours)
+    /// `expires_at` given to an upload that sends no `expires_after`, and to a
+    /// batch's output and error files from the batch's creation (default: 30
+    /// days). Content retention measures from the same point, so this is the
+    /// longest any content stays available.
     pub default_expiry_seconds: i64,
-    /// Minimum expiration time in seconds (default: 1 hour)
+    /// Smallest `expires_after[seconds]` an upload may request (default: 1 hour)
     pub min_expiry_seconds: i64,
-    /// Maximum expiration time in seconds (default: 30 days)
+    /// Largest `expires_after[seconds]` an upload may request (default: 30
+    /// days). Must not exceed what content retention honours.
     pub max_expiry_seconds: i64,
     /// Buffer size for file upload streams (default: 100)
     pub upload_buffer_size: usize,
@@ -1284,9 +1288,9 @@ pub struct FilesConfig {
 impl Default for FilesConfig {
     fn default() -> Self {
         Self {
-            default_expiry_seconds: 24 * 60 * 60,  // 24 hours
-            min_expiry_seconds: 60 * 60,           // 1 hour
-            max_expiry_seconds: 30 * 24 * 60 * 60, // 30 days
+            default_expiry_seconds: 30 * 24 * 60 * 60, // 30 days
+            min_expiry_seconds: 60 * 60,               // 1 hour
+            max_expiry_seconds: 30 * 24 * 60 * 60,     // 30 days
             upload_buffer_size: 100,
             download_buffer_size: 100,
             batch_insert_size: 5000,
@@ -4193,7 +4197,7 @@ impl Config {
 
             if self.batches.files.default_expiry_seconds <= 0 {
                 return Err(Error::Internal {
-                    operation: "Config validation: default_expiry_seconds must be positive (default: 86400 = 24 hours).".to_string(),
+                    operation: "Config validation: default_expiry_seconds must be positive (default: 2592000 = 30 days).".to_string(),
                 });
             }
 
