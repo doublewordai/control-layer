@@ -278,7 +278,7 @@ serve concurrently, and change it when that capacity changes.
 
 Some upstreams are several interchangeable replicas behind one address, each
 with a per-process cache that only helps when a conversation's turns come back
-to it (for example a serving frontend's tokenizer prefix cache). Behind a plain
+to it (for example an upstream that caches per-conversation state in memory). Behind a plain
 load-balanced address every new connection picks a replica at random, so a
 conversation's turns are spread over all of them.
 
@@ -305,12 +305,12 @@ top of replica affinity.
 
 ```json
 {
-  "url": "http://frontend:8000/v1",
+  "url": "http://upstream:8000/v1",
   "replicas": {
     "urls": [
-      "http://frontend-replica-0:8000/v1",
-      "http://frontend-replica-1:8000/v1",
-      "http://frontend-replica-2:8000/v1"
+      "http://upstream-replica-0:8000/v1",
+      "http://upstream-replica-1:8000/v1",
+      "http://upstream-replica-2:8000/v1"
     ],
     "load_factor": 1.25,
     "failover_on_status": [503]

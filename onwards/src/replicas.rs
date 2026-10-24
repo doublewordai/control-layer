@@ -2,8 +2,8 @@
 //!
 //! Some upstreams are a set of interchangeable replicas behind one Service
 //! address, each holding a per-process cache that only helps when a
-//! conversation's turns return to it (a frontend's tokenizer prefix cache, for
-//! example). Behind a plain Service, every new connection lands on a random
+//! conversation's turns return to it (per-conversation state kept in memory,
+//! for example). Behind a plain Service, every new connection lands on a random
 //! replica, so a conversation's turns are spread over all of them and each
 //! replica sees a growing prefix it has never seen.
 //!
