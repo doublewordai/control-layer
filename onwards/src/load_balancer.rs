@@ -326,6 +326,14 @@ impl ProviderPool {
         self.affinity.is_some()
     }
 
+    /// Whether any provider receives the conversation key in a header (see
+    /// [`crate::target::ProviderSpec::affinity_key_header`]).
+    pub(crate) fn forwards_affinity_key(&self) -> bool {
+        self.providers
+            .iter()
+            .any(|p| p.target.affinity_key_header.is_some())
+    }
+
     /// Keep the old pool's conversation tracker across a reload that leaves
     /// its configuration unchanged, so the active set and share survive
     /// routing-config updates.

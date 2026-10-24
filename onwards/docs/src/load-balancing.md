@@ -127,6 +127,7 @@ Settings specific to each provider:
 | `response_headers` | Provider-specific headers |
 | `trusted` | Override pool-level trust for strict mode error sanitization (`true`/`false`; omit to inherit from pool) |
 | `propagate_trace_context` | Whether to inject W3C `traceparent` / `tracestate` headers on outbound requests to this provider (`true`/`false`; omit to inherit from the resolved `trusted` value). Useful for preventing trace IDs from leaking to third-party providers whose downstream HTTP fetches would re-emit them. See [Trace context propagation](#trace-context-propagation) below. |
+| `affinity_key_header` | Header in which this provider receives a hash of each request's conversation key (omit to send nothing). See [Forwarding the conversation key](#forwarding-the-conversation-key) below. |
 
 ## Trace context propagation
 
@@ -272,6 +273,46 @@ priority selection.
 
 `target_conversations` does not adapt: set it to what the preferred provider can
 serve concurrently, and change it when that capacity changes.
+
+### Forwarding the conversation key
+
+Some upstreams are several interchangeable replicas behind one address, each
+with a per-replica cache that only pays off when a conversation's next turn
+returns to the replica that served the last one. Such an upstream can balance
+on a header, by consistent hashing for example, but a client rarely sends a
+header that identifies its conversation.
+
+`affinity_key_header` on a provider makes onwards send one. Every request to
+that provider carries the request's conversation key, the same key
+[conversation affinity](#conversation-affinity) uses, in the named header. The
+key comes from `x-session-id`, `session_id` or `prompt_cache_key`, or else
+from the conversation's opening messages, so every turn of a conversation
+carries the same value and different conversations almost always carry
+different values.
+
+```json
+{
+  "url": "http://upstream:8000/v1",
+  "affinity_key_header": "x-affinity-key"
+}
+```
+
+- The value is 16 hex digits: a 64-bit SHA-256-derived hash of the key, never
+  the identifier or message content it came from.
+- Onwards does not choose a replica. The request goes to the provider's `url`,
+  and the upstream decides what to do with the header.
+- Onwards replaces any value the caller sent, and removes the header when the
+  request has no key, so a caller cannot choose the value.
+- It applies to realtime and dispatched traffic alike. Providers without the
+  option receive nothing new.
+- The header may not be one onwards or the transport sets: `host`,
+  `content-length`, `content-type`, `transfer-encoding`, `connection`,
+  credentials, trace context or `x-session-id`. Config load fails on an invalid or
+  reserved name.
+
+`onwards_affinity_key_requests_total{source}` counts requests to pools with
+such a provider by where their key came from: `header`, `session_id`,
+`prompt_cache_key`, `opening`, or `none` when the request has no key.
 
 ### Realtime-only failover statuses
 
