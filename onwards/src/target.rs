@@ -19,6 +19,7 @@ use crate::auth::KeySet;
 use crate::inflight::InflightLimits;
 use crate::load_balancer::{Provider, ProviderPool};
 use crate::reasoning::ReasoningTranslationConfig;
+use crate::replicas::{ReplicaAffinityConfig, ReplicaSet};
 use crate::serving::{AccountServing, ProviderKind, ServingOverlay};
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -173,6 +174,13 @@ pub struct ProviderSpec {
     /// provider.
     #[serde(default)]
     pub kind: ProviderKind,
+
+    /// The direct addresses of the replicas behind `url`, to keep each
+    /// conversation on one of them (see [`crate::replicas`]). `url` stays the
+    /// address for requests without a conversation key and the last resort
+    /// when no replica accepts the connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<ReplicaAffinityConfig>,
 }
 
 /// Load balancing strategy for selecting providers
@@ -516,6 +524,10 @@ pub struct TargetSpec {
     /// Translate canonical OpenAI reasoning controls into this provider's request shape.
     #[serde(default)]
     pub reasoning_translation: Option<ReasoningTranslationConfig>,
+
+    /// See [`ProviderSpec::replicas`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<ReplicaAffinityConfig>,
 }
 
 fn default_weight() -> u32 {
@@ -722,6 +734,7 @@ impl TargetSpecOrList {
                         reasoning_translation: t.reasoning_translation,
                         accepts_scheduling_priority: t.accepts_scheduling_priority,
                         kind: t.kind,
+                        replicas: t.replicas,
                     })
                     .collect();
                 Ok(PoolConfig {
@@ -766,6 +779,7 @@ impl TargetSpecOrList {
                     reasoning_translation: spec.reasoning_translation,
                     accepts_scheduling_priority: spec.accepts_scheduling_priority,
                     kind: spec.kind,
+                    replicas: spec.replicas,
                 };
                 Ok(PoolConfig {
                     keys,
@@ -825,6 +839,10 @@ impl From<TargetSpec> for Target {
             reasoning_translation: value.reasoning_translation,
             accepts_scheduling_priority: value.accepts_scheduling_priority,
             kind: value.kind,
+            replicas: value
+                .replicas
+                .as_ref()
+                .map(|config| Arc::new(ReplicaSet::new(config))),
         }
     }
 }
@@ -852,6 +870,10 @@ impl From<ProviderSpec> for Target {
             reasoning_translation: value.reasoning_translation,
             accepts_scheduling_priority: value.accepts_scheduling_priority,
             kind: value.kind,
+            replicas: value
+                .replicas
+                .as_ref()
+                .map(|config| Arc::new(ReplicaSet::new(config))),
         }
     }
 }
@@ -1006,6 +1028,8 @@ pub struct Target {
     /// See [`ProviderSpec::kind`].
     #[builder(default)]
     pub kind: ProviderKind,
+    /// See [`ProviderSpec::replicas`].
+    pub replicas: Option<Arc<ReplicaSet>>,
 }
 
 impl Target {
@@ -1418,6 +1442,17 @@ fn build_pool(
         }
     }
     for (index, provider) in pool_config.providers.iter().enumerate() {
+        if let Some(config) = provider.replicas.as_ref() {
+            config.validate(&provider.url).map_err(|error| {
+                anyhow!(
+                    "Invalid replicas for target '{}' pool '{}' provider {}: {}",
+                    alias,
+                    pool_name,
+                    index,
+                    error
+                )
+            })?;
+        }
         if let Some(config) = provider.reasoning_translation.as_ref() {
             config.validate().map_err(|error| {
                 anyhow!(
@@ -2898,6 +2933,7 @@ mod tests {
                 reasoning_translation: None,
                 accepts_scheduling_priority: false,
                 kind: Default::default(),
+                replicas: None,
             }],
             overlays: Default::default(),
             inflight_limit: None,

@@ -59,6 +59,7 @@ pub mod load_balancer;
 pub mod models;
 pub mod reasoning;
 pub mod rejections;
+pub mod replicas;
 pub mod response_id;
 pub mod response_sanitizer;
 pub mod serving;

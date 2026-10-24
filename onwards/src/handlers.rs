@@ -11,6 +11,7 @@ use crate::errors::{ErrorResponseBody, OnwardsErrorResponse};
 use crate::inflight::{BATCH_INFLIGHT_SCOPE, InflightSlot};
 use crate::models::ListModelResponse;
 use crate::rejections::RejectionContext;
+use crate::replicas::ReplicaGuard;
 use crate::serving::{self, ProviderKind, ServingClassOutcome, ServingResolution};
 use crate::sse::SseBufferedStream;
 use crate::target::{ConcurrencyGuard, RequestClass, RoutingAction, Target};
@@ -293,6 +294,7 @@ struct GuardedStream<S> {
     _inflight_guard: InflightGuard,
     _inflight_slot: Option<InflightSlot>,
     _batch_inflight_slot: Option<InflightSlot>,
+    _replica_guard: Option<ReplicaGuard>,
 }
 
 impl<S, E> futures_util::Stream for GuardedStream<S>
@@ -307,6 +309,14 @@ where
     ) -> std::task::Poll<Option<Self::Item>> {
         std::pin::Pin::new(&mut self.inner).poll_next(cx)
     }
+}
+
+/// Whether a forwarding error happened while connecting, so that nothing
+/// reached the upstream and another address may take the request.
+fn is_connect_error(error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    error
+        .downcast_ref::<hyper_util::client::legacy::Error>()
+        .is_some_and(|e| e.is_connect())
 }
 
 /// Stores the original model name requested by the client
@@ -1137,20 +1147,33 @@ pub async fn target_message_handler<T: HttpClient>(
         && is_realtime;
     // Conversation affinity decides preferred-first once per conversation;
     // only realtime traffic on pools that opt in pays for the body parse.
-    let conversation = if pool.affinity_enabled() && is_realtime {
-        serde_json::from_slice::<serde_json::Value>(&body_bytes)
+    // Replica affinity keeps every conversation, realtime or dispatched, on
+    // one replica of its provider, so pools with replicas parse every body.
+    let pool_affinity = pool.affinity_enabled() && is_realtime;
+    let replica_affinity = pool.replica_affinity_enabled();
+    let conversation = if pool_affinity || replica_affinity {
+        let keyed = serde_json::from_slice::<serde_json::Value>(&body_bytes)
             .ok()
             .and_then(|body| {
                 let header = original_headers
                     .get(affinity::SESSION_HEADER)
                     .and_then(|v| v.to_str().ok());
-                affinity::conversation_key(header, &body)
-            })
+                affinity::conversation_key_with_source(header, &body)
+            });
+        if replica_affinity {
+            metrics::counter!(
+                "onwards_conversation_key_total",
+                "source" => keyed.map_or("none", |(_, source)| source.as_str()),
+                "traffic" => traffic,
+            )
+            .increment(1);
+        }
+        keyed.map(|(key, _)| key)
     } else {
         None
     };
     let mut providers = pool
-        .select_iter_routed(aimd_eligible, conversation, &model_name, resolved_pool_name.unwrap_or("default"))
+        .select_iter_routed(aimd_eligible, conversation.filter(|_| pool_affinity), &model_name, resolved_pool_name.unwrap_or("default"))
         .excluding_members(ineligible_members.iter().copied());
     while let Some((member_idx, target, connection_guard)) = providers.next() {
         any_attempted = true;
@@ -1440,33 +1463,6 @@ pub async fn target_message_handler<T: HttpClient>(
             withhold_trace_context(&mut attempt_headers);
         }
 
-        // Build the request
-        let attempt_req = axum::extract::Request::builder()
-            .method(method.clone())
-            .uri(upstream_uri_parsed)
-            .body(axum::body::Body::from(attempt_body))
-            .unwrap();
-        let (mut parts, body) = attempt_req.into_parts();
-        parts.headers = attempt_headers;
-        let attempt_req = axum::extract::Request::from_parts(parts, body);
-
-        trace!(
-            "Outgoing request to provider:\n  URI: {}",
-            upstream_uri
-        );
-
-        // Make the request with optional timeout
-        // Note: Timeout only applies to receiving response headers, not reading the full body.
-        // For streaming responses, the body may take much longer than the timeout.
-        let upstream_span = tracing::info_span!(
-            "onwards.upstream_request",
-            otel.name = "onwards.upstream_request",
-            otel.kind = "Client",
-            http.request.method = %method,
-            url.full = %upstream_uri,
-            server.address = target.url.host_str().unwrap_or_default(),
-            http.response.status_code = tracing::field::Empty,
-        );
         // The header wait ends at the earlier of the provider's request timeout
         // and this attempt's first-token deadline.
         let request_deadline = target
@@ -1476,25 +1472,134 @@ pub async fn target_message_handler<T: HttpClient>(
             (Some(request), Some(first_token)) => Some(request.min(first_token)),
             (request, first_token) => request.or(first_token),
         };
-        let request_result = async {
-            if let Some(deadline) = header_deadline {
-                match tokio::time::timeout_at(deadline, state.http_client.request(attempt_req))
-                    .await
-                {
-                    Err(_) => {
-                        // Timeout occurred
-                        debug!("Request to {} timed out waiting for response headers", upstream_uri);
-                        Err(UpstreamOutcome::Timeout)
-                    }
-                    Ok(result) => result.map_err(UpstreamOutcome::Error),
+
+        // With replica affinity and a conversation key, try the provider's
+        // replicas in the conversation's order (see `crate::replicas`), moving
+        // on only when a replica refuses the connection or answers with one of
+        // the set's failover statuses, and end with the provider's own URL.
+        // Without either, the provider's URL is the only candidate.
+        let replica_set = target.replicas.as_deref();
+        let replica_order = match (replica_set, conversation) {
+            (Some(set), Some(key)) => {
+                let plan = set.plan(key);
+                if plan.spilled {
+                    metrics::counter!(
+                        "onwards_replica_spills_total",
+                        "replica" => set.replica(plan.order[0]).label.clone(),
+                    )
+                    .increment(1);
                 }
-            } else {
-                // No timeout configured
-                state.http_client.request(attempt_req).await.map_err(UpstreamOutcome::Error)
+                plan.order
             }
-        }
-        .instrument(upstream_span.clone())
-        .await;
+            _ => Vec::new(),
+        };
+        let mut candidates = replica_order.into_iter().map(Some).chain(std::iter::once(None));
+        let (request_result, upstream_span, upstream_uri, replica_guard) = loop {
+            let candidate = candidates
+                .next()
+                .expect("the provider's own URL ends the candidates");
+            let replica = candidate.zip(replica_set);
+            let (candidate_uri, candidate_uri_parsed) = match replica {
+                None => (upstream_uri.clone(), upstream_uri_parsed.clone()),
+                Some((index, set)) => {
+                    let joined = set.replica(index).url.join(path_to_join).ok().and_then(|url| {
+                        let text = url.to_string();
+                        Uri::try_from(&text).ok().map(|parsed| (text, parsed))
+                    });
+                    match joined {
+                        Some(joined) => joined,
+                        None => continue,
+                    }
+                }
+            };
+            let mut candidate_headers = attempt_headers.clone();
+            if replica.is_some()
+                && let Some(host) = candidate_uri_parsed.host()
+            {
+                let host_value = match candidate_uri_parsed.port_u16() {
+                    Some(port) => format!("{host}:{port}"),
+                    None => host.to_string(),
+                };
+                if let Ok(value) = host_value.parse() {
+                    candidate_headers.insert("host", value);
+                }
+            }
+
+            // Build the request
+            let attempt_req = axum::extract::Request::builder()
+                .method(method.clone())
+                .uri(candidate_uri_parsed)
+                .body(axum::body::Body::from(attempt_body.clone()))
+                .unwrap();
+            let (mut parts, body) = attempt_req.into_parts();
+            parts.headers = candidate_headers;
+            let attempt_req = axum::extract::Request::from_parts(parts, body);
+
+            trace!(
+                "Outgoing request to provider:\n  URI: {}",
+                candidate_uri
+            );
+
+            // Make the request with optional timeout
+            // Note: Timeout only applies to receiving response headers, not reading the full body.
+            // For streaming responses, the body may take much longer than the timeout.
+            let upstream_span = tracing::info_span!(
+                "onwards.upstream_request",
+                otel.name = "onwards.upstream_request",
+                otel.kind = "Client",
+                http.request.method = %method,
+                url.full = %candidate_uri,
+                server.address = target.url.host_str().unwrap_or_default(),
+                onwards.replica = replica.map(|(index, set)| set.replica(index).label.as_str()).unwrap_or_default(),
+                http.response.status_code = tracing::field::Empty,
+            );
+            let guard = replica.map(|(index, set)| set.acquire(index));
+            let request_result = async {
+                if let Some(deadline) = header_deadline {
+                    match tokio::time::timeout_at(deadline, state.http_client.request(attempt_req))
+                        .await
+                    {
+                        Err(_) => {
+                            // Timeout occurred
+                            debug!("Request to {} timed out waiting for response headers", candidate_uri);
+                            Err(UpstreamOutcome::Timeout)
+                        }
+                        Ok(result) => result.map_err(UpstreamOutcome::Error),
+                    }
+                } else {
+                    // No timeout configured
+                    state.http_client.request(attempt_req).await.map_err(UpstreamOutcome::Error)
+                }
+            }
+            .instrument(upstream_span.clone())
+            .await;
+
+            if let Some((index, set)) = replica {
+                let label = set.replica(index).label.clone();
+                if let Err(UpstreamOutcome::Error(e)) = &request_result
+                    && is_connect_error(e.as_ref())
+                {
+                    // Nothing reached the replica: the next candidate takes it.
+                    debug!("Replica {} refused the connection, trying the next candidate", label);
+                    metrics::counter!("onwards_replica_requests_total", "replica" => label, "outcome" => "connect_failed")
+                        .increment(1);
+                    continue;
+                }
+                if let Ok(response) = &request_result
+                    && set.fails_over_on(response.status().as_u16())
+                {
+                    // The replica turned the request away before doing any
+                    // work on it (see `failover_on_status`).
+                    debug!("Replica {} answered {}, trying the next candidate", label, response.status());
+                    metrics::counter!("onwards_replica_requests_total", "replica" => label, "outcome" => "status_failover")
+                        .increment(1);
+                    continue;
+                }
+                metrics::counter!("onwards_replica_requests_total", "replica" => label, "outcome" => "sent")
+                    .increment(1);
+            }
+            break (request_result, upstream_span, candidate_uri, guard);
+        };
 
         // Handle request errors
         let mut response = match request_result {
@@ -2175,6 +2280,7 @@ pub async fn target_message_handler<T: HttpClient>(
             _inflight_guard: inflight_guard.take().expect("inflight_guard taken once on success path"),
             _inflight_slot: inflight_slot.take(),
             _batch_inflight_slot: batch_inflight_slot.take(),
+            _replica_guard: replica_guard,
         };
         let response = Response::from_parts(parts, axum::body::Body::from_stream(guarded));
 
@@ -3347,6 +3453,7 @@ mod tests {
             reasoning_translation: None,
             accepts_scheduling_priority: false,
             kind: Default::default(),
+            replicas: None,
         }
     }
 

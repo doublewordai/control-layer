@@ -110,25 +110,61 @@ impl AffinityConfig {
     }
 }
 
+/// Where a request's conversation key came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySource {
+    /// The [`SESSION_HEADER`] header.
+    Header,
+    /// A `session_id` string in the body.
+    SessionId,
+    /// A `prompt_cache_key` string in the body.
+    PromptCacheKey,
+    /// The conversation's opening messages.
+    Opening,
+}
+
+impl KeySource {
+    /// Metric label value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeySource::Header => "header",
+            KeySource::SessionId => "session_id",
+            KeySource::PromptCacheKey => "prompt_cache_key",
+            KeySource::Opening => "opening",
+        }
+    }
+}
+
 /// The conversation a request belongs to, as a stable 64-bit hash. `None` when
 /// the request carries nothing that identifies a conversation.
 ///
 /// `session_header` is the value of [`SESSION_HEADER`], if present.
 pub fn conversation_key(session_header: Option<&str>, body: &Value) -> Option<u64> {
+    conversation_key_with_source(session_header, body).map(|(key, _)| key)
+}
+
+/// [`conversation_key`] together with where the key came from.
+pub fn conversation_key_with_source(
+    session_header: Option<&str>,
+    body: &Value,
+) -> Option<(u64, KeySource)> {
     let explicit = session_header
         .filter(|s| !s.is_empty())
+        .map(|s| (s, KeySource::Header))
         .or_else(|| {
             body.get("session_id")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
+                .map(|s| (s, KeySource::SessionId))
         })
         .or_else(|| {
             body.get("prompt_cache_key")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
+                .map(|s| (s, KeySource::PromptCacheKey))
         });
-    if let Some(id) = explicit {
-        return Some(hash(&[b"id", id.as_bytes()]));
+    if let Some((id, source)) = explicit {
+        return Some((hash(&[b"id", id.as_bytes()]), source));
     }
     let (system, first) = opening(body)?;
     let system = system.map(|(role, content)| (role, canonical(content)));
@@ -138,7 +174,7 @@ pub fn conversation_key(session_header: Option<&str>, body: &Value) -> Option<u6
         parts.extend([role.as_bytes(), content.as_bytes()]);
     }
     parts.extend([first.0.as_bytes(), first_content.as_bytes()]);
-    Some(hash(&parts))
+    Some((hash(&parts), KeySource::Opening))
 }
 
 /// `h` in `[0, 1)` for a conversation key.

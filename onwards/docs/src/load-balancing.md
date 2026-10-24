@@ -127,6 +127,7 @@ Settings specific to each provider:
 | `response_headers` | Provider-specific headers |
 | `trusted` | Override pool-level trust for strict mode error sanitization (`true`/`false`; omit to inherit from pool) |
 | `propagate_trace_context` | Whether to inject W3C `traceparent` / `tracestate` headers on outbound requests to this provider (`true`/`false`; omit to inherit from the resolved `trusted` value). Useful for preventing trace IDs from leaking to third-party providers whose downstream HTTP fetches would re-emit them. See [Trace context propagation](#trace-context-propagation) below. |
+| `replicas` | Direct addresses of the replicas behind `url`, to keep each conversation on one replica. See [Replica affinity](#replica-affinity) below. |
 
 ## Trace context propagation
 
@@ -272,6 +273,69 @@ priority selection.
 
 `target_conversations` does not adapt: set it to what the preferred provider can
 serve concurrently, and change it when that capacity changes.
+
+### Replica affinity
+
+Some upstreams are several interchangeable replicas behind one address, each
+with a per-process cache that only helps when a conversation's turns come back
+to it (for example a serving frontend's tokenizer prefix cache). Behind a plain
+load-balanced address every new connection picks a replica at random, so a
+conversation's turns are spread over all of them.
+
+A provider's `replicas` lists the replicas' direct addresses. A request with a
+conversation key (the same key as [conversation affinity](#conversation-affinity),
+for realtime and dispatched traffic alike) goes to the replica that ranks highest
+for that key under rendezvous hashing:
+
+- every gateway replica makes the same choice without sharing state;
+- adding or removing a replica moves only the conversations that rank it first;
+- a replica is skipped while its in-flight requests from this process reach
+  `load_factor` times the mean over the replicas, so a key that carries a large
+  share of traffic spills to its next-ranked replica instead of overloading one;
+- a replica that refuses the connection (its name does not resolve, or nothing
+  accepts) is skipped for the next-ranked one. Nothing was sent, so this is
+  always safe. The provider's `url` is the last resort.
+- a replica that answers with a status in `failover_on_status` is skipped the
+  same way. List only statuses the replicas send before doing any work on the
+  request, such as a draining server's 503, because the request is sent again.
+
+Requests without a conversation key use `url`. Other status codes from a
+replica are handled as they would be from `url`: pool fallback still applies on
+top of replica affinity.
+
+```json
+{
+  "url": "http://frontend:8000/v1",
+  "replicas": {
+    "urls": [
+      "http://frontend-replica-0:8000/v1",
+      "http://frontend-replica-1:8000/v1",
+      "http://frontend-replica-2:8000/v1"
+    ],
+    "load_factor": 1.25,
+    "failover_on_status": [503]
+  }
+}
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `urls` | required | 1 to 64 replica base URLs, each with the same path as `url` |
+| `load_factor` | `1.25` | In-flight bound as a multiple of the mean, 1.0 to 10.0. Lower keeps replicas more level and moves more conversations |
+| `failover_on_status` | `[]` | 4xx/5xx statuses at which the next candidate is tried instead of returning the response |
+
+For the fastest hand-off when a replica stops, give each replica an address
+that refuses connections as soon as it is no longer ready, such as a
+per-replica Kubernetes Service that selects one pod: its endpoint is removed
+when the pod starts terminating, and connections to a Service without endpoints
+are refused.
+
+Metrics: `onwards_conversation_key_total{source,traffic}` counts where keys came
+from (`header`, `session_id`, `prompt_cache_key`, `opening` or `none`);
+`onwards_replica_requests_total{replica,outcome}` counts requests each replica
+served (`sent`), refused at connect (`connect_failed`) or turned away with a
+failover status (`status_failover`); `onwards_replica_spills_total{replica}`
+counts requests a replica took because a higher-ranked one was over the bound.
 
 ### Realtime-only failover statuses
 

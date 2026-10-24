@@ -326,6 +326,12 @@ impl ProviderPool {
         self.affinity.is_some()
     }
 
+    /// Whether any provider keeps conversations on one of its replicas (see
+    /// [`crate::replicas`]).
+    pub(crate) fn replica_affinity_enabled(&self) -> bool {
+        self.providers.iter().any(|p| p.target.replicas.is_some())
+    }
+
     /// Keep the old pool's conversation tracker across a reload that leaves
     /// its configuration unchanged, so the active set and share survive
     /// routing-config updates.

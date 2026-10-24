@@ -1286,6 +1286,7 @@ fn convert_composite_to_target_spec(
                     reasoning_translation: target.reasoning_translation.clone().map(Into::into),
                     accepts_scheduling_priority: target.endpoint_accepts_scheduling_priority,
                     kind: target.endpoint_kind,
+                    replicas: None,
                 }
             }
         };
@@ -1463,6 +1464,7 @@ fn convert_to_config_file(
                 reasoning_translation: target.reasoning_translation.clone().map(Into::into),
                 accepts_scheduling_priority: target.endpoint_accepts_scheduling_priority,
                 kind: target.endpoint_kind,
+                replicas: None,
             };
 
             // Build fallback configuration. For single-provider (standard)
