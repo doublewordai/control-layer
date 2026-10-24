@@ -70,8 +70,9 @@ async fn archived_batch(
     .unwrap();
     let batch_id: Uuid = sqlx::query_scalar(
         "INSERT INTO batches (file_id, endpoint, completion_window, expires_at, \
-                              location, archive_bucket, counts_frozen_at) \
-         VALUES ($1, '/v1/x', '24h', $3 + INTERVAL '24 hours', 'archive', $2, $3) RETURNING id",
+                              location, archive_bucket, counts_frozen_at, created_at) \
+         VALUES ($1, '/v1/x', '24h', $3 + INTERVAL '24 hours', 'archive', $2, $3, \
+                 ($2::timestamp AT TIME ZONE 'UTC') + INTERVAL '1 day') RETURNING id",
     )
     .bind(file_id)
     .bind(week_start)
@@ -115,7 +116,7 @@ async fn manager(pool: &PgPool) -> PostgresRequestManager<TestDbPools> {
 }
 
 #[sqlx::test]
-async fn an_expired_week_retires_and_stamps_batch_metadata(pool: PgPool) {
+async fn an_expired_week_retires_without_touching_batch_metadata(pool: PgPool) {
     let week = monday(10);
     ensure_week(&pool, week).await;
     let batch = archived_batch(&pool, week, Utc::now() - Duration::days(60)).await;
@@ -149,19 +150,16 @@ async fn an_expired_week_retires_and_stamps_batch_metadata(pool: PgPool) {
     assert_eq!(state, "retired");
     assert!(journal_done);
 
-    // The batch metadata row survives, stamped with the deletion timestamp.
-    let (expired_at, journal_completed): (Option<DateTime<Utc>>, DateTime<Utc>) = sqlx::query_as(
-        "SELECT b.retention_expired_at, journal.completed_at \
-             FROM batches b, retention_partition_retirements journal \
-             WHERE b.id = $1 AND journal.parent_table = 'batch_requests_archive' \
-               AND journal.lower_bound = $2",
-    )
-    .bind(batch.batch_id)
-    .bind(week)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(expired_at, Some(journal_completed));
+    // The batch metadata row survives untouched: results files report
+    // expiry from their own expires_at, and a per-batch write here would
+    // grow with the week.
+    let expired_at: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT retention_expired_at FROM batches WHERE id = $1")
+            .bind(batch.batch_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(expired_at, None);
 
     let further = manager(&pool)
         .await
@@ -171,12 +169,15 @@ async fn an_expired_week_retires_and_stamps_batch_metadata(pool: PgPool) {
     assert_eq!(further, RetainedResponseRetirementOutcome::NoCandidate);
 }
 
+/// Retention is measured from the week, not from when each batch finished:
+/// one batch retried weeks later must not keep every other batch's
+/// completions in the week alive.
 #[sqlx::test]
-async fn a_batch_inside_its_retention_period_blocks_the_week(pool: PgPool) {
+async fn a_late_finish_does_not_hold_the_week(pool: PgPool) {
     let week = monday(10);
     ensure_week(&pool, week).await;
     archived_batch(&pool, week, Utc::now() - Duration::days(60)).await;
-    // A second batch in the same week finalized recently.
+    // A second batch in the same week finalized yesterday.
     archived_batch(&pool, week, Utc::now() - Duration::days(1)).await;
 
     let outcome = manager(&pool)
@@ -184,22 +185,56 @@ async fn a_batch_inside_its_retention_period_blocks_the_week(pool: PgPool) {
         .retire_expired_batch_archive_partition(true, 30)
         .await
         .unwrap();
-    assert_eq!(outcome, RetainedResponseRetirementOutcome::NoCandidate);
-    let bucket_state: String =
-        sqlx::query_scalar("SELECT state FROM batch_archive_buckets WHERE week_start = $1")
-            .bind(week)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(bucket_state, "active");
+    assert_eq!(outcome, RetainedResponseRetirementOutcome::Retired);
 }
 
+/// The week is not yet past `week end + retention days`.
 #[sqlx::test]
-async fn live_split_or_unfrozen_batches_fail_the_gate_closed(pool: PgPool) {
-    for (index, (location, frozen)) in [
-        ("live", Some(Utc::now() - Duration::days(60))),
-        ("split", Some(Utc::now() - Duration::days(60))),
-        ("archive", None),
+async fn a_young_week_is_not_a_candidate(pool: PgPool) {
+    let week = monday(4);
+    ensure_week(&pool, week).await;
+    archived_batch(&pool, week, Utc::now() - Duration::days(20)).await;
+
+    let outcome = manager(&pool)
+        .await
+        .retire_expired_batch_archive_partition(true, 30)
+        .await
+        .unwrap();
+    assert_eq!(outcome, RetainedResponseRetirementOutcome::NoCandidate);
+}
+
+/// Only a batch that is still running, and was created in the week, holds
+/// it open: it may yet write results into the partition. A finished batch
+/// holds nothing open whatever its location, and a running batch from
+/// another week is not this week's concern.
+#[sqlx::test]
+async fn only_an_unfinished_batch_created_in_the_week_blocks(pool: PgPool) {
+    let frozen = Some(Utc::now() - Duration::days(60));
+    for (index, (location, frozen, created_in_week, expected)) in [
+        (
+            "live",
+            frozen,
+            true,
+            RetainedResponseRetirementOutcome::Retired,
+        ),
+        (
+            "split",
+            frozen,
+            true,
+            RetainedResponseRetirementOutcome::Retired,
+        ),
+        (
+            "archive",
+            None,
+            true,
+            RetainedResponseRetirementOutcome::NoCandidate,
+        ),
+        (
+            "archive",
+            None,
+            false,
+            RetainedResponseRetirementOutcome::Retired,
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -207,13 +242,18 @@ async fn live_split_or_unfrozen_batches_fail_the_gate_closed(pool: PgPool) {
         let week = monday(20 + index as i64);
         ensure_week(&pool, week).await;
         let batch = archived_batch(&pool, week, Utc::now() - Duration::days(60)).await;
-        sqlx::query("UPDATE batches SET location = $2, counts_frozen_at = $3 WHERE id = $1")
-            .bind(batch.batch_id)
-            .bind(location)
-            .bind(frozen)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE batches SET location = $2, counts_frozen_at = $3, \
+                 created_at = CASE WHEN $4 THEN created_at ELSE NOW() END \
+             WHERE id = $1",
+        )
+        .bind(batch.batch_id)
+        .bind(location)
+        .bind(frozen)
+        .bind(created_in_week)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let outcome = manager(&pool)
             .await
@@ -221,10 +261,12 @@ async fn live_split_or_unfrozen_batches_fail_the_gate_closed(pool: PgPool) {
             .await
             .unwrap();
         assert_eq!(
-            outcome,
-            RetainedResponseRetirementOutcome::NoCandidate,
-            "location={location} frozen={frozen:?} must block retirement"
+            outcome, expected,
+            "location={location} frozen={frozen:?} created_in_week={created_in_week}"
         );
+        if expected == RetainedResponseRetirementOutcome::Retired {
+            continue;
+        }
         sqlx::query(&format!(
             "ALTER TABLE batch_requests_archive DETACH PARTITION {}",
             child_name(week)
@@ -347,39 +389,5 @@ async fn a_renamed_pending_child_fails_closed(pool: PgPool) {
     assert!(
         renamed_exists.is_some(),
         "the renamed relation must survive"
-    );
-}
-
-#[sqlx::test]
-async fn stamping_never_regresses_an_earlier_expiry(pool: PgPool) {
-    let week = monday(10);
-    ensure_week(&pool, week).await;
-    let batch = archived_batch(&pool, week, Utc::now() - Duration::days(60)).await;
-    // Truncate to PostgreSQL's microsecond resolution so the round-tripped
-    // stamp compares exactly equal.
-    let earlier = chrono::SubsecRound::trunc_subsecs(Utc::now() - Duration::days(5), 6);
-    sqlx::query("UPDATE batches SET retention_expired_at = $2 WHERE id = $1")
-        .bind(batch.batch_id)
-        .bind(earlier)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    let outcome = manager(&pool)
-        .await
-        .retire_expired_batch_archive_partition(true, 30)
-        .await
-        .unwrap();
-    assert_eq!(outcome, RetainedResponseRetirementOutcome::Retired);
-    let stamped: Option<DateTime<Utc>> =
-        sqlx::query_scalar("SELECT retention_expired_at FROM batches WHERE id = $1")
-            .bind(batch.batch_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(
-        stamped,
-        Some(earlier),
-        "an existing stamp is never rewritten"
     );
 }

@@ -1,10 +1,14 @@
 //! Weekly batch-archive partition retirement.
 //!
 //! Deletes archived batch response content by dropping whole weekly
-//! `batch_requests_archive` partitions once every batch in the week is past
-//! its content-retention period. Batch metadata rows are never deleted:
-//! completion atomically stamps `batches.retention_expired_at` so the API
-//! reports expiry while the account-lifetime metadata survives.
+//! `batch_requests_archive` partitions once the week is past the retention
+//! period measured from the week itself, so a batch's completions live a
+//! fixed time from its creation, like its input file. Batch metadata rows are
+//! never deleted. The API reports results files as expired from the
+//! `expires_at` they were given at creation; nothing is stamped on the
+//! batches at retirement, since any per-batch write at that point grows with
+//! the week (a million rows in one statement, cancelled by the statement
+//! timeout) and the week could never retire.
 
 use crate::error::Result;
 use crate::manager::RetainedResponseRetirementOutcome;
@@ -65,12 +69,12 @@ const BATCH_ARCHIVE_FAMILY: FamilySpec = FamilySpec {
             )
         )
         "#,
-    // A weekly bucket is eligible only when the whole week is past the
-    // retention horizon AND no batch bucketed in it can still need its
-    // content: every one is fully archived, frozen, and individually past
-    // its own finalization-anchored retention period. Any live, split,
-    // unfrozen, or younger batch fails the gate closed. The scan is over
-    // batch metadata only.
+    // A weekly bucket is eligible when the whole week is past the retention
+    // horizon and no batch created in that week is still running: such a
+    // batch may yet write results into the partition. A finished batch holds
+    // nothing open, however late it finished; one retry no longer extends
+    // the week for every batch in it. The guard reads only unfinished
+    // batches, a few dozen rows under idx_batches_unfinished_created_at.
     candidate_sql: r#"
         SELECT bucket.partition_schema,
                namespace.oid AS partition_schema_oid,
@@ -91,28 +95,16 @@ const BATCH_ARCHIVE_FAMILY: FamilySpec = FamilySpec {
           AND NOT EXISTS (
               SELECT 1
               FROM batches b
-              WHERE b.archive_bucket >= bucket.week_start
-                AND b.archive_bucket < bucket.week_start + 7
-                AND (
-                    b.location <> 'archive'
-                    OR b.counts_frozen_at IS NULL
-                    OR (b.counts_frozen_at + make_interval(days => $1))
-                          > statement_timestamp()
-                )
+              WHERE b.counts_frozen_at IS NULL
+                AND b.deleted_at IS NULL
+                AND b.created_at >= (bucket.week_start::timestamp AT TIME ZONE 'UTC')
+                AND b.created_at < ((bucket.week_start + 7)::timestamp AT TIME ZONE 'UTC')
           )
         ORDER BY bucket.week_start
         LIMIT 1
         "#,
     candidate_binds_retention: true,
-    // Committed atomically with the journal/bucket completion: batch
-    // metadata survives, stamped with the exact deletion timestamp so the
-    // API reports expired content and the explicit-erasure purge never
-    // treats these tombstones as its own.
-    completion_sql: Some(
-        "UPDATE batches SET retention_expired_at = $3 \
-         WHERE archive_bucket >= $1 AND archive_bucket < $2 \
-           AND retention_expired_at IS NULL",
-    ),
+    completion_sql: None,
 };
 
 pub(super) async fn retire_expired_batch_archive_partition<P: PoolProvider>(
