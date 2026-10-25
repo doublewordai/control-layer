@@ -2407,6 +2407,7 @@ pub async fn build_router(
         let daemon = &state.current_config().background_services.batch_daemon;
         let outbound_config = crate::inference::outbound_request::OutboundConfig {
             timeouts: crate::inference::outbound_request::StreamTimeouts::from_daemon_config(daemon),
+            key_policy: state.key_policy_cache.clone(),
         };
         onwards_router.layer(middleware::from_fn_with_state(
             outbound_config,

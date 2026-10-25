@@ -4,17 +4,21 @@
 //! request policy: the `users.zero_data_retention` flag (read by
 //! [`crate::inference::zdr::is_zdr_request`]), the account's
 //! `users.disabled_modalities` (read by the inference middleware's modality
-//! gate), and any `users.toleration_preset` (read by the inference middleware
+//! gate), any `users.toleration_preset` (read by the inference middleware
 //! and the batch ingest path to affix a preset's toleration list to every
-//! request from the account). All answer on the request hot path with a
-//! lock-free map read and no DB round-trip.
+//! request from the account), and the account and purpose the key bills
+//! (read with the [`PriceBook`] to price a request before it is sent). All
+//! answer on the request hot path with a lock-free map read and no DB
+//! round-trip.
 //!
 //! Unlike [`crate::sync::onwards_config`], which rebuilds the whole routing
-//! table on every change, this runs one small two-table join and swaps a flat
-//! map, so refreshing it on every `auth_config_changed` notification is cheap.
-//! It reuses that channel (fired by the `api_keys` trigger and the `users`
-//! ZDR, disabled-modalities and toleration-preset triggers), a 100ms debounce,
-//! and a periodic fallback reload.
+//! table on every change, this runs one small two-table join plus the tariff
+//! lookups and swaps flat maps, so refreshing it on every
+//! `auth_config_changed` notification is cheap. It reuses that channel (fired
+//! by the `api_keys` and `model_tariffs` triggers and the `users` ZDR,
+//! disabled-modalities and toleration-preset triggers), a 100ms debounce, and
+//! a periodic fallback reload, which is also what picks up a cache-tariff
+//! change.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,8 +29,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::config::ONWARDS_CONFIG_CHANGED_CHANNEL;
+use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::metrics::errors::component;
 use crate::modalities::ModalitySet;
+use crate::pricing::{PriceBook, PriceQuery, UnitPrices};
 use crate::scheduling::TolerationPresets;
 
 /// The account-level policy a key inherits from its owner (`api_keys.user_id`,
@@ -51,6 +57,18 @@ pub struct KeyPolicy {
     /// that model. A class policy has already been folded over its model's.
     /// Shared by every key of the account.
     pub model_toleration_presets: Option<Arc<HashMap<String, Arc<str>>>>,
+    /// The account the key's usage is charged to and the purpose that selects
+    /// its tariff. Set for every key in the map; `None` for a policy read per
+    /// account rather than per key.
+    pub billing: Option<KeyBilling>,
+}
+
+/// Who a key's usage is charged to (`api_keys.user_id`) and the purpose its
+/// tariff is selected by (`api_keys.purpose`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyBilling {
+    pub account: crate::types::UserId,
+    pub purpose: ApiKeyPurpose,
 }
 
 impl KeyPolicy {
@@ -94,6 +112,9 @@ pub struct KeyPolicyCache {
     /// Shared by `Arc` (the map inside is immutable after construction), so a
     /// clone is cheap and a hot-path resolve holds no lock.
     presets: TolerationPresets,
+    /// Every model's prices, general and for the accounts in the map,
+    /// reloaded with it.
+    prices: Arc<ArcSwap<PriceBook>>,
 }
 
 impl KeyPolicyCache {
@@ -103,6 +124,7 @@ impl KeyPolicyCache {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             presets: TolerationPresets::default(),
+            prices: Arc::new(ArcSwap::from_pointee(PriceBook::default())),
         }
     }
 
@@ -113,6 +135,7 @@ impl KeyPolicyCache {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             presets,
+            prices: Arc::new(ArcSwap::from_pointee(PriceBook::default())),
         }
     }
 
@@ -180,8 +203,22 @@ impl KeyPolicyCache {
         self.presets.store(presets);
     }
 
+    /// The per-token prices a request made with `secret` is charged at, or
+    /// `None` when the key is not in the map. Hot-path safe.
+    pub(crate) fn unit_prices(&self, secret: &str, query: &PriceQuery<'_>) -> Option<UnitPrices> {
+        let map = self.inner.load();
+        let billing = map.get(secret)?.billing.as_ref()?;
+        Some(self.prices.load().unit_prices(billing.account, &billing.purpose, query))
+    }
+
     fn replace(&self, map: HashMap<String, KeyPolicy>) {
         self.inner.store(Arc::new(map));
+    }
+
+    /// Replace the price book. Test-only; [`refresh`] reloads it with the map.
+    #[cfg(test)]
+    pub(crate) fn replace_prices(&self, prices: PriceBook) {
+        self.prices.store(Arc::new(prices));
     }
 
     /// Build a cache from explicit (secret, zdr) pairs. Test-only.
@@ -220,7 +257,7 @@ impl KeyPolicyCache {
 async fn load(pool: &PgPool) -> Result<HashMap<String, KeyPolicy>, sqlx::Error> {
     let rows = sqlx::query!(
         r#"
-        SELECT ak.secret, ak.user_id, u.zero_data_retention, u.disabled_modalities, u.toleration_preset
+        SELECT ak.secret, ak.user_id, ak.purpose, u.zero_data_retention, u.disabled_modalities, u.toleration_preset
         FROM api_keys ak
         JOIN users u ON u.id = ak.user_id
         WHERE NOT ak.is_deleted
@@ -240,6 +277,10 @@ async fn load(pool: &PgPool) -> Result<HashMap<String, KeyPolicy>, sqlx::Error> 
                     disabled_modalities: ModalitySet::from_db(&r.disabled_modalities),
                     toleration_preset: r.toleration_preset.map(Arc::from),
                     model_toleration_presets: model_presets.get(&r.user_id).cloned(),
+                    billing: Some(KeyBilling {
+                        account: r.user_id,
+                        purpose: crate::pricing::parse_api_key_purpose(&r.purpose),
+                    }),
                 },
             )
         })
@@ -285,8 +326,16 @@ async fn load_model_presets<'c>(
 /// manual refresh so none of them can drift.
 pub async fn refresh(pool: &PgPool, cache: &KeyPolicyCache) -> Result<usize, sqlx::Error> {
     let map = load(pool).await?;
+    let accounts: Vec<crate::types::UserId> = map
+        .values()
+        .filter_map(|policy| policy.billing.as_ref().map(|billing| billing.account))
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let prices = PriceBook::load(pool, &accounts).await?;
     let n = map.len();
     cache.replace(map);
+    cache.prices.store(Arc::new(prices));
     Ok(n)
 }
 
@@ -315,6 +364,7 @@ pub async fn load_policy(conn: &mut sqlx::PgConnection, user_id: crate::types::U
         disabled_modalities: ModalitySet::from_db(&row.disabled_modalities),
         toleration_preset: row.toleration_preset.map(Arc::from),
         model_toleration_presets,
+        billing: None,
     })
 }
 

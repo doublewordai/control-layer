@@ -1149,6 +1149,9 @@ pub async fn target_message_handler<T: HttpClient>(
     } else {
         None
     };
+    // The prices the embedding application charges this request at, if it
+    // attached them. Written for `dynamo` members only, with the hints.
+    let billing_prices = req.extensions().get::<serving::BillingPrices>().copied();
     let mut providers = pool
         .select_iter_routed(aimd_eligible, conversation, &model_name, resolved_pool_name.unwrap_or("default"))
         .excluding_members(ineligible_members.iter().copied());
@@ -1341,7 +1344,9 @@ pub async fn target_message_handler<T: HttpClient>(
         // values are scrubbed at dwctl's ingress, alongside the body priority
         // (the same perimeter the priority strip relies on).
         // A non-JSON body (a multipart upload) carries no hints and is
-        // forwarded as it came.
+        // forwarded as it came. The request's prices travel the same way, as
+        // `nvext.billing`, replacing any value already in the body; without
+        // them the body's own value (a first hop's) is forwarded.
         if target.kind == ProviderKind::Dynamo
             && !scheduling_fields_refused
             && !attempt_body.is_empty()
@@ -1353,6 +1358,9 @@ pub async fn target_message_handler<T: HttpClient>(
                 tracing::Span::current().record("onwards.hints_sent", true);
             }
             serving::stamp_default_priority(object);
+            if let Some(prices) = billing_prices {
+                prices.stamp(object);
+            }
             attempt_body = match serde_json::to_vec(&body) {
                 Ok(bytes) => axum::body::Bytes::from(bytes),
                 Err(_) => return LoopAction::Done(Err(OnwardsErrorResponse::internal())),

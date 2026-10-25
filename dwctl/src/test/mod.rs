@@ -4,6 +4,7 @@ pub mod batch_trace_attributes;
 pub mod cache_classifier;
 pub mod databases;
 pub mod modalities;
+pub mod nvext_billing;
 pub mod rejections;
 pub mod request_log_credentials;
 pub mod responses;
