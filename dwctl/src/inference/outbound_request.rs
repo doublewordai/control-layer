@@ -801,6 +801,7 @@ mod tests {
             ("sk-batch".to_string(), policy(ApiKeyPurpose::Batch)),
         ]);
         key_policy.replace_prices(PriceBook::from_rows(
+            [account],
             [(
                 "m".to_string(),
                 vec![

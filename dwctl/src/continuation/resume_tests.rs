@@ -392,11 +392,13 @@ async fn a_resume_leg_carries_the_original_requests_prices(pool: PgPool) {
         billing: Some(KeyBilling { account, purpose }),
         ..Default::default()
     };
+    let customer = uuid::Uuid::new_v4();
     let key_policy = KeyPolicyCache::from_policies([
-        ("sk-customer".to_string(), policy(uuid::Uuid::new_v4(), ApiKeyPurpose::Realtime)),
+        ("sk-customer".to_string(), policy(customer, ApiKeyPurpose::Realtime)),
         (KEY.to_string(), policy(uuid::Uuid::nil(), ApiKeyPurpose::Continuation)),
     ]);
     key_policy.replace_prices(PriceBook::from_rows(
+        [customer, uuid::Uuid::nil()],
         [(
             MODEL.to_string(),
             vec![TariffInfo {

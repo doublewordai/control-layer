@@ -591,6 +591,9 @@ pub(crate) struct PriceQuery<'a> {
 pub(crate) struct PriceBook {
     models: std::collections::HashMap<String, ModelInfo>,
     cache_tariffs: std::collections::HashMap<String, Vec<CacheTariffRow>>,
+    /// The accounts whose own prices were loaded. Any other account may have
+    /// prices of its own that this book lacks, so it is not priced from it.
+    accounts: std::collections::HashSet<uuid::Uuid>,
 }
 
 impl PriceBook {
@@ -602,6 +605,7 @@ impl PriceBook {
         Ok(Self {
             models: lookup_model_tariffs(pool, &aliases, accounts).await?,
             cache_tariffs: lookup_cache_tariffs(pool, &aliases, accounts).await?,
+            accounts: accounts.iter().copied().collect(),
         })
     }
 
@@ -609,13 +613,17 @@ impl PriceBook {
     /// `account` at `purpose`'s tariff: the same tariff and cache multipliers,
     /// resolved at the same timestamp. Usage it does not charge for (an unpriced
     /// model, a non-billing key purpose, the system account) is free.
-    pub fn unit_prices(&self, account: uuid::Uuid, purpose: &ApiKeyPurpose, query: &PriceQuery<'_>) -> UnitPrices {
+    ///
+    /// `None` when the book cannot tell: `account` was not one it was loaded
+    /// for, or the model was not deployed when it was loaded.
+    pub fn unit_prices(&self, account: uuid::Uuid, purpose: &ApiKeyPurpose, query: &PriceQuery<'_>) -> Option<UnitPrices> {
         if account.is_nil() {
-            return UnitPrices::FREE;
+            return Some(UnitPrices::FREE);
         }
-        let Some(model) = self.models.get(query.model) else {
-            return UnitPrices::FREE;
-        };
+        if !self.accounts.contains(&account) {
+            return None;
+        }
+        let model = self.models.get(query.model)?;
         let timestamp = query.batch_created_at.unwrap_or(query.now);
         let (input, output) = find_best_tariff(
             &model.tariffs,
@@ -634,11 +642,13 @@ impl PriceBook {
                 let mults = resolve_cache_multipliers(rows, timestamp, Some(account), Some(query.serving_class));
                 clamp_implicit_read_multiplier(mults, Some(source.as_str()))
             });
-        UnitPrices::new(input, output, cache)
+        Some(UnitPrices::new(input, output, cache))
     }
 
+    /// A book of `models` and `cache_tariffs`, loaded for `accounts`.
     #[cfg(test)]
     pub fn from_rows(
+        accounts: impl IntoIterator<Item = uuid::Uuid>,
         models: impl IntoIterator<Item = (String, Vec<TariffInfo>)>,
         cache_tariffs: impl IntoIterator<Item = (String, Vec<CacheTariffRow>)>,
     ) -> Self {
@@ -656,6 +666,7 @@ impl PriceBook {
                 })
                 .collect(),
             cache_tariffs: cache_tariffs.into_iter().collect(),
+            accounts: accounts.into_iter().collect(),
         }
     }
 }
@@ -1261,6 +1272,7 @@ mod tests {
         let mut deal = make_tariff(ApiKeyPurpose::Realtime, now - hours(2), None, "0.000002", "0.000006", None);
         deal.account = Some(deal_account);
         let book = PriceBook::from_rows(
+            [account, deal_account],
             [
                 (
                     "m".to_string(),
@@ -1287,7 +1299,7 @@ mod tests {
             [],
         );
 
-        let realtime = price("0.000003", "0.000003", "0.000009");
+        let realtime = Some(price("0.000003", "0.000003", "0.000009"));
         assert_eq!(book.unit_prices(account, &ApiKeyPurpose::Realtime, &query("m")), realtime);
         assert_eq!(
             book.unit_prices(account, &ApiKeyPurpose::Playground, &query("m")),
@@ -1296,7 +1308,7 @@ mod tests {
         );
         assert_eq!(
             book.unit_prices(deal_account, &ApiKeyPurpose::Realtime, &query("m")),
-            price("0.000002", "0.000002", "0.000006"),
+            Some(price("0.000002", "0.000002", "0.000006")),
             "the account's own price wins"
         );
 
@@ -1304,7 +1316,7 @@ mod tests {
         batch.completion_window = Some("24h");
         assert_eq!(
             book.unit_prices(account, &ApiKeyPurpose::Batch, &batch),
-            price("0.000001", "0.000001", "0.000003")
+            Some(price("0.000001", "0.000001", "0.000003"))
         );
         batch.completion_window = Some("1h");
         assert_eq!(
@@ -1315,23 +1327,28 @@ mod tests {
         batch.batch_created_at = Some(now - hours(3));
         assert_eq!(
             book.unit_prices(account, &ApiKeyPurpose::Batch, &batch),
-            price("0.000005", "0.000005", "0.000015"),
+            Some(price("0.000005", "0.000005", "0.000015")),
             "a batch request is priced as of the batch's creation"
         );
 
         for (model, account, purpose) in [
             ("unpriced", account, ApiKeyPurpose::Realtime),
             ("zero", account, ApiKeyPurpose::Realtime),
-            ("not-deployed", account, ApiKeyPurpose::Realtime),
             ("m", account, ApiKeyPurpose::Continuation),
             ("m", uuid::Uuid::nil(), ApiKeyPurpose::Realtime),
         ] {
             assert_eq!(
                 book.unit_prices(account, &purpose, &query(model)),
-                UnitPrices::FREE,
+                Some(UnitPrices::FREE),
                 "{model} {account} {purpose:?}"
             );
         }
+
+        // What the book was not loaded with has no price, not a free one: an
+        // account whose own prices it did not load, and a model it has no
+        // record of.
+        assert_eq!(book.unit_prices(uuid::Uuid::new_v4(), &ApiKeyPurpose::Realtime, &query("m")), None);
+        assert_eq!(book.unit_prices(account, &ApiKeyPurpose::Realtime, &query("not-deployed")), None);
     }
 
     #[test]
@@ -1350,7 +1367,9 @@ mod tests {
         };
         let mut surcharge = tariff_row(Decimal::TWO, 2, None);
         surcharge.read_multiplier = Decimal::new(15, 1);
+        let account = uuid::Uuid::new_v4();
         let book = PriceBook::from_rows(
+            [account],
             [
                 ("cached".to_string(), tariff()),
                 ("surcharge".to_string(), tariff()),
@@ -1369,7 +1388,7 @@ mod tests {
                 batch_created_at: created_at,
                 ..query(model)
             };
-            book.unit_prices(uuid::Uuid::new_v4(), &ApiKeyPurpose::Realtime, &query).cached
+            book.unit_prices(account, &ApiKeyPurpose::Realtime, &query).unwrap().cached
         };
         let engine = Some(crate::prompt_cache::CacheReadSource::Engine);
         let module = Some(crate::prompt_cache::CacheReadSource::Module);
