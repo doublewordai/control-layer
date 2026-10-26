@@ -46,7 +46,7 @@ use futures::StreamExt;
 use futures::stream::Stream;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;

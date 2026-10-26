@@ -487,6 +487,26 @@ async fn class_routes_serve_realtime_by_class_and_bill_the_class(pool: PgPool) {
             ),
         ]
     );
+    // The customer's ledger names each charge as requested.
+    let descriptions = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let rows: Vec<String> = sqlx::query_scalar(
+                "SELECT description FROM credits_transactions WHERE user_id = $1 AND description LIKE 'API usage:%' ORDER BY description",
+            )
+            .bind(f.user)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            if rows.len() == 2 {
+                break rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("two usage debits");
+    assert!(descriptions[0].starts_with("API usage: policy ("), "{descriptions:?}");
+    assert!(descriptions[1].starts_with("API usage: policy:fast ("), "{descriptions:?}");
     f.services.shutdown().await;
 }
 

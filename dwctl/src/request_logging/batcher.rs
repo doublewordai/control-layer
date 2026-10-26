@@ -1251,9 +1251,14 @@ where
             user_ids.push(user_id);
             amounts.push(total_cost);
             source_ids.push(analytics_id.to_string());
+            // A class route is its own product to the customer: name it as requested.
+            let requested = match record.raw.requested_serving_class.as_deref() {
+                Some(class) if class != crate::inference::serving_name::STANDARD_CLASS => format!("{model}:{class}"),
+                _ => model.clone(),
+            };
             descriptions.push(Some(format!(
                 "API usage: {} ({} input + {} output tokens)",
-                model, record.raw.prompt_tokens, record.raw.completion_tokens
+                requested, record.raw.prompt_tokens, record.raw.completion_tokens
             )));
             fusillade_batch_ids.push(record.raw.fusillade_batch_id);
             models.push(model);

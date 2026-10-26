@@ -843,8 +843,10 @@ struct OnwardsCompositeModel {
     /// Traffic routing rules from the database
     routing_rules: Vec<RoutingRule>,
     components: Vec<CompositeModelComponent>,
-    // API keys that have access to this composite model
+    // API keys that have access to this composite model's legacy route
     api_keys: Vec<OnwardsApiKey>,
+    /// API keys with access to each class target of a class-routed model.
+    class_api_keys: HashMap<String, Vec<OnwardsApiKey>>,
     /// `deployed_models.routing_mode`: `class_routes` serves `classes`
     /// instead of `components`.
     routing_mode: String,
@@ -922,11 +924,14 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
     .fetch_all(db)
     .await?;
 
-    // Query API keys with access to composite models (uses deployment_groups since composites are in deployed_models)
+    // Query API keys with access to composite models (uses deployment_groups since composites are in deployed_models).
+    // A class-routed model gets one key set per class target: each class is paid
+    // or free by its own prices, so a priced class never locks accounts out of a free one.
     let api_key_rows = sqlx::query!(
         r#"
         SELECT
             cm.id as composite_model_id,
+            target.class_key as "class_key?",
             ak.id as api_key_id,
             ak.secret as api_key_secret,
             ak.purpose as api_key_purpose,
@@ -935,6 +940,13 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             ak.user_username,
             ak.user_display_name as "user_display_name?"
         FROM deployed_models cm
+        CROSS JOIN LATERAL (
+            -- NULL: the legacy route. Otherwise one target per serving class.
+            SELECT NULL::text AS class_key WHERE NOT class_routes_active(cm.id)
+            UNION ALL
+            SELECT c.class_key FROM model_serving_classes c
+            WHERE c.deployed_model_id = cm.id AND class_routes_active(cm.id)
+        ) target
         CROSS JOIN LATERAL (
             SELECT DISTINCT
                 ak.id,
@@ -995,12 +1007,17 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     NOT EXISTS (
                         SELECT 1 FROM model_tariffs mt
                         WHERE mt.deployed_model_id = cm.id AND mt.user_id IS NULL
-                          AND (mt.serving_class IS NULL OR class_routes_active(cm.id))
+                          -- The legacy route: class-less prices. A class target: its
+                          -- class's prices; the standard target also the class-less ones.
+                          AND (mt.serving_class IS NOT DISTINCT FROM target.class_key
+                               OR (mt.serving_class IS NULL AND target.class_key = 'standard'))
                           AND mt.valid_until IS NULL
                           AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                     ) AND NOT EXISTS (
                         SELECT 1 FROM model_tariffs mt
                         WHERE mt.deployed_model_id = cm.id AND mt.user_id = ak.user_id
+                          AND (target.class_key IS NULL OR mt.serving_class = target.class_key
+                               OR (mt.serving_class IS NULL AND target.class_key = 'standard'))
                           AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())
                           AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                     )
@@ -1032,12 +1049,15 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                       AND (EXISTS (
                         SELECT 1 FROM model_tariffs mt
                         WHERE mt.deployed_model_id = cm.id AND mt.user_id IS NULL
-                          AND (mt.serving_class IS NULL OR class_routes_active(cm.id))
+                          AND (mt.serving_class IS NOT DISTINCT FROM target.class_key
+                               OR (mt.serving_class IS NULL AND target.class_key = 'standard'))
                           AND mt.valid_until IS NULL
                           AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                       ) OR EXISTS (
                         SELECT 1 FROM model_tariffs mt
                         WHERE mt.deployed_model_id = cm.id AND mt.user_id = ak.user_id
+                          AND (target.class_key IS NULL OR mt.serving_class = target.class_key
+                               OR (mt.serving_class IS NULL AND target.class_key = 'standard'))
                           AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())
                           AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                       ))
@@ -1055,7 +1075,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
         ) ak
         WHERE cm.is_composite = TRUE
           AND cm.deleted = FALSE
-        ORDER BY cm.id, ak.id
+        ORDER BY cm.id, target.class_key, ak.id
         "#,
         escalation_models
     )
@@ -1136,6 +1156,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 routing_rules: Vec::new(), // Populated from separate query below
                 components: Vec::new(),
                 api_keys: Vec::new(),
+                class_api_keys: HashMap::new(),
                 routing_mode: row.routing_mode,
                 classes: Vec::new(),
             },
@@ -1283,9 +1304,13 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
     // Add API keys to composite models
     for row in api_key_rows {
         if let Some(composite) = composite_map.get_mut(&row.composite_model_id) {
+            let keys = match row.class_key {
+                Some(class) => composite.class_api_keys.entry(class).or_default(),
+                None => &mut composite.api_keys,
+            };
             // Avoid duplicates
-            if !composite.api_keys.iter().any(|k| k.id == row.api_key_id) {
-                composite.api_keys.push(OnwardsApiKey {
+            if !keys.iter().any(|k| k.id == row.api_key_id) {
+                keys.push(OnwardsApiKey {
                     id: row.api_key_id,
                     secret: row.api_key_secret,
                     purpose: row.api_key_purpose.clone(),
@@ -1403,7 +1428,7 @@ fn convert_class_routes(
         );
         return None;
     }
-    for api_key in &composite.api_keys {
+    for api_key in composite.class_api_keys.values().flatten() {
         key_definitions.insert(
             api_key.id.to_string(),
             KeyDefinition {
@@ -1414,8 +1439,14 @@ fn convert_class_routes(
             },
         );
     }
-    let keys: Option<std::collections::HashSet<_>> =
-        (!composite.api_keys.is_empty()).then(|| composite.api_keys.iter().map(|k| k.secret.clone().into()).collect());
+    // Each class admits its own keys: a class is paid or free by its own prices.
+    let class_keys = |class: &str| -> Option<std::collections::HashSet<_>> {
+        composite
+            .class_api_keys
+            .get(class)
+            .filter(|keys| !keys.is_empty())
+            .map(|keys| keys.iter().map(|k| k.secret.clone().into()).collect())
+    };
     let fallback = composite_fallback(composite).map(|mut config| {
         // One upstream: there is nothing to keep a conversation on.
         config.affinity = None;
@@ -1453,7 +1484,7 @@ fn convert_class_routes(
                 kind: target.endpoint_kind,
             };
             let pool = PoolSpec {
-                keys: keys.clone(),
+                keys: class_keys(&class.class_key),
                 rate_limit: None,
                 concurrency_limit: None,
                 fallback: fallback.clone(),
@@ -1819,6 +1850,14 @@ fn convert_to_config_file(
         {
             target_specs.extend(class_targets);
             continue;
+        }
+        // An activation the gateway cannot serve falls back to the legacy route,
+        // admitting the standard class's keys.
+        let mut composite = composite;
+        if composite.api_keys.is_empty()
+            && let Some(keys) = composite.class_api_keys.remove(STANDARD_CLASS)
+        {
+            composite.api_keys = keys;
         }
         if composite.components.is_empty() {
             crate::background_error!(

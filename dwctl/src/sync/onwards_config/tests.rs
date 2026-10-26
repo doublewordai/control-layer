@@ -2763,6 +2763,41 @@ async fn activate_composite_classes(pool: &sqlx::PgPool, with_standard: bool) {
 }
 
 #[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn a_priced_class_does_not_lock_accounts_out_of_a_free_one(pool: sqlx::PgPool) {
+    // Key A's spend cap is exhausted: it keeps generally free targets only.
+    sqlx::query("UPDATE api_keys SET spend_limit=1 WHERE secret = $1")
+        .bind(KEY_A_SECRET)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO api_key_spend_checkpoints(api_key_id,total_spend,window_spend) SELECT id,1,1 FROM api_keys WHERE secret = $1")
+        .bind(KEY_A_SECRET)
+        .execute(&pool)
+        .await
+        .unwrap();
+    activate_composite_classes(&pool, true).await;
+    // Only the fast class is priced.
+    sqlx::query(
+        "INSERT INTO model_tariffs(deployed_model_id,serving_class,name,input_price_per_token,output_price_per_token,api_key_purpose)
+         SELECT id,'fast','fast',1,1,'realtime' FROM deployed_models WHERE alias = 'composite-priority'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let standard = targets.targets.get("composite-priority").unwrap();
+    let fast = targets.targets.get("composite-priority:fast").unwrap();
+    assert!(pool_has_key(standard.value(), KEY_A_SECRET), "the free standard class stays open");
+    assert!(
+        !pool_has_key(fast.value(), KEY_A_SECRET),
+        "the priced fast class is closed to a capped key"
+    );
+    // Key B's account has no access to the model: neither class admits it.
+    assert!(!pool_has_key(standard.value(), KEY_B_SECRET));
+    assert!(!pool_has_key(fast.value(), KEY_B_SECRET));
+}
+
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_class_routed_model_has_one_target_per_class(pool: sqlx::PgPool) {
     let composite = uuid::Uuid::parse_str("50000000-0000-0000-0000-000000000001").unwrap();
     let user_a = "00000000-0000-0000-0000-0000000000a1";
