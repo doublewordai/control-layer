@@ -353,7 +353,7 @@ batches:
     - "48h"
   files:
     max_file_size: 104857600        # 100 MB
-    default_expiry_seconds: 86400   # 24 hours
+    default_expiry_seconds: 2592000 # 30 days
     min_expiry_seconds: 3600        # 1 hour
     max_expiry_seconds: 2592000     # 30 days
     upload_buffer_size: 100
@@ -365,7 +365,18 @@ batches:
 | `enabled` | boolean | `true` | Enable `/ai/v1/files` and `/ai/v1/batches` endpoints. |
 | `allowed_completion_windows` | list | `["24h"]` | SLA options users can select. |
 | `files.max_file_size` | integer | `104857600` | Maximum upload size in bytes. A gzip or zstd file is decoded as it uploads, and the limit applies to its decoded size; the compressed upload itself may not exceed the limit either. |
-| `files.default_expiry_seconds` | integer | `86400` | Default file retention. |
+| `files.default_expiry_seconds` | integer | `2592000` | Lifetime of file content. Sets `expires_at` on an upload that sends no `expires_after`, and on a batch's output and error files, counted from the batch's creation. |
+| `files.min_expiry_seconds` | integer | `3600` | Smallest `expires_after[seconds]` an upload may request. |
+| `files.max_expiry_seconds` | integer | `2592000` | Largest `expires_after[seconds]` an upload may request. |
+
+The expiry settings must be positive and ordered `min_expiry_seconds <= default_expiry_seconds <= max_expiry_seconds`. They are validated even when `enabled` is `false`, and a config that breaks these rules is refused at startup.
+
+`expires_at` decides when file content stops being available:
+
+- An upload whose `expires_after[seconds]` is not an integer between `min_expiry_seconds` and `max_expiry_seconds` is rejected with 400 (`invalid_expiry`).
+- `GET /ai/v1/files/{file_id}/content` returns 410 once the file is past its `expires_at`. File metadata stays readable and reports the status `expired`.
+- `GET /ai/v1/batches/{batch_id}/results` returns 410 once the batch's output or error file is past its `expires_at`.
+- Output and error files expire `default_expiry_seconds` after the batch is created. OpenAI counts from when the batch completes instead, so here they expire up to one completion window earlier. Output and error files created before they were given an expiry are treated as expiring `default_expiry_seconds` after their creation.
 
 ## Background Services
 

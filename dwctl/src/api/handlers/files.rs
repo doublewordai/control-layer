@@ -2469,7 +2469,12 @@ mod tests {
     #[dwctl_test_macros::test]
     #[test_log::test]
     async fn upload_without_expires_after_gets_the_default_lifetime(pool: PgPool) {
-        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        // Not the built-in default, so this proves the setting reaches the
+        // repository rather than matching its own fallback.
+        let default_seconds = 2 * 24 * 60 * 60;
+        let mut config = create_test_config();
+        config.batches.files.default_expiry_seconds = default_seconds;
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
         let user = batch_uploader(&pool).await;
 
         let before = Utc::now().timestamp();
@@ -2477,7 +2482,6 @@ mod tests {
         upload.assert_status(axum::http::StatusCode::CREATED);
         let file: FileResponse = upload.json();
 
-        let default_seconds = crate::config::FilesConfig::default().default_expiry_seconds;
         let expires_at = file.expires_at.expect("uploads always carry an expiry");
         assert!(
             (before + default_seconds..=before + default_seconds + 5).contains(&expires_at),

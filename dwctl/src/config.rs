@@ -4187,53 +4187,56 @@ impl Config {
 
             // Validate file size limits are sensible (0 = unlimited is allowed but not recommended)
             // Note: max_file_size is now in limits.files, not batches.files
+        }
 
-            // Validate expiry times are positive and in sensible order
-            if self.batches.files.min_expiry_seconds <= 0 {
-                return Err(Error::Internal {
-                    operation: "Config validation: min_expiry_seconds must be positive (default: 3600 = 1 hour).".to_string(),
-                });
-            }
+        // Validate expiry times are positive and in sensible order. The request
+        // manager takes these whether or not the batches API is enabled, and it
+        // refuses a non-positive or misordered expiry, so check them here to
+        // report a config error rather than fail at startup.
+        if self.batches.files.min_expiry_seconds <= 0 {
+            return Err(Error::Internal {
+                operation: "Config validation: min_expiry_seconds must be positive (default: 3600 = 1 hour).".to_string(),
+            });
+        }
 
-            if self.batches.files.default_expiry_seconds <= 0 {
-                return Err(Error::Internal {
-                    operation: "Config validation: default_expiry_seconds must be positive (default: 2592000 = 30 days).".to_string(),
-                });
-            }
+        if self.batches.files.default_expiry_seconds <= 0 {
+            return Err(Error::Internal {
+                operation: "Config validation: default_expiry_seconds must be positive (default: 2592000 = 30 days).".to_string(),
+            });
+        }
 
-            if self.batches.files.max_expiry_seconds <= 0 {
-                return Err(Error::Internal {
-                    operation: "Config validation: max_expiry_seconds must be positive (default: 2592000 = 30 days).".to_string(),
-                });
-            }
+        if self.batches.files.max_expiry_seconds <= 0 {
+            return Err(Error::Internal {
+                operation: "Config validation: max_expiry_seconds must be positive (default: 2592000 = 30 days).".to_string(),
+            });
+        }
 
-            // Validate expiry times are in correct order
-            if self.batches.files.min_expiry_seconds > self.batches.files.default_expiry_seconds {
-                return Err(Error::Internal {
-                    operation: format!(
-                        "Config validation: min_expiry_seconds ({}) cannot be greater than default_expiry_seconds ({})",
-                        self.batches.files.min_expiry_seconds, self.batches.files.default_expiry_seconds
-                    ),
-                });
-            }
+        // Validate expiry times are in correct order
+        if self.batches.files.min_expiry_seconds > self.batches.files.default_expiry_seconds {
+            return Err(Error::Internal {
+                operation: format!(
+                    "Config validation: min_expiry_seconds ({}) cannot be greater than default_expiry_seconds ({})",
+                    self.batches.files.min_expiry_seconds, self.batches.files.default_expiry_seconds
+                ),
+            });
+        }
 
-            if self.batches.files.default_expiry_seconds > self.batches.files.max_expiry_seconds {
-                return Err(Error::Internal {
-                    operation: format!(
-                        "Config validation: default_expiry_seconds ({}) cannot be greater than max_expiry_seconds ({})",
-                        self.batches.files.default_expiry_seconds, self.batches.files.max_expiry_seconds
-                    ),
-                });
-            }
+        if self.batches.files.default_expiry_seconds > self.batches.files.max_expiry_seconds {
+            return Err(Error::Internal {
+                operation: format!(
+                    "Config validation: default_expiry_seconds ({}) cannot be greater than max_expiry_seconds ({})",
+                    self.batches.files.default_expiry_seconds, self.batches.files.max_expiry_seconds
+                ),
+            });
+        }
 
-            if self.batches.files.min_expiry_seconds > self.batches.files.max_expiry_seconds {
-                return Err(Error::Internal {
-                    operation: format!(
-                        "Config validation: min_expiry_seconds ({}) cannot be greater than max_expiry_seconds ({})",
-                        self.batches.files.min_expiry_seconds, self.batches.files.max_expiry_seconds
-                    ),
-                });
-            }
+        if self.batches.files.min_expiry_seconds > self.batches.files.max_expiry_seconds {
+            return Err(Error::Internal {
+                operation: format!(
+                    "Config validation: min_expiry_seconds ({}) cannot be greater than max_expiry_seconds ({})",
+                    self.batches.files.min_expiry_seconds, self.batches.files.max_expiry_seconds
+                ),
+            });
         }
 
         Ok(())
@@ -5183,6 +5186,30 @@ secret_key: "test-secret-key"
 
         let result = config.validate();
         assert!(result.is_ok()); // Should pass because both batches AND daemon are disabled
+    }
+
+    #[test]
+    fn expiry_validated_when_batches_and_daemon_are_disabled() {
+        // The request manager is built from these keys on every instance and
+        // refuses a non-positive or misordered expiry, so a bad value must be
+        // a config error here rather than a failure at startup.
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = false;
+        config.background_services.batch_daemon.enabled = DaemonEnabled::Never;
+        assert!(config.validate().is_ok(), "{:?}", config.validate().err());
+
+        config.batches.files.default_expiry_seconds = config.batches.files.max_expiry_seconds + 1;
+        let err_msg = config.validate().unwrap_err().to_string();
+        assert!(
+            err_msg.contains("default_expiry_seconds") && err_msg.contains("max_expiry_seconds"),
+            "{err_msg}"
+        );
+
+        config.batches.files.default_expiry_seconds = 0;
+        let err_msg = config.validate().unwrap_err().to_string();
+        assert!(err_msg.contains("default_expiry_seconds must be positive"), "{err_msg}");
     }
 
     /// Helper: a config that passes validation up to the cache checks, with caching on.
