@@ -19,6 +19,8 @@
 
 use metrics::{counter, histogram};
 
+use crate::inference::serving_name::{STANDARD_CLASS, split_served};
+
 // ── Adoption ──────────────────────────────────────────────────────────────────
 
 /// Every chat-completions request the layer sees, labelled by whether the client included
@@ -52,13 +54,22 @@ pub fn record_request_outcome(outcome: &'static str) {
 /// `read / (read + creation)`. The full-prompt hit rate and the uncached residual are
 /// [DB]-derived from `http_analytics` (`prompt_tokens − read − creation`), which is also
 /// the authoritative billing source — this counter is the real-time *classified* volume.
-pub fn record_token_volumes(model: &str, read: u64, creation_5m: u64, creation_1h: u64, creation_24h: u64) {
+/// `requested` is the name as requested; the model and its class are separate labels.
+pub fn record_token_volumes(requested: &str, read: u64, creation_5m: u64, creation_1h: u64, creation_24h: u64) {
+    let (model, class) = split_served(requested);
+    let class = class.unwrap_or(STANDARD_CLASS).to_owned();
     if read > 0 {
-        counter!("dwctl_cache_read_input_tokens_total", "model" => model.to_owned()).increment(read);
+        counter!("dwctl_cache_read_input_tokens_total", "model" => model.to_owned(), "serving_class" => class.clone()).increment(read);
     }
     for (tier, n) in [("5m", creation_5m), ("1h", creation_1h), ("24h", creation_24h)] {
         if n > 0 {
-            counter!("dwctl_cache_creation_input_tokens_total", "model" => model.to_owned(), "tier" => tier).increment(n);
+            counter!(
+                "dwctl_cache_creation_input_tokens_total",
+                "model" => model.to_owned(),
+                "serving_class" => class.clone(),
+                "tier" => tier
+            )
+            .increment(n);
         }
     }
 }

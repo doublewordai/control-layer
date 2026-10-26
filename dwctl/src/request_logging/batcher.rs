@@ -1191,6 +1191,7 @@ where
         let mut models: Vec<String> = Vec::new();
         let mut served_bys: Vec<String> = Vec::new();
         let mut served_models: Vec<String> = Vec::new();
+        let mut serving_classes: Vec<String> = Vec::new();
         let mut api_key_ids_credit: Vec<Option<Uuid>> = Vec::new();
         // Service tier, computed in memory from the fusillade metadata, so the
         // transactions list can label each row (realtime / flex / async / batch)
@@ -1264,6 +1265,13 @@ where
             models.push(model);
             served_bys.push(crate::metrics::served_by_host(record.raw.served_by.as_deref()));
             served_models.push(record.raw.served_model.clone().unwrap_or_default());
+            serving_classes.push(
+                record
+                    .raw
+                    .resolved_serving_class
+                    .clone()
+                    .unwrap_or_else(|| crate::inference::serving_name::STANDARD_CLASS.to_owned()),
+            );
             api_key_ids_credit.push(record.api_key_id);
             service_tiers
                 .push(compute_billing_tier(record.raw.fusillade_batch_id, record.raw.batch_completion_window.as_deref()).to_string());
@@ -1278,7 +1286,7 @@ where
         let expected_count = user_ids.len() as u64;
 
         // Build a map from source_id to (index, user_id, amount, model, served_by, served_model) for metric recording
-        type CreditMetricRecord = (usize, Uuid, Decimal, String, String, String);
+        type CreditMetricRecord = (usize, Uuid, Decimal, String, String, String, String);
         let source_id_to_record: HashMap<String, CreditMetricRecord> = source_ids
             .iter()
             .enumerate()
@@ -1292,6 +1300,7 @@ where
                         models[i].clone(),
                         served_bys[i].clone(),
                         served_models[i].clone(),
+                        serving_classes[i].clone(),
                     ),
                 )
             })
@@ -1761,7 +1770,7 @@ where
 
         // Record metrics only for successfully inserted credit transactions
         for row in &inserted_rows {
-            if let Some((_, user_id, amount, model, served_by, served_model)) = source_id_to_record.get(&row.source_id) {
+            if let Some((_, user_id, amount, model, served_by, served_model, serving_class)) = source_id_to_record.get(&row.source_id) {
                 // Nanocredits (1 credit = 1e9). Tariffs price tokens at
                 // DECIMAL(12,8), so a single token can cost 1e-8 credits; nano
                 // is the coarsest power of ten that represents every
@@ -1774,6 +1783,7 @@ where
                     "dwctl_credits_deducted_nanocredits_total",
                     "user_id" => user_id.to_string(),
                     "model" => model.clone(),
+                    "serving_class" => serving_class.clone(),
                     "served_by" => served_by.clone(),
                     "served_model" => served_model.clone()
                 )
@@ -1821,6 +1831,7 @@ where
             batch_sla: record.raw.batch_completion_window.clone().unwrap_or_default(),
             batch_request_source: record.raw.batch_request_source.clone(),
             served_by: record.raw.served_by.clone(),
+            resolved_serving_class: record.raw.resolved_serving_class.clone(),
         }
     }
 }
@@ -2710,6 +2721,7 @@ mod integration_tests {
             .find(|l| l.starts_with("dwctl_credits_deducted_nanocredits_total{"))
             .expect("the deduction is counted");
         assert!(line.contains(r#"model="composite-alias""#), "{line}");
+        assert!(line.contains(r#"serving_class="standard""#), "{line}");
         assert!(line.contains(r#"served_by="inference.internal""#), "{line}");
         assert!(line.contains(r#"served_model="component-model""#), "{line}");
         // (1000 * 0.00001) + (500 * 0.00003) = 0.025 credits.

@@ -11,6 +11,7 @@ use prometheus::{HistogramOpts, HistogramVec, Registry};
 use tracing::instrument;
 
 use crate::{
+    inference::serving_name::STANDARD_CLASS,
     metrics::MetricsRecorder,
     request_logging::{batcher::compute_billing_tier, serializers::HttpAnalyticsRow},
 };
@@ -48,6 +49,7 @@ impl GenAiMetrics {
                 "gen_ai_operation_name",
                 "gen_ai_provider_name",
                 "gen_ai_request_model",
+                "serving_class",
                 "gen_ai_response_model",
                 "server_address",
                 "server_port",
@@ -78,6 +80,7 @@ impl GenAiMetrics {
                 "gen_ai_operation_name",
                 "gen_ai_provider_name",
                 "gen_ai_request_model",
+                "serving_class",
                 "gen_ai_response_model",
                 "server_address",
                 "server_port",
@@ -103,6 +106,7 @@ impl GenAiMetrics {
                 "gen_ai_operation_name",
                 "gen_ai_provider_name",
                 "gen_ai_request_model",
+                "serving_class",
                 "gen_ai_response_model",
                 "server_address",
                 "server_port",
@@ -125,6 +129,7 @@ impl GenAiMetrics {
                 "gen_ai_operation_name",
                 "gen_ai_provider_name",
                 "gen_ai_request_model",
+                "serving_class",
                 "gen_ai_response_model",
                 "gen_ai_token_type",
                 "server_address",
@@ -201,6 +206,8 @@ impl MetricsRecorder for GenAiMetrics {
         let provider_name = row.provider_name.as_deref().unwrap_or("");
         let served_by = served_by_host(row.served_by.as_deref());
         let request_model = row.request_model.as_deref().unwrap_or("");
+        // The model and its class are separate labels: aggregate by model, or split by class.
+        let serving_class = row.resolved_serving_class.as_deref().unwrap_or(STANDARD_CLASS);
         let response_model = row.response_model.as_deref().unwrap_or("");
         let request_origin = &row.request_origin;
         let batch_sla = &row.batch_sla;
@@ -213,6 +220,7 @@ impl MetricsRecorder for GenAiMetrics {
             operation,
             provider_name,
             request_model,
+            serving_class,
             response_model,
             server_address,
             server_port,
@@ -230,6 +238,7 @@ impl MetricsRecorder for GenAiMetrics {
                 operation,
                 provider_name,
                 request_model,
+                serving_class,
                 response_model,
                 server_address,
                 server_port,
@@ -251,6 +260,7 @@ impl MetricsRecorder for GenAiMetrics {
                 operation,
                 provider_name,
                 request_model,
+                serving_class,
                 response_model,
                 server_address,
                 server_port,
@@ -268,6 +278,7 @@ impl MetricsRecorder for GenAiMetrics {
                 operation,
                 provider_name,
                 request_model,
+                serving_class,
                 response_model,
                 "input",
                 server_address,
@@ -286,6 +297,7 @@ impl MetricsRecorder for GenAiMetrics {
                 operation,
                 provider_name,
                 request_model,
+                serving_class,
                 response_model,
                 "output",
                 server_address,
@@ -351,6 +363,7 @@ mod tests {
         // Create test fixture for a streaming chat completion
         let row = HttpAnalyticsRow {
             served_by: None,
+            resolved_serving_class: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 123,
             timestamp: chrono::Utc::now(),
@@ -482,6 +495,7 @@ mod tests {
             let model = format!("tier-case-{expected_tier}");
             let row = HttpAnalyticsRow {
                 served_by: None,
+                resolved_serving_class: None,
                 instance_id: Uuid::new_v4(),
                 correlation_id: i as i64,
                 timestamp: chrono::Utc::now(),
@@ -544,6 +558,7 @@ mod tests {
 
         let row = HttpAnalyticsRow {
             served_by: None,
+            resolved_serving_class: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 456,
             timestamp: chrono::Utc::now(),
@@ -609,6 +624,7 @@ mod tests {
 
         let row = HttpAnalyticsRow {
             served_by: None,
+            resolved_serving_class: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 789,
             timestamp: chrono::Utc::now(),
@@ -685,6 +701,7 @@ mod tests {
 
         let row = HttpAnalyticsRow {
             served_by: None,
+            resolved_serving_class: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 999,
             timestamp: chrono::Utc::now(),
@@ -747,6 +764,7 @@ mod tests {
 
         let row = HttpAnalyticsRow {
             served_by: None,
+            resolved_serving_class: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 111,
             timestamp: chrono::Utc::now(),
@@ -812,6 +830,7 @@ mod tests {
 
         let row = HttpAnalyticsRow {
             served_by: None,
+            resolved_serving_class: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 222,
             timestamp: chrono::Utc::now(),
@@ -874,6 +893,7 @@ mod tests {
 
         let row = HttpAnalyticsRow {
             served_by: None,
+            resolved_serving_class: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 333,
             timestamp: chrono::Utc::now(),
@@ -931,6 +951,7 @@ mod tests {
         for status_code in [400, 401, 500, 503] {
             let row = HttpAnalyticsRow {
                 served_by: None,
+                resolved_serving_class: None,
                 instance_id: Uuid::new_v4(),
                 correlation_id: 444,
                 timestamp: chrono::Utc::now(),
@@ -986,6 +1007,7 @@ mod tests {
 
         let row = HttpAnalyticsRow {
             served_by: None,
+            resolved_serving_class: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 555,
             timestamp: chrono::Utc::now(),
