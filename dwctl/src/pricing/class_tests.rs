@@ -157,13 +157,12 @@ fn cache_class_deals_require_a_general_enablement_row_and_respect_history() {
             .read,
         Decimal::ZERO
     );
-    // The account's class-less deal covers standard only; another class
-    // without its own deal falls to the general row.
+    // The account's model-level multipliers cover every class without its own.
     assert_eq!(
         resolve_cache_multipliers(&rows, now, Some(account), Some("throughput"))
             .unwrap()
             .read,
-        Decimal::ONE
+        Decimal::new(5, 1)
     );
     assert_eq!(
         resolve_cache_multipliers(&rows, now, Some(account), Some("standard")).unwrap().read,
@@ -883,13 +882,13 @@ fn public_class_cache_multipliers_inherit_enablement_and_follow_account_deals() 
         resolve_cache_multipliers(&rows, now, None, Some("fast")).unwrap().read,
         Decimal::from(2)
     );
-    // A class-less account deal does not reach the fast class...
+    // The account's model-level multipliers beat the public fast ones...
     rows.push(row(Some(account), None, 1));
     assert_eq!(
         resolve_cache_multipliers(&rows, now, Some(account), Some("fast")).unwrap().read,
-        Decimal::from(2)
+        Decimal::from(1)
     );
-    // ...it covers standard.
+    // ...and cover standard; an account class deal beats them both.
     assert_eq!(
         resolve_cache_multipliers(&rows, now, Some(account), Some("standard")).unwrap().read,
         Decimal::ONE

@@ -230,15 +230,15 @@ pub(crate) fn resolve_cache_multipliers(
             .max_by_key(|r| r.valid_from)
     };
     let general = valid(None, None)?;
-    // An account's class-less deal covers the standard class only: any other
-    // class is priced by the account's deal for that class, else the model's.
-    let standard = serving_class.is_none_or(|class| class == "standard");
+    // Cache multipliers apply to every tier: an account's model-level
+    // multipliers cover batch, flex and every class without its own, unlike
+    // its class-less prices, which cover the standard class only.
     Some(
         account
             .and_then(|a| {
                 serving_class
                     .and_then(|class| valid(Some(a), Some(class)))
-                    .or_else(|| standard.then(|| valid(Some(a), None)).flatten())
+                    .or_else(|| valid(Some(a), None))
             })
             .or_else(|| serving_class.and_then(|class| valid(None, Some(class))))
             .unwrap_or(general),

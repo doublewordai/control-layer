@@ -90,6 +90,10 @@ pub struct AccountModelPolicy {
     /// window. Realtime prices are set per class.
     #[serde(default)]
     pub tariffs: Vec<Tariff>,
+    /// Prompt-cache multipliers the account pays on this model: on batch and
+    /// flex, and on every class that does not set its own.
+    #[serde(default)]
+    pub cache_tariff: Option<CachePrices>,
     /// Per-class policy, keyed by class. An omitted class keeps the model's
     /// defaults for that class.
     #[serde(default)]
@@ -126,7 +130,11 @@ pub struct AccountClassPolicy {
 
 impl AccountModelPolicy {
     fn is_empty(&self) -> bool {
-        self.priority.is_none() && self.toleration_preset.is_none() && self.tariffs.is_empty() && self.classes.is_empty()
+        self.priority.is_none()
+            && self.toleration_preset.is_none()
+            && self.tariffs.is_empty()
+            && self.cache_tariff.is_none()
+            && self.classes.is_empty()
     }
 }
 
@@ -315,6 +323,9 @@ impl AccountLimitsCatalog {
                     model.tariffs.iter().all(|t| t.purpose == TariffPurpose::Batch),
                     "{context}: realtime and playground prices belong under `classes.<class>.tariffs`"
                 );
+                if let Some(cache) = &model.cache_tariff {
+                    validate_cache_tariff(&cache.as_tariff(), &context)?;
+                }
                 for (class, policy) in &model.classes {
                     let context = format!("{context}, class {class:?}");
                     ensure!(is_class_key(class), "{context}: invalid class key");
@@ -723,7 +734,13 @@ async fn apply_prices(
                 .await
                 .with_context(|| context(alias))?;
             provisioning
-                .reconcile_cache_tariff(model_id, Some(account), None, None, effective_at)
+                .reconcile_cache_tariff(
+                    model_id,
+                    Some(account),
+                    None,
+                    model.cache_tariff.as_ref().map(CachePrices::as_tariff).as_ref(),
+                    effective_at,
+                )
                 .await
                 .with_context(|| context(alias))?;
             // Standard is always reconciled (an omitted standard retires its
@@ -824,6 +841,7 @@ async fn resolve_models(db: &mut PgConnection, catalog: &AccountLimitsCatalog) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal::Decimal;
     use tempfile::tempdir;
 
     fn write(directory: &Path, name: &str, contents: &str) {
@@ -1136,7 +1154,7 @@ mod tests {
             directory.path(),
             "acme.yaml",
             &format!(
-                "account: acme\npriority: 100\nmodels:\n  org/model:\n    priority: 300\n    tariffs: [{BATCH}]\n    classes:\n      standard:\n        realtime_inflight: 900\n        tariffs: [{REALTIME}]\n        cache_tariff: {{read_multiplier: '0.2', write_multiplier_5m: '1', write_multiplier_1h: '1', write_multiplier_24h: '1'}}\n        ttft_ms: 1000\n        itl_ms: 30\n"
+                "account: acme\npriority: 100\nmodels:\n  org/model:\n    priority: 300\n    tariffs: [{BATCH}]\n    cache_tariff: {{read_multiplier: '0.3', write_multiplier_5m: '1', write_multiplier_1h: '1', write_multiplier_24h: '1'}}\n    classes:\n      standard:\n        realtime_inflight: 900\n        tariffs: [{REALTIME}]\n        cache_tariff: {{read_multiplier: '0.2', write_multiplier_5m: '1', write_multiplier_1h: '1', write_multiplier_24h: '1'}}\n        ttft_ms: 1000\n        itl_ms: 30\n"
             ),
         );
         write(
@@ -1175,14 +1193,18 @@ mod tests {
                 ),
             ]
         );
-        let cache: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM model_cache_tariffs WHERE user_id = $1 AND serving_class = 'standard' AND valid_until IS NULL",
+        // One model-level row (batch, flex and classes without their own) and one for standard.
+        let cache: Vec<(Option<String>, Decimal)> = sqlx::query_as(
+            "SELECT serving_class, read_multiplier FROM model_cache_tariffs WHERE user_id = $1 AND valid_until IS NULL ORDER BY serving_class NULLS FIRST",
         )
         .bind(org)
-        .fetch_one(&pool)
+        .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(cache, 1);
+        assert_eq!(
+            cache,
+            vec![(None, Decimal::new(3, 1)), (Some("standard".to_owned()), Decimal::new(2, 1))]
+        );
         assert_eq!(
             active_prices(&pool, person).await,
             vec![(
