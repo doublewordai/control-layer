@@ -17,7 +17,7 @@ pub use fusillade_core::manager::{
 pub use fusillade_core::request::AnyRequest;
 pub use postgres::{
     BatchInsertStrategy, DynPools, FileExpiry, PoolHandle, PoolProvider, PostgresRequestManager,
-    TestDbPools,
+    RetryAgeLimits, TestDbPools,
 };
 pub use transform::ResponseTransformer;
 

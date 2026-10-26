@@ -4486,7 +4486,8 @@ impl Application {
         })
         .with_batch_insert_strategy(fusillade_arsenal::BatchInsertStrategy::Batched {
             batch_size: config.batches.files.batch_insert_size,
-        });
+        })
+        .with_retry_age_limits(retention_maintenance_config.retry_age_limits());
         if pools.fusillade.is_split()
             && let config::ComponentDb::Schema {
                 name,

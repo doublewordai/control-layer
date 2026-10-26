@@ -188,6 +188,28 @@ impl Default for FileExpiry {
     }
 }
 
+/// Retention periods, in days, after which a batch can no longer be retried.
+///
+/// A retry makes a batch unfinished again, and an unfinished batch holds its
+/// archive week (results) and its input's template week open past their
+/// retention periods. To keep that hold short and predictable, a batch is not
+/// retried once it is within one day of either period:
+///
+/// - `batch_archive_days`: refused once `now > batch.created_at +
+///   batch_archive_days - 1 day`;
+/// - `template_days`: refused once `now > input_file.created_at +
+///   template_days - 1 day`, since a retry re-reads the input templates.
+///
+/// A week drops no earlier than `week_start + 7 days + retention days`, and
+/// every batch or file in it was created at or after `week_start`, so the
+/// one-day margin puts the cut-off before the drop, never after. `None`
+/// means that family's content is not retired and imposes no limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetryAgeLimits {
+    pub batch_archive_days: Option<u32>,
+    pub template_days: Option<u32>,
+}
+
 /// Server-side budget for one daemon maintenance call, derived from the
 /// daemon's client-side query timeout.
 ///
@@ -242,6 +264,7 @@ pub struct PostgresRequestManager<P: PoolProvider> {
     download_buffer_size: usize,
     batch_insert_strategy: BatchInsertStrategy,
     file_expiry: FileExpiry,
+    retry_age_limits: RetryAgeLimits,
     /// TRANSITIONAL ZDR hook - see [`crate::transform`]. Transforms response/
     /// error bodies before persistence; `None` is identity. Remove when stream
     /// reassembly moves into dwctl.
@@ -479,6 +502,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             download_buffer_size: 100,
             batch_insert_strategy: BatchInsertStrategy::default(),
             file_expiry: FileExpiry::default(),
+            retry_age_limits: RetryAgeLimits::default(),
             response_transformer: std::sync::OnceLock::new(),
             maintenance_budget: maintenance_budget(DEFAULT_MAINTENANCE_QUERY_TIMEOUT),
         }
@@ -836,25 +860,31 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         // sources before creating the batch or its virtual files. An FK alone
         // only proves the soft-deleted file row still exists, and a file past
         // its template week's retirement has no content left to run.
-        let source_available = sqlx::query_scalar::<_, bool>(
-            r#"SELECT EXISTS(
-                SELECT 1 FROM files
-                WHERE id = $1
-                  AND deleted_at IS NULL
-                  AND status = 'processed'
-                  AND (expires_at IS NULL OR expires_at > NOW())
-                  AND EXISTS (
-                      SELECT 1 FROM request_template_buckets bucket
-                      WHERE bucket.state = 'active'
-                        AND bucket.week_start = date_trunc('week', files.created_at AT TIME ZONE 'UTC')::date
-                  )
-                FOR UPDATE
-            )"#,
+        //
+        // The template week's registry row is share-locked until commit.
+        // Retirement locks it FOR UPDATE before fencing the week and then
+        // re-checks for unfinished batches, so either it waits for this
+        // batch to commit and sees it, or it fenced first and this lock
+        // re-reads the row as no longer active.
+        let source_available = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            SELECT f.id FROM files f
+            JOIN request_template_buckets bucket
+              ON bucket.week_start = date_trunc('week', f.created_at AT TIME ZONE 'UTC')::date
+            WHERE f.id = $1
+              AND f.deleted_at IS NULL
+              AND f.status = 'processed'
+              AND (f.expires_at IS NULL OR f.expires_at > NOW())
+              AND bucket.state = 'active'
+            FOR UPDATE OF f
+            FOR SHARE OF bucket
+            "#,
         )
         .bind(*input.file_id)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to lock source file: {e}")))?;
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to lock source file: {e}")))?
+        .is_some();
         if !source_available {
             return Err(FusilladeError::ValidationError(
                 "source file is deleted, expired, or its content has been retired".to_string(),
@@ -1165,6 +1195,63 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         );
         self.file_expiry = file_expiry;
         self
+    }
+
+    /// Refuse retries of batches near the end of their content retention;
+    /// see [`RetryAgeLimits`].
+    pub fn with_retry_age_limits(mut self, limits: RetryAgeLimits) -> Self {
+        self.retry_age_limits = limits;
+        self
+    }
+
+    /// Refuse a retry once the batch is within a day of the end of its
+    /// content retention; see [`RetryAgeLimits`]. A missing batch passes, so
+    /// callers keep their own not-found handling.
+    async fn check_retry_age<'e, E>(&self, executor: E, batch_id: Uuid) -> Result<()>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
+        let RetryAgeLimits {
+            batch_archive_days,
+            template_days,
+        } = self.retry_age_limits;
+        if batch_archive_days.is_none() && template_days.is_none() {
+            return Ok(());
+        }
+        let days = |days: Option<u32>| days.and_then(|days| i32::try_from(days).ok());
+        // created_at never changes, so this needs no lock. A NULL period
+        // makes its comparison NULL, which COALESCE turns into "not past".
+        let past: Option<(bool, bool)> = sqlx::query_as(
+            r#"
+            SELECT
+                COALESCE(NOW() > b.created_at
+                    + make_interval(days => $2::int) - INTERVAL '1 day', FALSE),
+                COALESCE(NOW() > f.created_at
+                    + make_interval(days => $3::int) - INTERVAL '1 day', FALSE)
+            FROM batches b
+            LEFT JOIN files f ON f.id = b.file_id
+            WHERE b.id = $1
+            "#,
+        )
+        .bind(batch_id)
+        .bind(days(batch_archive_days))
+        .bind(days(template_days))
+        .fetch_optional(executor)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to check batch retry age: {e}")))?;
+        match past {
+            Some((true, _)) => Err(FusilladeError::ValidationError(format!(
+                "batch is too old to retry: retries are accepted until one day before \
+                 its results reach the end of their {}-day retention period",
+                batch_archive_days.unwrap_or_default()
+            ))),
+            Some((_, true)) => Err(FusilladeError::ValidationError(format!(
+                "batch is too old to retry: retries are accepted until one day before \
+                 its input file reaches the end of its {}-day retention period",
+                template_days.unwrap_or_default()
+            ))),
+            _ => Ok(()),
+        }
     }
 
     /// Output and error files created before they carried an expiry read as
@@ -5700,6 +5787,9 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
     ) -> Result<Vec<Result<()>>> {
         tracing::debug!(%batch_id, count = requested_ids.len(), "Retrying failed requests");
 
+        self.check_retry_age(self.write_executor(), *batch_id)
+            .await?;
+
         // One batch-driven lookup, matching retry_failed_requests_for_batch:
         // resolve the batch first, then read only its own rows (live, plus
         // archived rows in its bucket) filtered by the requested ids. Ids from
@@ -5768,6 +5858,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             .map(|(id, _)| (*id, Some(*batch_id)))
             .collect();
 
+        let mut source_unavailable = false;
         let repended: std::collections::HashSet<Uuid> = if retryable.is_empty() {
             Default::default()
         } else {
@@ -5814,20 +5905,21 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             let available_file_ids: Vec<Uuid> = if source_file_ids.is_empty() {
                 Vec::new()
             } else {
+                // Share-lock each source's template week, as batch creation
+                // does, so retirement cannot fence it under this retry.
                 sqlx::query_scalar(
                     r#"
-                    SELECT id FROM files
-                    WHERE id = ANY($1)
-                      AND deleted_at IS NULL
-                      AND status = 'processed'
-                      AND (expires_at IS NULL OR expires_at > NOW())
-                      AND EXISTS (
-                          SELECT 1 FROM request_template_buckets bucket
-                          WHERE bucket.state = 'active'
-                            AND bucket.week_start = date_trunc('week', files.created_at AT TIME ZONE 'UTC')::date
-                      )
-                    ORDER BY id
-                    FOR UPDATE
+                    SELECT f.id FROM files f
+                    JOIN request_template_buckets bucket
+                      ON bucket.week_start = date_trunc('week', f.created_at AT TIME ZONE 'UTC')::date
+                    WHERE f.id = ANY($1)
+                      AND f.deleted_at IS NULL
+                      AND f.status = 'processed'
+                      AND (f.expires_at IS NULL OR f.expires_at > NOW())
+                      AND bucket.state = 'active'
+                    ORDER BY f.id
+                    FOR UPDATE OF f
+                    FOR SHARE OF bucket
                     "#,
                 )
                 .bind(&source_file_ids)
@@ -5835,6 +5927,9 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 .await
                 .map_err(|_| FusilladeError::Other(anyhow!("Failed to lock retry source files")))?
             };
+            // Every requested row belongs to this one batch; its rows fall
+            // out below and each reports the unavailable source.
+            source_unavailable = available_file_ids.len() < source_file_ids.len();
             let safe_batch_ids: std::collections::HashSet<Uuid> = if available_file_ids.is_empty() {
                 Default::default()
             } else {
@@ -5999,6 +6094,11 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 Some((state, true)) if state == "failed" => {
                     if repended.contains(&**id) {
                         Ok(())
+                    } else if source_unavailable {
+                        Err(FusilladeError::ValidationError(
+                            "batch source file is deleted, expired, or its content has been retired"
+                                .to_string(),
+                        ))
                     } else {
                         Err(FusilladeError::InvalidState(
                             *id,
@@ -6049,27 +6149,32 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             ));
         };
 
-        let source_available = sqlx::query_scalar::<_, bool>(
-            r#"SELECT EXISTS(
-                SELECT 1 FROM files
-                WHERE id = $1
-                  AND deleted_at IS NULL
-                  AND status = 'processed'
-                  AND (expires_at IS NULL OR expires_at > NOW())
-                  AND EXISTS (
-                      SELECT 1 FROM request_template_buckets bucket
-                      WHERE bucket.state = 'active'
-                        AND bucket.week_start = date_trunc('week', files.created_at AT TIME ZONE 'UTC')::date
-                  )
-                FOR UPDATE
-            )"#,
+        self.check_retry_age(&mut *tx, *batch_id).await?;
+
+        // Share-lock the input's template week until commit, as batch
+        // creation does: retirement either waits and then sees this batch
+        // unfinished, or fenced first and the week reads as not active.
+        let source_available = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            SELECT f.id FROM files f
+            JOIN request_template_buckets bucket
+              ON bucket.week_start = date_trunc('week', f.created_at AT TIME ZONE 'UTC')::date
+            WHERE f.id = $1
+              AND f.deleted_at IS NULL
+              AND f.status = 'processed'
+              AND (f.expires_at IS NULL OR f.expires_at > NOW())
+              AND bucket.state = 'active'
+            FOR UPDATE OF f
+            FOR SHARE OF bucket
+            "#,
         )
         .bind(source_file_id)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| {
             FusilladeError::Other(anyhow!("Failed to lock batch source for retry: {}", e))
-        })?;
+        })?
+        .is_some();
         if !source_available {
             return Err(FusilladeError::ValidationError(
                 "batch source file is deleted, expired, or its content has been retired"
@@ -6119,6 +6224,28 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                     routing.0
                 )));
             };
+            // The failed/canceled rows and the completions the batch keeps
+            // live in this archive week. Share-lock its registry row until
+            // commit, as archive_batch does: once retirement has fenced the
+            // week, the move-back below would read a missing partition, find
+            // nothing, and reset the batch over completions that are gone.
+            // A fence that comes later waits for this commit, then sees the
+            // batch unfinished.
+            let bucket_state: Option<String> = sqlx::query_scalar(
+                "SELECT state FROM batch_archive_buckets WHERE week_start = $1 FOR SHARE",
+            )
+            .bind(bucket)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to lock archive bucket for retry: {}", e))
+            })?;
+            if bucket_state.as_deref() != Some("active") {
+                return Err(FusilladeError::ValidationError(
+                    "batch results have been retired; the batch can no longer be retried"
+                        .to_string(),
+                ));
+            }
             let moved = sqlx::query!(
                 r#"
                 INSERT INTO requests (id, batch_id, template_id, state, retry_attempt, not_before,

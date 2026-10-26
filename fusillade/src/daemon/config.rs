@@ -237,7 +237,7 @@ impl RetentionMaintenanceConfig {
         self
     }
 
-    /// Set the finalization-anchored batch content retention period. There is
+    /// Set the creation-anchored batch content retention period. There is
     /// deliberately no default; enabling batch-archive retirement without an
     /// explicit period fails validation.
     pub fn with_batch_archive_retention_days(mut self, days: Option<u32>) -> Self {
@@ -290,13 +290,13 @@ impl RetentionMaintenanceConfig {
         self.batch_archive_retirement_enabled
     }
 
-    /// The finalization-anchored batch content retention period, when set.
+    /// The creation-anchored batch content retention period, when set.
     pub fn batch_archive_retention_days(&self) -> Option<u32> {
         self.batch_archive_retention_days
     }
 
-    /// Enable or disable file-content expiry and selection of newly eligible
-    /// weekly template buckets. Durable unfinished retirements remain
+    /// Enable or disable selection of newly eligible weekly template
+    /// buckets. Durable unfinished retirements remain
     /// recoverable while this is false.
     pub fn with_template_retirement_enabled(mut self, enabled: bool) -> Self {
         self.template_retirement_enabled = enabled;
@@ -311,7 +311,7 @@ impl RetentionMaintenanceConfig {
         self
     }
 
-    /// Whether file-content expiry and template bucket selection are enabled.
+    /// Whether template bucket selection is enabled.
     pub fn template_retirement_enabled(&self) -> bool {
         self.template_retirement_enabled
     }
@@ -319,6 +319,22 @@ impl RetentionMaintenanceConfig {
     /// The creation-anchored input-content retention period, when set.
     pub fn template_retention_days(&self) -> Option<u32> {
         self.template_retention_days
+    }
+
+    /// Retry age limits for the store: a family's period applies only when
+    /// that family's retirement is enabled, since otherwise its content is
+    /// never dropped. See [`fusillade_arsenal::RetryAgeLimits`].
+    pub fn retry_age_limits(&self) -> fusillade_arsenal::RetryAgeLimits {
+        fusillade_arsenal::RetryAgeLimits {
+            batch_archive_days: self
+                .batch_archive_retirement_enabled
+                .then_some(self.batch_archive_retention_days)
+                .flatten(),
+            template_days: self
+                .template_retirement_enabled
+                .then_some(self.template_retention_days)
+                .flatten(),
+        }
     }
 }
 

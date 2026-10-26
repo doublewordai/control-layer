@@ -1829,8 +1829,13 @@ pub async fn retry_failed_batch_requests<P: PoolProvider>(
         .request_manager
         .retry_failed_requests_for_batch(fusillade::BatchId(batch_id))
         .await
-        .map_err(|e| Error::Internal {
-            operation: format!("retry failed requests: {}", e),
+        .map_err(|e| match e {
+            // Refusals the client can act on: the batch is past its retry
+            // age cut-off, or its input or results have been retired.
+            fusillade::FusilladeError::ValidationError(message) => Error::BadRequest { message },
+            e => Error::Internal {
+                operation: format!("retry failed requests: {}", e),
+            },
         })?;
 
     // retried_count == 0 is still SUCCESS when the retry overturned a
@@ -1941,8 +1946,13 @@ pub async fn retry_specific_requests<P: PoolProvider>(
         .request_manager
         .retry_failed_requests(fusillade::BatchId(batch_id), request_ids.clone())
         .await
-        .map_err(|e| Error::Internal {
-            operation: format!("retry failed requests: {}", e),
+        .map_err(|e| match e {
+            // Refusals the client can act on: the batch is past its retry
+            // age cut-off, or its input or results have been retired.
+            fusillade::FusilladeError::ValidationError(message) => Error::BadRequest { message },
+            e => Error::Internal {
+                operation: format!("retry failed requests: {}", e),
+            },
         })?;
 
     // Check for any failures
