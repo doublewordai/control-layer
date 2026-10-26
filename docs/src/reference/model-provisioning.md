@@ -143,7 +143,9 @@ names currently supported are `default` and `completions`.
 
 A model can offer more than one serving class. `model` routes to its `standard`
 class and `model:<class>` to any other class it declares, each with its own
-upstream, realtime prices and default realtime limit. Classes are declared in
+upstream, realtime prices and default realtime limit. Model aliases never contain
+`:` (the catalog and the admin API refuse one), so a suffix always names a class.
+Classes are declared in
 `clay.class_routes`; they take effect only once the model sets
 `routing_mode: class_routes`. Until then the model keeps its legacy route
 (`deployments`, `routing`, `tariffs`), and declared classes are stored but unused.
@@ -157,6 +159,7 @@ clay:
       display_name: Standard
       endpoint: gateway
       upstream_model_name: example/model
+      realtime_inflight_limit: 14
       tariffs:
         - name: Standard realtime
           purpose: realtime
@@ -166,7 +169,7 @@ clay:
       display_name: Fast
       endpoint: gateway
       upstream_model_name: example/model-fast
-      realtime_inflight_limit: 20
+      realtime_inflight_limit: 7
       tariffs:
         - name: Fast realtime
           purpose: realtime
@@ -188,10 +191,19 @@ Rules:
 - The endpoint must exist. Upstream names are endpoint-scoped strings, nonempty
   and without whitespace. Classes may share a destination.
 - `realtime_inflight_limit` caps one account's concurrent realtime requests to
-  that class. It must be positive; omitted, the class uses the model's
-  `settings.realtime_inflight_limit`. Each class counts separately.
-- Batch tariffs are allowed only under `standard`. Model-level batch tariffs
-  remain supported.
+  that class. Every class sets its own, as a positive number; each class counts
+  separately. The model's `settings.realtime_inflight_limit` serves only its
+  legacy route.
+- A class's `tariffs` are its realtime and playground prices. Batch and flex
+  prices are set on the model's `tariffs`, whatever the class: batch and flex
+  always run on the standard class.
+- A class's `cache_tariff` overrides the model's multipliers on that class's
+  realtime traffic; the model's `cache_tariff` covers batch, flex and every
+  class without its own.
+- Reasoning translation is a property of the model: every class uses the
+  standard class's endpoint default under the model's
+  `settings.reasoning_translation_overrides`. Before activating a model whose
+  member deployments carry reasoning overrides, copy them to the model.
 - `aliases` must be empty: class names are generated (`model`, `model:<class>`),
   and synonyms are not supported. The retired numeric-target `serving_classes`
   declaration is accepted only as an empty map.
@@ -210,15 +222,23 @@ model's batch capacity.
 
 - **Realtime only.** Flex, background and batch requests use the `standard`
   class. A flex or background request naming `model:<class>` is refused with
-  400 `serving_class_realtime_only`; a batch line naming it is refused at upload.
+  400 `serving_class_realtime_only`, and any other suffix with 404
+  `model_not_found`; a batch line with a suffix is refused at upload.
 - **Discovery.** `/v1/models` lists `model:<class>` beside the model for each
-  class other than `standard`, with the reasoning efforts its upstream supports.
-  Class entries carry no prices yet.
+  class other than `standard`, with the model's reasoning efforts. Class entries
+  carry no prices yet.
+- **Admission.** Each class admits keys by its own prices: a priced class closes
+  to accounts without credit or with an exhausted spend cap, while a free class
+  stays open. The standard class also counts the model's class-less prices.
+- **Metrics and traces.** Request metrics and spans carry the model and a
+  `serving_class` label (`standard` for the standard class and legacy models), so
+  a model aggregates across classes or splits by class.
 - **Analytics and billing.** A request to `model:<class>` is recorded under the
   model's name with `requested_serving_class` and `resolved_serving_class` set to
   the class, and is priced as that class ([how billing works][billing]).
 - **Prompt caching.** A class route inherits its model's cache enablement and
-  minimum prefix. `standard` keeps the model's cache scope; other classes use
+  minimum prefix and is tokenized as its model. `standard` keeps the model's
+  cache scope; other classes use
   their own, because they reach different engines.
 - **Account settings.** Account files can set priority, scheduling hints,
   toleration presets, realtime limits and prices for any class the model declares.
@@ -424,17 +444,17 @@ models:
   example/chat-model:
     priority: 300                 # optional; overrides the account default
     toleration_preset: no-overflow  # optional; overrides the account's preset
-    tariffs:                      # batch prices only, at model level
+    tariffs:                      # batch and flex prices only, at model level
       - {name: batch-24h, purpose: batch, completion_window: 24h,
          input_per_million_tokens: "0.50", output_per_million_tokens: "1.50"}
+    cache_tariff: {read_multiplier: "0.2", write_multiplier_5m: "1",   # every tier,
+                   write_multiplier_1h: "1", write_multiplier_24h: "1"} # unless a class sets its own
     classes:
       standard:
         realtime_inflight: 200
         tariffs:                  # realtime and playground prices, per class
           - {name: realtime, purpose: realtime,
              input_per_million_tokens: "0.70", output_per_million_tokens: "1.40"}
-        cache_tariff: {read_multiplier: "0.2", write_multiplier_5m: "1",
-                       write_multiplier_1h: "1", write_multiplier_24h: "1"}
         ttft_ms: 1000             # optional latency targets
         itl_ms: 30
         priority: 500             # optional; overrides the model's priority
@@ -461,8 +481,13 @@ Rules:
   ones override them for that class. Prices do not carry across classes: a class
   without its own `tariffs` in the file is billed at the model's price for that
   class.
-- Limits, realtime and playground prices, and the cache tariff are declared per
-  class; model-level `tariffs` take batch prices only.
+- Limits and realtime and playground prices are declared per class; model-level
+  `tariffs` take batch and flex prices only. A class the file does not name keeps
+  the model's default for that class (a limit of 1,000 on `standard` leaves `fast`
+  at its own default).
+- `cache_tariff` at model level covers batch, flex and every class without its
+  own; a class's `cache_tariff` overrides it on that class. Multipliers resolve
+  account class, account model, then the model's class and model defaults.
 - Priority inherits class, then model, then account, then the default. It is
   sent as the scheduling priority on the account's realtime requests to
   `dynamo` serving members; batch and flex keep their deadline priority.

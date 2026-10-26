@@ -142,8 +142,9 @@ rolls back atomically. Historical org token/cache prices prevent hard account
 deletion; normal soft deletion retains them. Released migrations are immutable.
 
 Cache multipliers are selected independently by account + resolved class →
-account all-class (the `standard` class, or a model without classes) → public
-class → general model, at the same timestamp. They have no
+account all-class → public class → general model, at the same timestamp. Unlike
+prices, an account's all-class multipliers cover every class (and batch and flex),
+because a multiplier applies to whatever token price the request pays. They have no
 purpose/window dimension. A general cache tariff is required for Control Layer
 cache pricing to apply; an organisation override alone cannot enable it.
 Applicable cache-read/write multipliers adjust the selected input token rate.
