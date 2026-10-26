@@ -381,7 +381,7 @@ async fn a_cut_stream_is_resumed_into_one_seamless_response(pool: PgPool) {
 /// original request from the customer's key and reports the prices on its
 /// response; the leg must be sent at those.
 #[dwctl_test_macros::test]
-async fn a_resume_leg_carries_the_original_requests_prices(pool: PgPool) {
+async fn a_resume_leg_carries_the_original_requests_output_price_and_no_prompt_price(pool: PgPool) {
     use crate::db::models::api_keys::ApiKeyPurpose;
     use crate::inference::outbound_request::{OutboundConfig, StreamTimeouts, outbound_request_middleware};
     use crate::pricing::{PriceBook, TariffInfo};
@@ -449,11 +449,11 @@ async fn a_resume_leg_carries_the_original_requests_prices(pool: PgPool) {
     assert_eq!(
         legs[0].prices,
         Some(BillingPrices {
-            prompt: 3e-6,
-            cached: 3e-6,
+            prompt: 0.0,
+            cached: 0.0,
             output: 9e-6,
         }),
-        "the leg is sent at the customer's prices, not the continuation key's"
+        "the leg's output is billed at the customer's price, not the continuation key's; its re-prefilled prompt isn't billed"
     );
 }
 

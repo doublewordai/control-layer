@@ -13,8 +13,11 @@
 //! Because the leg enters BELOW outlet and the cache layer, it produces no second
 //! analytics row, no second billing record and no second cache classify — the
 //! customer's request stays exactly one logical request. The leg carries the
-//! original request's prices as its [`onwards::serving::BillingPrices`]
-//! extension, so a `dynamo` member is told what the customer pays for its tokens.
+//! original request's output price as its [`onwards::serving::BillingPrices`]
+//! extension, with its prompt and cached prices at zero, so a `dynamo` member is
+//! told what the customer pays for its tokens: the leg's prompt is the original
+//! prompt and everything generated so far, re-prefilled, which the customer
+//! doesn't pay for.
 
 use std::pin::Pin;
 use std::time::Duration;
@@ -140,6 +143,17 @@ pub fn build_leg_body(ctx: &RequestContext, token_ids: &[u32], max_tokens: Optio
     body
 }
 
+/// What a leg's tokens are billed at: only its output, at the original request's
+/// output price. Its prompt (the original prompt and what was generated so far,
+/// re-prefilled) costs the customer nothing.
+fn leg_prices(original: BillingPrices) -> BillingPrices {
+    BillingPrices {
+        prompt: 0.0,
+        cached: 0.0,
+        output: original.output,
+    }
+}
+
 fn build_leg_request(path: &str, key_secret: &str, body: &Value, prices: Option<BillingPrices>) -> Request<Body> {
     let bytes = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
     let mut request = Request::builder()
@@ -206,7 +220,7 @@ pub async fn attempt(state: &ContinuationState, ctx: &RequestContext, continuati
     // [`super::RouteInfo::strip_leading_bos`]: BOS-prepending is a per-MEMBER
     // property, and this body is built once, before onwards picks a member.
     let body = build_leg_body(ctx, &render.token_ids, max_tokens, state.cfg.priority);
-    let request = build_leg_request(&ctx.path, &state.key_secret, &body, ctx.prices);
+    let request = build_leg_request(&ctx.path, &state.key_secret, &body, ctx.prices.map(leg_prices));
 
     // Dispatch accounting happens BEFORE the await: a leg that times out,
     // 4xxs, or comes back non-streaming still re-prefilled the prompt
