@@ -26,7 +26,8 @@
 //!
 //! An embedding application may also attach the per-token prices a request
 //! is charged at as a [`BillingPrices`] request extension. They are written
-//! as `nvext.billing`, on members of kind `dynamo` only, alongside the hints.
+//! as `nvext.billing` on every request to a member of kind `dynamo`, including
+//! a pool member that does not accept the scheduling fields, and on no other.
 
 use std::fmt;
 use std::str::FromStr;
@@ -1115,6 +1116,86 @@ mod handler_tests {
             body(&mock.get_requests()[0])["nvext"]["billing"],
             inbound["nvext"]["billing"]
         );
+    }
+
+    /// A `dynamo` member of a named pool that does not accept the scheduling
+    /// fields still receives the prices; only the scheduling fields are
+    /// withheld from it, and a non-`dynamo` member behind it receives neither.
+    #[tokio::test]
+    async fn prices_reach_a_dynamo_member_that_refuses_scheduling_fields() {
+        use tower::ServiceExt;
+        let member = |url: &str, kind| {
+            Provider::new(
+                Target::builder()
+                    .url(url.parse().unwrap())
+                    .kind(kind)
+                    .accepts_scheduling_priority(false)
+                    .build(),
+                1,
+            )
+        };
+        let pool = |providers| {
+            ProviderPool::with_config(
+                providers,
+                None,
+                None,
+                None,
+                Some(FallbackConfig {
+                    enabled: true,
+                    on_status: vec![500],
+                    ..Default::default()
+                }),
+                LoadBalanceStrategy::Priority,
+                false,
+                Vec::new(),
+            )
+        };
+        let completions = pool(vec![
+            member(DYNAMO.0, ProviderKind::Dynamo),
+            member(EXTERNAL.0, ProviderKind::External),
+        ]);
+        let targets = targets(&setup(&[DYNAMO]));
+        targets.targets.insert(
+            ALIAS.to_string(),
+            TargetPools::with_pools(
+                pool(vec![member(DYNAMO.0, ProviderKind::Dynamo)]),
+                HashMap::from([(crate::target::COMPLETIONS_POOL.to_string(), completions)]),
+            ),
+        );
+
+        let mock = MockHttpClient::new(StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"boom"}"#);
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {KEY}"))
+            .body(Body::from(
+                json!({
+                    "model": ALIAS,
+                    "prompt": "hi",
+                    "priority": 7,
+                    "nvext": {"agent_hints": {"priority": 7}}
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        request.extensions_mut().insert(PRICES);
+        build_router(AppState::with_client(targets, mock.clone()))
+            .oneshot(request)
+            .await
+            .unwrap();
+
+        let requests = mock.get_requests();
+        assert_eq!(requests.len(), 2, "the dynamo member failed over");
+        let dynamo = body(&requests[0]);
+        assert_eq!(
+            dynamo["nvext"],
+            json!({"billing": {"prompt": 2e-6, "cached": 2e-7, "output": 8e-6}}),
+            "the prices are sent, the scheduling fields are not"
+        );
+        assert!(dynamo.get("priority").is_none());
+        let external = body(&requests[1]);
+        assert!(external.get("nvext").is_none() && external.get("priority").is_none());
     }
 
     #[test]

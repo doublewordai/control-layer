@@ -1150,7 +1150,7 @@ pub async fn target_message_handler<T: HttpClient>(
         None
     };
     // The prices the embedding application charges this request at, if it
-    // attached them. Written for `dynamo` members only, with the hints.
+    // attached them. Written for `dynamo` members only.
     let billing_prices = req.extensions().get::<serving::BillingPrices>().copied();
     let mut providers = pool
         .select_iter_routed(aimd_eligible, conversation, &model_name, resolved_pool_name.unwrap_or("default"))
@@ -1344,20 +1344,26 @@ pub async fn target_message_handler<T: HttpClient>(
         // values are scrubbed at dwctl's ingress, alongside the body priority
         // (the same perimeter the priority strip relies on).
         // A non-JSON body (a multipart upload) carries no hints and is
-        // forwarded as it came. The request's prices travel the same way, as
-        // `nvext.billing`, replacing any value already in the body; without
-        // them the body's own value (a first hop's) is forwarded.
+        // forwarded as it came. The request's prices are written as
+        // `nvext.billing` on every JSON request to a `dynamo` member, replacing
+        // any value already in the body. They are not a scheduling field, so a
+        // member that refuses those still receives them. Without attached
+        // prices the body's own value (a first hop's) is forwarded, except to a
+        // member the strip above removed `nvext` for.
+        let stamp_scheduling = !scheduling_fields_refused;
         if target.kind == ProviderKind::Dynamo
-            && !scheduling_fields_refused
+            && (stamp_scheduling || billing_prices.is_some())
             && !attempt_body.is_empty()
             && let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(&attempt_body)
             && let Some(object) = body.as_object_mut()
         {
-            serving_resolution.hints.stamp(object);
-            if !serving_resolution.hints.is_empty() {
-                tracing::Span::current().record("onwards.hints_sent", true);
+            if stamp_scheduling {
+                serving_resolution.hints.stamp(object);
+                if !serving_resolution.hints.is_empty() {
+                    tracing::Span::current().record("onwards.hints_sent", true);
+                }
+                serving::stamp_default_priority(object);
             }
-            serving::stamp_default_priority(object);
             if let Some(prices) = billing_prices {
                 prices.stamp(object);
             }
