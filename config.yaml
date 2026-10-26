@@ -498,10 +498,10 @@ batches:
     # expires_at given to an upload that sends no expires_after, and to a
     # batch's output and error files from the batch's creation. Uploads may
     # request expires_after[seconds] between min and max; a value outside
-    # that range is refused with 400. Downloads past expires_at answer 410,
-    # and a batch cannot be created from a file that would expire inside its
-    # completion window. Keep default and max no longer than content
-    # retention, so no file shows a date its content will not reach.
+    # that range is refused with 400. File content and batch results past
+    # expires_at answer 410. These are validated even when batches are
+    # disabled; min <= default <= max. Keep default and max no longer than
+    # content retention, so no file shows a date its content will not reach.
     # default_expiry_seconds: 2592000 # 30 days
     # min_expiry_seconds: 3600 # 1 hour
     # max_expiry_seconds: 2592000 # 30 days
