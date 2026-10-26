@@ -1884,7 +1884,7 @@ Use this for fine-grained control over which requests to retry, rather than retr
     request_body = RetryRequestsRequest,
     responses(
         (status = 200, description = "Specified requests queued for retry.", body = BatchResponse),
-        (status = 400, description = "No valid request IDs provided, the batch is past the retry age cut-off, or its input or results have been deleted by content retention."),
+        (status = 400, description = "No valid request IDs provided, or the batch is past the retry age cut-off. Requests whose input has been deleted by content retention are left as they are; the batch is returned with status 200."),
         (status = 404, description = "Batch not found or you don't have access to it."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
@@ -1947,8 +1947,8 @@ pub async fn retry_specific_requests<P: PoolProvider>(
         .retry_failed_requests(fusillade::BatchId(batch_id), request_ids.clone())
         .await
         .map_err(|e| match e {
-            // Refusals the client can act on: the batch is past its retry
-            // age cut-off, or its input or results have been retired.
+            // The batch is past its retry age cut-off. A request whose input
+            // has been retired is refused on its own, in `results`.
             fusillade::FusilladeError::ValidationError(message) => Error::BadRequest { message },
             e => Error::Internal {
                 operation: format!("retry failed requests: {}", e),

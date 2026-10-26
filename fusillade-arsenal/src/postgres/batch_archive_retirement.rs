@@ -5,10 +5,12 @@
 //! period measured from the week itself, so a batch's completions live a
 //! fixed time from its creation, like its input file. Batch metadata rows are
 //! never deleted. The API reports results files as expired from the
-//! `expires_at` they were given at creation; nothing is stamped on the
-//! batches at retirement, since any per-batch write at that point grows with
-//! the week (a million rows in one statement, cancelled by the statement
-//! timeout) and the week could never retire.
+//! `expires_at` they were given at creation, so finished batches are not
+//! stamped at retirement: a write to every batch in the week grows with the
+//! week (a million rows in one statement, cancelled by the statement timeout)
+//! and the week could never retire. Only the week's explicitly deleted
+//! batches are stamped, which takes them out of the erasure purge's
+//! tombstone set once their archived rows are gone; there are few of them.
 
 use crate::error::Result;
 use crate::manager::RetainedResponseRetirementOutcome;
