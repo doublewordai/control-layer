@@ -13,7 +13,7 @@ use crate::models::ListModelResponse;
 use crate::rejections::RejectionContext;
 use crate::serving::{self, ProviderKind, ServingClassOutcome, ServingResolution};
 use crate::sse::SseBufferedStream;
-use crate::target::{ConcurrencyGuard, RequestClass, RoutingAction, Target};
+use crate::target::{ConcurrencyGuard, RequestClass, RoutingAction, Target, serving_metric_labels};
 use axum::{
     Json,
     extract::Request,
@@ -249,7 +249,7 @@ struct InflightGuard {
     /// `None` for requests that error before model resolution (e.g. an oversized
     /// body or an unparseable model), which therefore only count toward the
     /// global gauge.
-    model: Option<String>,
+    model: Option<(String, String)>,
 }
 
 impl InflightGuard {
@@ -262,22 +262,22 @@ impl InflightGuard {
     /// per guard; the matching decrement happens in `Drop`. On the Dynamo gateway
     /// the requested model is the served model, so this label matches what the
     /// autoscaler scales and what `/v1/models` lists.
-    fn set_model(&mut self, model: &str) {
+    fn set_model(&mut self, model: &str, serving_class: &str) {
         debug_assert!(
             self.model.is_none(),
             "set_model must be called at most once per guard (else the per-model gauge leaks)"
         );
-        let model = model.to_string();
-        metrics::gauge!("onwards_model_inflight", "model" => model.clone()).increment(1.0);
-        self.model = Some(model);
+        let labels = (model.to_string(), serving_class.to_string());
+        metrics::gauge!("onwards_model_inflight", "model" => labels.0.clone(), "serving_class" => labels.1.clone()).increment(1.0);
+        self.model = Some(labels);
     }
 }
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
         metrics::gauge!("onwards_requests_inflight").decrement(1.0);
-        if let Some(model) = self.model.take() {
-            metrics::gauge!("onwards_model_inflight", "model" => model).decrement(1.0);
+        if let Some((model, serving_class)) = self.model.take() {
+            metrics::gauge!("onwards_model_inflight", "model" => model, "serving_class" => serving_class).decrement(1.0);
         }
     }
 }
@@ -348,6 +348,7 @@ pub struct ServedBy {
 #[derive(Clone, Debug)]
 pub(crate) struct UpstreamFailureLabels {
     pub(crate) model: String,
+    pub(crate) serving_class: String,
     pub(crate) traffic: &'static str,
     /// Host of the upstream URL, matching dwctl's `served_by` label: one value
     /// per endpoint, where the full URL could carry a path per deployment.
@@ -574,8 +575,11 @@ pub async fn target_message_handler<T: HttpClient>(
     let request_class = RequestClass::from_path(&canonical_request_path);
     // The alias's serving policy (presets, overlays) is declared on its
     // default pool and applies whichever pool serves this request's class.
-    let (mut resolved_pool_name, mut pool, mut alias_serving, alias_inflight, alias_batch_inflight) = match state.targets.targets.get(&model_name) {
+    let (mut resolved_pool_name, mut pool, mut alias_serving, alias_inflight, alias_batch_inflight, metric_model, metric_class) = match state.targets.targets.get(&model_name) {
         Some(pools) => {
+            // Metric labels: a class route (`model:<class>`) is labelled as its
+            // model and class, so its series aggregate with the model's.
+            let (metric_model, metric_class) = serving_metric_labels(&model_name, pools.default_pool().class_route_of());
             // Now that the model is known to be a configured target, tag the
             // in-flight guard so `onwards_model_inflight{model=…}` tracks this
             // request for its whole lifetime (the guard moves into GuardedStream on
@@ -583,15 +587,18 @@ pub async fn target_message_handler<T: HttpClient>(
             // Gating on a known model bounds the gauge's label set — an unknown
             // model 404s above without ever creating a series.
             if let Some(guard) = inflight_guard.as_mut() {
-                guard.set_model(&model_name);
+                guard.set_model(&metric_model, &metric_class);
             }
             rejection.set_model(&model_name);
+            rejection.set_metric_labels(&metric_model, &metric_class);
             (
                 pools.resolved_name(request_class),
                 pools.resolve(request_class).clone(),
                 pools.default_pool().alias_serving().clone(),
                 pools.default_pool().inflight_limits().cloned(),
                 pools.default_pool().batch_inflight_limit(),
+                metric_model,
+                metric_class,
             )
         }
         None => {
@@ -735,7 +742,8 @@ pub async fn target_message_handler<T: HttpClient>(
             key_purpose.as_deref(),
         );
         let span = tracing::Span::current();
-        span.record("onwards.serving.resolved", resolution.resolved.as_str());
+        // The class this request is served by: its class route's, else standard.
+        span.record("onwards.serving.resolved", metric_class.as_str());
         // The customer's configured scheduling hints, recorded apart from
         // the class. Whether an attempt actually carried them is recorded on
         // its `onwards.provider_attempt` span (`onwards.hints_sent`).
@@ -748,9 +756,9 @@ pub async fn target_message_handler<T: HttpClient>(
         );
         metrics::counter!(
             "onwards_serving_class_requests_total",
-            "model" => model_name.to_string(),
+            "model" => metric_model.clone(),
             "requested" => "",
-            "resolved" => resolution.resolved.as_str(),
+            "resolved" => metric_class.clone(),
         )
         .increment(1);
         resolution
@@ -795,7 +803,8 @@ pub async fn target_message_handler<T: HttpClient>(
             metrics::counter!(
                 "onwards_unsupported_params_total",
                 "param" => *param,
-                "model" => model_name.to_string(),
+                "model" => metric_model.clone(),
+ "serving_class" => metric_class.clone(),
                 "traffic" => traffic,
                 "action" => action,
             )
@@ -857,7 +866,8 @@ pub async fn target_message_handler<T: HttpClient>(
             "onwards_upstream_failed_total",
             "reason" => "no_providers",
             "status" => "529",
-            "model" => model_name.to_string(),
+            "model" => metric_model.clone(),
+ "serving_class" => metric_class.clone(),
             "traffic" => traffic,
         )
         .increment(1);
@@ -871,14 +881,16 @@ pub async fn target_message_handler<T: HttpClient>(
             let account_name = account_name.unwrap_or_default();
             metrics::gauge!(
                 "onwards_inflight_account_limit",
-                "model" => model_name.clone(),
+                "model" => metric_model.clone(),
+ "serving_class" => metric_class.clone(),
                 "account" => account.to_string(),
                 "account_name" => account_name.clone(),
             )
             .set(f64::from(limit));
             metrics::counter!(
                 "onwards_inflight_limit_checks_total",
-                "model" => model_name.clone(),
+                "model" => metric_model.clone(),
+ "serving_class" => metric_class.clone(),
                 "account" => account.to_string(),
                 "account_name" => account_name.clone(),
             )
@@ -896,7 +908,8 @@ pub async fn target_message_handler<T: HttpClient>(
                     );
                     metrics::counter!(
                         "onwards_inflight_limit_refusals_total",
-                        "model" => model_name.clone(),
+                        "model" => metric_model.clone(),
+ "serving_class" => metric_class.clone(),
                         "account" => account.to_string(),
                         "account_name" => account_name,
                     )
@@ -932,7 +945,8 @@ pub async fn target_message_handler<T: HttpClient>(
                 );
                 metrics::counter!(
                     "onwards_batch_inflight_refusals_total",
-                    "model" => model_name.clone(),
+                    "model" => metric_model.clone(),
+ "serving_class" => metric_class.clone(),
                 )
                 .increment(1);
                 record_response_status(529);
@@ -984,7 +998,8 @@ pub async fn target_message_handler<T: HttpClient>(
                         "onwards_upstream_failed_total",
                         "reason" => "model_at_capacity",
                         "status" => "529",
-                        "model" => model_name.to_string(),
+                        "model" => metric_model.clone(),
+ "serving_class" => metric_class.clone(),
                         "traffic" => traffic,
                     )
                     .increment(1);
@@ -1062,7 +1077,8 @@ pub async fn target_message_handler<T: HttpClient>(
         );
         metrics::counter!(
             "onwards_self_hosted_only_skips_total",
-            "model" => model_name.to_string(),
+            "model" => metric_model.clone(),
+ "serving_class" => metric_class.clone(),
         )
         .increment(ineligible_members.len() as u64);
     }
@@ -1509,7 +1525,8 @@ pub async fn target_message_handler<T: HttpClient>(
                     // first-token breach.
                     metrics::counter!(
                         "onwards_first_token_breaches_total",
-                        "model" => model_name.to_string(),
+                        "model" => metric_model.clone(),
+ "serving_class" => metric_class.clone(),
                         "pool" => resolved_pool_name.unwrap_or("default"),
                         "role" => provider_role,
                     )
@@ -1763,7 +1780,8 @@ pub async fn target_message_handler<T: HttpClient>(
                         // deadline value never contaminates the latency histogram.
                         metrics::counter!(
                             "onwards_first_token_breaches_total",
-                            "model" => model_name.to_string(),
+                            "model" => metric_model.clone(),
+ "serving_class" => metric_class.clone(),
                             "pool" => resolved_pool_name.unwrap_or("default"),
                             "role" => provider_role,
                         )
@@ -1800,7 +1818,8 @@ pub async fn target_message_handler<T: HttpClient>(
                 if lead.saw_content {
                     metrics::histogram!(
                         "onwards_first_token_seconds",
-                        "model" => model_name.to_string(),
+                        "model" => metric_model.clone(),
+ "serving_class" => metric_class.clone(),
                         "pool" => resolved_pool_name.unwrap_or("default"),
                         "role" => provider_role,
                     )
@@ -2152,7 +2171,8 @@ pub async fn target_message_handler<T: HttpClient>(
             onwards_model: target.onwards_model.clone(),
         });
         response.extensions_mut().insert(UpstreamFailureLabels {
-            model: model_name.to_string(),
+            model: metric_model.clone(),
+            serving_class: metric_class.clone(),
             traffic,
             served_by: target.url.host_str().unwrap_or_default().to_string(),
         });
@@ -2253,7 +2273,8 @@ pub async fn target_message_handler<T: HttpClient>(
             // one. Falls back to the response status when no attempt got far
             // enough to see one.
             "status" => last_upstream_status.unwrap_or(status).to_string(),
-            "model" => model_name.to_string(),
+            "model" => metric_model.clone(),
+ "serving_class" => metric_class.clone(),
             "traffic" => traffic,
         )
         .increment(1);
@@ -2270,7 +2291,8 @@ pub async fn target_message_handler<T: HttpClient>(
             "onwards_upstream_failed_total",
             "reason" => "no_eligible_provider",
             "status" => "503",
-            "model" => model_name.to_string(),
+            "model" => metric_model.clone(),
+ "serving_class" => metric_class.clone(),
             "traffic" => traffic,
         )
         .increment(1);
@@ -2291,7 +2313,8 @@ pub async fn target_message_handler<T: HttpClient>(
             "onwards_upstream_failed_total",
             "reason" => "all_at_capacity",
             "status" => "529",
-            "model" => model_name.to_string(),
+            "model" => metric_model.clone(),
+ "serving_class" => metric_class.clone(),
             "traffic" => traffic,
         )
         .increment(1);
@@ -2305,7 +2328,8 @@ pub async fn target_message_handler<T: HttpClient>(
             "onwards_upstream_failed_total",
             "reason" => "empty_pool_late",
             "status" => status.to_string(),
-            "model" => model_name.to_string(),
+            "model" => metric_model.clone(),
+ "serving_class" => metric_class.clone(),
             "traffic" => traffic,
         )
         .increment(1);

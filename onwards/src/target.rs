@@ -1511,6 +1511,24 @@ fn build_pool(
     .with_class_route_of(pool_config.class_route_of))
 }
 
+/// The class a request is served by when it names no class route.
+pub const STANDARD_SERVING_CLASS: &str = "standard";
+
+/// The `model` and `serving_class` metric labels for the configured alias
+/// `alias`: a class route (`model:<class>`, whose pool names `class_route_of`)
+/// is labelled as its model and class, so its series aggregate with the model's;
+/// any other alias as itself, in the standard class.
+pub fn serving_metric_labels(alias: &str, class_route_of: Option<&str>) -> (String, String) {
+    if let Some(model) = class_route_of
+        && let Some(class) = alias
+            .strip_prefix(model)
+            .and_then(|rest| rest.strip_prefix(':'))
+    {
+        return (model.to_owned(), class.to_owned());
+    }
+    (alias.to_owned(), STANDARD_SERVING_CLASS.to_owned())
+}
+
 impl Targets {
     /// The configured alias `model` names. `None` when it names no configured
     /// alias, so a caller can label by model without taking arbitrary client
@@ -1525,6 +1543,12 @@ impl Targets {
         self.targets
             .get(alias)
             .and_then(|pools| pools.default_pool().class_route_of().map(str::to_owned))
+    }
+
+    /// The `model` and `serving_class` metric labels for a configured alias.
+    /// See [`serving_metric_labels`].
+    pub fn metric_labels(&self, alias: &str) -> (String, String) {
+        serving_metric_labels(alias, self.class_route_of(alias).as_deref())
     }
 
     pub async fn from_config_file(config_path: &PathBuf) -> Result<Self, anyhow::Error> {
@@ -1778,6 +1802,24 @@ impl Targets {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn class_routes_are_labelled_as_their_model_and_class() {
+        use super::{STANDARD_SERVING_CLASS, serving_metric_labels};
+        assert_eq!(
+            serving_metric_labels("org/model:fast", Some("org/model")),
+            ("org/model".to_owned(), "fast".to_owned())
+        );
+        assert_eq!(
+            serving_metric_labels("org/model", None),
+            ("org/model".to_owned(), STANDARD_SERVING_CLASS.to_owned())
+        );
+        // A marker that does not prefix the alias is ignored.
+        assert_eq!(
+            serving_metric_labels("other:fast", Some("org/model")),
+            ("other:fast".to_owned(), STANDARD_SERVING_CLASS.to_owned())
+        );
+    }
     use super::*;
     use crate::auth::ConstantTimeString;
     use dashmap::DashMap;
