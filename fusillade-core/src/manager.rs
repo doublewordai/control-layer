@@ -1834,10 +1834,10 @@ pub trait DaemonStorage: Send + Sync {
         Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
     }
 
-    /// Retire one weekly batch-archive partition whose every batch is past
-    /// the finalization-anchored `retention_days`. Batch metadata rows are
-    /// stamped, never deleted. Storage backends opt in explicitly; the
-    /// default is disabled.
+    /// Retire one weekly batch-archive partition once the week is past
+    /// `retention_days`, measured from the week itself, and no batch created
+    /// in it is unfinished. Batch metadata rows are never touched. Storage
+    /// backends opt in explicitly; the default is disabled.
     async fn retire_expired_batch_archive_partition(
         &self,
         _select_new: bool,
@@ -1846,9 +1846,10 @@ pub trait DaemonStorage: Send + Sync {
         Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
     }
 
-    /// Retire one weekly generation-2 template partition once it is past the
-    /// horizon and no live file still owns templates in it. Storage backends
-    /// opt in explicitly; the default is disabled.
+    /// Retire one weekly generation-2 template partition once it is past
+    /// `retention_days`, measured from the week itself, and no unfinished
+    /// batch reads input uploaded in it. Storage backends opt in explicitly;
+    /// the default is disabled.
     async fn retire_expired_template_partition(
         &self,
         _select_new: bool,

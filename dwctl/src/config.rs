@@ -2338,8 +2338,9 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub retained_response_retirement_enabled: bool,
 
-    /// Allow weekly batch-archive partition retirement. Disabled by default
-    /// and additionally requires an explicit retention period.
+    /// Allow weekly batch-archive partition retirement. Disabled by default.
+    /// Retention follows `batches.files.max_expiry_seconds`; see
+    /// [`content_retention_days`].
     #[serde(default)]
     pub batch_archive_retirement_enabled: bool,
 
@@ -2350,20 +2351,21 @@ pub struct DaemonConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_generation_writes_enabled: Option<bool>,
 
-    /// Allow weekly template partition retirement.
-    /// Disabled by default and additionally requires an explicit retention
-    /// period.
+    /// Allow weekly template partition retirement. Disabled by default.
+    /// Retention follows `batches.files.max_expiry_seconds`; see
+    /// [`content_retention_days`].
     #[serde(default)]
     pub template_retirement_enabled: bool,
 
-    /// Creation-anchored input-content retention period in days. No default:
-    /// enabling template retirement without it fails startup.
-    #[serde(default)]
+    /// Deprecated and ignored: content retention follows
+    /// `batches.files.max_expiry_seconds`. The key is still accepted so
+    /// existing values files keep parsing; a warning is logged at startup
+    /// when it is set. Remove it from your configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_retention_days: Option<u32>,
 
-    /// Creation-anchored batch content retention period in days. No
-    /// default: enabling batch-archive retirement without it fails startup.
-    #[serde(default)]
+    /// Deprecated and ignored; see `template_retention_days`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_archive_retention_days: Option<u32>,
 
     /// Explicit direct/session-capable primary endpoint used only for
@@ -2754,8 +2756,24 @@ impl Default for DaemonConfig {
     }
 }
 
+/// Content retention in whole days, derived from the longest file expiry an
+/// upload may ask for, rounded up: `ceil(max_expiry_seconds / 1 day)`.
+///
+/// Both weekly content families (batch archive and request templates) drop a
+/// week once `week_start + 7 days + this` has passed. Every file's
+/// `expires_at` is at most `created_at + max_expiry_seconds`, which is at
+/// most the week's end plus this, so the date the API shows can never
+/// outrun the content.
+pub fn content_retention_days(max_expiry_seconds: i64) -> u32 {
+    const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
+    let days = max_expiry_seconds.max(1).saturating_add(SECONDS_PER_DAY - 1) / SECONDS_PER_DAY;
+    u32::try_from(days.min(i64::from(i32::MAX))).unwrap_or(i32::MAX as u32)
+}
+
 impl DaemonConfig {
-    pub fn to_fusillade_retention_maintenance_config(&self) -> fusillade::RetentionMaintenanceConfig {
+    /// Build the daemon's retention maintenance controls. Content retention
+    /// is derived from `max_expiry_seconds`; see [`content_retention_days`].
+    pub fn to_fusillade_retention_maintenance_config(&self, max_expiry_seconds: i64) -> fusillade::RetentionMaintenanceConfig {
         fusillade::RetentionMaintenanceConfig::new(self.retention.clone())
             .with_batchless_archive_sweep_enabled(self.batchless_archive_sweep_enabled)
             .with_batchless_archive_backfill_enabled(self.batchless_archive_backfill_enabled)
@@ -2764,9 +2782,8 @@ impl DaemonConfig {
             .with_retained_response_partitions_days_ahead(self.retained_response_partitions_days_ahead)
             .with_retained_response_retirement_enabled(self.retained_response_retirement_enabled)
             .with_batch_archive_retirement_enabled(self.batch_archive_retirement_enabled)
-            .with_batch_archive_retention_days(self.batch_archive_retention_days)
             .with_template_retirement_enabled(self.template_retirement_enabled)
-            .with_template_retention_days(self.template_retention_days)
+            .with_content_retention_days(Some(content_retention_days(max_expiry_seconds)))
     }
 
     /// Convert to fusillade daemon config
@@ -3772,37 +3789,6 @@ impl Config {
     }
 
     /// Validate the configuration for consistency and required fields
-    /// Content-retention settings that would drop content before the
-    /// `expires_at` the API shows for it. A week drops N days after it ends,
-    /// so its newest content lives exactly N days; a file whose expires_at
-    /// reaches further shows a date its content will not reach. Startup warns
-    /// rather than refuses: content going before the shown date is the safe
-    /// direction.
-    fn retention_expiry_warnings(&self) -> Vec<RetentionExpiryWarning> {
-        let daemon = &self.background_services.batch_daemon;
-        let seconds_per_day = 24 * 60 * 60;
-        let mut warnings = Vec::new();
-        if daemon.template_retirement_enabled
-            && let Some(days) = daemon.template_retention_days
-            && i64::from(days) * seconds_per_day < self.batches.files.max_expiry_seconds
-        {
-            warnings.push(RetentionExpiryWarning::TemplateRetentionBelowMaxExpiry {
-                days,
-                max_expiry_seconds: self.batches.files.max_expiry_seconds,
-            });
-        }
-        if daemon.batch_archive_retirement_enabled
-            && let Some(days) = daemon.batch_archive_retention_days
-            && i64::from(days) * seconds_per_day < self.batches.files.default_expiry_seconds
-        {
-            warnings.push(RetentionExpiryWarning::BatchArchiveRetentionBelowDefaultExpiry {
-                days,
-                default_expiry_seconds: self.batches.files.default_expiry_seconds,
-            });
-        }
-        warnings
-    }
-
     pub fn validate(&self) -> Result<(), Error> {
         for (name, component) in [("fusillade", self.database.fusillade()), ("outlet", self.database.outlet())] {
             component
@@ -3885,43 +3871,6 @@ impl Config {
             return Err(Error::Internal {
                 operation: "Config validation: partition retirement on a dedicated database requires an explicit direct session endpoint using the same role as fusillade query traffic".to_string(),
             });
-        }
-        if owns_archive_maintenance
-            && daemon.batch_archive_retirement_enabled
-            && daemon.batch_archive_retention_days.is_none_or(|days| days < 1)
-        {
-            return Err(Error::Internal {
-                operation:
-                    "Config validation: batch-archive partition retirement requires an explicit positive batch_archive_retention_days"
-                        .to_string(),
-            });
-        }
-        if owns_archive_maintenance && daemon.template_retirement_enabled && daemon.template_retention_days.is_none_or(|days| days < 1) {
-            return Err(Error::Internal {
-                operation: "Config validation: template partition retirement requires an explicit positive template_retention_days"
-                    .to_string(),
-            });
-        }
-        if owns_archive_maintenance {
-            for warning in self.retention_expiry_warnings() {
-                match warning {
-                    RetentionExpiryWarning::TemplateRetentionBelowMaxExpiry { days, max_expiry_seconds } => tracing::warn!(
-                        template_retention_days = days,
-                        max_expiry_seconds,
-                        "template_retention_days is shorter than the longest expires_at an upload may request; \
-                         input content can be dropped before the date the API shows for it"
-                    ),
-                    RetentionExpiryWarning::BatchArchiveRetentionBelowDefaultExpiry {
-                        days,
-                        default_expiry_seconds,
-                    } => tracing::warn!(
-                        batch_archive_retention_days = days,
-                        default_expiry_seconds,
-                        "batch_archive_retention_days is shorter than the expires_at given to results files; \
-                         completions can be dropped before the date the API shows for them"
-                    ),
-                }
-            }
         }
         if owns_archive_maintenance
             && batchless_movement_enabled
@@ -4321,14 +4270,6 @@ impl Config {
     }
 }
 
-/// A retention period shorter than a file expiry it should cover; see
-/// [`Config::retention_expiry_warnings`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetentionExpiryWarning {
-    TemplateRetentionBelowMaxExpiry { days: u32, max_expiry_seconds: i64 },
-    BatchArchiveRetentionBelowDefaultExpiry { days: u32, default_expiry_seconds: i64 },
-}
-
 #[cfg(test)]
 mod tests {
     /// The built-in list is a snapshot and will always lag some provider.
@@ -4456,7 +4397,7 @@ mod tests {
         assert_eq!(daemon.batchless_archive_backfill_concurrency, 1);
         assert!(daemon.retained_response_partitions_days_ahead > 0);
 
-        let mapped = daemon.to_fusillade_retention_maintenance_config();
+        let mapped = daemon.to_fusillade_retention_maintenance_config(30 * 24 * 60 * 60 + 1);
         assert_eq!(mapped.policy(), &daemon.retention);
         assert_eq!(mapped.batchless_archive_sweep_enabled(), daemon.batchless_archive_sweep_enabled);
         assert_eq!(
@@ -4478,7 +4419,12 @@ mod tests {
             daemon.retained_response_retirement_enabled
         );
         assert_eq!(mapped.batch_archive_retirement_enabled(), daemon.batch_archive_retirement_enabled);
-        assert_eq!(mapped.batch_archive_retention_days(), daemon.batch_archive_retention_days);
+        assert_eq!(mapped.template_retirement_enabled(), daemon.template_retirement_enabled);
+        assert_eq!(
+            mapped.content_retention_days(),
+            Some(31),
+            "retention rounds max expiry up to whole days"
+        );
     }
 
     #[test]
@@ -5213,51 +5159,13 @@ secret_key: "test-secret-key"
     }
 
     #[test]
-    fn retention_shorter_than_file_expiry_warns_and_longer_does_not() {
+    fn content_retention_rounds_max_expiry_up_to_whole_days() {
         let day = 24 * 60 * 60;
-        let mut config = Config::default();
-        config.batches.files.default_expiry_seconds = 30 * day;
-        config.batches.files.max_expiry_seconds = 30 * day;
-        let daemon = &mut config.background_services.batch_daemon;
-        daemon.batch_archive_retirement_enabled = true;
-        daemon.template_retirement_enabled = true;
-
-        // Shorter than the expiry the API shows: content would go early.
-        daemon.batch_archive_retention_days = Some(29);
-        daemon.template_retention_days = Some(29);
-        assert_eq!(
-            config.retention_expiry_warnings(),
-            vec![
-                RetentionExpiryWarning::TemplateRetentionBelowMaxExpiry {
-                    days: 29,
-                    max_expiry_seconds: 30 * day,
-                },
-                RetentionExpiryWarning::BatchArchiveRetentionBelowDefaultExpiry {
-                    days: 29,
-                    default_expiry_seconds: 30 * day,
-                },
-            ]
-        );
-
-        // Equal or longer is safe: content outlives the shown date.
-        let daemon = &mut config.background_services.batch_daemon;
-        daemon.batch_archive_retention_days = Some(30);
-        daemon.template_retention_days = Some(45);
-        assert_eq!(config.retention_expiry_warnings(), vec![]);
-
-        // The template period is checked against max, not default, expiry.
-        config.batches.files.max_expiry_seconds = 60 * day;
-        assert_eq!(
-            config.retention_expiry_warnings(),
-            vec![RetentionExpiryWarning::TemplateRetentionBelowMaxExpiry {
-                days: 45,
-                max_expiry_seconds: 60 * day,
-            }]
-        );
-
-        // A family whose retirement is disabled never drops content.
-        config.background_services.batch_daemon.template_retirement_enabled = false;
-        assert_eq!(config.retention_expiry_warnings(), vec![]);
+        assert_eq!(content_retention_days(1), 1);
+        assert_eq!(content_retention_days(day), 1);
+        assert_eq!(content_retention_days(day + 1), 2);
+        assert_eq!(content_retention_days(30 * day), 30);
+        assert_eq!(content_retention_days(i64::MAX), i32::MAX as u32);
     }
 
     #[test]
@@ -5275,10 +5183,12 @@ secret_key: "test-secret-key"
         daemon.batchless_archive_sweep_enabled = true;
         daemon.retained_response_retirement_enabled = true;
         daemon.batch_archive_retirement_enabled = true;
+        // Deprecated no-op key: still parses, never rejects.
         daemon.batch_archive_retention_days = Some(1);
         // Deprecated no-op key: still parses, never rejects.
         daemon.template_generation_writes_enabled = Some(true);
         daemon.template_retirement_enabled = true;
+        // Deprecated no-op key: still parses, never rejects.
         daemon.template_retention_days = Some(1);
         assert!(config.validate().is_ok(), "{:?}", config.validate().err());
     }

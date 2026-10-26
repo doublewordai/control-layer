@@ -188,28 +188,6 @@ impl Default for FileExpiry {
     }
 }
 
-/// Retention periods, in days, after which a batch can no longer be retried.
-///
-/// A retry makes a batch unfinished again, and an unfinished batch holds its
-/// archive week (results) and its input's template week open past their
-/// retention periods. To keep that hold short and predictable, a batch is not
-/// retried once it is within one day of either period:
-///
-/// - `batch_archive_days`: refused once `now > batch.created_at +
-///   batch_archive_days - 1 day`;
-/// - `template_days`: refused once `now > input_file.created_at +
-///   template_days - 1 day`, since a retry re-reads the input templates.
-///
-/// A week drops no earlier than `week_start + 7 days + retention days`, and
-/// every batch or file in it was created at or after `week_start`, so the
-/// one-day margin puts the cut-off before the drop, never after. `None`
-/// means that family's content is not retired and imposes no limit.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RetryAgeLimits {
-    pub batch_archive_days: Option<u32>,
-    pub template_days: Option<u32>,
-}
-
 /// Server-side budget for one daemon maintenance call, derived from the
 /// daemon's client-side query timeout.
 ///
@@ -264,7 +242,7 @@ pub struct PostgresRequestManager<P: PoolProvider> {
     download_buffer_size: usize,
     batch_insert_strategy: BatchInsertStrategy,
     file_expiry: FileExpiry,
-    retry_age_limits: RetryAgeLimits,
+    retry_age_limit: Option<chrono::Duration>,
     /// TRANSITIONAL ZDR hook - see [`crate::transform`]. Transforms response/
     /// error bodies before persistence; `None` is identity. Remove when stream
     /// reassembly moves into dwctl.
@@ -502,7 +480,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             download_buffer_size: 100,
             batch_insert_strategy: BatchInsertStrategy::default(),
             file_expiry: FileExpiry::default(),
-            retry_age_limits: RetryAgeLimits::default(),
+            retry_age_limit: None,
             response_transformer: std::sync::OnceLock::new(),
             maintenance_budget: maintenance_budget(DEFAULT_MAINTENANCE_QUERY_TIMEOUT),
         }
@@ -1197,61 +1175,59 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         self
     }
 
-    /// Refuse retries of batches near the end of their content retention;
-    /// see [`RetryAgeLimits`].
-    pub fn with_retry_age_limits(mut self, limits: RetryAgeLimits) -> Self {
-        self.retry_age_limits = limits;
+    /// Refuse to retry a batch near the end of its content retention.
+    ///
+    /// A retry makes a batch unfinished again, and an unfinished batch holds
+    /// its archive week (results) and its input's template week open past
+    /// the retention period `limit`. To keep that hold short and
+    /// predictable, a batch is not retried once
+    /// `now > created_at + limit - 1 day`, measured from the batch's
+    /// creation and from its input file's upload (a retry re-reads the
+    /// input templates). A week drops no earlier than
+    /// `week_start + 7 days + limit`, and everything in it was created at or
+    /// after `week_start`, so the one-day margin puts the cut-off before the
+    /// drop, never after. `None` (the default) means content is not retired
+    /// and retries have no age limit.
+    pub fn with_retry_age_limit(mut self, limit: Option<chrono::Duration>) -> Self {
+        self.retry_age_limit = limit;
         self
     }
 
     /// Refuse a retry once the batch is within a day of the end of its
-    /// content retention; see [`RetryAgeLimits`]. A missing batch passes, so
-    /// callers keep their own not-found handling.
+    /// content retention; see [`Self::with_retry_age_limit`]. A missing
+    /// batch passes, so callers keep their own not-found handling.
     async fn check_retry_age<'e, E>(&self, executor: E, batch_id: Uuid) -> Result<()>
     where
         E: sqlx::Executor<'e, Database = sqlx::Postgres>,
     {
-        let RetryAgeLimits {
-            batch_archive_days,
-            template_days,
-        } = self.retry_age_limits;
-        if batch_archive_days.is_none() && template_days.is_none() {
+        let Some(limit) = self.retry_age_limit else {
             return Ok(());
-        }
-        let days = |days: Option<u32>| days.and_then(|days| i32::try_from(days).ok());
-        // created_at never changes, so this needs no lock. A NULL period
-        // makes its comparison NULL, which COALESCE turns into "not past".
-        let past: Option<(bool, bool)> = sqlx::query_as(
+        };
+        // created_at never changes, so this needs no lock. A batch is created
+        // after its input file, so the file's upload is the earlier clock
+        // whenever there is one.
+        let past: Option<bool> = sqlx::query_scalar(
             r#"
-            SELECT
-                COALESCE(NOW() > b.created_at
-                    + make_interval(days => $2::int) - INTERVAL '1 day', FALSE),
-                COALESCE(NOW() > f.created_at
-                    + make_interval(days => $3::int) - INTERVAL '1 day', FALSE)
+            SELECT NOW() > LEAST(b.created_at, COALESCE(f.created_at, b.created_at))
+                           + $2 * INTERVAL '1 second' - INTERVAL '1 day'
             FROM batches b
             LEFT JOIN files f ON f.id = b.file_id
             WHERE b.id = $1
             "#,
         )
         .bind(batch_id)
-        .bind(days(batch_archive_days))
-        .bind(days(template_days))
+        .bind(limit.num_seconds() as f64)
         .fetch_optional(executor)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to check batch retry age: {e}")))?;
-        match past {
-            Some((true, _)) => Err(FusilladeError::ValidationError(format!(
-                "batch is too old to retry: retries are accepted until one day before \
-                 its results reach the end of their {}-day retention period",
-                batch_archive_days.unwrap_or_default()
-            ))),
-            Some((_, true)) => Err(FusilladeError::ValidationError(format!(
-                "batch is too old to retry: retries are accepted until one day before \
-                 its input file reaches the end of its {}-day retention period",
-                template_days.unwrap_or_default()
-            ))),
-            _ => Ok(()),
+        if past == Some(true) {
+            return Err(FusilladeError::ValidationError(format!(
+                "batch is too old to retry: retries are accepted until one day before its \
+                 content reaches the end of its {}-day retention period",
+                limit.num_days()
+            )));
         }
+        Ok(())
     }
 
     /// Output and error files created before they carried an expiry read as
