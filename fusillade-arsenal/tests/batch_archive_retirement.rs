@@ -120,6 +120,12 @@ async fn an_expired_week_retires_without_touching_batch_metadata(pool: PgPool) {
     let week = monday(10);
     ensure_week(&pool, week).await;
     let batch = archived_batch(&pool, week, Utc::now() - Duration::days(60)).await;
+    let deleted = archived_batch(&pool, week, Utc::now() - Duration::days(60)).await;
+    sqlx::query("UPDATE batches SET deleted_at = NOW() WHERE id = $1")
+        .bind(deleted.batch_id)
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let outcome = manager(&pool)
         .await
@@ -160,6 +166,16 @@ async fn an_expired_week_retires_without_touching_batch_metadata(pool: PgPool) {
             .await
             .unwrap();
     assert_eq!(expired_at, None);
+
+    // An explicitly deleted batch leaves the erasure purge's tombstone set:
+    // its archived rows went with the partition.
+    let deleted_expired_at: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT retention_expired_at FROM batches WHERE id = $1")
+            .bind(deleted.batch_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(deleted_expired_at.is_some());
 
     let further = manager(&pool)
         .await
