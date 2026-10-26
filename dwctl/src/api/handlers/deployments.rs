@@ -873,9 +873,6 @@ pub async fn update_deployed_model<P: PoolProvider>(
 
     validate_tariff_prices(update.tariffs.as_deref())?;
 
-    if let Some(alias) = update.alias.as_deref() {
-        validate_alias_has_no_class_separator(alias.trim())?;
-    }
     // `Some(None)` clears the cap; only a concrete non-positive value is invalid.
     validate_batch_capacity(update.batch_capacity.flatten())?;
 
@@ -962,6 +959,12 @@ pub async fn update_deployed_model<P: PoolProvider>(
         }
     };
 
+    // Only a new alias is checked: an edit that resends an existing alias is unchanged.
+    if let Some(alias) = update.alias.as_deref().map(str::trim)
+        && alias != model_alias
+    {
+        validate_alias_has_no_class_separator(alias)?;
+    }
     validate_realtime_fallback_statuses(update.fallback_realtime_on_status.as_deref())?;
     validate_aimd(
         update.first_token_timeout_ms.unwrap_or(cur_timeout),
@@ -1692,6 +1695,18 @@ mod tests {
             .json(&json!({"alias":"org/model:fast"}))
             .await
             .assert_status(axum::http::StatusCode::BAD_REQUEST);
+        // An existing alias with a colon stays editable when an edit resends it unchanged.
+        sqlx::query("UPDATE deployed_models SET alias = 'legacy/member:interactive' WHERE id = $1")
+            .bind(model.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        app.patch(&format!("/admin/api/v1/models/{}", model.id))
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"alias":"legacy/member:interactive","description":"edited"}))
+            .await
+            .assert_status_ok();
     }
 
     #[dwctl_test_macros::test]

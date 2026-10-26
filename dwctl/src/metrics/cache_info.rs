@@ -41,8 +41,8 @@ pub struct CacheInfoState {
     prev_tariffs: HashSet<(String, String, String)>,
     /// (model, serving_class) of class-routed models that emitted class gauges.
     prev_classes: HashSet<(String, String)>,
-    /// (model, serving_class, purpose) combos that emitted class tariff gauges.
-    prev_class_tariffs: HashSet<(String, String, String)>,
+    /// (model, serving_class, purpose, completion_window) combos that emitted class tariff gauges.
+    prev_class_tariffs: HashSet<(String, String, String, String)>,
     /// Whether at least one cycle has run (skip zeroing on the first call).
     initialized: bool,
 }
@@ -426,13 +426,15 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets, state: 
             .unwrap_or_default()
         {
             let purpose = t.purpose.clone().unwrap_or_default();
-            current_class_tariffs.insert((alias.clone(), class.clone(), purpose.clone()));
+            let window = t.completion_window.clone().unwrap_or_default();
+            current_class_tariffs.insert((alias.clone(), class.clone(), purpose.clone(), window.clone()));
             for (direction, price) in [("input", t.input_price), ("output", t.output_price)] {
                 gauge!(
                     "dwctl_model_class_tariff",
                     "model" => alias.clone(),
                     "serving_class" => class.clone(),
                     "purpose" => purpose.clone(),
+                    "completion_window" => window.clone(),
                     "direction" => direction,
                 )
                 .set(price);
@@ -446,13 +448,14 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets, state: 
                 gauge!(metric, "model" => model.clone(), "serving_class" => class.clone()).set(0.0);
             }
         }
-        for (model, class, purpose) in state.prev_class_tariffs.difference(&current_class_tariffs) {
+        for (model, class, purpose, window) in state.prev_class_tariffs.difference(&current_class_tariffs) {
             for direction in ["input", "output"] {
                 gauge!(
                     "dwctl_model_class_tariff",
                     "model" => model.clone(),
                     "serving_class" => class.clone(),
                     "purpose" => purpose.clone(),
+                    "completion_window" => window.clone(),
                     "direction" => direction,
                 )
                 .set(0.0);

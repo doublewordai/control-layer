@@ -121,7 +121,10 @@ pub struct HttpAnalyticsRow {
     /// URL of the upstream that served the request (onwards `ServedBy`
     /// extension), for per-component attribution of composite models.
     pub served_by: Option<String>,
-    /// The class the request was served by (`standard` unless a class route was named).
+    /// The resolved serving class (`http_analytics.resolved_serving_class`): the class a
+    /// class route names, else the class the gateway resolved (`standard`, or a retired
+    /// class on older rows). `None` when nothing was resolved (e.g. the request never
+    /// reached the gateway); metrics label it `standard`.
     pub resolved_serving_class: Option<String>,
 }
 

@@ -873,11 +873,8 @@
           "maxItems": 0
         },
         "realtime_inflight_limit": {
-          "description": "Concurrent realtime requests one account may have in flight on this\nclass. Omit for the model's `settings.realtime_inflight_limit`.",
-          "type": [
-            "integer",
-            "null"
-          ],
+          "description": "Concurrent realtime requests one account may have in flight on this\nclass. Required: each class sets its own.",
+          "type": "integer",
           "format": "int32",
           "minimum": 1
         },
@@ -905,6 +902,7 @@
         "display_name",
         "endpoint",
         "upstream_model_name",
+        "realtime_inflight_limit",
         "tariffs"
       ]
     },

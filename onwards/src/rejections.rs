@@ -3,7 +3,7 @@
 //! Every client error onwards decides on, as opposed to one reporting an
 //! upstream's response:
 //!
-//! - increments `onwards_rejections_total{model, status, code, traffic}`.
+//! - increments `onwards_rejections_total{model, serving_class, status, code, traffic}`.
 //!   `model` is set only for configured aliases, so the label stays bounded
 //!   whatever a client sends;
 //! - sets `error.type` (the error code), `onwards.rejection.param`,

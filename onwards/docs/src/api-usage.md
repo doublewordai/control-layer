@@ -63,8 +63,8 @@ Every client error that onwards decides on itself, such as an unknown model, a f
   - `schema_mismatch`: valid JSON that doesn't match the schema;
   - `invalid_content_type`: a `/v1/responses` body not sent as JSON;
   - `invalid_body`: a `/v1/responses` body that couldn't be read.
-- `model` is the configured model the request names. It is empty when the request names no configured model.
-- `serving_class` is `standard`, or for a class route (a target whose pool sets `class_route_of`, named `model:<class>`) its class; `model` is then the model it belongs to. Every per-model request metric carries the same pair, so a model aggregates across its classes or splits by class.
+- `model` is the configured model the request names, without the serving-class suffix of a class route. It is empty when the request names no configured model.
+- `serving_class` is the class of a class route (a target whose pool sets `class_route_of`, named `model:<class>`), and `standard` otherwise. The per-request in-flight, limit, failure and first-token metrics carry the same pair, so a model aggregates across its classes or splits by class.
 - `traffic` is `dispatched` for requests carrying the first-token-timeout exempt header and `realtime` otherwise.
 
 Each rejection also sets these attributes on the current trace span, usually onwards' `onwards.request` span. Strict mode refuses some requests before that span exists (body errors, payload too large, unsupported `/v1/completions` and Responses reasoning fields). Those attributes go on the enclosing span when onwards runs inside a gateway that opens one per request, such as dwctl; the standalone server opens none, so they are only counted there:

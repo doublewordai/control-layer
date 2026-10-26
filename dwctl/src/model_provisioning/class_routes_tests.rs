@@ -87,14 +87,15 @@ fn class_catalog_rejects_class_aliases_and_bad_limits() {
         catalog(&v)
             .unwrap_err()
             .to_string()
-            .contains("realtime_inflight_limit is required and must be positive")
+            .contains("realtime_inflight_limit must be positive")
     );
     let mut v = fixture();
     v["clay"]["class_routes"]["fast"]
         .as_mapping_mut()
         .unwrap()
         .remove("realtime_inflight_limit");
-    assert!(catalog(&v).unwrap_err().to_string().contains("realtime_inflight_limit is required"));
+    let error = format!("{:#}", catalog(&v).unwrap_err());
+    assert!(error.contains("missing field `realtime_inflight_limit`"), "{error}");
 }
 
 #[test]

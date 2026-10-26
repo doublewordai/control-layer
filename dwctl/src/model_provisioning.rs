@@ -144,10 +144,9 @@ pub struct ClassRoute {
     #[schemars(extend("maxItems" = 0))]
     pub aliases: Vec<String>,
     /// Concurrent realtime requests one account may have in flight on this
-    /// class. Omit for the model's `settings.realtime_inflight_limit`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// class. Required: each class sets its own.
     #[schemars(range(min = 1))]
-    pub realtime_inflight_limit: Option<i32>,
+    pub realtime_inflight_limit: i32,
     pub tariffs: Vec<Tariff>,
     /// Omit to inherit the model's all-class multipliers; does not enable caching.
     #[serde(default)]
@@ -639,8 +638,8 @@ impl Catalog {
                         model.source
                     );
                     ensure!(
-                        class.realtime_inflight_limit.is_some_and(|limit| limit > 0),
-                        "{}: class {key:?}: realtime_inflight_limit is required and must be positive",
+                        class.realtime_inflight_limit > 0,
+                        "{}: class {key:?}: realtime_inflight_limit must be positive",
                         model.source
                     );
                     if let Some(cache) = &class.cache_tariff {
