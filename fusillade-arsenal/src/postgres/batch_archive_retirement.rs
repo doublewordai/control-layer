@@ -130,7 +130,18 @@ const BATCH_ARCHIVE_FAMILY: FamilySpec = FamilySpec {
         )
         "#,
     ),
-    completion_sql: None,
+    // Takes the week's explicitly deleted batches out of the erasure purge's
+    // tombstone set (`deleted_at IS NOT NULL AND retention_expired_at IS
+    // NULL`): their archived rows have just gone with the partition, and
+    // otherwise every purge tick would probe them forever. Only deleted
+    // batches are stamped, read through that set's partial index
+    // idx_batches_explicitly_deleted, so the write stays small however large
+    // the week; finished batches are left alone.
+    completion_sql: Some(
+        "UPDATE batches SET retention_expired_at = $3 \
+         WHERE deleted_at IS NOT NULL AND retention_expired_at IS NULL \
+           AND archive_bucket >= $1 AND archive_bucket < $2",
+    ),
 };
 
 pub(super) async fn retire_expired_batch_archive_partition<P: PoolProvider>(

@@ -1275,7 +1275,8 @@ pub struct FilesConfig {
     /// Smallest `expires_after[seconds]` an upload may request (default: 1 hour)
     pub min_expiry_seconds: i64,
     /// Largest `expires_after[seconds]` an upload may request (default: 30
-    /// days). Must not exceed what content retention honours.
+    /// days). Content retention is this rounded up to whole days, so no
+    /// `expires_at` outlives the content.
     pub max_expiry_seconds: i64,
     /// Buffer size for file upload streams (default: 100)
     pub upload_buffer_size: usize,
