@@ -931,7 +931,9 @@ background_services:
     # session-capable maintenance endpoint as response retirement.
     # Keep N at or above batches.files.default_expiry_seconds (in days) so a
     # results file is never dropped before the expires_at it was given;
-    # startup logs a warning otherwise.
+    # startup logs a warning otherwise. While enabled, a batch can no longer
+    # be retried once it is within one day of N days old (a retry would hold
+    # its week open past the period); the API answers 400.
     # batch_archive_retirement_enabled: false
     # batch_archive_retention_days: <positive days>
     # DEPRECATED and ignored: request templates are always written to the
@@ -947,6 +949,8 @@ background_services:
     # same session-capable maintenance endpoint. Keep N at or above
     # batches.files.max_expiry_seconds (in days) so no input is dropped
     # before the expires_at it shows; startup logs a warning otherwise.
+    # While enabled, a batch can no longer be retried once its input file is
+    # within one day of N days old.
     # template_retirement_enabled: false
     # template_retention_days: <positive days>
     # Schema mode reuses the main direct credentials automatically. Override for

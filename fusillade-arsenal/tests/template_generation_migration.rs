@@ -449,6 +449,90 @@ async fn template_week_retires_on_age_unless_an_unfinished_batch_reads_it(pool: 
     );
 }
 
+/// The week is not yet past `week end + retention days`, so nothing holds it
+/// but its age.
+#[sqlx::test]
+async fn a_young_template_week_is_not_a_candidate(pool: PgPool) {
+    use fusillade_arsenal::manager::{DaemonStorage, RetainedResponseRetirementOutcome};
+
+    let week = monday(&pool, -4).await;
+    sqlx::query("SELECT ensure_request_template_partition($1, NULL)")
+        .bind(week)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let file = file_uploaded_in(&pool, week).await;
+    insert_g2_template(&pool, week, file).await;
+
+    let outcome = retirement_manager(&pool)
+        .await
+        .retire_expired_template_partition(true, 30)
+        .await
+        .unwrap();
+    assert_eq!(outcome, RetainedResponseRetirementOutcome::NoCandidate);
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM request_template_buckets WHERE week_start = $1")
+            .bind(week)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "active");
+}
+
+/// An unfinished batch holds only the week its own input was uploaded in.
+#[sqlx::test]
+async fn an_unfinished_batch_on_input_from_another_week_does_not_block(pool: PgPool) {
+    use fusillade_arsenal::manager::{DaemonStorage, RetainedResponseRetirementOutcome};
+
+    let week = monday(&pool, -60).await;
+    let other_week = monday(&pool, -59).await;
+    for monday in [week, other_week] {
+        sqlx::query("SELECT ensure_request_template_partition($1, NULL)")
+            .bind(monday)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let file = file_uploaded_in(&pool, week).await;
+    insert_g2_template(&pool, week, file).await;
+    let other_file = file_uploaded_in(&pool, other_week).await;
+    insert_g2_template(&pool, other_week, other_file).await;
+    // Still running, but on input uploaded the following week.
+    sqlx::query(
+        "INSERT INTO batches (file_id, endpoint, completion_window, expires_at, created_at) \
+         VALUES ($1, '/v1/x', '24h', NOW() + INTERVAL '24 hours', \
+                 ($2::timestamp AT TIME ZONE 'UTC') + INTERVAL '1 day')",
+    )
+    .bind(other_file)
+    .bind(other_week)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let manager = retirement_manager(&pool).await;
+    let outcome = manager
+        .retire_expired_template_partition(true, 30)
+        .await
+        .unwrap();
+    assert_eq!(outcome, RetainedResponseRetirementOutcome::Retired);
+    let states: Vec<(chrono::NaiveDate, String)> = sqlx::query_as(
+        "SELECT week_start, state FROM request_template_buckets \
+         WHERE week_start = ANY($1) ORDER BY week_start",
+    )
+    .bind(vec![week, other_week])
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        states,
+        vec![
+            (week, "retired".to_string()),
+            (other_week, "active".to_string())
+        ],
+        "only the week the running batch reads stays"
+    );
+}
+
 #[sqlx::test]
 async fn an_unowned_template_row_fails_the_gate_closed(pool: PgPool) {
     use fusillade_arsenal::manager::{DaemonStorage, RetainedResponseRetirementOutcome};

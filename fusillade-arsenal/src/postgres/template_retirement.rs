@@ -69,7 +69,10 @@ const TEMPLATE_FAMILY: FamilySpec = FamilySpec {
     // The week must be past the horizon and no unfinished batch may still
     // read templates from it: a batch's templates are in the week its input
     // file was uploaded, so the guard joins the few dozen unfinished batches
-    // (idx_batches_unfinished_created_at) to their files. A finished batch
+    // to their files. A batch is always created after its input file, so
+    // only batches created since the week began can read it; that bound is
+    // what lets the guard range-scan idx_batches_unfinished_created_at
+    // rather than read every unfinished batch. A finished batch
     // holds nothing open; its results do not need the templates. A dedicated
     // (file-less) template row still fails the gate closed: nothing
     // unmanaged is dropped implicitly.
@@ -96,6 +99,7 @@ const TEMPLATE_FAMILY: FamilySpec = FamilySpec {
               JOIN files f ON f.id = b.file_id
               WHERE b.counts_frozen_at IS NULL
                 AND b.deleted_at IS NULL
+                AND b.created_at >= (bucket.week_start::timestamp AT TIME ZONE 'UTC')
                 AND f.created_at >= (bucket.week_start::timestamp AT TIME ZONE 'UTC')
                 AND f.created_at < ((bucket.week_start + 7)::timestamp AT TIME ZONE 'UTC')
           )
@@ -110,6 +114,21 @@ const TEMPLATE_FAMILY: FamilySpec = FamilySpec {
         LIMIT 1
         "#,
     candidate_binds_retention: true,
+    // The candidate's unfinished-batch guard, re-run under the bucket lock.
+    recheck_sql: Some(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM batches b
+            JOIN files f ON f.id = b.file_id
+            WHERE b.counts_frozen_at IS NULL
+              AND b.deleted_at IS NULL
+              AND b.created_at >= ($1::date::timestamp AT TIME ZONE 'UTC')
+              AND f.created_at >= ($1::date::timestamp AT TIME ZONE 'UTC')
+              AND f.created_at < (($1::date + 7)::timestamp AT TIME ZONE 'UTC')
+        )
+        "#,
+    ),
     completion_sql: None,
 };
 

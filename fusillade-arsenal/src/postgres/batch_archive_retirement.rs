@@ -75,6 +75,19 @@ const BATCH_ARCHIVE_FAMILY: FamilySpec = FamilySpec {
     // nothing open, however late it finished; one retry no longer extends
     // the week for every batch in it. The guard reads only unfinished
     // batches, a few dozen rows under idx_batches_unfinished_created_at.
+    //
+    // The guard keys on the week a batch was *created* in, while archived
+    // rows are partitioned by `batches.archive_bucket`. The two differ only
+    // for a batch whose creation week had already been fenced when it
+    // archived: archive_batch then places it in the current week. Such a
+    // batch, once retried, does not hold that later week through this
+    // guard. Retry bounds the gap instead: it share-locks the batch's own
+    // archive_bucket row and refuses unless that week is active, and the
+    // retry age cut-off (RetryAgeLimits) stops retries a day before the
+    // creation week can drop. The later week drops at least a week after
+    // the creation week, so a retried batch has that long to finish before
+    // its archived completions could go. Not worth an expression index on
+    // COALESCE(archive_bucket, creation week) for this edge.
     candidate_sql: r#"
         SELECT bucket.partition_schema,
                namespace.oid AS partition_schema_oid,
@@ -104,6 +117,19 @@ const BATCH_ARCHIVE_FAMILY: FamilySpec = FamilySpec {
         LIMIT 1
         "#,
     candidate_binds_retention: true,
+    // The candidate's unfinished-batch guard, re-run under the bucket lock.
+    recheck_sql: Some(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM batches b
+            WHERE b.counts_frozen_at IS NULL
+              AND b.deleted_at IS NULL
+              AND b.created_at >= ($1::date::timestamp AT TIME ZONE 'UTC')
+              AND b.created_at < (($1::date + 7)::timestamp AT TIME ZONE 'UTC')
+        )
+        "#,
+    ),
     completion_sql: None,
 };
 

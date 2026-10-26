@@ -286,6 +286,94 @@ async fn only_an_unfinished_batch_created_in_the_week_blocks(pool: PgPool) {
     }
 }
 
+/// The candidate query runs before the week's registry row is locked. A
+/// writer that share-locked the row (as batch creation and retry do) and
+/// commits a running batch while the claim waits for that lock must still
+/// stop the week from being fenced: the claim re-checks under the lock.
+#[sqlx::test]
+async fn a_batch_committed_while_the_claim_waits_holds_the_week(pool: PgPool) {
+    let week = monday(10);
+    ensure_week(&pool, week).await;
+    archived_batch(&pool, week, Utc::now() - Duration::days(60)).await;
+
+    let mut writer = pool.begin().await.unwrap();
+    let state: String = sqlx::query_scalar(
+        "SELECT state FROM batch_archive_buckets WHERE week_start = $1 FOR SHARE",
+    )
+    .bind(week)
+    .fetch_one(&mut *writer)
+    .await
+    .unwrap();
+    assert_eq!(state, "active");
+    let file_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO files (name, size_bytes, size_finalized, status, purpose) \
+         VALUES ('race-' || gen_random_uuid(), 0, TRUE, 'processed', 'batch') RETURNING id",
+    )
+    .fetch_one(&mut *writer)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO batches (file_id, endpoint, completion_window, expires_at, created_at) \
+         VALUES ($1, '/v1/x', '24h', NOW() + INTERVAL '24 hours', \
+                 ($2::timestamp AT TIME ZONE 'UTC') + INTERVAL '2 days')",
+    )
+    .bind(file_id)
+    .bind(week)
+    .execute(&mut *writer)
+    .await
+    .unwrap();
+
+    let manager = manager(&pool).await;
+    let retirement = tokio::spawn(async move {
+        manager
+            .retire_expired_batch_archive_partition(true, 30)
+            .await
+    });
+
+    // Poll until the claim is blocked on the registry row, well inside its
+    // 5 s lock timeout.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM pg_stat_activity
+                 WHERE datname = current_database()
+                   AND pid <> pg_backend_pid()
+                   AND wait_event_type = 'Lock'
+                   AND query LIKE '%batch_archive_buckets%FOR UPDATE%'
+             )",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if waiting {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the claim never waited for the week's registry row"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    writer.commit().await.unwrap();
+
+    let outcome = retirement.await.unwrap().unwrap();
+    assert_eq!(outcome, RetainedResponseRetirementOutcome::NoCandidate);
+    let (state, journaled): (String, bool) = sqlx::query_as(
+        "SELECT bucket.state, EXISTS ( \
+             SELECT 1 FROM retention_partition_retirements journal \
+             WHERE journal.parent_table = 'batch_requests_archive' \
+               AND journal.lower_bound = bucket.week_start) \
+         FROM batch_archive_buckets bucket WHERE bucket.week_start = $1",
+    )
+    .bind(week)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "active", "the week must not be fenced");
+    assert!(!journaled, "no retirement may be journaled");
+}
+
 #[sqlx::test]
 async fn recovery_completes_a_pending_journal_without_the_selection_flag(pool: PgPool) {
     let week = monday(10);
