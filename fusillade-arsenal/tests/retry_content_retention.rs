@@ -1,23 +1,21 @@
 //! Batch creation and retry refuse input or results whose content week is
 //! being, or has been, retired, and retry refuses a batch near the end of
-//! its content retention (`RetryAgeLimits`).
+//! its content retention (`with_retry_age_limit`).
 
 use chrono::{Datelike, Duration, NaiveDate, Utc};
 use fusillade_arsenal::batch::{BatchId, BatchInput, FileId, RequestTemplateInput};
 use fusillade_arsenal::error::FusilladeError;
 use fusillade_arsenal::request::RequestId;
-use fusillade_arsenal::{
-    PostgresRequestManager, PostgresStorageConfig, RetryAgeLimits, Storage, TestDbPools,
-};
+use fusillade_arsenal::{PostgresRequestManager, PostgresStorageConfig, Storage, TestDbPools};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-async fn manager(pool: &PgPool, limits: RetryAgeLimits) -> PostgresRequestManager<TestDbPools> {
+async fn manager(pool: &PgPool, limit: Option<Duration>) -> PostgresRequestManager<TestDbPools> {
     PostgresRequestManager::new(
         TestDbPools::new(pool.clone()).await.unwrap(),
         PostgresStorageConfig::default(),
     )
-    .with_retry_age_limits(limits)
+    .with_retry_age_limit(limit)
 }
 
 async fn upload(manager: &PostgresRequestManager<TestDbPools>) -> FileId {
@@ -119,7 +117,7 @@ fn assert_validation(result: Result<impl std::fmt::Debug, FusilladeError>, conte
 
 #[sqlx::test]
 async fn batch_creation_requires_an_active_input_week(pool: PgPool) {
-    let manager = manager(&pool, RetryAgeLimits::default()).await;
+    let manager = manager(&pool, None).await;
     let file_id = upload(&manager).await;
 
     for state in ["retiring", "retired"] {
@@ -142,7 +140,7 @@ async fn batch_creation_requires_an_active_input_week(pool: PgPool) {
 
 #[sqlx::test]
 async fn batch_retry_requires_an_active_input_week(pool: PgPool) {
-    let manager = manager(&pool, RetryAgeLimits::default()).await;
+    let manager = manager(&pool, None).await;
     let batch_id = failed_batch(&pool, &manager).await;
     let file_id = batch_file(&pool, batch_id).await;
 
@@ -166,7 +164,7 @@ async fn batch_retry_requires_an_active_input_week(pool: PgPool) {
 
 #[sqlx::test]
 async fn request_retry_requires_an_active_input_week(pool: PgPool) {
-    let manager = manager(&pool, RetryAgeLimits::default()).await;
+    let manager = manager(&pool, None).await;
     let batch_id = failed_batch(&pool, &manager).await;
     let file_id = batch_file(&pool, batch_id).await;
     let ids = request_ids(&pool, batch_id).await;
@@ -211,18 +209,11 @@ async fn set_batch_created_at(pool: &PgPool, batch_id: BatchId, age: &str) {
     .unwrap();
 }
 
-/// With a 30-day results period, retries are accepted until the batch is 29
-/// days old: one day before its archive week could drop.
+/// With a 30-day retention period, retries are accepted until the batch is
+/// 29 days old: one day before its archive week could drop.
 #[sqlx::test]
 async fn batch_retry_stops_a_day_before_results_retention_ends(pool: PgPool) {
-    let manager = manager(
-        &pool,
-        RetryAgeLimits {
-            batch_archive_days: Some(30),
-            template_days: None,
-        },
-    )
-    .await;
+    let manager = manager(&pool, Some(Duration::days(30))).await;
 
     let inside = failed_batch(&pool, &manager).await;
     set_batch_created_at(&pool, inside, "28 days 23 hours").await;
@@ -277,18 +268,12 @@ async fn set_input_created_at(pool: &PgPool, batch_id: BatchId, age: &str) {
     .unwrap();
 }
 
-/// With a 10-day input period, retries are accepted until the input file is
-/// 9 days old: one day before its template week could drop.
+/// The same period also runs from the input file's upload: with 10 days,
+/// retries are accepted until the input file is 9 days old, one day before
+/// its template week could drop, even though the batch itself is new.
 #[sqlx::test]
 async fn batch_retry_stops_a_day_before_input_retention_ends(pool: PgPool) {
-    let manager = manager(
-        &pool,
-        RetryAgeLimits {
-            batch_archive_days: None,
-            template_days: Some(10),
-        },
-    )
-    .await;
+    let manager = manager(&pool, Some(Duration::days(10))).await;
 
     let inside = failed_batch(&pool, &manager).await;
     set_input_created_at(&pool, inside, "8 days 23 hours").await;
@@ -349,7 +334,7 @@ async fn ensure_archive_week(pool: &PgPool, week_start: NaiveDate) {
 /// move back nothing and reset the batch over completions that are gone.
 #[sqlx::test]
 async fn archived_batch_retry_requires_an_active_archive_week(pool: PgPool) {
-    let manager = manager(&pool, RetryAgeLimits::default()).await;
+    let manager = manager(&pool, None).await;
     let today = Utc::now().date_naive();
     let week =
         today - Duration::days(today.weekday().num_days_from_monday().into()) - Duration::days(70);

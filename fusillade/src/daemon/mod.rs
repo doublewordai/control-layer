@@ -1375,7 +1375,7 @@ fn validate_retirement_capability(
     }
     if config.batch_archive_retirement_enabled()
         && !config
-            .batch_archive_retention_days()
+            .content_retention_days()
             .is_some_and(|days| (1..=i32::MAX as u32).contains(&days))
     {
         return Err(FusilladeError::ValidationError(
@@ -1391,7 +1391,7 @@ fn validate_retirement_capability(
     }
     if config.template_retirement_enabled()
         && !config
-            .template_retention_days()
+            .content_retention_days()
             .is_some_and(|days| (1..=i32::MAX as u32).contains(&days))
     {
         return Err(FusilladeError::ValidationError(
@@ -3503,39 +3503,36 @@ where
                 ));
                 daemon_handles.push(("retained_response_retirement", retirement_handle));
 
-                // Recovery of an unfinished batch-archive retirement must
-                // survive the flag or period being withdrawn, so the loop
-                // always runs; it selects NEW buckets only when both are set.
-                let batch_retention_days = self
+                // Recovery of an unfinished weekly retirement must survive
+                // the flag or period being withdrawn, so each loop always
+                // runs; it selects NEW buckets only when its flag and the
+                // shared content retention period are both set.
+                let content_retention_days = self
                     .retention_maintenance
-                    .batch_archive_retention_days()
+                    .content_retention_days()
                     .and_then(|days| i32::try_from(days).ok());
                 let batch_select_new = self
                     .retention_maintenance
                     .batch_archive_retirement_enabled()
-                    && batch_retention_days.is_some();
+                    && content_retention_days.is_some();
                 let batch_handle = tokio::spawn(run_batch_archive_retirement_loop(
                     self.storage.clone(),
                     self.shutdown_token.clone(),
                     query_timeout,
                     batch_select_new,
-                    batch_retention_days.unwrap_or(0),
+                    content_retention_days.unwrap_or(0),
                     Duration::from_secs(86_400),
                 ));
                 daemon_handles.push(("batch_archive_retirement", batch_handle));
 
-                let template_retention_days = self
-                    .retention_maintenance
-                    .template_retention_days()
-                    .and_then(|days| i32::try_from(days).ok());
                 let template_select_new = self.retention_maintenance.template_retirement_enabled()
-                    && template_retention_days.is_some();
+                    && content_retention_days.is_some();
                 let template_handle = tokio::spawn(run_template_retirement_loop(
                     self.storage.clone(),
                     self.shutdown_token.clone(),
                     query_timeout,
                     template_select_new,
-                    template_retention_days.unwrap_or(0),
+                    content_retention_days.unwrap_or(0),
                     Duration::from_secs(86_400),
                 ));
                 daemon_handles.push(("template_retirement", template_handle));

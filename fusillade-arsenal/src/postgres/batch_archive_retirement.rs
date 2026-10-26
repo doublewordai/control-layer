@@ -83,7 +83,7 @@ const BATCH_ARCHIVE_FAMILY: FamilySpec = FamilySpec {
     // batch, once retried, does not hold that later week through this
     // guard. Retry bounds the gap instead: it share-locks the batch's own
     // archive_bucket row and refuses unless that week is active, and the
-    // retry age cut-off (RetryAgeLimits) stops retries a day before the
+    // retry age cut-off (with_retry_age_limit) stops retries a day before the
     // creation week can drop. The later week drops at least a week after
     // the creation week, so a retried batch has that long to finish before
     // its archived completions could go. Not worth an expression index on
