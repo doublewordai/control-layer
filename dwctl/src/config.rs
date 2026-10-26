@@ -1269,8 +1269,8 @@ pub enum EmailTransportConfig {
 pub struct FilesConfig {
     /// `expires_at` given to an upload that sends no `expires_after`, and to a
     /// batch's output and error files from the batch's creation (default: 30
-    /// days). Content retention measures from the same point, so this is the
-    /// longest any content stays available.
+    /// days). Uploads may request up to `max_expiry_seconds`, so content
+    /// retention must cover that maximum, not this default.
     pub default_expiry_seconds: i64,
     /// Smallest `expires_after[seconds]` an upload may request (default: 1 hour)
     pub min_expiry_seconds: i64,

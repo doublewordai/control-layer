@@ -373,8 +373,8 @@ The expiry settings must be positive and ordered `min_expiry_seconds <= default_
 
 `expires_at` decides when file content stops being available:
 
-- An upload whose `expires_after[seconds]` is not an integer between `min_expiry_seconds` and `max_expiry_seconds` is rejected with 400 (`invalid_expiry`).
-- `GET /ai/v1/files/{file_id}/content` returns 410 once the file is past its `expires_at`. File metadata stays readable and reports the status `expired`.
+- An upload whose `expires_after[seconds]` is not an integer between `min_expiry_seconds` and `max_expiry_seconds` is rejected with 400.
+- `GET /ai/v1/files/{file_id}/content` returns 410 once the file is past its `expires_at`. File metadata stays readable after expiry.
 - `GET /ai/v1/batches/{batch_id}/results` returns 410 once the batch's output or error file is past its `expires_at`.
 - Output and error files expire `default_expiry_seconds` after the batch is created. OpenAI counts from when the batch completes instead, so here they expire up to one completion window earlier. Output and error files created before they were given an expiry are treated as expiring `default_expiry_seconds` after their creation.
 
