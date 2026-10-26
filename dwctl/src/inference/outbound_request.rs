@@ -11,7 +11,10 @@
 //! It also prices the request: the per-token prices it will be charged at are
 //! attached as an [`onwards::serving::BillingPrices`] extension, which onwards
 //! writes as `nvext.billing` on requests to `dynamo` members. Any `nvext.billing`
-//! already in the body is removed first, whoever sent it.
+//! already in the body is removed first, whoever sent it. A request that arrives
+//! with the extension already attached keeps it: a resume leg carries its original
+//! request's prices, not its own key's. The prices are also set on the response,
+//! which is where the continuation layer reads them for its resume legs.
 //!
 //! On the way back, the response to a request this forced is read as SSE and
 //! reassembled into a single non-streaming body. Both halves of that
@@ -158,9 +161,12 @@ pub async fn outbound_request_middleware(State(cfg): State<OutboundConfig>, requ
     };
 
     let (edited, model) = transform(&bytes, force_stream, stream_usage);
-    if let Some(prices) = model.and_then(|model| unit_prices(&cfg, &parts, &model)) {
+    if parts.extensions.get::<onwards::serving::BillingPrices>().is_none()
+        && let Some(prices) = model.and_then(|model| unit_prices(&cfg, &parts, &model))
+    {
         parts.extensions.insert(prices.to_billing());
     }
+    let prices = parts.extensions.get::<onwards::serving::BillingPrices>().copied();
 
     let response = match edited {
         Some(edited) => {
@@ -175,11 +181,15 @@ pub async fn outbound_request_middleware(State(cfg): State<OutboundConfig>, requ
         None => next.run(Request::from_parts(parts, Body::from(bytes))).await,
     };
 
-    if force_stream {
+    let mut response = if force_stream {
         reassemble_stream(response, cfg.timeouts).await
     } else {
         response
+    };
+    if let Some(prices) = prices {
+        response.extensions_mut().insert(prices);
     }
+    response
 }
 
 /// The per-token prices the request is charged at, from the key's account and

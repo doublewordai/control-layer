@@ -153,6 +153,11 @@ pub struct RequestContext {
     /// Metric label for the request origin (realtime / batch / playground),
     /// resolved at arm time from the API key purpose.
     pub origin: &'static str,
+    /// The prices the original request was sent at, read off its response.
+    /// Every resume leg is sent at them rather than at the continuation key's:
+    /// the customer is charged for a leg's tokens, through the merged usage, at
+    /// the original request's prices.
+    pub prices: Option<onwards::serving::BillingPrices>,
 }
 
 impl RequestContext {
@@ -370,6 +375,7 @@ pub async fn continuation_middleware(State(state): State<ContinuationState>, req
         response_id,
         route,
         origin: "unknown",
+        prices: None,
     };
 
     let response = next.run(forward(parts, body_bytes)).await;
@@ -400,6 +406,7 @@ pub async fn continuation_middleware(State(state): State<ContinuationState>, req
         return response;
     }
     ctx.origin = origin.label();
+    ctx.prices = response.extensions().get::<onwards::serving::BillingPrices>().copied();
     metrics::record_eligible_stream(&ctx.model, ctx.origin);
 
     tee(response, state, ctx)
@@ -901,6 +908,7 @@ mod tests {
             response_id: None,
             route: RouteInfo::default(),
             origin: "realtime",
+            prices: None,
         };
         assert_eq!(ctx.messages()[0]["role"], "user");
         assert!(ctx.tools().is_some());
@@ -915,6 +923,7 @@ mod tests {
             response_id: None,
             route: RouteInfo::default(),
             origin: "realtime",
+            prices: None,
         };
         assert_eq!(ctx.max_tokens(), Some(42));
         assert!(ctx.tools().is_none());
