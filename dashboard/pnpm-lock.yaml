@@ -35,7 +35,7 @@ importers:
         version: 5.3.0
       '@hookform/resolvers':
         specifier: ^5.2.1
-        version: 5.9.2(@standard-schema/spec@1.1.0)(react-hook-form@7.90.0(@types/react@19.3.0)(react@19.3.1))(zod@3.25.76)
+        version: 5.9.2(@standard-schema/spec@1.1.0)(react-hook-form@7.90.0(@types/react@19.3.0)(react@19.3.1))(zod@4.6.7)
       '@radix-ui/react-alert-dialog':
         specifier: ^1.1.15
         version: 1.2.1(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
@@ -134,7 +134,7 @@ importers:
         version: 0.4.6(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
       openai:
         specifier: ^6.0.0
-        version: 6.49.0(zod@3.25.76)
+        version: 6.49.0(zod@4.6.7)
       react:
         specifier: ^19.1.1
         version: 19.3.1
@@ -172,8 +172,8 @@ importers:
         specifier: ^1.0.7
         version: 1.0.7(tailwindcss@4.3.3)
       zod:
-        specifier: ^3.25.76
-        version: 3.25.76
+        specifier: ^4.0.0
+        version: 4.6.7
     devDependencies:
       '@eslint/js':
         specifier: ^9.33.0
@@ -228,10 +228,10 @@ importers:
         version: 2.15.0(@types/node@24.19.2)(typescript@5.9.3)
       rollup:
         specifier: npm:@rollup/wasm-node
-        version: '@rollup/wasm-node@4.65.0'
+        version: '@rollup/wasm-node@4.65.1'
       rollup-plugin-visualizer:
         specifier: ^7.0.0
-        version: 7.1.1(@rollup/wasm-node@4.65.0)(rolldown@1.2.15)
+        version: 7.1.1(@rollup/wasm-node@4.65.1)(rolldown@1.2.15)
       tailwindcss:
         specifier: ^4.1.12
         version: 4.3.3
@@ -1462,8 +1462,8 @@ packages:
   '@rolldown/pluginutils@1.0.1':
     resolution: {integrity: sha512-2j9bGt5Jh8hj+vPtgzPtl72j0yRxHAyumoo6TNfAjsLB04UtpSvPbPcDcBMxz7n+9CYB0c1GxQFxYRg2jimqGw==}
 
-  '@rollup/wasm-node@4.65.0':
-    resolution: {integrity: sha512-mq/KckZff56GjZvSu8Ubmcg+k87fxQK59oOwpxmnLyn3+8FQmhqhI012kvxzOTLnanCCyzepNRS5gK87T2tYAg==}
+  '@rollup/wasm-node@4.65.1':
+    resolution: {integrity: sha512-Be9x0pnFS91wtAslz0fx3HnLbqQuV4EF2XLemwjz8BGqLjMrw9tCzu7vIuWgpjCEsMQgMtZ1FIWHJxX95ZwBkw==}
     engines: {node: '>=18.0.0', npm: '>=8.0.0'}
     hasBin: true
 
@@ -4169,8 +4169,8 @@ packages:
     resolution: {integrity: sha512-rVksvsnNCdJ/ohGc6xgPwyN8eheCxsiLM8mxuE/t/mOVqJewPuO1miLpTHQiRgTKCLexL4MeAFVagts7HmNZ2Q==}
     engines: {node: '>=10'}
 
-  zod@3.25.76:
-    resolution: {integrity: sha512-gzUt/qt81nXsFGKIFcC3YnfEAx5NkunCfnDlvuBSSFS02bcXu4Lmea0AFIUwbLWxWPx3d9p8S5QoaujKcNQxcQ==}
+  zod@4.6.7:
+    resolution: {integrity: sha512-g8W2D2kU6a8untc053fX1uVBKzM7yqAxW/3zwk83+6RyF2+SKOuV+c0wBDhUwzV1PaGapmZH+rmcUzPf+3CGwg==}
 
   zwitch@2.0.4:
     resolution: {integrity: sha512-bXE4cR/kVZhKZX/RjPEflHaKVhUVl85noU3v6b8apfQEc1x4A+zBxjZ4lN8LqGd6WZ3dl98pY4o717VFmoPp+A==}
@@ -4436,13 +4436,13 @@ snapshots:
 
   '@fontsource/space-grotesk@5.3.0': {}
 
-  '@hookform/resolvers@5.9.2(@standard-schema/spec@1.1.0)(react-hook-form@7.90.0(@types/react@19.3.0)(react@19.3.1))(zod@3.25.76)':
+  '@hookform/resolvers@5.9.2(@standard-schema/spec@1.1.0)(react-hook-form@7.90.0(@types/react@19.3.0)(react@19.3.1))(zod@4.6.7)':
     dependencies:
       '@standard-schema/utils': 0.3.0
       react-hook-form: 7.90.0(@types/react@19.3.0)(react@19.3.1)
     optionalDependencies:
       '@standard-schema/spec': 1.1.0
-      zod: 3.25.76
+      zod: 4.6.7
 
   '@humanfs/core@0.19.2':
     dependencies:
@@ -5192,7 +5192,7 @@ snapshots:
 
   '@rolldown/pluginutils@1.0.1': {}
 
-  '@rollup/wasm-node@4.65.0':
+  '@rollup/wasm-node@4.65.1':
     dependencies:
       '@types/estree': 1.0.9
     optionalDependencies:
@@ -7348,9 +7348,9 @@ snapshots:
       powershell-utils: 0.2.1
       wsl-utils: 1.0.1
 
-  openai@6.49.0(zod@3.25.76):
+  openai@6.49.0(zod@4.6.7):
     optionalDependencies:
-      zod: 3.25.76
+      zod: 4.6.7
 
   optionator@0.9.4:
     dependencies:
@@ -7680,7 +7680,7 @@ snapshots:
       '@rolldown/binding-win32-arm64-msvc': 1.2.15
       '@rolldown/binding-win32-x64-msvc': 1.2.15
 
-  rollup-plugin-visualizer@7.1.1(@rollup/wasm-node@4.65.0)(rolldown@1.2.15):
+  rollup-plugin-visualizer@7.1.1(@rollup/wasm-node@4.65.1)(rolldown@1.2.15):
     dependencies:
       open: 11.0.4
       picomatch: 4.0.7
@@ -7688,7 +7688,7 @@ snapshots:
       yargs: 18.2.0
     optionalDependencies:
       rolldown: 1.2.15
-      rollup: '@rollup/wasm-node@4.65.0'
+      rollup: '@rollup/wasm-node@4.65.1'
 
   run-applescript@7.1.0: {}
 
@@ -8304,6 +8304,6 @@ snapshots:
 
   yocto-queue@0.1.0: {}
 
-  zod@3.25.76: {}
+  zod@4.6.7: {}
 
   zwitch@2.0.4: {}
