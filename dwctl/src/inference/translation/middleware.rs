@@ -87,6 +87,17 @@ pub async fn translation_middleware(State(registry): State<TranslationRegistry>,
             let model = rejections::model_of(&original_request);
             return rejections::refuse(&parts, response, "invalid_parameter", Some(param), model.as_deref());
         }
+        Err(TranslationError::UnsupportedParameter { param, message }) => {
+            let (status, bytes) = translator.error_for_code(StatusCode::BAD_REQUEST, &message, Some(param), "unsupported_parameter");
+            let model = rejections::model_of(&original_request);
+            return rejections::refuse(
+                &parts,
+                json_response(status, bytes),
+                "unsupported_parameter",
+                Some(param),
+                model.as_deref(),
+            );
+        }
         Err(TranslationError::Reasoning(error)) => {
             let status = StatusCode::from_u16(error.status_code()).unwrap_or(StatusCode::BAD_REQUEST);
             let (status, bytes) = translator.error_for_code(status, error.message(), error.param(), error.code());
@@ -347,6 +358,30 @@ mod tests {
         assert_eq!(body["stop_reason"], "end_turn");
         assert_eq!(body["usage"]["input_tokens"], 4);
         assert_eq!(body["usage"]["output_tokens"], 2);
+    }
+
+    #[tokio::test]
+    async fn server_side_tool_returns_anthropic_400_before_downstream() {
+        async fn must_not_run(_req: Request) -> Response {
+            panic!("unsupported server tool reached downstream")
+        }
+
+        let server = test_app(Router::new().route("/messages", post(must_not_run)));
+        let response = server
+            .post("/ai/v1/messages")
+            .add_header("x-api-key", "sk-test")
+            .json(&serde_json::json!({
+                "model": "claude-x", "max_tokens": 50,
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [{"type": "web_search_20250305", "name": "web_search"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code().as_u16(), 400);
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(body["error"]["message"].as_str().unwrap().contains("web_search_20250305"));
     }
 
     /// An over-limit request body is rejected as an Anthropic error, not buffered.

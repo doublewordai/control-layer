@@ -109,7 +109,7 @@ outlet = "0.11.1"
 outlet-postgres = "0.8.0"
 brotli = "8.0"
 flate2 = "1"
-zstd = "0.13"
+zstd = "0.14"
 async-compression = { version = "0.4", features = ["tokio", "gzip", "zstd"] }
 lettre = { version = "0.11", features = [
   "smtp-transport",
@@ -125,8 +125,8 @@ hickory-resolver = { version = "0.26.3", default-features = false, features = [
 ] }
 aes-gcm = "0.11.0"
 # Redis-backed keystore for zero-data-retention flex request keys.
-deadpool-redis = "0.18"
-redis = { version = "0.27", default-features = false, features = [
+deadpool-redis = "0.22"
+redis = { version = "0.32", default-features = false, features = [
   "tokio-rustls-comp",
   "connection-manager",
 ] }
