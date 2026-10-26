@@ -60,6 +60,7 @@ use super::query::{self, Inject, InvalidBreakpointValue};
 use super::sse::SseBufferedStream;
 use super::stats::CacheBilling;
 use crate::inference::rejections;
+use crate::inference::serving_name::ServingName;
 
 /// Bound on the index commit (off the response path). A slow/hung DB can't leak the
 /// spawned task or hold a pool connection indefinitely; a miss just drops the write
@@ -318,13 +319,16 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
 
     // Fork classify, parallel with the upstream call. Owns its inputs so the task is
     // `'static`; this is the one body clone (a future parse-once refactor would remove it).
-    let classify_handle = virtual_model.map(|model| {
+    let classify_handle = virtual_model.map(|requested| {
+        // Entries are scoped by the name as requested; tokenization uses the model.
+        let model = ServingName::of(&parts.extensions, &requested).model;
         let classifier = state.classifier.clone();
         let body = body_bytes.to_vec();
         tokio::spawn(async move {
             classifier
                 .classify(ClassifyRequest {
-                    virtual_model: &model,
+                    virtual_model: &requested,
+                    model: &model,
                     body: &body,
                     api_key: api_key.as_deref(),
                     // Serving always has the bearer token; only historical replay pre-resolves.

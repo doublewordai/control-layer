@@ -31,6 +31,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::clickhouse::{ClickhouseConfig, SinkHandle, SinkOptions};
+use crate::inference::serving_name::split_served;
 use crate::metrics::errors::component::PREFIX_CHAIN;
 use crate::prompt_cache::{
     ParseError, PrincipalResolver, TelemetryPolicy, TierPolicy, TokenizerClient, TokenizerError, parse_chat_completions,
@@ -177,6 +178,7 @@ pub struct PromptChainRow {
     pub instance_id: Uuid,
     pub correlation_id: i64,
     pub principal_id: Uuid,
+    /// The name as requested: `model`, or `model:<class>` for a class route.
     pub model: String,
     /// Hex, 32 characters each, one per block boundary in parse order.
     pub chain: Vec<String>,
@@ -329,7 +331,9 @@ impl PrefixChainRecorder {
             skipped("no_model");
             return;
         };
-        if !self.filter.allows(&model) {
+        // The allowlist and tokenizer-svc know models; the row keeps the name as
+        // requested, so each class's prompts stay distinguishable.
+        if !self.filter.allows(split_served(&model).0) {
             skipped("model_filtered");
             return;
         }
@@ -393,7 +397,7 @@ impl PrefixChainRecorder {
             }
         };
 
-        let (block_tokens, tokenizer_version) = match self.tokenizer.tokenize(&model, &chain.texts).await {
+        let (block_tokens, tokenizer_version) = match self.tokenizer.tokenize(split_served(&model).0, &chain.texts).await {
             Ok(r) if r.segment_counts.len() == chain.len() => {
                 counter!("dwctl_prefix_chain_tokenize_total", "outcome" => "ok").increment(1);
                 (r.segment_counts, r.tokenizer_version)

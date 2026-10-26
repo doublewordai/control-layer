@@ -13,6 +13,7 @@ use crate::api::models::files::{
 };
 use crate::api::models::users::CurrentUser;
 use crate::auth::permissions::{RequiresPermission, can_read_all_resources, operation, resource};
+use crate::inference::serving_name::has_class_suffix;
 
 use crate::AppState;
 use crate::db::{
@@ -180,7 +181,7 @@ impl OpenAIBatchRequest {
         accessible_models: &HashMap<String, AccessibleBatchModel>,
         allowed_url_paths: &[String],
         tolerations: &AccountTolerations,
-        class_routes: &HashSet<String>,
+        class_routes: &HashMap<String, String>,
     ) -> Result<fusillade::RequestTemplateInput> {
         // Validate custom_id is safe for HTTP headers
         validate_custom_id(&self.custom_id)?;
@@ -201,21 +202,15 @@ impl OpenAIBatchRequest {
             })?
             .to_string();
 
-        // A class other than standard serves realtime only; batch work runs
-        // on the model's standard class.
-        if class_routes.contains(&model) {
-            let alias = model.split_once(':').map_or(model.as_str(), |(alias, _)| alias);
-            return Err(Error::BadRequest {
-                message: format!("Model '{model}' is available for realtime requests only; use '{alias}' in batch files."),
-            });
+        // Batch work always runs on the model's standard class, and model
+        // aliases never contain ':', so any suffix is refused.
+        if has_class_suffix(&model) {
+            let message = match class_routes.get(&model) {
+                Some(standard) => format!("Model '{model}' is available for realtime requests only; use '{standard}' in batch files."),
+                None => format!("Model '{model}' has not been configured or is not available to user."),
+            };
+            return Err(Error::BadRequest { message });
         }
-
-        // Batches use deadline scheduling, so a model suffix is ignored.
-        // Resolve the base model before validating access.
-        let (model, _) = crate::inference::model_selector::split_model_suffix(&model).map_err(|error| Error::BadRequest {
-            message: error.to_string(),
-        })?;
-        let model = model.to_string();
 
         // Validate model access
         let accessible_model = accessible_models.get(&model).ok_or_else(|| Error::ModelAccessDenied {
@@ -823,7 +818,7 @@ struct FileRequestContext {
     allowed_url_paths: Vec<String>,
     /// Class routes (`alias:<class>`) of class-routed models, refused in
     /// batch lines.
-    class_routes: HashSet<String>,
+    class_routes: HashMap<String, String>,
     /// The toleration presets of the account that owns this upload, resolved
     /// per line by its model. A pinned line's list is written verbatim to
     /// `nvext.routing_constraints.tolerations` on its template body.
@@ -1482,8 +1477,10 @@ pub async fn upload_file<P: PoolProvider>(
                     targets
                         .targets
                         .iter()
-                        .filter(|entry| entry.value().default_pool().class_route_of().is_some())
-                        .map(|entry| entry.key().clone())
+                        .filter_map(|entry| {
+                            let model = entry.value().default_pool().class_route_of()?.to_owned();
+                            Some((entry.key().clone(), model))
+                        })
                         .collect()
                 })
                 .unwrap_or_default(),

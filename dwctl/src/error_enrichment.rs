@@ -30,6 +30,7 @@ use crate::{
     db::handlers::{Credits, api_keys::ApiKeys},
     errors::Error,
     inference::rejections::{Recorder, RejectionCode},
+    inference::serving_name::ServingName,
     telemetry::span_account_name,
     types::UserId,
 };
@@ -88,6 +89,9 @@ pub async fn error_enrichment_middleware(
     };
 
     let model_name = serde_json::from_slice::<ChatRequest>(&bytes).ok().map(|req| req.model);
+    // Access and modality are properties of the model: a class route
+    // (`model:<class>`) is checked as its model. Messages keep the name as sent.
+    let lookup_model = model_name.as_deref().map(|model| ServingName::of(&parts.extensions, model).model);
     // The model as a span label: only a configured alias, like onwards
     // records, never arbitrary client input.
     let span_model = model_name
@@ -170,8 +174,9 @@ pub async fn error_enrichment_middleware(
 
         // 1. Model access via group membership
         if let Some(model) = &model_name
+            && let Some(lookup) = &lookup_model
             && let Some(ApiKeyOwner { user_id, .. }) = key_info.as_ref()
-            && let Ok(has_access) = check_user_has_model_access(pools.write().into_inner(), *user_id, model).await
+            && let Ok(has_access) = check_user_has_model_access(pools.write().into_inner(), *user_id, lookup).await
             && !has_access
         {
             return tag(
@@ -189,7 +194,8 @@ pub async fn error_enrichment_middleware(
 
         // 2. Modality blocked by a traffic routing rule on this model.
         if let Some(model) = &model_name
-            && let Ok(Some(purpose)) = check_modality_blocked(pools.write().into_inner(), &key, model).await
+            && let Some(lookup) = &lookup_model
+            && let Ok(Some(purpose)) = check_modality_blocked(pools.write().into_inner(), &key, lookup).await
         {
             return tag(
                 Error::ModalityAccessDenied {

@@ -37,6 +37,7 @@ use sqlx_pool_router::PoolProvider;
 
 use super::image_normalizer_middleware::{normalize_error_response, normalize_value_to_tokens, refuse_normalize_error};
 use super::rejections;
+use super::serving_name::{ServingName, has_class_suffix};
 use super::store::{self as response_store, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
 use super::streaming::{ReplayFrame, flex_stream_response};
 use crate::db::{errors::DbError, handlers::api_keys::ApiKeys, models::api_keys::ApiKeyPurpose};
@@ -119,7 +120,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     }
 
     // Read and parse the request body
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
     let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -177,50 +178,44 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(|s| s.to_string());
 
-    // Asynchronous requests are scheduled by their deadline, so a model
-    // suffix (`alias:suffix`) is discarded here, at the outermost layer, and
-    // analytics, the prompt cache and billing all key on the bare alias. A
-    // malformed selector is a 400. Realtime model names are passed through
-    // unchanged.
-    // A class other than standard (`alias:<class>` on a class-routed model)
-    // serves realtime only: asynchronous work is scheduled on the standard
-    // class by its deadline. Checked on the requested tier, so an endpoint that
-    // serves flex as realtime still refuses it.
+    // The name is split once, here, into its model and class; inner layers
+    // read the attached `ServingName`. Model aliases never contain `:`, so a
+    // suffix only ever names a class route. Flex and background work always
+    // runs on the model's standard class: any suffix is refused (checked on the
+    // requested tier, so an endpoint that serves flex as realtime refuses it too).
+    let serving_name = request_value["model"]
+        .as_str()
+        .map(|model| ServingName::resolve(model, parts.extensions.get::<rejections::Recorder>()));
     if matches!(requested_tier, ServiceTier::Flex | ServiceTier::Background)
-        && let Some(model) = request_value["model"].as_str()
-        && let Some(standard) = parts
-            .extensions
-            .get::<rejections::Recorder>()
-            .and_then(|recorder| recorder.class_route_of(model))
+        && let Some(name) = &serving_name
+        && has_class_suffix(&name.requested)
     {
-        let model = model.to_owned();
-        let message =
-            format!("Model '{model}' is available for realtime requests only; send flex and background requests to '{standard}'.");
-        return invalid_request(&parts, Some(&model), &message, "serving_class_realtime_only", "model");
-    }
-
-    let scrubbed_suffix = match strip_async_model_suffix(&mut request_value, is_daemon_processed) {
-        Ok(changed) => changed,
-        Err(err) => {
-            let response = Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({"error": {"message": err.to_string(), "type": "invalid_request_error", "param": "model"}})
-                        .to_string(),
-                ))
-                .unwrap();
-            let model = request_value["model"].as_str();
-            return rejections::refuse(&parts, response, "invalid_model_selector", Some("model"), model);
+        let model = name.requested.clone();
+        if name.class.is_some() {
+            let message = format!(
+                "Model '{model}' is available for realtime requests only; send flex and background requests to '{}'.",
+                name.model
+            );
+            return invalid_request(&parts, Some(&model), &message, "serving_class_realtime_only", "model");
         }
-    };
+        let mut response = invalid_request_response(
+            &format!("The model '{model}' does not exist or you do not have access to it."),
+            "model_not_found",
+            "model",
+        );
+        *response.status_mut() = StatusCode::NOT_FOUND;
+        return rejections::refuse(&parts, response, "model_not_found", Some("model"), Some(&model));
+    }
+    if let Some(name) = serving_name {
+        parts.extensions.insert(name);
+    }
 
     // An operator can pin an account to a scheduling-toleration preset, for
     // all of its models or (through the account catalog) for one model: every
     // such request then carries exactly the preset's list at
     // `nvext.routing_constraints.tolerations`, replacing anything the client
-    // sent (stripped by `strip_scheduling_priority` above). Resolved after the
-    // suffix strip, so it keys on the bare alias, through the per-key policy
+    // sent (stripped by `strip_scheduling_priority` above). Keyed on the name
+    // as sent (a class route has its own preset), through the per-key policy
     // map; this covers realtime, flex and background alike, and batch JSONL
     // files are scrubbed and stamped at ingest. The "Default" setting and
     // every unpinned account are unchanged.
@@ -237,8 +232,8 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // bytes it receives (COR-522), so anything a scrubber removed from
     // `request_value` only stays removed if the bytes are rebuilt from it.
     // Every scrubber reports whether it changed something; the common case
-    // (nothing to scrub, no suffix, no pin) keeps the caller's bytes untouched.
-    let mut body_bytes = if scrubbed_suffix || scrubbed_ids || scrubbed_scheduling || scrubbed_pinned {
+    // (nothing to scrub, no pin) keeps the caller's bytes untouched.
+    let mut body_bytes = if scrubbed_ids || scrubbed_scheduling || scrubbed_pinned {
         bytes::Bytes::from(request_value.to_string())
     } else {
         body_bytes
@@ -1555,27 +1550,6 @@ pub(crate) fn set_routing_tolerations(value: &mut serde_json::Value, tolerations
     true
 }
 
-/// Discard a model suffix on an asynchronous request, returning whether the
-/// body changed. Realtime requests are left alone.
-fn strip_async_model_suffix(
-    value: &mut serde_json::Value,
-    asynchronous: bool,
-) -> Result<bool, super::model_selector::InvalidModelSelector> {
-    if !asynchronous {
-        return Ok(false);
-    }
-    let Some(model) = value.get("model").and_then(|m| m.as_str()) else {
-        return Ok(false);
-    };
-    let (alias, suffix) = super::model_selector::split_model_suffix(model)?;
-    let changed = suffix.is_some();
-    if changed {
-        let alias = alias.to_string();
-        value["model"] = serde_json::Value::String(alias);
-    }
-    Ok(changed)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1666,28 +1640,6 @@ mod tests {
             clean,
             serde_json::json!({"model": "m", "nvext": {"cache_control": {"enabled": true}}})
         );
-    }
-
-    #[test]
-    fn realtime_model_names_are_passed_through_unchanged() {
-        let mut body = serde_json::json!({"model": "org/model:suffix", "messages": []});
-        assert_eq!(strip_async_model_suffix(&mut body, false), Ok(false));
-        assert_eq!(body["model"], "org/model:suffix");
-    }
-
-    #[test]
-    fn async_suffixes_are_discarded_after_a_shape_check() {
-        let mut body = serde_json::json!({"model":"m:x-fast"});
-        assert_eq!(strip_async_model_suffix(&mut body, true), Ok(true));
-        assert_eq!(body["model"], "m");
-        let mut body = serde_json::json!({"model":"m"});
-        assert_eq!(strip_async_model_suffix(&mut body, true), Ok(false));
-        let mut body = serde_json::json!({"model":"m:a:b"});
-        assert!(strip_async_model_suffix(&mut body, true).is_err());
-        assert_eq!(body["model"], "m:a:b", "an invalid request is left as sent");
-        // No model at all (Model-Override header path): nothing to do.
-        let mut body = serde_json::json!({"messages": []});
-        assert_eq!(strip_async_model_suffix(&mut body, true), Ok(false));
     }
 
     #[test]

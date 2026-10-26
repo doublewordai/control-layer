@@ -206,74 +206,37 @@ async fn realtime_class_suffixes_are_not_parsed(pool: PgPool) {
 }
 
 #[dwctl_test_macros::test]
-async fn batch_upload_discards_model_suffixes(pool: PgPool) {
+async fn async_work_naming_a_model_suffix_is_refused(pool: PgPool) {
+    // Model aliases never contain ':', so a suffix can only name a class, and
+    // batch and flex always run on the standard class: nothing is rewritten.
     let f = Fixture::new(&pool).await;
     let headers = format!("Bearer {}", f.key);
-    // No final newline exercises the final buffered-line parser as well.
-    let lines = [
-        "policy:interactive",
-        "policy:throughput",
-        "policy:standard",
-        "policy",
-        "policy:x-fast",
-    ]
-    .into_iter()
-    .enumerate()
-    .map(|(i, model)| {
-        json!({"custom_id":format!("r{i}"),"method":"POST","url":"/v1/chat/completions",
+    let upload = |model: &str| {
+        let line = json!({"custom_id":"r","method":"POST","url":"/v1/chat/completions",
             "body":{"model":model,"messages":[{"role":"user","content":"hi"}]}})
-        .to_string()
-    })
-    .collect::<Vec<_>>()
-    .join("\n");
-    let response = f
-        .server
-        .post("/ai/v1/files")
-        .add_header("Authorization", &headers)
-        .multipart(
+        .to_string();
+        f.server.post("/ai/v1/files").add_header("Authorization", &headers).multipart(
             MultipartForm::new()
                 .add_text("purpose", "batch")
-                .add_part("file", Part::bytes(lines.into_bytes()).file_name("classes.jsonl")),
+                .add_part("file", Part::bytes(line.into_bytes()).file_name("models.jsonl")),
         )
-        .await;
-    response.assert_status(StatusCode::CREATED);
-    let id = response.json::<Value>()["id"].as_str().unwrap().to_owned();
-    let content = f
-        .server
-        .get(&format!("/ai/v1/files/{id}/content"))
-        .add_header("Authorization", &headers)
-        .await;
-    content.assert_status_ok();
-    let models = content
-        .text()
-        .lines()
-        .map(|line| {
-            serde_json::from_str::<Value>(line).unwrap()["body"]["model"]
-                .as_str()
-                .unwrap()
-                .to_owned()
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(models, ["policy", "policy", "policy", "policy", "policy"]);
-
-    for (model, expected) in [
-        ("inaccessible:interactive", StatusCode::FORBIDDEN),
-        ("policy:throughput:interactive", StatusCode::BAD_REQUEST),
-        ("policy:", StatusCode::BAD_REQUEST),
-    ] {
-        let line =
-            json!({"custom_id":"denied","method":"POST","url":"/v1/chat/completions","body":{"model":model,"messages":[]}}).to_string();
-        f.server
-            .post("/ai/v1/files")
-            .add_header("Authorization", &headers)
-            .multipart(
-                MultipartForm::new()
-                    .add_text("purpose", "batch")
-                    .add_part("file", Part::bytes(line.into_bytes()).file_name("denied.jsonl")),
-            )
-            .await
-            .assert_status(expected);
+    };
+    upload("policy").await.assert_status(StatusCode::CREATED);
+    for model in ["policy:interactive", "policy:standard", "policy:x-fast", "policy:", "policy:a:b"] {
+        upload(model).await.assert_status(StatusCode::BAD_REQUEST);
     }
+
+    for model in ["policy:interactive", "policy:standard"] {
+        let response = f
+            .server
+            .post("/ai/v1/chat/completions")
+            .add_header("Authorization", &headers)
+            .json(&json!({"model": model, "messages": [{"role": "user", "content": "hi"}], "service_tier": "flex"}))
+            .await;
+        response.assert_status(StatusCode::NOT_FOUND);
+        assert_eq!(response.json::<Value>()["error"]["code"], "model_not_found", "{model}");
+    }
+    assert!(f.upstream.received_requests().await.unwrap().is_empty());
 }
 
 #[dwctl_test_macros::test]

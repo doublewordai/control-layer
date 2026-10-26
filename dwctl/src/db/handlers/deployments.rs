@@ -1573,14 +1573,16 @@ impl<'c> Deployments<'c> {
 
             UNION ALL
 
-            -- A class route (`alias:<class>`) is served by its class's endpoint.
+            -- A class route (`alias:<class>`) reasons as its model: the standard class's.
             SELECT
                 model.alias || ':' || class.class_key AS routing_alias,
                 endpoint.reasoning_translation AS endpoint_reasoning_translation,
                 model.reasoning_translation_overrides AS model_reasoning_translation_overrides
             FROM model_serving_classes class
             INNER JOIN deployed_models model ON model.id = class.deployed_model_id
-            INNER JOIN inference_endpoints endpoint ON endpoint.id = class.inference_endpoint_id
+            INNER JOIN model_serving_classes standard
+                ON standard.deployed_model_id = model.id AND standard.class_key = 'standard'
+            INNER JOIN inference_endpoints endpoint ON endpoint.id = standard.inference_endpoint_id
             WHERE class.class_key <> 'standard'
               AND model.alias || ':' || class.class_key = ANY($1)
               AND model.deleted = FALSE
@@ -4868,7 +4870,7 @@ mod tests {
     }
 
     #[dwctl_test_macros::test]
-    async fn a_class_routed_model_takes_reasoning_efforts_from_its_class_endpoints(pool: PgPool) {
+    async fn every_class_of_a_class_routed_model_reasons_as_the_model(pool: PgPool) {
         let user = create_test_user(&pool).await;
         let (composite_id, _) = create_composite_and_components(&pool, user.id, 1).await;
         let alias: String = sqlx::query_scalar("SELECT alias FROM deployed_models WHERE id = $1")
@@ -4921,9 +4923,10 @@ mod tests {
             policies[&alias].supported_efforts().unwrap().chat_completions,
             Some(vec![ReasoningEffort::Low, ReasoningEffort::Medium, ReasoningEffort::High])
         );
+        // The fast endpoint's own default is ignored: reasoning is a property of the model.
         assert_eq!(
             policies[&fast].supported_efforts().unwrap().chat_completions,
-            Some(vec![ReasoningEffort::High])
+            Some(vec![ReasoningEffort::Low, ReasoningEffort::Medium, ReasoningEffort::High])
         );
     }
 

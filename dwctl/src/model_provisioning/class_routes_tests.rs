@@ -34,6 +34,7 @@ clay:
       display_name: Standard
       endpoint: gateway
       upstream_model_name: dynamo-example/throughput
+      realtime_inflight_limit: 14
       tariffs:
         - name: standard
           purpose: realtime
@@ -86,8 +87,26 @@ fn class_catalog_rejects_class_aliases_and_bad_limits() {
         catalog(&v)
             .unwrap_err()
             .to_string()
-            .contains("realtime_inflight_limit must be positive")
+            .contains("realtime_inflight_limit is required and must be positive")
     );
+    let mut v = fixture();
+    v["clay"]["class_routes"]["fast"]
+        .as_mapping_mut()
+        .unwrap()
+        .remove("realtime_inflight_limit");
+    assert!(catalog(&v).unwrap_err().to_string().contains("realtime_inflight_limit is required"));
+}
+
+#[test]
+fn virtual_model_aliases_cannot_contain_a_class_separator() {
+    let mut v = fixture();
+    v["clay"]["alias"] = serde_yaml::Value::String("example/model:fast".into());
+    assert!(catalog(&v).unwrap_err().to_string().contains("must not contain ':'"));
+    // Physical deployments are exempt until components are removed.
+    let mut v = fixture();
+    v["clay"]["deployments"][0]["alias"] = serde_yaml::Value::String("legacy-example/model:interactive".into());
+    v["clay"]["routing"]["pools"]["default"][0]["deployment"] = serde_yaml::Value::String("legacy-example/model:interactive".into());
+    catalog(&v).unwrap();
 }
 
 #[test]
@@ -127,24 +146,14 @@ fn add_batch_price(value: &mut serde_yaml::Value, class: &str) {
 }
 
 #[test]
-fn class_catalog_rejects_batch_prices_on_nonstandard_classes() {
-    for key in ["fast", "economy"] {
+fn class_catalog_rejects_batch_prices_on_every_class() {
+    for key in ["standard", "fast"] {
         let mut value = fixture();
-        if key != "fast" {
-            value["clay"]["class_routes"][key] = value["clay"]["class_routes"]["fast"].clone();
-        }
         add_batch_price(&mut value, key);
         let error = catalog(&value).unwrap_err().to_string();
-        assert!(error.contains("batch prices can only specialize standard"), "{error}");
+        assert!(error.contains("batch and flex prices are set on the model"), "{error}");
         assert!(error.contains(key), "{error}");
     }
-}
-
-#[test]
-fn class_catalog_accepts_batch_prices_on_standard() {
-    let mut value = fixture();
-    add_batch_price(&mut value, "standard");
-    catalog(&value).unwrap();
 }
 
 #[sqlx::test]
@@ -170,7 +179,7 @@ async fn staging_classes_preserves_legacy_route_and_effective_price(pool: PgPool
             .fetch_all(&pool)
             .await
             .unwrap();
-    assert_eq!(limits, [("fast".into(), Some(7)), ("standard".into(), None)]);
+    assert_eq!(limits, [("fast".into(), Some(7)), ("standard".into(), Some(14))]);
     for class in [None, Some("standard"), Some("fast")] {
         let price: Decimal =
             sqlx::query_scalar("SELECT input_price_per_token FROM effective_model_tariff($1,NULL,'realtime',NULL,$2,NOW())")

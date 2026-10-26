@@ -1421,6 +1421,13 @@ fn convert_class_routes(
         config.affinity = None;
         config
     });
+    // Reasoning translation is a property of the model: every class uses the
+    // standard class's (its endpoint's default under the model's overrides).
+    let reasoning_translation = composite
+        .classes
+        .iter()
+        .find(|class| class.class_key == STANDARD_CLASS)
+        .and_then(|class| class.target.reasoning_translation.clone());
     let targets = composite
         .classes
         .iter()
@@ -1441,7 +1448,7 @@ fn convert_class_routes(
                 request_timeout_secs: None,
                 trusted: Some(target.trusted),
                 propagate_trace_context: None,
-                reasoning_translation: target.reasoning_translation.clone().map(Into::into),
+                reasoning_translation: reasoning_translation.clone().map(Into::into),
                 accepts_scheduling_priority: target.endpoint_accepts_scheduling_priority,
                 kind: target.endpoint_kind,
             };

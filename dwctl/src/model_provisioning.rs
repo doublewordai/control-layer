@@ -554,6 +554,13 @@ impl Catalog {
 
         for model in &self.models {
             validate_alias(&mut aliases, &model.clay.alias, &model.source, "virtual model")?;
+            // `model:<class>` names a class; physical deployments are exempt until components go.
+            ensure!(
+                !model.clay.alias.contains(':'),
+                "{}: virtual model alias {:?} must not contain ':', which separates a model from its serving class",
+                model.source,
+                model.clay.alias
+            );
             ensure_nonempty(
                 model.clay.model_name.as_deref().unwrap_or(&model.canonical_model),
                 &model.source,
@@ -617,8 +624,8 @@ impl Catalog {
                     );
                     validate_tariffs(&class.tariffs, &model.source)?;
                     ensure!(
-                        key == "standard" || class.tariffs.iter().all(|t| t.purpose != TariffPurpose::Batch),
-                        "{}: class {key:?}: batch prices can only specialize standard",
+                        class.tariffs.iter().all(|t| t.purpose != TariffPurpose::Batch),
+                        "{}: class {key:?}: batch and flex prices are set on the model, not on a class",
                         model.source
                     );
                     ensure!(
@@ -632,8 +639,8 @@ impl Catalog {
                         model.source
                     );
                     ensure!(
-                        class.realtime_inflight_limit.is_none_or(|limit| limit > 0),
-                        "{}: class {key:?}: realtime_inflight_limit must be positive",
+                        class.realtime_inflight_limit.is_some_and(|limit| limit > 0),
+                        "{}: class {key:?}: realtime_inflight_limit is required and must be positive",
                         model.source
                     );
                     if let Some(cache) = &class.cache_tariff {
