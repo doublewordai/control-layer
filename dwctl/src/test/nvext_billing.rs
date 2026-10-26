@@ -30,6 +30,22 @@ async fn upstream() -> MockServer {
     Mock::given(method("POST"))
         .respond_with(|request: &wiremock::Request| {
             let body: Value = request.body_json().unwrap();
+            if body["stream"] == json!(true) {
+                let chunk = |delta: Value, usage: Value| {
+                    json!({
+                        "id":"chatcmpl-test","created":1,"model":body["model"],
+                        "object":"chat.completion.chunk",
+                        "choices":[{"index":0,"delta":delta,"finish_reason":null}],
+                        "usage":usage
+                    })
+                };
+                let sse = format!(
+                    "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                    chunk(json!({"role":"assistant","content":"OK"}), Value::Null),
+                    chunk(json!({}), json!({"prompt_tokens":10,"completion_tokens":5,"total_tokens":15})),
+                );
+                return ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream");
+            }
             ResponseTemplate::new(200).set_body_json(json!({
                 "id":"chatcmpl-test","created":1,"model":body["model"],
                 "object":"chat.completion",
@@ -171,6 +187,29 @@ async fn realtime_requests_to_dynamo_carry_their_realtime_prices(pool: PgPool) {
             "the realtime price, whatever the client sent: {body}"
         );
     }
+}
+
+#[dwctl_test_macros::test]
+async fn streaming_requests_to_dynamo_carry_their_prices(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    f.server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {}", f.realtime_key))
+        .json(&json!({
+            "model": "on-dynamo",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+            "nvext": {"billing": {"prompt": 0, "cached": 0, "output": 0}},
+        }))
+        .await
+        .assert_status_ok();
+    let body: Value = f.dynamo.received_requests().await.unwrap().last().unwrap().body_json().unwrap();
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["nvext"]["billing"],
+        json!({"prompt": 1e-6, "cached": 1e-6, "output": 3e-6}),
+        "a streaming request is priced like any other: {body}"
+    );
 }
 
 /// The batch daemon dispatches through the same stack, on the batch-purpose
