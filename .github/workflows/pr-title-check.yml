@@ -5,6 +5,10 @@ on:
     types: [opened, edited, synchronize, reopened]
   merge_group:
     types: [checks_requested]
+  # Release Please opens and updates its pull requests with GITHUB_TOKEN,
+  # which does not trigger pull_request, so it dispatches this on the release
+  # branch to report the required check.
+  workflow_dispatch: {}
 
 jobs:
   check-title:
@@ -39,3 +43,7 @@ jobs:
       - name: Skip pull request title validation for merge-group commits
         if: github.event_name == 'merge_group'
         run: echo "Pull request title was validated before this merge-group commit was queued."
+
+      - name: Skip pull request title validation for dispatched release checks
+        if: github.event_name == 'workflow_dispatch'
+        run: echo "Dispatched by Release Please for its own pull request, whose title it generates."

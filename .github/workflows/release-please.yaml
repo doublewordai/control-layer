@@ -5,10 +5,16 @@ on:
     branches:
       - main
 
+# Everything here runs on the workflow's own GITHUB_TOKEN. GitHub does not
+# start workflows from events that token creates (pushes, pull requests,
+# releases), except workflow_dispatch, so this workflow dispatches what those
+# events used to trigger: the Release workflow for each new release, and the
+# required checks for each release pull request it opens or updates.
 permissions:
   contents: write
   pull-requests: write
   issues: write
+  actions: write
 
 jobs:
   release-please:
@@ -21,7 +27,30 @@ jobs:
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
-          token: ${{ secrets.RELEASE_TOKEN }}
+
+      # Releases created with GITHUB_TOKEN do not fire `release: published`,
+      # so start the Release workflow for each one. Every job there accepts a
+      # dispatched tag and checks it out. The action reports the root
+      # component as `tag_name` and every other component as
+      # `<path>--tag_name`; both only exist for releases created in this run.
+      - name: Dispatch the Release workflow for new releases
+        if: ${{ steps.release.outputs.releases_created == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_OUTPUTS: ${{ toJSON(steps.release.outputs) }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          tags=$(jq -r 'to_entries[]
+            | select(.key == "tag_name" or (.key | endswith("--tag_name")))
+            | .value | select(. != null and . != "")' <<< "$RELEASE_OUTPUTS" | sort -u)
+          if [[ -z "$tags" ]]; then
+            echo "releases_created is true but no tag names were reported" >&2
+            exit 1
+          fi
+          while read -r tag; do
+            echo "Dispatching release.yml for $tag"
+            gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" -f release_tag="$tag"
+          done <<< "$tags"
 
   synchronize-release-prs:
     needs: [release-please]
@@ -39,7 +68,6 @@ jobs:
       - name: Checkout release PR
         uses: actions/checkout@v7
         with:
-          token: ${{ secrets.RELEASE_TOKEN }}
           ref: ${{ matrix.pr.headBranchName }}
 
       - name: Install Rust
@@ -59,3 +87,17 @@ jobs:
           git add Cargo.lock fusillade-arsenal/Cargo.toml
           git commit -m "chore: synchronize release dependencies"
           git push origin HEAD:${{ matrix.pr.headBranchName }}
+
+      # Neither release-please's push nor the one above triggers pull_request
+      # workflows, so run the required checks on the release PR's head
+      # explicitly. Their jobs are gated on pull_request/merge_group, so a
+      # dispatched run reports them skipped (what a versions-only release PR
+      # reports anyway); the merge queue still runs the full suite.
+      - name: Run required checks on the release PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ matrix.pr.headBranchName }}
+        run: |
+          for workflow in ci.yaml pr-title-check.yml; do
+            gh workflow run "$workflow" --repo "$GITHUB_REPOSITORY" --ref "$BRANCH"
+          done

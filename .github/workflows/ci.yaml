@@ -5,6 +5,11 @@ on:
   pull_request: {}
   merge_group:
     types: [checks_requested]
+  # Release Please pushes its release branches with GITHUB_TOKEN, which does
+  # not trigger pull_request, so it dispatches CI on the release branch to
+  # report the required checks. Jobs gated on pull_request/merge_group report
+  # skipped; the merge queue's merge_group run still validates everything.
+  workflow_dispatch: {}
 
 jobs:
   changes:
