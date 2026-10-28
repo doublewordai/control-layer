@@ -25,6 +25,11 @@ jobs:
         with:
           app-id: ${{ vars.RELEASE_PLEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY }}
+          # Only this repository (the default) and only what release-please
+          # needs, whatever else the App installation may be granted.
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
 
       - uses: googleapis/release-please-action@v5
         id: release
@@ -54,6 +59,11 @@ jobs:
         with:
           app-id: ${{ vars.RELEASE_PLEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY }}
+          # Only this repository (the default) and only what release-please
+          # needs, whatever else the App installation may be granted.
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
 
       - name: Checkout release PR
         uses: actions/checkout@v7
