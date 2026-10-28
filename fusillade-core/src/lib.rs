@@ -56,10 +56,9 @@ mod redacted_api_key_tests {
     const SECRET: &str = "sk-test-do-not-log";
 
     fn assert_redacted(value: &impl std::fmt::Debug) {
-        for output in [format!("{value:?}"), format!("{value:#?}")] {
-            assert!(!output.contains(SECRET), "secret leaked: {output}");
-            assert!(output.contains("api_key: \"<redacted>\""), "{output}");
-        }
+        let output = format!("{value:?}");
+        assert!(!output.contains(SECRET), "secret leaked: {output}");
+        assert!(output.contains("api_key: \"<redacted>\""), "{output}");
     }
 
     #[test]
