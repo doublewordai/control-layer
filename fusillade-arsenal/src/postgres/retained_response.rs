@@ -1730,13 +1730,27 @@ const COUNT_OWNER_FLEX_REQUESTS_SQL: &str = r#"
         JOIN retained_response_objects object
           ON object.delete_on = bucket.delete_on
          AND object.object_kind = 'request'
-        JOIN retained_response_request_routes route
-          ON route.request_id = object.object_id
-         AND route.group_id = object.group_id
-         AND route.delete_on = object.delete_on
-        JOIN retained_response_group_routes group_route
-          ON group_route.group_id = object.group_id
-         AND group_route.delete_on = object.delete_on
+        -- Route checks are LIMIT 1 probes, not joins. Both route tables are
+        -- keyed so each object has at most one match, but a plain join lets the
+        -- planner (which expects ~1 object) merge-join the whole request-route
+        -- index in key order: harmless for an owner with no retained flex work,
+        -- a walk over most of a very large index for one with plenty. The LIMIT
+        -- keeps this a per-object index probe whatever the owner's volume.
+        CROSS JOIN LATERAL (
+            SELECT 1
+            FROM retained_response_request_routes route
+            WHERE route.request_id = object.object_id
+              AND route.group_id = object.group_id
+              AND route.delete_on = object.delete_on
+            LIMIT 1
+        ) route
+        CROSS JOIN LATERAL (
+            SELECT 1
+            FROM retained_response_group_routes group_route
+            WHERE group_route.group_id = object.group_id
+              AND group_route.delete_on = object.delete_on
+            LIMIT 1
+        ) group_route
         WHERE bucket.state = 'active'
           AND bucket.partition_schema = current_schema()
           AND bucket.partition_table =
@@ -4238,6 +4252,33 @@ mod tests {
         }
     }
 
+    /// Whether every scan of `relation_name` in the plan sits beneath a
+    /// `Limit` node, i.e. it is executed as a per-row probe rather than as one
+    /// side of a join the planner is free to turn into a full index walk.
+    fn relation_only_under_limit(plan: &serde_json::Value, relation_name: &str) -> bool {
+        fn walk(value: &serde_json::Value, relation_name: &str, under_limit: bool) -> bool {
+            match value {
+                serde_json::Value::Array(values) => values
+                    .iter()
+                    .all(|value| walk(value, relation_name, under_limit)),
+                serde_json::Value::Object(fields) => {
+                    let under_limit = under_limit
+                        || fields.get("Node Type").and_then(|value| value.as_str())
+                            == Some("Limit");
+                    let this_ok = under_limit
+                        || fields.get("Relation Name").and_then(|value| value.as_str())
+                            != Some(relation_name);
+                    this_ok
+                        && fields
+                            .values()
+                            .all(|value| walk(value, relation_name, under_limit))
+                }
+                _ => true,
+            }
+        }
+        walk(plan, relation_name, false)
+    }
+
     fn relation_actual_loops(plan: &serde_json::Value, relation_name: &str) -> u64 {
         match plan {
             serde_json::Value::Array(values) => values
@@ -4583,6 +4624,19 @@ mod tests {
             0,
             "flex-count plan must remove or avoid scanning the irrelevant daily child: {flex_plan}"
         );
+        for route_table in [
+            "retained_response_request_routes",
+            "retained_response_group_routes",
+        ] {
+            assert!(
+                plan_mentions_relation(&flex_plan, route_table),
+                "flex-count plan must check {route_table}: {flex_plan}"
+            );
+            assert!(
+                relation_only_under_limit(&flex_plan, route_table),
+                "flex-count plan must probe {route_table} per object, never join it: {flex_plan}"
+            );
+        }
 
         let trailing_rows = sqlx::query(TRAILING_DEMAND_SQL)
             .bind(timestamp("2026-08-10T00:00:00Z"))
