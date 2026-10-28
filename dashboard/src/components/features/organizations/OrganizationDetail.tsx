@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import { useOrganization } from "@/api/control-layer/hooks";
+import { useOrganization, useUser } from "@/api/control-layer/hooks";
 import { Button } from "@/components/ui/button";
 import { ArrowLeft } from "lucide-react";
 import { useAuthorization } from "@/utils";
@@ -16,6 +16,10 @@ export function OrganizationDetail() {
   const [showEditModal, setShowEditModal] = useState(false);
   const { hasPermission } = useAuthorization();
   const isPlatformManager = hasPermission("users-groups");
+  const { data: currentUser } = useUser("current");
+  const membership = currentUser?.organizations?.find((entry) => entry.id === organizationId);
+  const canManage = membership?.role === "owner" || membership?.role === "admin";
+  const supportOnly = isPlatformManager && membership?.role !== "owner";
 
   if (isLoading) {
     return (
@@ -74,7 +78,7 @@ export function OrganizationDetail() {
         </Button>
       </div>
 
-      <MemberManagement organizationId={organizationId!} />
+      <MemberManagement organizationId={organizationId!} readOnly={!canManage} />
 
       {isPlatformManager && (
         <OrganizationServingCard organizationId={organizationId!} />
@@ -84,8 +88,8 @@ export function OrganizationDetail() {
         isOpen={showEditModal}
         onClose={() => setShowEditModal(false)}
         organization={org}
-        canEditZdr={isPlatformManager}
-        canEditServing={isPlatformManager}
+        canEditZdr={isPlatformManager || membership?.role === "owner"}
+        supportOnly={supportOnly}
       />
     </div>
   );

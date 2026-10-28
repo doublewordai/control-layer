@@ -15,13 +15,13 @@
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# Setup: Get user IDs and grant roles
+# Setup: Get pre-provisioned user IDs
 # -----------------------------------------------------------------------------
 
 # Get user IDs
 GET http://localhost:3001/admin/api/v1/users/current
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Captures]
 admin_user_id: jsonpath "$.id"
@@ -34,20 +34,11 @@ HTTP 200
 user1_id: jsonpath "$.id"
 
 GET http://localhost:3001/admin/api/v1/users/current
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 HTTP 200
 [Captures]
 user2_id: jsonpath "$.id"
-
-# Temporarily grant user2 PlatformManager role for testing
-PATCH http://localhost:3001/admin/api/v1/users/{{user2_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
-{
-  "roles": ["PlatformManager"]
-}
-HTTP 200
 
 # =============================================================================
 # Transaction Creation (POST /transactions) - Requires Credits::CreateAll
@@ -102,8 +93,8 @@ HTTP 403
 
 # User2 (PlatformManager) grants credits to user1 - should succeed
 POST http://localhost:3001/admin/api/v1/transactions
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 {
   "user_id": "{{user1_id}}",
   "transaction_type": "admin_grant",
@@ -123,8 +114,8 @@ user1_transaction_id: jsonpath "$.id"
 
 # User2 (PlatformManager) grants credits to themselves - should succeed
 POST http://localhost:3001/admin/api/v1/transactions
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 {
   "user_id": "{{user2_id}}",
   "transaction_type": "admin_grant",
@@ -141,8 +132,8 @@ user2_transaction_id: jsonpath "$.id"
 
 # User2 (PlatformManager) creates another transaction for user1
 POST http://localhost:3001/admin/api/v1/transactions
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 {
   "user_id": "{{user1_id}}",
   "transaction_type": "admin_grant",
@@ -184,8 +175,8 @@ HTTP 404
 
 # User2 (PlatformManager) gets user1's transaction - should succeed
 GET http://localhost:3001/admin/api/v1/transactions/{{user1_transaction_id}}
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{user1_transaction_id}}"
@@ -193,8 +184,8 @@ jsonpath "$.user_id" == "{{user1_id}}"
 
 # User2 gets their own transaction - should succeed
 GET http://localhost:3001/admin/api/v1/transactions/{{user2_transaction_id}}
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{user2_transaction_id}}"
@@ -283,8 +274,8 @@ HTTP 403
 
 # User2 (PlatformManager) lists without params - should only see own by default
 GET http://localhost:3001/admin/api/v1/transactions
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 HTTP 200
 [Asserts]
 jsonpath "$.data" isCollection
@@ -299,8 +290,8 @@ jsonpath "$.data[?(@.user_id == '{{user1_id}}')]" count == 0
 
 # User2 lists all transactions - should see everyone's
 GET http://localhost:3001/admin/api/v1/transactions?all=true
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 HTTP 200
 [Asserts]
 jsonpath "$.data" isCollection
@@ -310,8 +301,8 @@ jsonpath "$.data[*].user_id" contains "{{user2_id}}"
 
 # User2 uses all=true with pagination - should succeed
 GET http://localhost:3001/admin/api/v1/transactions?all=true&skip=0&limit=10
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 HTTP 200
 [Asserts]
 jsonpath "$.data" isCollection
@@ -322,8 +313,8 @@ jsonpath "$.data" isCollection
 
 # User2 gets user1's transactions specifically - should succeed
 GET http://localhost:3001/admin/api/v1/transactions?user_id={{user1_id}}
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 HTTP 200
 [Asserts]
 jsonpath "$.data" isCollection
@@ -334,8 +325,8 @@ jsonpath "$.data[?(@.user_id == '{{user2_id}}')]" count == 0
 
 # User2 gets their own transactions via user_id - should succeed
 GET http://localhost:3001/admin/api/v1/transactions?user_id={{user2_id}}
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 HTTP 200
 [Asserts]
 jsonpath "$.data[*].user_id" contains "{{user2_id}}"
@@ -343,8 +334,8 @@ jsonpath "$.data[?(@.user_id == '{{user1_id}}')]" count == 0
 
 # User2 uses user_id with pagination - should succeed
 GET http://localhost:3001/admin/api/v1/transactions?user_id={{user1_id}}&skip=0&limit=5
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 HTTP 200
 [Asserts]
 jsonpath "$.data" isCollection
@@ -355,8 +346,8 @@ jsonpath "$.data" isCollection
 
 # User2 uses all=true with user_id - all takes precedence, should see everyone
 GET http://localhost:3001/admin/api/v1/transactions?all=true&user_id={{user1_id}}
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 HTTP 200
 [Asserts]
 jsonpath "$.data" isCollection
@@ -366,8 +357,8 @@ jsonpath "$.data[*].user_id" contains "{{user2_id}}"
 
 # User2 uses all=true with user_id and pagination - should see everyone
 GET http://localhost:3001/admin/api/v1/transactions?all=true&user_id={{user2_id}}&skip=0&limit=10
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 HTTP 200
 [Asserts]
 jsonpath "$.data" isCollection
@@ -378,8 +369,8 @@ jsonpath "$.data" isCollection
 
 # User2 (PlatformManager) tests pagination on all transactions
 GET http://localhost:3001/admin/api/v1/transactions?all=true&skip=0&limit=1
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 HTTP 200
 [Asserts]
 jsonpath "$.data" isCollection
@@ -395,20 +386,3 @@ jsonpath "$.data" isCollection
 jsonpath "$.data" count <= 1
 # All results should be for user1
 jsonpath "$.data[*].user_id" contains "{{user1_id}}"
-
-# =============================================================================
-# Cleanup: Restore user2 to original roles
-# =============================================================================
-
-# Restore user2 to StandardUser + BatchAPIUser
-PATCH http://localhost:3001/admin/api/v1/users/{{user2_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
-{
-  "roles": ["StandardUser", "BatchAPIUser"]
-}
-HTTP 200
-
-# =============================================================================
-# Cleanup Complete
-# =============================================================================

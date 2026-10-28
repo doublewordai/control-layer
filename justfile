@@ -411,6 +411,7 @@ _test-other target="" *args="":
         # Generate admin JWT
         if ADMIN_JWT=$(EMAIL=$ADMIN_EMAIL PASSWORD=$ADMIN_PASSWORD ./scripts/login.sh); then
             echo "admin_jwt=$ADMIN_JWT" > test.env
+            echo "admin_email=$ADMIN_EMAIL" >> test.env
             echo "✅ Admin JWT generated successfully"
         else
             echo "❌ Failed to generate admin JWT:"
@@ -458,6 +459,10 @@ _test-other target="" *args="":
             echo "❌ Failed to generate user 2 JWT - see error above"
             exit 1
         fi    
+
+        # These headers represent the trusted upstream SSO boundary in the
+        # isolated test stack. Privileged roles are never granted via the API.
+        docker compose -f docker-compose.yml -f docker-compose.test.yml exec -T postgres psql -v ON_ERROR_STOP=1 -U control_layer -d control_layer < scripts/seed-auth-test-users.sql
 
         echo "Test cookies written to test.env"
 

@@ -618,9 +618,10 @@ pub async fn update_organization<P: PoolProvider>(
 ) -> Result<Json<OrganizationResponse>> {
     let can_all = crate::auth::permissions::has_permission(&current_user, Resource::Organizations, Operation::UpdateAll);
 
+    let support_zdr = current_user.is_sso_platform_manager() && data.is_enable_zdr_only();
     let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
 
-    let caller_org_role = if can_all {
+    let caller_org_role = if can_all || support_zdr {
         None
     } else {
         let mut org_repo = Organizations::new(&mut pool_conn);
@@ -636,9 +637,8 @@ pub async fn update_organization<P: PoolProvider>(
     };
 
     // SECURITY: Organization admins can manage ordinary org fields, but only
-    // owners (or platform managers via UpdateAll) may change this compliance
-    // setting.
-    if !can_all && data.zero_data_retention.is_some() && caller_org_role.as_deref() != Some("owner") {
+    // owners may toggle this setting. SSO support may only enable it.
+    if !can_all && !support_zdr && data.zero_data_retention.is_some() && caller_org_role.as_deref() != Some("owner") {
         return Err(Error::InsufficientPermissions {
             required: Permission::Allow(Resource::Organizations, Operation::UpdateOwn),
             action: Operation::UpdateOwn,
@@ -891,6 +891,9 @@ pub async fn update_organization<P: PoolProvider>(
     // Only a platform manager could have set a preset (the UpdateAll gate above
     // rejects anyone else), so they are the only caller who sees it here, the
     // same rule the GET endpoint applies.
+    if support_zdr {
+        tracing::info!(actor_id = %current_user.id, target_user_id = %id, "zero data retention enabled");
+    }
     let toleration_preset = if can_all { org.toleration_preset.clone() } else { None };
 
     let mut response = OrganizationResponse::from_user(UserResponse::from(org))
@@ -3406,8 +3409,6 @@ mod tests {
     #[test_log::test]
     async fn test_deleted_workspace_is_not_matched_by_domain(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
-        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
-        let pm_headers = add_auth_headers(&pm);
         let user = create_test_user_on_domain(&pool, Role::StandardUser, "gone.test").await;
         let headers = add_auth_headers(&user);
 
@@ -3432,12 +3433,10 @@ mod tests {
             );
         }
 
-        let resp = server
-            .delete(&format!("/admin/api/v1/organizations/{org_id}"))
-            .add_header(&pm_headers[0].0, &pm_headers[0].1)
-            .add_header(&pm_headers[1].0, &pm_headers[1].1)
-            .await;
-        assert!(resp.status_code().is_success(), "delete failed: {}", resp.text());
+        crate::db::handlers::Organizations::new(&mut *pool.acquire().await.unwrap())
+            .delete(uuid::Uuid::parse_str(&org_id).unwrap())
+            .await
+            .unwrap();
 
         let mut conn = pool.acquire().await.unwrap();
         assert!(
@@ -3619,7 +3618,7 @@ mod tests {
 
     #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn test_organization_owners_cannot_touch_serving_settings_only_platform_managers(pool: PgPool) {
+    async fn test_organization_owners_cannot_touch_serving_settings_or_customer_serving_settings(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
         let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
         let pm_headers = add_auth_headers(&pm);
@@ -3659,16 +3658,14 @@ mod tests {
         assert_ne!(body["display_name"].as_str(), Some("Renamed"), "a refused patch applies nothing");
         assert_eq!(body["self_hosted_only"].as_bool(), Some(false));
 
-        // A platform manager operates it.
+        // Platform support does not grant general customer settings access.
         let resp = server
             .patch(&format!("/admin/api/v1/organizations/{org_id}"))
             .add_header(&pm_headers[0].0, &pm_headers[0].1)
             .add_header(&pm_headers[1].0, &pm_headers[1].1)
             .json(&json!({ "self_hosted_only": true }))
             .await;
-        resp.assert_status(axum::http::StatusCode::OK);
-        let body = resp.json::<serde_json::Value>();
-        assert_eq!(body["self_hosted_only"].as_bool(), Some(true));
+        resp.assert_status(axum::http::StatusCode::FORBIDDEN);
     }
 
     #[dwctl_test_macros::test]
@@ -3678,6 +3675,7 @@ mod tests {
         let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
         let pm_headers = add_auth_headers(&pm);
         let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
         let org_admin = create_test_user(&pool, Role::StandardUser).await;
         let member = create_test_user(&pool, Role::StandardUser).await;
         let other_owner = create_test_user(&pool, Role::StandardUser).await;
@@ -3710,8 +3708,8 @@ mod tests {
         for (user_id, role) in [(org_admin.id, "admin"), (member.id, "member")] {
             let resp = server
                 .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
-                .add_header(&pm_headers[0].0, &pm_headers[0].1)
-                .add_header(&pm_headers[1].0, &pm_headers[1].1)
+                .add_header(&owner_headers[0].0, &owner_headers[0].1)
+                .add_header(&owner_headers[1].0, &owner_headers[1].1)
                 .json(&json!({ "user_id": user_id, "role": role }))
                 .await;
             resp.assert_status(axum::http::StatusCode::CREATED);
@@ -4753,6 +4751,7 @@ mod tests {
         let pm_headers = add_auth_headers(&pm);
 
         let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
         let member = create_test_user(&pool, Role::StandardUser).await;
         let member_headers = add_auth_headers(&member);
 
@@ -4769,8 +4768,8 @@ mod tests {
         // PM adds member
         let resp = server
             .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
-            .add_header(&pm_headers[0].0, &pm_headers[0].1)
-            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
             .json(&json!({ "user_id": member.id, "role": "member" }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
@@ -4862,6 +4861,7 @@ mod tests {
         let admin_headers = add_auth_headers(&admin);
 
         let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
 
         // Platform manager creates an org with owner as the designated owner
         let resp = server
@@ -4876,8 +4876,8 @@ mod tests {
         // Try to remove the only owner (via platform admin) — should fail
         let resp = server
             .delete(&format!("/admin/api/v1/organizations/{org_id}/members/{}", owner.id))
-            .add_header(&admin_headers[0].0, &admin_headers[0].1)
-            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
             .await;
         resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
         let body = resp.text();
@@ -4892,6 +4892,7 @@ mod tests {
         let admin_headers = add_auth_headers(&admin);
 
         let owner1 = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner1);
         let owner2 = create_test_user(&pool, Role::StandardUser).await;
 
         // Platform manager creates an org with owner1 as the designated owner
@@ -4907,8 +4908,8 @@ mod tests {
         // Admin adds owner2 as owner
         let resp = server
             .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
-            .add_header(&admin_headers[0].0, &admin_headers[0].1)
-            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
             .json(&json!({ "user_id": owner2.id, "role": "owner" }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
@@ -4916,8 +4917,8 @@ mod tests {
         // Now removing owner1 should succeed (owner2 still exists)
         let resp = server
             .delete(&format!("/admin/api/v1/organizations/{org_id}/members/{}", owner1.id))
-            .add_header(&admin_headers[0].0, &admin_headers[0].1)
-            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
             .await;
         resp.assert_status(axum::http::StatusCode::NO_CONTENT);
     }
@@ -4930,6 +4931,7 @@ mod tests {
         let admin_headers = add_auth_headers(&admin);
 
         let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
 
         // Platform manager creates an org with owner as the designated owner
         let resp = server
@@ -4944,8 +4946,8 @@ mod tests {
         // Try to demote the only owner to member — should fail
         let resp = server
             .patch(&format!("/admin/api/v1/organizations/{org_id}/members/{}", owner.id))
-            .add_header(&admin_headers[0].0, &admin_headers[0].1)
-            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
             .json(&json!({ "role": "member" }))
             .await;
         resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
@@ -4963,6 +4965,7 @@ mod tests {
         let pm_headers = add_auth_headers(&pm);
 
         let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
         let org_admin = create_test_user(&pool, Role::StandardUser).await;
         let org_admin_headers = add_auth_headers(&org_admin);
         let member = create_test_user(&pool, Role::StandardUser).await;
@@ -4980,8 +4983,8 @@ mod tests {
         // Platform manager adds org_admin as admin
         let resp = server
             .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
-            .add_header(&pm_headers[0].0, &pm_headers[0].1)
-            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
             .json(&json!({ "user_id": org_admin.id, "role": "admin" }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
@@ -4989,8 +4992,8 @@ mod tests {
         // Platform manager adds member
         let resp = server
             .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
-            .add_header(&pm_headers[0].0, &pm_headers[0].1)
-            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
             .json(&json!({ "user_id": member.id, "role": "member" }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
@@ -5013,6 +5016,7 @@ mod tests {
         let pm_headers = add_auth_headers(&pm);
 
         let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
         let org_admin = create_test_user(&pool, Role::StandardUser).await;
         let org_admin_headers = add_auth_headers(&org_admin);
         let new_user = create_test_user(&pool, Role::StandardUser).await;
@@ -5030,8 +5034,8 @@ mod tests {
         // Platform manager adds org_admin as admin
         let resp = server
             .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
-            .add_header(&pm_headers[0].0, &pm_headers[0].1)
-            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
             .json(&json!({ "user_id": org_admin.id, "role": "admin" }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
@@ -5081,7 +5085,7 @@ mod tests {
 
     #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn test_platform_manager_can_assign_owner_role(pool: PgPool) {
+    async fn test_platform_manager_cannot_assign_customer_org_owner_role(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
 
         let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -5099,16 +5103,14 @@ mod tests {
         resp.assert_status(axum::http::StatusCode::CREATED);
         let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
 
-        // Platform manager adds new_user as owner — should succeed
+        // Platform role alone cannot grant access to existing customer content
         let resp = server
             .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
             .add_header(&pm_headers[0].0, &pm_headers[0].1)
             .add_header(&pm_headers[1].0, &pm_headers[1].1)
             .json(&json!({ "user_id": new_user.id, "role": "owner" }))
             .await;
-        resp.assert_status(axum::http::StatusCode::CREATED);
-        let body = resp.json::<serde_json::Value>();
-        assert_eq!(body["role"].as_str().unwrap(), "owner");
+        resp.assert_status(axum::http::StatusCode::FORBIDDEN);
     }
 
     // ── Validation endpoint ──────────────────────────────────────────────
@@ -5723,6 +5725,7 @@ mod tests {
         let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
         let pm_headers = add_auth_headers(&pm);
         let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
         let plain_member = create_test_user(&pool, Role::StandardUser).await;
         let plain_member_headers = add_auth_headers(&plain_member);
 
@@ -5731,8 +5734,8 @@ mod tests {
         // Add as plain `member` — NOT owner/admin.
         let resp = server
             .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
-            .add_header(&pm_headers[0].0, &pm_headers[0].1)
-            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
             .json(&json!({ "user_id": plain_member.id, "role": "member" }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
@@ -5801,12 +5804,7 @@ mod tests {
             .add_header(&pm_headers[1].0, &pm_headers[1].1)
             .json(&json!({ "email": "new-contact@example.com" }))
             .await;
-        resp.assert_status(axum::http::StatusCode::OK);
-        let body = resp.json::<serde_json::Value>();
-        assert_eq!(
-            body["pending_email_change"]["new_email"].as_str().unwrap(),
-            "new-contact@example.com"
-        );
+        resp.assert_status(axum::http::StatusCode::FORBIDDEN);
     }
 
     #[dwctl_test_macros::test]

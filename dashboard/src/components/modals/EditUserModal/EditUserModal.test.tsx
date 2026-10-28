@@ -83,3 +83,27 @@ describe("EditUserModal layout", () => {
     expect(body.contains(save)).toBe(false);
   });
 });
+
+describe("EditUserModal support permissions", () => {
+  it("enables ZDR without submitting roles or other account fields", async () => {
+    mutateAsync.mockReset().mockResolvedValue({});
+    const user = userEvent.setup();
+    render(<EditUserModal isOpen supportOnly canEditZdr onClose={vi.fn()} onSuccess={vi.fn()}
+      userId="customer-test" currentUser={{ name: "Customer", email: "customer@example.com", username: "customer",
+        roles: ["StandardUser"], zero_data_retention: false }} />);
+    const dialog = within(screen.getByRole("dialog"));
+    expect(dialog.queryByRole("checkbox", { name: /Platform Manager/ })).not.toBeInTheDocument();
+    await user.click(dialog.getByRole("switch", { name: "Toggle zero data retention" }));
+    await user.click(dialog.getByRole("button", { name: "Save Changes" }));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledWith({ id: "customer-test", data: { zero_data_retention: true } }));
+  });
+
+  it("cannot disable ZDR for another account", () => {
+    render(<EditUserModal isOpen supportOnly canEditZdr onClose={vi.fn()} onSuccess={vi.fn()}
+      userId="customer-test" currentUser={{ name: "Customer", email: "customer@example.com", username: "customer",
+        roles: ["StandardUser"], zero_data_retention: true }} />);
+    const dialog = within(screen.getByRole("dialog"));
+    expect(dialog.getByRole("switch", { name: "Toggle zero data retention" })).toBeDisabled();
+    expect(dialog.getByRole("button", { name: "Save Changes" })).toBeDisabled();
+  });
+});

@@ -116,16 +116,16 @@ export function Batches({
 
   // Show User column for PlatformManagers (see all batches) or in org context (see org members)
   const isPlatformManager = userRoles.includes("PlatformManager");
-  const showUserColumn = isPlatformManager || isOrgContext;
+  const showUserColumn = isOrgContext;
   // Context and Source columns are used by the file table only
-  const showContextColumn = isPlatformManager;
+  const showContextColumn = false;
   const showSourceColumn = hasPermission("connections");
 
   // Member filter:
   // - Org context (all users): show org members dropdown (client-side filtered)
   // - Personal context (PM only): show users via server-side search
-  const showMemberFilter = isOrgContext || (isPlatformManager && !isOrgContext);
-  const useServerSideMemberSearch = isPlatformManager && !isOrgContext;
+  const showMemberFilter = isOrgContext;
+  const useServerSideMemberSearch = false;
   const { data: orgMembers } = useOrganizationMembers(
     activeOrganizationId || "",
   );

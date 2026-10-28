@@ -20,8 +20,8 @@
 
 # Get user IDs
 GET http://localhost:3001/admin/api/v1/users/current
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Captures]
 admin_user_id: jsonpath "$.id"
@@ -42,8 +42,8 @@ user2_id: jsonpath "$.id"
 
 # Create test endpoint for models
 POST http://localhost:3001/admin/api/v1/endpoints
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "name": "groups-test-endpoint-{{newUuid}}",
   "url": "http://mock-llm-server:3000",
@@ -55,8 +55,8 @@ groups_test_endpoint_id: jsonpath "$.id"
 
 # Create test models for group assignments
 POST http://localhost:3001/admin/api/v1/models
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "type": "standard",
   "model_name": "groups-test-model-1",
@@ -68,8 +68,8 @@ HTTP 200
 test_model_1_id: jsonpath "$.id"
 
 POST http://localhost:3001/admin/api/v1/models
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "type": "standard",
   "model_name": "groups-test-model-2",
@@ -114,8 +114,8 @@ HTTP 403
 
 # Admin creates group 1 (will add user1 to this)
 POST http://localhost:3001/admin/api/v1/groups
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "name": "test-group-1-{{newUuid}}",
   "description": "Test group 1"
@@ -130,8 +130,8 @@ group1_id: jsonpath "$.id"
 
 # Admin creates group 2 (will add user2 to this)
 POST http://localhost:3001/admin/api/v1/groups
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "name": "test-group-2-{{newUuid}}",
   "description": "Test group 2"
@@ -144,8 +144,8 @@ group2_id: jsonpath "$.id"
 
 # Admin creates group 3 (empty group, admin not in it)
 POST http://localhost:3001/admin/api/v1/groups
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "name": "test-group-3-{{newUuid}}",
   "description": "Empty test group"
@@ -166,8 +166,8 @@ group3_id: jsonpath "$.id"
 
 # Add user1 to group1 first (so they're a member)
 POST http://localhost:3001/admin/api/v1/groups/{{group1_id}}/users/{{user1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # User1 tries to list groups - should be forbidden (even though they're in group1)
@@ -188,8 +188,8 @@ HTTP 403
 
 # Admin lists all groups - should see all 3 groups
 GET http://localhost:3001/admin/api/v1/groups
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.data" count >= 3
@@ -229,8 +229,8 @@ HTTP 403
 
 # Admin fetches group1 - should succeed
 GET http://localhost:3001/admin/api/v1/groups/{{group1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{group1_id}}"
@@ -238,16 +238,16 @@ jsonpath "$.name" startsWith "test-group-1-"
 
 # Admin fetches group2 - should succeed
 GET http://localhost:3001/admin/api/v1/groups/{{group2_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{group2_id}}"
 
 # Admin fetches group3 (empty group) - should succeed
 GET http://localhost:3001/admin/api/v1/groups/{{group3_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{group3_id}}"
@@ -293,8 +293,8 @@ HTTP 403
 
 # Admin updates group1 - should succeed
 PATCH http://localhost:3001/admin/api/v1/groups/{{group1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "description": "Updated by admin"
 }
@@ -305,8 +305,8 @@ jsonpath "$.description" == "Updated by admin"
 
 # Admin updates group2 - should succeed
 PATCH http://localhost:3001/admin/api/v1/groups/{{group2_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "name": "test-group-2-renamed"
 }
@@ -363,14 +363,14 @@ HTTP 403
 
 # Admin adds user2 to group2 - should succeed
 POST http://localhost:3001/admin/api/v1/groups/{{group2_id}}/users/{{user2_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # Admin adds user1 to group3 - should succeed
 POST http://localhost:3001/admin/api/v1/groups/{{group3_id}}/users/{{user1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # -----------------------------------------------------------------------------
@@ -379,8 +379,8 @@ HTTP 204
 
 # Admin removes user1 from group3 - should succeed
 DELETE http://localhost:3001/admin/api/v1/groups/{{group3_id}}/users/{{user1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # =============================================================================
@@ -431,8 +431,8 @@ HTTP 403
 
 # Admin adds group3 to user1 via user endpoint - should succeed
 POST http://localhost:3001/admin/api/v1/users/{{user1_id}}/groups/{{group3_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # -----------------------------------------------------------------------------
@@ -441,8 +441,8 @@ HTTP 204
 
 # Admin removes group3 from user1 via user endpoint - should succeed
 DELETE http://localhost:3001/admin/api/v1/users/{{user1_id}}/groups/{{group3_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # =============================================================================
@@ -477,8 +477,8 @@ HTTP 403
 
 # Admin lists users in group1 - should succeed
 GET http://localhost:3001/admin/api/v1/groups/{{group1_id}}/users
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$" isCollection
@@ -486,8 +486,8 @@ jsonpath "$" contains "{{user1_id}}"
 
 # Admin lists users in group2 - should succeed
 GET http://localhost:3001/admin/api/v1/groups/{{group2_id}}/users
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$" isCollection
@@ -495,8 +495,8 @@ jsonpath "$" contains "{{user2_id}}"
 
 # Admin lists users in group3 (empty) - should succeed
 GET http://localhost:3001/admin/api/v1/groups/{{group3_id}}/users
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$" isCollection
@@ -533,8 +533,8 @@ HTTP 403
 
 # Admin lists user1's groups - should succeed
 GET http://localhost:3001/admin/api/v1/users/{{user1_id}}/groups
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$" isCollection
@@ -542,8 +542,8 @@ jsonpath "$[*].id" contains "{{group1_id}}"
 
 # Admin lists user2's groups - should succeed
 GET http://localhost:3001/admin/api/v1/users/{{user2_id}}/groups
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$" isCollection
@@ -583,8 +583,8 @@ jsonpath "$[0].created_by" not exists
 
 # Admin fetches user1's groups - should see created_by
 GET http://localhost:3001/admin/api/v1/users/{{user1_id}}/groups
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$" isCollection
@@ -593,8 +593,8 @@ jsonpath "$[0].created_by" == "{{admin_user_id}}"
 
 # Admin fetches user2's groups - should see created_by
 GET http://localhost:3001/admin/api/v1/users/{{user2_id}}/groups
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$" isCollection
@@ -633,8 +633,8 @@ HTTP 403
 
 # Add model first (as admin) so we can test removal
 POST http://localhost:3001/admin/api/v1/groups/{{group1_id}}/models/{{test_model_1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # User1 tries to remove model from group1 - should be forbidden
@@ -655,14 +655,14 @@ HTTP 403
 
 # Admin adds test_model_2 to group2 - should succeed
 POST http://localhost:3001/admin/api/v1/groups/{{group2_id}}/models/{{test_model_2_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # Admin adds test_model_1 to group3 (empty group) - should succeed
 POST http://localhost:3001/admin/api/v1/groups/{{group3_id}}/models/{{test_model_1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # -----------------------------------------------------------------------------
@@ -671,8 +671,8 @@ HTTP 204
 
 # Admin removes test_model_1 from group3 - should succeed
 DELETE http://localhost:3001/admin/api/v1/groups/{{group3_id}}/models/{{test_model_1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # =============================================================================
@@ -707,8 +707,8 @@ HTTP 403
 
 # Admin lists models in group1 - should succeed
 GET http://localhost:3001/admin/api/v1/groups/{{group1_id}}/models
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$" isCollection
@@ -716,8 +716,8 @@ jsonpath "$" contains "{{test_model_1_id}}"
 
 # Admin lists models in group2 - should succeed
 GET http://localhost:3001/admin/api/v1/groups/{{group2_id}}/models
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$" isCollection
@@ -725,8 +725,8 @@ jsonpath "$" contains "{{test_model_2_id}}"
 
 # Admin lists models in group3 (empty) - should succeed
 GET http://localhost:3001/admin/api/v1/groups/{{group3_id}}/models
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$" isCollection
@@ -757,8 +757,8 @@ HTTP 403
 
 # Admin lists groups for test_model_1 - should succeed
 GET http://localhost:3001/admin/api/v1/models/{{test_model_1_id}}/groups
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$" isCollection
@@ -766,8 +766,8 @@ jsonpath "$" contains "{{group1_id}}"
 
 # Admin lists groups for test_model_2 - should succeed
 GET http://localhost:3001/admin/api/v1/models/{{test_model_2_id}}/groups
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$" isCollection
@@ -805,14 +805,14 @@ HTTP 403
 
 # Admin deletes group3 (empty group) - should succeed
 DELETE http://localhost:3001/admin/api/v1/groups/{{group3_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # Verify group3 is deleted
 GET http://localhost:3001/admin/api/v1/groups/{{group3_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 404
 
 # =============================================================================
@@ -820,26 +820,26 @@ HTTP 404
 # =============================================================================
 
 DELETE http://localhost:3001/admin/api/v1/groups/{{group1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 DELETE http://localhost:3001/admin/api/v1/groups/{{group2_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 DELETE http://localhost:3001/admin/api/v1/models/{{test_model_1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 
 DELETE http://localhost:3001/admin/api/v1/models/{{test_model_2_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 
 DELETE http://localhost:3001/admin/api/v1/endpoints/{{groups_test_endpoint_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204

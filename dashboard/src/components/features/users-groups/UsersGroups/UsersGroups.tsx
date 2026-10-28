@@ -280,10 +280,10 @@ const UsersGroups: React.FC = () => {
         onEdit: (org) => setEditingOrg(org),
         onDelete: (org) => setDeletingOrg(org),
         onManageBilling: (org) => navigate(`/cost-management?user=${org.id}`),
-        canDelete: isPlatformManager,
+        canDelete: false,
         tolerationPresets: config?.scheduling_toleration_presets,
       }),
-    [navigate, isPlatformManager, config?.scheduling_toleration_presets],
+    [navigate, config?.scheduling_toleration_presets],
   );
 
   const handleDeleteOrg = async () => {
@@ -494,7 +494,8 @@ const UsersGroups: React.FC = () => {
             onSelectionChange={setSelectedUsers}
             headerActions={
               <div className="flex items-center gap-2">
-                <Button onClick={() => setShowCreateUserModal(true)} size="sm">
+                <Button hidden
+                    onClick={() => setShowCreateUserModal(true)} size="sm">
                   <UserPlus className="w-4 h-4" />
                   Add User
                 </Button>
@@ -510,6 +511,7 @@ const UsersGroups: React.FC = () => {
                 </div>
                 <div className="flex items-center gap-2">
                   <button
+                    hidden
                     onClick={() => setShowBulkDeleteModal(true)}
                     className="flex items-center gap-1 px-3 py-1.5 bg-red-600 text-white text-sm rounded-md hover:bg-red-700 transition-colors"
                   >
@@ -757,7 +759,8 @@ const UsersGroups: React.FC = () => {
             toleration_preset: activeUser.toleration_preset,
           }}
           canEditZdr={isPlatformManager}
-          canEditServing={isPlatformManager}
+          canEditServing={false}
+          supportOnly
         />
       )}
       {activeGroup && (
@@ -789,7 +792,8 @@ const UsersGroups: React.FC = () => {
         onClose={() => setEditingOrg(null)}
         organization={editingOrg}
         canEditZdr={isPlatformManager}
-        canEditServing={isPlatformManager}
+        canEditServing={false}
+          supportOnly
       />
       <Dialog
         open={!!deletingOrg}

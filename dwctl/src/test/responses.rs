@@ -102,8 +102,8 @@ pub(super) async fn setup_ai_test_with_config(
     // Create API key
     let key_response = server
         .post(&format!("/admin/api/v1/users/{}/api-keys", user.id))
-        .add_header(&admin_headers[0].0, &admin_headers[0].1)
-        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .add_header("x-doubleword-user", user.external_user_id.as_deref().unwrap())
+        .add_header("x-doubleword-email", &user.email)
         .json(&serde_json::json!({
             "purpose": "realtime",
             "name": "Responses test key"

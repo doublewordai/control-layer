@@ -75,6 +75,25 @@ pub struct OrganizationUpdate {
     pub toleration_preset: Option<Option<String>>,
 }
 
+impl OrganizationUpdate {
+    pub fn is_enable_zdr_only(&self) -> bool {
+        matches!(
+            self,
+            Self {
+                zero_data_retention: Some(true),
+                display_name: None,
+                email: None,
+                batch_notifications_enabled: None,
+                low_balance_threshold: None,
+                self_hosted_only: None,
+                auto_join_enabled: None,
+                disabled_modalities: None,
+                toleration_preset: None,
+            }
+        )
+    }
+}
+
 /// Full organization details returned by the API.
 /// Organizations are users with user_type = 'organization', so this wraps UserResponse
 /// with additional org-specific fields.

@@ -24,6 +24,7 @@ interface EditOrganizationModalProps {
   organization: Organization | null;
   /** Whether the current user may toggle zero data retention (admins only). */
   canEditZdr?: boolean;
+  supportOnly?: boolean;
   /** Whether the viewer may change the serving account settings (platform managers only). */
   canEditServing?: boolean;
 }
@@ -33,6 +34,7 @@ export function EditOrganizationModal({
   onClose,
   organization,
   canEditZdr = false,
+  supportOnly = false,
   canEditServing = false,
 }: EditOrganizationModalProps) {
   const [email, setEmail] = useState("");
@@ -83,7 +85,7 @@ export function EditOrganizationModal({
     try {
       const updated = await updateOrg.mutateAsync({
         id: organization.id,
-        data: {
+        data: supportOnly ? { zero_data_retention: true } : {
           display_name: displayName || undefined,
           email: requestedEmail || undefined,
           ...(canEditZdr
@@ -137,7 +139,7 @@ export function EditOrganizationModal({
           data-testid="edit-organization-form-body"
         >
           <div className="grid gap-4">
-            <div className="grid gap-4 sm:grid-cols-2 sm:items-start">
+            <div className="grid gap-4 sm:grid-cols-2 sm:items-start" hidden={supportOnly}>
               <div className="grid gap-2">
                 <Label htmlFor="edit-email">Email</Label>
                 <Input
@@ -187,6 +189,7 @@ export function EditOrganizationModal({
                 </div>
                 <Switch
                   id="edit-zdr"
+                  disabled={supportOnly && !!organization?.zero_data_retention}
                   checked={zeroDataRetention}
                   onCheckedChange={setZeroDataRetention}
                   aria-label="Toggle zero data retention"
@@ -231,7 +234,7 @@ export function EditOrganizationModal({
           <Button
             type="submit"
             form="edit-organization-form"
-            disabled={updateOrg.isPending}
+            disabled={updateOrg.isPending || (supportOnly && (!zeroDataRetention || !!organization?.zero_data_retention))}
           >
             {updateOrg.isPending ? "Saving..." : "Save"}
           </Button>

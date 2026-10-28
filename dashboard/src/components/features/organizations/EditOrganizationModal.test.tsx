@@ -58,6 +58,30 @@ const mockOrg: Organization = {
 };
 
 describe("EditOrganizationModal", () => {
+  it("enables ZDR through support mode without sending other fields", async () => {
+    const update = vi.fn();
+    server.use(http.patch("*/organizations/:id", async ({ request }) => {
+      update(await request.json());
+      return HttpResponse.json({ ...mockOrg, zero_data_retention: true });
+    }));
+    const user = userEvent.setup();
+    render(<EditOrganizationModal isOpen onClose={vi.fn()} organization={mockOrg} supportOnly canEditZdr />, { wrapper: createWrapper() });
+    const dialog = screen.getByRole("dialog");
+    const save = within(dialog).getByRole("button", { name: "Save" });
+    expect(save).toBeDisabled();
+    expect(within(dialog).queryByRole("textbox", { name: "Email" })).not.toBeInTheDocument();
+    await user.click(within(dialog).getByRole("switch", { name: /zero data retention/i }));
+    await user.click(save);
+    await waitFor(() => expect(update).toHaveBeenCalledWith({ zero_data_retention: true }));
+  });
+
+  it("cannot disable existing ZDR through support mode", async () => {
+    render(<EditOrganizationModal isOpen onClose={vi.fn()} organization={{ ...mockOrg, zero_data_retention: true }} supportOnly canEditZdr />, { wrapper: createWrapper() });
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByRole("switch", { name: /zero data retention/i })).toBeDisabled();
+    expect(within(dialog).getByRole("button", { name: "Save" })).toBeDisabled();
+  });
+
   it("renders pre-filled form when open", async () => {
     render(
       <EditOrganizationModal

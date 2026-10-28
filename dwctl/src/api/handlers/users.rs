@@ -277,6 +277,10 @@ pub async fn get_user<P: PoolProvider>(
     };
 
     let mut response = UserResponse::from(user).with_toleration_preset(toleration_preset);
+    if target_user_id == current_user.id {
+        response.roles = current_user.roles.clone();
+        response.is_admin = current_user.is_admin;
+    }
 
     // Include billing if requested and permitted
     // Permitted if:
@@ -437,7 +441,8 @@ pub async fn update_user<P: PoolProvider>(
     let can_update_all_users = permissions::can_update_all_resources(&current_user, Resource::Users);
     let can_update_own_user = permissions::can_update_own_resource(&current_user, Resource::Users, user_id);
 
-    if !can_update_all_users && !can_update_own_user {
+    let support_zdr = current_user.is_sso_platform_manager() && user_data.is_enable_zdr_only();
+    if !can_update_all_users && !can_update_own_user && !support_zdr {
         return Err(Error::InsufficientPermissions {
             required: Permission::Any(vec![
                 Permission::Allow(Resource::Users, Operation::UpdateAll),
@@ -499,9 +504,13 @@ pub async fn update_user<P: PoolProvider>(
     let mut conn = state.db.write().acquire().await.expect("Failed to acquire database connection");
 
     let mut repo = Users::new(&mut conn);
+    let enabling_zdr = user_data.zero_data_retention == Some(true);
     let db_request = UserUpdateDBRequest::new(user_data);
 
     let user = repo.update(user_id, &db_request).await?;
+    if enabling_zdr {
+        tracing::info!(actor_id = %current_user.id, target_user_id = %user_id, "zero data retention enabled");
+    }
     // Only a platform manager could have set a preset (the UpdateAll gate above
     // rejects anyone else), so they are the only caller who sees it back.
     let toleration_preset = if can_update_all_users {
@@ -894,10 +903,7 @@ mod tests {
             .json(&new_user)
             .await;
 
-        response.assert_status(axum::http::StatusCode::CREATED);
-        let created_user: UserResponse = response.json();
-        assert_eq!(created_user.username, "newuser");
-        assert_eq!(created_user.email, "newuser@example.com");
+        response.assert_status_forbidden();
     }
 
     #[dwctl_test_macros::test]
@@ -1319,11 +1325,7 @@ mod tests {
             .json(&update_data)
             .await;
 
-        response.assert_status_ok();
-        let updated_user: UserResponse = response.json();
-        assert_eq!(updated_user.id, regular_user.id);
-        assert_eq!(updated_user.display_name.as_deref(), Some("Updated Display Name"));
-        assert_eq!(updated_user.avatar_url.as_deref(), Some("https://example.com/new-avatar.jpg"));
+        response.assert_status_forbidden();
     }
 
     #[dwctl_test_macros::test]
@@ -1353,7 +1355,7 @@ mod tests {
 
     #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn test_users_cannot_touch_their_own_serving_settings_only_platform_managers(pool: PgPool) {
+    async fn test_users_cannot_touch_their_own_serving_settings_or_customer_serving_settings(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -1389,9 +1391,7 @@ mod tests {
             .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
             .json(&json!({ "self_hosted_only": true }))
             .await;
-        response.assert_status_ok();
-        let updated: UserResponse = response.json();
-        assert!(updated.self_hosted_only);
+        response.assert_status_forbidden();
     }
 
     #[dwctl_test_macros::test]
@@ -1433,7 +1433,7 @@ mod tests {
             .json(&update_data)
             .await;
 
-        response.assert_status_not_found();
+        response.assert_status_forbidden();
     }
 
     #[dwctl_test_macros::test]
@@ -1449,16 +1449,16 @@ mod tests {
             .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
-        response.assert_status(axum::http::StatusCode::NO_CONTENT);
+        response.assert_status_forbidden();
 
-        // Verify user is deleted by trying to get it
+        // Denied deletion leaves the customer account intact
         let get_response = app
             .get(&format!("/admin/api/v1/users/{}", regular_user.id))
             .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
             .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
-        get_response.assert_status_not_found();
+        get_response.assert_status_ok();
     }
 
     #[dwctl_test_macros::test]
@@ -1490,7 +1490,7 @@ mod tests {
             .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
-        response.assert_status_not_found();
+        response.assert_status_forbidden();
     }
 
     #[dwctl_test_macros::test]
@@ -1505,7 +1505,7 @@ mod tests {
             .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
-        response.assert_status_bad_request();
+        response.assert_status_forbidden();
     }
 
     #[dwctl_test_macros::test]
@@ -1650,7 +1650,7 @@ mod tests {
             .await;
         response.assert_status_ok();
 
-        // PlatformManager should be able to create users
+        // PlatformManager cannot create users
         let new_user = json!({
             "username": "created_by_pm",
             "email": "createdbypm@example.com",
@@ -1663,26 +1663,25 @@ mod tests {
             .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .json(&new_user)
             .await;
-        response.assert_status(axum::http::StatusCode::CREATED);
-        let created_user: UserResponse = response.json();
+        response.assert_status_forbidden();
 
-        // PlatformManager should be able to update users
+        // PlatformManager cannot update unrelated user settings
         let update_data = json!({"display_name": "Updated by PM"});
         let response = app
-            .patch(&format!("/admin/api/v1/users/{}", created_user.id))
+            .patch(&format!("/admin/api/v1/users/{}", standard_user.id))
             .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
             .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .json(&update_data)
             .await;
-        response.assert_status_ok();
+        response.assert_status_forbidden();
 
-        // PlatformManager should be able to delete users
+        // PlatformManager cannot delete users
         let response = app
-            .delete(&format!("/admin/api/v1/users/{}", created_user.id))
+            .delete(&format!("/admin/api/v1/users/{}", standard_user.id))
             .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
             .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
-        response.assert_status(axum::http::StatusCode::NO_CONTENT);
+        response.assert_status_forbidden();
     }
 
     #[dwctl_test_macros::test]
@@ -1733,7 +1732,7 @@ mod tests {
             .await;
         response.assert_status_forbidden();
 
-        // User with PlatformManager + RequestViewer should have full user management
+        // User with PlatformManager + RequestViewer cannot bypass customer mutation restrictions
         let full_admin = create_test_user_with_roles(&pool, vec![Role::PlatformManager, Role::RequestViewer]).await;
 
         let response = app
@@ -1749,7 +1748,7 @@ mod tests {
             .add_header(&add_auth_headers(&full_admin)[1].0, &add_auth_headers(&full_admin)[1].1)
             .json(&new_user)
             .await;
-        response.assert_status(axum::http::StatusCode::CREATED);
+        response.assert_status_forbidden();
     }
 
     #[dwctl_test_macros::test]
@@ -1794,7 +1793,7 @@ mod tests {
         let role_tests = vec![
             (vec![Role::StandardUser], false, true, false, "StandardUser only"),
             (vec![Role::RequestViewer], false, true, false, "RequestViewer only"),
-            (vec![Role::PlatformManager], true, true, true, "PlatformManager only"),
+            (vec![Role::PlatformManager], true, true, false, "PlatformManager only"),
             (
                 vec![Role::StandardUser, Role::RequestViewer],
                 false,
@@ -1806,14 +1805,14 @@ mod tests {
                 vec![Role::PlatformManager, Role::RequestViewer],
                 true,
                 true,
-                true,
+                false,
                 "PlatformManager + RequestViewer",
             ),
             (
                 vec![Role::PlatformManager, Role::StandardUser],
                 true,
                 true,
-                true,
+                false,
                 "PlatformManager + StandardUser",
             ),
         ];
@@ -1932,38 +1931,12 @@ mod tests {
             .json(&update_data)
             .await;
 
-        response.assert_status_ok();
-        let updated_user: UserResponse = response.json();
-
-        // Backend should have automatically added StandardUser role
-        assert_eq!(updated_user.roles.len(), 2);
-        assert!(updated_user.roles.contains(&Role::StandardUser));
-        assert!(updated_user.roles.contains(&Role::RequestViewer));
-        assert!(!updated_user.roles.contains(&Role::PlatformManager));
-
-        // Try to update with empty roles array
-        let update_data = json!({
-            "roles": []
-        });
-
-        let response = app
-            .patch(&format!("/admin/api/v1/users/{}", regular_user.id))
-            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
-            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
-            .json(&update_data)
-            .await;
-
-        response.assert_status_ok();
-        let updated_user: UserResponse = response.json();
-
-        // Backend should have automatically added StandardUser role
-        assert_eq!(updated_user.roles.len(), 1);
-        assert!(updated_user.roles.contains(&Role::StandardUser));
+        response.assert_status_forbidden();
     }
 
     #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn test_admin_can_toggle_zero_data_retention(pool: PgPool) {
+    async fn test_admin_can_enable_but_not_disable_zero_data_retention(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let regular_user = create_test_user(&pool, Role::StandardUser).await;
@@ -1983,7 +1956,7 @@ mod tests {
         let updated_user: UserResponse = response.json();
         assert!(updated_user.zero_data_retention, "admin should be able to enable ZDR");
 
-        // And back off again.
+        // Staff cannot turn customer retention protection back off.
         let update_data = json!({ "zero_data_retention": false });
         let response = app
             .patch(&format!("/admin/api/v1/users/{}", regular_user.id))
@@ -1991,8 +1964,7 @@ mod tests {
             .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&update_data)
             .await;
-        response.assert_status_ok();
-        assert!(!response.json::<UserResponse>().zero_data_retention);
+        response.assert_status_forbidden();
     }
 
     #[dwctl_test_macros::test]
