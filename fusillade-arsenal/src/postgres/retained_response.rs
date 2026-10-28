@@ -1769,17 +1769,26 @@ const COUNT_OWNER_FLEX_REQUESTS_SQL: &str = r#"
               SELECT 1 FROM requests live
               WHERE live.id = object.object_id AND live.created_by IS NOT NULL
           )
+        -- Applies to the whole UNION ALL. NULL means no limit; a cap lets a
+        -- threshold check stop as soon as the answer is known instead of
+        -- counting all of a heavy owner's work.
+        LIMIT $3
     ) candidate
 "#;
 
+/// Count the owner's flex requests since `cutoff`, live and retained. With
+/// `limit`, returns `min(count, limit)` and stops reading once it has `limit`
+/// rows.
 pub(crate) async fn count_owner_flex_requests_since<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
     owner: &str,
     cutoff: DateTime<Utc>,
+    limit: Option<i64>,
 ) -> Result<i64> {
     sqlx::query_scalar(COUNT_OWNER_FLEX_REQUESTS_SQL)
         .bind(owner)
         .bind(cutoff)
+        .bind(limit)
         .fetch_one(manager.write_executor())
         .await
         .map_err(read_database_failure)
@@ -4252,26 +4261,36 @@ mod tests {
         }
     }
 
-    /// Whether every scan of `relation_name` in the plan sits beneath a
-    /// `Limit` node, i.e. it is executed as a per-row probe rather than as one
-    /// side of a join the planner is free to turn into a full index walk.
+    /// Whether every scan of `relation_name` in the plan is the direct child
+    /// of a `Limit` node, i.e. it is executed as a per-row probe rather than
+    /// as one side of a join the planner is free to turn into a full index
+    /// walk. Only the immediate parent counts: a `Limit` further up (such as
+    /// one capping the whole query) says nothing about how the scan is joined.
     fn relation_only_under_limit(plan: &serde_json::Value, relation_name: &str) -> bool {
-        fn walk(value: &serde_json::Value, relation_name: &str, under_limit: bool) -> bool {
+        fn walk(value: &serde_json::Value, relation_name: &str, parent_is_limit: bool) -> bool {
             match value {
                 serde_json::Value::Array(values) => values
                     .iter()
-                    .all(|value| walk(value, relation_name, under_limit)),
+                    .all(|value| walk(value, relation_name, parent_is_limit)),
                 serde_json::Value::Object(fields) => {
-                    let under_limit = under_limit
-                        || fields.get("Node Type").and_then(|value| value.as_str())
-                            == Some("Limit");
-                    let this_ok = under_limit
+                    let this_ok = parent_is_limit
                         || fields.get("Relation Name").and_then(|value| value.as_str())
                             != Some(relation_name);
+                    let is_plan_node = fields.contains_key("Node Type");
+                    let is_limit =
+                        fields.get("Node Type").and_then(|value| value.as_str()) == Some("Limit");
                     this_ok
-                        && fields
-                            .values()
-                            .all(|value| walk(value, relation_name, under_limit))
+                        && fields.iter().all(|(key, value)| {
+                            // Child plan nodes see whether this node is a Limit;
+                            // non-node wrappers (the top-level "Plan" key) pass
+                            // the flag through unchanged.
+                            let flag = if is_plan_node && key == "Plans" {
+                                is_limit
+                            } else {
+                                parent_is_limit
+                            };
+                            walk(value, relation_name, flag)
+                        })
                 }
                 _ => true,
             }
@@ -4598,15 +4617,18 @@ mod tests {
 
         let flex_explain =
             format!("EXPLAIN (ANALYZE, FORMAT JSON) {COUNT_OWNER_FLEX_REQUESTS_SQL}");
+        // Explain the capped form the unverified volume check runs.
         let flex_plan: serde_json::Value = sqlx::query_scalar(&flex_explain)
             .bind("planner-owner")
             .bind(timestamp("2026-08-10T00:00:00Z"))
+            .bind(Some(1001_i64))
             .fetch_one(&pool)
             .await
             .expect("bounded retained flex-count SQL must be explainable");
         let flex_count: i64 = sqlx::query_scalar(COUNT_OWNER_FLEX_REQUESTS_SQL)
             .bind("planner-owner")
             .bind(timestamp("2026-08-10T00:00:00Z"))
+            .bind(Option::<i64>::None)
             .fetch_one(&pool)
             .await
             .unwrap();
