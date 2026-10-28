@@ -203,7 +203,7 @@ pub struct File {
 ///
 /// Templates are mutable, but requests snapshot the template state
 /// at execution time.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct RequestTemplate {
     pub id: TemplateId,
     pub file_id: FileId,
@@ -218,8 +218,21 @@ pub struct RequestTemplate {
     pub updated_at: DateTime<Utc>,
 }
 
+debug_with_redacted_api_key!(RequestTemplate {
+    id,
+    file_id,
+    custom_id,
+    endpoint,
+    method,
+    path,
+    body,
+    model,
+    created_at,
+    updated_at,
+});
+
 /// Input for creating a new request template.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct RequestTemplateInput {
     pub custom_id: Option<String>, // OpenAI Batch API custom identifier
     pub endpoint: String,
@@ -229,6 +242,15 @@ pub struct RequestTemplateInput {
     pub model: String,
     pub api_key: String,
 }
+
+debug_with_redacted_api_key!(RequestTemplateInput {
+    custom_id,
+    endpoint,
+    method,
+    path,
+    body,
+    model,
+});
 
 /// Batch output item - represents a completed request in OpenAI format.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -429,7 +451,7 @@ pub enum FileStreamResult {
 }
 
 /// Input parameters for creating a new batch.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct BatchInput {
     /// The file containing request templates
     pub file_id: FileId,
@@ -453,11 +475,21 @@ pub struct BatchInput {
     pub total_requests: Option<i64>,
 }
 
+debug_with_redacted_api_key!(BatchInput {
+    file_id,
+    endpoint,
+    completion_window,
+    metadata,
+    created_by,
+    api_key_id,
+    total_requests,
+});
+
 /// Input parameters for creating a file-backed background batch.
 ///
 /// Background batches deliberately have no completion window. They use the
 /// ordinary batch lifecycle but are dispatched only by the background daemon.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct BackgroundBatchInput {
     /// The file containing request templates.
     pub file_id: FileId,
@@ -474,6 +506,15 @@ pub struct BackgroundBatchInput {
     /// Expected number of request templates in the source file.
     pub total_requests: Option<i64>,
 }
+
+debug_with_redacted_api_key!(BackgroundBatchInput {
+    file_id,
+    endpoint,
+    metadata,
+    created_by,
+    api_key_id,
+    total_requests,
+});
 
 /// A batch represents one execution of all of a file's templates.
 #[derive(Debug, Clone, Serialize)]
