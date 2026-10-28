@@ -37,9 +37,14 @@ pub const REDACTED: &str = "<redacted>";
 
 /// dwctl API keys are `sk-` and 43 or more base64url characters; 20 also
 /// covers shorter test and provider keys of the same shape (`sk-proj-...`).
-/// Bearer tokens are matched up to the first character a token can't contain.
+/// Nothing is required before `sk-`, so a key is still found after an escape
+/// (`%22sk-...`, `\nsk-...`) or glued to a word; a hyphenated word that ends
+/// in `sk` and runs on for 20 characters is redacted too, the safer mistake.
+/// Bearer tokens are matched up to the first character a token can't contain,
+/// and only from 16 characters, so prose like "Bearer token validation
+/// failed" is left alone.
 static SECRET_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?P<bearer>\bbearer\s+)[A-Za-z0-9._~+/=-]+|\bsk-[A-Za-z0-9_-]{20,}").expect("secret pattern is valid")
+    Regex::new(r"(?i)(?P<bearer>\bbearer\s+)[A-Za-z0-9._~+/=-]{16,}|sk-[A-Za-z0-9_-]{20,}").expect("secret pattern is valid")
 });
 
 /// `text` with every API key and bearer token replaced by [`REDACTED`].
@@ -52,40 +57,71 @@ pub fn redact_secrets(text: &str) -> Cow<'_, str> {
 }
 
 /// A [`MakeWriter`] whose writers pass everything through [`redact_secrets`].
-///
-/// The fmt layer formats each event into a buffer and writes it with one
-/// `write_all`, so a whole line is redacted at once and a credential is never
-/// split across two writes.
 pub struct RedactingMakeWriter<M>(pub M);
 
 impl<'a, M: MakeWriter<'a>> MakeWriter<'a> for RedactingMakeWriter<M> {
     type Writer = RedactingWriter<M::Writer>;
 
     fn make_writer(&'a self) -> Self::Writer {
-        RedactingWriter(self.0.make_writer())
+        RedactingWriter::new(self.0.make_writer())
     }
 
     fn make_writer_for(&'a self, meta: &Metadata<'_>) -> Self::Writer {
-        RedactingWriter(self.0.make_writer_for(meta))
+        RedactingWriter::new(self.0.make_writer_for(meta))
     }
 }
 
-/// The writer [`RedactingMakeWriter`] makes.
-pub struct RedactingWriter<W>(W);
+/// The writer [`RedactingMakeWriter`] makes. It holds output back until a
+/// line is complete, so a credential split across writes is still matched
+/// whole. The fmt layer writes each event as one line in one `write_all`
+/// today; this doesn't depend on that.
+pub struct RedactingWriter<W: io::Write> {
+    inner: W,
+    pending: Vec<u8>,
+}
+
+impl<W: io::Write> RedactingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            pending: Vec::new(),
+        }
+    }
+
+    fn write_pending(&mut self) -> io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let text = String::from_utf8_lossy(&self.pending);
+        self.inner.write_all(redact_secrets(&text).as_bytes())?;
+        self.pending.clear();
+        Ok(())
+    }
+}
 
 impl<W: io::Write> io::Write for RedactingWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.write_all(redact_secrets(&String::from_utf8_lossy(buf)).as_bytes())?;
+        self.pending.extend_from_slice(buf);
+        if buf.ends_with(b"\n") {
+            self.write_pending()?;
+        }
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.0.flush()
+        self.write_pending()?;
+        self.inner.flush()
     }
 }
 
-/// A [`SpanExporter`] that passes each span's name, string attributes, events
-/// and status description through [`redact_secrets`] before handing the batch
+impl<W: io::Write> Drop for RedactingWriter<W> {
+    fn drop(&mut self) {
+        let _ = self.write_pending();
+    }
+}
+
+/// A [`SpanExporter`] that passes each span's name, string attributes, events,
+/// links and status description through [`redact_secrets`] before handing the batch
 /// to the wrapped exporter.
 #[derive(Debug)]
 pub struct RedactingSpanExporter<E>(pub E);
@@ -115,6 +151,9 @@ fn redact_span(span: &mut SpanData) {
     for event in span.events.events.iter_mut() {
         redact_cow(&mut event.name);
         redact_attributes(&mut event.attributes);
+    }
+    for link in span.links.links.iter_mut() {
+        redact_attributes(&mut link.attributes);
     }
     if let Status::Error { description } = &mut span.status {
         redact_cow(description);
@@ -161,20 +200,34 @@ mod tests {
             redact_secrets(&format!(r#"{{"api_key":"{KEY}","n":1}}"#)),
             r#"{"api_key":"<redacted>","n":1}"#
         );
+        // After an escape, or glued to a word.
+        assert_eq!(redact_secrets(&format!("key=%22{KEY}%22")), "key=%22<redacted>%22");
+        assert_eq!(redact_secrets(&format!(r"first line\n{KEY}")), r"first line\n<redacted>");
+        assert_eq!(redact_secrets(&format!("apikey{KEY}")), "apikey<redacted>");
     }
 
     #[test]
     fn redacts_bearer_tokens_and_keeps_the_scheme() {
         assert_eq!(
-            redact_secrets("authorization: Bearer abc.def-ghi"),
+            redact_secrets("authorization: Bearer 0123456789abcdef.ghijklmnop"),
             "authorization: Bearer <redacted>"
         );
-        assert_eq!(redact_secrets("authorization: bearer abc"), "authorization: bearer <redacted>");
+        assert_eq!(
+            redact_secrets("authorization: bearer 0123456789abcdef"),
+            "authorization: bearer <redacted>"
+        );
     }
 
     #[test]
     fn leaves_text_without_credentials_borrowed() {
-        for text in ["sk-short", "risk-assessment", "task-1234", "no secrets here"] {
+        for text in [
+            "sk-short",
+            "risk-assessment",
+            "task-1234",
+            "no secrets here",
+            "Bearer token validation successful",
+            "Bearer token validation failed",
+        ] {
             assert!(matches!(redact_secrets(text), Cow::Borrowed(t) if t == text), "{text}");
         }
     }
@@ -182,12 +235,27 @@ mod tests {
     #[test]
     fn writer_redacts_each_write() {
         let mut out = Vec::new();
-        io::Write::write_all(&mut RedactingWriter(&mut out), format!("key={KEY}\n").as_bytes()).unwrap();
+        io::Write::write_all(&mut RedactingWriter::new(&mut out), format!("key={KEY}\n").as_bytes()).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "key=<redacted>\n");
     }
 
+    /// A line written in pieces is redacted whole: when it ends, on flush, or
+    /// when the writer is dropped.
     #[test]
-    fn exporter_redacts_name_attributes_events_and_status() {
+    fn writer_redacts_a_credential_split_across_writes() {
+        let (head, tail) = KEY.split_at(10);
+        let mut out = Vec::new();
+        {
+            let mut writer = RedactingWriter::new(&mut out);
+            for piece in ["authorization: Bearer ", head, tail, "\n", "key=", head, tail] {
+                io::Write::write_all(&mut writer, piece.as_bytes()).unwrap();
+            }
+        }
+        assert_eq!(String::from_utf8(out).unwrap(), "authorization: Bearer <redacted>\nkey=<redacted>");
+    }
+
+    #[test]
+    fn exporter_redacts_name_attributes_events_links_and_status() {
         let mut span = test_span_data();
         span.name = format!("POST {KEY}").into();
         span.attributes = vec![
@@ -199,6 +267,11 @@ mod tests {
             format!("failed with {KEY}"),
             std::time::SystemTime::now(),
             vec![KeyValue::new("authorization", format!("Bearer {KEY}"))],
+            0,
+        ));
+        span.links.links.push(opentelemetry::trace::Link::new(
+            span.span_context.clone(),
+            vec![KeyValue::new("source", format!("batch created with {KEY}"))],
             0,
         ));
         span.status = Status::error(format!("rejected {KEY}"));
