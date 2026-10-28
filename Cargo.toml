@@ -11,6 +11,14 @@ members = [
 default-members = ["dwctl"]
 resolver = "2"
 
+# Log output goes through the tracing subscriber, which redacts credentials
+# (dwctl/src/log_redaction.rs). These macros write around it, so code that
+# genuinely needs a terminal (a CLI's output) allows them at that site.
+[workspace.lints.clippy]
+print_stdout = "deny"
+print_stderr = "deny"
+dbg_macro = "deny"
+
 # Coverage builds compile the entire test suite as one very large crate. Full
 # debug info and incremental state make that clean build slower and produce
 # several gigabytes of artifacts, while neither is needed for CI coverage.

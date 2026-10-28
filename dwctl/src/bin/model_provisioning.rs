@@ -38,6 +38,7 @@ enum Command {
     Schema,
 }
 
+#[allow(clippy::print_stdout, reason = "this CLI's output is its result")]
 fn main() -> Result<()> {
     match Args::parse().command {
         Command::Validate { directory } => {

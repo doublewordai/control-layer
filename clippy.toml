@@ -1,0 +1,4 @@
+# Tests may print; production code must log through tracing (see the
+# workspace lints in Cargo.toml).
+allow-print-in-tests = true
+allow-dbg-in-tests = true
