@@ -1876,7 +1876,18 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
     ) -> Result<i64> {
         // The archive-aware live/retained union always uses one primary
         // statement snapshot; `_strict` remains for Storage compatibility.
-        retained_response::count_owner_flex_requests_since(self, owner, cutoff).await
+        retained_response::count_owner_flex_requests_since(self, owner, cutoff, None).await
+    }
+
+    async fn count_owner_flex_requests_since_capped(
+        &self,
+        owner: &str,
+        cutoff: DateTime<Utc>,
+        _strict: bool,
+        limit: i64,
+    ) -> Result<i64> {
+        retained_response::count_owner_flex_requests_since(self, owner, cutoff, Some(limit.max(0)))
+            .await
     }
 
     async fn get_pending_request_counts_by_model_and_window(
