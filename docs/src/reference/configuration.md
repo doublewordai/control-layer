@@ -395,6 +395,24 @@ background_services:
 
 Only runs on the leader instance when leader election is enabled.
 
+### Batch SLA Metrics
+
+Optional aggregate-only batch monitoring on the internal metrics endpoint:
+
+```yaml
+background_services:
+  batch_sla_metrics:
+    enabled: false
+    sample_interval: 30s
+    query_timeout: 10s
+    excluded_standard_models: []
+```
+
+Requires `enable_metrics: true`. The sampling interval must be at least 5s;
+query timeout must be positive and shorter than the interval. One replica per
+Fusillade database/schema collects a snapshot. Consumers must check collector
+health and freshness before using counts. See [metric contract and rollout](../../batch-sla-metrics.md).
+
 ### Batch Daemon
 
 Processes batch inference jobs:

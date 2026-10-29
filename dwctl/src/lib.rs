@@ -310,6 +310,9 @@ where
     pub metrics_recorder: Option<GenAiMetrics>,
     #[builder(default = false)]
     pub is_leader: bool,
+    /// Atomically published, aggregate-only batch health.
+    #[builder(default)]
+    pub batch_sla_metrics: Arc<arc_swap::ArcSwap<metrics::batch_sla::Snapshot>>,
     pub request_manager: Arc<fusillade_arsenal::PostgresRequestManager<P>>,
     /// Background task runner for enqueuing deferred work (batch population, etc.)
     pub task_runner: Arc<tasks::TaskRunner<P>>,
@@ -2777,6 +2780,7 @@ pub async fn build_router(
 
         // Get handle for the endpoint closure
         let endpoint_handle = get_or_install_prometheus_handle();
+        let batch_sla_metrics = state.batch_sla_metrics.clone();
 
         // Add metrics endpoint that combines both axum-prometheus and GenAI metrics
         router = router
@@ -2796,6 +2800,7 @@ pub async fn build_router(
 
                     // Combine both
                     axum_metrics.push_str(&String::from_utf8_lossy(&gen_ai_buffer));
+                    axum_metrics.push_str(&batch_sla_metrics.load().render());
                     axum_metrics
                 }),
             )
@@ -3074,6 +3079,7 @@ impl BackgroundShutdownTokens {
 }
 
 pub struct BackgroundServices {
+    pub batch_sla_metrics: Arc<arc_swap::ArcSwap<metrics::batch_sla::Snapshot>>,
     request_manager: Arc<fusillade_arsenal::PostgresRequestManager<DbPools>>,
     /// The onwards-instance daemon id registered in the `daemons` table
     /// for realtime / inline-loop attribution. The graceful-shutdown
@@ -4092,6 +4098,19 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         .connect_with(pools.main.direct.write().connect_options().as_ref().clone())
         .await?;
 
+    let batch_sla_metrics = Arc::new(arc_swap::ArcSwap::from_pointee(metrics::batch_sla::Snapshot::default()));
+    if config.enable_metrics && config.background_services.batch_sla_metrics.enabled {
+        let snapshot = batch_sla_metrics.clone();
+        let main = db_pools.clone();
+        let manager = request_manager.clone();
+        let direct = pools.fusillade.direct.clone();
+        let collector_config = config.background_services.batch_sla_metrics.clone();
+        let shutdown = shutdown_token.clone();
+        background_tasks.spawn("batch-sla-metrics", async move {
+            metrics::batch_sla::run(main, manager, direct, collector_config, snapshot, shutdown).await
+        });
+    }
+
     // Start pool metrics sampler if metrics are enabled
     if config.enable_metrics {
         let mut labeled = vec![
@@ -4306,6 +4325,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
     let (background_tasks, task_names) = background_tasks.into_parts();
 
     Ok(BackgroundServices {
+        batch_sla_metrics,
         request_manager,
         task_runner,
         is_leader,
@@ -4725,6 +4745,7 @@ impl Application {
             .db(db_pools.clone())
             .config(shared_config.clone())
             .is_leader(bg_services.is_leader)
+            .batch_sla_metrics(bg_services.batch_sla_metrics.clone())
             .request_manager(bg_services.request_manager.clone())
             .task_runner(bg_services.task_runner.clone())
             .maybe_outlet_db(outlet_pools.clone())
