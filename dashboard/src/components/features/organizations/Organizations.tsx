@@ -51,10 +51,10 @@ export function Organizations() {
         onView: (org) => navigate(`/organizations/${org.id}`),
         onEdit: (org) => setEditingOrg(org),
         onDelete: (org) => setDeletingOrg(org),
-        canDelete: isPlatformManager,
+        canDelete: false,
         tolerationPresets: config?.scheduling_toleration_presets,
       }),
-    [navigate, isPlatformManager, config?.scheduling_toleration_presets],
+    [navigate, config?.scheduling_toleration_presets],
   );
 
   const handleDelete = async () => {
@@ -115,7 +115,7 @@ export function Organizations() {
         isOpen={!!editingOrg}
         onClose={() => setEditingOrg(null)}
         organization={editingOrg}
-        canEditServing={isPlatformManager}
+        supportOnly={isPlatformManager}
         canEditZdr={isPlatformManager}
       />
 

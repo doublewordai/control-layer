@@ -76,7 +76,7 @@ async fn ai_models_pricing_is_opt_in_and_preserves_inference_access(pool: PgPool
         .get("/admin/api/v1/models?include=pricing")
         .add_header("authorization", format!("Bearer {}", key.secret))
         .await;
-    response.assert_status_unauthorized();
+    response.assert_status_forbidden();
 
     for authorization in [None, Some("Bearer unknown-key")] {
         let mut request = server.get("/ai/v1/models?include=pricing");

@@ -2577,7 +2577,7 @@ mod tests {
                 user_id: user.id,
                 name: "test-key".to_string(),
                 description: None,
-                purpose: ApiKeyPurpose::Realtime,
+                purpose: ApiKeyPurpose::Platform,
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,

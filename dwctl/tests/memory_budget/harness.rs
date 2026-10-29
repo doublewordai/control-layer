@@ -163,6 +163,7 @@ fn config(port: u16, database_url: &str, tokenizer_url: &str) -> Config {
         "secret_key": "memory-budget-secret-key-memory-budget",
         "admin_email": ADMIN_EMAIL,
         "admin_password": ADMIN_PASSWORD,
+        "auth": { "proxy_header": { "enabled": true, "auto_create_users": true } },
         "enable_metrics": true,
         "enable_request_logging": true,
         "enable_analytics": true,
@@ -182,26 +183,12 @@ async fn setup(base_url: String, upstream_url: String, database_url: String, opt
     let client = reqwest::Client::builder().pool_max_idle_per_host(0).build().expect("http client");
     wait_for(&client, &format!("{base_url}/health")).await;
 
-    let login = client
-        .post(format!("{base_url}/authentication/login"))
-        .json(&json!({ "email": ADMIN_EMAIL, "password": ADMIN_PASSWORD }))
-        .send()
-        .await
-        .expect("login");
-    assert!(login.status().is_success(), "login failed: {}", login.status());
-    let session = login
-        .headers()
-        .get_all("set-cookie")
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .find_map(|value| value.split(';').next().filter(|pair| pair.starts_with("dwctl_session=")))
-        .expect("session cookie")
-        .to_string();
-
+    // Test-only trusted SSO boundary. Native sessions cannot perform platform setup.
     let admin = |method: Method, path: &str, body: Option<Value>| {
         let mut request = client
             .request(method, format!("{base_url}/admin/api/v1{path}"))
-            .header("cookie", &session);
+            .header("x-doubleword-user", ADMIN_EMAIL)
+            .header("x-doubleword-email", ADMIN_EMAIL);
         if let Some(body) = body {
             request = request.json(&body);
         }

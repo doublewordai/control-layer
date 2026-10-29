@@ -2052,7 +2052,7 @@ mod openapi_access_control {
     }
 
     #[dwctl_test_macros::test]
-    async fn admin_spec_allows_platform_api_key(pool: PgPool) {
+    async fn admin_spec_rejects_platform_api_key(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
         let key = create_api_key(&pool, admin.id, ApiKeyPurpose::Platform).await;
@@ -2061,7 +2061,7 @@ mod openapi_access_control {
             .get("/admin/openapi.json")
             .add_header("authorization", format!("Bearer {key}"))
             .await;
-        assert_eq!(response.status_code().as_u16(), 200);
+        assert_eq!(response.status_code().as_u16(), 403);
     }
 
     #[dwctl_test_macros::test]

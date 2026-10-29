@@ -3,10 +3,10 @@
 # =============================================================================
 # Tests CRUD operations on /files and /batches endpoints
 # Covers: StandardUser + BatchAPIUser permissions (own resources only) and 
-# PlatformManager permissions (all resources)
+# SSO PlatformManager permissions (own resources only)
 #
 # Test users:
-# - admin_jwt: Platform Manager
+# - admin_email: trusted SSO administrator
 # - user_jwt: Standard User 1 (user@example.org) with BatchAPIUser role
 # - user2_jwt: Standard User 2 (user2@example.org) with BatchAPIUser role
 #
@@ -28,8 +28,8 @@
 # -----------------------------------------------------------------------------
 
 GET http://localhost:3001/admin/api/v1/users/current
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Captures]
 admin_user_id: jsonpath "$.id"
@@ -50,8 +50,8 @@ user2_id: jsonpath "$.id"
 
 # Create test endpoint pointing to mock LLM server
 POST http://localhost:3001/admin/api/v1/endpoints
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "name": "test-endpoint-{{newUuid}}-permtest",
   "url": "http://mock-llm-server:3000",
@@ -63,8 +63,8 @@ test_endpoint_id: jsonpath "$.id"
 
 # Create main test group (user1 and user2 will have access to gpt-4 and thinking models)
 POST http://localhost:3001/admin/api/v1/groups
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "name": "test-group-main-{{newUuid}}-permtest",
   "description": "Main test group with access to gpt-4 and thinking models"
@@ -75,19 +75,19 @@ main_group_id: jsonpath "$.id"
 
 # Add user1 and user2 to main group
 POST http://localhost:3001/admin/api/v1/groups/{{main_group_id}}/users/{{user1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 POST http://localhost:3001/admin/api/v1/groups/{{main_group_id}}/users/{{user2_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # Create gpt-4-mock model deployment
 POST http://localhost:3001/admin/api/v1/models
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "type": "standard",
   "model_name": "gpt-4-mock",
@@ -100,14 +100,14 @@ gpt4_model_id: jsonpath "$.id"
 
 # Add gpt-4-mock model to main group
 POST http://localhost:3001/admin/api/v1/groups/{{main_group_id}}/models/{{gpt4_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # Create mock-gpt-thinking model deployment
 POST http://localhost:3001/admin/api/v1/models
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "type": "standard",
   "model_name": "mock-gpt-thinking",
@@ -120,14 +120,14 @@ thinking_model_id: jsonpath "$.id"
 
 # Add mock-gpt-thinking model to main group
 POST http://localhost:3001/admin/api/v1/groups/{{main_group_id}}/models/{{thinking_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # Create mock-gpt-markdown model (restricted - no one has access initially)
 POST http://localhost:3001/admin/api/v1/models
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "type": "standard",
   "model_name": "mock-gpt-markdown",
@@ -140,8 +140,8 @@ restricted_model_id: jsonpath "$.id"
 
 # Create restricted group for permission revocation test (only user1 initially)
 POST http://localhost:3001/admin/api/v1/groups
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "name": "test-group-restricted-{{newUuid}}-permtest",
   "description": "Restricted group for permission revocation test"
@@ -152,14 +152,14 @@ restricted_group_id: jsonpath "$.id"
 
 # Add user1 to restricted group
 POST http://localhost:3001/admin/api/v1/groups/{{restricted_group_id}}/users/{{user1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # Add mock-gpt-markdown model to restricted group
 POST http://localhost:3001/admin/api/v1/groups/{{restricted_group_id}}/models/{{restricted_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # =============================================================================
@@ -223,8 +223,8 @@ body contains "has not been configured or is not available to user"
 
 # Admin CANNOT upload without group access (demonstrates restriction)
 POST http://localhost:3001/ai/v1/files
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 [MultipartFormData]
 purpose: batch
 file: file,gpt4.jsonl;
@@ -235,22 +235,22 @@ body contains "has not been configured or is not available to user"
 
 # Add admin to main group to grant access
 POST http://localhost:3001/admin/api/v1/groups/{{main_group_id}}/users/{{admin_user_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # Verify admin is in the group (this also helps ensure the cache is updated)
 GET http://localhost:3001/admin/api/v1/groups/{{main_group_id}}/users
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$[*]" contains "{{admin_user_id}}"
 
-# Admin CAN now upload gpt4.jsonl (has group access)
+# Staff ownership is required: now upload gpt4.jsonl (has group access)
 POST http://localhost:3001/ai/v1/files
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 [MultipartFormData]
 purpose: batch
 file: file,gpt4.jsonl;
@@ -262,8 +262,8 @@ jsonpath "$.filename" == "gpt4.jsonl"
 
 # Add admin to restricted group for mixed file test
 POST http://localhost:3001/admin/api/v1/groups/{{restricted_group_id}}/users/{{admin_user_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # User1 CAN upload mixed.jsonl (has access to both gpt-4-mock and mock-gpt-markdown via groups)
@@ -279,10 +279,10 @@ user1_mixed_file_id: jsonpath "$.id"
 [Asserts]
 jsonpath "$.filename" == "mixed.jsonl"
 
-# Admin CAN upload mixed.jsonl (has access to both models)
+# Staff ownership is required: upload mixed.jsonl (has access to both models)
 POST http://localhost:3001/ai/v1/files
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 [MultipartFormData]
 purpose: batch
 file: file,mixed.jsonl;
@@ -318,20 +318,16 @@ jsonpath "$.object" == "list"
 jsonpath "$.data" count == 1
 jsonpath "$.data[0].id" == "{{user2_thinking_file_id}}"
 
-# Admin sees all files (3 from user1 + 1 from user2 + 2 from admin = 6
-# explicit uploads). Responses are batchless on this branch, so the
-# `/v1/responses` path's `create_realtime` / `create_flex` calls no
-# longer mint synthetic per-request `files` rows like the old
-# `create_single_request_batch` did.
+# SSO admins see only their own files.
 GET http://localhost:3001/ai/v1/files
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.object" == "list"
-jsonpath "$.data" count == 6
-jsonpath "$.data[*].id" contains "{{user1_gpt4_file_id}}"
-jsonpath "$.data[*].id" contains "{{user2_thinking_file_id}}"
+jsonpath "$.data" count == 2
+jsonpath "$.data[*].id" not contains "{{user1_gpt4_file_id}}"
+jsonpath "$.data[*].id" not contains "{{user2_thinking_file_id}}"
 jsonpath "$.data[*].id" contains "{{admin_gpt4_file_id}}"
 
 # -----------------------------------------------------------------------------
@@ -359,20 +355,16 @@ GET http://localhost:3001/ai/v1/files/{{user1_gpt4_file_id}}
 dwctl_session: {{user2_jwt}}
 HTTP 404
 
-# Admin CAN read all file metadata
+# Staff ownership is required: read all file metadata
 GET http://localhost:3001/ai/v1/files/{{user1_gpt4_file_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
-HTTP 200
-[Asserts]
-jsonpath "$.id" == "{{user1_gpt4_file_id}}"
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
+HTTP 404
 
 GET http://localhost:3001/ai/v1/files/{{user2_thinking_file_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
-HTTP 200
-[Asserts]
-jsonpath "$.id" == "{{user2_thinking_file_id}}"
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
+HTTP 404
 
 # -----------------------------------------------------------------------------
 # GET /files/{file_id}/content - Get File Content
@@ -399,22 +391,16 @@ GET http://localhost:3001/ai/v1/files/{{user1_gpt4_file_id}}/content
 dwctl_session: {{user2_jwt}}
 HTTP 404
 
-# Admin CAN read all file content
+# Staff ownership is required: read all file content
 GET http://localhost:3001/ai/v1/files/{{user1_gpt4_file_id}}/content
-[Cookies]
-dwctl_session: {{admin_jwt}}
-HTTP 200
-[Asserts]
-header "content-type" == "application/x-ndjson"
-body contains "gpt-4-mock-permtest"
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
+HTTP 404
 
 GET http://localhost:3001/ai/v1/files/{{user2_thinking_file_id}}/content
-[Cookies]
-dwctl_session: {{admin_jwt}}
-HTTP 200
-[Asserts]
-header "content-type" == "application/x-ndjson"
-body contains "mock-gpt-thinking-permtest"
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
+HTTP 404
 
 # =============================================================================
 # BATCHES PERMISSIONS TESTS
@@ -496,10 +482,10 @@ dwctl_session: {{user2_jwt}}
 }
 HTTP 403
 
-# Admin CAN create batch from their own file
+# Staff ownership is required: create batch from their own file
 POST http://localhost:3001/ai/v1/batches
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "input_file_id": "{{admin_gpt4_file_id}}",
   "endpoint": "/v1/chat/completions",
@@ -511,25 +497,21 @@ admin_batch_id: jsonpath "$.id"
 [Asserts]
 jsonpath "$.input_file_id" == "{{admin_gpt4_file_id}}"
 
-# Admin CAN create batch from user1's file (has ReadAll permission)
+# Staff ownership is required: creation from another owner's file is denied
 POST http://localhost:3001/ai/v1/batches
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "input_file_id": "{{user1_gpt4_file_id}}",
   "endpoint": "/v1/chat/completions",
   "completion_window": "24h"
 }
-HTTP 201
-[Captures]
-admin_batch_from_user1_file: jsonpath "$.id"
-[Asserts]
-jsonpath "$.input_file_id" == "{{user1_gpt4_file_id}}"
+HTTP 403
 
 # Permission revocation test: Remove user1 from restricted group, then create batch
 DELETE http://localhost:3001/admin/api/v1/groups/{{restricted_group_id}}/users/{{user1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # User1 can still create batch from previously uploaded restricted file
@@ -581,27 +563,23 @@ GET http://localhost:3001/ai/v1/batches/{{user1_batch_id}}
 dwctl_session: {{user2_jwt}}
 HTTP 404
 
-# Admin CAN get all batches
+# Staff ownership is required: get all batches
 GET http://localhost:3001/ai/v1/batches/{{user1_batch_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
-HTTP 200
-[Asserts]
-jsonpath "$.id" == "{{user1_batch_id}}"
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
+HTTP 404
 
 GET http://localhost:3001/ai/v1/batches/{{user2_batch_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
-HTTP 200
-[Asserts]
-jsonpath "$.id" == "{{user2_batch_id}}"
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
+HTTP 404
 
 # =============================================================================
 # GET /files/{file_id} - Batch Output/Error File Permissions
 # =============================================================================
 # When batches complete, they create output_file_id and error_file_id
 # Users should only be able to access these files for their own batches
-# Platform managers can access all batch output/error files
+# SSO staff cannot access customer batch output/error files
 
 # -----------------------------------------------------------------------------
 # Capture output/error file IDs from user1's batch
@@ -780,84 +758,76 @@ dwctl_session: {{user2_jwt}}
 HTTP 404
 
 # -----------------------------------------------------------------------------
-# Admin CAN read user1's batch output file metadata
+# Staff ownership is required: read user1's batch output file metadata
 # -----------------------------------------------------------------------------
 
 GET http://localhost:3001/ai/v1/files/{{user1_batch_output_file_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
-HTTP 200
-[Asserts]
-jsonpath "$.id" == "{{user1_batch_output_file_id}}"
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
+HTTP 404
 
 # -----------------------------------------------------------------------------
-# Admin CAN read user1's batch output file content
+# Staff ownership is required: read user1's batch output file content
 # -----------------------------------------------------------------------------
 
 GET http://localhost:3001/ai/v1/files/{{user1_batch_output_file_id}}/content
-[Cookies]
-dwctl_session: {{admin_jwt}}
-HTTP 200
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
+HTTP 404
 
 # -----------------------------------------------------------------------------
-# Admin CAN read user1's batch error file metadata
+# Staff ownership is required: read user1's batch error file metadata
 # -----------------------------------------------------------------------------
 
 GET http://localhost:3001/ai/v1/files/{{user1_batch_error_file_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
-HTTP 200
-[Asserts]
-jsonpath "$.id" == "{{user1_batch_error_file_id}}"
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
+HTTP 404
 
 # -----------------------------------------------------------------------------
-# Admin CAN read user1's batch error file content
+# Staff ownership is required: read user1's batch error file content
 # -----------------------------------------------------------------------------
 
 GET http://localhost:3001/ai/v1/files/{{user1_batch_error_file_id}}/content
-[Cookies]
-dwctl_session: {{admin_jwt}}
-HTTP 200
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
+HTTP 404
 
 # -----------------------------------------------------------------------------
-# Admin CAN read user2's batch output file metadata
+# Staff ownership is required: read user2's batch output file metadata
 # -----------------------------------------------------------------------------
 
 GET http://localhost:3001/ai/v1/files/{{user2_batch_output_file_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
-HTTP 200
-[Asserts]
-jsonpath "$.id" == "{{user2_batch_output_file_id}}"
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
+HTTP 404
 
 # -----------------------------------------------------------------------------
-# Admin CAN read user2's batch output file content
+# Staff ownership is required: read user2's batch output file content
 # -----------------------------------------------------------------------------
 
 GET http://localhost:3001/ai/v1/files/{{user2_batch_output_file_id}}/content
-[Cookies]
-dwctl_session: {{admin_jwt}}
-HTTP 200
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
+HTTP 404
 
 # -----------------------------------------------------------------------------
-# Admin CAN read user2's batch error file metadata
+# Staff ownership is required: read user2's batch error file metadata
 # -----------------------------------------------------------------------------
 
 GET http://localhost:3001/ai/v1/files/{{user2_batch_error_file_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
-HTTP 200
-[Asserts]
-jsonpath "$.id" == "{{user2_batch_error_file_id}}"
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
+HTTP 404
 
 # -----------------------------------------------------------------------------
-# Admin CAN read user2's batch error file content
+# Staff ownership is required: read user2's batch error file content
 # -----------------------------------------------------------------------------
 
 GET http://localhost:3001/ai/v1/files/{{user2_batch_error_file_id}}/content
-[Cookies]
-dwctl_session: {{admin_jwt}}
-HTTP 200
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
+HTTP 404
 
 # -----------------------------------------------------------------------------
 # GET /batches/{batch_id}/analytics - Get Batch Analytics Permissions
@@ -891,20 +861,16 @@ GET http://localhost:3001/ai/v1/batches/{{user1_batch_id}}/analytics
 dwctl_session: {{user2_jwt}}
 HTTP 404
 
-# Admin CAN get analytics for all batches
+# Staff ownership is required: get analytics for all batches
 GET http://localhost:3001/ai/v1/batches/{{user1_batch_id}}/analytics
-[Cookies]
-dwctl_session: {{admin_jwt}}
-HTTP 200
-[Asserts]
-jsonpath "$.total_requests" exists
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
+HTTP 404
 
 GET http://localhost:3001/ai/v1/batches/{{user2_batch_id}}/analytics
-[Cookies]
-dwctl_session: {{admin_jwt}}
-HTTP 200
-[Asserts]
-jsonpath "$.total_requests" exists
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
+HTTP 404
 
 # -----------------------------------------------------------------------------
 # POST /batches/{batch_id}/cancel - Cancel Batch Permissions
@@ -934,26 +900,14 @@ HTTP 200
 jsonpath "$.id" == "{{user2_batch_id}}"
 jsonpath "$.status" matches "^(cancelling|cancelled)$"
 
-# Admin CAN cancel all batches
+# Staff ownership is required: cancel all batches
 POST http://localhost:3001/ai/v1/batches/{{admin_batch_id}}/cancel
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{admin_batch_id}}"
 
-POST http://localhost:3001/ai/v1/batches/{{admin_batch_from_user1_file}}/cancel
-[Cookies]
-dwctl_session: {{admin_jwt}}
-HTTP 200
-[Asserts]
-jsonpath "$.id" == "{{admin_batch_from_user1_file}}"
-
-# -----------------------------------------------------------------------------
-# GET /batches - List Batches Permissions
-# -----------------------------------------------------------------------------
-
-# Create fresh batches for list test (previous ones are cancelled)
 POST http://localhost:3001/ai/v1/batches
 [Cookies]
 dwctl_session: {{user_jwt}}
@@ -979,8 +933,8 @@ HTTP 201
 user2_list_batch: jsonpath "$.id"
 
 POST http://localhost:3001/ai/v1/batches
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "input_file_id": "{{admin_gpt4_file_id}}",
   "endpoint": "/v1/chat/completions",
@@ -1012,15 +966,15 @@ jsonpath "$.data[*].id" contains "{{user2_list_batch}}"
 jsonpath "$.data[*].id" not contains "{{user1_list_batch}}"
 jsonpath "$.data[*].id" not contains "{{admin_list_batch}}"
 
-# Admin sees ALL batches
+# SSO admins see only their own batches
 GET http://localhost:3001/ai/v1/batches
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.object" == "list"
-jsonpath "$.data[*].id" contains "{{user1_list_batch}}"
-jsonpath "$.data[*].id" contains "{{user2_list_batch}}"
+jsonpath "$.data[*].id" not contains "{{user1_list_batch}}"
+jsonpath "$.data[*].id" not contains "{{user2_list_batch}}"
 jsonpath "$.data[*].id" contains "{{admin_list_batch}}"
 
 # -----------------------------------------------------------------------------
@@ -1054,17 +1008,15 @@ GET http://localhost:3001/ai/v1/files/{{user1_gpt4_file_id}}
 dwctl_session: {{user_jwt}}
 HTTP 404
 
-# Admin CAN delete all files
+# Staff ownership is required: delete all files
 DELETE http://localhost:3001/ai/v1/files/{{user2_thinking_file_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
-HTTP 200
-[Asserts]
-jsonpath "$.deleted" == true
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
+HTTP 404
 
 DELETE http://localhost:3001/ai/v1/files/{{admin_gpt4_file_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.deleted" == true
@@ -1090,14 +1042,14 @@ jsonpath "$.deleted" == true
 
 # First, re-add user1 to restricted group (was removed earlier in permission revocation test)
 POST http://localhost:3001/admin/api/v1/groups/{{restricted_group_id}}/users/{{user1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # Verify user1 is in the restricted group (ensures cache is updated before upload)
 GET http://localhost:3001/admin/api/v1/groups/{{restricted_group_id}}/users
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$" count >= 1
@@ -1105,8 +1057,8 @@ jsonpath "$[*]" contains "{{user1_id}}"
 
 # Also verify user1 is still in main group (needed for gpt-4-mock-permtest in mixed.jsonl)
 GET http://localhost:3001/admin/api/v1/groups/{{main_group_id}}/users
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$[*]" contains "{{user1_id}}"
@@ -1143,8 +1095,8 @@ dwctl_session: {{user_jwt}}
 HTTP 200
 
 DELETE http://localhost:3001/admin/api/v1/groups/{{restricted_group_id}}/users/{{user1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # Permission changes reach onwards asynchronously. Observe the revoked access
@@ -1265,31 +1217,31 @@ body matches "403"
 # =============================================================================
 
 DELETE http://localhost:3001/admin/api/v1/groups/{{main_group_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 DELETE http://localhost:3001/admin/api/v1/groups/{{restricted_group_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 DELETE http://localhost:3001/admin/api/v1/models/{{gpt4_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 
 DELETE http://localhost:3001/admin/api/v1/models/{{thinking_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 
 DELETE http://localhost:3001/admin/api/v1/models/{{restricted_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 
 DELETE http://localhost:3001/admin/api/v1/endpoints/{{test_endpoint_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204

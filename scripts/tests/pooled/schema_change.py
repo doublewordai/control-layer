@@ -13,11 +13,10 @@ def verify_concurrent_model_name_writes(app, direct, pooled_dsn):
     app.start()
     base = f"http://127.0.0.1:{app.config['port']}"
     with requests.Session() as session:
-        response = session.post(base + "/authentication/login", json={
-            "email": "pool-test@example.invalid",
-            "password": "local-pool-test-password",
-        }, timeout=20)
-        response.raise_for_status()
+        session.headers.update({
+            "X-Doubleword-User": "pool-test@example.invalid",
+            "X-Doubleword-Email": "pool-test@example.invalid",
+        })
         endpoint = str(direct.execute("SELECT id FROM inference_endpoints LIMIT 1").fetchone()[0])
         alias = "pooled-names-" + uuid.uuid4().hex
         response = session.post(base + "/admin/api/v1/models", json={
@@ -118,15 +117,10 @@ def verify_models_schema_change(app, direct):
     base = f"http://127.0.0.1:{app.config['port']}"
     app.start()
     session = requests.Session()
-    response = session.post(
-        base + "/authentication/login",
-        json={
-            "email": "pool-test@example.invalid",
-            "password": "local-pool-test-password",
-        },
-        timeout=20,
-    )
-    response.raise_for_status()
+    session.headers.update({
+        "X-Doubleword-User": "pool-test@example.invalid",
+        "X-Doubleword-Email": "pool-test@example.invalid",
+    })
 
     def listings():
         results = []

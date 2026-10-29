@@ -21,8 +21,8 @@
 
 # Get current user to check initial balance
 GET http://localhost:3001/admin/api/v1/users/current?include=billing
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Captures]
 initial_balance: jsonpath "$.credit_balance"
@@ -30,8 +30,8 @@ initial_balance: jsonpath "$.credit_balance"
 
 # Create payment checkout session
 POST http://localhost:3001/admin/api/v1/payments
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.url" exists
@@ -43,48 +43,48 @@ session_id: regex "session_id=([^&]+)"
 
 # Verify NO transaction was created yet (matches real payment flow)
 GET http://localhost:3001/admin/api/v1/users/current?include=billing
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.credit_balance" == {{initial_balance}}
 
 # Process payment manually (simulates frontend callback after redirect)
 PATCH http://localhost:3001/admin/api/v1/payments/{{session_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.message" == "Payment processed successfully"
 
 # Capture balance after payment processed
 GET http://localhost:3001/admin/api/v1/users/current?include=billing
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Captures]
 balance_after_checkout: jsonpath "$.credit_balance"
 
 # Process payment again to verify idempotency
 PATCH http://localhost:3001/admin/api/v1/payments/{{session_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.message" == "Payment processed successfully"
 
 # Verify balance unchanged after duplicate processing (idempotent)
 GET http://localhost:3001/admin/api/v1/users/current?include=billing
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.credit_balance" == {{balance_after_checkout}}
 
 # List transactions to verify payment was recorded
 GET http://localhost:3001/admin/api/v1/transactions
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.data" isCollection

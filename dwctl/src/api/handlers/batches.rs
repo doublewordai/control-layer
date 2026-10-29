@@ -543,7 +543,6 @@ The batch will begin processing immediately. Use `GET /batches/{batch_id}` to mo
 pub async fn create_batch<P: PoolProvider>(
     State(state): State<AppState<P>>,
     current_user: RequiresPermission<resource::Batches, operation::CreateOwn>,
-    has_api_key: crate::auth::current_user::HasApiKey,
     // Before `Json`, which consumes the body and so must come last.
     headers: axum::http::HeaderMap,
     Json(req): Json<CreateBatchRequest>,
@@ -558,10 +557,10 @@ pub async fn create_batch<P: PoolProvider>(
         });
     }
 
-    // Users with Batches::CreateAll (PlatformManager, admins) can use any
+    // SSO platform managers and admins can use any
     // completion window that humantime can parse. Everyone else is restricted
     // to the configured allowed values.
-    let can_use_any_window = has_permission(&current_user, Resource::Batches, Operation::CreateAll);
+    let can_use_any_window = current_user.is_sso_platform_manager();
     if !is_background && !can_use_any_window && !config.batches.allowed_completion_windows.contains(&req.completion_window) {
         let allowed: Vec<&str> = config.batches.allowed_completion_windows.iter().map(|w| w.as_str()).collect();
 
@@ -717,7 +716,7 @@ pub async fn create_batch<P: PoolProvider>(
     // Determine request_source from authentication method
     // - API key present -> "api"
     // - No API key (cookie auth) -> "frontend"
-    let request_source = if has_api_key.0 { "api" } else { "frontend" };
+    let request_source = if current_user.api_key_id.is_some() { "api" } else { "frontend" };
 
     // The creating call's User-Agent, which is the only moment a batch's CLIENT is
     // knowable. Every request the batch goes on to make is dispatched by the fusillade
@@ -5797,9 +5796,10 @@ mod tests {
         let batch_id = Uuid::new_v4();
 
         sqlx::query(
-            "INSERT INTO fusillade.files (id, name, status, created_at, updated_at) VALUES ($1, 'test.jsonl', 'processed', NOW(), NOW())",
+            "INSERT INTO fusillade.files (id, name, status, created_at, updated_at, uploaded_by) VALUES ($1, 'test.jsonl', 'processed', NOW(), NOW(), $2)",
         )
         .bind(file_id)
+        .bind(user_id.to_string())
         .execute(pool)
         .await
         .expect("insert file");
@@ -6361,7 +6361,7 @@ mod tests {
             .json(&batch_req(&file_id, None))
             .add_header("authorization", format!("Bearer {}", secrets["platform"]))
             .await;
-        resp.assert_status_unauthorized();
+        resp.assert_status_forbidden();
 
         // Inference-key Bearer auth: same request succeeds.
         app.post("/ai/v1/batches")

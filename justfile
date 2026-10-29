@@ -405,12 +405,13 @@ _test-other target="" *args="":
             exit 1
         fi
 
-        echo "Using admin email: $ADMIN_EMAIL, and admin password $ADMIN_PASSWORD"
+        echo "Using test admin: $ADMIN_EMAIL"
 
 
         # Generate admin JWT
         if ADMIN_JWT=$(EMAIL=$ADMIN_EMAIL PASSWORD=$ADMIN_PASSWORD ./scripts/login.sh); then
             echo "admin_jwt=$ADMIN_JWT" > test.env
+            echo "admin_email=$ADMIN_EMAIL" >> test.env
             echo "✅ Admin JWT generated successfully"
         else
             echo "❌ Failed to generate admin JWT:"
@@ -459,6 +460,12 @@ _test-other target="" *args="":
             exit 1
         fi    
 
+        # These headers represent the trusted upstream SSO boundary in the
+        # isolated test stack. Privileged roles are never granted via the API.
+        # Remove privileged fixtures even when a test or later cleanup fails.
+        trap './scripts/drop-test-users.sh' EXIT
+        docker compose -f docker-compose.yml -f docker-compose.test.yml exec -T postgres psql -v ON_ERROR_STOP=1 -U control_layer -d control_layer < scripts/seed-auth-test-users.sql
+
         echo "Test cookies written to test.env"
 
         if [ "$RUN_API_TESTS" = true ]; then
@@ -475,8 +482,7 @@ _test-other target="" *args="":
 
         echo ""
         echo "Cleaning up test users and groups..."
-        ./scripts/drop-test-users.sh
-        ADMIN_PASSWORD=$ADMIN_PASSWORD ./scripts/drop-test-groups.sh
+        ./scripts/drop-test-groups.sh
         ./scripts/drop-permtest-resources.sh
         exit 0
     fi

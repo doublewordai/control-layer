@@ -38,6 +38,7 @@ interface EditUserModalProps {
   };
   /** Whether the current user may toggle zero data retention (admins only). */
   canEditZdr?: boolean;
+  supportOnly?: boolean;
   /** Whether the current user may change the serving account settings (platform managers only). */
   canEditServing?: boolean;
 }
@@ -60,6 +61,7 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
   userId,
   currentUser,
   canEditZdr = false,
+  supportOnly = false,
   canEditServing = false,
 }) => {
   const [formData, setFormData] = useState({
@@ -83,7 +85,7 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
     try {
       await updateUserMutation.mutateAsync({
         id: userId,
-        data: {
+        data: supportOnly ? { zero_data_retention: true } : {
           display_name: formData.display_name.trim() || undefined,
           avatar_url: formData.avatar_url.trim() || undefined,
           roles: formData.roles,
@@ -169,7 +171,7 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
         >
           <AlertBox variant="error">{error}</AlertBox>
 
-          <section className="space-y-3">
+          <section className="space-y-3" hidden={supportOnly}>
             <SectionHeading>Profile</SectionHeading>
             <div className="grid gap-4 sm:grid-cols-2">
               <div>
@@ -220,7 +222,7 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
             </p>
           </section>
 
-          <section className="space-y-3">
+          <section className="space-y-3" hidden={supportOnly}>
             <SectionHeading>Roles</SectionHeading>
             <div className="grid gap-x-6 gap-y-2 sm:grid-cols-2">
               {AVAILABLE_ROLES.map((role) => {
@@ -298,6 +300,7 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
               </div>
               <Switch
                 id="zero_data_retention"
+                disabled={supportOnly && currentUser.zero_data_retention}
                 checked={formData.zero_data_retention}
                 onCheckedChange={(checked) =>
                   setFormData((prev) => ({
@@ -375,7 +378,7 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
           <Button
             type="submit"
             form="edit-user-form"
-            disabled={updateUserMutation.isPending}
+            disabled={updateUserMutation.isPending || (supportOnly && (!formData.zero_data_retention || currentUser.zero_data_retention))}
           >
             {updateUserMutation.isPending ? (
               <>

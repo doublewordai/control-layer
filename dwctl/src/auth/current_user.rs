@@ -2,8 +2,7 @@
 
 use crate::db::errors::DbError;
 use crate::{
-    AppState,
-    api::models::users::{CurrentUser, Role},
+    api::models::users::{AuthMethod, CurrentUser, Role},
     auth::session,
     db::handlers::{Repository, Users},
     errors::{Error, Result},
@@ -74,6 +73,7 @@ async fn try_jwt_session_auth(
             let last_login = user.last_login;
             return Some(Ok((
                 CurrentUser {
+                    auth_method: AuthMethod::NativeSession,
                     id: user.id,
                     username: user.username,
                     email: user.email,
@@ -263,6 +263,7 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
                 let last_login = user.last_login;
                 Some((
                     CurrentUser {
+                        auth_method: AuthMethod::TrustedSso,
                         id: user.id,
                         username: user.username,
                         email: user.email,
@@ -289,6 +290,7 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
                 let last_login = user.last_login;
                 Some((
                     CurrentUser {
+                        auth_method: AuthMethod::TrustedSso,
                         id: user.id,
                         username: user.username,
                         email: user.email,
@@ -341,7 +343,7 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
 
 /// Extract user from API key in Authorization header if present and valid
 /// Returns:
-/// - None: No Authorization header or not a Bearer token
+/// - None: No explicit API credentials
 /// - Some(Ok((user, last_login))): Valid API key found and user authenticated
 /// - Some(Err(error)): Bearer token present but invalid or insufficient permissions
 #[instrument(skip(parts, db))]
@@ -349,8 +351,16 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
     // Extract Authorization header
     let auth_header = match parts.headers.get(axum::http::header::AUTHORIZATION) {
         Some(header) => header,
+        None if parts.headers.contains_key("x-api-key") => {
+            // This extractor accepts management credentials only as Bearer tokens.
+            // Unsupported explicit credentials must not fall through to SSO.
+            return Some(Err(Error::Unauthenticated { message: None }));
+        }
         None => return None,
     };
+    if parts.headers.get_all(axum::http::header::AUTHORIZATION).iter().count() != 1 {
+        return Some(Err(Error::Unauthenticated { message: None }));
+    }
 
     let auth_str = match auth_header.to_str() {
         Ok(s) => s,
@@ -362,9 +372,9 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
     };
 
     // Check for Bearer token format
-    let api_key = match auth_str.strip_prefix("Bearer ") {
-        Some(key) => key,
-        None => return None, // Not a Bearer token, try other auth methods
+    let api_key = match auth_str.split_once(' ') {
+        Some((scheme, key)) if scheme.eq_ignore_ascii_case("bearer") && !key.is_empty() => key,
+        _ => return Some(Err(Error::Unauthenticated { message: None })),
     };
 
     // Look up API key in database
@@ -381,7 +391,9 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
                u.payment_provider_id, u.last_login
         FROM api_keys ak
         INNER JOIN users u ON ak.created_by = u.id
+        INNER JOIN users account ON ak.user_id = account.id
         WHERE ak.secret = $1 AND ak.is_deleted = false
+          AND u.is_deleted = false AND account.is_deleted = false
         "#,
         api_key
     )
@@ -459,6 +471,19 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
     // For org-scoped keys (created_by != user_id), user_id is the org.
     // For personal keys, created_by == user_id so no org context.
     let active_organization = if api_key_data.created_by != api_key_data.user_id {
+        // An issued org key cannot outlive the holder's membership.
+        let membership = crate::db::handlers::Organizations::new(&mut conn)
+            .get_user_org_role(api_key_data.created_by, api_key_data.user_id)
+            .await;
+        match membership {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Some(Err(Error::Unauthenticated {
+                    message: Some(crate::errors::INVALID_API_KEY_MESSAGE.to_string()),
+                }));
+            }
+            Err(error) => return Some(Err(Error::Database(error))),
+        }
         Some(api_key_data.user_id)
     } else {
         None
@@ -466,6 +491,7 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
 
     Some(Ok((
         CurrentUser {
+            auth_method: AuthMethod::ApiKey,
             id: api_key_data.created_by,
             username: api_key_data.username,
             email: api_key_data.email,
@@ -483,29 +509,6 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
         },
         api_key_data.last_login,
     )))
-}
-
-/// Extractor that checks if the request contains an API key in the Authorization header.
-///
-/// Used to determine the request source:
-/// - API key present → request came from API client
-/// - No API key → request came from frontend (cookie auth)
-#[derive(Debug, Clone)]
-pub struct HasApiKey(pub bool);
-
-impl FromRequestParts<AppState> for HasApiKey {
-    type Rejection = std::convert::Infallible;
-
-    async fn from_request_parts(parts: &mut Parts, _state: &AppState) -> std::result::Result<Self, Self::Rejection> {
-        let has_api_key = parts
-            .headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|h| h.to_str().ok())
-            .map(|s| s.starts_with("Bearer "))
-            .unwrap_or(false);
-
-        Ok(HasApiKey(has_api_key))
-    }
 }
 
 /// The HTTP header name used to specify the active organization context.
@@ -648,27 +651,24 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
         // - Some(Ok((user, last_login))) means successful authentication
         // - Some(Err(error)) means auth credentials were present but invalid
         //
-        // Strategy: Try ALL methods and return the first successful one.
-        // Only fail if ALL methods either weren't present or failed.
-        // This allows a user with a valid session cookie + invalid API key to still authenticate.
+        // API credentials are authoritative when supplied: invalid keys fail closed.
+        // Only requests without API credentials may use native sessions or trusted SSO.
 
         let mut auth_errors = Vec::new();
         let mut any_auth_attempted = false;
 
         // Try API key authentication first (most specific)
-        match try_api_key_auth(parts, &state.db.read()).await {
+        match try_api_key_auth(parts, &state.db.write()).await {
             Some(Ok((mut user, last_login))) => {
+                user = user.with_auth_method(AuthMethod::ApiKey);
                 debug!("Authentication successful via API key");
                 trace!("Authenticated user: {}", user.id);
-                populate_org_context(&mut user, parts, &state.db.read()).await;
+                populate_org_context(&mut user, parts, &state.db.write()).await;
                 maybe_update_last_login(user.id, last_login, &state.db.write());
                 return Ok(user);
             }
-            Some(Err(e)) => {
-                trace!("API key authentication failed: {:?}", e);
-                any_auth_attempted = true;
-                auth_errors.push(("API key", e));
-            }
+            // Explicit API credentials must not fall back to browser/SSO authority.
+            Some(Err(e)) => return Err(e),
             None => {
                 trace!("No API key authentication attempted");
             }
@@ -677,11 +677,12 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
         // Native authentication (JWT sessions)
         let config = state.current_config();
         if config.auth.native.enabled {
-            match try_jwt_session_auth(parts, &config, &state.db.read()).await {
+            match try_jwt_session_auth(parts, &config, &state.db.write()).await {
                 Some(Ok((mut user, last_login))) => {
+                    user = user.with_auth_method(AuthMethod::NativeSession);
                     debug!("Authentication successful via JWT session");
                     trace!("Authenticated user: {}", user.id);
-                    populate_org_context(&mut user, parts, &state.db.read()).await;
+                    populate_org_context(&mut user, parts, &state.db.write()).await;
                     maybe_update_last_login(user.id, last_login, &state.db.write());
                     return Ok(user);
                 }
@@ -700,9 +701,10 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
         if config.auth.proxy_header.enabled {
             match try_proxy_header_auth(parts, state).await {
                 Some(Ok((mut user, last_login))) => {
+                    user = user.with_auth_method(AuthMethod::TrustedSso);
                     debug!("Authentication successful via proxy header");
                     trace!("Authenticated user: {}", user.id);
-                    populate_org_context(&mut user, parts, &state.db.read()).await;
+                    populate_org_context(&mut user, parts, &state.db.write()).await;
                     maybe_update_last_login(user.id, last_login, &state.db.write());
                     return Ok(user);
                 }
@@ -725,15 +727,7 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
         } else {
             debug!("Authentication failed: invalid credentials");
             trace!("All authentication attempts failed ({}): {:?}", auth_errors.len(), auth_errors);
-            // Surface the API-key failure copy (the region-aware invalid-key
-            // message) rather than the generic "Authentication required"
-            // fallback. Scoped to the API-key method so the other auth
-            // methods' responses stay byte-identical.
-            let message = auth_errors.iter().find_map(|(method, e)| match e {
-                Error::Unauthenticated { message } if *method == "API key" => message.clone(),
-                _ => None,
-            });
-            Err(Error::Unauthenticated { message })
+            Err(Error::Unauthenticated { message: None })
         }
     }
 }
@@ -743,7 +737,7 @@ mod tests {
     use crate::{
         api::models::{
             transactions::TransactionFilters,
-            users::{CurrentUser, Role},
+            users::{AuthMethod, CurrentUser, Role},
         },
         db::handlers::{Organizations, Users, repository::Repository},
         errors::Error,
@@ -1265,6 +1259,7 @@ mod tests {
     fn test_require_admin_function() {
         // Test with admin user
         let admin_user = CurrentUser {
+            auth_method: AuthMethod::TrustedSso,
             id: uuid::Uuid::new_v4(),
             username: "admin".to_string(),
             email: "admin@example.com".to_string(),
@@ -1283,6 +1278,7 @@ mod tests {
 
         // Test with regular user
         let regular_user = CurrentUser {
+            auth_method: AuthMethod::TrustedSso,
             id: uuid::Uuid::new_v4(),
             username: "user".to_string(),
             email: "user@example.com".to_string(),
@@ -1314,6 +1310,7 @@ mod tests {
 
         // Create a JWT token
         let current_user = CurrentUser {
+            auth_method: AuthMethod::TrustedSso,
             id: user.id,
             username: user.username.clone(),
             email: user.email.clone(),
@@ -1375,7 +1372,7 @@ mod tests {
         let extracted_user = CurrentUser::from_request_parts(&mut parts, &state).await.unwrap();
         assert_eq!(extracted_user.id, user.id);
         assert!(extracted_user.roles.contains(&Role::StandardUser));
-        assert!(extracted_user.roles.contains(&Role::PlatformManager));
+        assert!(!extracted_user.roles.contains(&Role::PlatformManager));
     }
 
     #[dwctl_test_macros::test]
@@ -1389,6 +1386,7 @@ mod tests {
 
         // Create a JWT token
         let current_user = CurrentUser {
+            auth_method: AuthMethod::TrustedSso,
             id: user.id,
             username: user.username.clone(),
             email: user.email.clone(),

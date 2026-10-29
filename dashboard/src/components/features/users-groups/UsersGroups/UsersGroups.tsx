@@ -1,11 +1,10 @@
-import React, { useState, useRef, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import { useSearchParams, useNavigate } from "react-router-dom";
 import { Users, UserPlus, Search, X, Trash2, Plus } from "lucide-react";
 import { useDebounce } from "@/hooks/useDebounce";
 import {
   useUsers,
   useGroups,
-  useDeleteUser,
   useDeleteGroup,
   useOrganizations,
   useDeleteOrganization,
@@ -136,10 +135,8 @@ const UsersGroups: React.FC = () => {
   const loading = usersLoading || groupsLoading;
   const error = usersError || groupsError;
 
-  // Selected users and groups for bulk operations
-  const [selectedUsers, setSelectedUsers] = useState<DisplayUser[]>([]);
+  // Selected groups for bulk operations
   const [selectedGroups, setSelectedGroups] = useState<Set<string>>(new Set());
-  const tableRef = useRef<any>(null);
 
   // Modals
   const [showCreateUserModal, setShowCreateUserModal] = useState(false);
@@ -151,7 +148,6 @@ const UsersGroups: React.FC = () => {
   const [showDeleteGroupModal, setShowDeleteGroupModal] = useState(false);
   const [showEditUserModal, setShowEditUserModal] = useState(false);
   const [showEditGroupModal, setShowEditGroupModal] = useState(false);
-  const [showBulkDeleteModal, setShowBulkDeleteModal] = useState(false);
   const [showBulkDeleteGroupsModal, setShowBulkDeleteGroupsModal] =
     useState(false);
 
@@ -165,7 +161,6 @@ const UsersGroups: React.FC = () => {
   const [activeGroup, setActiveGroup] = useState<DisplayGroup | null>(null);
 
   // Bulk operations
-  const deleteUserMutation = useDeleteUser();
   const deleteGroupMutation = useDeleteGroup();
   const deleteOrgMutation = useDeleteOrganization();
 
@@ -208,24 +203,6 @@ const UsersGroups: React.FC = () => {
     } catch (error) {
       console.error("Error deleting groups:", error);
       toast.error("Failed to delete some groups. Please try again.");
-    }
-  };
-
-  const handleBulkDelete = async () => {
-    try {
-      // Delete users one by one
-      for (const user of selectedUsers) {
-        await deleteUserMutation.mutateAsync(user.id);
-      }
-      setSelectedUsers([]); // Clear selection after successful deletion
-      setShowBulkDeleteModal(false);
-      // Clear table selection if ref is available
-      if (tableRef.current?.resetRowSelection) {
-        tableRef.current.resetRowSelection();
-      }
-    } catch (error) {
-      console.error("Error deleting users:", error);
-      // Keep modal open to show error
     }
   };
 
@@ -280,10 +257,10 @@ const UsersGroups: React.FC = () => {
         onEdit: (org) => setEditingOrg(org),
         onDelete: (org) => setDeletingOrg(org),
         onManageBilling: (org) => navigate(`/cost-management?user=${org.id}`),
-        canDelete: isPlatformManager,
+        canDelete: false,
         tolerationPresets: config?.scheduling_toleration_presets,
       }),
-    [navigate, isPlatformManager, config?.scheduling_toleration_presets],
+    [navigate, config?.scheduling_toleration_presets],
   );
 
   const handleDeleteOrg = async () => {
@@ -491,32 +468,13 @@ const UsersGroups: React.FC = () => {
               onPageSizeChange: usersPagination.handlePageSizeChange,
             }}
             showPageSizeSelector={true}
-            onSelectionChange={setSelectedUsers}
             headerActions={
               <div className="flex items-center gap-2">
-                <Button onClick={() => setShowCreateUserModal(true)} size="sm">
+                <Button hidden
+                    onClick={() => setShowCreateUserModal(true)} size="sm">
                   <UserPlus className="w-4 h-4" />
                   Add User
                 </Button>
-              </div>
-            }
-            actionBar={
-              <div className="bg-muted border rounded-lg p-3 mb-4 flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <span className="text-sm font-medium text-foreground">
-                    {selectedUsers.length} user
-                    {selectedUsers.length !== 1 ? "s" : ""} selected
-                  </span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => setShowBulkDeleteModal(true)}
-                    className="flex items-center gap-1 px-3 py-1.5 bg-red-600 text-white text-sm rounded-md hover:bg-red-700 transition-colors"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                    Delete Selected
-                  </button>
-                </div>
               </div>
             }
           />
@@ -757,7 +715,8 @@ const UsersGroups: React.FC = () => {
             toleration_preset: activeUser.toleration_preset,
           }}
           canEditZdr={isPlatformManager}
-          canEditServing={isPlatformManager}
+          canEditServing={false}
+          supportOnly
         />
       )}
       {activeGroup && (
@@ -789,7 +748,8 @@ const UsersGroups: React.FC = () => {
         onClose={() => setEditingOrg(null)}
         organization={editingOrg}
         canEditZdr={isPlatformManager}
-        canEditServing={isPlatformManager}
+        canEditServing={false}
+          supportOnly
       />
       <Dialog
         open={!!deletingOrg}
@@ -816,84 +776,6 @@ const UsersGroups: React.FC = () => {
               disabled={deleteOrgMutation.isPending}
             >
               {deleteOrgMutation.isPending ? "Deleting..." : "Delete"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      {/* Bulk Delete Confirmation Modal */}
-      <Dialog open={showBulkDeleteModal} onOpenChange={setShowBulkDeleteModal}>
-        <DialogContent className="sm:max-w-md">
-          <DialogHeader>
-            <DialogTitle>Delete Users</DialogTitle>
-            <DialogDescription>This action cannot be undone</DialogDescription>
-          </DialogHeader>
-          <div className="flex items-center gap-3 pb-4">
-            <div className="w-10 h-10 bg-red-100 rounded-full flex items-center justify-center">
-              <Trash2 className="w-5 h-5 text-red-600" />
-            </div>
-          </div>
-
-          <div className="space-y-4">
-            <p className="text-gray-700">
-              Are you sure you want to delete{" "}
-              <strong>{selectedUsers.length}</strong> user
-              {selectedUsers.length !== 1 ? "s" : ""}?
-            </p>
-
-            <div className="bg-gray-50 rounded-lg p-3 max-h-32 overflow-y-auto">
-              <p className="text-sm font-medium text-gray-600 mb-2">
-                Users to be deleted:
-              </p>
-              <ul className="text-sm text-gray-700 space-y-1">
-                {selectedUsers.map((user) => (
-                  <li key={user.id} className="flex justify-between">
-                    <span>{user.name}</span>
-                    <span className="text-gray-500">{user.email}</span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-
-            <div className="p-3 bg-yellow-50 border border-yellow-200 rounded-lg">
-              <p className="text-sm text-yellow-800">
-                <strong>Warning:</strong> This will permanently delete{" "}
-                {selectedUsers.length > 1
-                  ? "these user accounts"
-                  : "this user account"}{" "}
-                and remove {selectedUsers.length > 1 ? "them" : "them"} from all
-                groups. This action cannot be undone.
-              </p>
-            </div>
-          </div>
-
-          <DialogFooter>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => setShowBulkDeleteModal(false)}
-              disabled={deleteUserMutation.isPending}
-            >
-              Cancel
-            </Button>
-            <Button
-              type="button"
-              variant="destructive"
-              onClick={handleBulkDelete}
-              disabled={deleteUserMutation.isPending}
-            >
-              {deleteUserMutation.isPending ? (
-                <>
-                  <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>
-                  Deleting...
-                </>
-              ) : (
-                <>
-                  <Trash2 className="w-4 h-4" />
-                  Delete {selectedUsers.length} User
-                  {selectedUsers.length !== 1 ? "s" : ""}
-                </>
-              )}
             </Button>
           </DialogFooter>
         </DialogContent>

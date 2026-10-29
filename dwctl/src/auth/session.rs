@@ -120,6 +120,7 @@ mod tests {
 
     fn create_test_user() -> CurrentUser {
         CurrentUser {
+            auth_method: crate::api::models::users::AuthMethod::TrustedSso,
             id: Uuid::new_v4(),
             email: "test@example.com".to_string(),
             username: "testuser".to_string(),
