@@ -159,6 +159,7 @@ pub mod inference;
 pub mod keystore;
 mod leader_election;
 pub mod limits;
+pub mod log_redaction;
 mod metrics;
 /// jemalloc statistics (re-exported for the memory validation harness).
 pub use metrics::allocator as allocator_metrics;
