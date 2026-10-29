@@ -1232,6 +1232,7 @@ async fn test_e2e_traffic_routing_rules(pool: PgPool) {
 #[test_log::test]
 async fn test_database_seeding_behavior(pool: PgPool) {
     use crate::config::ModelSource;
+    use crate::crypto::hash_api_key;
     use url::Url;
     use uuid::Uuid;
 
@@ -1295,6 +1296,16 @@ async fn test_database_seeding_behavior(pool: PgPool) {
         .expect("Should be able to get API key secret");
     assert_ne!(updated_secret, original_secret, "API key secret should have been updated");
     assert!(updated_secret.len() > 10, "New API key should be a reasonable length");
+    let stored = sqlx::query!("SELECT secret_hash, secret_prefix FROM api_keys WHERE id = $1", system_api_key_id)
+        .fetch_one(&pool)
+        .await
+        .expect("Should be able to get API key hash");
+    assert_eq!(
+        stored.secret_hash.as_deref(),
+        Some(&hash_api_key(&updated_secret)[..]),
+        "Seeded system key must store hash_api_key(secret)"
+    );
+    assert_eq!(stored.secret_prefix.as_deref(), Some(&updated_secret[..8]));
 
     // Verify seeded flag is now true
     let seeded_after_first = sqlx::query_scalar!("SELECT value FROM system_config WHERE key = 'endpoints_seeded'")

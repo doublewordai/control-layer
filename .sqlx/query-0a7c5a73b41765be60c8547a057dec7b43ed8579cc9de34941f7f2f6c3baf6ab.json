@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden, spend_limit, spend_limit_interval)\n            VALUES ($1, $2, $3, $4, $5, $6, false, $7, $8)\n            RETURNING id, name, description, secret, user_id, created_at, last_used, purpose, hidden, is_deleted, created_by, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at\n            ",
+  "query": "\n            INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden, spend_limit, spend_limit_interval, secret_hash, secret_prefix)\n            VALUES ($1, $2, $3, $4, $5, $6, false, $7, $8, $9, $10)\n            RETURNING id, name, description, secret, user_id, created_at, last_used, purpose, hidden, is_deleted, created_by, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at\n            ",
   "describe": {
     "columns": [
       {
@@ -88,6 +88,8 @@
         "Uuid",
         "Uuid",
         "Numeric",
+        "Text",
+        "Bytea",
         "Text"
       ]
     },
@@ -109,5 +111,5 @@
       true
     ]
   },
-  "hash": "2cea6225abff1768a31e23ecafab3f8e2e64f0273a4062649786330aa9d84f80"
+  "hash": "0a7c5a73b41765be60c8547a057dec7b43ed8579cc9de34941f7f2f6c3baf6ab"
 }
