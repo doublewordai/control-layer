@@ -57,6 +57,7 @@ fn create_test_target(model_name: &str, alias: &str, endpoint_url: &str) -> Onwa
         auth_header_prefix: "Bearer ".to_string(),
         endpoint_accepts_scheduling_priority: false,
         api_keys: Vec::new(),
+        has_key_grants: false,
         endpoint_kind: Default::default(),
     }
 }
@@ -1102,6 +1103,39 @@ async fn test_cache_shape_composite_with_all_components_disabled(pool: sqlx::PgP
         pool_entry.default_pool().is_empty(),
         "composite pool should have zero providers when all components are disabled"
     );
+}
+
+/// A deployment whose granted keys all have malformed hashes keeps an empty
+/// key set, which onwards rejects; only a deployment with no grants at all is
+/// left without keys (open to every request).
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_malformed_key_hashes_leave_an_empty_key_set(pool: sqlx::PgPool) {
+    let aliases = ["regular-private", "composite-priority"];
+    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    for alias in aliases {
+        assert!(
+            pool_keys_len(targets.targets.get(alias).unwrap().value()) > 0,
+            "{alias} starts with keys"
+        );
+    }
+
+    // Five bytes, not a SHA-256: every key is dropped from the onwards config.
+    sqlx::query("UPDATE api_keys SET secret_hash = substring(secret_hash FROM 1 FOR 5)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    for alias in aliases {
+        let keys = targets.targets.get(alias).unwrap().value().default_pool().keys().cloned();
+        assert_eq!(keys, Some(Default::default()), "{alias} must reject, not allow, every request");
+    }
+
+    sqlx::query("UPDATE api_keys SET is_deleted = true").execute(&pool).await.unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    for alias in aliases {
+        let keys = targets.targets.get(alias).unwrap().value().default_pool().keys().cloned();
+        assert_eq!(keys, None, "{alias} has no key grants, so no keys are configured");
+    }
 }
 
 #[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_regular_public_extra_group_assignment")))]

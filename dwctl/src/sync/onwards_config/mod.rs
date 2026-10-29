@@ -105,6 +105,10 @@ struct OnwardsTarget {
 
     // API keys that have access to this deployment
     api_keys: Vec<OnwardsApiKey>,
+    /// At least one key row granted access, even if [`key_hash`] dropped it.
+    /// Such a deployment keeps a (possibly empty) key set rather than none,
+    /// so a malformed hash cannot open it to every request.
+    has_key_grants: bool,
 }
 
 /// Minimal API key data needed for onwards config
@@ -306,8 +310,11 @@ fn key_labels(api_key: &OnwardsApiKey) -> HashMap<String, String> {
 
 /// The onwards key hash for a stored `api_keys.secret_hash`. `None` (the key is
 /// left out of the onwards config, so it cannot authenticate) when the hash is
-/// missing or malformed; the `secret_hash IS NOT NULL` check makes that
-/// unreachable for rows written by any supported release.
+/// missing or malformed; the `secret_hash IS NOT NULL` check makes a missing
+/// hash unreachable for rows written by any supported release. Callers still
+/// record the grant (`has_key_grants`), so a deployment whose keys are all
+/// dropped rejects every request instead of being treated as having no keys
+/// configured, which onwards would leave open.
 fn key_hash(api_key_id: ApiKeyId, secret_hash: Option<Vec<u8>>) -> Option<KeyHash> {
     let hash = secret_hash.as_deref().and_then(|bytes| KeyHash::try_from(bytes).ok());
     if hash.is_none() {
@@ -794,6 +801,8 @@ struct OnwardsCompositeModel {
     components: Vec<CompositeModelComponent>,
     // API keys that have access to this composite model
     api_keys: Vec<OnwardsApiKey>,
+    /// See [`OnwardsTarget::has_key_grants`].
+    has_key_grants: bool,
 }
 
 /// Loads composite models with their components and API keys from the database
@@ -1068,6 +1077,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 routing_rules: Vec::new(), // Populated from separate query below
                 components: Vec::new(),
                 api_keys: Vec::new(),
+                has_key_grants: false,
             },
         );
     }
@@ -1125,6 +1135,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     endpoint_accepts_scheduling_priority: row.endpoint_accepts_scheduling_priority,
                     endpoint_kind: parse_provider_kind(&row.endpoint_kind),
                     api_keys: Vec::new(),
+                    has_key_grants: false,
                 },
             });
         }
@@ -1133,6 +1144,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
     // Add API keys to composite models
     for row in api_key_rows {
         if let Some(composite) = composite_map.get_mut(&row.composite_model_id) {
+            composite.has_key_grants = true;
             // Avoid duplicates
             if !composite.api_keys.iter().any(|k| k.id == row.api_key_id)
                 && let Some(secret_hash) = key_hash(row.api_key_id, row.api_key_secret_hash)
@@ -1215,7 +1227,7 @@ fn convert_composite_to_target_spec(
     }
 
     // Get API key hashes for access control
-    let keys = if composite.api_keys.is_empty() {
+    let keys = if !composite.has_key_grants {
         None
     } else {
         Some(composite.api_keys.iter().map(|k| k.secret_hash).collect())
@@ -1448,7 +1460,7 @@ fn convert_to_config_file(
                 );
             }
 
-            let keys = if target.api_keys.is_empty() {
+            let keys = if !target.has_key_grants {
                 None
             } else {
                 Some(target.api_keys.iter().map(|k| k.secret_hash).collect())
@@ -1843,8 +1855,11 @@ pub async fn load_targets_from_db_with_batch_default(
                 endpoint_accepts_scheduling_priority: row.endpoint_accepts_scheduling_priority,
                 endpoint_kind: parse_provider_kind(&row.endpoint_kind),
                 api_keys: Vec::new(),
+                has_key_grants: false,
             }
         });
+
+        target.has_key_grants |= row.api_key_id.is_some();
 
         if let (
             Some(api_key_id),
