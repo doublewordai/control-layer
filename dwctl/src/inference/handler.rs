@@ -65,7 +65,8 @@ pub async fn get_response<P: PoolProvider>(
     Path(response_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
     // Require a valid API key and resolve the owner (user_id).
-    // For org-scoped keys, user_id is the org ID.
+    // For org-scoped keys, user_id is the org ID. Primary pool: replica lag must
+    // not reject a just-created key or accept a just-deleted one.
     let api_key = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -75,7 +76,7 @@ pub async fn get_response<P: PoolProvider>(
     let owner_id: String =
         sqlx::query_scalar("SELECT user_id::text FROM public.api_keys WHERE secret_hash = $1 AND is_deleted = false LIMIT 1")
             .bind(&hash_api_key(api_key)[..])
-            .fetch_optional(state.db.read())
+            .fetch_optional(state.db.write())
             .await
             .map_err(|e| Error::Database(e.into()))?
             .ok_or_else(|| Error::Unauthenticated { message: None })?;
@@ -195,7 +196,7 @@ pub async fn delete_response<P: PoolProvider>(
     let owner_id: String =
         sqlx::query_scalar("SELECT user_id::text FROM public.api_keys WHERE secret_hash = $1 AND is_deleted = false LIMIT 1")
             .bind(&hash_api_key(api_key)[..])
-            .fetch_optional(state.db.read())
+            .fetch_optional(state.db.write())
             .await
             .map_err(|e| Error::Database(e.into()))?
             .ok_or_else(|| Error::Unauthenticated { message: None })?;

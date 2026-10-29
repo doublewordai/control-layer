@@ -178,13 +178,8 @@ pub async fn list_ai_models<P: PoolProvider>(
         .as_deref()
         .is_some_and(|includes| includes.split(',').any(|include| include.trim() == "pricing"));
 
-    let mut conn = state
-        .db
-        .read()
-        .acquire()
-        .await
-        .map_err(|e| database_error("acquire_read_connection", e))?;
-
+    // Resolve the key on the primary: replica lag must not reject a just-created
+    // key or accept a just-deleted one. The model listing below stays on the replica.
     let user_id = sqlx::query_scalar::<_, uuid::Uuid>(
         r#"
         SELECT ak.user_id
@@ -198,7 +193,7 @@ pub async fn list_ai_models<P: PoolProvider>(
         "#,
     )
     .bind(&hash_api_key(token)[..])
-    .fetch_optional(&mut *conn)
+    .fetch_optional(&state.db.write())
     .await
     .map_err(|e| database_error("lookup_api_key", e))?;
 
@@ -213,6 +208,13 @@ pub async fn list_ai_models<P: PoolProvider>(
         );
         return Err(rejections::refuse(origin, response, "invalid_api_key", None, None));
     };
+
+    let mut conn = state
+        .db
+        .read()
+        .acquire()
+        .await
+        .map_err(|e| database_error("acquire_read_connection", e))?;
 
     let mut models_query = QueryBuilder::new(
         r#"

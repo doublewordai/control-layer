@@ -656,8 +656,9 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
         let mut auth_errors = Vec::new();
         let mut any_auth_attempted = false;
 
-        // Try API key authentication first (most specific)
-        match try_api_key_auth(parts, &state.db.read()).await {
+        // Try API key authentication first (most specific). Primary pool: replica
+        // lag must not reject a just-created key or accept a just-deleted one.
+        match try_api_key_auth(parts, &state.db.write()).await {
             Some(Ok((mut user, last_login))) => {
                 debug!("Authentication successful via API key");
                 trace!("Authenticated user: {}", user.id);
