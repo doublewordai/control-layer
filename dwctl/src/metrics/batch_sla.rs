@@ -10,6 +10,7 @@ use sqlx_pool_router::{DbPools, PoolProvider};
 use tokio_util::sync::CancellationToken;
 
 use crate::db::handlers::batch_sla::{self, BatchSlaRow};
+use crate::metrics::errors::component;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -78,7 +79,8 @@ impl Snapshot {
         for name in ["affected_batches", "max_lateness_seconds", "min_time_remaining_seconds"] {
             writeln!(output, "# TYPE dwctl_batch_sla_{name} gauge").unwrap();
         }
-        // An empty policy is an explicit healthy zero. Replacement drops old model series.
+        // Empty policies render zeros; consumers must check health and freshness.
+        // Replacement drops old model series.
         for (policy, window) in [("flex", "1h"), ("standard", "24h"), ("near", "_all")] {
             let rows: Vec<_> = self.rows.iter().filter(|row| row.policy == policy).collect();
             if rows.is_empty() {
@@ -219,7 +221,12 @@ pub async fn run(
                 connection = None;
                 published.store(Arc::new(published.load().failed()));
                 // Never include database errors, queries or customer values in logs.
-                tracing::warn!("Batch SLA metrics collection failed or timed out");
+                crate::background_error!(
+                    component::BATCH_SLA_METRICS,
+                    "collection_failed",
+                    Warning,
+                    "Batch SLA metrics collection failed or timed out"
+                );
             }
         }
     }

@@ -272,6 +272,11 @@ async fn aggregate_queries_match_legacy_alerts_and_preserve_privacy(pool: PgPool
 #[dwctl_test_macros::test]
 async fn collector_fails_closed_recovers_and_releases_leadership(pool: PgPool) {
     catalog(&pool).await;
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    // The SQLx test harness uses a current-thread runtime, so the spawned
+    // collector and this assertion use the same thread-local recorder.
+    let _recorder_guard = metrics::set_default_local_recorder(&recorder);
     let main = DbPools::new(pool.clone());
     let manager = Arc::new(manager(&pool));
     let published = Arc::new(ArcSwap::from_pointee(Snapshot::default()));
@@ -300,6 +305,7 @@ async fn collector_fails_closed_recovers_and_releases_leadership(pool: PgPool) {
         .unwrap();
     }
     wait_until(&published, |s| s.success).await;
+    assert!(!handle.render().contains("component=\"batch_sla_metrics\""));
     let last_success = published.load().last_success;
     let mut contender = None;
     assert!(!claim_leadership(&mut contender, &main).await.unwrap());
@@ -310,6 +316,14 @@ async fn collector_fails_closed_recovers_and_releases_leadership(pool: PgPool) {
         .await
         .unwrap();
     wait_until(&published, |s| !s.success && s.last_success == last_success).await;
+    let metrics = handle.render();
+    let failure_metric = metrics
+        .lines()
+        .find(|line| line.starts_with("dwctl_background_errors_total{") && line.contains("component=\"batch_sla_metrics\""))
+        .expect("collector failure must increment the background-error counter");
+    assert!(failure_metric.contains("reason=\"collection_failed\""));
+    assert!(failure_metric.contains("severity=\"warning\""));
+    assert!(failure_metric.split_whitespace().last().unwrap().parse::<f64>().unwrap() >= 1.0);
     blocker.rollback().await.unwrap();
     wait_until(&published, |s| s.success && s.last_success > last_success).await;
     shutdown.cancel();

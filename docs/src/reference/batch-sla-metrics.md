@@ -49,6 +49,14 @@ A model is exported by name only if it is currently available to the Everyone
 group in the model catalogue. Flex batches use the first model in lexical order;
 private names become `_private` and missing metadata becomes `_unknown`. Standard
 batches use `_all`. An empty flex/near policy emits zero with model `_none`.
+Before the first successful snapshot and while a replica is on standby, all
+three policies emit zero placeholders with model `_none`, including standard.
+In those states `collector_active` and `collection_success` are 0 and the
+last-success timestamp is 0. These placeholders do not establish that no batches
+are affected: consumers must require successful, active, fresh collection as
+described below. A failure after a successful snapshot retains the previous
+values and timestamp with collection health set to 0.
+
 No user IDs, batch IDs, file IDs, API keys, request/response bodies, custom IDs or
 free-form error strings are exported. Queries select metadata only. This does
 not sanitize other existing metrics, logs or traces.
