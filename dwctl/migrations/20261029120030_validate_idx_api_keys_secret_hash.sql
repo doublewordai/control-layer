@@ -12,6 +12,7 @@ BEGIN
           AND i.indisready
           AND i.indisunique
           AND NOT i.indisexclusion
+          AND NOT i.indnullsnotdistinct
           AND i.indnkeyatts = 1
           AND i.indnatts = 1
           AND i.indoption::text = '0'
