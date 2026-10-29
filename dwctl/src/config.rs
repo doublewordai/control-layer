@@ -3119,12 +3119,13 @@ pub struct OnwardsSyncConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct KeyPolicySyncConfig {
     /// Keep the map fresh after startup (default: true). With this off, a
-    /// change to an account's ZDR flag or disabled modalities only reaches
-    /// this instance on restart.
+    /// change to an account's ZDR flag, disabled modalities or prices only
+    /// reaches this instance on restart.
     pub enabled: bool,
     /// Fallback full-reload interval in milliseconds (default: 300000). The
-    /// reload is one small two-table join, and NOTIFY carries real changes,
-    /// so this only guards against a missed notification. `0` disables it.
+    /// reload is one small two-table join plus the tariff lookups, and NOTIFY
+    /// carries real changes (cache tariffs excepted), so this mostly guards
+    /// against a missed notification. `0` disables it.
     pub fallback_interval_milliseconds: u64,
 }
 

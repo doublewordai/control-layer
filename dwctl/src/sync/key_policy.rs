@@ -4,29 +4,35 @@
 //! request policy: the `users.zero_data_retention` flag (read by
 //! [`crate::inference::zdr::is_zdr_request`]), the account's
 //! `users.disabled_modalities` (read by the inference middleware's modality
-//! gate), and any `users.toleration_preset` (read by the inference middleware
+//! gate), any `users.toleration_preset` (read by the inference middleware
 //! and the batch ingest path to affix a preset's toleration list to every
-//! request from the account). All answer on the request hot path with a
-//! lock-free map read and no DB round-trip.
+//! request from the account), and the account and purpose the key bills
+//! (read with the [`PriceBook`] to price a request before it is sent). All
+//! answer on the request hot path with a lock-free map read and no DB
+//! round-trip.
 //!
 //! Unlike [`crate::sync::onwards_config`], which rebuilds the whole routing
-//! table on every change, this runs one small two-table join and swaps a flat
-//! map, so refreshing it on every `auth_config_changed` notification is cheap.
-//! It reuses that channel (fired by the `api_keys` trigger and the `users`
-//! ZDR, disabled-modalities and toleration-preset triggers), a 100ms debounce,
-//! and a periodic fallback reload.
+//! table on every change, this runs one small two-table join plus the tariff
+//! lookups and swaps flat maps, so refreshing it on every
+//! `auth_config_changed` notification is cheap. It reuses that channel (fired
+//! by the `api_keys` and `model_tariffs` triggers and the `users` ZDR,
+//! disabled-modalities and toleration-preset triggers), a 100ms debounce, and
+//! a periodic fallback reload, which is also what picks up a cache-tariff
+//! change.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use sqlx::{PgPool, postgres::PgListener};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::config::ONWARDS_CONFIG_CHANGED_CHANNEL;
+use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::metrics::errors::component;
 use crate::modalities::ModalitySet;
+use crate::pricing::{PriceBook, PriceQuery, UnitPrices};
 use crate::scheduling::TolerationPresets;
 
 /// The account-level policy a key inherits from its owner (`api_keys.user_id`,
@@ -51,6 +57,18 @@ pub struct KeyPolicy {
     /// that model. A class policy has already been folded over its model's.
     /// Shared by every key of the account.
     pub model_toleration_presets: Option<Arc<HashMap<String, Arc<str>>>>,
+    /// The account the key's usage is charged to and the purpose that selects
+    /// its tariff. Set for every key in the map; `None` for a policy read per
+    /// account rather than per key.
+    pub billing: Option<KeyBilling>,
+}
+
+/// Who a key's usage is charged to (`api_keys.user_id`) and the purpose its
+/// tariff is selected by (`api_keys.purpose`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyBilling {
+    pub account: crate::types::UserId,
+    pub purpose: ApiKeyPurpose,
 }
 
 impl KeyPolicy {
@@ -94,6 +112,11 @@ pub struct KeyPolicyCache {
     /// Shared by `Arc` (the map inside is immutable after construction), so a
     /// clone is cheap and a hot-path resolve holds no lock.
     presets: TolerationPresets,
+    /// Every model's prices, general and for the accounts in the map,
+    /// reloaded with it. `None` until a load succeeds; a failed reload keeps
+    /// the previous book, which prices only the accounts and models it was
+    /// loaded with.
+    prices: Arc<ArcSwapOption<PriceBook>>,
 }
 
 impl KeyPolicyCache {
@@ -103,6 +126,7 @@ impl KeyPolicyCache {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             presets: TolerationPresets::default(),
+            prices: Arc::new(ArcSwapOption::empty()),
         }
     }
 
@@ -113,6 +137,7 @@ impl KeyPolicyCache {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             presets,
+            prices: Arc::new(ArcSwapOption::empty()),
         }
     }
 
@@ -180,8 +205,25 @@ impl KeyPolicyCache {
         self.presets.store(presets);
     }
 
+    /// The per-token prices a request made with `secret` is charged at, or
+    /// `None` when the key is not in the map, no prices have loaded yet, or
+    /// the loaded prices predate the key's account or the model (a price
+    /// reload failed since they were added). Hot-path safe.
+    pub(crate) fn unit_prices(&self, secret: &str, query: &PriceQuery<'_>) -> Option<UnitPrices> {
+        let map = self.inner.load();
+        let billing = map.get(secret)?.billing.as_ref()?;
+        let prices = self.prices.load();
+        prices.as_ref()?.unit_prices(billing.account, &billing.purpose, query)
+    }
+
     fn replace(&self, map: HashMap<String, KeyPolicy>) {
         self.inner.store(Arc::new(map));
+    }
+
+    /// Replace the price book. Test-only; [`refresh`] reloads it with the map.
+    #[cfg(test)]
+    pub(crate) fn replace_prices(&self, prices: PriceBook) {
+        self.prices.store(Some(Arc::new(prices)));
     }
 
     /// Build a cache from explicit (secret, zdr) pairs. Test-only.
@@ -220,7 +262,7 @@ impl KeyPolicyCache {
 async fn load(pool: &PgPool) -> Result<HashMap<String, KeyPolicy>, sqlx::Error> {
     let rows = sqlx::query!(
         r#"
-        SELECT ak.secret, ak.user_id, u.zero_data_retention, u.disabled_modalities, u.toleration_preset
+        SELECT ak.secret, ak.user_id, ak.purpose, u.zero_data_retention, u.disabled_modalities, u.toleration_preset
         FROM api_keys ak
         JOIN users u ON u.id = ak.user_id
         WHERE NOT ak.is_deleted
@@ -240,6 +282,10 @@ async fn load(pool: &PgPool) -> Result<HashMap<String, KeyPolicy>, sqlx::Error> 
                     disabled_modalities: ModalitySet::from_db(&r.disabled_modalities),
                     toleration_preset: r.toleration_preset.map(Arc::from),
                     model_toleration_presets: model_presets.get(&r.user_id).cloned(),
+                    billing: Some(KeyBilling {
+                        account: r.user_id,
+                        purpose: crate::pricing::parse_api_key_purpose(&r.purpose),
+                    }),
                 },
             )
         })
@@ -283,10 +329,29 @@ async fn load_model_presets<'c>(
 /// Reload `cache` in place from the DB, returning the number of keys loaded.
 /// Shared by [`initial_cache`], the background listener, and the test-only
 /// manual refresh so none of them can drift.
+///
+/// Only the policy map's load is an error. Prices are optional: when they fail
+/// to load, the error is logged, the map is still replaced, and the previous
+/// price book is kept (none at boot, so requests carry no prices). A key of an
+/// account that book was not loaded for, or a request for a model it does not
+/// hold, carries no prices until a load succeeds.
 pub async fn refresh(pool: &PgPool, cache: &KeyPolicyCache) -> Result<usize, sqlx::Error> {
     let map = load(pool).await?;
+    let accounts: Vec<crate::types::UserId> = map
+        .values()
+        .filter_map(|policy| policy.billing.as_ref().map(|billing| billing.account))
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let prices = PriceBook::load(pool, &accounts).await;
     let n = map.len();
     cache.replace(map);
+    match prices {
+        Ok(prices) => cache.prices.store(Some(Arc::new(prices))),
+        Err(e) => {
+            crate::background_error!(component::ZDR_KEY_SYNC, "load_prices", Error, error = %e, "key policy sync: failed to load prices; keeping the previous prices");
+        }
+    }
     Ok(n)
 }
 
@@ -315,6 +380,7 @@ pub async fn load_policy(conn: &mut sqlx::PgConnection, user_id: crate::types::U
         disabled_modalities: ModalitySet::from_db(&row.disabled_modalities),
         toleration_preset: row.toleration_preset.map(Arc::from),
         model_toleration_presets,
+        billing: None,
     })
 }
 
@@ -611,6 +677,115 @@ mod tests {
         assert_eq!(
             cache.tolerations("sk-retired", "any/model").as_deref(),
             Some(&serde_json::json!([]))
+        );
+    }
+
+    /// Deploy `alias` on an endpoint of its own, returning the model's id.
+    async fn deploy(pool: &sqlx::PgPool, by: crate::types::UserId, alias: &str) -> uuid::Uuid {
+        sqlx::query_scalar(
+            "WITH e AS (INSERT INTO inference_endpoints (name,url,created_by) VALUES ($1,'http://localhost:1',$2) RETURNING id)
+             INSERT INTO deployed_models (model_name,alias,hosted_on,created_by,type) SELECT $1,$1,e.id,$2,'CHAT' FROM e RETURNING id",
+        )
+        .bind(alias)
+        .bind(by)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Price `model` for realtime at `input` and `output` millionths of a
+    /// credit per token, for `account` alone or, with `None`, for everyone.
+    async fn add_tariff(pool: &sqlx::PgPool, model: uuid::Uuid, account: Option<crate::types::UserId>, input: i64, output: i64) {
+        sqlx::query(
+            "INSERT INTO model_tariffs (deployed_model_id,user_id,name,input_price_per_token,output_price_per_token,api_key_purpose,valid_from) VALUES ($1,$2,'test',$3,$4,'realtime',$5)",
+        )
+        .bind(model)
+        .bind(account)
+        .bind(rust_decimal::Decimal::new(input, 6))
+        .bind(rust_decimal::Decimal::new(output, 6))
+        .bind(chrono::Utc::now() - chrono::Duration::minutes(1))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Prices are optional: a price load that fails still refreshes the
+    /// policy map and keeps the prices already loaded, and at boot it leaves
+    /// requests unpriced rather than failing startup. The kept prices are
+    /// used only for what they were loaded with: an account or a model added
+    /// since gets no prices rather than general or free ones.
+    #[dwctl_test_macros::test]
+    async fn a_failed_price_load_still_refreshes_the_map_and_keeps_the_old_prices(pool: sqlx::PgPool) {
+        use crate::api::models::users::Role;
+        use crate::test::utils::{create_test_api_key_for_user, create_test_user};
+        use rust_decimal::Decimal;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let key = create_test_api_key_for_user(&pool, user.id).await.secret;
+        let model = deploy(&pool, user.id, "priced-model").await;
+        add_tariff(&pool, model, None, 1, 3).await;
+        let query = |model: &'static str| PriceQuery {
+            model,
+            completion_window: None,
+            batch_created_at: None,
+            now: chrono::Utc::now(),
+            serving_class: "standard",
+            cache_reads: None,
+        };
+        let priced = Some(UnitPrices {
+            prompt: Decimal::new(1, 6),
+            cached: Decimal::new(1, 6),
+            output: Decimal::new(3, 6),
+        });
+
+        let cache = initial_cache(&pool, TolerationPresets::default()).await.unwrap();
+        assert_eq!(cache.unit_prices(&key, &query("priced-model")), priced);
+        assert!(!cache.is_zdr(&key));
+
+        // Change the policy, add an account with its own price and a newly
+        // priced model, then make the tariff lookup fail.
+        sqlx::query("UPDATE users SET zero_data_retention = true WHERE id = $1")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let deal = create_test_user(&pool, Role::StandardUser).await;
+        let deal_key = create_test_api_key_for_user(&pool, deal.id).await.secret;
+        add_tariff(&pool, model, Some(deal.id), 2, 6).await;
+        let later = deploy(&pool, user.id, "later-model").await;
+        add_tariff(&pool, later, None, 5, 15).await;
+        sqlx::query("ALTER TABLE model_tariffs RENAME TO model_tariffs_unavailable")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        refresh(&pool, &cache).await.expect("a price load failure is not a refresh failure");
+        assert!(cache.is_zdr(&key), "the policy map was replaced");
+        assert_eq!(
+            cache.unit_prices(&key, &query("priced-model")),
+            priced,
+            "the previous prices are kept"
+        );
+        assert!(cache.policy_if_known(&deal_key).is_some(), "the new account's key is in the map");
+        assert_eq!(
+            cache.unit_prices(&deal_key, &query("priced-model")),
+            None,
+            "the kept prices hold nothing of the new account's own, so its key is not priced"
+        );
+        assert_eq!(
+            cache.unit_prices(&key, &query("later-model")),
+            None,
+            "the kept prices predate the model, so it is not priced"
+        );
+
+        let booted = initial_cache(&pool, TolerationPresets::default())
+            .await
+            .expect("a price load failure does not fail startup");
+        assert!(booted.is_zdr(&key));
+        assert_eq!(
+            booted.unit_prices(&key, &query("priced-model")),
+            None,
+            "no prices have loaded, so none are sent"
         );
     }
 }

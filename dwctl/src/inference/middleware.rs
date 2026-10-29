@@ -1466,7 +1466,8 @@ fn scrub_request_id_fields(value: &mut serde_json::Value) -> bool {
 ///
 /// Also removes the serving router targets (`nvext.router.{ttft_target,
 /// itl_target}`): those are the resolver's to set (onwards writes them after
-/// resolution), never the caller's.
+/// resolution), never the caller's. Likewise `nvext.billing`, the prices the
+/// request is charged at.
 ///
 /// Returns whether anything was removed. Onwards validates and then forwards
 /// the ORIGINAL bytes (COR-522), so a removal only takes effect if the caller
@@ -1493,6 +1494,9 @@ pub(crate) fn strip_scheduling_priority(value: &mut serde_json::Value) -> bool {
             if let Some(routing) = nvext.get_mut("routing_constraints").and_then(|r| r.as_object_mut()) {
                 scrubbed |= routing.shift_remove("tolerations").is_some();
             }
+            // The prices a request is charged at are attached on the way out;
+            // a caller cannot state its own.
+            scrubbed |= onwards::serving::scrub_billing(nvext);
         }
     }
     scrubbed
@@ -1706,6 +1710,16 @@ mod tests {
 
         let mut clean = serde_json::json!({"model": "m", "nvext": {"routing_constraints": {"region": "eu"}}});
         assert!(!strip_scheduling_priority(&mut clean), "nothing removed, nothing to rebuild");
+    }
+
+    #[test]
+    fn strip_scheduling_priority_also_scrubs_client_prices() {
+        let mut body = serde_json::json!({
+            "model": "m",
+            "nvext": {"billing": {"prompt": 0, "cached": 0, "output": 0}, "cache_control": {"enabled": true}}
+        });
+        assert!(strip_scheduling_priority(&mut body), "the prices were present and removed");
+        assert_eq!(body["nvext"], serde_json::json!({"cache_control": {"enabled": true}}));
     }
 
     #[test]

@@ -8,6 +8,14 @@
 //!   emits a usage frame in the final SSE chunk), and force `stream: true` on
 //!   batch traffic to a configured path.
 //!
+//! It also prices the request: the per-token prices it will be charged at are
+//! attached as an [`onwards::serving::BillingPrices`] extension, which onwards
+//! writes as `nvext.billing` on requests to `dynamo` members. Any `nvext.billing`
+//! already in the body is removed first, whoever sent it. A request that arrives
+//! with the extension already attached keeps it: a resume leg carries its original
+//! request's prices, not its own key's. The prices are also set on the response,
+//! which is where the continuation layer reads them for its resume legs.
+//!
 //! On the way back, the response to a request this forced is read as SSE and
 //! reassembled into a single non-streaming body. Both halves of that
 //! transformation therefore live here, and the daemon that dispatches the request
@@ -62,10 +70,13 @@ pub struct StreamTimeouts {
     pub body: Duration,
 }
 
-/// What this layer needs to decide and perform the stream round trip.
+/// What this layer needs to decide and perform the stream round trip, and to
+/// price the request.
 #[derive(Clone)]
 pub struct OutboundConfig {
     pub timeouts: StreamTimeouts,
+    /// Each key's billing account and purpose, and every model's prices.
+    pub key_policy: crate::sync::key_policy::KeyPolicyCache,
 }
 
 /// `batch_metadata` key the daemon's dispatch sets to mark a request for
@@ -149,7 +160,15 @@ pub async fn outbound_request_middleware(State(cfg): State<OutboundConfig>, requ
         }
     };
 
-    let response = match transform(&bytes, force_stream, stream_usage) {
+    let (edited, model) = transform(&bytes, force_stream, stream_usage);
+    if parts.extensions.get::<onwards::serving::BillingPrices>().is_none()
+        && let Some(prices) = model.and_then(|model| unit_prices(&cfg, &parts, &model))
+    {
+        parts.extensions.insert(prices.to_billing());
+    }
+    let prices = parts.extensions.get::<onwards::serving::BillingPrices>().copied();
+
+    let response = match edited {
         Some(edited) => {
             // The body changed size, so the inbound Content-Length is now stale.
             // Drop it (as the Anthropic translator does) so it is recomputed
@@ -162,27 +181,59 @@ pub async fn outbound_request_middleware(State(cfg): State<OutboundConfig>, requ
         None => next.run(Request::from_parts(parts, Body::from(bytes))).await,
     };
 
-    if force_stream {
+    let mut response = if force_stream {
         reassemble_stream(response, cfg.timeouts).await
     } else {
         response
+    };
+    if let Some(prices) = prices {
+        response.extensions_mut().insert(prices);
     }
+    response
+}
+
+/// The per-token prices the request is charged at, from the key's account and
+/// purpose, the model it names, the batch headers billing reads, and how the
+/// cache layer reports its cache reads. `None` for a key not in the policy map.
+fn unit_prices(cfg: &OutboundConfig, parts: &axum::http::request::Parts, model: &str) -> Option<crate::pricing::UnitPrices> {
+    let value = |name: &str| parts.headers.get(name).and_then(|v| v.to_str().ok()).filter(|v| !v.is_empty());
+    let secret = value(header::AUTHORIZATION.as_str())?.strip_prefix("Bearer ")?;
+    let completion_window = value("x-fusillade-batch-completion-window");
+    let batch_created_at = value("x-fusillade-batch-created-at").and_then(|v| v.parse::<chrono::DateTime<chrono::Utc>>().ok());
+    let cache_reads = parts.extensions.get::<crate::prompt_cache::CacheReadSource>().copied();
+    let query = crate::pricing::PriceQuery {
+        model,
+        completion_window,
+        batch_created_at,
+        now: chrono::Utc::now(),
+        serving_class: onwards::serving::ServingClass::Standard.as_str(),
+        cache_reads,
+    };
+    cfg.key_policy.unit_prices(secret, &query)
 }
 
 /// Inject the streaming usage flags into a JSON body, returning `Some(new_bytes)`
-/// only when something changed. A body that is not a JSON object (or fails to
-/// parse) is left untouched (`None`) - onwards still validates and rejects it.
-fn transform(bytes: &Bytes, force_stream: bool, stream_usage: bool) -> Option<Vec<u8>> {
-    let mut value = serde_json::from_slice::<Value>(bytes).ok()?;
-    let obj = value.as_object_mut()?;
+/// only when something changed, and the model the body names. A body that is
+/// not a JSON object (or fails to parse) is left untouched (`None`) - onwards
+/// still validates and rejects it.
+fn transform(bytes: &Bytes, force_stream: bool, stream_usage: bool) -> (Option<Vec<u8>>, Option<String>) {
+    let Some(mut value) = serde_json::from_slice::<Value>(bytes).ok() else {
+        return (None, None);
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return (None, None);
+    };
+    let model = obj.get("model").and_then(Value::as_str).map(str::to_owned);
     let mut changed = false;
 
     // This is the last DWCTL boundary before Onwards resolves and stamps
     // trusted targets. Also covers previously stored batch bodies that skipped
     // ingress sanitization. Keep server-assigned deadline/continuation priority;
-    // only the router's timing targets are always recomputed downstream.
+    // only the router's timing targets and the prices are always recomputed
+    // downstream.
     if let Some(nvext) = obj.get_mut("nvext").and_then(Value::as_object_mut) {
         changed |= onwards::serving::scrub_router_targets(nvext);
+        changed |= onwards::serving::scrub_billing(nvext);
     }
 
     let request_streaming = obj.get("stream").and_then(Value::as_bool) == Some(true) || force_stream;
@@ -204,7 +255,8 @@ fn transform(bytes: &Bytes, force_stream: bool, stream_usage: bool) -> Option<Ve
         }
     }
 
-    if changed { serde_json::to_vec(&value).ok() } else { None }
+    let edited = if changed { serde_json::to_vec(&value).ok() } else { None };
+    (edited, model)
 }
 
 /// Read an SSE response to completion and return the body it assembles to.
@@ -442,7 +494,7 @@ mod tests {
 
     fn run(body: &serde_json::Value, fusillade: bool) -> Option<serde_json::Value> {
         let bytes = Bytes::from(serde_json::to_vec(body).unwrap());
-        transform(&bytes, fusillade, true).map(|b| serde_json::from_slice(&b).unwrap())
+        transform(&bytes, fusillade, true).0.map(|b| serde_json::from_slice(&b).unwrap())
     }
 
     #[test]
@@ -457,7 +509,7 @@ mod tests {
         let body = Bytes::from_static(
             br#"{"model":"m","stream":true,"response_format":{"type":"json_schema","json_schema":{"name":"a","schema":{"type":"object","properties":{"z":{"type":"string"},"a":{"type":"string"}}}}},"messages":[]}"#,
         );
-        let out = transform(&body, false, true).expect("should transform");
+        let out = transform(&body, false, true).0.expect("should transform");
         assert_eq!(
             String::from_utf8(out).unwrap(),
             r#"{"model":"m","stream":true,"response_format":{"type":"json_schema","json_schema":{"name":"a","schema":{"type":"object","properties":{"z":{"type":"string"},"a":{"type":"string"}}}}},"messages":[],"stream_options":{"include_usage":true}}"#
@@ -715,6 +767,112 @@ mod tests {
     fn config() -> OutboundConfig {
         OutboundConfig {
             timeouts: timeouts(1000, 1000, 5000),
+            key_policy: crate::sync::key_policy::KeyPolicyCache::empty(),
+        }
+    }
+
+    /// The prices attached for a request sent through this layer with `key`
+    /// and `headers`, and the body that reached the next layer.
+    async fn priced_through_the_edge(key: &str, headers: &[(&str, &str)], body: serde_json::Value) -> serde_json::Value {
+        use crate::db::models::api_keys::ApiKeyPurpose;
+        use crate::pricing::{PriceBook, TariffInfo};
+        use crate::sync::key_policy::{KeyBilling, KeyPolicy, KeyPolicyCache};
+        use axum::{Router, routing::post};
+        use rust_decimal::Decimal;
+
+        let tariff = |purpose, window: Option<&str>, input: i64, output: i64| TariffInfo {
+            id: uuid::Uuid::new_v4(),
+            purpose,
+            effective_from: chrono::Utc::now() - chrono::Duration::hours(1),
+            valid_until: None,
+            input_price_per_token: Decimal::new(input, 6),
+            output_price_per_token: Decimal::new(output, 6),
+            completion_window: window.map(str::to_string),
+            account: None,
+            serving_class: None,
+        };
+        let account = uuid::Uuid::new_v4();
+        let policy = |purpose| KeyPolicy {
+            billing: Some(KeyBilling { account, purpose }),
+            ..Default::default()
+        };
+        let key_policy = KeyPolicyCache::from_policies([
+            ("sk-realtime".to_string(), policy(ApiKeyPurpose::Realtime)),
+            ("sk-batch".to_string(), policy(ApiKeyPurpose::Batch)),
+        ]);
+        key_policy.replace_prices(PriceBook::from_rows(
+            [account],
+            [(
+                "m".to_string(),
+                vec![
+                    tariff(ApiKeyPurpose::Realtime, None, 3, 9),
+                    tariff(ApiKeyPurpose::Batch, Some("24h"), 1, 3),
+                ],
+            )],
+            [],
+        ));
+
+        let next = |request: Request| async move {
+            let prices = request.extensions().get::<onwards::serving::BillingPrices>().copied();
+            let body = axum::body::to_bytes(request.into_body(), usize::MAX).await.unwrap();
+            axum::Json(serde_json::json!({
+                "prices": prices,
+                "body": serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            }))
+        };
+        let config = OutboundConfig { key_policy, ..config() };
+        let app = Router::new()
+            .route("/chat/completions", post(next))
+            .layer(axum::middleware::from_fn_with_state(config, outbound_request_middleware));
+        let server = axum_test::TestServer::new(app).unwrap();
+        let mut request = server
+            .post("/chat/completions")
+            .add_header("authorization", format!("Bearer {key}"))
+            .json(&body);
+        for (name, value) in headers {
+            request = request.add_header(*name, *value);
+        }
+        request.await.json()
+    }
+
+    #[tokio::test]
+    async fn requests_carry_the_prices_their_key_is_charged_at() {
+        let body = serde_json::json!({"model": "m", "messages": []});
+        let realtime = priced_through_the_edge("sk-realtime", &[], body.clone()).await;
+        assert_eq!(
+            realtime["prices"],
+            serde_json::json!({"prompt": 3e-6, "cached": 3e-6, "output": 9e-6})
+        );
+
+        let batch = priced_through_the_edge(
+            "sk-batch",
+            &[
+                ("x-fusillade-batch-completion-window", "24h"),
+                ("x-fusillade-batch-created-at", &chrono::Utc::now().to_rfc3339()),
+            ],
+            body.clone(),
+        )
+        .await;
+        assert_eq!(batch["prices"], serde_json::json!({"prompt": 1e-6, "cached": 1e-6, "output": 3e-6}));
+
+        let unknown = priced_through_the_edge("sk-unknown", &[], body).await;
+        assert!(unknown["prices"].is_null(), "a key outside the policy map is not priced");
+    }
+
+    #[tokio::test]
+    async fn a_caller_cannot_state_its_own_prices() {
+        let forged = serde_json::json!({
+            "model": "m",
+            "messages": [],
+            "nvext": {"billing": {"prompt": 0, "cached": 0, "output": 0}, "cache_control": {"enabled": true}}
+        });
+        for key in ["sk-realtime", "sk-unknown"] {
+            let out = priced_through_the_edge(key, &[], forged.clone()).await;
+            assert_eq!(
+                out["body"]["nvext"],
+                serde_json::json!({"cache_control": {"enabled": true}}),
+                "{key}"
+            );
         }
     }
 

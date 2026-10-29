@@ -23,6 +23,11 @@
 //! priority is sent [`DEFAULT_PRIORITY`], so every priority is relative to
 //! realtime's 0. Everything a client could send to steer this itself is
 //! scrubbed at dwctl's ingress; only the resolver sets them.
+//!
+//! An embedding application may also attach the per-token prices a request
+//! is charged at as a [`BillingPrices`] request extension. They are written
+//! as `nvext.billing` on every request to a member of kind `dynamo`, including
+//! a pool member that does not accept the scheduling fields, and on no other.
 
 use std::fmt;
 use std::str::FromStr;
@@ -42,6 +47,8 @@ pub const NVEXT_AGENT_HINTS_FIELD: &str = "agent_hints";
 /// The scheduling priority carrier the serving stack honours
 /// (`nvext.agent_hints.priority`).
 pub const PRIORITY_FIELD: &str = "priority";
+/// The per-token prices inside `nvext` (`nvext.billing`).
+pub const NVEXT_BILLING_FIELD: &str = "billing";
 /// The priority a request to a `dynamo` member carries when nothing set one:
 /// realtime's. Batch deadlines sit below it, continuation resumes above.
 pub const DEFAULT_PRIORITY: i32 = 0;
@@ -123,6 +130,47 @@ pub fn scrub_router_targets(nvext: &mut serde_json::Map<String, serde_json::Valu
         nvext.shift_remove(NVEXT_ROUTER_FIELD);
     }
     removed.iter().any(Option::is_some)
+}
+
+/// Request extension: the per-token prices the request is charged at, in the
+/// embedding application's own units. Sent to members of kind `dynamo` as
+/// `nvext.billing`, so the serving stack can account the value of the tokens
+/// it serves.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct BillingPrices {
+    /// Price of a prompt token that was not served from cache.
+    pub prompt: f64,
+    /// Price of a prompt token served from cache.
+    pub cached: f64,
+    /// Price of an output token.
+    pub output: f64,
+}
+
+impl BillingPrices {
+    /// Write the prices as `nvext.billing`, replacing any value already there
+    /// and leaving the rest of `nvext` alone.
+    pub fn stamp(&self, body: &mut serde_json::Map<String, serde_json::Value>) {
+        let nvext = body
+            .entry(NVEXT_FIELD)
+            .or_insert_with(|| serde_json::Value::Object(Default::default()));
+        if !nvext.is_object() {
+            *nvext = serde_json::Value::Object(Default::default());
+        }
+        nvext
+            .as_object_mut()
+            .expect("nvext was just made an object")
+            .insert(
+                NVEXT_BILLING_FIELD.to_string(),
+                serde_json::to_value(self).expect("prices serialize"),
+            );
+    }
+}
+
+/// Remove `nvext.billing`, returning whether it was present. Only the
+/// embedding application sets it; an inbound value is a caller stating its
+/// own price.
+pub fn scrub_billing(nvext: &mut serde_json::Map<String, serde_json::Value>) -> bool {
+    nvext.shift_remove(NVEXT_BILLING_FIELD).is_some()
 }
 
 /// What kind of server a provider is. Decides who receives the hints and
@@ -967,6 +1015,210 @@ mod handler_tests {
         let req = &mock.get_requests()[0];
         assert_eq!(sent(req), None);
         assert_eq!(body(req)["nvext"]["agent_hints"]["priority"], -1234);
+    }
+
+    const PRICES: BillingPrices = BillingPrices {
+        prompt: 2e-6,
+        cached: 2e-7,
+        output: 8e-6,
+    };
+
+    /// Send a chat completion carrying `prices` as a request extension, the
+    /// way an embedding application attaches them, and return the status.
+    async fn post_priced(
+        s: &Setup,
+        mock: &MockHttpClient,
+        prices: Option<BillingPrices>,
+        body_extra: serde_json::Value,
+    ) -> StatusCode {
+        use tower::ServiceExt;
+        let mut payload = json!({"model": ALIAS, "messages": [{"role": "user", "content": "hi"}]});
+        if let Some(extra) = body_extra.as_object() {
+            for (k, v) in extra {
+                payload[k] = v.clone();
+            }
+        }
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {KEY}"))
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+        if let Some(prices) = prices {
+            request.extensions_mut().insert(prices);
+        }
+        build_router(AppState::with_client(targets(s), mock.clone()))
+            .oneshot(request)
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn prices_reach_only_dynamo_members() {
+        let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
+        let status = post_priced(&setup(&[DYNAMO]), &mock, Some(PRICES), json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body(&mock.get_requests()[0])["nvext"],
+            json!({
+                "agent_hints": {"priority": 0},
+                "billing": {"prompt": 2e-6, "cached": 2e-7, "output": 8e-6}
+            })
+        );
+
+        for member in [EXTERNAL, HOSTED] {
+            let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
+            let status = post_priced(&setup(&[member]), &mock, Some(PRICES), json!({})).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                body(&mock.get_requests()[0]).get("nvext").is_none(),
+                "{:?}",
+                member.1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prices_are_written_per_attempt_and_never_carried_to_a_fallback_member() {
+        let mock = MockHttpClient::new(StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"boom"}"#);
+        post_priced(&setup(&[DYNAMO, EXTERNAL]), &mock, Some(PRICES), json!({})).await;
+        let requests = mock.get_requests();
+        assert_eq!(requests.len(), 2, "the dynamo member failed over");
+        assert_eq!(
+            body(&requests[0])["nvext"]["billing"]["output"],
+            8e-6,
+            "the dynamo attempt is priced"
+        );
+        assert!(
+            body(&requests[1]).get("nvext").is_none(),
+            "the fallback attempt starts from the unpriced body"
+        );
+    }
+
+    #[tokio::test]
+    async fn attached_prices_replace_an_inbound_value_and_without_them_it_passes_through() {
+        let inbound = json!({"nvext": {"billing": {"prompt": 1, "cached": 1, "output": 1}}});
+
+        let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
+        post_priced(&setup(&[DYNAMO]), &mock, Some(PRICES), inbound.clone()).await;
+        assert_eq!(
+            body(&mock.get_requests()[0])["nvext"]["billing"],
+            json!({"prompt": 2e-6, "cached": 2e-7, "output": 8e-6})
+        );
+
+        // The hop inside the serving namespace attaches none and forwards
+        // what the first hop wrote; callers are scrubbed by the embedder.
+        let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
+        post_priced(&setup(&[DYNAMO]), &mock, None, inbound.clone()).await;
+        assert_eq!(
+            body(&mock.get_requests()[0])["nvext"]["billing"],
+            inbound["nvext"]["billing"]
+        );
+    }
+
+    /// A `dynamo` member of a named pool that does not accept the scheduling
+    /// fields still receives the prices; only the scheduling fields are
+    /// withheld from it, and a non-`dynamo` member behind it receives neither.
+    #[tokio::test]
+    async fn prices_reach_a_dynamo_member_that_refuses_scheduling_fields() {
+        use tower::ServiceExt;
+        let member = |url: &str, kind| {
+            Provider::new(
+                Target::builder()
+                    .url(url.parse().unwrap())
+                    .kind(kind)
+                    .accepts_scheduling_priority(false)
+                    .build(),
+                1,
+            )
+        };
+        let pool = |providers| {
+            ProviderPool::with_config(
+                providers,
+                None,
+                None,
+                None,
+                Some(FallbackConfig {
+                    enabled: true,
+                    on_status: vec![500],
+                    ..Default::default()
+                }),
+                LoadBalanceStrategy::Priority,
+                false,
+                Vec::new(),
+            )
+        };
+        let completions = pool(vec![
+            member(DYNAMO.0, ProviderKind::Dynamo),
+            member(EXTERNAL.0, ProviderKind::External),
+        ]);
+        let targets = targets(&setup(&[DYNAMO]));
+        targets.targets.insert(
+            ALIAS.to_string(),
+            TargetPools::with_pools(
+                pool(vec![member(DYNAMO.0, ProviderKind::Dynamo)]),
+                HashMap::from([(crate::target::COMPLETIONS_POOL.to_string(), completions)]),
+            ),
+        );
+
+        let mock = MockHttpClient::new(StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"boom"}"#);
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {KEY}"))
+            .body(Body::from(
+                json!({
+                    "model": ALIAS,
+                    "prompt": "hi",
+                    "priority": 7,
+                    "nvext": {"agent_hints": {"priority": 7}}
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        request.extensions_mut().insert(PRICES);
+        build_router(AppState::with_client(targets, mock.clone()))
+            .oneshot(request)
+            .await
+            .unwrap();
+
+        let requests = mock.get_requests();
+        assert_eq!(requests.len(), 2, "the dynamo member failed over");
+        let dynamo = body(&requests[0]);
+        assert_eq!(
+            dynamo["nvext"],
+            json!({"billing": {"prompt": 2e-6, "cached": 2e-7, "output": 8e-6}}),
+            "the prices are sent, the scheduling fields are not"
+        );
+        assert!(dynamo.get("priority").is_none());
+        let external = body(&requests[1]);
+        assert!(external.get("nvext").is_none() && external.get("priority").is_none());
+    }
+
+    #[test]
+    fn prices_are_stamped_into_nvext_and_scrubbed_from_it() {
+        let mut body =
+            json!({"model": "m", "nvext": {"agent_hints": {"priority": 3}, "billing": "x"}});
+        PRICES.stamp(body.as_object_mut().unwrap());
+        assert_eq!(
+            body["nvext"],
+            json!({
+                "agent_hints": {"priority": 3},
+                "billing": {"prompt": 2e-6, "cached": 2e-7, "output": 8e-6}
+            })
+        );
+
+        let mut body = json!({"nvext": "x"});
+        PRICES.stamp(body.as_object_mut().unwrap());
+        assert_eq!(body["nvext"]["billing"]["prompt"], 2e-6);
+
+        let nvext = body["nvext"].as_object_mut().unwrap();
+        assert!(scrub_billing(nvext));
+        assert!(nvext.is_empty());
+        assert!(!scrub_billing(nvext));
     }
 
     #[tokio::test]

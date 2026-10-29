@@ -4,13 +4,15 @@
 //! cache-adjusted charged cost, the cache-split safety rules, and tariff resolution
 //! as-of a point in time.
 //!
-//! It lives outside [`crate::request_logging::batcher`] because two callers need it and
-//! they must not drift:
+//! It lives outside [`crate::request_logging::batcher`] because several callers need it
+//! and they must not drift:
 //!
 //! - the **live path** ([`crate::request_logging::batcher`]), pricing a request as it
-//!   completes, and
+//!   completes,
 //! - the **recompute path** ([`crate::recompute`]), re-pricing a historical request from
-//!   its stored payload when a bug wrote the wrong token counts.
+//!   its stored payload when a bug wrote the wrong token counts, and
+//! - the **send path** ([`PriceBook`]), pricing a request before it is sent, so the
+//!   serving stack is told the per-token prices the live path will charge.
 //!
 //! A recompute that priced differently from the live path would produce a "correction"
 //! that is itself wrong, so the arithmetic is deliberately shared rather than
@@ -419,6 +421,254 @@ pub(crate) fn list_price(
     let inp = input_price.unwrap_or(Decimal::ZERO);
     let outp = output_price.unwrap_or(Decimal::ZERO);
     Some(Decimal::from(prompt_tokens.max(0)) * inp + Decimal::from(completion_tokens.max(0)) * outp)
+}
+
+/// An `api_keys.purpose` value; anything unrecognised prices as realtime.
+pub(crate) fn parse_api_key_purpose(s: &str) -> ApiKeyPurpose {
+    match s {
+        "platform" => ApiKeyPurpose::Platform,
+        "batch" => ApiKeyPurpose::Batch,
+        "playground" => ApiKeyPurpose::Playground,
+        "continuation" => ApiKeyPurpose::Continuation,
+        _ => ApiKeyPurpose::Realtime,
+    }
+}
+
+/// Load tariff history (including expired versions) for the requested models and
+/// billed accounts, plus general prices. Unrelated accounts are never loaded.
+/// Returns alias → model info for [`find_best_tariff`] at any timestamp.
+///
+/// Shared by the live batcher and [`PriceBook`], so a request is priced before it is
+/// sent from the same rows it is billed from afterwards.
+pub(crate) async fn lookup_model_tariffs<'e, E>(
+    executor: E,
+    aliases: &[String],
+    accounts: &[uuid::Uuid],
+) -> Result<std::collections::HashMap<String, ModelInfo>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    struct ModelRow {
+        alias: String,
+        provider_name: Option<String>,
+        tariff_id: Option<uuid::Uuid>,
+        tariff_purpose: Option<String>,
+        tariff_valid_from: Option<DateTime<Utc>>,
+        tariff_valid_until: Option<DateTime<Utc>>,
+        tariff_input_price: Option<Decimal>,
+        tariff_output_price: Option<Decimal>,
+        tariff_completion_window: Option<String>,
+        tariff_account: Option<uuid::Uuid>,
+        tariff_class: Option<String>,
+    }
+
+    // Keep all historical versions within the requested account scopes.
+    // Note: Column aliases use "?" suffix to force nullable for LEFT JOIN columns
+    let rows: Vec<ModelRow> = sqlx::query_as!(
+        ModelRow,
+        r#"
+            SELECT
+                dm.alias,
+                ie.name as "provider_name?",
+                mt.id as "tariff_id?",
+                mt.api_key_purpose as "tariff_purpose?",
+                mt.valid_from as "tariff_valid_from?",
+                mt.valid_until as "tariff_valid_until?",
+                mt.input_price_per_token as "tariff_input_price?",
+                mt.output_price_per_token as "tariff_output_price?",
+                mt.completion_window as "tariff_completion_window?",
+                mt.user_id as "tariff_account?",
+                mt.serving_class as "tariff_class?"
+            FROM deployed_models dm
+            LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id
+            LEFT JOIN model_tariffs mt ON mt.deployed_model_id = dm.id
+                AND (mt.user_id IS NULL OR mt.user_id = ANY($2))
+                AND (mt.user_id IS NOT NULL OR mt.serving_class IS NULL)
+            WHERE dm.alias = ANY($1)
+            ORDER BY dm.alias, mt.valid_from DESC
+            "#,
+        aliases,
+        accounts
+    )
+    .fetch_all(executor)
+    .await?;
+
+    // Group by alias
+    let mut map: std::collections::HashMap<String, ModelInfo> = std::collections::HashMap::new();
+    for row in rows {
+        let entry = map.entry(row.alias.clone()).or_insert_with(|| ModelInfo {
+            provider_name: row.provider_name.unwrap_or_default(),
+            tariffs: Vec::new(),
+        });
+
+        // Add tariff if present
+        if let (Some(id), Some(purpose), Some(valid_from), Some(input_price), Some(output_price)) = (
+            row.tariff_id,
+            row.tariff_purpose,
+            row.tariff_valid_from,
+            row.tariff_input_price,
+            row.tariff_output_price,
+        ) {
+            entry.tariffs.push(TariffInfo {
+                id,
+                serving_class: row.tariff_class,
+                purpose: parse_api_key_purpose(&purpose),
+                effective_from: valid_from,
+                valid_until: row.tariff_valid_until,
+                input_price_per_token: input_price,
+                output_price_per_token: output_price,
+                completion_window: row.tariff_completion_window,
+                account: row.tariff_account,
+            });
+        }
+    }
+    Ok(map)
+}
+
+/// The per-token prices of one request: what [`charged_cost`] multiplies its token
+/// counts by when it has no cache writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UnitPrices {
+    /// Price of an input token that was not a cache read.
+    pub prompt: Decimal,
+    /// Price of a cache-read input token.
+    pub cached: Decimal,
+    /// Price of an output token (reasoning tokens included).
+    pub output: Decimal,
+}
+
+impl UnitPrices {
+    /// A request that is charged nothing.
+    pub const FREE: Self = Self {
+        prompt: Decimal::ZERO,
+        cached: Decimal::ZERO,
+        output: Decimal::ZERO,
+    };
+
+    /// The prices [`charged_cost`] bills a resolved tariff at: input at the input price,
+    /// cache reads at the read multiplier when `cache` is set and at the input price
+    /// otherwise, output at the output price. A model with no price is free.
+    pub fn new(input_price: Option<Decimal>, output_price: Option<Decimal>, cache: Option<CacheMultipliers>) -> Self {
+        let input = input_price.unwrap_or(Decimal::ZERO);
+        Self {
+            prompt: input,
+            cached: cache.map_or(input, |m| input * m.read),
+            output: output_price.unwrap_or(Decimal::ZERO),
+        }
+    }
+
+    /// The prices as written into the request body.
+    pub fn to_billing(self) -> onwards::serving::BillingPrices {
+        use rust_decimal::prelude::ToPrimitive;
+        onwards::serving::BillingPrices {
+            prompt: self.prompt.to_f64().unwrap_or(0.0),
+            cached: self.cached.to_f64().unwrap_or(0.0),
+            output: self.output.to_f64().unwrap_or(0.0),
+        }
+    }
+}
+
+/// What a request's price depends on besides its key, known before it is sent.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PriceQuery<'a> {
+    /// The model alias the request names.
+    pub model: &'a str,
+    /// The batch completion window, for requests the daemon dispatches.
+    pub completion_window: Option<&'a str>,
+    /// When the batch was created, for requests the daemon dispatches: they are
+    /// priced as of then.
+    pub batch_created_at: Option<DateTime<Utc>>,
+    pub now: DateTime<Utc>,
+    pub serving_class: &'a str,
+    /// Where the request's cache reads are billed from, when the cache layer prices
+    /// them; `None` bills every input token at the input price.
+    pub cache_reads: Option<crate::prompt_cache::CacheReadSource>,
+}
+
+/// Every model's tariff and cache-tariff history, loaded with the analytics batcher's
+/// own lookups, so a request can be priced before it is sent.
+#[derive(Default)]
+pub(crate) struct PriceBook {
+    models: std::collections::HashMap<String, ModelInfo>,
+    cache_tariffs: std::collections::HashMap<String, Vec<CacheTariffRow>>,
+    /// The accounts whose own prices were loaded. Any other account may have
+    /// prices of its own that this book lacks, so it is not priced from it.
+    accounts: std::collections::HashSet<uuid::Uuid>,
+}
+
+impl PriceBook {
+    /// Load every model's general prices and the prices of `accounts`.
+    pub async fn load(pool: &sqlx::PgPool, accounts: &[uuid::Uuid]) -> Result<Self, sqlx::Error> {
+        let aliases = sqlx::query_scalar!("SELECT DISTINCT alias FROM deployed_models")
+            .fetch_all(pool)
+            .await?;
+        Ok(Self {
+            models: lookup_model_tariffs(pool, &aliases, accounts).await?,
+            cache_tariffs: lookup_cache_tariffs(pool, &aliases, accounts).await?,
+            accounts: accounts.iter().copied().collect(),
+        })
+    }
+
+    /// The prices the analytics batcher bills `query` at, for a key that bills
+    /// `account` at `purpose`'s tariff: the same tariff and cache multipliers,
+    /// resolved at the same timestamp. Usage it does not charge for (an unpriced
+    /// model, a non-billing key purpose, the system account) is free.
+    ///
+    /// `None` when the book cannot tell: `account` was not one it was loaded
+    /// for, or the model was not deployed when it was loaded.
+    pub fn unit_prices(&self, account: uuid::Uuid, purpose: &ApiKeyPurpose, query: &PriceQuery<'_>) -> Option<UnitPrices> {
+        if account.is_nil() {
+            return Some(UnitPrices::FREE);
+        }
+        if !self.accounts.contains(&account) {
+            return None;
+        }
+        let model = self.models.get(query.model)?;
+        let timestamp = query.batch_created_at.unwrap_or(query.now);
+        let (input, output) = find_best_tariff(
+            &model.tariffs,
+            Some(purpose),
+            query.completion_window,
+            timestamp,
+            Some(account),
+            Some(query.serving_class),
+        );
+        let rows = self.cache_tariffs.get(query.model).map(Vec::as_slice).unwrap_or_default();
+        // The cache layer reports reads only for a model with cache pricing enabled now.
+        let cache = query
+            .cache_reads
+            .filter(|_| resolve_cache_multipliers(rows, query.now, None, None).is_some())
+            .and_then(|source| {
+                let mults = resolve_cache_multipliers(rows, timestamp, Some(account), Some(query.serving_class));
+                clamp_implicit_read_multiplier(mults, Some(source.as_str()))
+            });
+        Some(UnitPrices::new(input, output, cache))
+    }
+
+    /// A book of `models` and `cache_tariffs`, loaded for `accounts`.
+    #[cfg(test)]
+    pub fn from_rows(
+        accounts: impl IntoIterator<Item = uuid::Uuid>,
+        models: impl IntoIterator<Item = (String, Vec<TariffInfo>)>,
+        cache_tariffs: impl IntoIterator<Item = (String, Vec<CacheTariffRow>)>,
+    ) -> Self {
+        Self {
+            models: models
+                .into_iter()
+                .map(|(alias, tariffs)| {
+                    (
+                        alias,
+                        ModelInfo {
+                            provider_name: String::new(),
+                            tariffs,
+                        },
+                    )
+                })
+                .collect(),
+            cache_tariffs: cache_tariffs.into_iter().collect(),
+            accounts: accounts.into_iter().collect(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -939,6 +1189,228 @@ mod tests {
         let (input, output) = find_best_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now, None, None);
         assert_eq!(input, None, "Future tariff should not be selected");
         assert_eq!(output, None);
+    }
+
+    /// The prices times the usage are the cost: input that was not a cache read at
+    /// the prompt price, cache reads at the cached price, output at the output price.
+    fn priced(unit: UnitPrices, prompt: i64, completion: i64, cached: i64) -> Decimal {
+        unit.prompt * Decimal::from(prompt - cached) + unit.cached * Decimal::from(cached) + unit.output * Decimal::from(completion)
+    }
+
+    #[test]
+    fn unit_prices_times_usage_is_the_charged_cost() {
+        let tariffs = [
+            (Some(inp()), Some(outp())),
+            (Some(inp()), None),
+            (None, Some(outp())),
+            (Some(Decimal::ZERO), Some(Decimal::ZERO)),
+            (None, None),
+        ];
+        let caches = [
+            None,
+            Some(CacheMultipliers::default()),
+            Some(CacheMultipliers {
+                read: Decimal::new(5, 1),
+                ..CacheMultipliers::default()
+            }),
+            clamp_implicit_read_multiplier(
+                Some(CacheMultipliers {
+                    read: Decimal::new(15, 1),
+                    ..CacheMultipliers::default()
+                }),
+                Some("engine"),
+            ),
+        ];
+        let usages = [(1000, 100, 0), (1000, 100, 400), (1000, 0, 1000), (0, 50, 0), (7, 3, 7)];
+        for (i, (input, output)) in tariffs.into_iter().enumerate() {
+            for (j, cache) in caches.into_iter().enumerate() {
+                for (prompt, completion, cached) in usages {
+                    let charged = charged_cost(
+                        &counts(prompt, completion, cached, 0, 0, 0),
+                        Some("m"),
+                        input,
+                        output,
+                        cache,
+                        ANALYTICS_BATCHER,
+                    )
+                    .unwrap_or(Decimal::ZERO);
+                    assert_eq!(
+                        priced(UnitPrices::new(input, output, cache), prompt, completion, cached),
+                        charged,
+                        "tariff {i}, cache {j}, usage {prompt}/{completion}/{cached}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn query(model: &str) -> PriceQuery<'_> {
+        PriceQuery {
+            model,
+            completion_window: None,
+            batch_created_at: None,
+            now: Utc::now(),
+            serving_class: "standard",
+            cache_reads: None,
+        }
+    }
+
+    fn price(input: &str, cached: &str, output: &str) -> UnitPrices {
+        UnitPrices {
+            prompt: Decimal::from_str(input).unwrap(),
+            cached: Decimal::from_str(cached).unwrap(),
+            output: Decimal::from_str(output).unwrap(),
+        }
+    }
+
+    #[test]
+    fn unit_prices_follow_the_tariff_billing_selects() {
+        let now = Utc::now();
+        let hours = chrono::Duration::hours;
+        let deal_account = uuid::Uuid::new_v4();
+        let account = uuid::Uuid::new_v4();
+        let mut deal = make_tariff(ApiKeyPurpose::Realtime, now - hours(2), None, "0.000002", "0.000006", None);
+        deal.account = Some(deal_account);
+        let book = PriceBook::from_rows(
+            [account, deal_account],
+            [
+                (
+                    "m".to_string(),
+                    vec![
+                        make_tariff(
+                            ApiKeyPurpose::Realtime,
+                            now - hours(48),
+                            Some(now - hours(2)),
+                            "0.000005",
+                            "0.000015",
+                            None,
+                        ),
+                        make_tariff(ApiKeyPurpose::Realtime, now - hours(2), None, "0.000003", "0.000009", None),
+                        make_tariff(ApiKeyPurpose::Batch, now - hours(2), None, "0.000001", "0.000003", Some("24h")),
+                        deal,
+                    ],
+                ),
+                ("unpriced".to_string(), vec![]),
+                (
+                    "zero".to_string(),
+                    vec![make_tariff(ApiKeyPurpose::Realtime, now - hours(2), None, "0", "0", None)],
+                ),
+            ],
+            [],
+        );
+
+        let realtime = Some(price("0.000003", "0.000003", "0.000009"));
+        assert_eq!(book.unit_prices(account, &ApiKeyPurpose::Realtime, &query("m")), realtime);
+        assert_eq!(
+            book.unit_prices(account, &ApiKeyPurpose::Playground, &query("m")),
+            realtime,
+            "playground falls back to realtime"
+        );
+        assert_eq!(
+            book.unit_prices(deal_account, &ApiKeyPurpose::Realtime, &query("m")),
+            Some(price("0.000002", "0.000002", "0.000006")),
+            "the account's own price wins"
+        );
+
+        let mut batch = query("m");
+        batch.completion_window = Some("24h");
+        assert_eq!(
+            book.unit_prices(account, &ApiKeyPurpose::Batch, &batch),
+            Some(price("0.000001", "0.000001", "0.000003"))
+        );
+        batch.completion_window = Some("1h");
+        assert_eq!(
+            book.unit_prices(account, &ApiKeyPurpose::Batch, &batch),
+            realtime,
+            "an SLA without a batch price falls back to realtime"
+        );
+        batch.batch_created_at = Some(now - hours(3));
+        assert_eq!(
+            book.unit_prices(account, &ApiKeyPurpose::Batch, &batch),
+            Some(price("0.000005", "0.000005", "0.000015")),
+            "a batch request is priced as of the batch's creation"
+        );
+
+        for (model, account, purpose) in [
+            ("unpriced", account, ApiKeyPurpose::Realtime),
+            ("zero", account, ApiKeyPurpose::Realtime),
+            ("m", account, ApiKeyPurpose::Continuation),
+            ("m", uuid::Uuid::nil(), ApiKeyPurpose::Realtime),
+        ] {
+            assert_eq!(
+                book.unit_prices(account, &purpose, &query(model)),
+                Some(UnitPrices::FREE),
+                "{model} {account} {purpose:?}"
+            );
+        }
+
+        // What the book was not loaded with has no price, not a free one: an
+        // account whose own prices it did not load, and a model it has no
+        // record of.
+        assert_eq!(book.unit_prices(uuid::Uuid::new_v4(), &ApiKeyPurpose::Realtime, &query("m")), None);
+        assert_eq!(book.unit_prices(account, &ApiKeyPurpose::Realtime, &query("not-deployed")), None);
+    }
+
+    #[test]
+    fn cached_price_follows_how_the_cache_layer_reports_reads() {
+        let now = Utc::now();
+        let hours = chrono::Duration::hours;
+        let tariff = || {
+            vec![make_tariff(
+                ApiKeyPurpose::Realtime,
+                now - hours(2),
+                None,
+                "0.00001",
+                "0.00003",
+                None,
+            )]
+        };
+        let mut surcharge = tariff_row(Decimal::TWO, 2, None);
+        surcharge.read_multiplier = Decimal::new(15, 1);
+        let account = uuid::Uuid::new_v4();
+        let book = PriceBook::from_rows(
+            [account],
+            [
+                ("cached".to_string(), tariff()),
+                ("surcharge".to_string(), tariff()),
+                ("expired".to_string(), tariff()),
+                ("uncached".to_string(), tariff()),
+            ],
+            [
+                ("cached".to_string(), vec![tariff_row(Decimal::TWO, 2, None)]),
+                ("surcharge".to_string(), vec![surcharge]),
+                ("expired".to_string(), vec![tariff_row(Decimal::TWO, 4, Some(now - hours(1)))]),
+            ],
+        );
+        let cached = |model: &str, reads, created_at| {
+            let query = PriceQuery {
+                cache_reads: reads,
+                batch_created_at: created_at,
+                ..query(model)
+            };
+            book.unit_prices(account, &ApiKeyPurpose::Realtime, &query).unwrap().cached
+        };
+        let engine = Some(crate::prompt_cache::CacheReadSource::Engine);
+        let module = Some(crate::prompt_cache::CacheReadSource::Module);
+        let input = Decimal::from_str("0.00001").unwrap();
+
+        assert_eq!(cached("cached", engine, None), Decimal::from_str("0.000001").unwrap());
+        assert_eq!(cached("cached", module, None), Decimal::from_str("0.000001").unwrap());
+        assert_eq!(
+            cached("cached", None, None),
+            input,
+            "reads the cache layer does not report are billed as input"
+        );
+        assert_eq!(
+            cached("surcharge", engine, None),
+            input,
+            "an engine read never costs more than input"
+        );
+        assert_eq!(cached("surcharge", module, None), Decimal::from_str("0.000015").unwrap());
+        assert_eq!(cached("uncached", engine, None), input);
+        // Cache pricing that has since ended: the cache layer reports no reads now,
+        // even for a batch created while it applied.
+        assert_eq!(cached("expired", engine, Some(now - hours(2))), input);
     }
 }
 

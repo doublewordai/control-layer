@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT ak.secret, ak.user_id, u.zero_data_retention, u.disabled_modalities, u.toleration_preset\n        FROM api_keys ak\n        JOIN users u ON u.id = ak.user_id\n        WHERE NOT ak.is_deleted\n        ",
+  "query": "\n        SELECT ak.secret, ak.user_id, ak.purpose, u.zero_data_retention, u.disabled_modalities, u.toleration_preset\n        FROM api_keys ak\n        JOIN users u ON u.id = ak.user_id\n        WHERE NOT ak.is_deleted\n        ",
   "describe": {
     "columns": [
       {
@@ -15,16 +15,21 @@
       },
       {
         "ordinal": 2,
+        "name": "purpose",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
         "name": "zero_data_retention",
         "type_info": "Bool"
       },
       {
-        "ordinal": 3,
+        "ordinal": 4,
         "name": "disabled_modalities",
         "type_info": "TextArray"
       },
       {
-        "ordinal": 4,
+        "ordinal": 5,
         "name": "toleration_preset",
         "type_info": "Text"
       }
@@ -37,8 +42,9 @@
       false,
       false,
       false,
+      false,
       true
     ]
   },
-  "hash": "8fbd0c37b78964f008a9ad0b0918b08d0f0dede0bf76c66a853fdaeea27ce809"
+  "hash": "8c4770411b487bd4dd84a821dafb7635f3db4873211504b1a4656ed615ef224a"
 }
