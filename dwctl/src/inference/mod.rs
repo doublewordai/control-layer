@@ -35,4 +35,5 @@ pub mod streaming;
 
 pub mod engine;
 pub mod translation;
+pub mod validation;
 pub mod zdr;
