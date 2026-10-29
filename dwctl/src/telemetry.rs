@@ -19,6 +19,12 @@
 //! queries that read log lines depend on the JSON field names described on
 //! [`fmt_layer`], and in JSON mode panics are written in the same shape.
 //!
+//! # Credentials
+//!
+//! Log lines, JSON panic lines and exported spans pass through
+//! [`crate::log_redaction`], which replaces API keys and bearer tokens with
+//! `<redacted>` however they got into the output.
+//!
 //! # What gets exported
 //!
 //! Logs and traces are filtered separately. `RUST_LOG` decides what reaches the
@@ -109,7 +115,7 @@ use onwards::{ErrorOrigin, RequestIdentity, ServedBy};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
 pub use opentelemetry_sdk::trace::SdkTracerProvider;
-use opentelemetry_sdk::trace::Tracer;
+use opentelemetry_sdk::trace::{SpanExporter, Tracer};
 use serde_json::{Map, Value, json};
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::collections::HashMap;
@@ -125,6 +131,8 @@ use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::registry::{LookupSpan, Registry, SpanRef};
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
+
+use crate::log_redaction::{RedactingMakeWriter, RedactingSpanExporter, redact_secrets};
 
 /// Environment variable holding the filter directives for the span exporter.
 /// Same syntax as `RUST_LOG`, applied to the trace backend only.
@@ -292,7 +300,7 @@ where
     S: Subscriber + for<'span> LookupSpan<'span>,
     W: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
 {
-    let layer = tracing_subscriber::fmt::layer().with_writer(writer);
+    let layer = tracing_subscriber::fmt::layer().with_writer(RedactingMakeWriter(writer));
     match format {
         LogFormat::Compact => layer.compact().boxed(),
         LogFormat::Json => CorrelationLayer
@@ -443,7 +451,7 @@ where
 /// subscriber is handling an event is dispatched to no subscriber at all.
 fn write_panic_as_json(info: &PanicHookInfo<'_>) {
     let line = panic_line(info, &Backtrace::capture(), current_spans());
-    let _ = writeln!(std::io::stderr().lock(), "{line}");
+    let _ = writeln!(std::io::stderr().lock(), "{}", redact_secrets(&line.to_string()));
 }
 
 /// The span the panicking thread is in and its scope, root first, shaped
@@ -596,16 +604,7 @@ fn create_otlp_tracer() -> anyhow::Result<(Tracer, SdkTracerProvider, OtlpSettin
         .with_headers(headers)
         .build()?;
 
-    // Create tracer provider with resource
-    let resource = opentelemetry_sdk::Resource::builder()
-        .with_service_name(service_name.clone())
-        .build();
-
-    let tracer_provider = SdkTracerProvider::builder()
-        .with_batch_exporter(exporter)
-        .with_resource(resource)
-        .build();
-
+    let tracer_provider = tracer_provider(exporter, &service_name);
     let tracer = tracer_provider.tracer(service_name.clone());
     let settings = OtlpSettings {
         service_name,
@@ -614,6 +613,18 @@ fn create_otlp_tracer() -> anyhow::Result<(Tracer, SdkTracerProvider, OtlpSettin
     };
 
     Ok((tracer, tracer_provider, settings))
+}
+
+/// A tracer provider that batches spans to `exporter`, redacting credentials
+/// from them first (see [`crate::log_redaction`]).
+fn tracer_provider(exporter: impl SpanExporter + 'static, service_name: &str) -> SdkTracerProvider {
+    let resource = opentelemetry_sdk::Resource::builder()
+        .with_service_name(service_name.to_string())
+        .build();
+    SdkTracerProvider::builder()
+        .with_batch_exporter(RedactingSpanExporter(exporter))
+        .with_resource(resource)
+        .build()
 }
 
 /// What [`create_otlp_tracer`] configured, logged once logging is up.
@@ -627,7 +638,7 @@ struct OtlpSettings {
 mod tests {
     use super::*;
     use opentelemetry_sdk::error::OTelSdkResult;
-    use opentelemetry_sdk::trace::{SpanData, SpanExporter};
+    use opentelemetry_sdk::trace::SpanData;
     use std::sync::{Arc, Mutex};
     use tracing::Instrument;
 
@@ -767,6 +778,63 @@ mod tests {
                 .map(str::to_string)
                 .collect()
         }
+    }
+
+    /// A key of the shape `generate_api_key` produces.
+    const KEY: &str = "sk-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AbCdE";
+
+    /// An input whose derived `Debug` prints its key, as fusillade's batch
+    /// input once did.
+    #[derive(Debug)]
+    #[allow(dead_code, reason = "read only through Debug")]
+    struct LeakyInput {
+        file_id: u32,
+        api_key: String,
+    }
+
+    #[tracing::instrument(level = "debug")]
+    fn create_record(input: LeakyInput) {
+        tracing::warn!(authorization = %format!("Bearer {KEY}"), "upstream rejected the request");
+        tracing::error!(error = %format!("invalid key {KEY}"), "create failed");
+    }
+
+    /// A key reaching the subscriber through an instrumented argument's
+    /// `Debug`, a header field or an error message is redacted in every log
+    /// format and in the exported spans.
+    #[tokio::test]
+    async fn credentials_are_redacted_from_logs_and_exported_spans() {
+        let exported = Exported::default();
+        let provider = tracer_provider(exported.clone(), "test");
+        let json = Captured::default();
+        let compact = Captured::default();
+        let (json_writer, compact_writer) = (json.clone(), compact.clone());
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("debug"))
+            .with(fmt_layer(LogFormat::Json, move || json_writer.clone()))
+            .with(fmt_layer(LogFormat::Compact, move || compact_writer.clone()))
+            .with(otel_layer(provider.tracer("test"), "debug"));
+
+        tracing::subscriber::with_default(subscriber, || {
+            create_record(LeakyInput {
+                file_id: 7,
+                api_key: KEY.to_string(),
+            });
+        });
+        provider.shutdown().unwrap();
+
+        for (format, lines) in [("json", json.lines()), ("compact", compact.lines())] {
+            assert_eq!(lines.len(), 2, "{format}: {lines:?}");
+            for line in &lines {
+                assert!(!line.contains(KEY), "{format} line leaked the key: {line}");
+                assert!(line.contains("<redacted>"), "{format}: {line}");
+            }
+        }
+
+        let spans = exported.0.lock().unwrap();
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        let span = format!("{:?}", spans[0]);
+        assert!(!span.contains(KEY), "exported span leaked the key: {span}");
+        assert!(span.contains("file_id: 7"), "the rest of the input is still recorded: {span}");
     }
 
     /// In JSON, the request IDs recorded on the spans an event is in are

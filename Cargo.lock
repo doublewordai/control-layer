@@ -1997,6 +1997,7 @@ dependencies = [
  "prometheus",
  "rand 0.10.3",
  "redis",
+ "regex",
  "reqwest",
  "rust-embed",
  "rust_decimal",
