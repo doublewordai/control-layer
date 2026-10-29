@@ -4,7 +4,7 @@
     "config:recommended"
   ],
   "constraints": {
-    "pnpm": "10.34.7"
+    "pnpm": "10.34.9"
   },
   "packageRules": [
     {
