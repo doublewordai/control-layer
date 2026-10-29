@@ -1560,7 +1560,7 @@ impl Targets {
                             .unwrap_or(rate_limit.requests_per_second),
                     ),
                 ));
-                // Map the actual API key to its rate limiter
+                // Map the key's hash to its rate limiter
                 key_rate_limiters.insert(key_def.key, limiter);
             }
             if let Some(ref concurrency_limit) = key_def.concurrency_limit {

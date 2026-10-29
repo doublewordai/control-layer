@@ -599,7 +599,6 @@ mod tests {
 /// upstream member for each resolution outcome.
 #[cfg(test)]
 mod handler_tests {
-    use crate::auth::KeyHash;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -611,6 +610,7 @@ mod handler_tests {
     use serde_json::json;
 
     use super::*;
+    use crate::auth::KeyHash;
     use crate::handlers::target_message_handler;
     use crate::load_balancer::{Provider, ProviderPool};
     use crate::strict::build_strict_router;
