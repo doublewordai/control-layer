@@ -674,9 +674,12 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
     // (required for admin API access used by internal services like scouter)
     let system_api_key_id = Uuid::nil();
     let new_secret = crypto::generate_api_key();
+    let new_secret_hash = crypto::hash_api_key(&new_secret);
     sqlx::query!(
-        "UPDATE api_keys SET secret = $1, purpose = 'platform' WHERE id = $2",
+        "UPDATE api_keys SET secret = $1, secret_hash = $2, secret_prefix = $3, purpose = 'platform' WHERE id = $4",
         new_secret,
+        &new_secret_hash[..],
+        crypto::api_key_prefix(&new_secret),
         system_api_key_id
     )
     .execute(&mut *tx)

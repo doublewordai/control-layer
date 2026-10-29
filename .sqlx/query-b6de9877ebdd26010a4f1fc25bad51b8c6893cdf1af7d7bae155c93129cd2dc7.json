@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE api_keys SET secret = $2, secret_hash = $3, secret_prefix = $4\n            WHERE id = $1 AND is_deleted = false AND hidden = false AND parent_api_key_id IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Varchar",
+        "Bytea",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b6de9877ebdd26010a4f1fc25bad51b8c6893cdf1af7d7bae155c93129cd2dc7"
+}
