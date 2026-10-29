@@ -34,9 +34,19 @@
 //!   identifies the conversation for its whole life.
 //!
 //! Requests without a key use ordinary priority selection.
+//!
+//! ## Forwarding the key
+//!
+//! A provider can also receive the key, so that the upstream can keep a
+//! conversation on one of its own replicas (see
+//! [`ProviderSpec::affinity_key_header`](crate::target::ProviderSpec::affinity_key_header)).
+//! Onwards does not choose a replica: it sends the request to the provider's
+//! URL as usual, with the key's hash in the named header. The value is the
+//! 64-bit key in hex, never the identifier or content it was derived from.
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::http::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -110,25 +120,61 @@ impl AffinityConfig {
     }
 }
 
+/// Where a request's conversation key came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySource {
+    /// The [`SESSION_HEADER`] header.
+    Header,
+    /// A `session_id` string in the body.
+    SessionId,
+    /// A `prompt_cache_key` string in the body.
+    PromptCacheKey,
+    /// The conversation's opening messages.
+    Opening,
+}
+
+impl KeySource {
+    /// Metric label value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeySource::Header => "header",
+            KeySource::SessionId => "session_id",
+            KeySource::PromptCacheKey => "prompt_cache_key",
+            KeySource::Opening => "opening",
+        }
+    }
+}
+
 /// The conversation a request belongs to, as a stable 64-bit hash. `None` when
 /// the request carries nothing that identifies a conversation.
 ///
 /// `session_header` is the value of [`SESSION_HEADER`], if present.
 pub fn conversation_key(session_header: Option<&str>, body: &Value) -> Option<u64> {
+    conversation_key_with_source(session_header, body).map(|(key, _)| key)
+}
+
+/// [`conversation_key`] together with where the key came from.
+pub fn conversation_key_with_source(
+    session_header: Option<&str>,
+    body: &Value,
+) -> Option<(u64, KeySource)> {
     let explicit = session_header
         .filter(|s| !s.is_empty())
+        .map(|s| (s, KeySource::Header))
         .or_else(|| {
             body.get("session_id")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
+                .map(|s| (s, KeySource::SessionId))
         })
         .or_else(|| {
             body.get("prompt_cache_key")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
+                .map(|s| (s, KeySource::PromptCacheKey))
         });
-    if let Some(id) = explicit {
-        return Some(hash(&[b"id", id.as_bytes()]));
+    if let Some((id, source)) = explicit {
+        return Some((hash(&[b"id", id.as_bytes()]), source));
     }
     let (system, first) = opening(body)?;
     let system = system.map(|(role, content)| (role, canonical(content)));
@@ -138,7 +184,40 @@ pub fn conversation_key(session_header: Option<&str>, body: &Value) -> Option<u6
         parts.extend([role.as_bytes(), content.as_bytes()]);
     }
     parts.extend([first.0.as_bytes(), first_content.as_bytes()]);
-    Some(hash(&parts))
+    Some((hash(&parts), KeySource::Opening))
+}
+
+/// Headers an affinity key may not be written to: request framing, routing,
+/// credentials and trace context, which onwards or the transport set.
+const RESERVED_KEY_HEADERS: &[&str] = &[
+    "host",
+    "content-length",
+    "content-type",
+    "transfer-encoding",
+    "connection",
+    "authorization",
+    "x-api-key",
+    "api-key",
+    "traceparent",
+    "tracestate",
+    SESSION_HEADER,
+];
+
+/// Parse the name of the header a provider receives the key in.
+pub fn parse_key_header(name: &str) -> Result<HeaderName, String> {
+    let header = HeaderName::from_bytes(name.as_bytes())
+        .map_err(|_| format!("affinity_key_header '{name}' is not a valid header name"))?;
+    if RESERVED_KEY_HEADERS.contains(&header.as_str()) {
+        return Err(format!(
+            "affinity_key_header '{name}' is reserved; choose a dedicated header"
+        ));
+    }
+    Ok(header)
+}
+
+/// The header value for a key: 16 lowercase hex digits.
+pub fn key_header_value(key: u64) -> HeaderValue {
+    HeaderValue::from_str(&format!("{key:016x}")).expect("hex digits are a valid header value")
 }
 
 /// `h` in `[0, 1)` for a conversation key.
@@ -343,6 +422,66 @@ mod tests {
             messages.push(json!({"role": role, "content": text}));
         }
         json!({"model": "m", "messages": messages})
+    }
+
+    #[test]
+    fn key_source_names_where_the_key_came_from() {
+        let body = chat("s", "u", &[]);
+        let source = |header: Option<&str>, body: &Value| {
+            conversation_key_with_source(header, body).map(|(_, source)| source)
+        };
+        assert_eq!(source(Some("abc"), &body), Some(KeySource::Header));
+        let mut with_id = body.clone();
+        with_id["session_id"] = json!("abc");
+        assert_eq!(source(None, &with_id), Some(KeySource::SessionId));
+        let mut with_cache_key = body.clone();
+        with_cache_key["prompt_cache_key"] = json!("abc");
+        assert_eq!(
+            source(None, &with_cache_key),
+            Some(KeySource::PromptCacheKey)
+        );
+        assert_eq!(source(None, &body), Some(KeySource::Opening));
+        assert_eq!(source(None, &json!({"model": "m"})), None);
+        // The source never changes the key itself.
+        assert_eq!(
+            conversation_key_with_source(None, &body).map(|(key, _)| key),
+            conversation_key(None, &body)
+        );
+    }
+
+    #[test]
+    fn key_header_value_is_fixed_width_hex_of_the_key() {
+        let value = key_header_value(0xab);
+        assert_eq!(value.to_str().unwrap(), "00000000000000ab");
+        let key =
+            conversation_key(None, &chat("secret system prompt", "secret task", &[])).unwrap();
+        let value = key_header_value(key);
+        let text = value.to_str().unwrap();
+        assert_eq!(text.len(), 16);
+        assert!(text.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(!text.contains("secret"));
+    }
+
+    #[test]
+    fn key_header_must_be_a_valid_unreserved_name() {
+        assert_eq!(
+            parse_key_header("X-Affinity-Key").unwrap().as_str(),
+            "x-affinity-key"
+        );
+        assert!(parse_key_header("not a header").is_err());
+        assert!(parse_key_header("").is_err());
+        for reserved in [
+            "Authorization",
+            "host",
+            "content-length",
+            "traceparent",
+            SESSION_HEADER,
+        ] {
+            assert!(
+                parse_key_header(reserved).is_err(),
+                "{reserved} must be refused"
+            );
+        }
     }
 
     #[test]

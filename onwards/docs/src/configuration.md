@@ -26,6 +26,7 @@ Onwards is configured through a JSON file. Each key in the `targets` object defi
 | `sanitize_response` | bool | No | Enforce strict OpenAI schema compliance for responses only (see [Sanitization](sanitization.md)) |
 | `propagate_trace_context` | optional bool | No | Inject W3C `traceparent` / `tracestate` headers on outbound requests; omit to inherit from the resolved `trusted` value. **Provider-scoped:** valid on a single-provider target and on each entry of a pool's `providers` array — *not* as a top-level key on a pool that uses `providers`. See [Trace context propagation](load-balancing.md#trace-context-propagation). |
 | `reasoning_translation` | object | No | Translate canonical OpenAI reasoning efforts into this provider's request shape. Provider-scoped in load-balanced pools. |
+| `affinity_key_header` | string | No | Send a hash of each request's conversation key in this header, for an upstream that keeps conversations on one of its replicas. Provider-scoped. See [Forwarding the conversation key](load-balancing.md#forwarding-the-conversation-key). |
 | `strategy` | string | No | Load balancing strategy: `weighted_random` or `priority` |
 | `fallback` | object | No | Retry configuration (see [Load Balancing](load-balancing.md)) |
 | `providers` | array | No | Array of provider configurations for load balancing |

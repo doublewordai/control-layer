@@ -13,7 +13,7 @@
 //!
 //! Pool-level configuration (keys, rate_limit) applies to all providers in the pool.
 //! Provider-level configuration (url, onwards_key, weight) is specific to each provider.
-use crate::affinity::AffinityConfig;
+use crate::affinity::{self, AffinityConfig};
 use crate::aimd::AimdConfig;
 use crate::auth::KeySet;
 use crate::inflight::InflightLimits;
@@ -173,6 +173,16 @@ pub struct ProviderSpec {
     /// provider.
     #[serde(default)]
     pub kind: ProviderKind,
+
+    /// Send each request's conversation key to this provider in the named
+    /// header (see [`crate::affinity`]), so an upstream that balances over
+    /// its own replicas can keep a conversation on one of them. The value is
+    /// a hash of the key in hex, never prompt content; the request still goes
+    /// to `url`. Onwards replaces any inbound value of the header, and
+    /// removes it when the request has no key. Unset (the default): the
+    /// header is passed through like any other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affinity_key_header: Option<String>,
 }
 
 /// Load balancing strategy for selecting providers
@@ -505,6 +515,10 @@ pub struct TargetSpec {
     #[builder(default)]
     pub kind: ProviderKind,
 
+    /// See [`ProviderSpec::affinity_key_header`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affinity_key_header: Option<String>,
+
     /// Request timeout in seconds. If specified, requests exceeding this duration
     /// will be cancelled and return a 504 Gateway Timeout error.
     /// If fallback is enabled, the next provider will be tried.
@@ -722,6 +736,7 @@ impl TargetSpecOrList {
                         reasoning_translation: t.reasoning_translation,
                         accepts_scheduling_priority: t.accepts_scheduling_priority,
                         kind: t.kind,
+                        affinity_key_header: t.affinity_key_header,
                     })
                     .collect();
                 Ok(PoolConfig {
@@ -766,6 +781,7 @@ impl TargetSpecOrList {
                     reasoning_translation: spec.reasoning_translation,
                     accepts_scheduling_priority: spec.accepts_scheduling_priority,
                     kind: spec.kind,
+                    affinity_key_header: spec.affinity_key_header,
                 };
                 Ok(PoolConfig {
                     keys,
@@ -825,6 +841,10 @@ impl From<TargetSpec> for Target {
             reasoning_translation: value.reasoning_translation,
             accepts_scheduling_priority: value.accepts_scheduling_priority,
             kind: value.kind,
+            affinity_key_header: value
+                .affinity_key_header
+                .as_deref()
+                .and_then(|name| affinity::parse_key_header(name).ok()),
         }
     }
 }
@@ -852,6 +872,10 @@ impl From<ProviderSpec> for Target {
             reasoning_translation: value.reasoning_translation,
             accepts_scheduling_priority: value.accepts_scheduling_priority,
             kind: value.kind,
+            affinity_key_header: value
+                .affinity_key_header
+                .as_deref()
+                .and_then(|name| affinity::parse_key_header(name).ok()),
         }
     }
 }
@@ -1006,6 +1030,8 @@ pub struct Target {
     /// See [`ProviderSpec::kind`].
     #[builder(default)]
     pub kind: ProviderKind,
+    /// See [`ProviderSpec::affinity_key_header`]. Validated at config load.
+    pub affinity_key_header: Option<axum::http::HeaderName>,
 }
 
 impl Target {
@@ -1418,6 +1444,17 @@ fn build_pool(
         }
     }
     for (index, provider) in pool_config.providers.iter().enumerate() {
+        if let Some(name) = provider.affinity_key_header.as_deref() {
+            affinity::parse_key_header(name).map_err(|error| {
+                anyhow!(
+                    "Invalid provider for target '{}' pool '{}' provider {}: {}",
+                    alias,
+                    pool_name,
+                    index,
+                    error
+                )
+            })?;
+        }
         if let Some(config) = provider.reasoning_translation.as_ref() {
             config.validate().map_err(|error| {
                 anyhow!(
@@ -2898,6 +2935,7 @@ mod tests {
                 reasoning_translation: None,
                 accepts_scheduling_priority: false,
                 kind: Default::default(),
+                affinity_key_header: None,
             }],
             overlays: Default::default(),
             inflight_limit: None,

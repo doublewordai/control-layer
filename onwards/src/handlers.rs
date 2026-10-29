@@ -468,6 +468,20 @@ fn filter_headers_for_upstream(headers: &mut HeaderMap, target: &Target) {
     headers.insert("x-forwarded-proto", "https".parse().unwrap());
 }
 
+/// Write the request's conversation key into the provider's affinity header,
+/// if it has one (see [`crate::target::ProviderSpec::affinity_key_header`]).
+/// Any inbound value is replaced, so a caller cannot choose the upstream
+/// replica, and removed when the request has no key.
+fn apply_affinity_key_header(headers: &mut HeaderMap, target: &Target, key: Option<u64>) {
+    let Some(name) = &target.affinity_key_header else {
+        return;
+    };
+    headers.remove(name);
+    if let Some(key) = key {
+        headers.insert(name.clone(), affinity::key_header_value(key));
+    }
+}
+
 /// The main handler responsible for forwarding requests to targets
 /// TODO(fergus): Better error messages beyond raw status codes.
 pub async fn target_message_handler<T: HttpClient>(
@@ -1137,18 +1151,27 @@ pub async fn target_message_handler<T: HttpClient>(
         && is_realtime;
     // Conversation affinity decides preferred-first once per conversation;
     // only realtime traffic on pools that opt in pays for the body parse.
-    let conversation = if pool.affinity_enabled() && is_realtime {
+    // A provider that receives the key in a header needs it for all traffic.
+    let pool_affinity = pool.affinity_enabled() && is_realtime;
+    let forwards_key = pool.forwards_affinity_key();
+    let keyed = if pool_affinity || forwards_key {
         serde_json::from_slice::<serde_json::Value>(&body_bytes)
             .ok()
             .and_then(|body| {
                 let header = original_headers
                     .get(affinity::SESSION_HEADER)
                     .and_then(|v| v.to_str().ok());
-                affinity::conversation_key(header, &body)
+                affinity::conversation_key_with_source(header, &body)
             })
     } else {
         None
     };
+    if forwards_key {
+        let source = keyed.map_or("none", |(_, source)| source.as_str());
+        metrics::counter!("onwards_affinity_key_requests_total", "source" => source).increment(1);
+    }
+    let affinity_key = keyed.map(|(key, _)| key);
+    let conversation = affinity_key.filter(|_| pool_affinity);
     let mut providers = pool
         .select_iter_routed(aimd_eligible, conversation, &model_name, resolved_pool_name.unwrap_or("default"))
         .excluding_members(ineligible_members.iter().copied());
@@ -1416,6 +1439,7 @@ pub async fn target_message_handler<T: HttpClient>(
 
         // Filter headers for upstream forwarding
         filter_headers_for_upstream(&mut attempt_headers, target);
+        apply_affinity_key_header(&mut attempt_headers, target, affinity_key);
 
         // Apply W3C trace-context policy for this upstream, gated on the
         // per-target propagate_trace_context flag (defaults to the resolved
@@ -3347,6 +3371,7 @@ mod tests {
             reasoning_translation: None,
             accepts_scheduling_priority: false,
             kind: Default::default(),
+            affinity_key_header: None,
         }
     }
 
