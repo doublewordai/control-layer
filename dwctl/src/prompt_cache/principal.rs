@@ -2,7 +2,8 @@
 //! cache scope's `principal_id` (= `api_keys.user_id`, the `target_user_id`: org or
 //! personal user). Two-tier, per the design:
 //!
-//! - **L1**: an in-process memo. The `api_key -> user_id` mapping is **immutable**
+//! - **L1**: an in-process memo keyed by the token's SHA-256 hash, so it holds no
+//!   plaintext secrets. The `api_key -> user_id` mapping is **immutable**
 //!   (a key's `user_id` never changes), so the memo needs no invalidation; a modest
 //!   TTL is kept only for memory hygiene. onwards passes only *validated* tokens and
 //!   a deleted key fails that validation, so a stale memo entry can never be used.
@@ -17,6 +18,7 @@ use std::time::Duration;
 
 use moka::future::Cache;
 
+use crate::crypto::hash_api_key;
 use crate::db::handlers::api_keys::ApiKeys;
 use crate::types::UserId;
 
@@ -29,12 +31,12 @@ use super::metrics as cache_metrics;
 pub struct PrincipalResolver {
     /// Live provider (not a pinned pool): survives runtime pool swaps.
     pool: sqlx_pool_router::DynPools,
-    l1: Cache<String, Option<UserId>>,
+    l1: Cache<[u8; 32], Option<UserId>>,
 }
 
 impl PrincipalResolver {
     pub fn new(pool: impl sqlx_pool_router::PoolProvider) -> Self {
-        // 100k entries ≈ a few MB (String key + Option<Uuid>) — comfortably covers the
+        // 100k entries ≈ a few MB (32-byte hash key + Option<Uuid>) — comfortably covers the
         // active-key working set of a busy tenant; cold keys evict + take one DB miss on
         // next use (cheap, indexed point lookup). Bump via `with_capacity` if churn warrants.
         Self::with_capacity(pool, 100_000)
@@ -63,7 +65,8 @@ impl PrincipalResolver {
     /// lookup of a key that happened to collide with a probed string (negligible:
     /// secrets are crypto-random), and the TTL bounds even that. So caching `None` is fine.
     pub async fn resolve(&self, token: &str) -> CacheResult<Option<UserId>> {
-        if let Some(cached) = self.l1.get(token).await {
+        let token_hash = hash_api_key(token);
+        if let Some(cached) = self.l1.get(&token_hash).await {
             // An L1 hit on a cached `None` is a cached *unknown* key, not a resolve hit —
             // count it as unknown_key so key-probe / invalid-key volume stays accurate.
             cache_metrics::record_principal_resolve(if cached.is_some() { "hit" } else { "unknown_key" });
@@ -72,7 +75,7 @@ impl PrincipalResolver {
         let mut conn = self.pool.write().acquire().await?;
         let user_id = ApiKeys::new(&mut conn).get_user_id_by_secret(token).await?;
         cache_metrics::record_principal_resolve(if user_id.is_some() { "miss" } else { "unknown_key" });
-        self.l1.insert(token.to_string(), user_id).await;
+        self.l1.insert(token_hash, user_id).await;
         Ok(user_id)
     }
 }

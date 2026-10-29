@@ -58,6 +58,7 @@ use moka::future::Cache;
 use sqlx::PgPool;
 
 use crate::UserId;
+use crate::crypto::hash_api_key;
 use crate::db::handlers::api_keys::ApiKeys;
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::metrics::errors::component;
@@ -397,7 +398,8 @@ impl Drop for InflightGuard {
 /// (realtime / batch / playground) is derived — the same input analytics uses for
 /// `request_origin`.
 ///
-/// Read-through with an in-process memo, exactly like
+/// Read-through with an in-process memo keyed by the token's SHA-256 hash (no
+/// plaintext secrets held), exactly like
 /// [`crate::prompt_cache::principal::PrincipalResolver`]: a key's purpose is
 /// immutable, so the memo needs no invalidation and the TTL is hygiene only.
 /// This layer sits BELOW auth (onwards validates the key), so the token here is
@@ -407,7 +409,7 @@ impl Drop for InflightGuard {
 pub struct PurposeResolver {
     /// Live provider (not a pinned pool): survives runtime pool swaps.
     pools: sqlx_pool_router::DynPools,
-    l1: Cache<String, Option<ApiKeyPurpose>>,
+    l1: Cache<[u8; 32], Option<ApiKeyPurpose>>,
 }
 
 impl PurposeResolver {
@@ -422,7 +424,8 @@ impl PurposeResolver {
     }
 
     pub async fn resolve(&self, token: &str) -> Option<ApiKeyPurpose> {
-        if let Some(cached) = self.l1.get(token).await {
+        let token_hash = hash_api_key(token);
+        if let Some(cached) = self.l1.get(&token_hash).await {
             return cached;
         }
         // Only a SUCCESSFUL lookup is cached. A transient DB failure must not
@@ -438,7 +441,7 @@ impl PurposeResolver {
         match looked_up {
             Ok(found) => {
                 let purpose = found.map(|(_, _, purpose)| purpose);
-                self.l1.insert(token.to_string(), purpose.clone()).await;
+                self.l1.insert(token_hash, purpose.clone()).await;
                 purpose
             }
             Err(_) => None,
