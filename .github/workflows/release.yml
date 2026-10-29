@@ -85,6 +85,18 @@ jobs:
       # Sending a repository_dispatch needs contents: write on the target repo,
       # so mint a release-app token scoped to that repo alone rather than
       # holding a long-lived personal token.
+      # Fail closed: with an empty repository list the minted token would
+      # cover every repository in the installation, not just the target.
+      - name: Require the deployment target
+        env:
+          DEPLOY_TARGET_OWNER: ${{ secrets.DEPLOY_TARGET_OWNER }}
+          DEPLOY_TARGET_REPO: ${{ secrets.DEPLOY_TARGET_REPO }}
+        run: |
+          if [[ -z "$DEPLOY_TARGET_OWNER" || -z "$DEPLOY_TARGET_REPO" ]]; then
+            echo "DEPLOY_TARGET_OWNER and DEPLOY_TARGET_REPO must both be set" >&2
+            exit 1
+          fi
+
       - name: Mint deploy dispatch token
         id: dispatch-token
         uses: actions/create-github-app-token@v2
