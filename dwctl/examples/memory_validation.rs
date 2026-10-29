@@ -25,6 +25,8 @@
 //!
 //! Run with: `cargo run --release -p dwctl --example memory_validation -- --help`.
 
+#![allow(clippy::print_stdout, clippy::print_stderr, reason = "a harness whose output is its report")]
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 

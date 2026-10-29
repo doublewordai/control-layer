@@ -4062,5 +4062,18 @@ mod unverified_volume_counts {
             0,
             "created_at < cutoff must be excluded"
         );
+
+        // The capped variant is min(count, limit): exact below the limit,
+        // clamped at it, and a non-positive limit counts nothing.
+        for (limit, expected) in [(5, 2), (2, 2), (1, 1), (0, 0), (-3, 0)] {
+            assert_eq!(
+                manager
+                    .count_owner_flex_requests_since_capped("user-a", past, true, limit)
+                    .await
+                    .unwrap(),
+                expected,
+                "capped count with limit {limit}"
+            );
+        }
     }
 }

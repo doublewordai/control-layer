@@ -1,5 +1,42 @@
 # Changelog
 
+## [15.6.0](https://github.com/doublewordai/control-layer/compare/v15.5.1...v15.6.0) (2026-10-29)
+
+
+### Features
+
+* **api-keys:** store a SHA-256 hash and display prefix of each key secret (DW-1007) ([#2138](https://github.com/doublewordai/control-layer/issues/2138)) ([22908c5](https://github.com/doublewordai/control-layer/commit/22908c5038fbc266b48179c9a4d80b0f35284c00))
+
+
+### Build System
+
+* **deps:** bump rustls from 0.23.45 to 0.23.46 ([#2135](https://github.com/doublewordai/control-layer/issues/2135)) ([17e9d6f](https://github.com/doublewordai/control-layer/commit/17e9d6f9fa8a6ee87d0f3e19513b7f6a769560b4))
+
+## [15.5.1](https://github.com/doublewordai/control-layer/compare/v15.5.0...v15.5.1) (2026-10-29)
+
+
+### Bug Fixes
+
+* **deps:** update redis to 0.32 and deadpool-redis to 0.22 ([#2104](https://github.com/doublewordai/control-layer/issues/2104)) ([59b55f1](https://github.com/doublewordai/control-layer/commit/59b55f1be5660304377f843622b3184ffafa742d))
+* **deps:** update rust crate parking_lot to 0.13 ([#2101](https://github.com/doublewordai/control-layer/issues/2101)) ([0d2bdbb](https://github.com/doublewordai/control-layer/commit/0d2bdbbb4bf5a2ea313d81740ee0c4bfa44fdeb3))
+* **deps:** update rust crate zstd to 0.14 ([#2120](https://github.com/doublewordai/control-layer/issues/2120)) ([c04bcd3](https://github.com/doublewordai/control-layer/commit/c04bcd336e4931893b9d3d1761b6e106f3f4a7a9))
+* **dwctl:** carry prompt_cache_key through the Responses translation ([#2112](https://github.com/doublewordai/control-layer/issues/2112)) ([c8274db](https://github.com/doublewordai/control-layer/commit/c8274db739307b38f37dc45c6523842f949ca344))
+* **fusillade:** keep batch API keys out of debug logs ([#2129](https://github.com/doublewordai/control-layer/issues/2129)) ([ecb1cd0](https://github.com/doublewordai/control-layer/commit/ecb1cd0a6895c9d11b65a1b62162e9a0ea82fb0e))
+* **inference:** reject unsupported server-side tools ([#2095](https://github.com/doublewordai/control-layer/issues/2095)) ([f8dfb35](https://github.com/doublewordai/control-layer/commit/f8dfb359d9419a534847620624e93285f8ffeba2))
+* make the unverified flex volume count cheap (route probes + cap) ([#2132](https://github.com/doublewordai/control-layer/issues/2132)) ([d531d95](https://github.com/doublewordai/control-layer/commit/d531d95dbb50861077524b031979ea3f27b7677d))
+* **telemetry:** redact credentials at the log and trace sinks ([#2130](https://github.com/doublewordai/control-layer/issues/2130)) ([5b3dcb1](https://github.com/doublewordai/control-layer/commit/5b3dcb18a170850f5abbd2f613e9e4ad8f86a0de))
+* **tests:** stabilise underway plan assertion ([#2117](https://github.com/doublewordai/control-layer/issues/2117)) ([eeaaf93](https://github.com/doublewordai/control-layer/commit/eeaaf93d05f6a69fee0ff50b70fee901a40808b0))
+
+
+### Continuous Integration
+
+* run release-please with a GitHub App token ([#2134](https://github.com/doublewordai/control-layer/issues/2134)) ([44b0521](https://github.com/doublewordai/control-layer/commit/44b052110046c34eb95b8a13c69bf3e293059939))
+
+
+### Miscellaneous
+
+* **deps:** update rust crate uuid to v1.29.0 ([#2118](https://github.com/doublewordai/control-layer/issues/2118)) ([094cdb3](https://github.com/doublewordai/control-layer/commit/094cdb3e9ffcd10ccf71b6b7448362ee5f52ec44))
+
 ## [15.5.0](https://github.com/doublewordai/control-layer/compare/v15.4.0...v15.5.0) (2026-10-23)
 
 

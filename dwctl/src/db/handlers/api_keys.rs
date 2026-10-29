@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::crypto::generate_api_key;
+use crate::crypto::{api_key_prefix, generate_api_key, hash_api_key};
 use crate::db::errors::DbError;
 use crate::db::errors::Result;
 use crate::db::handlers::repository::Repository;
@@ -115,6 +115,8 @@ impl<'c> Repository for ApiKeys<'c> {
     async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
         // Generate a secure API key
         let secret = generate_api_key();
+        let secret_hash = hash_api_key(&secret);
+        let secret_prefix = api_key_prefix(&secret);
 
         // Convert purpose enum to string for database
         let purpose_str = match request.purpose {
@@ -128,8 +130,8 @@ impl<'c> Repository for ApiKeys<'c> {
         let api_key = sqlx::query_as!(
             ApiKey,
             r#"
-            INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden, spend_limit, spend_limit_interval)
-            VALUES ($1, $2, $3, $4, $5, $6, false, $7, $8)
+            INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden, spend_limit, spend_limit_interval, secret_hash, secret_prefix)
+            VALUES ($1, $2, $3, $4, $5, $6, false, $7, $8, $9, $10)
             RETURNING id, name, description, secret, user_id, created_at, last_used, purpose, hidden, is_deleted, created_by, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at
             "#,
             request.name,
@@ -139,7 +141,9 @@ impl<'c> Repository for ApiKeys<'c> {
             request.user_id,
             request.created_by,
             request.spend_limit,
-            request.spend_limit_interval
+            request.spend_limit_interval,
+            &secret_hash[..],
+            secret_prefix
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -337,6 +341,8 @@ impl<'c> ApiKeys<'c> {
         // Uses ON CONFLICT on the unique index (user_id, created_by, purpose)
         // WHERE hidden = true AND is_deleted = false to handle concurrent requests.
         let secret = generate_api_key();
+        let secret_hash = hash_api_key(&secret);
+        let secret_prefix = api_key_prefix(&secret);
         let name = if user_id == created_by {
             format!("Internal {} Key", purpose_str)
         } else {
@@ -352,8 +358,8 @@ impl<'c> ApiKeys<'c> {
         let row_secret = sqlx::query_scalar!(
             r#"
             WITH ins AS (
-                INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden)
-                VALUES ($1, $2, $3, $4, $5, $6, true)
+                INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden, secret_hash, secret_prefix)
+                VALUES ($1, $2, $3, $4, $5, $6, true, $7, $8)
                 ON CONFLICT (user_id, created_by, purpose) WHERE hidden = true AND is_deleted = false AND parent_api_key_id IS NULL
                 DO NOTHING
                 RETURNING secret
@@ -370,7 +376,9 @@ impl<'c> ApiKeys<'c> {
             secret,
             purpose_str,
             user_id,
-            created_by
+            created_by,
+            &secret_hash[..],
+            secret_prefix
         )
         .fetch_one(&mut *self.db)
         .await?
@@ -400,6 +408,8 @@ impl<'c> ApiKeys<'c> {
         // Uses ON CONFLICT on the unique index (user_id, created_by, purpose)
         // WHERE hidden = true AND is_deleted = false to handle concurrent requests.
         let secret = generate_api_key();
+        let secret_hash = hash_api_key(&secret);
+        let secret_prefix = api_key_prefix(&secret);
         let name = if user_id == created_by {
             format!("Internal {} Key", purpose_str)
         } else {
@@ -415,8 +425,8 @@ impl<'c> ApiKeys<'c> {
         let row = sqlx::query!(
             r#"
             WITH ins AS (
-                INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden)
-                VALUES ($1, $2, $3, $4, $5, $6, true)
+                INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden, secret_hash, secret_prefix)
+                VALUES ($1, $2, $3, $4, $5, $6, true, $7, $8)
                 ON CONFLICT (user_id, created_by, purpose) WHERE hidden = true AND is_deleted = false AND parent_api_key_id IS NULL
                 DO NOTHING
                 RETURNING id, secret
@@ -433,7 +443,9 @@ impl<'c> ApiKeys<'c> {
             secret,
             purpose_str,
             user_id,
-            created_by
+            created_by,
+            &secret_hash[..],
+            secret_prefix
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -459,6 +471,8 @@ impl<'c> ApiKeys<'c> {
     #[instrument(level = "debug", skip(self), fields(parent_api_key_id = %abbrev_uuid(&parent_id)), err)]
     pub async fn get_or_create_child_hidden_key(&mut self, parent_id: ApiKeyId) -> Result<(String, ApiKeyId)> {
         let secret = generate_api_key();
+        let secret_hash = hash_api_key(&secret);
+        let secret_prefix = api_key_prefix(&secret);
 
         // INSERT ... ON CONFLICT DO NOTHING + SELECT, like the shared-key
         // upserts above, so the common "child already exists" path fires no
@@ -468,7 +482,7 @@ impl<'c> ApiKeys<'c> {
         let row = sqlx::query!(
             r#"
             WITH ins AS (
-                INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden, parent_api_key_id)
+                INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden, parent_api_key_id, secret_hash, secret_prefix)
                 SELECT
                     'Internal batch key (cap scope ' || p.id::text || ')',
                     'Automatically managed internal API key executing batch/flex traffic for a capped API key. Not visible to users.',
@@ -477,7 +491,9 @@ impl<'c> ApiKeys<'c> {
                     p.user_id,
                     p.created_by,
                     true,
-                    p.id
+                    p.id,
+                    $3,
+                    $4
                 FROM api_keys p
                 -- Parent must be a root visible key: no children of hidden
                 -- keys and no grandchildren (a child's parent is never itself
@@ -495,7 +511,9 @@ impl<'c> ApiKeys<'c> {
             LIMIT 1
             "#,
             secret,
-            parent_id
+            parent_id,
+            &secret_hash[..],
+            secret_prefix
         )
         .fetch_optional(&mut *self.db)
         .await?
@@ -669,13 +687,17 @@ impl<'c> ApiKeys<'c> {
     #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
     pub async fn rotate_secret(&mut self, id: ApiKeyId) -> Result<String> {
         let secret = generate_api_key();
+        let secret_hash = hash_api_key(&secret);
+        let secret_prefix = api_key_prefix(&secret);
         let result = sqlx::query!(
             r#"
-            UPDATE api_keys SET secret = $2
+            UPDATE api_keys SET secret = $2, secret_hash = $3, secret_prefix = $4
             WHERE id = $1 AND is_deleted = false AND hidden = false AND parent_api_key_id IS NULL
             "#,
             id,
-            secret
+            secret,
+            &secret_hash[..],
+            secret_prefix
         )
         .execute(&mut *self.db)
         .await?;
@@ -1242,6 +1264,65 @@ mod tests {
             })
             .await
             .unwrap()
+    }
+
+    /// Assert the row's stored hash and prefix match `secret` and the plaintext
+    /// column still holds it (lookups use it until the hash switch-over).
+    async fn assert_secret_hash_stored(conn: &mut PgConnection, id: ApiKeyId, secret: &str, path: &str) {
+        let row = sqlx::query!("SELECT secret, secret_hash, secret_prefix FROM api_keys WHERE id = $1", id)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(row.secret, secret, "{path}: plaintext secret");
+        assert_eq!(
+            row.secret_hash.as_deref(),
+            Some(&hash_api_key(secret)[..]),
+            "{path}: secret_hash must be hash_api_key(secret)"
+        );
+        assert_eq!(row.secret_prefix.as_deref(), Some(&secret[..8]), "{path}: secret_prefix");
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_every_secret_write_stores_hash_and_prefix(pool: PgPool) {
+        let user = create_user(&pool, "hash-writes").await;
+        let other = create_user(&pool, "hash-writes-other").await;
+
+        // create
+        let key = create_visible_key(&pool, user, user).await;
+        let mut conn = pool.acquire().await.unwrap();
+        assert_secret_hash_stored(&mut conn, key.id, &key.secret, "create").await;
+
+        // get_or_create_hidden_key: insert path
+        let hidden_secret = ApiKeys::new(&mut conn)
+            .get_or_create_hidden_key(user, ApiKeyPurpose::Playground, other)
+            .await
+            .unwrap();
+        let hidden_id: ApiKeyId = sqlx::query_scalar!(
+            "SELECT id FROM api_keys WHERE user_id = $1 AND created_by = $2 AND purpose = 'playground' AND hidden",
+            user,
+            other
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        assert_secret_hash_stored(&mut conn, hidden_id, &hidden_secret, "get_or_create_hidden_key").await;
+
+        // get_or_create_hidden_key_with_id: insert path
+        let (batch_secret, batch_id) = ApiKeys::new(&mut conn)
+            .get_or_create_hidden_key_with_id(user, ApiKeyPurpose::Batch, user)
+            .await
+            .unwrap();
+        assert_secret_hash_stored(&mut conn, batch_id, &batch_secret, "get_or_create_hidden_key_with_id").await;
+
+        // get_or_create_child_hidden_key: insert path
+        let (child_secret, child_id) = ApiKeys::new(&mut conn).get_or_create_child_hidden_key(key.id).await.unwrap();
+        assert_secret_hash_stored(&mut conn, child_id, &child_secret, "get_or_create_child_hidden_key").await;
+
+        // rotate_secret replaces secret, hash and prefix together
+        let rotated = ApiKeys::new(&mut conn).rotate_secret(key.id).await.unwrap();
+        assert_ne!(rotated, key.secret);
+        assert_secret_hash_stored(&mut conn, key.id, &rotated, "rotate_secret").await;
     }
 
     #[dwctl_test_macros::test]
