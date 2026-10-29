@@ -59,6 +59,7 @@
 
 pub mod analytics;
 pub mod api_keys;
+pub mod batch_sla;
 pub mod batch_templates;
 pub mod cache_tariffs;
 pub mod capacity_reservations;

@@ -1,5 +1,24 @@
 # Changelog
 
+## [15.7.0](https://github.com/doublewordai/control-layer/compare/v15.6.0...v15.7.0) (2026-10-29)
+
+
+### Features
+
+* **metrics:** expose aggregate batch SLA health ([#2137](https://github.com/doublewordai/control-layer/issues/2137)) ([6c150d7](https://github.com/doublewordai/control-layer/commit/6c150d71835a31ece0b808d860d123c73a4bbf55))
+
+## [15.6.0](https://github.com/doublewordai/control-layer/compare/v15.5.1...v15.6.0) (2026-10-29)
+
+
+### Features
+
+* **api-keys:** store a SHA-256 hash and display prefix of each key secret (DW-1007) ([#2138](https://github.com/doublewordai/control-layer/issues/2138)) ([22908c5](https://github.com/doublewordai/control-layer/commit/22908c5038fbc266b48179c9a4d80b0f35284c00))
+
+
+### Build System
+
+* **deps:** bump rustls from 0.23.45 to 0.23.46 ([#2135](https://github.com/doublewordai/control-layer/issues/2135)) ([17e9d6f](https://github.com/doublewordai/control-layer/commit/17e9d6f9fa8a6ee87d0f3e19513b7f6a769560b4))
+
 ## [15.5.1](https://github.com/doublewordai/control-layer/compare/v15.5.0...v15.5.1) (2026-10-29)
 
 
