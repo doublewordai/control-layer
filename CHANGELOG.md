@@ -1,5 +1,12 @@
 # Changelog
 
+## [15.7.0](https://github.com/doublewordai/control-layer/compare/v15.6.0...v15.7.0) (2026-10-29)
+
+
+### Features
+
+* **metrics:** expose aggregate batch SLA health ([#2137](https://github.com/doublewordai/control-layer/issues/2137)) ([6c150d7](https://github.com/doublewordai/control-layer/commit/6c150d71835a31ece0b808d860d123c73a4bbf55))
+
 ## [15.6.0](https://github.com/doublewordai/control-layer/compare/v15.5.1...v15.6.0) (2026-10-29)
 
 
