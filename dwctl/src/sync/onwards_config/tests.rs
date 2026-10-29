@@ -2079,7 +2079,7 @@ async fn affinity_survives_database_sync(pool: sqlx::PgPool) {
 async fn test_deleted_keys_excluded_from_deployment_lookup(pool: sqlx::PgPool) {
     use crate::db::handlers::api_keys::ApiKeys;
 
-    sqlx::query("INSERT INTO api_keys (name, secret, user_id, created_by, purpose) VALUES ('revoked-system', 'sk-revoked-system', $1, $1, 'realtime')")
+    sqlx::query("INSERT INTO api_keys (name, secret, secret_hash, secret_prefix, user_id, created_by, purpose) VALUES ('revoked-system', 'sk-revoked-system', sha256(convert_to('sk-revoked-system', 'UTF8')), left('sk-revoked-system', 8), $1, $1, 'realtime')")
         .bind(uuid::Uuid::nil()).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) SELECT id, 'ALLOW_NEGATIVE_BALANCE', true FROM users")
         .execute(&pool)

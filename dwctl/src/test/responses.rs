@@ -782,7 +782,7 @@ async fn previous_response_id_of_another_users_response_is_rejected(pool: PgPool
     let id = poll_completed_row(&pool, uuid::Uuid::nil()).await;
     let other_user = create_test_user(&pool, Role::StandardUser).await;
     let other_api_key = format!("sk-foreign-chain-{}", uuid::Uuid::new_v4());
-    sqlx::query("INSERT INTO api_keys (id, name, secret, purpose, user_id, created_by) VALUES ($1, $2, $3, 'realtime', $4, $4)")
+    sqlx::query("INSERT INTO api_keys (id, name, secret, secret_hash, secret_prefix, purpose, user_id, created_by) VALUES ($1, $2, $3, sha256(convert_to($3, 'UTF8')), left($3, 8), 'realtime', $4, $4)")
         .bind(uuid::Uuid::new_v4())
         .bind("Foreign chain test key")
         .bind(&other_api_key)
@@ -937,7 +937,7 @@ async fn read_retained_response_preserves_public_id_and_owner(pool: PgPool) {
     assert_eq!(before_json["id"], response_id);
     let other_user = create_test_user(&pool, Role::StandardUser).await;
     let other_api_key = format!("sk-retained-owner-{}", uuid::Uuid::new_v4());
-    sqlx::query("INSERT INTO api_keys (id, name, secret, purpose, user_id, created_by) VALUES ($1, $2, $3, 'realtime', $4, $4)")
+    sqlx::query("INSERT INTO api_keys (id, name, secret, secret_hash, secret_prefix, purpose, user_id, created_by) VALUES ($1, $2, $3, sha256(convert_to($3, 'UTF8')), left($3, 8), 'realtime', $4, $4)")
         .bind(uuid::Uuid::new_v4())
         .bind("Retained response ownership test key")
         .bind(&other_api_key)

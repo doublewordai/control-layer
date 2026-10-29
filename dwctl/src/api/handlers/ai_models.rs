@@ -13,6 +13,7 @@ use serde_json::json;
 use sqlx::{QueryBuilder, Row};
 use sqlx_pool_router::PoolProvider;
 
+use crate::crypto::hash_api_key;
 use crate::{
     AppState,
     api::models::{
@@ -189,14 +190,14 @@ pub async fn list_ai_models<P: PoolProvider>(
         SELECT ak.user_id
         FROM api_keys ak
         INNER JOIN users u ON u.id = ak.user_id
-        WHERE ak.secret = $1
+        WHERE ak.secret_hash = $1
           AND ak.is_deleted = FALSE
           AND u.is_deleted = FALSE
           AND ak.purpose IN ('realtime', 'batch', 'playground', 'continuation')
         LIMIT 1
         "#,
     )
-    .bind(token)
+    .bind(&hash_api_key(token)[..])
     .fetch_optional(&mut *conn)
     .await
     .map_err(|e| database_error("lookup_api_key", e))?;

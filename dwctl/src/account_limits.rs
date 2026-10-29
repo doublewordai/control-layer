@@ -1247,7 +1247,7 @@ mod tests {
 
         // The per-key policy sees the class preset folded over the model's.
         let key = format!("sk-{}", Uuid::new_v4());
-        sqlx::query("INSERT INTO api_keys (name, secret, user_id, created_by, purpose) VALUES ('k', $1, $2, $2, 'realtime')")
+        sqlx::query("INSERT INTO api_keys (name, secret, secret_hash, secret_prefix, user_id, created_by, purpose) VALUES ('k', $1, sha256(convert_to($1, 'UTF8')), left($1, 8), $2, $2, 'realtime')")
             .bind(&key)
             .bind(org)
             .execute(&pool)

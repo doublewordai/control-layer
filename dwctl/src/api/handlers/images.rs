@@ -45,6 +45,7 @@
 
 use crate::AppState;
 use crate::api::models::users::CurrentUser;
+use crate::crypto::hash_api_key;
 use crate::errors::{Error, Result};
 use crate::image_normalizer::{ImageToken, TokenParseError};
 use axum::{
@@ -189,10 +190,10 @@ pub async fn try_resolve_caller(pool: &sqlx::PgPool, api_key: &str) -> std::resu
             user_id AS "user_id!",
             (purpose = 'batch' AND hidden) AS "is_daemon_dispatch!"
         FROM api_keys
-        WHERE secret = $1 AND is_deleted = FALSE
+        WHERE secret_hash = $1 AND is_deleted = FALSE
         LIMIT 1
         "#,
-        api_key,
+        &hash_api_key(api_key)[..],
     )
     .fetch_optional(pool)
     .await?;

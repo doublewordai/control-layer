@@ -63,7 +63,7 @@ impl Fixture {
             .await
             .assert_status(StatusCode::CREATED);
         let key = format!("sk-{}", Uuid::new_v4());
-        sqlx::query("INSERT INTO api_keys (name,secret,user_id,created_by,purpose) VALUES ('serving-test',$1,$2,$2,'realtime')")
+        sqlx::query("INSERT INTO api_keys (name,secret,secret_hash,secret_prefix,user_id,created_by,purpose) VALUES ('serving-test',$1,sha256(convert_to($1,'UTF8')),left($1,8),$2,$2,'realtime')")
             .bind(&key)
             .bind(user.id)
             .execute(pool)

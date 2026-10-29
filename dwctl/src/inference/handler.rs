@@ -9,6 +9,7 @@
 //! `created_by` against the API key's `user_id` (which is the org ID for
 //! org-scoped keys).
 
+use crate::crypto::hash_api_key;
 use crate::inference::response_store::StoreError;
 use axum::{
     Json,
@@ -71,12 +72,13 @@ pub async fn get_response<P: PoolProvider>(
         .and_then(|s| s.strip_prefix("Bearer "))
         .ok_or_else(|| Error::Unauthenticated { message: None })?;
 
-    let owner_id: String = sqlx::query_scalar("SELECT user_id::text FROM public.api_keys WHERE secret = $1 AND is_deleted = false LIMIT 1")
-        .bind(api_key)
-        .fetch_optional(state.db.read())
-        .await
-        .map_err(|e| Error::Database(e.into()))?
-        .ok_or_else(|| Error::Unauthenticated { message: None })?;
+    let owner_id: String =
+        sqlx::query_scalar("SELECT user_id::text FROM public.api_keys WHERE secret_hash = $1 AND is_deleted = false LIMIT 1")
+            .bind(&hash_api_key(api_key)[..])
+            .fetch_optional(state.db.read())
+            .await
+            .map_err(|e| Error::Database(e.into()))?
+            .ok_or_else(|| Error::Unauthenticated { message: None })?;
 
     // Parse the response ID: `resp_<uuid>` is the fusillade.requests id.
     let uuid_str = response_id.strip_prefix("resp_").unwrap_or(&response_id);
@@ -190,12 +192,13 @@ pub async fn delete_response<P: PoolProvider>(
         .and_then(|s| s.strip_prefix("Bearer "))
         .ok_or_else(|| Error::Unauthenticated { message: None })?;
 
-    let owner_id: String = sqlx::query_scalar("SELECT user_id::text FROM public.api_keys WHERE secret = $1 AND is_deleted = false LIMIT 1")
-        .bind(api_key)
-        .fetch_optional(state.db.read())
-        .await
-        .map_err(|e| Error::Database(e.into()))?
-        .ok_or_else(|| Error::Unauthenticated { message: None })?;
+    let owner_id: String =
+        sqlx::query_scalar("SELECT user_id::text FROM public.api_keys WHERE secret_hash = $1 AND is_deleted = false LIMIT 1")
+            .bind(&hash_api_key(api_key)[..])
+            .fetch_optional(state.db.read())
+            .await
+            .map_err(|e| Error::Database(e.into()))?
+            .ok_or_else(|| Error::Unauthenticated { message: None })?;
 
     let uuid_str = response_id.strip_prefix("resp_").unwrap_or(&response_id);
     let response_uuid = uuid::Uuid::parse_str(uuid_str).map_err(|_| Error::NotFound {

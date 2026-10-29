@@ -1258,11 +1258,13 @@ async fn test_database_seeding_behavior(pool: PgPool) {
     let system_api_key_id = Uuid::nil();
     let original_secret = "original_test_secret";
     sqlx::query!(
-        "INSERT INTO api_keys (id, name, secret, purpose, user_id, created_by) VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT (id) DO UPDATE SET secret = $3",
+        "INSERT INTO api_keys (id, name, secret, secret_hash, secret_prefix, purpose, user_id, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (id) DO UPDATE SET secret = $3, secret_hash = $4, secret_prefix = $5",
         system_api_key_id,
         "System API Key",
         original_secret,
+        &hash_api_key(original_secret)[..],
+        &original_secret[..8],
         "batch",
         system_api_key_id,
         system_api_key_id,
@@ -1321,10 +1323,16 @@ async fn test_database_seeding_behavior(pool: PgPool) {
         .expect("Should be able to update endpoint");
 
     let manual_secret = "manually_set_secret";
-    sqlx::query!("UPDATE api_keys SET secret = $1 WHERE id = $2", manual_secret, system_api_key_id)
-        .execute(&pool)
-        .await
-        .expect("Should be able to update API key");
+    sqlx::query!(
+        "UPDATE api_keys SET secret = $1, secret_hash = $2, secret_prefix = $3 WHERE id = $4",
+        manual_secret,
+        &hash_api_key(manual_secret)[..],
+        &manual_secret[..8],
+        system_api_key_id
+    )
+    .execute(&pool)
+    .await
+    .expect("Should be able to update API key");
 
     // Second call should skip all seeding (because seeded flag is true)
     super::seed_database(&sources, &pool)

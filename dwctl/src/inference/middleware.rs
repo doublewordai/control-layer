@@ -39,6 +39,7 @@ use super::image_normalizer_middleware::{normalize_error_response, normalize_val
 use super::rejections;
 use super::store::{self as response_store, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
 use super::streaming::{ReplayFrame, flex_stream_response};
+use crate::crypto::hash_api_key;
 use crate::db::{errors::DbError, handlers::api_keys::ApiKeys, models::api_keys::ApiKeyPurpose};
 use crate::image_normalizer::ImageNormalizer;
 
@@ -328,8 +329,8 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         // owner first, and treat an unresolvable key as "no such response".
         let owner: Option<String> = match api_key.as_deref() {
             Some(secret) => {
-                sqlx::query_scalar("SELECT user_id::text FROM public.api_keys WHERE secret = $1 AND is_deleted = false LIMIT 1")
-                    .bind(secret)
+                sqlx::query_scalar("SELECT user_id::text FROM public.api_keys WHERE secret_hash = $1 AND is_deleted = false LIMIT 1")
+                    .bind(&hash_api_key(secret)[..])
                     .fetch_optional(&state.dwctl_pool)
                     .await
                     .unwrap_or(None)
@@ -858,11 +859,11 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) 
               AND child.purpose = 'batch'
               AND child.hidden = true
               AND child.is_deleted = false
-        WHERE ak.secret = $1 AND ak.is_deleted = false
+        WHERE ak.secret_hash = $1 AND ak.is_deleted = false
         LIMIT 1
         "#,
     )
-    .bind(api_key)
+    .bind(&hash_api_key(api_key)[..])
     .fetch_optional(pool)
     .await?;
 
@@ -916,11 +917,11 @@ async fn api_key_creator_can_run_background(pool: &sqlx::PgPool, api_key: Option
               AND ur.role = 'BACKGROUNDINFERENCEUSER'
         )
         FROM api_keys ak
-        WHERE ak.secret = $1 AND ak.is_deleted = false
+        WHERE ak.secret_hash = $1 AND ak.is_deleted = false
         LIMIT 1
         "#,
     )
-    .bind(api_key)
+    .bind(&hash_api_key(api_key)[..])
     .fetch_optional(pool)
     .await
     .map_err(Into::into)

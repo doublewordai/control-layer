@@ -26,6 +26,7 @@
 //!    - Shows which modality and model are blocked
 
 use crate::{
+    crypto::hash_api_key,
     db::errors::DbError,
     db::handlers::{Credits, api_keys::ApiKeys},
     errors::Error,
@@ -366,9 +367,9 @@ async fn get_spend_cap_state(pool: PgPool, api_key: &str) -> Result<Option<Spend
         FROM api_keys ak
         JOIN api_keys root ON root.id = COALESCE(ak.parent_api_key_id, ak.id)
         LEFT JOIN api_key_spend_checkpoints ck ON ck.api_key_id = root.id
-        WHERE ak.secret = $1 AND ak.is_deleted = false AND root.spend_limit IS NOT NULL
+        WHERE ak.secret_hash = $1 AND ak.is_deleted = false AND root.spend_limit IS NOT NULL
         "#,
-        api_key
+        &hash_api_key(api_key)[..]
     )
     .fetch_optional(&pool)
     .await?;
@@ -428,13 +429,13 @@ pub async fn check_modality_blocked(pool: PgPool, api_key: &str, model_alias: &s
         JOIN api_keys ak ON ak.purpose = mtr.api_key_purpose
         WHERE dm.alias = $1
           AND dm.deleted = false
-          AND ak.secret = $2
+          AND ak.secret_hash = $2
           AND ak.is_deleted = false
           AND mtr.action = 'deny'
         LIMIT 1
         "#,
         model_alias,
-        api_key,
+        &hash_api_key(api_key)[..],
     )
     .fetch_optional(&mut *conn)
     .await?;
@@ -496,9 +497,9 @@ async fn get_api_key_user_and_purpose(pool: PgPool, api_key: &str) -> Result<Opt
         SELECT k.id, k.user_id, k.purpose, u.display_name, u.username
         FROM api_keys k
         JOIN users u ON u.id = k.user_id
-        WHERE k.secret = $1 AND k.is_deleted = false
+        WHERE k.secret_hash = $1 AND k.is_deleted = false
         "#,
-        api_key
+        &hash_api_key(api_key)[..]
     )
     .fetch_optional(&mut *conn)
     .await?;

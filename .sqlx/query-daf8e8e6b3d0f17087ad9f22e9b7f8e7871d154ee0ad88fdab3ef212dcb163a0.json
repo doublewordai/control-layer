@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT u.id\n            FROM api_keys ak\n            JOIN users u ON ak.user_id = u.id\n            WHERE ak.secret_hash = $1\n            AND ak.is_deleted = false\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "daf8e8e6b3d0f17087ad9f22e9b7f8e7871d154ee0ad88fdab3ef212dcb163a0"
+}

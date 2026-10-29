@@ -304,10 +304,10 @@ impl<'c> ApiKeys<'c> {
             SELECT u.id
             FROM api_keys ak
             JOIN users u ON ak.user_id = u.id
-            WHERE ak.secret = $1
+            WHERE ak.secret_hash = $1
             AND ak.is_deleted = false
             "#,
-            secret
+            &hash_api_key(secret)[..]
         )
         .fetch_optional(&mut *self.db)
         .await?;
@@ -1121,9 +1121,9 @@ impl<'c> ApiKeys<'c> {
             SELECT u.id as user_id, u.email, ak.purpose
             FROM api_keys ak
             JOIN users u ON ak.user_id = u.id
-            WHERE ak.secret = $1
+            WHERE ak.secret_hash = $1
             "#,
-            secret
+            &hash_api_key(secret)[..]
         )
         .fetch_optional(&mut *self.db)
         .await?;
