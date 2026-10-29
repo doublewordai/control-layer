@@ -1,7 +1,7 @@
 use std::{str::FromStr, time::Duration};
 
 use onwards::{
-    auth::ConstantTimeString,
+    auth::KeyHash,
     target::{LoadBalanceStrategy as OnwardsLoadBalanceStrategy, RequestClass, RoutingAction, TargetSpecOrList},
 };
 use tokio::{sync::mpsc, time::timeout};
@@ -67,7 +67,7 @@ const KEY_B_SECRET: &str = "sk-cache-b";
 const KEY_BATCH_SECRET: &str = "sk-cache-batch";
 
 fn pool_has_key(pools: &onwards::target::TargetPools, key: &str) -> bool {
-    let expected = ConstantTimeString::from(key.to_string());
+    let expected = KeyHash::from(key.to_string());
     pools
         .default_pool()
         .keys()
@@ -547,7 +547,10 @@ async fn test_cache_shape_zero_data_retention_label_reflects_owner(pool: sqlx::P
 
     let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
 
-    let key_a_labels = targets.key_labels.get(KEY_A_SECRET).expect("user A's key should carry labels");
+    let key_a_labels = targets
+        .key_labels
+        .get(&KeyHash::of(KEY_A_SECRET))
+        .expect("user A's key should carry labels");
     assert_eq!(
         key_a_labels.get("zdr"),
         Some(&"true".to_string()),
@@ -559,7 +562,10 @@ async fn test_cache_shape_zero_data_retention_label_reflects_owner(pool: sqlx::P
         Some(&"20000000-0000-0000-0000-0000000000a1".to_string())
     );
 
-    let key_b_labels = targets.key_labels.get(KEY_B_SECRET).expect("user B's key should carry labels");
+    let key_b_labels = targets
+        .key_labels
+        .get(&KeyHash::of(KEY_B_SECRET))
+        .expect("user B's key should carry labels");
     assert_eq!(
         key_b_labels.get("zdr"),
         Some(&"false".to_string()),
@@ -572,7 +578,7 @@ async fn test_cache_shape_key_labels_name_the_owning_account(pool: sqlx::PgPool)
     let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
 
     for (secret, username) in [(KEY_A_SECRET, "cache_user_a"), (KEY_B_SECRET, "cache_user_b")] {
-        let labels = targets.key_labels.get(secret).unwrap();
+        let labels = targets.key_labels.get(&KeyHash::of(secret)).unwrap();
         assert_eq!(labels.get(onwards::serving::ACCOUNT_NAME_LABEL).map(String::as_str), Some(username));
     }
 }
@@ -593,13 +599,13 @@ async fn test_cache_shape_key_labels_carry_account_display_name(pool: sqlx::PgPo
     let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
 
     let label = onwards::serving::ACCOUNT_DISPLAY_NAME_LABEL;
-    let a = targets.key_labels.get(KEY_A_SECRET).unwrap();
+    let a = targets.key_labels.get(&KeyHash::of(KEY_A_SECRET)).unwrap();
     assert_eq!(a.get(label).map(String::as_str), Some("Example Display Name"));
     assert_eq!(
         a.get(onwards::serving::ACCOUNT_NAME_LABEL).map(String::as_str),
         Some("cache_user_a")
     );
-    let b = targets.key_labels.get(KEY_B_SECRET).unwrap();
+    let b = targets.key_labels.get(&KeyHash::of(KEY_B_SECRET)).unwrap();
     assert_eq!(
         b.get(label).map(String::as_str),
         Some("cache_user_b"),
@@ -1517,7 +1523,7 @@ async fn test_api_keys_noop_upsert_does_not_trigger_notify(pool: sqlx::PgPool) {
 async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::PgPool) {
     use std::str::FromStr;
 
-    use onwards::auth::ConstantTimeString;
+    use onwards::auth::KeyHash;
 
     use crate::Role;
     use crate::db::handlers::{Deployments, InferenceEndpoints, Repository, api_keys::ApiKeys};
@@ -1693,8 +1699,8 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
     let pool_spec = composite_target.value();
 
     // Verify batch API key has access
-    // Keys are stored as ConstantTimeString in onwards
-    let batch_key_ct = ConstantTimeString::from(batch_api_key.secret.clone());
+    // onwards holds keys by hash
+    let batch_key_ct = KeyHash::from(batch_api_key.secret.clone());
     let keys = pool_spec.default_pool().keys().expect("Composite model should have keys");
     let has_batch_key = keys.iter().any(|k| k == &batch_key_ct);
 
@@ -1953,12 +1959,12 @@ async fn test_cache_shape_serving_accounts_and_overlays(pool: sqlx::PgPool) {
     let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
 
     // Every key carries its account; only accounts with settings are synced.
-    let key_a_labels = targets.key_labels.get(KEY_A_SECRET).unwrap();
+    let key_a_labels = targets.key_labels.get(&KeyHash::of(KEY_A_SECRET)).unwrap();
     assert_eq!(
         key_a_labels.get(onwards::serving::ACCOUNT_LABEL).map(String::as_str),
         Some("00000000-0000-0000-0000-0000000000a1")
     );
-    let key_b_labels = targets.key_labels.get(KEY_B_SECRET).unwrap();
+    let key_b_labels = targets.key_labels.get(&KeyHash::of(KEY_B_SECRET)).unwrap();
     assert_eq!(
         key_b_labels.get(onwards::serving::ACCOUNT_LABEL).map(String::as_str),
         Some("00000000-0000-0000-0000-0000000000b1")

@@ -12,6 +12,7 @@ use std::{
 use metrics::histogram;
 use onwards::affinity::AffinityConfig;
 use onwards::aimd::AimdConfig;
+use onwards::auth::KeyHash;
 use onwards::target::{
     Auth, BackoffConfig as OnwardsBackoffConfig, ConfigFile, FallbackConfig as OnwardsFallbackConfig,
     JitterStrategy as OnwardsJitterStrategy, KeyDefinition, LoadBalanceStrategy as OnwardsLoadBalanceStrategy, PoolSpec, PoolsSpec,
@@ -110,7 +111,9 @@ struct OnwardsTarget {
 #[derive(Debug, Clone)]
 struct OnwardsApiKey {
     id: ApiKeyId,
-    secret: String,
+    /// SHA-256 of the key's secret (`api_keys.secret_hash`); onwards matches
+    /// a presented bearer token by its hash.
+    secret_hash: KeyHash,
     purpose: String,
     /// Account-wide zero-data-retention flag on the api_key's owning user.
     /// Surfaced to onwards as a "zdr" key label; onwards does not act on it yet.
@@ -299,6 +302,24 @@ fn key_labels(api_key: &OnwardsApiKey) -> HashMap<String, String> {
         (onwards::serving::ACCOUNT_NAME_LABEL.to_string(), api_key.username.clone()),
         ("api_key_id".to_string(), api_key.id.to_string()),
     ])
+}
+
+/// The onwards key hash for a stored `api_keys.secret_hash`. `None` (the key is
+/// left out of the onwards config, so it cannot authenticate) when the hash is
+/// missing or malformed; the `secret_hash IS NOT NULL` check makes that
+/// unreachable for rows written by any supported release.
+fn key_hash(api_key_id: ApiKeyId, secret_hash: Option<Vec<u8>>) -> Option<KeyHash> {
+    let hash = secret_hash.as_deref().and_then(|bytes| KeyHash::try_from(bytes).ok());
+    if hash.is_none() {
+        crate::background_error!(
+            ONWARDS_SYNC,
+            "api_key_without_hash",
+            Error,
+            api_key_id = %api_key_id,
+            "API key has no valid secret_hash; leaving it out of the onwards config"
+        );
+    }
+    hash
 }
 
 /// Key label carrying the account's display name for trace attributes.
@@ -842,7 +863,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
         SELECT
             cm.id as composite_model_id,
             ak.id as api_key_id,
-            ak.secret as api_key_secret,
+            ak.secret_hash as "api_key_secret_hash?",
             ak.purpose as api_key_purpose,
             ak.user_zero_data_retention,
             ak.user_id,
@@ -852,7 +873,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
         CROSS JOIN LATERAL (
             SELECT DISTINCT
                 ak.id,
-                ak.secret,
+                ak.secret_hash,
                 ak.purpose,
                 ak.user_id,
                 u.zero_data_retention as user_zero_data_retention,
@@ -1113,10 +1134,12 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
     for row in api_key_rows {
         if let Some(composite) = composite_map.get_mut(&row.composite_model_id) {
             // Avoid duplicates
-            if !composite.api_keys.iter().any(|k| k.id == row.api_key_id) {
+            if !composite.api_keys.iter().any(|k| k.id == row.api_key_id)
+                && let Some(secret_hash) = key_hash(row.api_key_id, row.api_key_secret_hash)
+            {
                 composite.api_keys.push(OnwardsApiKey {
                     id: row.api_key_id,
-                    secret: row.api_key_secret,
+                    secret_hash,
                     purpose: row.api_key_purpose.clone(),
                     zero_data_retention: row.user_zero_data_retention,
                     user_id: row.user_id,
@@ -1183,7 +1206,7 @@ fn convert_composite_to_target_spec(
         key_definitions.insert(
             api_key.id.to_string(),
             KeyDefinition {
-                key: api_key.secret.clone(),
+                key: api_key.secret_hash,
                 rate_limit: None,
                 concurrency_limit: None,
                 labels: key_labels(api_key),
@@ -1191,11 +1214,11 @@ fn convert_composite_to_target_spec(
         );
     }
 
-    // Get API key secrets for access control
+    // Get API key hashes for access control
     let keys = if composite.api_keys.is_empty() {
         None
     } else {
-        Some(composite.api_keys.iter().map(|k| k.secret.clone().into()).collect())
+        Some(composite.api_keys.iter().map(|k| k.secret_hash).collect())
     };
 
     // Convert our LoadBalancingStrategy to onwards LoadBalanceStrategy
@@ -1417,7 +1440,7 @@ fn convert_to_config_file(
                 key_definitions.insert(
                     api_key.id.to_string(),
                     KeyDefinition {
-                        key: api_key.secret.clone(),
+                        key: api_key.secret_hash,
                         rate_limit: None,
                         concurrency_limit: None,
                         labels: key_labels(api_key),
@@ -1428,7 +1451,7 @@ fn convert_to_config_file(
             let keys = if target.api_keys.is_empty() {
                 None
             } else {
-                Some(target.api_keys.iter().map(|k| k.secret.clone().into()).collect())
+                Some(target.api_keys.iter().map(|k| k.secret_hash).collect())
             };
 
             let upstream_auth_header_name = if target.auth_header_name != "Authorization" {
@@ -1642,7 +1665,7 @@ pub async fn load_targets_from_db_with_batch_default(
             ie.accepts_scheduling_priority as endpoint_accepts_scheduling_priority,
             ie.kind as endpoint_kind,
             ak.id as "api_key_id?",
-            ak.secret as "api_key_secret?",
+            ak.secret_hash as "api_key_secret_hash?",
             ak.purpose as "api_key_purpose?",
             ak.user_zero_data_retention as "api_key_user_zero_data_retention?",
             ak.user_id as "api_key_user_id?",
@@ -1653,7 +1676,7 @@ pub async fn load_targets_from_db_with_batch_default(
         LEFT JOIN LATERAL (
             SELECT DISTINCT
                 ak.id,
-                ak.secret,
+                ak.secret_hash,
                 ak.purpose,
                 ak.user_id,
                 u.zero_data_retention as user_zero_data_retention,
@@ -1823,9 +1846,16 @@ pub async fn load_targets_from_db_with_batch_default(
             }
         });
 
-        if let (Some(api_key_id), Some(api_key_secret), Some(api_key_purpose), Some(zero_data_retention), Some(user_id), Some(username)) = (
+        if let (
+            Some(api_key_id),
+            Some(api_key_secret_hash),
+            Some(api_key_purpose),
+            Some(zero_data_retention),
+            Some(user_id),
+            Some(username),
+        ) = (
             row.api_key_id,
-            row.api_key_secret,
+            row.api_key_id.and_then(|id| key_hash(id, row.api_key_secret_hash)),
             row.api_key_purpose,
             row.api_key_user_zero_data_retention,
             row.api_key_user_id,
@@ -1833,7 +1863,7 @@ pub async fn load_targets_from_db_with_batch_default(
         ) {
             target.api_keys.push(OnwardsApiKey {
                 id: api_key_id,
-                secret: api_key_secret,
+                secret_hash: api_key_secret_hash,
                 purpose: api_key_purpose,
                 zero_data_retention,
                 user_id,

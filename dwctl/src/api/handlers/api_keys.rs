@@ -1270,7 +1270,7 @@ mod tests {
         use crate::db::handlers::{Credits, Tariffs};
         use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
         use crate::db::models::tariffs::TariffCreateDBRequest;
-        use onwards::auth::ConstantTimeString;
+        use onwards::auth::KeyHash;
 
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
@@ -1332,7 +1332,7 @@ mod tests {
         // Under the cap: both scope keys are in the paid pool.
         let targets = crate::sync::onwards_config::load_targets_from_db(&pool, &[], false).await.unwrap();
         let has_key = |targets: &onwards::target::Targets, secret: &str| {
-            let expected = ConstantTimeString::from(secret.to_string());
+            let expected = KeyHash::from(secret.to_string());
             targets.targets.get("cap-e2e-model").is_some_and(|p| {
                 p.value()
                     .default_pool()

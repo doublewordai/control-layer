@@ -599,6 +599,7 @@ mod tests {
 /// upstream member for each resolution outcome.
 #[cfg(test)]
 mod handler_tests {
+    use crate::auth::KeyHash;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -691,7 +692,7 @@ mod handler_tests {
         );
         let key_labels = Arc::new(DashMap::new());
         key_labels.insert(
-            KEY.to_string(),
+            KeyHash::of(KEY),
             HashMap::from([
                 ("purpose".to_string(), s.purpose.to_string()),
                 (ACCOUNT_LABEL.to_string(), ACCOUNT.to_string()),
