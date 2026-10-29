@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT dm.alias, o.class_key, o.user_id, o.inflight_limit\n        FROM realtime_inflight_class_overrides o\n        INNER JOIN deployed_models dm ON dm.id = o.deployed_model_id\n        WHERE dm.deleted = FALSE\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "class_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "inflight_limit",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "feca7d99d5ccb731a488420af2c49ea4246acffc7e894fc715a8aa8062b1fe27"
+}

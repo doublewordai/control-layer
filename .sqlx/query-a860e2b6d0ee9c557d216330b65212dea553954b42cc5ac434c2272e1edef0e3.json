@@ -1,0 +1,92 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            c.deployed_model_id,\n            c.class_key,\n            c.upstream_model_name,\n            c.realtime_inflight_limit,\n            dm.alias,\n            dm.reasoning_translation_overrides as model_reasoning_translation_overrides,\n            ie.reasoning_translation as endpoint_reasoning_translation,\n            ie.url as \"endpoint_url!\",\n            ie.api_key as endpoint_api_key,\n            ie.auth_header_name,\n            ie.auth_header_prefix,\n            ie.accepts_scheduling_priority as endpoint_accepts_scheduling_priority,\n            ie.kind as endpoint_kind\n        FROM model_serving_classes c\n        INNER JOIN deployed_models dm ON dm.id = c.deployed_model_id\n        INNER JOIN inference_endpoints ie ON ie.id = c.inference_endpoint_id\n        WHERE dm.routing_mode = 'class_routes'\n          AND dm.deleted = FALSE\n        ORDER BY c.deployed_model_id, c.class_key\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "deployed_model_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "class_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "upstream_model_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "realtime_inflight_limit",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "model_reasoning_translation_overrides",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 6,
+        "name": "endpoint_reasoning_translation",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 7,
+        "name": "endpoint_url!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 8,
+        "name": "endpoint_api_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "auth_header_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 10,
+        "name": "auth_header_prefix",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 11,
+        "name": "endpoint_accepts_scheduling_priority",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 12,
+        "name": "endpoint_kind",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "a860e2b6d0ee9c557d216330b65212dea553954b42cc5ac434c2272e1edef0e3"
+}

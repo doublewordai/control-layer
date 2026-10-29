@@ -121,6 +121,8 @@ pub struct HttpAnalyticsRow {
     /// URL of the upstream that served the request (onwards `ServedBy`
     /// extension), for per-component attribution of composite models.
     pub served_by: Option<String>,
+    /// The class the request was served by (`standard` unless a class route was named).
+    pub resolved_serving_class: Option<String>,
 }
 
 /// Usage metrics extracted from AI responses (subset of HttpAnalyticsRow)

@@ -13,6 +13,7 @@ use crate::api::models::files::{
 };
 use crate::api::models::users::CurrentUser;
 use crate::auth::permissions::{RequiresPermission, can_read_all_resources, operation, resource};
+use crate::inference::serving_name::has_class_suffix;
 
 use crate::AppState;
 use crate::db::{
@@ -180,6 +181,7 @@ impl OpenAIBatchRequest {
         accessible_models: &HashMap<String, AccessibleBatchModel>,
         allowed_url_paths: &[String],
         tolerations: &AccountTolerations,
+        class_routes: &HashMap<String, String>,
     ) -> Result<fusillade::RequestTemplateInput> {
         // Validate custom_id is safe for HTTP headers
         validate_custom_id(&self.custom_id)?;
@@ -200,12 +202,15 @@ impl OpenAIBatchRequest {
             })?
             .to_string();
 
-        // Batches use deadline scheduling, so a model suffix is ignored.
-        // Resolve the base model before validating access.
-        let (model, _) = crate::inference::model_selector::split_model_suffix(&model).map_err(|error| Error::BadRequest {
-            message: error.to_string(),
-        })?;
-        let model = model.to_string();
+        // Batch work always runs on the model's standard class, and model
+        // aliases never contain ':', so any suffix is refused.
+        if has_class_suffix(&model) {
+            let message = match class_routes.get(&model) {
+                Some(standard) => format!("Model '{model}' is available for realtime requests only; use '{standard}' in batch files."),
+                None => format!("Model '{model}' has not been configured or is not available to user."),
+            };
+            return Err(Error::BadRequest { message });
+        }
 
         // Validate model access
         let accessible_model = accessible_models.get(&model).ok_or_else(|| Error::ModelAccessDenied {
@@ -811,6 +816,9 @@ struct FileRequestContext {
     api_key: String,
     accessible_models: HashMap<String, AccessibleBatchModel>,
     allowed_url_paths: Vec<String>,
+    /// Class routes (`alias:<class>`) of class-routed models, refused in
+    /// batch lines.
+    class_routes: HashMap<String, String>,
     /// The toleration presets of the account that owns this upload, resolved
     /// per line by its model. A pinned line's list is written verbatim to
     /// `nvext.routing_constraints.tolerations` on its template body.
@@ -855,6 +863,7 @@ fn create_file_stream(
         accessible_models,
         allowed_url_paths,
         tolerations,
+        class_routes,
     } = req_ctx;
     let normalizer = config.normalizer.clone();
     let normalizer_mode = config.normalizer_mode;
@@ -1065,6 +1074,7 @@ fn create_file_stream(
                                                 &accessible_models,
                                                 &allowed_url_paths,
                                                 &tolerations,
+                                                &class_routes,
                                             ) {
                                                 Ok(mut template) => {
                                                     // Normalise image URLs in the per-template body
@@ -1168,6 +1178,7 @@ fn create_file_stream(
                                         &accessible_models,
                                         &allowed_url_paths,
                                         &tolerations,
+                                        &class_routes,
                                     ) {
                                         Ok(mut template) => {
                                             // Normalise image URLs in the trailing line as well.
@@ -1459,6 +1470,20 @@ pub async fn upload_file<P: PoolProvider>(
             accessible_models,
             allowed_url_paths: config.batches.allowed_url_paths.clone(),
             tolerations,
+            class_routes: state
+                .onwards_targets
+                .as_ref()
+                .map(|targets| {
+                    targets
+                        .targets
+                        .iter()
+                        .filter_map(|entry| {
+                            let model = entry.value().default_pool().class_route_of()?.to_owned();
+                            Some((entry.key().clone(), model))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         },
         Some(api_key_id),
     );

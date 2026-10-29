@@ -165,8 +165,42 @@ fn parse_stored_targets(value: Option<serde_json::Value>) -> Option<StoredTarget
     }
 }
 
-/// Loads every alias's overlays, keyed by alias then account id.
-async fn load_overlays_from_db(db: &PgPool) -> Result<OverlaysByAlias, anyhow::Error> {
+/// Per-account overlays: model-level (organisation overlays and account
+/// policies without a class) and per gateway target (the model's `alias` for
+/// the standard class, `alias:<class>` for any other), each a model-level
+/// overlay with that class's own policy folded over it.
+#[derive(Debug, Default)]
+struct Overlays {
+    model_level: OverlaysByAlias,
+    by_target: OverlaysByAlias,
+}
+
+impl Overlays {
+    /// The overlays a class target uses: its own, else the model's.
+    fn for_class(&self, alias: &str, class: &str) -> HashMap<String, ServingOverlay> {
+        let key = class_target_key(alias, class);
+        self.by_target
+            .get(&key)
+            .or_else(|| self.model_level.get(alias))
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// The gateway target a class is reached on: the model's alias for standard,
+/// `alias:<class>` otherwise.
+fn class_target_key(alias: &str, class: &str) -> String {
+    if class == STANDARD_CLASS {
+        alias.to_owned()
+    } else {
+        format!("{alias}:{class}")
+    }
+}
+
+const STANDARD_CLASS: &str = "standard";
+
+/// Loads every alias's overlays, model-level and per class target.
+async fn load_overlays_from_db(db: &PgPool) -> Result<Overlays, anyhow::Error> {
     let rows = sqlx::query!(
         r#"
         SELECT mo.user_id, dm.alias, mo.targets, mo.self_hosted_only
@@ -180,10 +214,10 @@ async fn load_overlays_from_db(db: &PgPool) -> Result<OverlaysByAlias, anyhow::E
     .fetch_all(db)
     .await?;
 
-    let mut overlays: OverlaysByAlias = HashMap::new();
+    let mut model_level: OverlaysByAlias = HashMap::new();
     for row in rows {
         let targets = parse_stored_targets(row.targets);
-        overlays.entry(row.alias).or_default().insert(
+        model_level.entry(row.alias).or_default().insert(
             row.user_id.to_string(),
             ServingOverlay {
                 self_hosted_only: row.self_hosted_only,
@@ -194,9 +228,8 @@ async fn load_overlays_from_db(db: &PgPool) -> Result<OverlaysByAlias, anyhow::E
         );
     }
 
-    // Account catalog policies: a model-wide row (no class) and the standard
-    // class row, the class taking precedence. Further classes take effect once
-    // models serve them.
+    // Account catalog policies: a model-wide row (no class) applies to every
+    // class; a class row narrows it to that class, taking precedence.
     let policies = sqlx::query!(
         r#"
         SELECT p.user_id, dm.alias, p.serving_class, p.priority, p.ttft_ms, p.itl_ms
@@ -205,29 +238,50 @@ async fn load_overlays_from_db(db: &PgPool) -> Result<OverlaysByAlias, anyhow::E
         INNER JOIN users u ON u.id = p.user_id
         WHERE dm.deleted = FALSE
           AND u.is_deleted = FALSE
-          AND (p.serving_class IS NULL OR p.serving_class = 'standard')
         ORDER BY p.serving_class NULLS FIRST
         "#
     )
     .fetch_all(db)
     .await?;
+    let mut class_rows = Vec::new();
     for row in policies {
-        let overlay = overlays.entry(row.alias).or_default().entry(row.user_id.to_string()).or_default();
-        if row.priority.is_some() {
-            overlay.priority = row.priority;
+        match row.serving_class {
+            None => {
+                let overlay = model_level
+                    .entry(row.alias)
+                    .or_default()
+                    .entry(row.user_id.to_string())
+                    .or_default();
+                if row.priority.is_some() {
+                    overlay.priority = row.priority;
+                }
+            }
+            Some(class) => class_rows.push((row.alias, class, row.user_id.to_string(), row.priority, row.ttft_ms, row.itl_ms)),
+        }
+    }
+
+    // Every model's standard target starts as its model-level overlays.
+    let mut by_target = model_level.clone();
+    for (alias, class, account, priority, ttft_ms, itl_ms) in class_rows {
+        let base = model_level.get(&alias).and_then(|overlays| overlays.get(&account)).cloned();
+        let overlay = by_target
+            .entry(class_target_key(&alias, &class))
+            .or_insert_with(|| model_level.get(&alias).cloned().unwrap_or_default())
+            .entry(account)
+            .or_insert_with(|| base.unwrap_or_default());
+        if priority.is_some() {
+            overlay.priority = priority;
         }
         // Only set values override, so a priority-only policy keeps any
         // targets already on the overlay.
-        if row.serving_class.is_some() {
-            if let Some(ttft) = row.ttft_ms.and_then(|v| u32::try_from(v).ok()) {
-                overlay.ttft_ms = Some(ttft);
-            }
-            if let Some(itl) = row.itl_ms.and_then(|v| u32::try_from(v).ok()) {
-                overlay.itl_ms = Some(itl);
-            }
+        if let Some(ttft) = ttft_ms.and_then(|v| u32::try_from(v).ok()) {
+            overlay.ttft_ms = Some(ttft);
+        }
+        if let Some(itl) = itl_ms.and_then(|v| u32::try_from(v).ok()) {
+            overlay.itl_ms = Some(itl);
         }
     }
-    Ok(overlays)
+    Ok(Overlays { model_level, by_target })
 }
 
 async fn load_inflight_overrides_from_db(db: &PgPool) -> Result<InflightOverridesByAlias, anyhow::Error> {
@@ -246,6 +300,24 @@ async fn load_inflight_overrides_from_db(db: &PgPool) -> Result<InflightOverride
     for row in rows {
         overrides
             .entry(row.alias)
+            .or_default()
+            .insert(row.user_id.to_string(), row.inflight_limit as u32);
+    }
+
+    // Limits on a non-standard class, keyed by its target (`alias:<class>`).
+    let class_rows = sqlx::query!(
+        r#"
+        SELECT dm.alias, o.class_key, o.user_id, o.inflight_limit
+        FROM realtime_inflight_class_overrides o
+        INNER JOIN deployed_models dm ON dm.id = o.deployed_model_id
+        WHERE dm.deleted = FALSE
+        "#
+    )
+    .fetch_all(db)
+    .await?;
+    for row in class_rows {
+        overrides
+            .entry(class_target_key(&row.alias, &row.class_key))
             .or_default()
             .insert(row.user_id.to_string(), row.inflight_limit as u32);
     }
@@ -771,8 +843,24 @@ struct OnwardsCompositeModel {
     /// Traffic routing rules from the database
     routing_rules: Vec<RoutingRule>,
     components: Vec<CompositeModelComponent>,
-    // API keys that have access to this composite model
+    // API keys that have access to this composite model's legacy route
     api_keys: Vec<OnwardsApiKey>,
+    /// API keys with access to each class target of a class-routed model.
+    class_api_keys: HashMap<String, Vec<OnwardsApiKey>>,
+    /// `deployed_models.routing_mode`: `class_routes` serves `classes`
+    /// instead of `components`.
+    routing_mode: String,
+    /// The model's serving classes (loaded only for class-routed models).
+    classes: Vec<OnwardsClassRoute>,
+}
+
+/// One serving class of a class-routed model: its own upstream and limit.
+#[derive(Debug, Clone)]
+struct OnwardsClassRoute {
+    class_key: String,
+    realtime_inflight_limit: Option<i32>,
+    /// The class's upstream, as a single-provider target.
+    target: OnwardsTarget,
 }
 
 /// Loads composite models with their components and API keys from the database
@@ -836,11 +924,14 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
     .fetch_all(db)
     .await?;
 
-    // Query API keys with access to composite models (uses deployment_groups since composites are in deployed_models)
+    // Query API keys with access to composite models (uses deployment_groups since composites are in deployed_models).
+    // A class-routed model gets one key set per class target: each class is paid
+    // or free by its own prices, so a priced class never locks accounts out of a free one.
     let api_key_rows = sqlx::query!(
         r#"
         SELECT
             cm.id as composite_model_id,
+            target.class_key as "class_key?",
             ak.id as api_key_id,
             ak.secret as api_key_secret,
             ak.purpose as api_key_purpose,
@@ -849,6 +940,13 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             ak.user_username,
             ak.user_display_name as "user_display_name?"
         FROM deployed_models cm
+        CROSS JOIN LATERAL (
+            -- NULL: the legacy route. Otherwise one target per serving class.
+            SELECT NULL::text AS class_key WHERE NOT class_routes_active(cm.id)
+            UNION ALL
+            SELECT c.class_key FROM model_serving_classes c
+            WHERE c.deployed_model_id = cm.id AND class_routes_active(cm.id)
+        ) target
         CROSS JOIN LATERAL (
             SELECT DISTINCT
                 ak.id,
@@ -908,12 +1006,18 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     -- positive deal can require credit on an otherwise free model.
                     NOT EXISTS (
                         SELECT 1 FROM model_tariffs mt
-                        WHERE mt.deployed_model_id = cm.id AND mt.user_id IS NULL AND mt.serving_class IS NULL
+                        WHERE mt.deployed_model_id = cm.id AND mt.user_id IS NULL
+                          -- The legacy route: class-less prices. A class target: its
+                          -- class's prices; the standard target also the class-less ones.
+                          AND (mt.serving_class IS NOT DISTINCT FROM target.class_key
+                               OR (mt.serving_class IS NULL AND target.class_key = 'standard'))
                           AND mt.valid_until IS NULL
                           AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                     ) AND NOT EXISTS (
                         SELECT 1 FROM model_tariffs mt
                         WHERE mt.deployed_model_id = cm.id AND mt.user_id = ak.user_id
+                          AND (target.class_key IS NULL OR mt.serving_class = target.class_key
+                               OR (mt.serving_class IS NULL AND target.class_key = 'standard'))
                           AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())
                           AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                     )
@@ -944,12 +1048,16 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                       AND ck.window_spend >= root.spend_limit
                       AND (EXISTS (
                         SELECT 1 FROM model_tariffs mt
-                        WHERE mt.deployed_model_id = cm.id AND mt.user_id IS NULL AND mt.serving_class IS NULL
+                        WHERE mt.deployed_model_id = cm.id AND mt.user_id IS NULL
+                          AND (mt.serving_class IS NOT DISTINCT FROM target.class_key
+                               OR (mt.serving_class IS NULL AND target.class_key = 'standard'))
                           AND mt.valid_until IS NULL
                           AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                       ) OR EXISTS (
                         SELECT 1 FROM model_tariffs mt
                         WHERE mt.deployed_model_id = cm.id AND mt.user_id = ak.user_id
+                          AND (target.class_key IS NULL OR mt.serving_class = target.class_key
+                               OR (mt.serving_class IS NULL AND target.class_key = 'standard'))
                           AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())
                           AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                       ))
@@ -967,7 +1075,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
         ) ak
         WHERE cm.is_composite = TRUE
           AND cm.deleted = FALSE
-        ORDER BY cm.id, ak.id
+        ORDER BY cm.id, target.class_key, ak.id
         "#,
         escalation_models
     )
@@ -1001,7 +1109,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             aimd,
             affinity,
             sanitize_responses,
-            trusted
+            trusted,
+            routing_mode
         FROM deployed_models
         WHERE is_composite = TRUE
           AND deleted = FALSE
@@ -1047,8 +1156,91 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 routing_rules: Vec::new(), // Populated from separate query below
                 components: Vec::new(),
                 api_keys: Vec::new(),
+                class_api_keys: HashMap::new(),
+                routing_mode: row.routing_mode,
+                classes: Vec::new(),
             },
         );
+    }
+
+    // Serving classes of class-routed models, each with its own upstream.
+    let class_rows = sqlx::query!(
+        r#"
+        SELECT
+            c.deployed_model_id,
+            c.class_key,
+            c.upstream_model_name,
+            c.realtime_inflight_limit,
+            dm.alias,
+            dm.reasoning_translation_overrides as model_reasoning_translation_overrides,
+            ie.reasoning_translation as endpoint_reasoning_translation,
+            ie.url as "endpoint_url!",
+            ie.api_key as endpoint_api_key,
+            ie.auth_header_name,
+            ie.auth_header_prefix,
+            ie.accepts_scheduling_priority as endpoint_accepts_scheduling_priority,
+            ie.kind as endpoint_kind
+        FROM model_serving_classes c
+        INNER JOIN deployed_models dm ON dm.id = c.deployed_model_id
+        INNER JOIN inference_endpoints ie ON ie.id = c.inference_endpoint_id
+        WHERE dm.routing_mode = 'class_routes'
+          AND dm.deleted = FALSE
+        ORDER BY c.deployed_model_id, c.class_key
+        "#
+    )
+    .fetch_all(db)
+    .await?;
+    for row in class_rows {
+        let Some(composite) = composite_map.get_mut(&row.deployed_model_id) else {
+            continue;
+        };
+        let endpoint_url = match url::Url::parse(&row.endpoint_url) {
+            Ok(url) => url,
+            Err(e) => {
+                warn!(alias = %row.alias, class = %row.class_key, "Skipping class with an invalid endpoint URL: {e}");
+                continue;
+            }
+        };
+        let target_key = class_target_key(&row.alias, &row.class_key);
+        composite.classes.push(OnwardsClassRoute {
+            class_key: row.class_key,
+            realtime_inflight_limit: row.realtime_inflight_limit,
+            target: OnwardsTarget {
+                model_name: row.upstream_model_name,
+                reasoning_translation: resolve_reasoning_translation(
+                    row.endpoint_reasoning_translation,
+                    row.model_reasoning_translation_overrides,
+                    &target_key,
+                ),
+                alias: target_key,
+                sanitize_responses: composite.sanitize_responses,
+                // A class's upstream is trusted like a self-hosted member
+                // when the endpoint is self-hosted.
+                trusted: parse_provider_kind(&row.endpoint_kind) != ProviderKind::External,
+                routing_rules: Vec::new(),
+                fallback_enabled: false,
+                fallback_on_rate_limit: false,
+                fallback_on_status: Vec::new(),
+                fallback_realtime_on_status: Vec::new(),
+                fallback_with_replacement: false,
+                fallback_max_attempts: None,
+                backoff_enabled: false,
+                backoff_initial_ms: 100,
+                backoff_max_ms: 5_000,
+                backoff_factor: 2.0,
+                backoff_jitter: "full".to_string(),
+                backoff_max_total_ms: None,
+                first_token_timeout_ms: None,
+                aimd: None,
+                endpoint_url,
+                endpoint_api_key: row.endpoint_api_key,
+                auth_header_name: row.auth_header_name,
+                auth_header_prefix: row.auth_header_prefix,
+                endpoint_accepts_scheduling_priority: row.endpoint_accepts_scheduling_priority,
+                endpoint_kind: parse_provider_kind(&row.endpoint_kind),
+                api_keys: Vec::new(),
+            },
+        });
     }
 
     // Add enabled components to their composite models
@@ -1112,9 +1304,13 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
     // Add API keys to composite models
     for row in api_key_rows {
         if let Some(composite) = composite_map.get_mut(&row.composite_model_id) {
+            let keys = match row.class_key {
+                Some(class) => composite.class_api_keys.entry(class).or_default(),
+                None => &mut composite.api_keys,
+            };
             // Avoid duplicates
-            if !composite.api_keys.iter().any(|k| k.id == row.api_key_id) {
-                composite.api_keys.push(OnwardsApiKey {
+            if !keys.iter().any(|k| k.id == row.api_key_id) {
+                keys.push(OnwardsApiKey {
                     id: row.api_key_id,
                     secret: row.api_key_secret,
                     purpose: row.api_key_purpose.clone(),
@@ -1167,6 +1363,155 @@ fn effective_batch_inflight_limit(batch_capacity: Option<i32>, default_batch_inf
     }
 }
 
+/// The pool fallback configuration a composite's settings describe.
+fn composite_fallback(composite: &OnwardsCompositeModel) -> Option<OnwardsFallbackConfig> {
+    if composite.fallback_enabled {
+        let backoff = composite.backoff_enabled.then_some(OnwardsBackoffConfig {
+            // The DB CHECK constraints guarantee these are positive and
+            // ordered, but we use `max(1)` defensively to avoid panicking
+            // the proxy if a row ever escaped validation.
+            initial_ms: composite.backoff_initial_ms.max(1) as u64,
+            max_ms: composite.backoff_max_ms.max(composite.backoff_initial_ms.max(1)) as u64,
+            factor: composite.backoff_factor.max(1.0),
+            jitter: match composite.backoff_jitter.as_str() {
+                "none" => OnwardsJitterStrategy::None,
+                _ => OnwardsJitterStrategy::Full,
+            },
+        });
+        let max_total_backoff_ms = composite.backoff_max_total_ms.and_then(|n| u64::try_from(n).ok());
+        Some(OnwardsFallbackConfig {
+            enabled: true,
+            on_rate_limit: composite.fallback_on_rate_limit,
+            // Convert i32 status codes to u16 for onwards
+            on_status: composite.fallback_on_status.iter().map(|&s| s as u16).collect(),
+            realtime_on_status: composite.fallback_realtime_on_status.iter().map(|&s| s as u16).collect(),
+            with_replacement: composite.fallback_with_replacement,
+            max_attempts: composite
+                .fallback_max_attempts
+                .and_then(|n| usize::try_from(n).ok().filter(|&v| v >= 1)),
+            backoff,
+            max_total_backoff_ms,
+            first_token_timeout_ms: composite.first_token_timeout_ms.map(|ms| ms as u64),
+            aimd: composite.aimd.clone(),
+            affinity: composite.affinity.clone(),
+        })
+    } else {
+        None
+    }
+}
+
+/// The gateway targets of a class-routed model: one per class (`alias` for
+/// standard, `alias:<class>` otherwise), each with the class's single
+/// upstream. `None` when the activation is unusable (no standard class, or a
+/// redirect rule): the model then keeps its legacy route.
+fn convert_class_routes(
+    composite: &OnwardsCompositeModel,
+    key_definitions: &mut HashMap<String, KeyDefinition>,
+    overlays: &Overlays,
+    inflight_overrides: &InflightOverridesByAlias,
+    default_batch_inflight_capacity: Option<u32>,
+) -> Option<Vec<(String, TargetSpecOrList)>> {
+    let has_standard = composite.classes.iter().any(|class| class.class_key == STANDARD_CLASS);
+    let redirects = composite
+        .routing_rules
+        .iter()
+        .any(|rule| matches!(rule.action, RoutingAction::Redirect { .. }));
+    if !has_standard || redirects {
+        crate::background_error!(
+            ONWARDS_SYNC,
+            "invalid_class_activation",
+            Error,
+            alias = %composite.alias,
+            has_standard,
+            redirects,
+            "Class-routed model has no standard class or redirects traffic; serving its legacy route"
+        );
+        return None;
+    }
+    for api_key in composite.class_api_keys.values().flatten() {
+        key_definitions.insert(
+            api_key.id.to_string(),
+            KeyDefinition {
+                key: api_key.secret.clone(),
+                rate_limit: None,
+                concurrency_limit: None,
+                labels: key_labels(api_key),
+            },
+        );
+    }
+    // Each class admits its own keys: a class is paid or free by its own prices.
+    let class_keys = |class: &str| -> Option<std::collections::HashSet<_>> {
+        composite
+            .class_api_keys
+            .get(class)
+            .filter(|keys| !keys.is_empty())
+            .map(|keys| keys.iter().map(|k| k.secret.clone().into()).collect())
+    };
+    let fallback = composite_fallback(composite).map(|mut config| {
+        // One upstream: there is nothing to keep a conversation on.
+        config.affinity = None;
+        config
+    });
+    // Reasoning translation is a property of the model: every class uses the
+    // standard class's (its endpoint's default under the model's overrides).
+    let reasoning_translation = composite
+        .classes
+        .iter()
+        .find(|class| class.class_key == STANDARD_CLASS)
+        .and_then(|class| class.target.reasoning_translation.clone());
+    let targets = composite
+        .classes
+        .iter()
+        .map(|class| {
+            let target = &class.target;
+            let standard = class.class_key == STANDARD_CLASS;
+            let provider = ProviderSpec {
+                url: target.endpoint_url.clone(),
+                onwards_key: target.endpoint_api_key.clone(),
+                onwards_model: Some(target.model_name.clone()),
+                rate_limit: None,
+                concurrency_limit: None,
+                upstream_auth_header_name: (target.auth_header_name != "Authorization").then(|| target.auth_header_name.clone()),
+                upstream_auth_header_prefix: (target.auth_header_prefix != "Bearer ").then(|| target.auth_header_prefix.clone()),
+                response_headers: None,
+                weight: 1,
+                sanitize_response: composite.sanitize_responses,
+                request_timeout_secs: None,
+                trusted: Some(target.trusted),
+                propagate_trace_context: None,
+                reasoning_translation: reasoning_translation.clone().map(Into::into),
+                accepts_scheduling_priority: target.endpoint_accepts_scheduling_priority,
+                kind: target.endpoint_kind,
+            };
+            let pool = PoolSpec {
+                keys: class_keys(&class.class_key),
+                rate_limit: None,
+                concurrency_limit: None,
+                fallback: fallback.clone(),
+                strategy: OnwardsLoadBalanceStrategy::Priority,
+                providers: vec![provider],
+                response_headers: None,
+                sanitize_response: composite.sanitize_responses,
+                trusted: false,
+                // Deny rules are model-wide: every class carries them.
+                routing_rules: composite.routing_rules.clone(),
+                overlays: overlays.for_class(&composite.alias, &class.class_key),
+                inflight_limit: Some(class.realtime_inflight_limit.unwrap_or(composite.realtime_inflight_limit) as u32),
+                // Batch is standard-only and counted on the model's alias.
+                batch_inflight_limit: standard
+                    .then(|| effective_batch_inflight_limit(composite.batch_capacity, default_batch_inflight_capacity, &composite.alias))
+                    .flatten(),
+                // `alias` itself is the model; only `alias:<class>` is a class route.
+                class_route_of: (!standard).then(|| composite.alias.clone()),
+                account_inflight_limits: inflight_overrides.get(&target.alias).cloned().unwrap_or_default(),
+            };
+            debug!(alias = %target.alias, upstream = %target.model_name, "Class route configured");
+            (target.alias.clone(), TargetSpecOrList::Pool(pool))
+        })
+        .collect();
+    Some(targets)
+}
+
 /// Converts a composite model to a TargetSpecOrList with weighted providers
 ///
 /// Uses onwards 0.10.0 weighted provider types for load balancing across
@@ -1204,40 +1549,7 @@ fn convert_composite_to_target_spec(
         LoadBalancingStrategy::Priority => OnwardsLoadBalanceStrategy::Priority,
     };
 
-    // Build fallback configuration
-    let fallback = if composite.fallback_enabled {
-        let backoff = composite.backoff_enabled.then_some(OnwardsBackoffConfig {
-            // The DB CHECK constraints guarantee these are positive and
-            // ordered, but we use `max(1)` defensively to avoid panicking
-            // the proxy if a row ever escaped validation.
-            initial_ms: composite.backoff_initial_ms.max(1) as u64,
-            max_ms: composite.backoff_max_ms.max(composite.backoff_initial_ms.max(1)) as u64,
-            factor: composite.backoff_factor.max(1.0),
-            jitter: match composite.backoff_jitter.as_str() {
-                "none" => OnwardsJitterStrategy::None,
-                _ => OnwardsJitterStrategy::Full,
-            },
-        });
-        let max_total_backoff_ms = composite.backoff_max_total_ms.and_then(|n| u64::try_from(n).ok());
-        Some(OnwardsFallbackConfig {
-            enabled: true,
-            on_rate_limit: composite.fallback_on_rate_limit,
-            // Convert i32 status codes to u16 for onwards
-            on_status: composite.fallback_on_status.iter().map(|&s| s as u16).collect(),
-            realtime_on_status: composite.fallback_realtime_on_status.iter().map(|&s| s as u16).collect(),
-            with_replacement: composite.fallback_with_replacement,
-            max_attempts: composite
-                .fallback_max_attempts
-                .and_then(|n| usize::try_from(n).ok().filter(|&v| v >= 1)),
-            backoff,
-            max_total_backoff_ms,
-            first_token_timeout_ms: composite.first_token_timeout_ms.map(|ms| ms as u64),
-            aimd: composite.aimd.clone(),
-            affinity: composite.affinity.clone(),
-        })
-    } else {
-        None
-    };
+    let fallback = composite_fallback(composite);
 
     // Build provider specs from components, grouped by the pool each membership
     // belongs to. The query orders by (pool, sort_order), so each pool's members
@@ -1369,6 +1681,7 @@ fn convert_composite_to_target_spec(
         } else {
             None
         },
+        class_route_of: None,
         account_inflight_limits: if pool_name == DEFAULT_COMPONENT_POOL {
             inflight_overrides.get(&composite.alias).cloned().unwrap_or_default()
         } else {
@@ -1401,7 +1714,7 @@ fn convert_to_config_file(
     targets: Vec<OnwardsTarget>,
     composites: Vec<OnwardsCompositeModel>,
     strict_mode: bool,
-    overlays: &OverlaysByAlias,
+    overlays: &Overlays,
     inflight_overrides: &InflightOverridesByAlias,
     accounts: AccountsById,
     default_batch_inflight_capacity: Option<u32>,
@@ -1513,9 +1826,10 @@ fn convert_to_config_file(
                 sanitize_response: target.sanitize_responses,
                 trusted: false,
                 routing_rules: target.routing_rules,
-                overlays: overlays.get(&target.alias).cloned().unwrap_or_default(),
+                overlays: overlays.by_target.get(&target.alias).cloned().unwrap_or_default(),
                 inflight_limit: None,
                 batch_inflight_limit: None,
+                class_route_of: None,
                 account_inflight_limits: HashMap::new(),
             };
 
@@ -1525,6 +1839,26 @@ fn convert_to_config_file(
 
     // Convert composite models (including those with no components - they'll return 503)
     for composite in composites {
+        if composite.routing_mode == "class_routes"
+            && let Some(class_targets) = convert_class_routes(
+                &composite,
+                &mut key_definitions,
+                overlays,
+                inflight_overrides,
+                default_batch_inflight_capacity,
+            )
+        {
+            target_specs.extend(class_targets);
+            continue;
+        }
+        // An activation the gateway cannot serve falls back to the legacy route,
+        // admitting the standard class's keys.
+        let mut composite = composite;
+        if composite.api_keys.is_empty()
+            && let Some(keys) = composite.class_api_keys.remove(STANDARD_CLASS)
+        {
+            composite.api_keys = keys;
+        }
         if composite.components.is_empty() {
             crate::background_error!(
                 ONWARDS_SYNC,
@@ -1538,7 +1872,7 @@ fn convert_to_config_file(
         let (alias, spec) = convert_composite_to_target_spec(
             &composite,
             &mut key_definitions,
-            overlays,
+            &overlays.by_target,
             inflight_overrides,
             default_batch_inflight_capacity,
         );

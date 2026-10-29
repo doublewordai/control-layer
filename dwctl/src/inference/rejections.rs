@@ -45,6 +45,12 @@ impl Recorder {
     pub fn configured_alias<'m>(&self, model: &'m str) -> Option<&'m str> {
         self.targets.configured_alias(model)
     }
+
+    /// The model `model` is a class route of (`alias:<class>`, which serves
+    /// realtime requests only), as marked by the config writer.
+    pub fn class_route_of(&self, model: &str) -> Option<String> {
+        self.targets.class_route_of(model)
+    }
 }
 
 /// The code a dwctl layer refused a response's request with, and the span it
@@ -377,5 +383,34 @@ mod tests {
     fn reads_the_model_of_a_body() {
         assert_eq!(model_of(br#"{"model": "m", "x": 1}"#).as_deref(), Some("m"));
         assert_eq!(model_of(b"{not json"), None);
+    }
+}
+
+#[cfg(test)]
+mod class_route_tests {
+    use onwards::target::Targets;
+
+    use super::Recorder;
+
+    #[test]
+    fn only_targets_marked_by_the_config_writer_are_class_routes() {
+        let targets = Targets::from_config(
+            serde_json::from_value(serde_json::json!({
+                "targets": {
+                    "vendor:legacy": {"url": "https://upstream.example.com/v1/"},
+                    "model": {"providers": [{"url": "https://upstream.example.com/v1/"}]},
+                    "model:fast": {"providers": [{"url": "https://upstream.example.com/v1/"}], "class_route_of": "model"}
+                },
+                "auth": {"global_keys": [], "key_definitions": {}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let recorder = Recorder::new(targets);
+        assert_eq!(recorder.class_route_of("model:fast").as_deref(), Some("model"));
+        // A colon in a legacy alias does not make it a class route.
+        assert_eq!(recorder.class_route_of("vendor:legacy"), None);
+        assert_eq!(recorder.class_route_of("model"), None);
+        assert_eq!(recorder.class_route_of("unknown:fast"), None);
     }
 }

@@ -180,7 +180,7 @@ where
         JOIN model_cache_tariffs mct ON mct.deployed_model_id = dm.id
         WHERE dm.alias = ANY($1)
           AND (mct.user_id IS NULL OR mct.user_id = ANY($2))
-          AND (mct.user_id IS NOT NULL OR mct.serving_class IS NULL)
+          AND (mct.user_id IS NOT NULL OR mct.serving_class IS NULL OR class_routes_active(dm.id))
         ORDER BY dm.alias, mct.valid_from DESC
         "#,
         aliases,
@@ -230,6 +230,9 @@ pub(crate) fn resolve_cache_multipliers(
             .max_by_key(|r| r.valid_from)
     };
     let general = valid(None, None)?;
+    // Cache multipliers apply to every tier: an account's model-level
+    // multipliers cover batch, flex and every class without its own, unlike
+    // its class-less prices, which cover the standard class only.
     Some(
         account
             .and_then(|a| {
@@ -292,9 +295,12 @@ pub(crate) fn find_best_tariff(
             if t.completion_window.as_deref() != if t.purpose == ApiKeyPurpose::Batch { window } else { None } {
                 return None;
             }
+            // An account's class-less deal covers the standard class only:
+            // any other class is priced by the account's deal for that class,
+            // else the model's.
             let scope_rank = match (t.account, t.serving_class.as_deref()) {
                 (Some(owner), Some(c)) if Some(owner) == account && Some(c) == class => 0,
-                (Some(owner), None) if Some(owner) == account => 1,
+                (Some(owner), None) if Some(owner) == account && class.is_none_or(|c| c == "standard") => 1,
                 (None, Some(c)) if Some(c) == class => 2,
                 (None, None) => 3,
                 _ => return None,

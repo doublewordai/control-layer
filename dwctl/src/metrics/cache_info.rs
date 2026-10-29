@@ -13,6 +13,8 @@ use serde::Deserialize;
 use sqlx::PgPool;
 use tracing::warn;
 
+use crate::inference::serving_name::STANDARD_CLASS;
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ModelLabels {
     alias: String,
@@ -37,6 +39,10 @@ pub struct CacheInfoState {
     prev_components: HashSet<(String, String, String, String, String)>,
     /// (model, purpose, completion_window) combos that emitted tariff gauges.
     prev_tariffs: HashSet<(String, String, String)>,
+    /// (model, serving_class) of class-routed models that emitted class gauges.
+    prev_classes: HashSet<(String, String)>,
+    /// (model, serving_class, purpose) combos that emitted class tariff gauges.
+    prev_class_tariffs: HashSet<(String, String, String)>,
     /// Whether at least one cycle has run (skip zeroing on the first call).
     initialized: bool,
 }
@@ -48,6 +54,8 @@ impl CacheInfoState {
             prev_groups: HashSet::new(),
             prev_components: HashSet::new(),
             prev_tariffs: HashSet::new(),
+            prev_classes: HashSet::new(),
+            prev_class_tariffs: HashSet::new(),
             initialized: false,
         }
     }
@@ -88,6 +96,18 @@ pub fn describe_cache_info_metrics() {
     metrics::describe_gauge!(
         "dwctl_model_realtime_inflight_limit",
         "Default per-account realtime in-flight limit for virtual models; 0 means unlimited."
+    );
+    metrics::describe_gauge!(
+        "dwctl_model_class_realtime_inflight_limit",
+        "Default per-account realtime in-flight limit of each serving class of a class-routed model."
+    );
+    metrics::describe_gauge!(
+        "dwctl_model_class_tariff",
+        "Public price per token, in credits, of each serving class of a class-routed model."
+    );
+    metrics::describe_gauge!(
+        "dwctl_model_class_api_key_count",
+        "API keys admitted to each serving class of a class-routed model."
     );
 }
 
@@ -366,14 +386,94 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets, state: 
         }
     }
 
+    // Serving classes of class-routed models: each class is its own destination,
+    // so its limit, prices and admitted keys are reported per (model, serving_class).
+    let class_rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT dm.alias, c.class_key,
+                (SELECT json_agg(json_build_object(
+                    'purpose', mt.api_key_purpose::text,
+                    'completion_window', mt.completion_window,
+                    'input_price', mt.input_price_per_token::float8,
+                    'output_price', mt.output_price_per_token::float8))::text
+                 FROM model_tariffs mt
+                 WHERE mt.deployed_model_id = dm.id AND mt.serving_class = c.class_key
+                   AND mt.user_id IS NULL AND mt.valid_until IS NULL)
+         FROM model_serving_classes c
+         JOIN deployed_models dm ON dm.id = c.deployed_model_id
+         WHERE NOT dm.deleted AND class_routes_active(dm.id)",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut current_classes = HashSet::new();
+    let mut current_class_tariffs = HashSet::new();
+    for (alias, class, tariffs_json) in class_rows {
+        let target = if class == STANDARD_CLASS {
+            alias.clone()
+        } else {
+            format!("{alias}:{class}")
+        };
+        if let Some(spec) = targets.targets.get(&target) {
+            let class_pool = spec.value().default_pool();
+            let limit = class_pool.inflight_limits().map(|limits| limits.default).unwrap_or(0);
+            gauge!("dwctl_model_class_realtime_inflight_limit", "model" => alias.clone(), "serving_class" => class.clone())
+                .set(limit as f64);
+            let keys = class_pool.keys().map(|k| k.len()).unwrap_or(0);
+            gauge!("dwctl_model_class_api_key_count", "model" => alias.clone(), "serving_class" => class.clone()).set(keys as f64);
+        }
+        for t in tariffs_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<Vec<TariffInfo>>(json).ok())
+            .unwrap_or_default()
+        {
+            let purpose = t.purpose.clone().unwrap_or_default();
+            current_class_tariffs.insert((alias.clone(), class.clone(), purpose.clone()));
+            for (direction, price) in [("input", t.input_price), ("output", t.output_price)] {
+                gauge!(
+                    "dwctl_model_class_tariff",
+                    "model" => alias.clone(),
+                    "serving_class" => class.clone(),
+                    "purpose" => purpose.clone(),
+                    "direction" => direction,
+                )
+                .set(price);
+            }
+        }
+        current_classes.insert((alias, class));
+    }
+    if state.initialized {
+        for (model, class) in state.prev_classes.difference(&current_classes) {
+            for metric in ["dwctl_model_class_realtime_inflight_limit", "dwctl_model_class_api_key_count"] {
+                gauge!(metric, "model" => model.clone(), "serving_class" => class.clone()).set(0.0);
+            }
+        }
+        for (model, class, purpose) in state.prev_class_tariffs.difference(&current_class_tariffs) {
+            for direction in ["input", "output"] {
+                gauge!(
+                    "dwctl_model_class_tariff",
+                    "model" => model.clone(),
+                    "serving_class" => class.clone(),
+                    "purpose" => purpose.clone(),
+                    "direction" => direction,
+                )
+                .set(0.0);
+            }
+        }
+    }
+
     state.prev_models = current_models;
     state.prev_groups = current_groups;
     state.prev_components = current_components;
     state.prev_tariffs = current_tariffs;
+    state.prev_classes = current_classes;
+    state.prev_class_tariffs = current_class_tariffs;
     state.initialized = true;
 
-    // API key counts — from the Targets DashMap (no SQL needed)
+    // API key counts — from the Targets DashMap (no SQL needed). Class routes
+    // are counted per class above.
     for entry in targets.targets.iter() {
+        if entry.value().default_pool().class_route_of().is_some() {
+            continue;
+        }
         let model = entry.key().clone();
         // Access control is a property of the alias; a non-default pool
         // inherits the default's keys unless it states its own.
@@ -430,6 +530,67 @@ mod tests {
                 .any(|line| line.starts_with("dwctl_model_info{") && line.contains("is_metered=\"false\""))
         );
         assert!(!own.iter().any(|line| line.starts_with("dwctl_model_tariff{")));
+    }
+
+    #[dwctl_test_macros::test]
+    async fn class_routed_models_report_each_class(pool: sqlx::PgPool) {
+        let handle = ensure_recorder();
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let endpoint = crate::test::utils::create_test_endpoint(&pool, "class-metric-ep", user.id).await;
+        let alias = format!("class-metric-{}", uuid::Uuid::new_v4());
+        let model: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO deployed_models (model_name,alias,is_composite,created_by,routing_mode) VALUES ($1,$1,true,$2,'class_routes') RETURNING id",
+        )
+        .bind(&alias)
+        .bind(user.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        for (class, limit, price) in [("standard", 14, "0.000002"), ("fast", 7, "0.000003")] {
+            sqlx::query(
+                "INSERT INTO model_serving_classes (deployed_model_id,class_key,display_name,inference_endpoint_id,upstream_model_name,realtime_inflight_limit)
+                 VALUES ($1,$2,$2,$3,'upstream',$4)",
+            )
+            .bind(model)
+            .bind(class)
+            .bind(endpoint)
+            .bind(limit)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO model_tariffs (deployed_model_id,serving_class,name,input_price_per_token,output_price_per_token,api_key_purpose)
+                 VALUES ($1,$2,$2,$3::numeric,$3::numeric,'realtime')",
+            )
+            .bind(model)
+            .bind(class)
+            .bind(price)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let targets = load_targets_from_db(&pool, &[], false).await.unwrap();
+        super::update_cache_info_metrics(&pool, &targets, &mut super::CacheInfoState::new())
+            .await
+            .unwrap();
+        let output = handle.render();
+        let own: Vec<_> = output.lines().filter(|line| line.contains(&alias)).collect();
+        let class_line = |metric: &str, class: &str| {
+            own.iter()
+                .find(|line| line.starts_with(&format!("{metric}{{")) && line.contains(&format!("serving_class=\"{class}\"")))
+                .map(|line| line.rsplit(' ').next().unwrap().to_owned())
+        };
+        assert_eq!(
+            class_line("dwctl_model_class_realtime_inflight_limit", "standard").as_deref(),
+            Some("14")
+        );
+        assert_eq!(
+            class_line("dwctl_model_class_realtime_inflight_limit", "fast").as_deref(),
+            Some("7")
+        );
+        assert!(class_line("dwctl_model_class_tariff", "fast").is_some());
+        // The class route is not reported as a model of its own.
+        assert!(!own.iter().any(|line| line.contains(&format!("model=\"{alias}:fast\""))));
     }
 
     #[dwctl_test_macros::test]

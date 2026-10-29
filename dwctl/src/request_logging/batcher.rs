@@ -541,6 +541,23 @@ where
             .into_iter()
             .collect();
 
+        // A request to a class route names `alias:<class>`; it is recorded and
+        // priced as the model's alias in that class.
+        let class_routes = self.batch_lookup_class_routes(tx, buffer).await?;
+        let buffer: Vec<RawAnalyticsRecord> = buffer
+            .iter()
+            .cloned()
+            .map(|mut raw| {
+                if let Some((alias, class)) = raw.request_model.as_deref().and_then(|model| class_routes.get(model)) {
+                    raw.request_model = Some(alias.clone());
+                    raw.requested_serving_class = Some(class.clone());
+                    raw.resolved_serving_class = Some(class.clone());
+                }
+                raw
+            })
+            .collect();
+        let buffer = buffer.as_slice();
+
         // Collect unique model aliases
         let models: Vec<&str> = buffer
             .iter()
@@ -786,7 +803,7 @@ where
             LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id
             LEFT JOIN model_tariffs mt ON mt.deployed_model_id = dm.id
                 AND (mt.user_id IS NULL OR mt.user_id = ANY($2))
-                AND (mt.user_id IS NOT NULL OR mt.serving_class IS NULL)
+                AND (mt.user_id IS NOT NULL OR mt.serving_class IS NULL OR class_routes_active(dm.id))
             WHERE dm.alias = ANY($1)
             ORDER BY dm.alias, mt.valid_from DESC
             "#,
@@ -828,6 +845,48 @@ where
 
         trace!(count = map.len(), "Batch lookup models completed");
         Ok(map)
+    }
+
+    /// The class routes (`alias:<class>` of a model with that class) among the
+    /// buffer's request models, mapped to (alias, class).
+    async fn batch_lookup_class_routes(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        buffer: &[RawAnalyticsRecord],
+    ) -> Result<HashMap<String, (String, String)>, sqlx::Error> {
+        let names: Vec<String> = buffer
+            .iter()
+            .filter_map(|r| r.request_model.clone())
+            .filter(|model| model.contains(':'))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        if names.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows = sqlx::query!(
+            r#"
+            SELECT dm.alias, c.class_key
+            FROM model_serving_classes c
+            JOIN deployed_models dm ON dm.id = c.deployed_model_id
+            -- Regardless of the model's current mode: a record queued before a
+            -- rollback is still recorded under its model and class (and priced
+            -- at the model's price, as class prices apply only while class
+            -- routes serve). A model of that exact name wins.
+            WHERE c.class_key <> 'standard'
+              AND dm.alias || ':' || c.class_key = ANY($1)
+              AND NOT EXISTS (
+                  SELECT 1 FROM deployed_models named
+                  WHERE named.alias = dm.alias || ':' || c.class_key AND named.deleted = false)
+            "#,
+            &names
+        )
+        .fetch_all(&mut **tx)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (format!("{}:{}", row.alias, row.class_key), (row.alias, row.class_key)))
+            .collect())
     }
 
     /// Batch lookup cache tariffs (per model, per tier) for the given aliases.
@@ -1132,6 +1191,7 @@ where
         let mut models: Vec<String> = Vec::new();
         let mut served_bys: Vec<String> = Vec::new();
         let mut served_models: Vec<String> = Vec::new();
+        let mut serving_classes: Vec<String> = Vec::new();
         let mut api_key_ids_credit: Vec<Option<Uuid>> = Vec::new();
         // Service tier, computed in memory from the fusillade metadata, so the
         // transactions list can label each row (realtime / flex / async / batch)
@@ -1192,14 +1252,26 @@ where
             user_ids.push(user_id);
             amounts.push(total_cost);
             source_ids.push(analytics_id.to_string());
+            // A class route is its own product to the customer: name it as requested.
+            let requested = match record.raw.requested_serving_class.as_deref() {
+                Some(class) if class != crate::inference::serving_name::STANDARD_CLASS => format!("{model}:{class}"),
+                _ => model.clone(),
+            };
             descriptions.push(Some(format!(
                 "API usage: {} ({} input + {} output tokens)",
-                model, record.raw.prompt_tokens, record.raw.completion_tokens
+                requested, record.raw.prompt_tokens, record.raw.completion_tokens
             )));
             fusillade_batch_ids.push(record.raw.fusillade_batch_id);
             models.push(model);
             served_bys.push(crate::metrics::served_by_host(record.raw.served_by.as_deref()));
             served_models.push(record.raw.served_model.clone().unwrap_or_default());
+            serving_classes.push(
+                record
+                    .raw
+                    .resolved_serving_class
+                    .clone()
+                    .unwrap_or_else(|| crate::inference::serving_name::STANDARD_CLASS.to_owned()),
+            );
             api_key_ids_credit.push(record.api_key_id);
             service_tiers
                 .push(compute_billing_tier(record.raw.fusillade_batch_id, record.raw.batch_completion_window.as_deref()).to_string());
@@ -1214,7 +1286,7 @@ where
         let expected_count = user_ids.len() as u64;
 
         // Build a map from source_id to (index, user_id, amount, model, served_by, served_model) for metric recording
-        type CreditMetricRecord = (usize, Uuid, Decimal, String, String, String);
+        type CreditMetricRecord = (usize, Uuid, Decimal, String, String, String, String);
         let source_id_to_record: HashMap<String, CreditMetricRecord> = source_ids
             .iter()
             .enumerate()
@@ -1228,6 +1300,7 @@ where
                         models[i].clone(),
                         served_bys[i].clone(),
                         served_models[i].clone(),
+                        serving_classes[i].clone(),
                     ),
                 )
             })
@@ -1697,7 +1770,7 @@ where
 
         // Record metrics only for successfully inserted credit transactions
         for row in &inserted_rows {
-            if let Some((_, user_id, amount, model, served_by, served_model)) = source_id_to_record.get(&row.source_id) {
+            if let Some((_, user_id, amount, model, served_by, served_model, serving_class)) = source_id_to_record.get(&row.source_id) {
                 // Nanocredits (1 credit = 1e9). Tariffs price tokens at
                 // DECIMAL(12,8), so a single token can cost 1e-8 credits; nano
                 // is the coarsest power of ten that represents every
@@ -1710,6 +1783,7 @@ where
                     "dwctl_credits_deducted_nanocredits_total",
                     "user_id" => user_id.to_string(),
                     "model" => model.clone(),
+                    "serving_class" => serving_class.clone(),
                     "served_by" => served_by.clone(),
                     "served_model" => served_model.clone()
                 )
@@ -1757,6 +1831,7 @@ where
             batch_sla: record.raw.batch_completion_window.clone().unwrap_or_default(),
             batch_request_source: record.raw.batch_request_source.clone(),
             served_by: record.raw.served_by.clone(),
+            resolved_serving_class: record.raw.resolved_serving_class.clone(),
         }
     }
 }
@@ -2261,6 +2336,38 @@ mod integration_tests {
     }
 
     #[dwctl_test_macros::test]
+    async fn class_route_records_resolve_after_a_rollback(pool: sqlx::PgPool) {
+        // Records queued while a model was class-routed still name `alias:<class>`
+        // when they are enriched after the model went back to legacy. A model
+        // whose own alias is `alias:<class>` keeps its records.
+        let routed = create_test_model(&pool, "routed").await;
+        let named = create_test_model(&pool, "named").await;
+        create_test_model(&pool, "named:fast").await;
+        for model in [routed, named] {
+            sqlx::query(
+                "INSERT INTO model_serving_classes (deployed_model_id, class_key, display_name, inference_endpoint_id, upstream_model_name)
+                 SELECT id, 'fast', 'Fast', hosted_on, 'upstream-fast' FROM deployed_models WHERE id = $1",
+            )
+            .bind(model)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let config = crate::test::utils::create_test_config();
+        let (batcher, _writer) = AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
+        let buffer = vec![
+            create_raw_record("routed:fast", None, 1, 1),
+            create_raw_record("named:fast", None, 1, 1),
+        ];
+        let mut tx = pool.begin().await.unwrap();
+        let routes = batcher.batch_lookup_class_routes(&mut tx, &buffer).await.unwrap();
+        assert_eq!(
+            routes,
+            HashMap::from([("routed:fast".to_owned(), ("routed".to_owned(), "fast".to_owned()))])
+        );
+    }
+
+    #[dwctl_test_macros::test]
     async fn tariff_lookups_scope_accounts_without_losing_history_or_unpriced_models(pool: sqlx::PgPool) {
         let model = create_test_model(&pool, "scoped-history").await;
         let private_only = create_test_model(&pool, "other-account-only").await;
@@ -2614,6 +2721,7 @@ mod integration_tests {
             .find(|l| l.starts_with("dwctl_credits_deducted_nanocredits_total{"))
             .expect("the deduction is counted");
         assert!(line.contains(r#"model="composite-alias""#), "{line}");
+        assert!(line.contains(r#"serving_class="standard""#), "{line}");
         assert!(line.contains(r#"served_by="inference.internal""#), "{line}");
         assert!(line.contains(r#"served_model="component-model""#), "{line}");
         // (1000 * 0.00001) + (500 * 0.00003) = 0.025 credits.
@@ -3184,7 +3292,9 @@ mod integration_tests {
             }
             let key = create_api_key_for_user(&pool, account, ApiKeyPurpose::Playground).await;
             let mut record = create_raw_record(alias, Some(key), 1000, 500);
-            record.resolved_serving_class = Some("interactive".to_string());
+            // An account's class-less deal covers the standard class.
+            let served_class = class.unwrap_or("standard");
+            record.resolved_serving_class = Some(served_class.to_string());
             run_batcher_with_records(&pool, vec![record]).await;
             let expected = input * Decimal::from(1000) + output * Decimal::from(500);
             let mut conn = pool.acquire().await.unwrap();
@@ -3201,7 +3311,7 @@ mod integration_tests {
             assert_eq!(cost, Some(expected), "zero is a price, not unresolved: {alias}");
             let mut repo = Tariffs::new(&mut conn);
             assert_eq!(
-                repo.get_effective_pricing_at_timestamp(model, Some(account), "playground", None, Some("interactive"), Utc::now())
+                repo.get_effective_pricing_at_timestamp(model, Some(account), "playground", None, Some(served_class), Utc::now())
                     .await
                     .unwrap(),
                 Some((input, output))

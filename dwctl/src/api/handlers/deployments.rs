@@ -597,6 +597,16 @@ fn validate_batch_capacity(capacity: Option<i32>) -> Result<()> {
     Ok(())
 }
 
+/// A model alias never contains `:`: `model:<class>` names one of its serving classes.
+fn validate_alias_has_no_class_separator(alias: &str) -> Result<()> {
+    if alias.contains(crate::inference::serving_name::CLASS_SEPARATOR) {
+        return Err(Error::BadRequest {
+            message: format!("Model alias '{alias}' must not contain ':', which separates a model from its serving class"),
+        });
+    }
+    Ok(())
+}
+
 #[utoipa::path(
     post,
     path = "/models",
@@ -647,6 +657,7 @@ pub async fn create_deployed_model<P: PoolProvider>(
             message: "Model name and alias must not be empty or whitespace".to_string(),
         });
     }
+    validate_alias_has_no_class_separator(alias)?;
 
     validate_tariff_prices(tariffs.as_deref())?;
 
@@ -862,6 +873,9 @@ pub async fn update_deployed_model<P: PoolProvider>(
 
     validate_tariff_prices(update.tariffs.as_deref())?;
 
+    if let Some(alias) = update.alias.as_deref() {
+        validate_alias_has_no_class_separator(alias.trim())?;
+    }
     // `Some(None)` clears the cap; only a concrete non-positive value is invalid.
     validate_batch_capacity(update.batch_capacity.flatten())?;
 
@@ -1656,6 +1670,29 @@ mod tests {
     };
     use serde_json::json;
     use sqlx::PgPool;
+
+    #[dwctl_test_macros::test]
+    async fn model_aliases_cannot_contain_a_class_separator(pool: PgPool) {
+        let (app, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let headers = add_auth_headers(&user);
+        let create = |alias: &str| {
+            app.post("/admin/api/v1/models")
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .json(&json!({"type":"composite","model_name":alias,"lb_strategy":"priority"}))
+        };
+        create("org/model:fast").await.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let response = create("org/model").await;
+        response.assert_status_ok();
+        let model: DeployedModelResponse = response.json();
+        app.patch(&format!("/admin/api/v1/models/{}", model.id))
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"alias":"org/model:fast"}))
+            .await
+            .assert_status(axum::http::StatusCode::BAD_REQUEST);
+    }
 
     #[dwctl_test_macros::test]
     async fn aimd_api_create_patch_clear_and_validate(pool: PgPool) {

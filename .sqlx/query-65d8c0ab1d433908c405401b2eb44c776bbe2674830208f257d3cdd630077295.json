@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT dm.alias, c.class_key\n            FROM model_serving_classes c\n            JOIN deployed_models dm ON dm.id = c.deployed_model_id\n            -- Regardless of the model's current mode: a record queued before a\n            -- rollback is still recorded under its model and class (and priced\n            -- at the model's price, as class prices apply only while class\n            -- routes serve). A model of that exact name wins.\n            WHERE c.class_key <> 'standard'\n              AND dm.alias || ':' || c.class_key = ANY($1)\n              AND NOT EXISTS (\n                  SELECT 1 FROM deployed_models named\n                  WHERE named.alias = dm.alias || ':' || c.class_key AND named.deleted = false)\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "class_key",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "65d8c0ab1d433908c405401b2eb44c776bbe2674830208f257d3cdd630077295"
+}

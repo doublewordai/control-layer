@@ -49,6 +49,24 @@ pub struct ModelDocument {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+// Mirrors validation: activation needs class routes with `standard` and no
+// redirect rule, and classes need `standard`.
+#[schemars(extend("allOf" = [
+    {
+        "if": {"required": ["routing_mode"], "properties": {"routing_mode": {"const": "class_routes"}}},
+        "then": {
+            "required": ["class_routes"],
+            "properties": {
+                "class_routes": {"required": ["standard"]},
+                "traffic_rules": {"items": {"not": {"required": ["action"], "properties": {"action": {"const": "redirect"}}}}}
+            }
+        }
+    },
+    {
+        "if": {"required": ["class_routes"], "properties": {"class_routes": {"minProperties": 1}}},
+        "then": {"properties": {"class_routes": {"required": ["standard"]}}}
+    }
+]))]
 pub struct ClayModel {
     pub alias: String,
     /// Defaults to the document's top-level `model` value.
@@ -76,16 +94,41 @@ pub struct ClayModel {
     pub access_groups: Vec<String>,
     #[serde(default)]
     pub traffic_rules: Vec<TrafficRule>,
+    /// How the model routes: `legacy` (its composite routing) or
+    /// `class_routes` (each class in `class_routes` to its own upstream:
+    /// `alias` to `standard`, `alias:<class>` to that class).
+    #[serde(default)]
+    pub routing_mode: RoutingMode,
     /// Retired. Accepted only when empty, so existing catalog files still
     /// load; remove it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     #[schemars(extend("maxProperties" = 0))]
     pub serving_classes: BTreeMap<String, serde_json::Value>,
-    /// Explicit class destinations and prices, staged independently of legacy routing.
-    /// Declaring these does not activate routes or advertise additional model names.
+    /// Class destinations and prices. Declaring them alone changes nothing;
+    /// `routing_mode: class_routes` activates them. `standard` is required.
     #[serde(default)]
     #[schemars(extend("propertyNames" = {"pattern": "^[a-z][a-z0-9_-]*$"}))]
     pub class_routes: BTreeMap<String, ClassRoute>,
+}
+
+/// How a virtual model routes its requests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingMode {
+    /// The model's composite routing (`routing`).
+    #[default]
+    Legacy,
+    /// Each class in `class_routes` routes to its own upstream.
+    ClassRoutes,
+}
+
+impl RoutingMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::ClassRoutes => "class_routes",
+        }
+    }
 }
 
 /// Complete catalog declaration for a stable class of the existing public model.
@@ -95,9 +138,16 @@ pub struct ClassRoute {
     pub display_name: String,
     pub endpoint: String,
     pub upstream_model_name: String,
-    /// Optional exact ingress spellings, never additional discovery entries.
-    #[serde(default)]
+    /// Retired. Accepted only when empty: a class is reached only by the
+    /// model's alias (`alias` or `alias:<class>`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(extend("maxItems" = 0))]
     pub aliases: Vec<String>,
+    /// Concurrent realtime requests one account may have in flight on this
+    /// class. Omit for the model's `settings.realtime_inflight_limit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub realtime_inflight_limit: Option<i32>,
     pub tariffs: Vec<Tariff>,
     /// Omit to inherit the model's all-class multipliers; does not enable caching.
     #[serde(default)]
@@ -504,6 +554,13 @@ impl Catalog {
 
         for model in &self.models {
             validate_alias(&mut aliases, &model.clay.alias, &model.source, "virtual model")?;
+            // `model:<class>` names a class; physical deployments are exempt until components go.
+            ensure!(
+                !model.clay.alias.contains(':'),
+                "{}: virtual model alias {:?} must not contain ':', which separates a model from its serving class",
+                model.source,
+                model.clay.alias
+            );
             ensure_nonempty(
                 model.clay.model_name.as_deref().unwrap_or(&model.canonical_model),
                 &model.source,
@@ -528,10 +585,25 @@ impl Catalog {
         }
 
         for model in &self.models {
+            ensure!(
+                model.clay.routing_mode == RoutingMode::Legacy || model.clay.class_routes.contains_key("standard"),
+                "{}: routing_mode class_routes requires a standard class in class_routes",
+                model.source
+            );
+            ensure!(
+                model.clay.routing_mode == RoutingMode::Legacy
+                    || !model
+                        .clay
+                        .traffic_rules
+                        .iter()
+                        .any(|rule| matches!(rule, TrafficRule::Redirect { .. })),
+                "{}: a class-routed model cannot redirect traffic; use deny rules",
+                model.source
+            );
             if !model.clay.class_routes.is_empty() {
                 ensure!(
-                    model.clay.class_routes.contains_key("standard") && model.clay.class_routes.contains_key("fast"),
-                    "{}: class_routes requires standard and fast",
+                    model.clay.class_routes.contains_key("standard"),
+                    "{}: class_routes requires a standard class",
                     model.source
                 );
                 for (key, class) in &model.clay.class_routes {
@@ -552,13 +624,23 @@ impl Catalog {
                     );
                     validate_tariffs(&class.tariffs, &model.source)?;
                     ensure!(
-                        key == "standard" || class.tariffs.iter().all(|t| t.purpose != TariffPurpose::Batch),
-                        "{}: class {key:?}: batch prices can only specialize standard",
+                        class.tariffs.iter().all(|t| t.purpose != TariffPurpose::Batch),
+                        "{}: class {key:?}: batch and flex prices are set on the model, not on a class",
                         model.source
                     );
                     ensure!(
                         class.tariffs.iter().any(|t| t.purpose == TariffPurpose::Realtime),
                         "{}: class {key:?} requires a realtime tariff",
+                        model.source
+                    );
+                    ensure!(
+                        class.aliases.is_empty(),
+                        "{}: class {key:?}: class aliases are retired; a class is reached as the model's alias or alias:{key}",
+                        model.source
+                    );
+                    ensure!(
+                        class.realtime_inflight_limit.is_some_and(|limit| limit > 0),
+                        "{}: class {key:?}: realtime_inflight_limit is required and must be positive",
                         model.source
                     );
                     if let Some(cache) = &class.cache_tariff {
@@ -581,16 +663,6 @@ impl Catalog {
             }
         }
         for model in &self.models {
-            for class in model.clay.class_routes.values() {
-                for alias in &class.aliases {
-                    ensure!(
-                        !alias.is_empty() && !alias.chars().any(char::is_whitespace),
-                        "{}: class alias must be nonempty without whitespace",
-                        model.source
-                    );
-                    validate_alias(&mut aliases, alias, &model.source, "class synonym")?;
-                }
-            }
             let mut component_keys = HashSet::new();
             for (pool, components) in &model.clay.routing.pools {
                 ensure!(

@@ -56,6 +56,8 @@ pub struct RejectionContext {
     identity: RequestIdentity,
     authenticated: bool,
     traffic: &'static str,
+    /// The `model` and `serving_class` metric labels, once the model resolves.
+    metric_labels: Option<(String, String)>,
 }
 
 impl RejectionContext {
@@ -96,6 +98,7 @@ impl RejectionContext {
                 key_purpose: label("purpose"),
             },
             traffic: if dispatched { "dispatched" } else { "realtime" },
+            metric_labels: None,
         }
     }
 
@@ -104,11 +107,19 @@ impl RejectionContext {
         self.identity.model = Some(model.to_string());
     }
 
+    /// Records the metric labels for the resolved model (see
+    /// [`crate::target::serving_metric_labels`]).
+    pub(crate) fn set_metric_labels(&mut self, model: &str, serving_class: &str) {
+        self.metric_labels = Some((model.to_string(), serving_class.to_string()));
+    }
+
     /// Records the alias `model` selects, with any serving-class suffix
     /// removed, if it is configured.
     pub fn set_model_if_configured(&mut self, targets: &Targets, model: &str) {
         if let Some(alias) = targets.configured_alias(model) {
             self.set_model(alias);
+            let (model, serving_class) = targets.metric_labels(alias);
+            self.set_metric_labels(&model, &serving_class);
         }
     }
 
@@ -140,10 +151,17 @@ impl RejectionContext {
         param: Option<&str>,
         reason: Option<&'static str>,
     ) {
-        let model = self.identity.model.as_deref().unwrap_or("");
+        let (model, serving_class) = match &self.metric_labels {
+            Some((model, serving_class)) => (model.clone(), serving_class.clone()),
+            None => (
+                self.identity.model.clone().unwrap_or_default(),
+                crate::target::STANDARD_SERVING_CLASS.to_owned(),
+            ),
+        };
         metrics::counter!(
             "onwards_rejections_total",
-            "model" => model.to_string(),
+            "model" => model,
+            "serving_class" => serving_class,
             "status" => status.as_str().to_string(),
             "code" => code.to_string(),
             "traffic" => self.traffic,

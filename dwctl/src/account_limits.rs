@@ -35,9 +35,13 @@ const ACCOUNT_LIMITS_LOCK: i64 = 0x4457_4143_4354_4c4d;
 /// Ownership marker on policy rows written by this catalog.
 const POLICY_SOURCE: &str = "account-catalog";
 
-/// Classes an account file may configure. Only `standard` exists until
-/// models gain further serving classes.
-const CONFIGURABLE_CLASSES: [&str; 1] = ["standard"];
+/// A class key: lowercase, as the model catalog's `class_routes` keys.
+fn is_class_key(key: &str) -> bool {
+    key.bytes().next().is_some_and(|c| c.is_ascii_lowercase())
+        && key
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-')
+}
 const STANDARD_CLASS: &str = "standard";
 
 #[derive(Debug, Clone)]
@@ -86,6 +90,10 @@ pub struct AccountModelPolicy {
     /// window. Realtime prices are set per class.
     #[serde(default)]
     pub tariffs: Vec<Tariff>,
+    /// Prompt-cache multipliers the account pays on this model: on batch and
+    /// flex, and on every class that does not set its own.
+    #[serde(default)]
+    pub cache_tariff: Option<CachePrices>,
     /// Per-class policy, keyed by class. An omitted class keeps the model's
     /// defaults for that class.
     #[serde(default)]
@@ -122,7 +130,11 @@ pub struct AccountClassPolicy {
 
 impl AccountModelPolicy {
     fn is_empty(&self) -> bool {
-        self.priority.is_none() && self.toleration_preset.is_none() && self.tariffs.is_empty() && self.classes.is_empty()
+        self.priority.is_none()
+            && self.toleration_preset.is_none()
+            && self.tariffs.is_empty()
+            && self.cache_tariff.is_none()
+            && self.classes.is_empty()
     }
 }
 
@@ -148,7 +160,22 @@ impl AccountDocument {
         self.realtime_inflight.keys().chain(self.models.keys())
     }
 
-    /// The effective limits, merging both shapes (equal duplicates are one limit).
+    /// Realtime limits on classes other than standard, by (alias, class).
+    fn class_limits(&self) -> BTreeMap<(&str, &str), i32> {
+        self.models
+            .iter()
+            .flat_map(|(alias, model)| {
+                model
+                    .classes
+                    .iter()
+                    .filter(|(class, _)| class.as_str() != STANDARD_CLASS)
+                    .filter_map(move |(class, policy)| policy.realtime_inflight.map(|limit| ((alias.as_str(), class.as_str()), limit)))
+            })
+            .collect()
+    }
+
+    /// The effective standard-class limits, merging both shapes (equal
+    /// duplicates are one limit).
     fn limits(&self) -> BTreeMap<&str, i32> {
         let mut limits: BTreeMap<&str, i32> = self
             .realtime_inflight
@@ -201,14 +228,23 @@ impl AccountLimitsCatalog {
     }
 
     pub fn validate_models(&self, models: &Catalog) -> Result<()> {
-        let aliases: HashSet<_> = models.models.iter().map(|model| model.clay.alias.as_str()).collect();
+        let catalog: HashMap<_, _> = models
+            .models
+            .iter()
+            .map(|model| (model.clay.alias.as_str(), &model.clay.class_routes))
+            .collect();
         for file in &self.files {
             for alias in file.document.aliases() {
-                ensure!(
-                    aliases.contains(alias.as_str()),
-                    "{}: model {alias:?} is absent from the model catalog",
-                    file.source
-                );
+                let Some(classes) = catalog.get(alias.as_str()) else {
+                    bail!("{}: model {alias:?} is absent from the model catalog", file.source);
+                };
+                for class in file.document.models.get(alias).into_iter().flat_map(|model| model.classes.keys()) {
+                    ensure!(
+                        class == STANDARD_CLASS || classes.contains_key(class),
+                        "{}: model {alias:?} has no class {class:?} in the model catalog",
+                        file.source
+                    );
+                }
             }
         }
         Ok(())
@@ -287,13 +323,12 @@ impl AccountLimitsCatalog {
                     model.tariffs.iter().all(|t| t.purpose == TariffPurpose::Batch),
                     "{context}: realtime and playground prices belong under `classes.<class>.tariffs`"
                 );
+                if let Some(cache) = &model.cache_tariff {
+                    validate_cache_tariff(&cache.as_tariff(), &context)?;
+                }
                 for (class, policy) in &model.classes {
                     let context = format!("{context}, class {class:?}");
-                    ensure!(
-                        CONFIGURABLE_CLASSES.contains(&class.as_str()),
-                        "{context}: unknown class; configurable classes are {}",
-                        CONFIGURABLE_CLASSES.join(", ")
-                    );
+                    ensure!(is_class_key(class), "{context}: invalid class key");
                     ensure!(!policy.is_empty(), "{context} configures nothing");
                     if let Some(limit) = policy.realtime_inflight {
                         ensure!(limit > 0, "{context}: realtime_inflight must be positive");
@@ -391,7 +426,9 @@ pub async fn apply(pool: &PgPool, catalog: &AccountLimitsCatalog) -> Result<()> 
         .await
         .context("read account catalog effective timestamp")?;
 
+    verify_classes(&mut transaction, catalog, &models).await?;
     apply_limits(&mut transaction, catalog, &accounts, &models).await?;
+    apply_class_limits(&mut transaction, catalog, &accounts, &models).await?;
     apply_priorities(&mut transaction, catalog, &accounts).await?;
     apply_policies(&mut transaction, catalog, &accounts, &models).await?;
     apply_prices(&mut transaction, catalog, &accounts, &models, effective_at).await?;
@@ -442,6 +479,79 @@ async fn apply_limits(
     .execute(&mut *db)
     .await
     .context("write account limits")?;
+    Ok(())
+}
+
+/// A class other than standard must exist on the model (the model catalog,
+/// applied just before, declares its classes).
+async fn verify_classes(db: &mut PgConnection, catalog: &AccountLimitsCatalog, models: &HashMap<String, Uuid>) -> Result<()> {
+    let declared: HashSet<(Uuid, String)> = sqlx::query_as("SELECT deployed_model_id, class_key FROM model_serving_classes")
+        .fetch_all(&mut *db)
+        .await
+        .context("read model classes")?
+        .into_iter()
+        .collect();
+    for file in &catalog.files {
+        for (alias, model) in &file.document.models {
+            for class in model.classes.keys().filter(|class| class.as_str() != STANDARD_CLASS) {
+                ensure!(
+                    declared.contains(&(models[alias], class.clone())),
+                    "{}: model {alias:?} has no class {class:?}",
+                    file.source
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Per-account limits on non-standard classes, owned table-wide like the
+/// standard-class limits.
+async fn apply_class_limits(
+    db: &mut PgConnection,
+    catalog: &AccountLimitsCatalog,
+    accounts: &HashMap<String, Uuid>,
+    models: &HashMap<String, Uuid>,
+) -> Result<()> {
+    let mut model_ids = Vec::new();
+    let mut account_ids = Vec::new();
+    let mut classes = Vec::new();
+    let mut limits = Vec::new();
+    for file in &catalog.files {
+        for ((alias, class), limit) in file.document.class_limits() {
+            model_ids.push(models[alias]);
+            account_ids.push(accounts[&file.document.account]);
+            classes.push(class.to_owned());
+            limits.push(limit);
+        }
+    }
+    sqlx::query(
+        "DELETE FROM realtime_inflight_class_overrides o
+         WHERE NOT EXISTS (
+             SELECT 1 FROM UNNEST($1::uuid[], $2::uuid[], $3::text[]) AS d(deployed_model_id, user_id, class_key)
+             WHERE d.deployed_model_id = o.deployed_model_id AND d.user_id = o.user_id AND d.class_key = o.class_key
+         )",
+    )
+    .bind(&model_ids)
+    .bind(&account_ids)
+    .bind(&classes)
+    .execute(&mut *db)
+    .await
+    .context("remove undeclared account class limits")?;
+    sqlx::query(
+        "INSERT INTO realtime_inflight_class_overrides (deployed_model_id, user_id, class_key, inflight_limit)
+         SELECT d.deployed_model_id, d.user_id, d.class_key, d.inflight_limit
+         FROM UNNEST($1::uuid[], $2::uuid[], $3::text[], $4::int[]) AS d(deployed_model_id, user_id, class_key, inflight_limit)
+         ON CONFLICT (deployed_model_id, user_id, class_key) DO UPDATE SET inflight_limit = EXCLUDED.inflight_limit
+         WHERE realtime_inflight_class_overrides.inflight_limit IS DISTINCT FROM EXCLUDED.inflight_limit",
+    )
+    .bind(&model_ids)
+    .bind(&account_ids)
+    .bind(&classes)
+    .bind(&limits)
+    .execute(&mut *db)
+    .await
+    .context("write account class limits")?;
     Ok(())
 }
 
@@ -624,37 +734,52 @@ async fn apply_prices(
                 .await
                 .with_context(|| context(alias))?;
             provisioning
-                .reconcile_cache_tariff(model_id, Some(account), None, None, effective_at)
-                .await
-                .with_context(|| context(alias))?;
-            let standard = model.classes.get(STANDARD_CLASS);
-            provisioning
-                .reconcile_tariffs(
+                .reconcile_cache_tariff(
                     model_id,
                     Some(account),
-                    Some(STANDARD_CLASS),
-                    standard.map_or(&[], |class| class.tariffs.as_slice()),
+                    None,
+                    model.cache_tariff.as_ref().map(CachePrices::as_tariff).as_ref(),
                     effective_at,
                 )
                 .await
                 .with_context(|| context(alias))?;
-            let cache = standard.and_then(|class| class.cache_tariff.as_ref()).map(CachePrices::as_tariff);
-            provisioning
-                .reconcile_cache_tariff(model_id, Some(account), Some(STANDARD_CLASS), cache.as_ref(), effective_at)
-                .await
-                .with_context(|| context(alias))?;
-            // Rows adopted under any other class scope are not declared: close them.
+            // Standard is always reconciled (an omitted standard retires its
+            // prices); every other declared class too.
+            let declared_classes: Vec<&str> = std::iter::once(STANDARD_CLASS)
+                .chain(model.classes.keys().map(String::as_str).filter(|class| *class != STANDARD_CLASS))
+                .collect();
+            for class in &declared_classes {
+                let prices = model.classes.get(*class);
+                provisioning
+                    .reconcile_tariffs(
+                        model_id,
+                        Some(account),
+                        Some(class),
+                        prices.map_or(&[], |p| p.tariffs.as_slice()),
+                        effective_at,
+                    )
+                    .await
+                    .with_context(|| context(alias))?;
+                let cache = prices.and_then(|p| p.cache_tariff.as_ref()).map(CachePrices::as_tariff);
+                provisioning
+                    .reconcile_cache_tariff(model_id, Some(account), Some(class), cache.as_ref(), effective_at)
+                    .await
+                    .with_context(|| context(alias))?;
+            }
+            // Rows this catalog owns under a class the file no longer declares: close them.
+            let declared_classes: Vec<String> = declared_classes.into_iter().map(str::to_owned).collect();
             for table in ["model_tariffs", "model_cache_tariffs"] {
                 sqlx::query(&format!(
                     "UPDATE {table} SET valid_until = $4
                      WHERE user_id = $1 AND deployed_model_id = $2 AND provisioning_source = $3
-                       AND serving_class IS NOT NULL AND serving_class <> 'standard'
+                       AND serving_class IS NOT NULL AND NOT (serving_class = ANY($5))
                        AND valid_from <= $4 AND (valid_until IS NULL OR valid_until > $4)"
                 ))
                 .bind(account)
                 .bind(model_id)
                 .bind(ACCOUNT_CATALOG_TARIFF_SOURCE)
                 .bind(effective_at)
+                .bind(&declared_classes)
                 .execute(&mut *db)
                 .await
                 .with_context(|| context(alias))?;
@@ -716,6 +841,7 @@ async fn resolve_models(db: &mut PgConnection, catalog: &AccountLimitsCatalog) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal::Decimal;
     use tempfile::tempdir;
 
     fn write(directory: &Path, name: &str, contents: &str) {
@@ -899,8 +1025,8 @@ mod tests {
                 "batch prices belong in the model's",
             ),
             (
-                "account: acme\nmodels:\n  org/model:\n    classes:\n      fast:\n        realtime_inflight: 5\n".to_owned(),
-                "unknown class",
+                "account: acme\nmodels:\n  org/model:\n    classes:\n      Fast:\n        realtime_inflight: 5\n".to_owned(),
+                "invalid class key",
             ),
             (
                 "account: acme\nrealtime_inflight:\n  org/model: 10\nmodels:\n  org/model:\n    classes:\n      standard:\n        realtime_inflight: 20\n".to_owned(),
@@ -1028,7 +1154,7 @@ mod tests {
             directory.path(),
             "acme.yaml",
             &format!(
-                "account: acme\npriority: 100\nmodels:\n  org/model:\n    priority: 300\n    tariffs: [{BATCH}]\n    classes:\n      standard:\n        realtime_inflight: 900\n        tariffs: [{REALTIME}]\n        cache_tariff: {{read_multiplier: '0.2', write_multiplier_5m: '1', write_multiplier_1h: '1', write_multiplier_24h: '1'}}\n        ttft_ms: 1000\n        itl_ms: 30\n"
+                "account: acme\npriority: 100\nmodels:\n  org/model:\n    priority: 300\n    tariffs: [{BATCH}]\n    cache_tariff: {{read_multiplier: '0.3', write_multiplier_5m: '1', write_multiplier_1h: '1', write_multiplier_24h: '1'}}\n    classes:\n      standard:\n        realtime_inflight: 900\n        tariffs: [{REALTIME}]\n        cache_tariff: {{read_multiplier: '0.2', write_multiplier_5m: '1', write_multiplier_1h: '1', write_multiplier_24h: '1'}}\n        ttft_ms: 1000\n        itl_ms: 30\n"
             ),
         );
         write(
@@ -1067,14 +1193,18 @@ mod tests {
                 ),
             ]
         );
-        let cache: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM model_cache_tariffs WHERE user_id = $1 AND serving_class = 'standard' AND valid_until IS NULL",
+        // One model-level row (batch, flex and classes without their own) and one for standard.
+        let cache: Vec<(Option<String>, Decimal)> = sqlx::query_as(
+            "SELECT serving_class, read_multiplier FROM model_cache_tariffs WHERE user_id = $1 AND valid_until IS NULL ORDER BY serving_class NULLS FIRST",
         )
         .bind(org)
-        .fetch_one(&pool)
+        .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(cache, 1);
+        assert_eq!(
+            cache,
+            vec![(None, Decimal::new(3, 1)), (Some("standard".to_owned()), Decimal::new(2, 1))]
+        );
         assert_eq!(
             active_prices(&pool, person).await,
             vec![(
@@ -1264,5 +1394,105 @@ mod tests {
         write(directory.path(), "acme.yaml", "account: acme\npriority: 1\n");
         apply(&pool, &AccountLimitsCatalog::load(directory.path()).unwrap()).await.unwrap();
         assert!(presets().await.is_empty());
+    }
+
+    async fn insert_class(pool: &PgPool, model: Uuid, class: &str) {
+        let endpoint: Uuid = sqlx::query_scalar(
+            "INSERT INTO inference_endpoints (name, url, created_by) VALUES ($1, 'http://upstream.test', '00000000-0000-0000-0000-000000000000') RETURNING id",
+        )
+        .bind(format!("endpoint-{class}"))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO model_serving_classes (deployed_model_id, class_key, display_name, inference_endpoint_id, upstream_model_name) VALUES ($1, $2, $2, $3, $2)",
+        )
+        .bind(model)
+        .bind(class)
+        .bind(endpoint)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[dwctl_test_macros::test]
+    async fn a_declared_class_carries_its_own_limits_and_prices(pool: PgPool) {
+        let org = insert_account(&pool, "acme", "organization").await;
+        let model = insert_virtual_model(&pool, "org/model").await;
+        let directory = tempdir().unwrap();
+        write(
+            directory.path(),
+            "acme.yaml",
+            &format!(
+                "account: acme\nmodels:\n  org/model:\n    classes:\n      standard:\n        realtime_inflight: 40\n      fast:\n        realtime_inflight: 5\n        tariffs: [{REALTIME}]\n"
+            ),
+        );
+        let catalog = AccountLimitsCatalog::load(directory.path()).unwrap();
+
+        // A class the model does not have is refused before anything is written.
+        let error = format!("{:#}", apply(&pool, &catalog).await.unwrap_err());
+        assert!(error.contains("has no class \"fast\""), "{error}");
+        assert!(stored(&pool).await.is_empty());
+
+        insert_class(&pool, model, "standard").await;
+        insert_class(&pool, model, "fast").await;
+        apply(&pool, &catalog).await.unwrap();
+        assert_eq!(stored(&pool).await, vec![(model, org, 40)], "standard keeps its table and key");
+        let class_limits: Vec<(Uuid, Uuid, String, i32)> =
+            sqlx::query_as("SELECT deployed_model_id, user_id, class_key, inflight_limit FROM realtime_inflight_class_overrides")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(class_limits, vec![(model, org, "fast".to_owned(), 5)]);
+        assert_eq!(
+            active_prices(&pool, org).await,
+            vec![(Some("fast".into()), "realtime".into(), None, ACCOUNT_CATALOG_TARIFF_SOURCE.into())]
+        );
+
+        // Dropping the class from the file clears its limit and retires its price.
+        write(
+            directory.path(),
+            "acme.yaml",
+            "account: acme\nmodels:\n  org/model:\n    classes:\n      standard:\n        realtime_inflight: 40\n",
+        );
+        apply(&pool, &AccountLimitsCatalog::load(directory.path()).unwrap()).await.unwrap();
+        let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM realtime_inflight_class_overrides")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0);
+        assert!(active_prices(&pool, org).await.is_empty());
+    }
+
+    #[test]
+    fn offline_validation_checks_classes_against_the_model_catalog() {
+        let models = tempdir().unwrap();
+        fs::write(
+            models.path().join("model.yaml"),
+            "model: org/model\nclay:\n  alias: org/model\n  deployments:\n    - {alias: provider, model_name: org/model, endpoint: onwards}\n  routing:\n    pools:\n      default:\n        - deployment: provider\n",
+        )
+        .unwrap();
+        let models = Catalog::load(models.path()).unwrap();
+        let directory = tempdir().unwrap();
+        write(
+            directory.path(),
+            "a.yaml",
+            "account: acme\nmodels:\n  org/model:\n    classes:\n      fast:\n        priority: 1\n",
+        );
+        let error = AccountLimitsCatalog::load(directory.path())
+            .unwrap()
+            .validate_models(&models)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("has no class \"fast\""), "{error}");
+        write(
+            directory.path(),
+            "a.yaml",
+            "account: acme\nmodels:\n  org/model:\n    classes:\n      standard:\n        priority: 1\n",
+        );
+        AccountLimitsCatalog::load(directory.path())
+            .unwrap()
+            .validate_models(&models)
+            .unwrap();
     }
 }

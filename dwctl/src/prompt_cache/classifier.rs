@@ -27,8 +27,12 @@ use super::tokenizer::{TokenizerClient, TokenizerError, WirePrefix};
 
 /// What `classify` needs from the request.
 pub struct ClassifyRequest<'a> {
-    /// The virtual model (the `deployed_models.alias` = the cache key dimension).
+    /// The cache scope's model name: the name as requested, `model` or `model:<class>`,
+    /// so each class keeps its own entries.
     pub virtual_model: &'a str,
+    /// The model alias, sent to tokenizer-svc. Every class of a model shares its
+    /// tokenizer, so `model:<class>` tokenizes as `model`.
+    pub model: &'a str,
     /// The raw request body (with `cache_control` markers intact).
     pub body: &'a [u8],
     /// The validated bearer token, or `None` (un-scopable → no caching).
@@ -289,7 +293,7 @@ impl Classifier {
             cache_metrics::record_skip("no_markers");
             return Ok(ClassifyOutcome::zero_active()); // markers are required to cache
         }
-        let versions = match self.tokenizer_versions(req.virtual_model).await? {
+        let versions = match self.tokenizer_versions(req.model).await? {
             VersionsLookup::Mapped(v) => v,
             // Not in the service's model list: a stable fact — the serving path degrades to
             // zeros for every such request, so a replay reaching the same zeros is faithful.
@@ -431,7 +435,7 @@ impl Classifier {
 
         // Tokenize the suffix (the only tokenization; reads needed none). Failure →
         // degrade to no caching (safe under the best-effort contract).
-        let tok = match self.tokenizer.tokenize(req.virtual_model, &segments).await {
+        let tok = match self.tokenizer.tokenize(req.model, &segments).await {
             Ok(tok) => tok,
             Err(e) => {
                 cache_metrics::record_skip("tokenize_failed");
@@ -520,7 +524,7 @@ impl Classifier {
             }
         }
 
-        let resp = match self.tokenizer.render(req.virtual_model, &messages, tools, true, &prefixes).await {
+        let resp = match self.tokenizer.render(req.model, &messages, tools, true, &prefixes).await {
             Ok(r) => r,
             Err(TokenizerError::Unmapped(_)) => {
                 cache_metrics::record_skip("tokenizer_unmapped");
@@ -587,7 +591,7 @@ impl Classifier {
         // confined to the span the template refused.
         if slots.iter().zip(per_breakpoint.iter()).any(|(s, c)| s.is_some() && c.is_none()) {
             let segments: Vec<String> = parsed.blocks.iter().map(|b| b.text.clone()).collect();
-            match self.tokenizer.tokenize(req.virtual_model, &segments).await {
+            match self.tokenizer.tokenize(req.model, &segments).await {
                 Ok(tok) if tok.cumulative.len() == segments.len() => {
                     let raw_at = |block: usize| u64::from(tok.cumulative[block]);
                     for i in 0..per_breakpoint.len() {
@@ -1103,6 +1107,7 @@ mod tests {
     fn req<'a>(secret: &'a str, body: &'a [u8]) -> ClassifyRequest<'a> {
         ClassifyRequest {
             virtual_model: ALIAS,
+            model: ALIAS,
             body,
             api_key: Some(secret),
             principal: None,

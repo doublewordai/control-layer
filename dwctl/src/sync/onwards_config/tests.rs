@@ -2722,9 +2722,162 @@ async fn a_priority_only_policy_keeps_overlay_targets(pool: sqlx::PgPool) {
     .await
     .unwrap();
     let overlays = super::load_overlays_from_db(&pool).await.unwrap();
-    let overlay = &overlays["hint-model"][&user.to_string()];
+    let overlay = &overlays.by_target["hint-model"][&user.to_string()];
     assert_eq!(
         (overlay.priority, overlay.ttft_ms, overlay.itl_ms),
         (Some(400), Some(800), Some(30))
     );
+}
+
+/// Make the fixture's priority composite class-routed: standard on the default
+/// endpoint, fast on the custom one with its own limit.
+async fn activate_composite_classes(pool: &sqlx::PgPool, with_standard: bool) {
+    let composite = uuid::Uuid::parse_str("50000000-0000-0000-0000-000000000001").unwrap();
+    sqlx::query("UPDATE deployed_models SET routing_mode = 'class_routes' WHERE id = $1")
+        .bind(composite)
+        .execute(pool)
+        .await
+        .unwrap();
+    let classes: &[(&str, &str, &str, Option<i32>)] = if with_standard {
+        &[
+            ("standard", "30000000-0000-0000-0000-000000000001", "pool-standard", None),
+            ("fast", "30000000-0000-0000-0000-000000000002", "pool-fast", Some(3)),
+        ]
+    } else {
+        &[("fast", "30000000-0000-0000-0000-000000000002", "pool-fast", Some(3))]
+    };
+    for (class, endpoint, upstream, limit) in classes {
+        sqlx::query(
+            "INSERT INTO model_serving_classes (deployed_model_id, class_key, display_name, inference_endpoint_id, upstream_model_name, realtime_inflight_limit)
+             VALUES ($1, $2, $2, $3::uuid, $4, $5)",
+        )
+        .bind(composite)
+        .bind(class)
+        .bind(endpoint)
+        .bind(upstream)
+        .bind(limit)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+}
+
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn a_priced_class_does_not_lock_accounts_out_of_a_free_one(pool: sqlx::PgPool) {
+    // Key A's spend cap is exhausted: it keeps generally free targets only.
+    sqlx::query("UPDATE api_keys SET spend_limit=1 WHERE secret = $1")
+        .bind(KEY_A_SECRET)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO api_key_spend_checkpoints(api_key_id,total_spend,window_spend) SELECT id,1,1 FROM api_keys WHERE secret = $1")
+        .bind(KEY_A_SECRET)
+        .execute(&pool)
+        .await
+        .unwrap();
+    activate_composite_classes(&pool, true).await;
+    // Only the fast class is priced.
+    sqlx::query(
+        "INSERT INTO model_tariffs(deployed_model_id,serving_class,name,input_price_per_token,output_price_per_token,api_key_purpose)
+         SELECT id,'fast','fast',1,1,'realtime' FROM deployed_models WHERE alias = 'composite-priority'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let standard = targets.targets.get("composite-priority").unwrap();
+    let fast = targets.targets.get("composite-priority:fast").unwrap();
+    assert!(pool_has_key(standard.value(), KEY_A_SECRET), "the free standard class stays open");
+    assert!(
+        !pool_has_key(fast.value(), KEY_A_SECRET),
+        "the priced fast class is closed to a capped key"
+    );
+    // Key B's account has no access to the model: neither class admits it.
+    assert!(!pool_has_key(standard.value(), KEY_B_SECRET));
+    assert!(!pool_has_key(fast.value(), KEY_B_SECRET));
+}
+
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_class_routed_model_has_one_target_per_class(pool: sqlx::PgPool) {
+    let composite = uuid::Uuid::parse_str("50000000-0000-0000-0000-000000000001").unwrap();
+    let user_a = "00000000-0000-0000-0000-0000000000a1";
+    activate_composite_classes(&pool, true).await;
+    sqlx::query("INSERT INTO realtime_inflight_limit_overrides (deployed_model_id, user_id, inflight_limit) VALUES ($1, $2::uuid, 50)")
+        .bind(composite)
+        .bind(user_a)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO realtime_inflight_class_overrides (deployed_model_id, user_id, class_key, inflight_limit) VALUES ($1, $2::uuid, 'fast', 9)")
+        .bind(composite)
+        .bind(user_a)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO account_model_policies (user_id, deployed_model_id, serving_class, priority, ttft_ms)
+         VALUES ($1::uuid, $2, NULL, 100, NULL), ($1::uuid, $2, 'fast', 500, 900)",
+    )
+    .bind(user_a)
+    .bind(composite)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO model_traffic_rules (deployed_model_id, api_key_purpose, action) VALUES ($1, 'playground', 'deny')")
+        .bind(composite)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let model_limit: i32 = sqlx::query_scalar("SELECT realtime_inflight_limit FROM deployed_models WHERE id = $1")
+        .bind(composite)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+
+    let standard = targets.targets.get("composite-priority").unwrap().default_pool().clone();
+    let fast = targets.targets.get("composite-priority:fast").unwrap().default_pool().clone();
+    // Each class has a single provider: its own upstream.
+    assert_eq!(standard.providers().len(), 1);
+    assert_eq!(standard.providers()[0].target.onwards_model.as_deref(), Some("pool-standard"));
+    assert_eq!(fast.providers().len(), 1);
+    assert_eq!(fast.providers()[0].target.onwards_model.as_deref(), Some("pool-fast"));
+    assert!(
+        fast.providers()[0]
+            .target
+            .url
+            .as_str()
+            .starts_with("https://api.custom.example.com/")
+    );
+
+    // Limits: the class default and its account overrides, each from its own table.
+    let standard_limits = standard.inflight_limits().unwrap();
+    assert_eq!(standard_limits.default, model_limit as u32);
+    assert_eq!(standard_limits.for_account(user_a), 50);
+    let fast_limits = fast.inflight_limits().unwrap();
+    assert_eq!(fast_limits.default, 3);
+    assert_eq!(fast_limits.for_account(user_a), 9);
+    // Batch runs on standard only.
+    assert!(standard.batch_inflight_limit().is_some());
+    assert_eq!(fast.batch_inflight_limit(), None);
+
+    // The model-wide policy applies to every class; the class row narrows it.
+    assert_eq!(standard.overlays()[user_a].priority, Some(100));
+    assert_eq!(fast.overlays()[user_a].priority, Some(500));
+    assert_eq!(fast.overlays()[user_a].ttft_ms, Some(900));
+
+    // Deny rules are model-wide, and both classes admit the model's keys.
+    assert_eq!(standard.routing_rules().len(), 1);
+    assert_eq!(fast.routing_rules().len(), 1);
+    assert!(standard.keys().is_some() && fast.keys().is_some());
+}
+
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_an_activation_without_standard_keeps_the_legacy_route(pool: sqlx::PgPool) {
+    activate_composite_classes(&pool, false).await;
+    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    let legacy = targets.targets.get("composite-priority").unwrap();
+    assert!(legacy.default_pool().providers().len() > 1, "the composite's members still serve");
+    assert!(targets.targets.get("composite-priority:fast").is_none());
 }

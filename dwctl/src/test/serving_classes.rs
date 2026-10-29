@@ -206,74 +206,37 @@ async fn realtime_class_suffixes_are_not_parsed(pool: PgPool) {
 }
 
 #[dwctl_test_macros::test]
-async fn batch_upload_discards_model_suffixes(pool: PgPool) {
+async fn async_work_naming_a_model_suffix_is_refused(pool: PgPool) {
+    // Model aliases never contain ':', so a suffix can only name a class, and
+    // batch and flex always run on the standard class: nothing is rewritten.
     let f = Fixture::new(&pool).await;
     let headers = format!("Bearer {}", f.key);
-    // No final newline exercises the final buffered-line parser as well.
-    let lines = [
-        "policy:interactive",
-        "policy:throughput",
-        "policy:standard",
-        "policy",
-        "policy:x-fast",
-    ]
-    .into_iter()
-    .enumerate()
-    .map(|(i, model)| {
-        json!({"custom_id":format!("r{i}"),"method":"POST","url":"/v1/chat/completions",
+    let upload = |model: &str| {
+        let line = json!({"custom_id":"r","method":"POST","url":"/v1/chat/completions",
             "body":{"model":model,"messages":[{"role":"user","content":"hi"}]}})
-        .to_string()
-    })
-    .collect::<Vec<_>>()
-    .join("\n");
-    let response = f
-        .server
-        .post("/ai/v1/files")
-        .add_header("Authorization", &headers)
-        .multipart(
+        .to_string();
+        f.server.post("/ai/v1/files").add_header("Authorization", &headers).multipart(
             MultipartForm::new()
                 .add_text("purpose", "batch")
-                .add_part("file", Part::bytes(lines.into_bytes()).file_name("classes.jsonl")),
+                .add_part("file", Part::bytes(line.into_bytes()).file_name("models.jsonl")),
         )
-        .await;
-    response.assert_status(StatusCode::CREATED);
-    let id = response.json::<Value>()["id"].as_str().unwrap().to_owned();
-    let content = f
-        .server
-        .get(&format!("/ai/v1/files/{id}/content"))
-        .add_header("Authorization", &headers)
-        .await;
-    content.assert_status_ok();
-    let models = content
-        .text()
-        .lines()
-        .map(|line| {
-            serde_json::from_str::<Value>(line).unwrap()["body"]["model"]
-                .as_str()
-                .unwrap()
-                .to_owned()
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(models, ["policy", "policy", "policy", "policy", "policy"]);
-
-    for (model, expected) in [
-        ("inaccessible:interactive", StatusCode::FORBIDDEN),
-        ("policy:throughput:interactive", StatusCode::BAD_REQUEST),
-        ("policy:", StatusCode::BAD_REQUEST),
-    ] {
-        let line =
-            json!({"custom_id":"denied","method":"POST","url":"/v1/chat/completions","body":{"model":model,"messages":[]}}).to_string();
-        f.server
-            .post("/ai/v1/files")
-            .add_header("Authorization", &headers)
-            .multipart(
-                MultipartForm::new()
-                    .add_text("purpose", "batch")
-                    .add_part("file", Part::bytes(line.into_bytes()).file_name("denied.jsonl")),
-            )
-            .await
-            .assert_status(expected);
+    };
+    upload("policy").await.assert_status(StatusCode::CREATED);
+    for model in ["policy:interactive", "policy:standard", "policy:x-fast", "policy:", "policy:a:b"] {
+        upload(model).await.assert_status(StatusCode::BAD_REQUEST);
     }
+
+    for model in ["policy:interactive", "policy:standard"] {
+        let response = f
+            .server
+            .post("/ai/v1/chat/completions")
+            .add_header("Authorization", &headers)
+            .json(&json!({"model": model, "messages": [{"role": "user", "content": "hi"}], "service_tier": "flex"}))
+            .await;
+        response.assert_status(StatusCode::NOT_FOUND);
+        assert_eq!(response.json::<Value>()["error"]["code"], "model_not_found", "{model}");
+    }
+    assert!(f.upstream.received_requests().await.unwrap().is_empty());
 }
 
 #[dwctl_test_macros::test]
@@ -415,4 +378,197 @@ async fn json_key_order_survives_batch_upload(pool: PgPool) {
         .await;
     content.assert_status_ok();
     assert!(content.text().contains(ORDERED_SCHEMA), "{}", content.text());
+}
+
+/// Activate `policy` as a class-routed model: standard and fast, each its own
+/// upstream on the fixture's endpoint, with public class prices.
+async fn activate_policy_classes(f: &Fixture, pool: &PgPool) {
+    sqlx::query(
+        "INSERT INTO model_serving_classes (deployed_model_id, class_key, display_name, inference_endpoint_id, upstream_model_name, realtime_inflight_limit)
+         SELECT dm.id, c.key, c.key, ie.id, c.upstream, c.lim
+         FROM deployed_models dm, inference_endpoints ie,
+              (VALUES ('standard', 'pool-standard', NULL::int), ('fast', 'pool-fast', 3)) c(key, upstream, lim)
+         WHERE dm.alias = 'policy' AND ie.name = 'serving-test'",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO model_tariffs (deployed_model_id, serving_class, name, input_price_per_token, output_price_per_token, api_key_purpose)
+         SELECT id, c.key, c.key, c.price, c.price, 'realtime' FROM deployed_models,
+              (VALUES ('standard', 0.000002::numeric), ('fast', 0.000004::numeric)) c(key, price)
+         WHERE alias = 'policy'",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE deployed_models SET routing_mode = 'class_routes' WHERE alias = 'policy'")
+        .execute(pool)
+        .await
+        .unwrap();
+    f.services.sync_onwards_config(pool).await.unwrap();
+}
+
+#[dwctl_test_macros::test]
+async fn class_routes_serve_realtime_by_class_and_bill_the_class(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    activate_policy_classes(&f, &pool).await;
+
+    // Discovery lists the class beside the model.
+    let models: Value = f
+        .server
+        .get("/ai/v1/models")
+        .add_header("Authorization", format!("Bearer {}", f.key))
+        .await
+        .json();
+    let ids: Vec<&str> = models["data"].as_array().unwrap().iter().filter_map(|m| m["id"].as_str()).collect();
+    assert!(ids.contains(&"policy") && ids.contains(&"policy:fast"), "{ids:?}");
+    assert!(!ids.contains(&"policy:standard"));
+
+    // Realtime: the alias reaches standard's upstream, alias:fast reaches fast's.
+    f.post("chat/completions", "policy", false).await.assert_status_ok();
+    assert_eq!(f.last_body().await["model"], "pool-standard");
+    f.post("chat/completions", "policy:fast", false).await.assert_status_ok();
+    assert_eq!(f.last_body().await["model"], "pool-fast");
+
+    // Flex never runs on a non-standard class.
+    let response = f
+        .server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {}", f.key))
+        .json(&json!({"model": "policy:fast", "messages": [{"role": "user", "content": "hi"}], "service_tier": "flex"}))
+        .await;
+    response.assert_status(StatusCode::BAD_REQUEST);
+    assert!(response.text().contains("serving_class_realtime_only"), "{}", response.text());
+    assert!(
+        response.text().contains("'policy'"),
+        "the refusal names the standard route: {}",
+        response.text()
+    );
+    // Not even where the endpoint would serve flex as realtime.
+    let response = f
+        .server
+        .post("/ai/v1/embeddings")
+        .add_header("Authorization", format!("Bearer {}", f.key))
+        .json(&json!({"model": "policy:fast", "input": "hi", "service_tier": "flex"}))
+        .await;
+    response.assert_status(StatusCode::BAD_REQUEST);
+    assert!(response.text().contains("serving_class_realtime_only"), "{}", response.text());
+
+    // Both realtime requests are recorded as the model, in their class, at
+    // their class's price.
+    let rows = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let rows: Vec<(String, Option<String>, Option<String>, Decimal)> = sqlx::query_as(
+                "SELECT model, requested_serving_class, resolved_serving_class, total_cost FROM http_analytics
+                 WHERE user_id = $1 AND status_code = 200 ORDER BY total_cost",
+            )
+            .bind(f.user)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            if rows.len() == 2 {
+                break rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("two priced analytics rows must be persisted");
+    assert_eq!(
+        rows,
+        vec![
+            ("policy".to_owned(), None, Some("standard".to_owned()), Decimal::new(30, 6)),
+            (
+                "policy".to_owned(),
+                Some("fast".to_owned()),
+                Some("fast".to_owned()),
+                Decimal::new(60, 6)
+            ),
+        ]
+    );
+    // The customer's ledger names each charge as requested.
+    let descriptions = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let rows: Vec<String> = sqlx::query_scalar(
+                "SELECT description FROM credits_transactions WHERE user_id = $1 AND description LIKE 'API usage:%' ORDER BY description",
+            )
+            .bind(f.user)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            if rows.len() == 2 {
+                break rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("two usage debits");
+    assert!(descriptions[0].starts_with("API usage: policy ("), "{descriptions:?}");
+    assert!(descriptions[1].starts_with("API usage: policy:fast ("), "{descriptions:?}");
+    f.services.shutdown().await;
+}
+
+#[dwctl_test_macros::test]
+async fn an_activation_without_standard_serves_and_prices_the_legacy_route(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    activate_policy_classes(&f, &pool).await;
+    sqlx::query("DELETE FROM model_serving_classes WHERE class_key = 'standard'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    f.services.sync_onwards_config(&pool).await.unwrap();
+
+    // No class route is listed or served, and the model takes its legacy route.
+    let models: Value = f
+        .server
+        .get("/ai/v1/models")
+        .add_header("Authorization", format!("Bearer {}", f.key))
+        .await
+        .json();
+    let ids: Vec<&str> = models["data"].as_array().unwrap().iter().filter_map(|m| m["id"].as_str()).collect();
+    assert!(ids.contains(&"policy") && !ids.contains(&"policy:fast"), "{ids:?}");
+    f.post("chat/completions", "policy", false).await.assert_status_ok();
+    assert_ne!(f.last_body().await["model"], "pool-standard");
+
+    // Billing reads no class price for the model while its classes don't serve.
+    let class_prices: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM deployed_models dm,
+             effective_model_tariff(dm.id, NULL, 'realtime', NULL, 'fast', now()) t
+         WHERE dm.alias = 'policy' AND t.serving_class IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(class_prices, 0);
+    f.services.shutdown().await;
+}
+
+#[dwctl_test_macros::test]
+async fn batch_lines_naming_a_class_route_are_refused(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    activate_policy_classes(&f, &pool).await;
+    let upload = |model: &str| {
+        let line = json!({"custom_id": "r0", "method": "POST", "url": "/v1/chat/completions",
+            "body": {"model": model, "messages": [{"role": "user", "content": "hi"}]}});
+        MultipartForm::new()
+            .add_part("purpose", Part::text("batch"))
+            .add_part("file", Part::bytes(format!("{line}\n").into_bytes()).file_name("batch.jsonl"))
+    };
+    let response = f
+        .server
+        .post("/ai/v1/files")
+        .add_header("Authorization", format!("Bearer {}", f.key))
+        .multipart(upload("policy:fast"))
+        .await;
+    response.assert_status(StatusCode::BAD_REQUEST);
+    assert!(response.text().contains("realtime requests only"), "{}", response.text());
+    f.server
+        .post("/ai/v1/files")
+        .add_header("Authorization", format!("Bearer {}", f.key))
+        .multipart(upload("policy"))
+        .await
+        .assert_status(StatusCode::CREATED);
+    f.services.shutdown().await;
 }
