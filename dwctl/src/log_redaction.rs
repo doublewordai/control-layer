@@ -92,10 +92,12 @@ impl<W: io::Write> RedactingWriter<W> {
         if self.pending.is_empty() {
             return Ok(());
         }
-        let text = String::from_utf8_lossy(&self.pending);
-        self.inner.write_all(redact_secrets(&text).as_bytes())?;
-        self.pending.clear();
-        Ok(())
+        // Taken before writing: if the sink fails partway, the line is dropped
+        // rather than written again from the start on the next flush or drop,
+        // which would repeat the part that got through.
+        let pending = std::mem::take(&mut self.pending);
+        let text = String::from_utf8_lossy(&pending);
+        self.inner.write_all(redact_secrets(&text).as_bytes())
     }
 }
 
@@ -252,6 +254,42 @@ mod tests {
             }
         }
         assert_eq!(String::from_utf8(out).unwrap(), "authorization: Bearer <redacted>\nkey=<redacted>");
+    }
+
+    /// A sink that takes part of the first write, fails the second, then
+    /// accepts everything.
+    #[derive(Default)]
+    struct FlakySink {
+        out: Vec<u8>,
+        calls: usize,
+    }
+
+    impl io::Write for FlakySink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.calls += 1;
+            let accepted = match self.calls {
+                1 => &buf[..5],
+                2 => return Err(io::Error::other("sink failed")),
+                _ => buf,
+            };
+            self.out.extend_from_slice(accepted);
+            Ok(accepted.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn writer_does_not_repeat_a_line_after_a_failed_write() {
+        let mut sink = FlakySink::default();
+        {
+            let mut writer = RedactingWriter::new(&mut sink);
+            assert!(io::Write::write_all(&mut writer, b"first line\n").is_err());
+            io::Write::write_all(&mut writer, b"second line\n").unwrap();
+        }
+        assert_eq!(String::from_utf8(sink.out).unwrap(), "firstsecond line\n");
     }
 
     #[test]
