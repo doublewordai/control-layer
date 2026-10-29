@@ -66,6 +66,60 @@ fn is_capacity_refusal(status: u16) -> bool {
     matches!(status, 503 | 529)
 }
 
+/// How well a failed attempt's error speaks for the whole request once every
+/// member of a fallback chain has failed. Higher wins; on a tie the later
+/// attempt wins, so a chain whose members all failed the same way reports the
+/// last failure exactly as it did before precedence existed.
+///
+/// A capacity refusal says "retry shortly" and is the most useful thing a
+/// caller can be told, so it beats any other failure: an upstream 529 first,
+/// then an upstream 503 (both reach the caller as 529 `overloaded`), then a
+/// rate limit (429). Everything else (a 404 from a member that does not
+/// serve the model, a generic 5xx, a timeout, a network error) ranks below
+/// them and keeps last-wins order among itself.
+///
+/// `error_status` is the status of the error the attempt would return;
+/// `upstream_status` is what the upstream itself answered, if it answered.
+fn exhausted_chain_rank(error_status: StatusCode, upstream_status: Option<u16>) -> u8 {
+    match error_status.as_u16() {
+        529 if upstream_status == Some(503) => 3,
+        529 => 4,
+        429 => 2,
+        _ => 1,
+    }
+}
+
+/// The failure a request reports when every attempt has failed: the
+/// highest-ranked attempt by [`exhausted_chain_rank`], kept whole, together
+/// with the upstream status that produced it.
+#[derive(Default)]
+struct ChainFailure {
+    best: Option<(u8, OnwardsErrorResponse, Option<u16>)>,
+}
+
+impl ChainFailure {
+    /// Record a failed attempt. It replaces the current choice unless that
+    /// one outranks it.
+    fn record(&mut self, error: Option<OnwardsErrorResponse>, upstream_status: Option<u16>) {
+        let Some(error) = error else { return };
+        let rank = exhausted_chain_rank(error.status, upstream_status);
+        if self
+            .best
+            .as_ref()
+            .is_none_or(|(best_rank, _, _)| rank >= *best_rank)
+        {
+            self.best = Some((rank, error, upstream_status));
+        }
+    }
+
+    fn into_parts(self) -> (Option<OnwardsErrorResponse>, Option<u16>) {
+        match self.best {
+            Some((_, error, upstream_status)) => (Some(error), upstream_status),
+            None => (None, None),
+        }
+    }
+}
+
 /// Detect a provider error envelope embedded in an HTTP 200 body.
 ///
 /// Some upstreams return `200 OK` with the real error in
@@ -1030,14 +1084,13 @@ pub async fn target_message_handler<T: HttpClient>(
     let original_headers = req.headers().clone();
     let method = req.method().clone();
 
-    // Track last error for fallback scenarios
-    let mut last_error: Option<OnwardsErrorResponse> = None;
-    // The status the UPSTREAM returned on the most recent attempt, before any
-    // sanitization. `last_error` cannot serve this purpose: by the time an
-    // attempt is recorded there it has already been mapped onto a gateway
-    // response, so an upstream 529 and an upstream 500 are both 503 and the
-    // distinction that matters for backpressure is gone.
-    let mut last_upstream_status: Option<u16> = None;
+    // The failure to report if every attempt fails: the most meaningful one
+    // across the chain (see `exhausted_chain_rank`), not merely the last. It
+    // keeps the status the UPSTREAM returned on that attempt alongside the
+    // gateway error: by the time an attempt is recorded its error has already
+    // been mapped onto a gateway response, so an upstream 529 and an upstream
+    // 503 are both 529 and the distinction is gone.
+    let mut chain_failure = ChainFailure::default();
 
     // A self-hosted-only account never reaches an external member: the
     // composite's eligible set is narrowed to its non-external providers for
@@ -1212,8 +1265,8 @@ pub async fn target_message_handler<T: HttpClient>(
             .map(|m| m.0.to_string());
 
         // The upstream status THIS attempt received, if it got that far.
-        // Unlike `last_upstream_status` it never carries over from an earlier
-        // attempt, so it can say whether this member refused the request.
+        // It never carries over from an earlier attempt, so it can say whether
+        // this member refused the request.
         let mut attempt_upstream_status: Option<u16> = None;
 
         let action = async {
@@ -1543,7 +1596,6 @@ pub async fn target_message_handler<T: HttpClient>(
         };
 
         let status = response.status().as_u16();
-        last_upstream_status = Some(status);
         attempt_upstream_status = Some(status);
         upstream_span.record("http.response.status_code", status);
         tracing::Span::current().record("http.response.status_code", status);
@@ -1881,7 +1933,6 @@ pub async fn target_message_handler<T: HttpClient>(
                 tracing::Span::current().record("http.response.status_code", embedded);
                 // A 200 carrying an embedded error IS that error for our
                 // purposes, so it overrides the 200 recorded above.
-                last_upstream_status = Some(embedded);
                 attempt_upstream_status = Some(embedded);
 
                 let retryable = fails_over_on(embedded, attempt_number)
@@ -2184,7 +2235,7 @@ pub async fn target_message_handler<T: HttpClient>(
 
         match action {
             LoopAction::Continue(err) => {
-                last_error = err;
+                chain_failure.record(err, attempt_upstream_status);
                 // A member that refused for overload is full right now: trying
                 // it again within this request cannot succeed, so it sits out
                 // the rest of the request.
@@ -2237,22 +2288,23 @@ pub async fn target_message_handler<T: HttpClient>(
     // "all providers at concurrency capacity"
     if any_attempted {
         // We tried at least one provider but all failed
-        let final_error = last_error
+        let (final_error, final_upstream_status) = chain_failure.into_parts();
+        let final_error = final_error
             .unwrap_or_else(|| OnwardsErrorResponse::model_not_found(model_name.as_str()));
-        // `status` carries the PRE-sanitization status of the last attempt, which
-        // the response itself discards: a 529 and a 500 both leave here as 503,
-        // so without this the caller cannot tell saturation from failure. This is
-        // the single exit where a candidate error actually becomes the response,
-        // so counting here counts outcomes rather than attempts.
+        // The `status` label carries the PRE-sanitization upstream status of the
+        // attempt whose error is returned, which the response itself discards: a
+        // 529 and a 503 both leave here as 529. This is the single exit where a
+        // candidate error actually becomes the response, so counting here counts
+        // outcomes rather than attempts.
         let status = final_error.status.as_u16();
         metrics::counter!(
             "onwards_upstream_failed_total",
             "reason" => "retries_exhausted",
-            // The upstream's own status on the final attempt, NOT the gateway
-            // response above, which collapses several upstream statuses into
-            // one. Falls back to the response status when no attempt got far
-            // enough to see one.
-            "status" => last_upstream_status.unwrap_or(status).to_string(),
+            // The upstream's own status on the attempt whose error is
+            // returned, NOT the gateway response above, which collapses several
+            // upstream statuses into one. Falls back to the response status
+            // when that attempt got no upstream status (timeout, network error).
+            "status" => final_upstream_status.unwrap_or(status).to_string(),
             "model" => model_name.to_string(),
             "traffic" => traffic,
         )
@@ -3415,5 +3467,67 @@ mod tests {
         headers.insert("content-type", "application/json".parse().unwrap());
         withhold_trace_context(&mut headers);
         assert_eq!(headers.len(), 1);
+    }
+
+    #[test]
+    fn exhausted_chain_prefers_capacity_then_rate_limit_then_latest() {
+        let chosen = |attempts: Vec<(OnwardsErrorResponse, Option<u16>)>| {
+            let mut failure = ChainFailure::default();
+            for (error, upstream) in attempts {
+                failure.record(Some(error), upstream);
+            }
+            let (error, upstream) = failure.into_parts();
+            (error.map(|e| e.status.as_u16()), upstream)
+        };
+
+        // A capacity refusal beats a later 404 or other failure.
+        assert_eq!(
+            chosen(vec![
+                (OnwardsErrorResponse::overloaded(), Some(529)),
+                (OnwardsErrorResponse::bad_gateway(), Some(404)),
+            ]),
+            (Some(529), Some(529))
+        );
+        // An upstream 529 beats an upstream 503, though both answer 529.
+        assert_eq!(
+            chosen(vec![
+                (OnwardsErrorResponse::overloaded(), Some(529)),
+                (OnwardsErrorResponse::overloaded(), Some(503)),
+            ]),
+            (Some(529), Some(529))
+        );
+        // A 503 refusal beats a 429, which beats a timeout.
+        assert_eq!(
+            chosen(vec![
+                (OnwardsErrorResponse::gateway_timeout(), None),
+                (OnwardsErrorResponse::overloaded(), Some(503)),
+                (OnwardsErrorResponse::upstream_rate_limited(None), Some(429)),
+            ]),
+            (Some(529), Some(503))
+        );
+        assert_eq!(
+            chosen(vec![
+                (OnwardsErrorResponse::upstream_rate_limited(None), Some(429)),
+                (OnwardsErrorResponse::gateway_timeout(), None),
+            ]),
+            (Some(429), Some(429))
+        );
+        // Among equals the latest attempt wins, as before precedence existed.
+        assert_eq!(
+            chosen(vec![
+                (OnwardsErrorResponse::bad_gateway(), Some(500)),
+                (OnwardsErrorResponse::gateway_timeout(), None),
+            ]),
+            (Some(504), None)
+        );
+        assert_eq!(
+            chosen(vec![
+                (OnwardsErrorResponse::gateway_timeout(), None),
+                (OnwardsErrorResponse::bad_gateway(), Some(404)),
+            ]),
+            (Some(502), Some(404))
+        );
+        // Nothing recorded: the caller falls back to its own default.
+        assert_eq!(chosen(vec![]), (None, None));
     }
 }
