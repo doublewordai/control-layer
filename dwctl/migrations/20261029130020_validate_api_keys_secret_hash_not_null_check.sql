@@ -4,6 +4,8 @@
 -- Neither statement blocks reads or other writes: the UPDATE locks only the
 -- rows it changes, VALIDATE takes SHARE UPDATE EXCLUSIVE. A later release
 -- turns this into SET NOT NULL (instant with a validated check) and drops it.
+SET LOCAL lock_timeout = '5s';
+
 UPDATE api_keys
 SET secret_hash = sha256(convert_to(secret, 'UTF8')),
     secret_prefix = left(secret, 8)
