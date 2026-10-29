@@ -586,14 +586,14 @@ pub async fn get_organization<P: PoolProvider>(
     Ok(Json(response))
 }
 
-/// Update an organization. Must be an owner or admin of the org, or platform manager.
-/// Zero data retention is restricted to organization owners and platform managers.
+/// Update an organization as an actual owner/admin. Only owners may disable ZDR.
+/// Trusted SSO support may enable ZDR cross-account, with no other fields.
 #[utoipa::path(
     patch,
     path = "/organizations/{id}",
     tag = "organizations",
     summary = "Update organization",
-    description = "Update organization details. Requires owner/admin role or platform manager access. Zero data retention can only be changed by an organization owner or platform manager.",
+    description = "Update organization details as an owner/admin. Only owners may change zero data retention in either direction. Trusted SSO platform managers/admins may enable zero data retention for another organization only with an enable-only payload containing no other changes. Platform roles do not otherwise bypass membership.",
     params(
         ("id" = String, Path, description = "Organization ID (UUID)"),
     ),
@@ -891,8 +891,9 @@ pub async fn update_organization<P: PoolProvider>(
     // Only a platform manager could have set a preset (the UpdateAll gate above
     // rejects anyone else), so they are the only caller who sees it here, the
     // same rule the GET endpoint applies.
-    if support_zdr {
-        tracing::info!(actor_id = %current_user.id, target_user_id = %id, "zero data retention enabled");
+    if let Some(enabled) = db_request.zero_data_retention {
+        tracing::info!(actor_id = %current_user.id, target_user_id = %id,
+            zero_data_retention = enabled, "zero data retention updated");
     }
     let toleration_preset = if can_all { org.toleration_preset.clone() } else { None };
 

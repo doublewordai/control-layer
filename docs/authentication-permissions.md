@@ -31,16 +31,21 @@ an upstream identity header and does not replace those deployment controls.
 
 ## Customer ownership
 
-Files, batches, stored responses, external connections and API credentials have
+Files, batches, stored responses, external connections, API credentials and webhooks have
 no platform-wide permission override, including for legacy admins. Lists are
 scoped before pagination and direct access is checked against the personal owner
 or a membership-validated active organization. Ordinary organization key-manager
 rights remain available within the organization. Staff cannot use their platform
 role to issue customer credentials or add themselves to an organization.
 
-Broad user create/update/delete permissions and organization mutation overrides
-are disabled. Platform role assignment and privileged account provisioning must
-use a separately controlled administrative process; they are not support actions.
+Organization webhook access follows membership; platform-scope webhooks additionally
+require trusted SSO platform authority, even when accessing one's own webhook.
+
+Broad user create/update/delete permissions and organization update/delete overrides
+are disabled. Trusted SSO platform managers can still create new organizations and
+assign their initial owner; this does not grant access to existing organizations.
+Platform role assignment and privileged account provisioning must use a separately
+controlled administrative process; they are not support actions.
 
 ## Existing dashboard operations
 

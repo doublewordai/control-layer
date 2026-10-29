@@ -16,7 +16,7 @@ export function OrganizationDetail() {
   const [showEditModal, setShowEditModal] = useState(false);
   const { hasPermission } = useAuthorization();
   const isPlatformManager = hasPermission("users-groups");
-  const { data: currentUser } = useUser("current");
+  const { data: currentUser } = useUser("current", { include: "organizations" });
   const membership = currentUser?.organizations?.find((entry) => entry.id === organizationId);
   const canManage = membership?.role === "owner" || membership?.role === "admin";
   const supportOnly = isPlatformManager && membership?.role !== "owner";

@@ -504,12 +504,13 @@ pub async fn update_user<P: PoolProvider>(
     let mut conn = state.db.write().acquire().await.expect("Failed to acquire database connection");
 
     let mut repo = Users::new(&mut conn);
-    let enabling_zdr = user_data.zero_data_retention == Some(true);
+    let zero_data_retention = user_data.zero_data_retention;
     let db_request = UserUpdateDBRequest::new(user_data);
 
     let user = repo.update(user_id, &db_request).await?;
-    if enabling_zdr {
-        tracing::info!(actor_id = %current_user.id, target_user_id = %user_id, "zero data retention enabled");
+    if let Some(enabled) = zero_data_retention {
+        tracing::info!(actor_id = %current_user.id, target_user_id = %user_id,
+            zero_data_retention = enabled, "zero data retention updated");
     }
     // Only a platform manager could have set a preset (the UpdateAll gate above
     // rejects anyone else), so they are the only caller who sees it back.
@@ -518,7 +519,12 @@ pub async fn update_user<P: PoolProvider>(
     } else {
         None
     };
-    Ok(Json(UserResponse::from(user).with_toleration_preset(toleration_preset)))
+    let mut response = UserResponse::from(user).with_toleration_preset(toleration_preset);
+    if user_id == current_user.id {
+        response.roles = current_user.roles.clone();
+        response.is_admin = current_user.is_admin;
+    }
+    Ok(Json(response))
 }
 
 // DELETE /user/{user_id} - Delete user (admin only)

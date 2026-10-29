@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT ak.id AS api_key_id, ak.user_id, ak.created_by, ak.purpose,\n               u.username, u.email, u.is_admin, u.display_name, u.avatar_url,\n               u.payment_provider_id, u.last_login\n        FROM api_keys ak\n        INNER JOIN users u ON ak.created_by = u.id\n        WHERE ak.secret = $1 AND ak.is_deleted = false\n        ",
+  "query": "\n        SELECT ak.id AS api_key_id, ak.user_id, ak.created_by, ak.purpose,\n               u.username, u.email, u.is_admin, u.display_name, u.avatar_url,\n               u.payment_provider_id, u.last_login\n        FROM api_keys ak\n        INNER JOIN users u ON ak.created_by = u.id\n        INNER JOIN users account ON ak.user_id = account.id\n        WHERE ak.secret = $1 AND ak.is_deleted = false\n          AND u.is_deleted = false AND account.is_deleted = false\n        ",
   "describe": {
     "columns": [
       {
@@ -78,5 +78,5 @@
       true
     ]
   },
-  "hash": "5410bcd83f753a4631c51ede25991dbf7e4f4f9535af49e416e4e350f0d4b425"
+  "hash": "4ad0fb6325233ecd8f23f1ed2653752e6b87036386b7c951f9cbccbd562ebd0d"
 }

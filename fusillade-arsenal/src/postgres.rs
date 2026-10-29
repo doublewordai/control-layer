@@ -4739,7 +4739,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             .await
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "debug", skip(self, input), fields(file_id = %input.file_id))]
     async fn create_batch_record(&self, input: BatchInput) -> Result<Batch> {
         let now = Utc::now();
         let std_duration = humantime::parse_duration(&input.completion_window).map_err(|e| {
@@ -4789,7 +4789,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             .await
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "debug", skip(self, input), fields(file_id = %input.file_id))]
     async fn create_background_batch_record(&self, input: BackgroundBatchInput) -> Result<Batch> {
         self.insert_batch_record(NewBatchRecord {
             file_id: input.file_id,

@@ -43,7 +43,9 @@ fn key_and_native_permission_ceiling_precedes_admin_and_roles() {
 
 #[dwctl_test_macros::test]
 async fn elevated_keys_are_ordinary_but_sso_keeps_credits_and_zdr(pool: PgPool) {
-    let (app, _services) = create_test_app(pool.clone(), false).await;
+    let mut config = crate::test::utils::create_test_config();
+    config.auth.native.enabled = true;
+    let (app, _services) = crate::test::utils::create_test_app_with_config(pool.clone(), config.clone(), false).await;
     for admin in [false, true] {
         let actor = if admin {
             create_test_admin_user(&pool, Role::StandardUser).await
@@ -86,6 +88,24 @@ async fn elevated_keys_are_ordinary_but_sso_keeps_credits_and_zdr(pool: PgPool) 
             .json(&json!({"name": "own key", "purpose": "realtime"}))
             .await
             .assert_status(StatusCode::CREATED);
+
+        // Allowed self-profile writes must return the same effective authority as GET.
+        let mut identity = serde_json::to_value(&actor).unwrap();
+        identity["organizations"] = json!([]);
+        let jwt = crate::auth::session::create_session_token(&serde_json::from_value::<CurrentUser>(identity).unwrap(), &config).unwrap();
+        let cookie = format!("{}={jwt}", config.auth.native.session.cookie_name);
+        for (header, credential) in [("Authorization", bearer.as_str()), ("Cookie", cookie.as_str())] {
+            let updated = app
+                .patch(&format!("/admin/api/v1/users/{}", actor.id))
+                .add_header(header, credential)
+                .json(&json!({"display_name": "Updated own profile"}))
+                .await;
+            updated.assert_status_ok();
+            let body = updated.json::<Value>();
+            assert_eq!(body["display_name"], "Updated own profile");
+            assert_eq!(body["is_admin"], false, "admin={admin}, {header}");
+            assert_eq!(body["roles"], own.json::<Value>()["roles"], "admin={admin}, {header}");
+        }
 
         // A valid key wins over forged/provided SSO headers; an invalid key cannot fall back.
         for authorization in [&bearer, "Bearer invalid", "bearer invalid", "Basic invalid"] {
@@ -305,5 +325,54 @@ async fn customer_content_requires_ownership_for_sso_and_keys(pool: PgPool) {
                 .await
                 .assert_status_not_found();
         }
+    }
+}
+
+#[dwctl_test_macros::test]
+async fn keys_require_live_accounts_and_active_org_membership(pool: PgPool) {
+    let (app, _services) = create_test_app(pool.clone(), false).await;
+    for case in [
+        "deleted_organization",
+        "deleted_holder",
+        "revoked_membership",
+        "deleted_personal_account",
+    ] {
+        let holder = create_test_user(&pool, Role::BatchAPIUser).await;
+        let account_id = if case == "deleted_personal_account" {
+            holder.id
+        } else {
+            crate::test::utils::create_test_org(&pool, holder.id).await.id
+        };
+        let key = create_test_api_key_for_user(&pool, holder.id).await;
+        sqlx::query("UPDATE api_keys SET user_id = $1 WHERE id = $2")
+            .bind(account_id)
+            .bind(key.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let bearer = format!("Bearer {}", key.secret);
+        app.get("/ai/v1/files")
+            .add_header("Authorization", &bearer)
+            .await
+            .assert_status_ok();
+        if case == "revoked_membership" {
+            sqlx::query("DELETE FROM user_organizations WHERE user_id = $1 AND organization_id = $2")
+                .bind(holder.id)
+                .bind(account_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        } else {
+            let deleted_id = if case == "deleted_organization" { account_id } else { holder.id };
+            // Leave keys and memberships intact to ensure authentication itself
+            // fails closed, without relying on asynchronous deletion cleanup.
+            sqlx::query("UPDATE users SET is_deleted = true WHERE id = $1")
+                .bind(deleted_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let response = app.get("/ai/v1/files").add_header("Authorization", &bearer).await;
+        assert_eq!(response.status_code(), StatusCode::UNAUTHORIZED, "{case}: {}", response.text());
     }
 }

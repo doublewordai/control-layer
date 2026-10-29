@@ -121,10 +121,8 @@ export const ApiKeys: React.FC = () => {
   // server-computed can_manage_keys flag decides (owners/admins are always
   // true, plain members only when granted the additive role).
   const canSelfManage = !isOrgContext || !!activeOrganization?.can_manage_keys;
-  // Anyone whose LIST is unscoped (org managers, and PlatformManagers whose
-  // ReadAll bypasses created_by scoping server-side) gets the scoping
-  // controls — otherwise a PM who is a plain member of the org sees
-  // everyone's keys with no way to narrow them.
+  // Only actual org managers can list every member's keys and need these
+  // scoping controls. Platform roles do not bypass ownership or membership.
   const showScopingControls =
     isOrgContext && isOrgManager;
   const pagination = useServerPagination();
@@ -379,7 +377,7 @@ export const ApiKeys: React.FC = () => {
   };
 
   // Mirrors what the server permits for edit/rename/delete: a
-  // PlatformManager, an org owner/admin acting on any key of the active org,
+  // an org owner/admin acting on any key of the active org,
   // or the key's creator when they hold self-manage rights. Keep this gate in
   // lockstep with the server.
   const canManageKey = (apiKey: ApiKey) =>

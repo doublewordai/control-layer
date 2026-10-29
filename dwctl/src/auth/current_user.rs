@@ -391,7 +391,9 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
                u.payment_provider_id, u.last_login
         FROM api_keys ak
         INNER JOIN users u ON ak.created_by = u.id
+        INNER JOIN users account ON ak.user_id = account.id
         WHERE ak.secret = $1 AND ak.is_deleted = false
+          AND u.is_deleted = false AND account.is_deleted = false
         "#,
         api_key
     )

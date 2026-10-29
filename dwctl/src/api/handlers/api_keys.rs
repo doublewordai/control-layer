@@ -318,7 +318,7 @@ pub async fn list_user_api_keys<P: PoolProvider>(
         }
     }
 
-    // PlatformManagers (ReadAll) see all keys for a user; everyone else is scoped to created_by.
+    // Org managers see all keys in their organization; other members see their own keys.
     // Governance context (org mode + caller's role) for the manager bypass
     // and managed-mode gating below.
     // Primary pool: governance decisions must see a just-flipped org mode or a
@@ -2540,7 +2540,7 @@ mod tests {
             .await
             .assert_status(axum::http::StatusCode::CREATED);
 
-        // PlatformManager lists org keys → should see all keys (bypasses created_by filter)
+        // An unrelated platform manager cannot list organization keys.
         let response = app
             .get(&format!("/admin/api/v1/users/{}/api-keys", org.id))
             .add_header(&add_auth_headers(&pm)[0].0, &add_auth_headers(&pm)[0].1)

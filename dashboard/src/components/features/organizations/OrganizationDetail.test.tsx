@@ -184,9 +184,12 @@ describe("OrganizationDetail", () => {
   });
 
   it.each(["owner", "admin"])("keeps %s membership distinct from platform support", async (role) => {
-    server.use(http.get("/admin/api/v1/users/current", () => HttpResponse.json({
+    server.use(http.get("/admin/api/v1/users/current", ({ request }) => HttpResponse.json({
       ...usersData[0],
-      organizations: [{ id: "org-550e8400-0001", name: "Example", role, can_manage_keys: true, zero_data_retention: false }],
+      // Match the real API: memberships are returned only when requested.
+      organizations: new URL(request.url).searchParams.get("include")?.split(",").includes("organizations")
+        ? [{ id: "org-550e8400-0001", name: "Example", role, can_manage_keys: true, zero_data_retention: false }]
+        : undefined,
     })));
     const user = userEvent.setup();
     const { container } = render(<OrganizationDetail />, { wrapper: createWrapper("org-550e8400-0001") });
