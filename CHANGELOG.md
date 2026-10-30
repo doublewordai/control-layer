@@ -1,5 +1,27 @@
 # Changelog
 
+## [15.8.0](https://github.com/doublewordai/control-layer/compare/v15.7.0...v15.8.0) (2026-10-30)
+
+
+### ⚠ BREAKING CHANGES
+
+* **onwards:** hold API keys by SHA-256 hash (DW-1008) ([#2140](https://github.com/doublewordai/control-layer/issues/2140))
+
+### Features
+
+* **api-keys:** backfill secret_hash and look API keys up by hash (DW-1008) ([#2139](https://github.com/doublewordai/control-layer/issues/2139)) ([1016706](https://github.com/doublewordai/control-layer/commit/1016706bed278b861fe8009e17adefeb6158a921))
+* **onwards:** hold API keys by SHA-256 hash (DW-1008) ([#2140](https://github.com/doublewordai/control-layer/issues/2140)) ([3b8e349](https://github.com/doublewordai/control-layer/commit/3b8e349b6a656aa690ccab7a98394db0a51ed302))
+
+
+### Documentation
+
+* **migrations:** record the API key hashing rollback floor (DW-1008) ([0c6ecb9](https://github.com/doublewordai/control-layer/commit/0c6ecb9873c0fc6c727174595606a6adec32c510))
+
+
+### Continuous Integration
+
+* send the deploy dispatch with a release-app token ([#2142](https://github.com/doublewordai/control-layer/issues/2142)) ([00e5f6e](https://github.com/doublewordai/control-layer/commit/00e5f6e1ae4f72c14bc43bbefc2d87db80fd1b1b))
+
 ## [15.7.0](https://github.com/doublewordai/control-layer/compare/v15.6.0...v15.7.0) (2026-10-29)
 
 
