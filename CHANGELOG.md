@@ -1,5 +1,12 @@
 # Changelog
 
+## [15.9.0](https://github.com/doublewordai/control-layer/compare/v15.8.0...v15.9.0) (2026-10-30)
+
+
+### Features
+
+* **models:** retired models return 410 with a configurable shutdown message ([#2146](https://github.com/doublewordai/control-layer/issues/2146)) ([00f00f5](https://github.com/doublewordai/control-layer/commit/00f00f56e64e7c786a85dbe4a63309c9ffc27a8e))
+
 ## [15.8.0](https://github.com/doublewordai/control-layer/compare/v15.7.0...v15.8.0) (2026-10-30)
 
 
