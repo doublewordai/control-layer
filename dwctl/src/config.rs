@@ -1275,7 +1275,8 @@ pub struct FilesConfig {
     /// Smallest `expires_after[seconds]` an upload may request (default: 1 hour)
     pub min_expiry_seconds: i64,
     /// Largest `expires_after[seconds]` an upload may request (default: 30
-    /// days). Must not exceed what content retention honours.
+    /// days). Content retention is this rounded up to whole days, so no
+    /// `expires_at` outlives the content.
     pub max_expiry_seconds: i64,
     /// Buffer size for file upload streams (default: 100)
     pub upload_buffer_size: usize,
@@ -2338,8 +2339,9 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub retained_response_retirement_enabled: bool,
 
-    /// Allow weekly batch-archive partition retirement. Disabled by default
-    /// and additionally requires an explicit retention period.
+    /// Allow weekly batch-archive partition retirement. Disabled by default.
+    /// Retention follows `batches.files.max_expiry_seconds`; see
+    /// [`content_retention_days`].
     #[serde(default)]
     pub batch_archive_retirement_enabled: bool,
 
@@ -2350,20 +2352,21 @@ pub struct DaemonConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_generation_writes_enabled: Option<bool>,
 
-    /// Allow file-content expiry and weekly template partition retirement.
-    /// Disabled by default and additionally requires an explicit retention
-    /// period.
+    /// Allow weekly template partition retirement. Disabled by default.
+    /// Retention follows `batches.files.max_expiry_seconds`; see
+    /// [`content_retention_days`].
     #[serde(default)]
     pub template_retirement_enabled: bool,
 
-    /// Creation-anchored input-content retention period in days. No default:
-    /// enabling template retirement without it fails startup.
-    #[serde(default)]
+    /// Deprecated and ignored: content retention follows
+    /// `batches.files.max_expiry_seconds`. The key is still accepted so
+    /// existing values files keep parsing; a warning is logged at startup
+    /// when it is set. Remove it from your configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_retention_days: Option<u32>,
 
-    /// Finalization-anchored batch content retention period in days. No
-    /// default: enabling batch-archive retirement without it fails startup.
-    #[serde(default)]
+    /// Deprecated and ignored; see `template_retention_days`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_archive_retention_days: Option<u32>,
 
     /// Explicit direct/session-capable primary endpoint used only for
@@ -2754,8 +2757,24 @@ impl Default for DaemonConfig {
     }
 }
 
+/// Content retention in whole days, derived from the longest file expiry an
+/// upload may ask for, rounded up: `ceil(max_expiry_seconds / 1 day)`.
+///
+/// Both weekly content families (batch archive and request templates) drop a
+/// week once `week_start + 7 days + this` has passed. Every file's
+/// `expires_at` is at most `created_at + max_expiry_seconds`, which is at
+/// most the week's end plus this, so the date the API shows can never
+/// outrun the content.
+pub fn content_retention_days(max_expiry_seconds: i64) -> u32 {
+    const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
+    let days = max_expiry_seconds.max(1).saturating_add(SECONDS_PER_DAY - 1) / SECONDS_PER_DAY;
+    u32::try_from(days.min(i64::from(i32::MAX))).unwrap_or(i32::MAX as u32)
+}
+
 impl DaemonConfig {
-    pub fn to_fusillade_retention_maintenance_config(&self) -> fusillade::RetentionMaintenanceConfig {
+    /// Build the daemon's retention maintenance controls. Content retention
+    /// is derived from `max_expiry_seconds`; see [`content_retention_days`].
+    pub fn to_fusillade_retention_maintenance_config(&self, max_expiry_seconds: i64) -> fusillade::RetentionMaintenanceConfig {
         fusillade::RetentionMaintenanceConfig::new(self.retention.clone())
             .with_batchless_archive_sweep_enabled(self.batchless_archive_sweep_enabled)
             .with_batchless_archive_backfill_enabled(self.batchless_archive_backfill_enabled)
@@ -2764,9 +2783,8 @@ impl DaemonConfig {
             .with_retained_response_partitions_days_ahead(self.retained_response_partitions_days_ahead)
             .with_retained_response_retirement_enabled(self.retained_response_retirement_enabled)
             .with_batch_archive_retirement_enabled(self.batch_archive_retirement_enabled)
-            .with_batch_archive_retention_days(self.batch_archive_retention_days)
             .with_template_retirement_enabled(self.template_retirement_enabled)
-            .with_template_retention_days(self.template_retention_days)
+            .with_content_retention_days(Some(content_retention_days(max_expiry_seconds)))
     }
 
     /// Convert to fusillade daemon config
@@ -3862,22 +3880,6 @@ impl Config {
             });
         }
         if owns_archive_maintenance
-            && daemon.batch_archive_retirement_enabled
-            && daemon.batch_archive_retention_days.is_none_or(|days| days < 1)
-        {
-            return Err(Error::Internal {
-                operation:
-                    "Config validation: batch-archive partition retirement requires an explicit positive batch_archive_retention_days"
-                        .to_string(),
-            });
-        }
-        if owns_archive_maintenance && daemon.template_retirement_enabled && daemon.template_retention_days.is_none_or(|days| days < 1) {
-            return Err(Error::Internal {
-                operation: "Config validation: template partition retirement requires an explicit positive template_retention_days"
-                    .to_string(),
-            });
-        }
-        if owns_archive_maintenance
             && batchless_movement_enabled
             && (daemon.batchless_archive_groups_per_tick <= 0 || daemon.batchless_archive_bytes_per_tick <= 0)
         {
@@ -4402,7 +4404,7 @@ mod tests {
         assert_eq!(daemon.batchless_archive_backfill_concurrency, 1);
         assert!(daemon.retained_response_partitions_days_ahead > 0);
 
-        let mapped = daemon.to_fusillade_retention_maintenance_config();
+        let mapped = daemon.to_fusillade_retention_maintenance_config(30 * 24 * 60 * 60 + 1);
         assert_eq!(mapped.policy(), &daemon.retention);
         assert_eq!(mapped.batchless_archive_sweep_enabled(), daemon.batchless_archive_sweep_enabled);
         assert_eq!(
@@ -4424,7 +4426,12 @@ mod tests {
             daemon.retained_response_retirement_enabled
         );
         assert_eq!(mapped.batch_archive_retirement_enabled(), daemon.batch_archive_retirement_enabled);
-        assert_eq!(mapped.batch_archive_retention_days(), daemon.batch_archive_retention_days);
+        assert_eq!(mapped.template_retirement_enabled(), daemon.template_retirement_enabled);
+        assert_eq!(
+            mapped.content_retention_days(),
+            Some(31),
+            "retention rounds max expiry up to whole days"
+        );
     }
 
     #[test]
@@ -5159,6 +5166,16 @@ secret_key: "test-secret-key"
     }
 
     #[test]
+    fn content_retention_rounds_max_expiry_up_to_whole_days() {
+        let day = 24 * 60 * 60;
+        assert_eq!(content_retention_days(1), 1);
+        assert_eq!(content_retention_days(day), 1);
+        assert_eq!(content_retention_days(day + 1), 2);
+        assert_eq!(content_retention_days(30 * day), 30);
+        assert_eq!(content_retention_days(i64::MAX), i32::MAX as u32);
+    }
+
+    #[test]
     fn retention_config_is_accepted_on_an_instance_that_never_runs_the_daemon() {
         // Split topology: API pods share the daemon pods' environment but run
         // with the daemon disabled. They own no maintenance and must not
@@ -5173,10 +5190,12 @@ secret_key: "test-secret-key"
         daemon.batchless_archive_sweep_enabled = true;
         daemon.retained_response_retirement_enabled = true;
         daemon.batch_archive_retirement_enabled = true;
+        // Deprecated no-op key: still parses, never rejects.
         daemon.batch_archive_retention_days = Some(1);
         // Deprecated no-op key: still parses, never rejects.
         daemon.template_generation_writes_enabled = Some(true);
         daemon.template_retirement_enabled = true;
+        // Deprecated no-op key: still parses, never rejects.
         daemon.template_retention_days = Some(1);
         assert!(config.validate().is_ok(), "{:?}", config.validate().err());
     }

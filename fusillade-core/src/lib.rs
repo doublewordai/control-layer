@@ -37,10 +37,9 @@ pub use daemon_record::{
 };
 pub use error::{FusilladeError, Result};
 pub use manager::{
-    DaemonStorage, FileExpiryCursor, FileExpiryStep, ModelFilter, ModelFilterState,
-    RetainedResponseArchiveOutcome, RetainedResponseMaintenanceError,
-    RetainedResponsePartitionRunway, RetainedResponseRetirementOutcome, RetentionPolicy, Storage,
-    TrailingDemandCount,
+    DaemonStorage, ModelFilter, ModelFilterState, RetainedResponseArchiveOutcome,
+    RetainedResponseMaintenanceError, RetainedResponsePartitionRunway,
+    RetainedResponseRetirementOutcome, RetentionPolicy, Storage, TrailingDemandCount,
 };
 pub use request::*;
 

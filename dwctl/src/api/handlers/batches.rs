@@ -1787,7 +1787,7 @@ pub async fn delete_batch<P: PoolProvider>(
     description = "Retry a batch: failed AND canceled requests are reset to pending and will be processed again; completed work is never redone. Retrying a cancelled batch overturns the cancellation (cancel-then-retry acts as pause/resume), so this also succeeds on a just-cancelled batch whose requests had not yet settled. Use it after fixing transient issues, increasing rate limits, or to resume a cancelled batch.",
     responses(
         (status = 200, description = "Requests queued for retry (or a cancellation was overturned and the batch resumed).", body = BatchResponse),
-        (status = 400, description = "Nothing to retry: no failed or canceled requests, and the batch was not cancelled."),
+        (status = 400, description = "The batch cannot be retried: it has no failed or canceled requests and was not cancelled, it is past the retry age cut-off, or its input or results have been deleted by content retention."),
         (status = 404, description = "Batch not found or you don't have access to it."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
@@ -1829,8 +1829,13 @@ pub async fn retry_failed_batch_requests<P: PoolProvider>(
         .request_manager
         .retry_failed_requests_for_batch(fusillade::BatchId(batch_id))
         .await
-        .map_err(|e| Error::Internal {
-            operation: format!("retry failed requests: {}", e),
+        .map_err(|e| match e {
+            // Refusals the client can act on: the batch is past its retry
+            // age cut-off, or its input or results have been retired.
+            fusillade::FusilladeError::ValidationError(message) => Error::BadRequest { message },
+            e => Error::Internal {
+                operation: format!("retry failed requests: {}", e),
+            },
         })?;
 
     // retried_count == 0 is still SUCCESS when the retry overturned a
@@ -1879,7 +1884,7 @@ Use this for fine-grained control over which requests to retry, rather than retr
     request_body = RetryRequestsRequest,
     responses(
         (status = 200, description = "Specified requests queued for retry.", body = BatchResponse),
-        (status = 400, description = "No valid request IDs provided."),
+        (status = 400, description = "No valid request IDs provided, or the batch is past the retry age cut-off. Requests whose input has been deleted by content retention are left as they are; the batch is returned with status 200."),
         (status = 404, description = "Batch not found or you don't have access to it."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
@@ -1941,8 +1946,13 @@ pub async fn retry_specific_requests<P: PoolProvider>(
         .request_manager
         .retry_failed_requests(fusillade::BatchId(batch_id), request_ids.clone())
         .await
-        .map_err(|e| Error::Internal {
-            operation: format!("retry failed requests: {}", e),
+        .map_err(|e| match e {
+            // The batch is past its retry age cut-off. A request whose input
+            // has been retired is refused on its own, in `results`.
+            fusillade::FusilladeError::ValidationError(message) => Error::BadRequest { message },
+            e => Error::Internal {
+                operation: format!("retry failed requests: {}", e),
+            },
         })?;
 
     // Check for any failures

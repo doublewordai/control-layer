@@ -82,6 +82,7 @@ const DAILY_RESPONSE_FAMILY: FamilySpec = FamilySpec {
         LIMIT 1
         "#,
     candidate_binds_retention: false,
+    recheck_sql: None,
     completion_sql: None,
 };
 

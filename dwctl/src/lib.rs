@@ -4472,7 +4472,10 @@ impl Application {
             .background_services
             .batch_daemon
             .to_fusillade_config_with_limits(Some(model_capacity_limits.clone()));
-        let retention_maintenance_config = config.background_services.batch_daemon.to_fusillade_retention_maintenance_config();
+        let retention_maintenance_config = config
+            .background_services
+            .batch_daemon
+            .to_fusillade_retention_maintenance_config(config.batches.files.max_expiry_seconds);
 
         if let Some(value) = config.background_services.batch_daemon.template_generation_writes_enabled {
             tracing::warn!(
@@ -4480,6 +4483,26 @@ impl Application {
                 "batch_daemon.template_generation_writes_enabled is deprecated and ignored: \
                  the weekly generation-2 template store is the only write path. Remove the key."
             );
+        }
+        for (key, value) in [
+            (
+                "template_retention_days",
+                config.background_services.batch_daemon.template_retention_days,
+            ),
+            (
+                "batch_archive_retention_days",
+                config.background_services.batch_daemon.batch_archive_retention_days,
+            ),
+        ] {
+            if let Some(days) = value {
+                tracing::warn!(
+                    key,
+                    days,
+                    max_expiry_seconds = config.batches.files.max_expiry_seconds,
+                    "batch_daemon.{key} is deprecated and ignored: content retention follows \
+                     batches.files.max_expiry_seconds. Remove the key."
+                );
+            }
         }
         let mut request_manager = fusillade_arsenal::PostgresRequestManager::new(
             fusillade_pools.clone(),
@@ -4510,7 +4533,8 @@ impl Application {
         })
         .with_batch_insert_strategy(fusillade_arsenal::BatchInsertStrategy::Batched {
             batch_size: config.batches.files.batch_insert_size,
-        });
+        })
+        .with_retry_age_limit(retention_maintenance_config.retry_age_limit());
         if pools.fusillade.is_split()
             && let config::ComponentDb::Schema {
                 name,

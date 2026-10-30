@@ -378,6 +378,8 @@ The expiry settings must be positive and ordered `min_expiry_seconds <= default_
 - `GET /ai/v1/batches/{batch_id}/results` returns 410 once the batch's output or error file is past its `expires_at`.
 - Output and error files expire `default_expiry_seconds` after the batch is created. OpenAI counts from when the batch completes instead, so here they expire up to one completion window earlier. Output and error files created before they were given an expiry are treated as expiring `default_expiry_seconds` after their creation.
 
+Stored batch content is deleted in weekly partitions by two retirement switches under `background_services.batch_daemon`, both `false` by default: `template_retirement_enabled` deletes batch inputs (request templates) and `batch_archive_retirement_enabled` deletes archived batch results. An enabled family deletes a week no earlier than `max_expiry_seconds` (rounded up to whole days) after the end of the week the content was created in. While either switch is on, a batch retry is refused with 400 once the batch or its input file is older than that period minus one day. The former `background_services.batch_daemon.batch_archive_retention_days` and `background_services.batch_daemon.template_retention_days` keys are deprecated and ignored; remove them.
+
 ## Background Services
 
 ### Onwards Sync

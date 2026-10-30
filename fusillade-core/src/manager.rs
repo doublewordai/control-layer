@@ -339,24 +339,6 @@ pub enum RetainedResponseRetirementOutcome {
     Retired,
 }
 
-/// Position in the oldest-first walk over files due for content expiry: the
-/// `(created_at, id)` of the last file a step examined.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileExpiryCursor {
-    pub created_at: DateTime<Utc>,
-    pub id: uuid::Uuid,
-}
-
-/// Content-free result of one bounded file-content expiry step.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileExpiryStep {
-    /// Files tombstoned by this step.
-    pub expired: u64,
-    /// Where the next step continues, or `None` once the walk has reached
-    /// the retention horizon.
-    pub next: Option<FileExpiryCursor>,
-}
-
 #[cfg(test)]
 mod retention_policy_tests {
     use super::*;
@@ -1870,10 +1852,10 @@ pub trait DaemonStorage: Send + Sync {
         Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
     }
 
-    /// Retire one weekly batch-archive partition whose every batch is past
-    /// the finalization-anchored `retention_days`. Batch metadata rows are
-    /// stamped, never deleted. Storage backends opt in explicitly; the
-    /// default is disabled.
+    /// Retire one weekly batch-archive partition once the week is past
+    /// `retention_days`, measured from the week itself, and no batch created
+    /// in it is unfinished. Batch metadata rows are never touched. Storage
+    /// backends opt in explicitly; the default is disabled.
     async fn retire_expired_batch_archive_partition(
         &self,
         _select_new: bool,
@@ -1882,31 +1864,15 @@ pub trait DaemonStorage: Send + Sync {
         Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
     }
 
-    /// Retire one weekly generation-2 template partition once it is past the
-    /// horizon and no live file still owns templates in it. Storage backends
-    /// opt in explicitly; the default is disabled.
+    /// Retire one weekly generation-2 template partition once it is past
+    /// `retention_days`, measured from the week itself, and no unfinished
+    /// batch reads input uploaded in it. Storage backends opt in explicitly;
+    /// the default is disabled.
     async fn retire_expired_template_partition(
         &self,
         _select_new: bool,
         _retention_days: i32,
     ) -> Result<RetainedResponseRetirementOutcome> {
-        Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
-    }
-
-    /// Tombstone aged-out input file metadata (content-free bounded update)
-    /// once every referencing batch's content is expired or erased.
-    ///
-    /// One call examines at most `scan_limit` due files after `after`,
-    /// oldest first, so its cost stays bounded however many due files live
-    /// batches still pin. Callers walk the due range by passing each step's
-    /// `next` back in. Storage backends opt in explicitly; the default is
-    /// disabled.
-    async fn expire_file_content(
-        &self,
-        _retention_days: i32,
-        _scan_limit: i64,
-        _after: Option<FileExpiryCursor>,
-    ) -> Result<FileExpiryStep> {
         Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
     }
 

@@ -106,7 +106,8 @@ where
                     config.claim_query_timeout_ms,
                 ))
                 .with_retained_response_fence_seconds(fence_seconds)
-                .with_retained_response_retention_bounds_seconds(retention_bounds),
+                .with_retained_response_retention_bounds_seconds(retention_bounds)
+                .with_retry_age_limit(retention.retry_age_limit()),
         );
         Ok(Self::from_store(storage, config).with_retention_maintenance(retention))
     }
