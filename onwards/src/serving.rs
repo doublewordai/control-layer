@@ -610,6 +610,7 @@ mod handler_tests {
     use serde_json::json;
 
     use super::*;
+    use crate::auth::KeyHash;
     use crate::handlers::target_message_handler;
     use crate::load_balancer::{Provider, ProviderPool};
     use crate::strict::build_strict_router;
@@ -691,7 +692,7 @@ mod handler_tests {
         );
         let key_labels = Arc::new(DashMap::new());
         key_labels.insert(
-            KEY.to_string(),
+            KeyHash::of(KEY),
             HashMap::from([
                 ("purpose".to_string(), s.purpose.to_string()),
                 (ACCOUNT_LABEL.to_string(), ACCOUNT.to_string()),

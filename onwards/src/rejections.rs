@@ -28,7 +28,10 @@ use axum::http::{HeaderMap, StatusCode};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
-use crate::{AppState, client::HttpClient, errors::OnwardsErrorResponse, serving, target::Targets};
+use crate::{
+    AppState, auth::KeyHash, client::HttpClient, errors::OnwardsErrorResponse, serving,
+    target::Targets,
+};
 
 /// Who made a request, from the key labels synced by the embedding gateway.
 ///
@@ -83,7 +86,7 @@ impl RejectionContext {
     /// As [`new`](Self::new), for a gateway that has already resolved the
     /// request's API key under its own protocol's rules.
     pub fn for_api_key(targets: &Targets, api_key: Option<&str>, dispatched: bool) -> Self {
-        let labels = api_key.and_then(|key| targets.key_labels.get(key));
+        let labels = api_key.and_then(|key| targets.key_labels.get(&KeyHash::of(key)));
         let label = |name: &str| labels.as_ref().and_then(|labels| labels.get(name).cloned());
         Self {
             authenticated: labels.is_some(),
