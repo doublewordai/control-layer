@@ -641,6 +641,14 @@ pub async fn create_batch<P: PoolProvider>(
         });
     }
 
+    // The repository refuses an unprocessed, deleted or expired source as
+    // well; this check only gives the client a precise message.
+    if file.status != fusillade::batch::FileStatus::Processed {
+        return Err(Error::BadRequest {
+            message: format!("Input file {} is {} and cannot be used for a batch", req.input_file_id, file.status),
+        });
+    }
+
     // Check that the file owner (whose API key is embedded in the request templates)
     // has sufficient balance. This catches cases where an admin creates a batch from
     // a file owned by another user/org that has negative balance.
@@ -907,8 +915,11 @@ pub async fn create_batch<P: PoolProvider>(
                 total_requests: Some(total_requests),
             })
             .await
-            .map_err(|e| Error::Internal {
-                operation: format!("create background batch record: {e}"),
+            .map_err(|e| match e {
+                fusillade::FusilladeError::ValidationError(message) => Error::BadRequest { message },
+                e => Error::Internal {
+                    operation: format!("create background batch record: {e}"),
+                },
             })?
     } else {
         // Bound how much an unverified creditor can queue. Checked before
@@ -962,13 +973,12 @@ pub async fn create_batch<P: PoolProvider>(
             });
         });
 
-        state
-            .request_manager
-            .create_batch_record(batch_input)
-            .await
-            .map_err(|e| Error::Internal {
+        state.request_manager.create_batch_record(batch_input).await.map_err(|e| match e {
+            fusillade::FusilladeError::ValidationError(message) => Error::BadRequest { message },
+            e => Error::Internal {
                 operation: format!("create batch record: {e}"),
-            })?
+            },
+        })?
     };
 
     // Enqueue background job to populate requests from templates.
@@ -1435,7 +1445,7 @@ Supports pagination via `limit` and `skip` query parameters, and filtering by `c
     responses(
         (status = 200, description = "Batch results as newline-delimited JSON. Check the `X-Incomplete` header to determine if more results exist.", content_type = "application/x-ndjson"),
         (status = 404, description = "Batch not found or you don't have access to it."),
-        (status = 410, description = "The batch's output or error file has been deleted, so its results are no longer available. Results whose input file was deleted are still returned, with `input_body` set to null."),
+        (status = 410, description = "The batch's output or error file has been deleted or has passed its `expires_at`, so its results are no longer available. Results whose input file was deleted are still returned, with `input_body` set to null."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
@@ -1486,7 +1496,7 @@ pub async fn get_batch_results<P: PoolProvider>(
     .into_iter()
     .filter_map(|(deleted, name)| deleted.then_some(name))
     .collect();
-    if !deleted_results_files.is_empty() {
+    let (Some(output_file_id), Some(error_file_id)) = (batch.output_file_id, batch.error_file_id) else {
         return Err(Error::Gone {
             message: format!(
                 "Results for batch {} are no longer available: its {} deleted.",
@@ -1496,6 +1506,27 @@ pub async fn get_batch_results<P: PoolProvider>(
                     _ => "output and error files have been".to_string(),
                 }
             ),
+        });
+    };
+
+    // Past the results files' `expires_at` their content is gone from
+    // `/files/{id}/content`, so it is gone here too. The repository's read
+    // supplies the date older results files are given, and marks them expired.
+    // Output and error files share one expiry; both are checked so neither
+    // can be served once its own date has passed.
+    let (output_file, error_file) = futures::try_join!(
+        state.request_manager.get_file(output_file_id),
+        state.request_manager.get_file(error_file_id),
+    )
+    .map_err(|e| Error::Internal {
+        operation: format!("fetch results files for batch {batch_id_str}: {e}"),
+    })?;
+    let now = chrono::Utc::now();
+    let is_expired =
+        |file: &fusillade::File| file.status == fusillade::batch::FileStatus::Expired || file.expires_at.is_some_and(|at| at <= now);
+    if is_expired(&output_file) || is_expired(&error_file) {
+        return Err(Error::Gone {
+            message: format!("Results for batch {batch_id_str} are no longer available: its results files have expired."),
         });
     }
 
@@ -3498,6 +3529,174 @@ mod tests {
         // Note: We can't easily verify the exact failed count since we didn't actually
         // create failed requests in the DB (just set the errors field). But we verified
         // it was hidden before, so the logic is working.
+    }
+
+    /// Upload a one-line `gpt-4` batch file for a user who can use the model.
+    async fn upload_input_file(app: &axum_test::TestServer, pool: &PgPool) -> (crate::api::models::users::UserResponse, String) {
+        let user = create_test_user_with_roles(pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(pool).await;
+        add_user_to_group(pool, user.id, group.id).await;
+        let deployment = create_test_deployment(pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(pool, deployment.id, group.id, user.id).await;
+
+        let jsonl = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let upload = app
+            .post("/ai/v1/files")
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", axum_test::multipart::Part::bytes(jsonl.as_bytes()).file_name("batch.jsonl")),
+            )
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload.json();
+        (user, file["id"].as_str().unwrap().to_string())
+    }
+
+    fn create_batch_request(input_file_id: &str, completion_window: &str) -> CreateBatchRequest {
+        CreateBatchRequest {
+            input_file_id: input_file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: completion_window.to_string(),
+            metadata: None,
+            api_key_id: None,
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn create_batch_rejects_an_expired_input_with_400(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let (user, file_id) = upload_input_file(&app, &pool).await;
+        sqlx::query("UPDATE fusillade.files SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+            .bind(Uuid::parse_str(&file_id).unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let response = app
+            .post("/ai/v1/batches")
+            .json(&create_batch_request(&file_id, "24h"))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+        assert!(response.text().contains("expired"), "unexpected response: {}", response.text());
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn results_files_show_an_expiry(pool: PgPool) {
+        // Not the built-in default, so this proves the setting reaches the
+        // repository rather than matching its own fallback.
+        let default_seconds = 2 * 24 * 60 * 60;
+        let mut config = create_test_config();
+        config.batches.files.default_expiry_seconds = default_seconds;
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let (user, file_id) = upload_input_file(&app, &pool).await;
+
+        let response = app
+            .post("/ai/v1/batches")
+            .json(&create_batch_request(&file_id, "24h"))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        response.assert_status(StatusCode::CREATED);
+        let batch: crate::api::models::batches::BatchResponse = response.json();
+
+        for results_file_id in [batch.output_file_id.unwrap(), batch.error_file_id.unwrap()] {
+            let file = app
+                .get(&format!("/ai/v1/files/{results_file_id}"))
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                .await;
+            file.assert_status_ok();
+            let file: serde_json::Value = file.json();
+            let expires_at = file["expires_at"].as_i64().expect("results files carry an expiry");
+            assert_eq!(expires_at, batch.created_at + default_seconds);
+        }
+    }
+
+    /// Past the results files' `expires_at`, `/files/{id}/content` answers 410;
+    /// the results endpoint must not serve the same content. Covers a stored
+    /// date on either file and the date derived for results files created
+    /// before they carried one, on both the paginated and the streaming paths.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn batch_results_are_gone_once_the_results_files_expire(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let (user, file_id) = upload_input_file(&app, &pool).await;
+        let auth = add_auth_headers(&user);
+
+        let response = app
+            .post("/ai/v1/batches")
+            .json(&create_batch_request(&file_id, "24h"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        response.assert_status(StatusCode::CREATED);
+        let batch: crate::api::models::batches::BatchResponse = response.json();
+        let output_file_id = Uuid::parse_str(&batch.output_file_id.unwrap()).unwrap();
+        let error_file_id = Uuid::parse_str(&batch.error_file_id.unwrap()).unwrap();
+        let paths = [
+            format!("/ai/v1/batches/{}/results", batch.id),
+            format!("/ai/v1/batches/{}/results?limit=10", batch.id),
+        ];
+        let assert_results = |status: StatusCode| {
+            let app = &app;
+            let auth = &auth;
+            let paths = &paths;
+            async move {
+                for path in paths {
+                    let response = app
+                        .get(path)
+                        .add_header(&auth[0].0, &auth[0].1)
+                        .add_header(&auth[1].0, &auth[1].1)
+                        .await;
+                    response.assert_status(status);
+                    if status == StatusCode::GONE {
+                        assert!(response.text().contains("expired"), "{path}: {}", response.text());
+                    }
+                }
+            }
+        };
+        let restore = |id: Uuid| {
+            let pool = &pool;
+            async move {
+                sqlx::query("UPDATE fusillade.files SET expires_at = NOW() + INTERVAL '1 day', status = 'processed' WHERE id = $1")
+                    .bind(id)
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            }
+        };
+
+        assert_results(StatusCode::OK).await;
+
+        // A stored date in the past on either file.
+        for id in [output_file_id, error_file_id] {
+            sqlx::query("UPDATE fusillade.files SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert_results(StatusCode::GONE).await;
+            restore(id).await;
+            assert_results(StatusCode::OK).await;
+        }
+
+        // A results file from before results carried an expiry reads as
+        // created_at + default; once that has passed, results are gone.
+        let default_seconds = crate::config::FilesConfig::default().default_expiry_seconds;
+        sqlx::query("UPDATE fusillade.files SET expires_at = NULL, created_at = NOW() - make_interval(secs => $2) WHERE id = $1")
+            .bind(output_file_id)
+            .bind((default_seconds + 1) as f64)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_results(StatusCode::GONE).await;
     }
 
     /// Give a hand-inserted batch the virtual output and error files that
