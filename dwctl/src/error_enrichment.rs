@@ -174,6 +174,24 @@ pub async fn error_enrichment_middleware(
             && let Ok(has_access) = check_user_has_model_access(pools.write().into_inner(), *user_id, model).await
             && !has_access
         {
+            if let Ok(Some(message)) = retirement_message(pools.write().into_inner(), model).await {
+                let body = serde_json::json!({
+                    "error": {
+                        "message": message,
+                        "type": "invalid_request_error",
+                        "param": null,
+                        "code": "model_not_found"
+                    }
+                });
+                return tag(
+                    Response::builder()
+                        .status(StatusCode::GONE)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap_or_else(|_| StatusCode::GONE.into_response()),
+                    "model_retired",
+                );
+            }
             return tag(
                 Error::ModelAccessDenied {
                     model_name: model.clone(),
@@ -603,6 +621,9 @@ pub async fn validate_api_key_model_access(pool: PgPool, api_key: &str, model: &
         .map_err(|e| format!("Failed to check model access: {e}"))?;
 
     if !has_access {
+        if let Ok(Some(message)) = retirement_message(pool.clone(), model).await {
+            return Err(message);
+        }
         return Err(format!(
             "You do not have access to '{}'. Please contact your administrator to request access.",
             model
@@ -635,6 +656,18 @@ fn modality_blocked_message(purpose: &str, model: &str) -> String {
     )
 }
 
+#[instrument(skip_all, name = "dwctl.retirement_message")]
+async fn retirement_message(pool: PgPool, model_alias: &str) -> Result<Option<String>, DbError> {
+    let mut conn = pool.acquire().await?;
+    let message = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT metadata->>'retirement_message' FROM deployed_models WHERE alias = $1 AND deleted = false LIMIT 1",
+    )
+    .bind(model_alias)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(message.flatten())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -664,6 +697,66 @@ mod tests {
         // Empty string falls back to a generic label rather than producing
         // a sentence starting with " access to ...".
         assert_eq!(modality_label(""), "This");
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_error_enrichment_middleware_reports_retired_model(pool: PgPool) {
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let api_key = ApiKeys::new(&mut conn)
+            .create(&ApiKeyCreateDBRequest {
+                user_id: user.id,
+                name: "Test Key".to_string(),
+                description: None,
+                purpose: ApiKeyPurpose::Realtime,
+                created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
+            })
+            .await
+            .unwrap();
+        drop(conn);
+
+        let endpoint_id = crate::test::utils::create_test_endpoint(&pool, "test-endpoint", user.id).await;
+        let deployment_id = crate::test::utils::create_test_model(&pool, "retired-model-name", "retired-model", endpoint_id, user.id).await;
+        sqlx::query("UPDATE deployed_models SET metadata = $1 WHERE id = $2")
+            .bind(serde_json::json!({"retirement_message": "The model `retired-model` was shut down. Use `current-model` instead."}))
+            .bind(deployment_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let router = axum::Router::new()
+            .route(
+                "/ai/v1/chat/completions",
+                axum::routing::post(|| async { StatusCode::FORBIDDEN.into_response() }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                sqlx_pool_router::DynPools::new(pool.clone()),
+                error_enrichment_middleware,
+            ));
+        let server = axum_test::TestServer::new(router).expect("Failed to create test server");
+
+        let retired = server
+            .post("/ai/v1/chat/completions")
+            .add_header("authorization", &format!("Bearer {}", api_key.secret))
+            .json(&serde_json::json!({"model": "retired-model", "messages": []}))
+            .await;
+        retired.assert_status(StatusCode::GONE);
+        let body: serde_json::Value = retired.json();
+        assert_eq!(body["error"]["code"], "model_not_found");
+        assert_eq!(
+            body["error"]["message"],
+            "The model `retired-model` was shut down. Use `current-model` instead."
+        );
+
+        let unknown = server
+            .post("/ai/v1/chat/completions")
+            .add_header("authorization", &format!("Bearer {}", api_key.secret))
+            .json(&serde_json::json!({"model": "test-model", "messages": []}))
+            .await;
+        unknown.assert_status(StatusCode::FORBIDDEN);
     }
 
     /// Integration test: Error enrichment middleware enriches 403 with balance info
