@@ -2330,7 +2330,7 @@ mod tests {
 
         // Issued key: owned by the workspace, attributed to the member.
         sqlx::query!(
-            "INSERT INTO api_keys (user_id, created_by, name, secret, purpose) VALUES ($1, $2, 'issued', 'sk-issued-key', 'inference')",
+            "INSERT INTO api_keys (user_id, created_by, name, secret, secret_hash, secret_prefix, purpose) VALUES ($1, $2, 'issued', 'sk-issued-key', sha256(convert_to('sk-issued-key', 'UTF8')), left('sk-issued-key', 8), 'inference')",
             org.id,
             member
         )
@@ -2339,7 +2339,7 @@ mod tests {
         .unwrap();
         // A key the owner holds in the same workspace must be left alone.
         sqlx::query!(
-            "INSERT INTO api_keys (user_id, created_by, name, secret, purpose) VALUES ($1, $2, 'owners', 'sk-owner-key', 'inference')",
+            "INSERT INTO api_keys (user_id, created_by, name, secret, secret_hash, secret_prefix, purpose) VALUES ($1, $2, 'owners', 'sk-owner-key', sha256(convert_to('sk-owner-key', 'UTF8')), left('sk-owner-key', 8), 'inference')",
             org.id,
             owner
         )
@@ -2389,7 +2389,7 @@ mod tests {
             .unwrap();
 
         let key_id: uuid::Uuid = sqlx::query_scalar!(
-            "INSERT INTO api_keys (user_id, created_by, name, secret, purpose) VALUES ($1, $1, 'org key', 'sk-conn-key', 'inference') RETURNING id",
+            "INSERT INTO api_keys (user_id, created_by, name, secret, secret_hash, secret_prefix, purpose) VALUES ($1, $1, 'org key', 'sk-conn-key', sha256(convert_to('sk-conn-key', 'UTF8')), left('sk-conn-key', 8), 'inference') RETURNING id",
             org.id
         )
         .fetch_one(&mut *conn)
@@ -2486,7 +2486,7 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         assert!(Users::new(&mut conn).delete(departed).await.unwrap());
         sqlx::query!(
-            "INSERT INTO api_keys (user_id, created_by, name, secret, purpose) VALUES ($1, $1, 'org key', 'sk-test-org-key', 'inference')",
+            "INSERT INTO api_keys (user_id, created_by, name, secret, secret_hash, secret_prefix, purpose) VALUES ($1, $1, 'org key', 'sk-test-org-key', sha256(convert_to('sk-test-org-key', 'UTF8')), left('sk-test-org-key', 8), 'inference')",
             org.id
         )
         .execute(&mut *conn)

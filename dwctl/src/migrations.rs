@@ -1244,3 +1244,6 @@ mod public_class_tests;
 
 #[cfg(test)]
 mod analytics_indexes_tests;
+
+#[cfg(test)]
+mod api_key_hash_tests;

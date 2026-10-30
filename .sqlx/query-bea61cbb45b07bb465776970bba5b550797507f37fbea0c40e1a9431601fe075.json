@@ -1,12 +1,12 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT ak.secret, ak.user_id, u.zero_data_retention, u.disabled_modalities, u.toleration_preset\n        FROM api_keys ak\n        JOIN users u ON u.id = ak.user_id\n        WHERE NOT ak.is_deleted\n        ",
+  "query": "\n        SELECT ak.secret_hash, ak.user_id, u.zero_data_retention, u.disabled_modalities, u.toleration_preset\n        FROM api_keys ak\n        JOIN users u ON u.id = ak.user_id\n        WHERE NOT ak.is_deleted\n        ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "secret",
-        "type_info": "Varchar"
+        "name": "secret_hash",
+        "type_info": "Bytea"
       },
       {
         "ordinal": 1,
@@ -33,12 +33,12 @@
       "Left": []
     },
     "nullable": [
-      false,
+      true,
       false,
       false,
       false,
       true
     ]
   },
-  "hash": "8fbd0c37b78964f008a9ad0b0918b08d0f0dede0bf76c66a853fdaeea27ce809"
+  "hash": "bea61cbb45b07bb465776970bba5b550797507f37fbea0c40e1a9431601fe075"
 }

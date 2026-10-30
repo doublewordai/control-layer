@@ -1,5 +1,6 @@
 //! User extraction from request authentication.
 
+use crate::crypto::hash_api_key;
 use crate::db::errors::DbError;
 use crate::{
     AppState,
@@ -381,9 +382,9 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
                u.payment_provider_id, u.last_login
         FROM api_keys ak
         INNER JOIN users u ON ak.created_by = u.id
-        WHERE ak.secret = $1 AND ak.is_deleted = false
+        WHERE ak.secret_hash = $1 AND ak.is_deleted = false
         "#,
-        api_key
+        &hash_api_key(api_key)[..]
     )
     .fetch_optional(&mut *conn)
     .await
@@ -655,8 +656,9 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
         let mut auth_errors = Vec::new();
         let mut any_auth_attempted = false;
 
-        // Try API key authentication first (most specific)
-        match try_api_key_auth(parts, &state.db.read()).await {
+        // Try API key authentication first (most specific). Primary pool: replica
+        // lag must not reject a just-created key or accept a just-deleted one.
+        match try_api_key_auth(parts, &state.db.write()).await {
             Some(Ok((mut user, last_login))) => {
                 debug!("Authentication successful via API key");
                 trace!("Authenticated user: {}", user.id);

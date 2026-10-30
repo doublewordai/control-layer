@@ -13,6 +13,7 @@ use fusillade_arsenal::PostgresRequestManager;
 use sqlx_pool_router::PoolProvider;
 use uuid::Uuid;
 
+use crate::crypto::hash_api_key;
 use crate::inference::response_store::{ResponseContext, ResponseStore, StoreError};
 
 /// Header set by the inference middleware so the outlet handler knows which
@@ -325,8 +326,8 @@ pub async fn poll_until_complete<P: PoolProvider + Clone>(
 /// Returns `Some(user_id)` if the key is found, `None` otherwise.
 pub async fn lookup_created_by(pool: &sqlx::PgPool, api_key: Option<&str>) -> Option<String> {
     let key = api_key?;
-    match sqlx::query("SELECT user_id FROM public.api_keys WHERE secret = $1 AND is_deleted = false LIMIT 1")
-        .bind(key)
+    match sqlx::query("SELECT user_id FROM public.api_keys WHERE secret_hash = $1 AND is_deleted = false LIMIT 1")
+        .bind(&hash_api_key(key)[..])
         .fetch_optional(pool)
         .await
     {

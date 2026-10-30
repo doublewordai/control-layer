@@ -1,6 +1,7 @@
 //! Lightweight per-key account policy sync.
 //!
-//! Maintains a memory-local map from api key secret to the owning account's
+//! Maintains a memory-local map from api key (by the SHA-256 hash of its
+//! secret, as stored in `api_keys.secret_hash`) to the owning account's
 //! request policy: the `users.zero_data_retention` flag (read by
 //! [`crate::inference::zdr::is_zdr_request`]), the account's
 //! `users.disabled_modalities` (read by the inference middleware's modality
@@ -25,9 +26,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::config::ONWARDS_CONFIG_CHANGED_CHANNEL;
+use crate::crypto::hash_api_key;
 use crate::metrics::errors::component;
 use crate::modalities::ModalitySet;
 use crate::scheduling::TolerationPresets;
+
+/// SHA-256 of an API key secret, as stored in `api_keys.secret_hash`.
+type KeyHash = [u8; 32];
 
 /// The account-level policy a key inherits from its owner (`api_keys.user_id`,
 /// the organization for an org key).
@@ -81,7 +86,7 @@ impl AccountTolerations {
     }
 }
 
-/// Lock-free, cheap-to-clone handle to the shared secret-to-policy map, plus
+/// Lock-free, cheap-to-clone handle to the shared key-hash-to-policy map, plus
 /// the deployment's resolved toleration presets the ids are looked up in.
 ///
 /// A secret absent from the map is a deleted or invalid key (auth rejects it
@@ -89,7 +94,9 @@ impl AccountTolerations {
 /// reads as the permissive default: not ZDR, nothing disabled, Default preset.
 #[derive(Clone)]
 pub struct KeyPolicyCache {
-    inner: Arc<ArcSwap<HashMap<String, KeyPolicy>>>,
+    /// Keyed by `hash_api_key(secret)`: the accessors take the presented
+    /// secret and hash it, so no plaintext key is held here.
+    inner: Arc<ArcSwap<HashMap<KeyHash, KeyPolicy>>>,
     /// The config presets a stored `toleration_preset` id resolves against.
     /// Shared by `Arc` (the map inside is immutable after construction), so a
     /// clone is cheap and a hot-path resolve holds no lock.
@@ -119,7 +126,7 @@ impl KeyPolicyCache {
     /// The policy for the api key `secret`, or the default for an unknown key.
     /// Hot-path safe.
     pub fn policy(&self, secret: &str) -> KeyPolicy {
-        self.inner.load().get(secret).cloned().unwrap_or_default()
+        self.inner.load().get(&hash_api_key(secret)).cloned().unwrap_or_default()
     }
 
     /// The policy for `secret` if the key is present in the map, or `None` when
@@ -128,7 +135,7 @@ impl KeyPolicyCache {
     /// cached account on the permissive default, so a caller can decide whether
     /// a DB read is warranted. Hot-path safe.
     pub fn policy_if_known(&self, secret: &str) -> Option<KeyPolicy> {
-        self.inner.load().get(secret).cloned()
+        self.inner.load().get(&hash_api_key(secret)).cloned()
     }
 
     /// Whether the api key `secret` belongs to a ZDR account. Hot-path safe.
@@ -147,8 +154,10 @@ impl KeyPolicyCache {
     /// config no longer defines fails closed to the empty list. Hot path safe.
     pub fn tolerations(&self, secret: &str, model: &str) -> Option<Arc<serde_json::Value>> {
         let map = self.inner.load();
-        self.presets
-            .resolve(map.get(secret).and_then(|policy| policy.toleration_preset_for(model)))
+        self.presets.resolve(
+            map.get(&hash_api_key(secret))
+                .and_then(|policy| policy.toleration_preset_for(model)),
+        )
     }
 
     /// Everything needed to resolve the tolerations of the account owning
@@ -180,7 +189,7 @@ impl KeyPolicyCache {
         self.presets.store(presets);
     }
 
-    fn replace(&self, map: HashMap<String, KeyPolicy>) {
+    fn replace(&self, map: HashMap<KeyHash, KeyPolicy>) {
         self.inner.store(Arc::new(map));
     }
 
@@ -191,7 +200,7 @@ impl KeyPolicyCache {
         cache.replace(
             pairs
                 .into_iter()
-                .map(|(secret, zdr)| (secret, KeyPolicy { zdr, ..Default::default() }))
+                .map(|(secret, zdr)| (hash_api_key(&secret), KeyPolicy { zdr, ..Default::default() }))
                 .collect(),
         );
         cache
@@ -201,7 +210,7 @@ impl KeyPolicyCache {
     #[cfg(test)]
     pub fn from_policies<I: IntoIterator<Item = (String, KeyPolicy)>>(pairs: I) -> Self {
         let cache = Self::empty();
-        cache.replace(pairs.into_iter().collect());
+        cache.replace(pairs.into_iter().map(|(secret, policy)| (hash_api_key(&secret), policy)).collect());
         cache
     }
 
@@ -210,17 +219,17 @@ impl KeyPolicyCache {
     #[cfg(test)]
     pub fn from_policies_with_presets<I: IntoIterator<Item = (String, KeyPolicy)>>(presets: TolerationPresets, pairs: I) -> Self {
         let cache = Self::with_presets(presets);
-        cache.replace(pairs.into_iter().collect());
+        cache.replace(pairs.into_iter().map(|(secret, policy)| (hash_api_key(&secret), policy)).collect());
         cache
     }
 }
 
-/// Run the join and collect the flat secret-to-policy map. The settings live
+/// Run the join and collect the flat key-hash-to-policy map. The settings live
 /// on `users` (account-wide); a key inherits its owner's via `api_keys.user_id`.
-async fn load(pool: &PgPool) -> Result<HashMap<String, KeyPolicy>, sqlx::Error> {
+async fn load(pool: &PgPool) -> Result<HashMap<KeyHash, KeyPolicy>, sqlx::Error> {
     let rows = sqlx::query!(
         r#"
-        SELECT ak.secret, ak.user_id, u.zero_data_retention, u.disabled_modalities, u.toleration_preset
+        SELECT ak.secret_hash, ak.user_id, u.zero_data_retention, u.disabled_modalities, u.toleration_preset
         FROM api_keys ak
         JOIN users u ON u.id = ak.user_id
         WHERE NOT ak.is_deleted
@@ -230,18 +239,21 @@ async fn load(pool: &PgPool) -> Result<HashMap<String, KeyPolicy>, sqlx::Error> 
     .await?;
     let model_presets = load_model_presets(pool, None).await?;
 
+    // A row without a hash cannot authenticate, so it needs no policy; the
+    // `secret_hash IS NOT NULL` check makes that unreachable in practice.
     Ok(rows
         .into_iter()
-        .map(|r| {
-            (
-                r.secret,
+        .filter_map(|r| {
+            let hash = r.secret_hash.as_deref().and_then(|bytes| KeyHash::try_from(bytes).ok())?;
+            Some((
+                hash,
                 KeyPolicy {
                     zdr: r.zero_data_retention,
                     disabled_modalities: ModalitySet::from_db(&r.disabled_modalities),
                     toleration_preset: r.toleration_preset.map(Arc::from),
                     model_toleration_presets: model_presets.get(&r.user_id).cloned(),
                 },
-            )
+            ))
         })
         .collect())
 }
@@ -434,7 +446,7 @@ mod tests {
         assert!(!handle.is_zdr("sk-on"));
         cache.replace(
             [(
-                "sk-on".to_string(),
+                hash_api_key("sk-on"),
                 KeyPolicy {
                     zdr: true,
                     ..Default::default()

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT k.id, k.user_id, k.purpose, u.display_name, u.username\n        FROM api_keys k\n        JOIN users u ON u.id = k.user_id\n        WHERE k.secret = $1 AND k.is_deleted = false\n        ",
+  "query": "\n        SELECT k.id, k.user_id, k.purpose, u.display_name, u.username\n        FROM api_keys k\n        JOIN users u ON u.id = k.user_id\n        WHERE k.secret_hash = $1 AND k.is_deleted = false\n        ",
   "describe": {
     "columns": [
       {
@@ -31,7 +31,7 @@
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "Bytea"
       ]
     },
     "nullable": [
@@ -42,5 +42,5 @@
       false
     ]
   },
-  "hash": "95b9724b577aa55950d83aafcf37cde311730e6fb33cb2004f7091d8e4478947"
+  "hash": "c49df817efb141f8a7e6bdfe191a0dba332b01d05cef5bb250b277101fffe657"
 }

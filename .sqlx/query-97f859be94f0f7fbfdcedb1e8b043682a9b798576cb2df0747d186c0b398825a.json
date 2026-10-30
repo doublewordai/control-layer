@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            created_by AS \"created_by!\",\n            user_id AS \"user_id!\",\n            (purpose = 'batch' AND hidden) AS \"is_daemon_dispatch!\"\n        FROM api_keys\n        WHERE secret = $1 AND is_deleted = FALSE\n        LIMIT 1\n        ",
+  "query": "\n        SELECT\n            created_by AS \"created_by!\",\n            user_id AS \"user_id!\",\n            (purpose = 'batch' AND hidden) AS \"is_daemon_dispatch!\"\n        FROM api_keys\n        WHERE secret_hash = $1 AND is_deleted = FALSE\n        LIMIT 1\n        ",
   "describe": {
     "columns": [
       {
@@ -21,7 +21,7 @@
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "Bytea"
       ]
     },
     "nullable": [
@@ -30,5 +30,5 @@
       null
     ]
   },
-  "hash": "6fe8629904a81b14af375d1ecf8d15a550019b8c02b07a6156fffeadf1637c75"
+  "hash": "97f859be94f0f7fbfdcedb1e8b043682a9b798576cb2df0747d186c0b398825a"
 }
