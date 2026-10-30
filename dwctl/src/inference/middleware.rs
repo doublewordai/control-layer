@@ -448,17 +448,21 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 return refuse(response, "unauthenticated", None);
             }
             Some(key) => {
-                if let Err(msg) =
-                    crate::error_enrichment::validate_api_key_model_access(state.dwctl_pool.write().into_inner(), key, model).await
-                {
-                    let response = Response::builder()
-                        .status(StatusCode::FORBIDDEN)
-                        .header("content-type", "application/json")
-                        .body(Body::from(
-                            serde_json::json!({"error": {"message": msg, "type": "invalid_request_error"}}).to_string(),
-                        ))
-                        .unwrap();
-                    return refuse(response, "forbidden", None);
+                match crate::error_enrichment::validate_api_key_model_access(state.dwctl_pool.write().into_inner(), key, model).await {
+                    Ok(()) => {}
+                    Err(crate::error_enrichment::ModelAccessRefusal::Retired(message)) => {
+                        return refuse(crate::error_enrichment::retired_model_response(&message), "model_retired", None);
+                    }
+                    Err(crate::error_enrichment::ModelAccessRefusal::Denied(msg)) => {
+                        let response = Response::builder()
+                            .status(StatusCode::FORBIDDEN)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                serde_json::json!({"error": {"message": msg, "type": "invalid_request_error"}}).to_string(),
+                            ))
+                            .unwrap();
+                        return refuse(response, "forbidden", None);
+                    }
                 }
             }
         }
