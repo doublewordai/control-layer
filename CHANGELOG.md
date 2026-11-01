@@ -1,5 +1,12 @@
 # Changelog
 
+## [15.10.0](https://github.com/doublewordai/control-layer/compare/v15.9.0...v15.10.0) (2026-11-01)
+
+
+### Features
+
+* **dwctl:** send each request's prices to dynamo endpoints as nvext.billing ([#2124](https://github.com/doublewordai/control-layer/issues/2124)) ([395efa5](https://github.com/doublewordai/control-layer/commit/395efa5a20cf82fddb70760e8bec8640fec8af98))
+
 ## [15.9.0](https://github.com/doublewordai/control-layer/compare/v15.8.0...v15.9.0) (2026-10-30)
 
 
