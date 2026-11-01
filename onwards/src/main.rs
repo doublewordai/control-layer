@@ -24,7 +24,7 @@ pub async fn main() -> anyhow::Result<()> {
     if let Some(provider) = tracer_provider
         && let Err(e) = provider.shutdown()
     {
-        eprintln!("Failed to shutdown tracer provider: {e}");
+        tracing::error!(error = %e, "Failed to shutdown tracer provider");
     }
 
     result

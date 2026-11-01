@@ -1253,6 +1253,24 @@ pub trait Storage: Send + Sync {
         cutoff: DateTime<Utc>,
         strict: bool,
     ) -> Result<i64>;
+
+    /// [`Storage::count_owner_flex_requests_since`] for threshold checks:
+    /// returns `min(count, limit)`, and backends may stop reading once
+    /// `limit` rows are found, so the cost is bounded by `limit` rather than
+    /// by the owner's volume. A caller deciding `count + n > cap` should pass
+    /// `cap + 1`. The default counts everything and clamps.
+    async fn count_owner_flex_requests_since_capped(
+        &self,
+        owner: &str,
+        cutoff: DateTime<Utc>,
+        strict: bool,
+        limit: i64,
+    ) -> Result<i64> {
+        Ok(self
+            .count_owner_flex_requests_since(owner, cutoff, strict)
+            .await?
+            .min(limit.max(0)))
+    }
     ///
     /// Cancel one or more individual pending or in-progress requests.
     ///

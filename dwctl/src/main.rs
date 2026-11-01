@@ -3,6 +3,7 @@ use std::process::ExitCode;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use dwctl::config::Args;
+use dwctl::log_redaction::redact_secrets;
 use dwctl::{Application, Config, migrations, telemetry};
 
 // jemalloc, for its decay behaviour rather than its allocation speed.
@@ -112,7 +113,12 @@ fn report_error(error: &anyhow::Error) {
         // pod or Job needs first.
         tracing::error!(error = format!("{error:#}"), "dwctl exited with an error");
     } else {
-        eprintln!("Error: {error:?}");
+        // Nothing else can report it, so this bypasses the subscriber, and
+        // redacts the way it would have.
+        #[allow(clippy::print_stderr, reason = "logging failed to start")]
+        {
+            eprintln!("Error: {}", redact_secrets(&format!("{error:?}")));
+        }
     }
 }
 
@@ -171,7 +177,10 @@ async fn async_main() -> anyhow::Result<()> {
         if let Some(provider) = tracer_provider {
             let _ = provider.shutdown();
         }
-        println!("Configuration is valid.");
+        #[allow(clippy::print_stdout, reason = "the result of `dwctl --validate`")]
+        {
+            println!("Configuration is valid.");
+        }
         return Ok(());
     }
 

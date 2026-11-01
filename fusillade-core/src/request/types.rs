@@ -77,7 +77,7 @@ pub struct Request<T: RequestState> {
 ///
 /// This contains all the information needed to make an HTTP request
 /// to a target API endpoint.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct RequestData {
     /// The ID with which the request was submitted.
     pub id: RequestId,
@@ -122,6 +122,20 @@ pub struct RequestData {
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub batch_metadata: std::collections::HashMap<String, String>,
 }
+
+debug_with_redacted_api_key!(RequestData {
+    id,
+    batch_id,
+    template_id,
+    custom_id,
+    endpoint,
+    method,
+    path,
+    body,
+    model,
+    created_by,
+    batch_metadata,
+});
 
 // ============================================================================
 // Request States

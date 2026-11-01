@@ -263,9 +263,10 @@ async fn insert_api_keys(database_url: &str, user_id: &str, count: usize) -> Str
     let mut connection = PgConnection::connect(database_url).await.expect("connect for key setup");
     let user_id = uuid::Uuid::parse_str(user_id).expect("user id is a uuid");
     let secrets: Vec<(String,)> = sqlx::query_as(
-        "INSERT INTO api_keys (name, secret, purpose, user_id, created_by)
-         SELECT 'memory-budget-' || n, 'sk-memory-budget-' || n || '-' || md5(random()::text), 'realtime', $1, $1
+        "INSERT INTO api_keys (name, secret, secret_hash, secret_prefix, purpose, user_id, created_by)
+         SELECT 'memory-budget-' || n, s.secret, sha256(convert_to(s.secret, 'UTF8')), left(s.secret, 8), 'realtime', $1, $1
          FROM generate_series(1, $2) AS n
+         CROSS JOIN LATERAL (SELECT 'sk-memory-budget-' || n || '-' || md5(random()::text) AS secret) s
          RETURNING secret",
     )
     .bind(user_id)

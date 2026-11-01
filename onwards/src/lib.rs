@@ -1069,6 +1069,7 @@ pub mod test_utils {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::KeyHash;
     use crate::load_balancer::{Provider, ProviderPool};
     use crate::target::{ConcurrencyLimiter, Target, Targets};
     use axum::http::StatusCode;
@@ -1278,14 +1279,14 @@ mod tests {
     /// exactly why the extension (not a header) carries this.
     #[tokio::test]
     async fn test_served_by_extension_set_on_success() {
-        use crate::auth::ConstantTimeString;
+        use crate::auth::KeyHash;
         use std::collections::{HashMap, HashSet};
         use tower::ServiceExt;
 
         let api_key_id = uuid::Uuid::new_v4();
         let api_key = "test-api-key";
         let mut keys = HashSet::new();
-        keys.insert(ConstantTimeString::from(api_key.to_string()));
+        keys.insert(KeyHash::from(api_key.to_string()));
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "gpt-4".to_string(),
@@ -1299,7 +1300,7 @@ mod tests {
         );
         let key_labels = Arc::new(DashMap::new());
         key_labels.insert(
-            api_key.to_string(),
+            KeyHash::of(api_key),
             HashMap::from([("api_key_id".to_string(), api_key_id.to_string())]),
         );
         let targets = target::Targets {
@@ -1348,7 +1349,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_authenticated_api_key_id_survives_models_and_strict_error() {
-        use crate::auth::ConstantTimeString;
+        use crate::auth::KeyHash;
         use crate::target::{RateLimitExceeded, RateLimiter};
         use std::collections::{HashMap, HashSet};
         use tower::ServiceExt;
@@ -1365,7 +1366,7 @@ mod tests {
         let api_key_id = uuid::Uuid::new_v4();
         let api_key = "test-api-key";
         let mut keys = HashSet::new();
-        keys.insert(ConstantTimeString::from(api_key.to_string()));
+        keys.insert(KeyHash::from(api_key.to_string()));
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "gpt-4".to_string(),
@@ -1388,7 +1389,7 @@ mod tests {
         );
         let key_labels = Arc::new(DashMap::new());
         key_labels.insert(
-            api_key.to_string(),
+            KeyHash::of(api_key),
             HashMap::from([("api_key_id".to_string(), api_key_id.to_string())]),
         );
         let targets = target::Targets {
@@ -1473,7 +1474,7 @@ mod tests {
         let refusal = |body: String, body_limit: usize| async move {
             let targets = fallback_targets("gpt-4", 1, vec![]);
             targets.key_labels.insert(
-                "sk-acct".to_string(),
+                KeyHash::of("sk-acct"),
                 HashMap::from([(serving::ACCOUNT_LABEL.to_string(), "acct-1".to_string())]),
             );
             let state = AppState::with_client(targets, MockHttpClient::new(StatusCode::OK, "{}"))
@@ -1534,7 +1535,7 @@ mod tests {
         let attribution = |mock: MockHttpClient| async move {
             let targets = fallback_targets("gpt-4", 1, vec![]);
             targets.key_labels.insert(
-                "sk-acct".to_string(),
+                KeyHash::of("sk-acct"),
                 HashMap::from([(serving::ACCOUNT_LABEL.to_string(), "acct-1".to_string())]),
             );
             let request = axum::http::Request::builder()
@@ -3168,17 +3169,63 @@ mod tests {
         assert_eq!(requests.len(), 0);
     }
 
+    /// A standalone config file lists plaintext keys; they are hashed on load
+    /// and a presented bearer is matched by hash. A key may also be given
+    /// pre-hashed as `sha256:<hex>`.
+    #[tokio::test]
+    async fn test_config_file_keys_authenticate_by_hash() {
+        use crate::auth::KeyHash;
+
+        let pre_hashed = serde_json::to_value(KeyHash::of("pre-hashed-key")).unwrap();
+        let config: target::ConfigFile = serde_json::from_value(json!({
+            "auth": {
+                "global_keys": [pre_hashed],
+                "key_definitions": {
+                    "labelled": { "key": "labelled-key", "labels": { "api_key_id": "00000000-0000-0000-0000-000000000001" } }
+                }
+            },
+            "targets": {
+                "gpt-4": { "url": "https://api.openai.com", "keys": ["plain-key", "labelled-key"] }
+            }
+        }))
+        .unwrap();
+        let targets = Targets::from_config(config).unwrap();
+        assert!(
+            targets
+                .key_labels
+                .contains_key(&KeyHash::of("labelled-key"))
+        );
+
+        let app_state = AppState::with_client(targets, MockHttpClient::new(StatusCode::OK, "{}"));
+        let server = TestServer::new(build_router(app_state)).unwrap();
+        let body = json!({"model": "gpt-4", "messages": [{"role": "user", "content": "Hello"}]});
+        for (token, expected) in [
+            ("plain-key", 200),
+            ("labelled-key", 200),
+            ("pre-hashed-key", 200),
+            ("wrong-key", 403),
+            (pre_hashed.as_str().unwrap(), 403),
+        ] {
+            let response = server
+                .post("/v1/chat/completions")
+                .add_header("authorization", format!("Bearer {token}"))
+                .json(&body)
+                .await;
+            assert_eq!(response.status_code(), expected, "token {token}");
+        }
+    }
+
     #[tokio::test]
     async fn test_models_endpoint_filters_by_bearer_token() {
-        use crate::auth::ConstantTimeString;
+        use crate::auth::KeyHash;
         use std::collections::HashSet;
 
         // Create keys for different models
         let mut gpt4_keys = HashSet::new();
-        gpt4_keys.insert(ConstantTimeString::from("gpt4-token".to_string()));
+        gpt4_keys.insert(KeyHash::from("gpt4-token".to_string()));
 
         let mut claude_keys = HashSet::new();
-        claude_keys.insert(ConstantTimeString::from("claude-token".to_string()));
+        claude_keys.insert(KeyHash::from("claude-token".to_string()));
 
         // Create targets with different access keys
         let targets_map = Arc::new(DashMap::new());
@@ -3667,7 +3714,7 @@ mod tests {
         // Set up per-key concurrency limiter
         let key_concurrency_limiters = Arc::new(DashMap::new());
         key_concurrency_limiters.insert(
-            "sk-limited-key".to_string(),
+            KeyHash::of("sk-limited-key"),
             ConcurrencyLimiter::with_limit(1),
         );
 
@@ -3752,7 +3799,7 @@ mod tests {
             ("sk-acct-b", "acct-b"),
         ] {
             key_labels.insert(
-                key.to_string(),
+                KeyHash::of(key),
                 std::collections::HashMap::from([(
                     serving::ACCOUNT_LABEL.to_string(),
                     account.to_string(),
@@ -3948,7 +3995,7 @@ mod tests {
         );
         let key_labels = Arc::new(DashMap::new());
         key_labels.insert(
-            "sk-acct-a".to_string(),
+            KeyHash::of("sk-acct-a"),
             std::collections::HashMap::from([
                 (serving::ACCOUNT_LABEL.to_string(), "acct-a".to_string()),
                 ("purpose".to_string(), "realtime".to_string()),
@@ -4017,7 +4064,7 @@ mod tests {
         targets_map.insert("batch-model".to_string(), pool.into());
         let key_labels = Arc::new(DashMap::new());
         key_labels.insert(
-            "sk-acct-a".to_string(),
+            KeyHash::of("sk-acct-a"),
             std::collections::HashMap::from([(
                 serving::ACCOUNT_LABEL.to_string(),
                 "acct-a".to_string(),
@@ -4421,7 +4468,7 @@ mod tests {
         );
         let key_labels = Arc::new(DashMap::new());
         key_labels.insert(
-            "sk-acct-a".to_string(),
+            KeyHash::of("sk-acct-a"),
             std::collections::HashMap::from([
                 (serving::ACCOUNT_LABEL.to_string(), "acct-a".to_string()),
                 ("purpose".to_string(), "batch".to_string()),

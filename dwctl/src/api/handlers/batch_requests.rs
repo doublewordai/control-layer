@@ -812,7 +812,7 @@ mod tests {
         let visible_key_id = uuid::Uuid::new_v4();
         let child_key_id = uuid::Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO api_keys (id, name, secret, purpose, user_id, created_by, hidden) VALUES ($1, 'Member key', $2, 'realtime', $3, $4, false)",
+            "INSERT INTO api_keys (id, name, secret, secret_hash, secret_prefix, purpose, user_id, created_by, hidden) VALUES ($1, 'Member key', $2, sha256(convert_to($2, 'UTF8')), left($2, 8), 'realtime', $3, $4, false)",
         )
         .bind(visible_key_id)
         .bind(format!("sk-visible-{}", visible_key_id.simple()))
@@ -822,7 +822,7 @@ mod tests {
         .await
         .expect("insert visible key");
         sqlx::query(
-            "INSERT INTO api_keys (id, name, secret, purpose, user_id, created_by, hidden, parent_api_key_id) VALUES ($1, 'Internal batch key (cap scope)', $2, 'batch', $3, $4, true, $5)",
+            "INSERT INTO api_keys (id, name, secret, secret_hash, secret_prefix, purpose, user_id, created_by, hidden, parent_api_key_id) VALUES ($1, 'Internal batch key (cap scope)', $2, sha256(convert_to($2, 'UTF8')), left($2, 8), 'batch', $3, $4, true, $5)",
         )
         .bind(child_key_id)
         .bind(format!("sk-child-{}", child_key_id.simple()))

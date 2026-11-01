@@ -95,6 +95,7 @@ pub fn build_strict_router<T: HttpClient + Clone + Send + Sync + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::KeyHash;
     use crate::target::{Target, Targets};
     use crate::test_utils::MockHttpClient;
     use axum::body::Body;
@@ -851,7 +852,7 @@ mod tests {
         let key_labels = Arc::new(DashMap::new());
         if let Some(purpose) = purpose {
             key_labels.insert(
-                "sk-test".to_string(),
+                KeyHash::of("sk-test"),
                 std::collections::HashMap::from([("purpose".to_string(), purpose.to_string())]),
             );
         }

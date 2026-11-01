@@ -1,5 +1,6 @@
 pub mod ai_models;
 pub mod anthropic;
+pub mod api_key_hash_auth;
 pub mod batch_trace_attributes;
 pub mod cache_classifier;
 pub mod databases;
@@ -1233,6 +1234,7 @@ async fn test_e2e_traffic_routing_rules(pool: PgPool) {
 #[test_log::test]
 async fn test_database_seeding_behavior(pool: PgPool) {
     use crate::config::ModelSource;
+    use crate::crypto::hash_api_key;
     use url::Url;
     use uuid::Uuid;
 
@@ -1258,11 +1260,13 @@ async fn test_database_seeding_behavior(pool: PgPool) {
     let system_api_key_id = Uuid::nil();
     let original_secret = "original_test_secret";
     sqlx::query!(
-        "INSERT INTO api_keys (id, name, secret, purpose, user_id, created_by) VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT (id) DO UPDATE SET secret = $3",
+        "INSERT INTO api_keys (id, name, secret, secret_hash, secret_prefix, purpose, user_id, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (id) DO UPDATE SET secret = $3, secret_hash = $4, secret_prefix = $5",
         system_api_key_id,
         "System API Key",
         original_secret,
+        &hash_api_key(original_secret)[..],
+        &original_secret[..8],
         "batch",
         system_api_key_id,
         system_api_key_id,
@@ -1296,6 +1300,16 @@ async fn test_database_seeding_behavior(pool: PgPool) {
         .expect("Should be able to get API key secret");
     assert_ne!(updated_secret, original_secret, "API key secret should have been updated");
     assert!(updated_secret.len() > 10, "New API key should be a reasonable length");
+    let stored = sqlx::query!("SELECT secret_hash, secret_prefix FROM api_keys WHERE id = $1", system_api_key_id)
+        .fetch_one(&pool)
+        .await
+        .expect("Should be able to get API key hash");
+    assert_eq!(
+        stored.secret_hash.as_deref(),
+        Some(&hash_api_key(&updated_secret)[..]),
+        "Seeded system key must store hash_api_key(secret)"
+    );
+    assert_eq!(stored.secret_prefix.as_deref(), Some(&updated_secret[..8]));
 
     // Verify seeded flag is now true
     let seeded_after_first = sqlx::query_scalar!("SELECT value FROM system_config WHERE key = 'endpoints_seeded'")
@@ -1311,10 +1325,16 @@ async fn test_database_seeding_behavior(pool: PgPool) {
         .expect("Should be able to update endpoint");
 
     let manual_secret = "manually_set_secret";
-    sqlx::query!("UPDATE api_keys SET secret = $1 WHERE id = $2", manual_secret, system_api_key_id)
-        .execute(&pool)
-        .await
-        .expect("Should be able to update API key");
+    sqlx::query!(
+        "UPDATE api_keys SET secret = $1, secret_hash = $2, secret_prefix = $3 WHERE id = $4",
+        manual_secret,
+        &hash_api_key(manual_secret)[..],
+        &manual_secret[..8],
+        system_api_key_id
+    )
+    .execute(&pool)
+    .await
+    .expect("Should be able to update API key");
 
     // Second call should skip all seeding (because seeded flag is true)
     super::seed_database(&sources, &pool)

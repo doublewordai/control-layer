@@ -33,3 +33,6 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chro
 
 [dev-dependencies]
 axum = "0.8"
+
+[lints]
+workspace = true
