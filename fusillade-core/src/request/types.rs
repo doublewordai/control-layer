@@ -73,6 +73,16 @@ pub struct Request<T: RequestState> {
     pub data: RequestData,
 }
 
+/// [`RequestData::batch_metadata`] entry naming the API key a claimed request
+/// is dispatched as (a UUID): the batch's `api_key_id`, or the one a batchless
+/// request was created with. Present only when the request has one.
+///
+/// Like every metadata entry it rides out as an `x-fusillade-batch-api_key_id`
+/// header unless a request processor removes it. A processor that
+/// authenticates dispatches by key id takes it out and sets
+/// [`RequestData::api_key`] from it, in preference to a stored key.
+pub const API_KEY_ID_METADATA_KEY: &str = "api_key_id";
+
 /// User-supplied data for a request to be processed by the fusillade system.
 ///
 /// This contains all the information needed to make an HTTP request
@@ -118,7 +128,9 @@ pub struct RequestData {
     #[serde(default)]
     pub created_by: String,
 
-    /// Batch metadata fields to be sent as headers (x-fusillade-COLUMN-NAME)
+    /// Batch metadata fields to be sent as headers (x-fusillade-COLUMN-NAME).
+    /// A claim also records the request's key id here under
+    /// [`API_KEY_ID_METADATA_KEY`].
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub batch_metadata: std::collections::HashMap<String, String>,
 }

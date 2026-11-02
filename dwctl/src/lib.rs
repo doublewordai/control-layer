@@ -4631,7 +4631,9 @@ impl Application {
 
         // Pre-dispatch preparation for daemon-claimed requests. MUST be installed
         // before `setup_background_services` spawns the daemon, or claims can be
-        // dispatched without it. Two steps that cannot happen on the loopback:
+        // dispatched without it. Steps that cannot happen on the loopback:
+        //   - Authentication: requests dispatch as their key id; the loopback
+        //     needs a credential for that id, minted per attempt.
         //   - ZDR decrypt: the stored body is `dwzdr1:` ciphertext, so it is not
         //     parseable JSON and every edge layer chokes before it could act.
         //   (`dw-img://` image tokens are deliberately NOT signed here: the loopback's
@@ -4643,7 +4645,16 @@ impl Application {
         let internal_credentials = auth::internal_credential::InternalCredentials::generate();
 
         {
+            // Requests store the key id they run as; each dispatch attempt
+            // gets a credential for it that outlives one processing attempt.
+            let dispatch_auth = crate::inference::engine::dispatch_processor::DispatchAuth::new(
+                internal_credentials.clone(),
+                std::time::Duration::from_millis(config.background_services.batch_daemon.processing_timeout_ms),
+                &config.host,
+                config.port,
+            );
             let dispatch_processor = crate::inference::engine::dispatch_processor::DispatchProcessor::new()
+                .with_auth(dispatch_auth)
                 .with_keystore(keystore.clone())
                 .with_streamable_endpoints(config.background_services.batch_daemon.streamable_endpoints.clone());
             if let Err(e) = postgres_daemon.set_processor(Arc::new(dispatch_processor)) {

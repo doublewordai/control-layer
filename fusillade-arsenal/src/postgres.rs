@@ -44,10 +44,10 @@ use crate::manager::{
     RetentionPolicy, TrailingDemandCount,
 };
 use crate::request::{
-    Canceled, CascadeTargetState, Claimed, Completed, CreateBackgroundInput, CreateFlexInput,
-    CreateRealtimeInput, DaemonId, Failed, FailureReason, LeakStamp, Pending,
-    PersistCompletedRealtimeInput, Processing, Request, RequestData, RequestDetail, RequestId,
-    RequestState, ServiceTierFilter,
+    API_KEY_ID_METADATA_KEY, Canceled, CascadeTargetState, Claimed, Completed,
+    CreateBackgroundInput, CreateFlexInput, CreateRealtimeInput, DaemonId, Failed, FailureReason,
+    LeakStamp, Pending, PersistCompletedRealtimeInput, Processing, Request, RequestData,
+    RequestDetail, RequestId, RequestState, ServiceTierFilter,
 };
 
 // Retained graph representation and movement stay isolated from the main
@@ -364,6 +364,7 @@ struct NewPendingRequest {
     method: String,
     path: String,
     api_key: String,
+    api_key_id: Option<Uuid>,
     created_by: String,
     service_tier: &'static str,
     /// Provenance stored on the template, standing in for the batch metadata a
@@ -384,6 +385,7 @@ struct ClaimedRequestRow {
     body: String,
     model: String,
     api_key: String,
+    api_key_id: Option<Uuid>,
     batch_expires_at: Option<DateTime<Utc>>,
     batch_id_str: String,
     batch_file_id: String,
@@ -953,6 +955,55 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         })
     }
 
+    /// [`Storage::create_flex`], recording the API key the request is
+    /// dispatched as. A claim reports it under
+    /// [`API_KEY_ID_METADATA_KEY`] in the request's batch metadata.
+    #[tracing::instrument(level = "debug", skip(self, input))]
+    pub async fn create_flex_as(
+        &self,
+        input: CreateFlexInput,
+        api_key_id: Option<Uuid>,
+    ) -> Result<RequestId> {
+        self.insert_batchless_pending_request(NewPendingRequest {
+            request_id: input.request_id,
+            body: input.body,
+            model: input.model,
+            endpoint: input.endpoint,
+            method: input.method,
+            path: input.path,
+            api_key: input.api_key,
+            api_key_id,
+            created_by: input.created_by,
+            service_tier: "flex",
+            metadata: input.metadata,
+        })
+        .await
+    }
+
+    /// [`Storage::create_background`], recording the API key the request is
+    /// dispatched as. See [`Self::create_flex_as`].
+    #[tracing::instrument(level = "debug", skip(self, input))]
+    pub async fn create_background_as(
+        &self,
+        input: CreateBackgroundInput,
+        api_key_id: Option<Uuid>,
+    ) -> Result<RequestId> {
+        self.insert_batchless_pending_request(NewPendingRequest {
+            request_id: input.request_id,
+            body: input.body,
+            model: input.model,
+            endpoint: input.endpoint,
+            method: input.method,
+            path: input.path,
+            api_key: input.api_key,
+            api_key_id,
+            created_by: input.created_by,
+            service_tier: "background",
+            metadata: input.metadata,
+        })
+        .await
+    }
+
     async fn insert_batchless_pending_request(
         &self,
         input: NewPendingRequest,
@@ -978,6 +1029,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 body: stored_body.as_ref(),
                 model: &input.model,
                 api_key: &input.api_key,
+                api_key_id: input.api_key_id,
                 metadata: input.metadata.as_ref(),
             },
         )
@@ -1107,6 +1159,12 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 batch_metadata
                     .entry("created_at".to_string())
                     .or_insert_with(|| row.batch_created_at.clone());
+                // The key the request is dispatched as, for a processor that
+                // authenticates by key id rather than with the stored key.
+                if let Some(api_key_id) = row.api_key_id {
+                    batch_metadata
+                        .insert(API_KEY_ID_METADATA_KEY.to_string(), api_key_id.to_string());
+                }
                 if let Some(completion_window) = row.batch_completion_window.clone() {
                     batch_metadata
                         .entry("completion_window".to_string())
@@ -2827,6 +2885,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                       r.template_id as "template_id!", r.retry_attempt,
                       t.custom_id, t.endpoint as "endpoint!", t.method as "method!", t.path as "path!",
                       t.body as "body!", t.model as "model!", t.api_key as "api_key!",
+                      t.api_key_id,
                       tc.effective_expires_at as "batch_expires_at?",
                       ''::TEXT as "batch_id_str!",
                       ''::TEXT as "batch_file_id!",
@@ -3165,6 +3224,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                       r.template_id as "template_id!", r.retry_attempt,
                       t.custom_id, t.endpoint as "endpoint!", t.method as "method!", t.path as "path!",
                       t.body as "body!", t.model as "model!", COALESCE(b.api_key, t.api_key) as "api_key!",
+                      COALESCE(b.api_key_id, t.api_key_id) as "api_key_id",
                       NULL::TIMESTAMPTZ as "batch_expires_at?",
                       COALESCE(b.id::TEXT, '') as "batch_id_str!",
                       COALESCE(b.file_id::TEXT, '') as "batch_file_id!",
@@ -6693,6 +6753,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 body: stored_body.as_ref(),
                 model: &input.model,
                 api_key: &input.api_key,
+                api_key_id: None,
                 metadata: None,
             },
         )
@@ -6743,36 +6804,12 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
 
     #[tracing::instrument(level = "debug", skip(self, input))]
     async fn create_flex(&self, input: CreateFlexInput) -> Result<RequestId> {
-        self.insert_batchless_pending_request(NewPendingRequest {
-            request_id: input.request_id,
-            body: input.body,
-            model: input.model,
-            endpoint: input.endpoint,
-            method: input.method,
-            path: input.path,
-            api_key: input.api_key,
-            created_by: input.created_by,
-            service_tier: "flex",
-            metadata: input.metadata,
-        })
-        .await
+        self.create_flex_as(input, None).await
     }
 
     #[tracing::instrument(level = "debug", skip(self, input))]
     async fn create_background(&self, input: CreateBackgroundInput) -> Result<RequestId> {
-        self.insert_batchless_pending_request(NewPendingRequest {
-            request_id: input.request_id,
-            body: input.body,
-            model: input.model,
-            endpoint: input.endpoint,
-            method: input.method,
-            path: input.path,
-            api_key: input.api_key,
-            created_by: input.created_by,
-            service_tier: "background",
-            metadata: input.metadata,
-        })
-        .await
+        self.create_background_as(input, None).await
     }
 
     async fn complete_request(
@@ -7497,6 +7534,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                       r.template_id as "template_id!", r.retry_attempt,
                       t.custom_id, t.endpoint as "endpoint!", t.method as "method!", t.path as "path!",
                       t.body as "body!", t.model as "model!", COALESCE(b.api_key, t.api_key) as "api_key!",
+                      COALESCE(b.api_key_id, t.api_key_id) as "api_key_id",
                       tc.effective_expires_at as "batch_expires_at?",
                       b.id::TEXT as "batch_id_str!",
                       COALESCE(b.file_id::TEXT, '') as "batch_file_id!",
@@ -10290,6 +10328,172 @@ mod tests {
             )
             .await
             .expect("batch claim failed")
+    }
+
+    fn key_id_of(request: &Request<Claimed>) -> Option<Uuid> {
+        request
+            .data
+            .batch_metadata
+            .get(API_KEY_ID_METADATA_KEY)
+            .map(|id| id.parse().unwrap())
+    }
+
+    /// Batchless requests record the key id they run as next to the stored
+    /// key, which the previous release still reads, and a claim reports both.
+    #[sqlx::test]
+    async fn batchless_requests_record_their_key_id(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(DaemonConfig {
+            background_concurrency_limit: 10,
+            ..Default::default()
+        });
+        let flex_key = Uuid::new_v4();
+        let background_key = Uuid::new_v4();
+        let flex = |api_key: &str| CreateFlexInput {
+            request_id: Uuid::new_v4(),
+            body: "{}".to_string(),
+            model: "key-id-model".to_string(),
+            endpoint: "https://api.example.com".to_string(),
+            method: "POST".to_string(),
+            path: "/test".to_string(),
+            api_key: api_key.to_string(),
+            created_by: "owner".to_string(),
+            metadata: None,
+        };
+        let by_id = manager
+            .create_flex_as(flex("flex-secret"), Some(flex_key))
+            .await
+            .unwrap();
+        let legacy = manager.create_flex(flex("legacy-secret")).await.unwrap();
+        let background_id = manager
+            .create_background_as(
+                CreateBackgroundInput {
+                    request_id: Uuid::new_v4(),
+                    body: "{}".to_string(),
+                    model: "key-id-model".to_string(),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    api_key: "background-secret".to_string(),
+                    created_by: "owner".to_string(),
+                    metadata: None,
+                },
+                Some(background_key),
+            )
+            .await
+            .unwrap();
+
+        let stored: HashMap<Uuid, (String, Option<Uuid>)> =
+            sqlx::query_as::<_, (Uuid, String, Option<Uuid>)>(
+                "SELECT r.id, t.api_key, t.api_key_id FROM requests r
+             JOIN request_templates_all t ON t.id = r.template_id",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(id, key, key_id)| (id, (key, key_id)))
+            .collect();
+        assert_eq!(stored[&by_id], ("flex-secret".to_string(), Some(flex_key)));
+        assert_eq!(stored[&legacy], ("legacy-secret".to_string(), None));
+        assert_eq!(
+            stored[&background_id],
+            ("background-secret".to_string(), Some(background_key))
+        );
+
+        mark_models_live_for_test(&manager, ["key-id-model"]).await;
+        let capacity = HashMap::from([("key-id-model".to_string(), 10)]);
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let claimed: HashMap<RequestId, (String, Option<Uuid>)> = manager
+            .claim_batchless_requests(10, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| (r.data.id, (r.data.api_key.clone(), key_id_of(r))))
+            .collect();
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(claimed[&by_id], ("flex-secret".to_string(), Some(flex_key)));
+        assert_eq!(claimed[&legacy], ("legacy-secret".to_string(), None));
+
+        let background = manager
+            .claim_background_batchless_requests(1, daemon_id, &capacity, &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(background.len(), 1);
+        assert_eq!(background[0].data.id, background_id);
+        assert_eq!(background[0].data.api_key, "background-secret");
+        assert_eq!(key_id_of(&background[0]), Some(background_key));
+    }
+
+    /// A batch request reports its batch's key id; one whose batch has none
+    /// reports none and keeps its stored key.
+    #[sqlx::test]
+    async fn batch_requests_report_the_batch_key_id(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let file_id = manager
+            .create_file(
+                "key-id.jsonl".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "batch-key-model".to_string(),
+                    api_key: "uploader-key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+        let batch_key = Uuid::new_v4();
+        let batch_input = |api_key_id, api_key: Option<&str>| crate::batch::BatchInput {
+            file_id,
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+            created_by: Some("owner".to_string()),
+            api_key_id,
+            api_key: api_key.map(str::to_string),
+            total_requests: None,
+        };
+        let by_id = manager
+            .create_batch(batch_input(Some(batch_key), Some("batch-secret")))
+            .await
+            .unwrap();
+        let legacy = manager.create_batch(batch_input(None, None)).await.unwrap();
+
+        let capacity = HashMap::from([("batch-key-model".to_string(), 10)]);
+        let claimed = claim_batch_requests_for_test(
+            &manager,
+            10,
+            10,
+            DaemonId::from(Uuid::new_v4()),
+            &capacity,
+            &HashMap::new(),
+        )
+        .await;
+        assert_eq!(claimed.len(), 2);
+        let by_batch: HashMap<BatchId, (String, Option<Uuid>)> = claimed
+            .iter()
+            .map(|r| {
+                (
+                    r.data.batch_id.unwrap(),
+                    (r.data.api_key.clone(), key_id_of(r)),
+                )
+            })
+            .collect();
+        assert_eq!(
+            by_batch[&by_id.id],
+            ("batch-secret".to_string(), Some(batch_key))
+        );
+        assert_eq!(by_batch[&legacy.id], ("uploader-key".to_string(), None));
     }
 
     #[sqlx::test]
