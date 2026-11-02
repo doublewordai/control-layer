@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use moka::future::Cache;
 
-use crate::crypto::hash_api_key;
+use crate::crypto::ApiKeyHash;
 use crate::db::handlers::api_keys::ApiKeys;
 use crate::types::UserId;
 
@@ -64,18 +64,17 @@ impl PrincipalResolver {
     /// caches or bills. The blast radius is at worst a wasted DB miss on the first real
     /// lookup of a key that happened to collide with a probed string (negligible:
     /// secrets are crypto-random), and the TTL bounds even that. So caching `None` is fine.
-    pub async fn resolve(&self, token: &str) -> CacheResult<Option<UserId>> {
-        let token_hash = hash_api_key(token);
-        if let Some(cached) = self.l1.get(&token_hash).await {
+    pub async fn resolve(&self, token_hash: &ApiKeyHash) -> CacheResult<Option<UserId>> {
+        if let Some(cached) = self.l1.get(token_hash).await {
             // An L1 hit on a cached `None` is a cached *unknown* key, not a resolve hit —
             // count it as unknown_key so key-probe / invalid-key volume stays accurate.
             cache_metrics::record_principal_resolve(if cached.is_some() { "hit" } else { "unknown_key" });
             return Ok(cached);
         }
         let mut conn = self.pool.write().acquire().await?;
-        let user_id = ApiKeys::new(&mut conn).get_user_id_by_secret(token).await?;
+        let user_id = ApiKeys::new(&mut conn).get_user_id_by_hash(token_hash).await?;
         cache_metrics::record_principal_resolve(if user_id.is_some() { "miss" } else { "unknown_key" });
-        self.l1.insert(token_hash, user_id).await;
+        self.l1.insert(*token_hash, user_id).await;
         Ok(user_id)
     }
 }
@@ -92,14 +91,18 @@ mod tests {
         let key = create_test_api_key_for_user(&pool, user.id).await;
 
         let resolver = PrincipalResolver::new(pool);
-        assert_eq!(resolver.resolve(&key.secret).await.unwrap(), Some(user.id));
+        let hash = crate::crypto::hash_api_key(&key.secret);
+        assert_eq!(resolver.resolve(&hash).await.unwrap(), Some(user.id));
         // Second call is served from the L1 memo — still correct.
-        assert_eq!(resolver.resolve(&key.secret).await.unwrap(), Some(user.id));
+        assert_eq!(resolver.resolve(&hash).await.unwrap(), Some(user.id));
     }
 
     #[dwctl_test_macros::test]
     async fn unknown_token_resolves_none(pool: sqlx::PgPool) {
         let resolver = PrincipalResolver::new(pool);
-        assert_eq!(resolver.resolve("not-a-real-secret").await.unwrap(), None);
+        assert_eq!(
+            resolver.resolve(&crate::crypto::hash_api_key("not-a-real-secret")).await.unwrap(),
+            None
+        );
     }
 }

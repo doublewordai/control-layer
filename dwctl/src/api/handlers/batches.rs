@@ -816,8 +816,13 @@ pub async fn create_batch<P: PoolProvider>(
     // batch's spend counts against the authenticating key's spending cap.
     let (batch_api_key, api_key_id, target_verified) = {
         let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
-        let (secret, key_id) = ApiKeys::new(&mut conn)
+        let key_id = ApiKeys::new(&mut conn)
             .resolve_batch_execution_key(target_user_id, attribution_user_id, authenticating_key_id)
+            .await
+            .map_err(Error::Database)?;
+        // Fusillade still dispatches batches with a stored key (until DW-1010).
+        let secret = ApiKeys::new(&mut conn)
+            .legacy_dispatch_secret(key_id)
             .await
             .map_err(Error::Database)?;
         // A capped authenticating key can resolve to a different billing

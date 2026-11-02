@@ -118,8 +118,8 @@ pub async fn create_connection<P: PoolProvider>(
     // Get or create hidden batch key for per-member attribution (same pattern as files/batches).
     // key owned by target_user_id (org or user), created_by = individual user.
     let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
-    let (_secret, api_key_id) = crate::db::handlers::api_keys::ApiKeys::new(&mut conn)
-        .get_or_create_hidden_key_with_id(target_user_id, crate::db::models::api_keys::ApiKeyPurpose::Batch, current_user.id)
+    let api_key_id = crate::db::handlers::api_keys::ApiKeys::new(&mut conn)
+        .get_or_create_hidden_key(target_user_id, crate::db::models::api_keys::ApiKeyPurpose::Batch, current_user.id)
         .await
         .map_err(Error::Database)?;
 

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::crypto::{api_key_prefix, generate_api_key, hash_api_key};
+use crate::crypto::{ApiKeyHash, api_key_prefix, generate_api_key, hash_api_key};
 use crate::db::errors::DbError;
 use crate::db::errors::Result;
 use crate::db::handlers::repository::Repository;
@@ -299,6 +299,12 @@ impl<'c> ApiKeys<'c> {
     /// Returns Some(user_id) if found, None if the key doesn't exist
     #[instrument(level = "debug", skip(self, secret), err)]
     pub async fn get_user_id_by_secret(&mut self, secret: &str) -> Result<Option<UserId>> {
+        self.get_user_id_by_hash(&hash_api_key(secret)).await
+    }
+
+    /// As [`Self::get_user_id_by_secret`], by the key's hash.
+    #[instrument(level = "debug", skip_all, err)]
+    pub async fn get_user_id_by_hash(&mut self, secret_hash: &ApiKeyHash) -> Result<Option<UserId>> {
         let user_id = sqlx::query_scalar!(
             r#"
             SELECT u.id
@@ -307,7 +313,7 @@ impl<'c> ApiKeys<'c> {
             WHERE ak.secret_hash = $1
             AND ak.is_deleted = false
             "#,
-            &hash_api_key(secret)[..]
+            &secret_hash[..]
         )
         .fetch_optional(&mut *self.db)
         .await?;
@@ -319,15 +325,17 @@ impl<'c> ApiKeys<'c> {
     ///
     /// Hidden API keys are automatically managed by the system and are not visible to users.
     /// They are used for proxying requests through admin_api and batch processing.
+    /// Their secret is random and never handed out: internal callers
+    /// authenticate as the key by id (see `auth::internal_credential`).
     ///
     /// # Arguments
     /// * `user_id` - The user ID to get or create a hidden key for
     /// * `purpose` - The purpose of the key
     ///
     /// # Returns
-    /// Returns the secret of the hidden API key
+    /// Returns the id of the hidden API key
     #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
-    pub async fn get_or_create_hidden_key(&mut self, user_id: UserId, purpose: ApiKeyPurpose, created_by: UserId) -> Result<String> {
+    pub async fn get_or_create_hidden_key(&mut self, user_id: UserId, purpose: ApiKeyPurpose, created_by: UserId) -> Result<ApiKeyId> {
         // Convert purpose enum to string for database
         let purpose_str = match purpose {
             ApiKeyPurpose::Platform => "platform",
@@ -355,18 +363,18 @@ impl<'c> ApiKeys<'c> {
 
         // Use INSERT ... ON CONFLICT DO NOTHING + SELECT to avoid firing the
         // api_keys_notify AFTER UPDATE trigger on the common "key already exists" path.
-        let row_secret = sqlx::query_scalar!(
+        let id = sqlx::query_scalar!(
             r#"
             WITH ins AS (
                 INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden, secret_hash, secret_prefix)
                 VALUES ($1, $2, $3, $4, $5, $6, true, $7, $8)
                 ON CONFLICT (user_id, created_by, purpose) WHERE hidden = true AND is_deleted = false AND parent_api_key_id IS NULL
                 DO NOTHING
-                RETURNING secret
+                RETURNING id
             )
-            SELECT secret FROM ins
+            SELECT id FROM ins
             UNION ALL
-            SELECT secret FROM api_keys
+            SELECT id FROM api_keys
             WHERE user_id = $5 AND created_by = $6 AND purpose = $4
               AND hidden = true AND is_deleted = false AND parent_api_key_id IS NULL
             LIMIT 1
@@ -384,76 +392,22 @@ impl<'c> ApiKeys<'c> {
         .await?
         .ok_or(DbError::NotFound)?;
 
-        Ok(row_secret)
+        Ok(id)
     }
 
-    /// Get or create a hidden API key, returning both the secret and the key's UUID.
-    /// Used when the caller needs to pass the key ID to fusillade for attribution.
-    #[instrument(level = "debug", skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
-    pub async fn get_or_create_hidden_key_with_id(
-        &mut self,
-        user_id: UserId,
-        purpose: ApiKeyPurpose,
-        created_by: UserId,
-    ) -> Result<(String, ApiKeyId)> {
-        let purpose_str = match purpose {
-            ApiKeyPurpose::Platform => "platform",
-            ApiKeyPurpose::Realtime => "realtime",
-            ApiKeyPurpose::Batch => "batch",
-            ApiKeyPurpose::Playground => "playground",
-            ApiKeyPurpose::Continuation => "continuation",
-        };
-
-        // Upsert: insert a hidden key or return the existing one.
-        // Uses ON CONFLICT on the unique index (user_id, created_by, purpose)
-        // WHERE hidden = true AND is_deleted = false to handle concurrent requests.
-        let secret = generate_api_key();
-        let secret_hash = hash_api_key(&secret);
-        let secret_prefix = api_key_prefix(&secret);
-        let name = if user_id == created_by {
-            format!("Internal {} Key", purpose_str)
-        } else {
-            format!("Internal {} Key ({})", purpose_str, &created_by.to_string()[..8])
-        };
-        let description = format!(
-            "Automatically managed internal API key for {} operations. Not visible to users.",
-            purpose_str
-        );
-
-        // Use INSERT ... ON CONFLICT DO NOTHING + SELECT to avoid firing the
-        // api_keys_notify AFTER UPDATE trigger on the common "key already exists" path.
-        let row = sqlx::query!(
-            r#"
-            WITH ins AS (
-                INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden, secret_hash, secret_prefix)
-                VALUES ($1, $2, $3, $4, $5, $6, true, $7, $8)
-                ON CONFLICT (user_id, created_by, purpose) WHERE hidden = true AND is_deleted = false AND parent_api_key_id IS NULL
-                DO NOTHING
-                RETURNING id, secret
-            )
-            SELECT id, secret FROM ins
-            UNION ALL
-            SELECT id, secret FROM api_keys
-            WHERE user_id = $5 AND created_by = $6 AND purpose = $4
-              AND hidden = true AND is_deleted = false AND parent_api_key_id IS NULL
-            LIMIT 1
-            "#,
-            name,
-            description,
-            secret,
-            purpose_str,
-            user_id,
-            created_by,
-            &secret_hash[..],
-            secret_prefix
+    /// The stored plaintext secret of a hidden key, for work that fusillade
+    /// still dispatches with a stored key (batches, flex and background
+    /// requests). Transitional: removed once fusillade dispatches by key id
+    /// (DW-1010). Nothing else may read a hidden key's secret.
+    #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
+    pub async fn legacy_dispatch_secret(&mut self, id: ApiKeyId) -> Result<String> {
+        sqlx::query_scalar!(
+            "SELECT secret FROM api_keys WHERE id = $1 AND hidden = true AND is_deleted = false",
+            id
         )
-        .fetch_one(&mut *self.db)
-        .await?;
-
-        let id = row.id.ok_or(DbError::NotFound)?;
-        let secret = row.secret.ok_or(DbError::NotFound)?;
-
-        Ok((secret, id))
+        .fetch_optional(&mut *self.db)
+        .await?
+        .ok_or(DbError::NotFound)
     }
 
     /// Get or create the hidden batch-purpose CHILD key for a capped visible key.
@@ -469,7 +423,7 @@ impl<'c> ApiKeys<'c> {
     /// before the first batch/flex request fires (same race-avoidance as
     /// pre-creating shared hidden keys at user creation).
     #[instrument(level = "debug", skip(self), fields(parent_api_key_id = %abbrev_uuid(&parent_id)), err)]
-    pub async fn get_or_create_child_hidden_key(&mut self, parent_id: ApiKeyId) -> Result<(String, ApiKeyId)> {
+    pub async fn get_or_create_child_hidden_key(&mut self, parent_id: ApiKeyId) -> Result<ApiKeyId> {
         let secret = generate_api_key();
         let secret_hash = hash_api_key(&secret);
         let secret_prefix = api_key_prefix(&secret);
@@ -479,7 +433,7 @@ impl<'c> ApiKeys<'c> {
         // UPDATE notify. Parent fields are read in the INSERT's SELECT so the
         // child cannot be created with mismatched scoping; a deleted or
         // missing parent inserts nothing and falls through to NotFound.
-        let row = sqlx::query!(
+        let id = sqlx::query_scalar!(
             r#"
             WITH ins AS (
                 INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden, parent_api_key_id, secret_hash, secret_prefix)
@@ -501,11 +455,11 @@ impl<'c> ApiKeys<'c> {
                 WHERE p.id = $2 AND p.is_deleted = false AND p.hidden = false AND p.parent_api_key_id IS NULL
                 ON CONFLICT (parent_api_key_id, purpose) WHERE hidden = true AND is_deleted = false AND parent_api_key_id IS NOT NULL
                 DO NOTHING
-                RETURNING id, secret
+                RETURNING id
             )
-            SELECT id, secret FROM ins
+            SELECT id FROM ins
             UNION ALL
-            SELECT id, secret FROM api_keys
+            SELECT id FROM api_keys
             WHERE parent_api_key_id = $2 AND purpose = 'batch'
               AND hidden = true AND is_deleted = false
             LIMIT 1
@@ -517,12 +471,10 @@ impl<'c> ApiKeys<'c> {
         )
         .fetch_optional(&mut *self.db)
         .await?
+        .flatten()
         .ok_or(DbError::NotFound)?;
 
-        let id = row.id.ok_or(DbError::NotFound)?;
-        let secret = row.secret.ok_or(DbError::NotFound)?;
-
-        Ok((secret, id))
+        Ok(id)
     }
 
     /// Resolve the hidden batch-purpose execution key for batch/file/flex work.
@@ -542,11 +494,11 @@ impl<'c> ApiKeys<'c> {
         target_user_id: UserId,
         created_by: UserId,
         authenticating_key_id: Option<ApiKeyId>,
-    ) -> Result<(String, ApiKeyId)> {
+    ) -> Result<ApiKeyId> {
         if let Some(parent_id) = authenticating_key_id {
-            let child = sqlx::query!(
+            let child = sqlx::query_scalar!(
                 r#"
-                SELECT id, secret FROM api_keys
+                SELECT id FROM api_keys
                 WHERE parent_api_key_id = $1 AND purpose = 'batch'
                   AND hidden = true AND is_deleted = false
                 "#,
@@ -556,11 +508,11 @@ impl<'c> ApiKeys<'c> {
             .await?;
 
             if let Some(child) = child {
-                return Ok((child.secret, child.id));
+                return Ok(child);
             }
         }
 
-        self.get_or_create_hidden_key_with_id(target_user_id, ApiKeyPurpose::Batch, created_by)
+        self.get_or_create_hidden_key(target_user_id, ApiKeyPurpose::Batch, created_by)
             .await
     }
 
@@ -1096,18 +1048,18 @@ impl<'c> ApiKeys<'c> {
         Ok(results)
     }
 
-    /// Get user information (ID, email, purpose) by API key secret
+    /// Get user information (ID, email, purpose) by API key hash
     ///
     /// This method is used by the request logging system to enrich analytics records
     /// with user information and determine tariff selection based on API key purpose.
     ///
     /// # Arguments
-    /// * `secret` - The API key secret to look up
+    /// * `secret_hash` - The hash of the API key secret to look up
     ///
     /// # Returns
     /// Returns a tuple of (user_id, email, purpose) if found, or None if not found
-    #[instrument(level = "debug", skip(self, secret), err)]
-    pub async fn get_user_info_by_secret(&mut self, secret: &str) -> Result<Option<(UserId, String, ApiKeyPurpose)>> {
+    #[instrument(level = "debug", skip_all, err)]
+    pub async fn get_user_info_by_hash(&mut self, secret_hash: &ApiKeyHash) -> Result<Option<(UserId, String, ApiKeyPurpose)>> {
         #[derive(Debug, FromRow)]
         struct UserInfo {
             user_id: UserId,
@@ -1123,7 +1075,7 @@ impl<'c> ApiKeys<'c> {
             JOIN users u ON ak.user_id = u.id
             WHERE ak.secret_hash = $1
             "#,
-            &hash_api_key(secret)[..]
+            &secret_hash[..]
         )
         .fetch_optional(&mut *self.db)
         .await?;
@@ -1293,12 +1245,13 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         assert_secret_hash_stored(&mut conn, key.id, &key.secret, "create").await;
 
-        // get_or_create_hidden_key: insert path
-        let hidden_secret = ApiKeys::new(&mut conn)
+        // get_or_create_hidden_key: insert path. The secret is never handed
+        // out; read the stored one to check its hash.
+        let hidden_id = ApiKeys::new(&mut conn)
             .get_or_create_hidden_key(user, ApiKeyPurpose::Playground, other)
             .await
             .unwrap();
-        let hidden_id: ApiKeyId = sqlx::query_scalar!(
+        let expected_id: ApiKeyId = sqlx::query_scalar!(
             "SELECT id FROM api_keys WHERE user_id = $1 AND created_by = $2 AND purpose = 'playground' AND hidden",
             user,
             other
@@ -1306,17 +1259,13 @@ mod tests {
         .fetch_one(&mut *conn)
         .await
         .unwrap();
+        assert_eq!(hidden_id, expected_id);
+        let hidden_secret = ApiKeys::new(&mut conn).legacy_dispatch_secret(hidden_id).await.unwrap();
         assert_secret_hash_stored(&mut conn, hidden_id, &hidden_secret, "get_or_create_hidden_key").await;
 
-        // get_or_create_hidden_key_with_id: insert path
-        let (batch_secret, batch_id) = ApiKeys::new(&mut conn)
-            .get_or_create_hidden_key_with_id(user, ApiKeyPurpose::Batch, user)
-            .await
-            .unwrap();
-        assert_secret_hash_stored(&mut conn, batch_id, &batch_secret, "get_or_create_hidden_key_with_id").await;
-
         // get_or_create_child_hidden_key: insert path
-        let (child_secret, child_id) = ApiKeys::new(&mut conn).get_or_create_child_hidden_key(key.id).await.unwrap();
+        let child_id = ApiKeys::new(&mut conn).get_or_create_child_hidden_key(key.id).await.unwrap();
+        let child_secret = ApiKeys::new(&mut conn).legacy_dispatch_secret(child_id).await.unwrap();
         assert_secret_hash_stored(&mut conn, child_id, &child_secret, "get_or_create_child_hidden_key").await;
 
         // rotate_secret replaces secret, hash and prefix together
@@ -1336,11 +1285,10 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let mut repo = ApiKeys::new(&mut conn);
 
-        let (secret1, child_id) = repo.get_or_create_child_hidden_key(parent.id).await.unwrap();
+        let child_id = repo.get_or_create_child_hidden_key(parent.id).await.unwrap();
         // Idempotent: second call returns the same key, not a new one.
-        let (secret2, child_id2) = repo.get_or_create_child_hidden_key(parent.id).await.unwrap();
+        let child_id2 = repo.get_or_create_child_hidden_key(parent.id).await.unwrap();
         assert_eq!(child_id, child_id2);
-        assert_eq!(secret1, secret2);
 
         // The child copies the parent's (user_id, created_by) verbatim and is
         // a hidden batch-purpose key linked via parent_api_key_id.
@@ -1360,10 +1308,7 @@ mod tests {
         // The shared member hidden key is a distinct row: the child does not
         // collide with (and does not replace) the parentless upsert.
         let mut repo = ApiKeys::new(&mut conn);
-        let (_, shared_id) = repo
-            .get_or_create_hidden_key_with_id(org, ApiKeyPurpose::Batch, member)
-            .await
-            .unwrap();
+        let shared_id = repo.get_or_create_hidden_key(org, ApiKeyPurpose::Batch, member).await.unwrap();
         assert_ne!(shared_id, child_id);
 
         // Member-filter lookups include both (batches may be attributed to either).
@@ -1381,25 +1326,21 @@ mod tests {
         let mut repo = ApiKeys::new(&mut conn);
 
         // Session-authenticated (no key id): shared hidden key.
-        let (_, shared_id) = repo.resolve_batch_execution_key(user, user, None).await.unwrap();
-        let (_, shared_again) = repo
-            .get_or_create_hidden_key_with_id(user, ApiKeyPurpose::Batch, user)
-            .await
-            .unwrap();
+        let shared_id = repo.resolve_batch_execution_key(user, user, None).await.unwrap();
+        let shared_again = repo.get_or_create_hidden_key(user, ApiKeyPurpose::Batch, user).await.unwrap();
         assert_eq!(shared_id, shared_again);
 
         // Key-authenticated but no child (uncapped): shared hidden key.
-        let (_, resolved) = repo.resolve_batch_execution_key(user, user, Some(key.id)).await.unwrap();
+        let resolved = repo.resolve_batch_execution_key(user, user, Some(key.id)).await.unwrap();
         assert_eq!(resolved, shared_id);
 
         // Once a child exists (cap set), the same call resolves to the child.
-        let (child_secret, child_id) = repo.get_or_create_child_hidden_key(key.id).await.unwrap();
-        let (resolved_secret, resolved_id) = repo.resolve_batch_execution_key(user, user, Some(key.id)).await.unwrap();
+        let child_id = repo.get_or_create_child_hidden_key(key.id).await.unwrap();
+        let resolved_id = repo.resolve_batch_execution_key(user, user, Some(key.id)).await.unwrap();
         assert_eq!(resolved_id, child_id);
-        assert_eq!(resolved_secret, child_secret);
 
         // Session flows still get the shared key even when a child exists.
-        let (_, session_id) = repo.resolve_batch_execution_key(user, user, None).await.unwrap();
+        let session_id = repo.resolve_batch_execution_key(user, user, None).await.unwrap();
         assert_eq!(session_id, shared_id);
     }
 
@@ -1411,7 +1352,7 @@ mod tests {
 
         let mut conn = pool.acquire().await.unwrap();
         let mut repo = ApiKeys::new(&mut conn);
-        let (_, child_id) = repo.get_or_create_child_hidden_key(key.id).await.unwrap();
+        let child_id = repo.get_or_create_child_hidden_key(key.id).await.unwrap();
 
         // Deleting the parent revokes the child in the same statement, so it
         // drops out of onwards' key set with the parent.
@@ -1431,11 +1372,8 @@ mod tests {
 
         let mut conn = pool.acquire().await.unwrap();
         let mut repo = ApiKeys::new(&mut conn);
-        let (_, child_id) = repo.get_or_create_child_hidden_key(key.id).await.unwrap();
-        let (_, shared_id) = repo
-            .get_or_create_hidden_key_with_id(user, ApiKeyPurpose::Batch, user)
-            .await
-            .unwrap();
+        let child_id = repo.get_or_create_child_hidden_key(key.id).await.unwrap();
+        let shared_id = repo.get_or_create_hidden_key(user, ApiKeyPurpose::Batch, user).await.unwrap();
 
         // No grandchildren (child as parent) and no children of hidden keys.
         assert!(matches!(
@@ -4791,25 +4729,20 @@ mod tests {
         let mut api_repo = ApiKeys::new(&mut conn);
 
         // Create hidden key
-        let secret1 = api_repo
+        let key_id = api_repo
             .get_or_create_hidden_key(user.id, ApiKeyPurpose::Batch, user.id)
             .await
             .unwrap();
 
         // Soft-delete it
-        let key_id = sqlx::query_scalar!("SELECT id FROM api_keys WHERE secret = $1", &secret1)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-
         api_repo.delete(key_id).await.unwrap();
 
         // Getting hidden key again should create a new one
-        let secret2 = api_repo
+        let key_id2 = api_repo
             .get_or_create_hidden_key(user.id, ApiKeyPurpose::Batch, user.id)
             .await
             .unwrap();
-        assert_ne!(secret1, secret2);
+        assert_ne!(key_id, key_id2);
     }
 
     // ── created_by filter tests ───────────────────────────────────────────

@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                d.id as deployment_id,\n                d.alias as deployment_alias\n            FROM deployed_models d\n            JOIN deployment_groups dg ON dg.deployment_id = d.id\n            WHERE d.alias = $1\n            AND dg.group_id IN (\n                SELECT ug.group_id FROM user_groups ug WHERE ug.user_id = $2\n                UNION\n                SELECT '00000000-0000-0000-0000-000000000000'::uuid\n                WHERE $2 != '00000000-0000-0000-0000-000000000000'::uuid\n            )\n            LIMIT 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "deployment_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "deployment_alias",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "4098e00613d154387e9c3a0d57ae1d55a84df176a751cb8a88fc0723edca3141"
+}

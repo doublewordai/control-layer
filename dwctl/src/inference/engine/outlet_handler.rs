@@ -20,6 +20,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use uuid::Uuid;
 
 use super::writer::{RawCompletedRequest, RequestsWriterSender};
+use crate::auth::internal_credential::{captured_key_hash, is_internal};
 use crate::inference::store::{ONWARDS_RESPONSE_ID_HEADER, lookup_created_by};
 
 /// Outlet handler that forwards completion records to the in-process writer.
@@ -34,13 +35,17 @@ pub struct FusilladeOutletHandler {
     sender: RequestsWriterSender,
     /// Live provider (not a pinned pool): survives runtime pool swaps.
     dwctl_pool: sqlx_pool_router::DynPools,
+    /// onwards' live key set, to find the key an internal credential
+    /// authenticated as (see [`captured_key_hash`]).
+    targets: onwards::target::Targets,
 }
 
 impl FusilladeOutletHandler {
-    pub fn new(sender: RequestsWriterSender, dwctl_pool: impl sqlx_pool_router::PoolProvider) -> Self {
+    pub fn new(sender: RequestsWriterSender, dwctl_pool: impl sqlx_pool_router::PoolProvider, targets: onwards::target::Targets) -> Self {
         Self {
             sender,
             dwctl_pool: sqlx_pool_router::DynPools::new(dwctl_pool),
+            targets,
         }
     }
 
@@ -133,7 +138,10 @@ impl FusilladeOutletHandler {
     /// attributed. The fusillade row's XOR check requires non-empty
     /// `created_by` for batchless rows; the underway-era code skipped the
     /// same case at the job level, so this is just where the skip moved to.
-    async fn resolve_attribution(&self, ctx: &CompleteResponseCtx) -> Option<(String, String)> {
+    ///
+    /// `authenticated` is the key onwards authenticated the request as, which
+    /// is how an internal credential is attributed. Its token is not stored.
+    async fn resolve_attribution(&self, ctx: &CompleteResponseCtx, authenticated: Option<Uuid>) -> Option<(String, String)> {
         let api_key = match ctx.api_key.as_deref() {
             Some(key) if !key.is_empty() => key.to_string(),
             _ => {
@@ -145,9 +153,11 @@ impl FusilladeOutletHandler {
                 return None;
             }
         };
-        let created_by = lookup_created_by(&self.dwctl_pool.write(), Some(&api_key)).await;
+        let key_hash = captured_key_hash(Some(&api_key), authenticated, &self.targets);
+        let created_by = lookup_created_by(&self.dwctl_pool.write(), key_hash.as_ref()).await;
+        let stored_key = if is_internal(&api_key) { String::new() } else { api_key };
         match created_by {
-            Some(uid) if !uid.is_empty() => Some((api_key, uid)),
+            Some(uid) if !uid.is_empty() => Some((stored_key, uid)),
             _ => {
                 tracing::debug!(
                     response_id = %ctx.response_id,
@@ -195,7 +205,8 @@ impl RequestHandler for FusilladeOutletHandler {
             let Some(ctx) = Self::extract_complete_response_ctx(&request_data) else {
                 return;
             };
-            let Some((api_key, created_by)) = handler.resolve_attribution(&ctx).await else {
+            let authenticated = response_data.extensions.get::<onwards::AuthenticatedApiKeyId>().map(|id| id.0);
+            let Some((api_key, created_by)) = handler.resolve_attribution(&ctx, authenticated).await else {
                 return;
             };
 
@@ -260,7 +271,9 @@ impl RequestHandler for FusilladeOutletHandler {
             let Some(ctx) = Self::extract_complete_response_ctx(&request_data) else {
                 return;
             };
-            let Some((api_key, created_by)) = handler.resolve_attribution(&ctx).await else {
+            // No response, so no authenticated key: an abandoned internal
+            // request goes unattributed and is dropped.
+            let Some((api_key, created_by)) = handler.resolve_attribution(&ctx, None).await else {
                 return;
             };
 
