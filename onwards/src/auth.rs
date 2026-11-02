@@ -124,6 +124,33 @@ pub fn validate_bearer_token(keys: &KeySet, token: &KeyHash) -> bool {
     keys.contains(token)
 }
 
+/// The label naming a key's id; [`crate::target::Targets::key_ids`] indexes
+/// keys by it.
+pub const API_KEY_ID_LABEL: &str = "api_key_id";
+
+/// A key an embedding application has already authenticated, set as a
+/// request extension.
+///
+/// When present, onwards uses this hash instead of hashing the
+/// `Authorization` bearer token. It still has to be in the target's key set,
+/// so a key removed from the configuration is refused as usual. Only
+/// in-process code can set request extensions, so a client cannot supply one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PresentedKey(pub KeyHash);
+
+/// The key hash a request presents: a [`PresentedKey`] extension if set,
+/// otherwise the hash of its `Authorization: Bearer` token.
+pub fn presented_key<B>(req: &axum::http::Request<B>) -> Option<KeyHash> {
+    if let Some(PresentedKey(hash)) = req.extensions().get::<PresentedKey>() {
+        return Some(*hash);
+    }
+    req.headers()
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(KeyHash::of)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +187,29 @@ mod tests {
         let keys: KeySet = [KeyHash::of("good")].into_iter().collect();
         assert!(validate_bearer_token(&keys, &KeyHash::of("good")));
         assert!(!validate_bearer_token(&keys, &KeyHash::of("bad")));
+    }
+
+    #[test]
+    fn presented_key_prefers_the_extension_over_the_bearer() {
+        let request = |bearer: Option<&str>| {
+            let mut builder = axum::http::Request::builder();
+            if let Some(bearer) = bearer {
+                builder = builder.header("authorization", format!("Bearer {bearer}"));
+            }
+            builder.body(()).unwrap()
+        };
+
+        assert_eq!(presented_key(&request(None)), None);
+        assert_eq!(
+            presented_key(&request(Some("sk-a"))),
+            Some(KeyHash::of("sk-a"))
+        );
+
+        let mut pre_authenticated = request(Some("not-a-key"));
+        pre_authenticated
+            .extensions_mut()
+            .insert(PresentedKey(KeyHash::of("sk-b")));
+        assert_eq!(presented_key(&pre_authenticated), Some(KeyHash::of("sk-b")));
     }
 
     #[test]

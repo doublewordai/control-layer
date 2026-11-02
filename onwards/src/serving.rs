@@ -755,6 +755,7 @@ mod handler_tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels,
+            key_ids: Default::default(),
             accounts,
             strict_mode: false,
             http_pool_config: None,
