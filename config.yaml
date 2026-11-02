@@ -923,24 +923,38 @@ background_services:
     # configured until every journaled retirement has completed, even if the
     # enable flag is turned back off.
     # retained_response_retirement_enabled: false
-    # Weekly batch-archive retirement irreversibly drops whole expired
-    # archive partitions once every batch in the week is past the
-    # finalization-anchored retention period below. Batch metadata rows are
-    # stamped retention-expired, never deleted. Requires the same
-    # session-capable maintenance endpoint as response retirement.
+    # Content retention for both weekly families below is R =
+    # batches.files.max_expiry_seconds rounded up to whole days. A week drops
+    # once it is R days past its end, so no file's expires_at can outrun its
+    # content. While either family is enabled, a batch can no longer be
+    # retried once it, or its input file, is R - 1 days old (a retry would
+    # hold its weeks open past the period); the API answers 400.
+    #
+    # Weekly batch-archive retirement irreversibly drops a whole archive
+    # partition once the week is past R, measured from the week itself, and
+    # no batch created in that week is still running. The oldest completion
+    # in a dropped week is 7 + R days old, the newest R days. Batch metadata
+    # rows are never touched. Requires the same session-capable maintenance
+    # endpoint as response retirement.
     # batch_archive_retirement_enabled: false
-    # batch_archive_retention_days: <positive days>
+    # DEPRECATED and ignored: batch_archive_retention_days and
+    # template_retention_days no longer set retention, which follows
+    # batches.files.max_expiry_seconds. The keys still parse so existing
+    # values files keep loading, but log a warning at startup. Remove them.
+    # batch_archive_retention_days: <ignored>
     # DEPRECATED and ignored: request templates are always written to the
     # weekly generation-2 partitions now that the generation-1 heap has been
     # retired. The key still parses so existing values files keep loading,
     # but it logs a warning at startup. Remove it.
     # template_generation_writes_enabled: false
-    # File-content expiry + weekly template partition retirement. Tombstones
-    # aged input-file metadata (rows survive) once every referencing batch's
-    # content is expired, then drops whole template weeks that no live file
-    # references. Requires the same session-capable maintenance endpoint.
+    # Weekly template retirement irreversibly drops a whole week of request
+    # templates (batch input content) once the week is past R, measured from
+    # the week itself, and no batch still running reads input uploaded in
+    # that week. File metadata rows are never touched; an input file reports
+    # expired from its own expires_at. Requires the same session-capable
+    # maintenance endpoint.
     # template_retirement_enabled: false
-    # template_retention_days: <positive days>
+    # template_retention_days: <ignored, deprecated; see above>
     # Schema mode reuses the main direct credentials automatically. Override for
     # dedicated databases or a different Fusillade query role. Use that role on
     # the DIRECT host; startup attests database, role, schema, and ownership.
