@@ -5143,4 +5143,145 @@ mod tests {
             .unwrap();
         assert_eq!(total_count, 4);
     }
+
+    /// An issued key awaiting its reveal, with its secret wrapped.
+    async fn wrapped_pending_key(pool: &PgPool, keystore: &crate::keystore::Keystore) -> ApiKeyDBResponse {
+        let user = create_user(pool, &format!("holder-{}", &uuid::Uuid::new_v4().to_string()[..8])).await;
+        let key = create_visible_key(pool, user, user).await;
+        let mut conn = pool.acquire().await.unwrap();
+        ApiKeys::new(&mut conn)
+            .mark_secret_reveal_pending(key.id, &keystore.wrap(key.secret.as_bytes()).unwrap())
+            .await
+            .unwrap();
+        key
+    }
+
+    async fn backend_pid(conn: &mut PgConnection) -> i32 {
+        sqlx::query_scalar!(r#"SELECT pg_backend_pid() AS "pid!""#)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap()
+    }
+
+    /// Poll until backend `pid` is waiting on a lock (the other transaction's
+    /// row lock), so the race is set up deterministically.
+    async fn wait_until_lock_waiting(pool: &PgPool, pid: i32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let waiting = sqlx::query_scalar!(
+                r#"SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock') AS "waiting!""#,
+                pid
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if waiting {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "backend {pid} never blocked on the row lock");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Run a reveal on its own connection and transaction, in the background.
+    async fn spawn_reveal(pool: &PgPool, id: ApiKeyId) -> (i32, tokio::task::JoinHandle<Option<PendingReveal>>) {
+        let mut conn = pool.acquire().await.unwrap();
+        let pid = backend_pid(&mut conn).await;
+        let handle = tokio::spawn(async move {
+            let mut tx = conn.begin().await.unwrap();
+            let reveal = ApiKeys::new(&mut tx).reveal_secret_once(id).await.unwrap();
+            tx.commit().await.unwrap();
+            reveal
+        });
+        (pid, handle)
+    }
+
+    async fn stored_pending_secret(pool: &PgPool, id: ApiKeyId) -> Option<Vec<u8>> {
+        sqlx::query_scalar!("SELECT pending_secret FROM api_keys WHERE id = $1", id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The revealed secret is the key's current one, recovered from its wrap.
+    fn assert_reveals(keystore: &crate::keystore::Keystore, reveal: &PendingReveal, secret: &str) {
+        assert_eq!(reveal.secret_hash.as_deref(), Some(&hash_api_key(secret)[..]));
+        assert_eq!(
+            crate::pending_secrets::resolve_reveal(Some(keystore), reveal),
+            Some((secret.to_string(), crate::pending_secrets::RevealSource::Wrapped))
+        );
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_concurrent_reveals_exactly_one_succeeds(pool: PgPool) {
+        let keystore = crate::keystore::test_keystore("k1", &[("k1", "wrap-one")]);
+        let key = wrapped_pending_key(&pool, &keystore).await;
+
+        // The first reveal holds the row lock; the second waits on it.
+        let mut first_conn = pool.acquire().await.unwrap();
+        let mut first_tx = first_conn.begin().await.unwrap();
+        let first = ApiKeys::new(&mut first_tx).reveal_secret_once(key.id).await.unwrap();
+        let (pid, second) = spawn_reveal(&pool, key.id).await;
+        wait_until_lock_waiting(&pool, pid).await;
+        assert!(!second.is_finished());
+        first_tx.commit().await.unwrap();
+
+        assert_reveals(&keystore, &first.expect("first reveal succeeds"), &key.secret);
+        assert!(second.await.unwrap().is_none(), "the second reveal must not succeed");
+        assert_eq!(stored_pending_secret(&pool, key.id).await, None);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_reveal_waiting_on_rotation_returns_the_new_secret(pool: PgPool) {
+        let keystore = crate::keystore::test_keystore("k1", &[("k1", "wrap-one")]);
+        let key = wrapped_pending_key(&pool, &keystore).await;
+
+        // Rotation (with its re-wrap, as the handler does) holds the row lock.
+        let mut rotate_conn = pool.acquire().await.unwrap();
+        let mut rotate_tx = rotate_conn.begin().await.unwrap();
+        let mut repo = ApiKeys::new(&mut rotate_tx);
+        let rotated = repo.rotate_secret(key.id).await.unwrap();
+        let rewrapped = keystore.wrap(rotated.as_bytes()).unwrap();
+        assert!(repo.set_pending_secret(key.id, &rewrapped, &hash_api_key(&rotated)).await.unwrap());
+        let (pid, reveal) = spawn_reveal(&pool, key.id).await;
+        wait_until_lock_waiting(&pool, pid).await;
+        assert!(!reveal.is_finished());
+        rotate_tx.commit().await.unwrap();
+
+        assert_reveals(&keystore, &reveal.await.unwrap().expect("reveal succeeds"), &rotated);
+        assert_eq!(stored_pending_secret(&pool, key.id).await, None);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_rotation_waiting_on_reveal_does_not_rewrap(pool: PgPool) {
+        let keystore = crate::keystore::test_keystore("k1", &[("k1", "wrap-one")]);
+        let key = wrapped_pending_key(&pool, &keystore).await;
+
+        let mut reveal_conn = pool.acquire().await.unwrap();
+        let mut reveal_tx = reveal_conn.begin().await.unwrap();
+        let revealed = ApiKeys::new(&mut reveal_tx).reveal_secret_once(key.id).await.unwrap();
+
+        let mut rotate_conn = pool.acquire().await.unwrap();
+        let pid = backend_pid(&mut rotate_conn).await;
+        let rotation = tokio::spawn(async move {
+            let mut tx = rotate_conn.begin().await.unwrap();
+            let mut repo = ApiKeys::new(&mut tx);
+            let rotated = repo.rotate_secret(key.id).await.unwrap();
+            let rewrapped = repo
+                .set_pending_secret(key.id, b"wrap-of-new-secret", &hash_api_key(&rotated))
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            rewrapped
+        });
+        wait_until_lock_waiting(&pool, pid).await;
+        assert!(!rotation.is_finished());
+        reveal_tx.commit().await.unwrap();
+
+        assert_reveals(&keystore, &revealed.expect("reveal succeeds"), &key.secret);
+        assert!(!rotation.await.unwrap(), "a revealed key gets no new wrap");
+        assert_eq!(stored_pending_secret(&pool, key.id).await, None);
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(ApiKeys::new(&mut conn).reveal_secret_once(key.id).await.unwrap().is_none());
+    }
 }

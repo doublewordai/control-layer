@@ -85,10 +85,82 @@ pub struct ReconcileReport {
     pub rewrapped: u64,
     /// Wraps cleared from keys that can no longer be revealed.
     pub cleared: u64,
-    /// Pending keys whose reveal still needs the plaintext column: every
-    /// pending key when no keystore is configured, otherwise those that could
-    /// not be wrapped.
+    /// Pending keys whose reveal is not verified to work from its wrap alone,
+    /// counted by re-reading them after wrapping: every pending key when no
+    /// keystore is configured.
     pub needing_plaintext: u64,
+}
+
+/// What a pending key's reveal needs, judged from one read of its row.
+enum PendingState {
+    /// Wrapped with the current wrap key, and the wrap is of the key's current
+    /// secret: the reveal needs nothing else.
+    Verified,
+    /// Wrap this secret (`rewrap`: replacing a valid wrap by an old wrap key).
+    Wrap { secret: String, rewrap: bool },
+    /// No keystore, or neither the wrap nor the plaintext yields the secret.
+    Unresolved,
+}
+
+fn pending_state(keystore: Option<&Keystore>, row: &PendingReveal) -> PendingState {
+    let (Some(keystore), Some(secret_hash)) = (keystore, row.secret_hash.as_deref()) else {
+        return PendingState::Unresolved;
+    };
+    if let Some(wrapped) = row.pending_secret.as_deref()
+        && let Some(secret) = unwrap_current(keystore, wrapped, secret_hash)
+    {
+        return if keystore.is_current(wrapped) {
+            PendingState::Verified
+        } else {
+            PendingState::Wrap { secret, rewrap: true }
+        };
+    }
+    match &row.secret {
+        Some(secret) if hash_api_key(secret)[..] == *secret_hash => PendingState::Wrap {
+            secret: secret.clone(),
+            rewrap: false,
+        },
+        _ => PendingState::Unresolved,
+    }
+}
+
+/// Wrap every row that needs it. A guarded write that matches nothing (the
+/// key was revealed, deleted or rotated since it was read) is left to the
+/// verification pass, which re-reads it.
+async fn wrap_rows(
+    repo: &mut ApiKeys<'_>,
+    keystore: Option<&Keystore>,
+    rows: Vec<PendingReveal>,
+    report: &mut ReconcileReport,
+) -> anyhow::Result<()> {
+    for row in rows {
+        let (Some(keystore), PendingState::Wrap { secret, rewrap }) = (keystore, pending_state(keystore, &row)) else {
+            continue;
+        };
+        let Some(secret_hash) = row.secret_hash.as_deref() else { continue };
+        let wrapped = keystore.wrap(secret.as_bytes())?;
+        if repo.set_pending_secret(row.id, &wrapped, secret_hash).await? {
+            if rewrap {
+                report.rewrapped += 1;
+            } else {
+                report.wrapped += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Re-read every pending key and count those whose reveal is not verified to
+/// work from its wrap alone. Only this count feeds the readiness gauge, so a
+/// write lost to a concurrent rotation by a release that doesn't maintain
+/// wraps shows up as unresolved instead of being assumed settled.
+async fn count_unverified(repo: &mut ApiKeys<'_>, keystore: Option<&Keystore>) -> anyhow::Result<u64> {
+    Ok(repo
+        .list_pending_reveals()
+        .await?
+        .iter()
+        .filter(|row| !matches!(pending_state(keystore, row), PendingState::Verified))
+        .count() as u64)
 }
 
 /// One reconcile pass over every key with a pending reveal.
@@ -99,38 +171,9 @@ pub async fn reconcile<P: PoolProvider>(db: &P, keystore: Option<&Keystore>) -> 
         cleared: repo.clear_orphaned_pending_secrets().await?,
         ..Default::default()
     };
-
-    for row in repo.list_pending_reveals().await? {
-        let (Some(keystore), Some(secret_hash)) = (keystore, row.secret_hash.as_deref()) else {
-            report.needing_plaintext += 1;
-            continue;
-        };
-        let existing = row
-            .pending_secret
-            .as_deref()
-            .and_then(|wrapped| unwrap_current(keystore, wrapped, secret_hash).map(|secret| (secret, keystore.is_current(wrapped))));
-        let (secret, rewrap) = match existing {
-            Some((_, true)) => continue,
-            Some((secret, false)) => (secret, true),
-            None => match row.secret {
-                Some(secret) if hash_api_key(&secret)[..] == *secret_hash => (secret, false),
-                _ => {
-                    report.needing_plaintext += 1;
-                    continue;
-                }
-            },
-        };
-        let wrapped = keystore.wrap(secret.as_bytes())?;
-        // A false return means the key was revealed, deleted or rotated since
-        // it was listed; whoever did that has already settled its wrap.
-        if repo.set_pending_secret(row.id, &wrapped, secret_hash).await? {
-            if rewrap {
-                report.rewrapped += 1;
-            } else {
-                report.wrapped += 1;
-            }
-        }
-    }
+    let rows = repo.list_pending_reveals().await?;
+    wrap_rows(&mut repo, keystore, rows, &mut report).await?;
+    report.needing_plaintext = count_unverified(&mut repo, keystore).await?;
     Ok(report)
 }
 
@@ -314,5 +357,41 @@ mod tests {
 
         // Idempotent.
         assert_eq!(reconcile(&db, Some(&ks)).await.unwrap(), ReconcileReport::default());
+    }
+
+    #[dwctl_test_macros::test]
+    async fn rotation_between_read_and_wrap_is_not_reported_settled(pool: PgPool) {
+        let ks = test_keystore("k1", &[("k1", "wrap-one")]);
+        let (id, _) = pending_key(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = ApiKeys::new(&mut conn);
+        let rows = repo.list_pending_reveals().await.unwrap();
+        assert_eq!(rows.len(), 1);
+
+        // A release that doesn't maintain wraps rotates the key after the read.
+        let rotated = "sk-rotated-by-previous-release";
+        sqlx::query!(
+            "UPDATE api_keys SET secret = $2, secret_hash = $3 WHERE id = $1",
+            id,
+            rotated,
+            &hash_api_key(rotated)[..]
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The guarded write misses, so nothing is wrapped and the key still
+        // needs plaintext.
+        let mut report = ReconcileReport::default();
+        wrap_rows(&mut repo, Some(&ks), rows, &mut report).await.unwrap();
+        assert_eq!(report.wrapped, 0);
+        assert_eq!(stored_wrap(&pool, id).await, None);
+        assert_eq!(count_unverified(&mut repo, Some(&ks)).await.unwrap(), 1);
+
+        // The next pass wraps the rotated secret and reports it verified.
+        let db = TestDbPools::new(pool.clone()).await.unwrap();
+        let report = reconcile(&db, Some(&ks)).await.unwrap();
+        assert_eq!((report.wrapped, report.needing_plaintext), (1, 0));
+        assert_eq!(ks.unwrap(&stored_wrap(&pool, id).await.unwrap()).unwrap(), rotated.as_bytes());
     }
 }
