@@ -141,10 +141,18 @@ pub struct PresentedKey(pub KeyHash);
 /// The key hash a request presents: a [`PresentedKey`] extension if set,
 /// otherwise the hash of its `Authorization: Bearer` token.
 pub fn presented_key<B>(req: &axum::http::Request<B>) -> Option<KeyHash> {
-    if let Some(PresentedKey(hash)) = req.extensions().get::<PresentedKey>() {
+    presented_key_from(req.headers(), req.extensions())
+}
+
+/// As [`presented_key`], from a request's headers and extensions.
+pub fn presented_key_from(
+    headers: &axum::http::HeaderMap,
+    extensions: &axum::http::Extensions,
+) -> Option<KeyHash> {
+    if let Some(PresentedKey(hash)) = extensions.get::<PresentedKey>() {
         return Some(*hash);
     }
-    req.headers()
+    headers
         .get("authorization")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
