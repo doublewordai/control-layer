@@ -423,8 +423,10 @@ scheduling:
 # secret is held in Postgres, wrapped with these wrap keys, until the holder's
 # one-off reveal. Without this section such requests are refused (503);
 # self-created keys are unaffected. Those wrapped secrets have no TTL: a
-# background task re-wraps them with the current wrap key every 15 minutes, so
-# keep a retired wrap key until that has run on an instance with the new key.
+# background task re-wraps them with each instance's current wrap key every 15
+# minutes. During a rolling rotation an instance still on the old current key
+# re-wraps with it, so keep a retired wrap key until every instance uses the new
+# current key and a reconcile has completed after that.
 #
 # Local dev: run `just redis-start`, then uncomment the block below.
 keystore:

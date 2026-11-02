@@ -237,15 +237,18 @@ describe("dwctlApi.users", () => {
         expect(createdKey.name).toBe(keyData.name);
       });
 
-      it("should surface the server's reason when creation is refused", async () => {
+      it("should surface the server's JSON message when creation is refused", async () => {
         const userId = "550e8400-e29b-41d4-a716-446655440001";
         server.use(
-          http.post(
-            `/admin/api/v1/users/${userId}/api-keys`,
-            () =>
-              new HttpResponse("No keystore configured", {
-                status: 503,
-              }),
+          http.post(`/admin/api/v1/users/${userId}/api-keys`, () =>
+            HttpResponse.json(
+              {
+                error: "service_unavailable",
+                message: "No keystore configured",
+                retry_after_seconds: 30,
+              },
+              { status: 503 },
+            ),
           ),
         );
 
@@ -255,8 +258,25 @@ describe("dwctlApi.users", () => {
             userId,
           ),
         ).rejects.toThrow(
-          "Failed to create API key: 503 - No keystore configured",
+          /^Failed to create API key: 503 - No keystore configured$/,
         );
+      });
+
+      it("should surface a plain-text error body as is", async () => {
+        const userId = "550e8400-e29b-41d4-a716-446655440001";
+        server.use(
+          http.post(
+            `/admin/api/v1/users/${userId}/api-keys`,
+            () => new HttpResponse("Bad name", { status: 400 }),
+          ),
+        );
+
+        await expect(
+          dwctlApi.users.apiKeys.create(
+            { name: "Issued Key", purpose: "realtime" },
+            userId,
+          ),
+        ).rejects.toThrow(/^Failed to create API key: 400 - Bad name$/);
       });
     });
 

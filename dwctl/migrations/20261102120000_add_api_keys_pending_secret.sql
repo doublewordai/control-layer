@@ -9,4 +9,4 @@
 ALTER TABLE api_keys ADD COLUMN pending_secret BYTEA;
 
 COMMENT ON COLUMN api_keys.pending_secret IS
-    'Keystore-wrapped secret of an issued key awaiting its one-off reveal (secret_revealed_at IS NULL); NULL otherwise.';
+    'Keystore-wrapped secret for a pending one-off reveal (secret_revealed_at IS NULL), set at issue or by reconciliation. A pending key may be NULL until reconciliation wraps it; NULL for every other key.';
