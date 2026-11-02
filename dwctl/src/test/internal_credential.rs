@@ -49,6 +49,8 @@ impl Harness {
         config.host = "127.0.0.1".to_string();
         config.port = port;
         config.background_services.onwards_sync.enabled = true;
+        // Write each completed response row as soon as it arrives.
+        config.background_services.task_workers.response_writer_batch_size = 1;
         let app = crate::Application::new_with_pool(config.clone(), Some(pool.clone()), None)
             .await
             .expect("app");
@@ -240,4 +242,52 @@ async fn playground_and_probes_work_without_key_secrets(pool: PgPool) {
     assert_eq!(result.status_code, Some(200));
 
     h.assert_no_token_reached_upstream().await;
+}
+
+/// A background playground request that an inner layer refuses before
+/// onwards sees it (here protocol translation, for an unsupported server
+/// tool) still has its pre-created row completed with the failure, so it
+/// never stays `processing`.
+#[dwctl_test_macros::test]
+async fn background_playground_request_refused_inside_the_stack_is_recorded(pool: PgPool) {
+    let h = Harness::start(&pool).await;
+    hidden_key(&pool, h.user.id, ApiKeyPurpose::Playground).await;
+    h.bg.sync_onwards_config(&pool).await.unwrap();
+
+    let session = add_auth_headers(&h.user);
+    let accepted = h
+        .server
+        .post("/admin/api/v1/ai/v1/responses")
+        .add_header(&session[0].0, &session[0].1)
+        .add_header(&session[1].0, &session[1].1)
+        .json(&serde_json::json!({
+            "model": MODEL,
+            "input": "hi",
+            "background": true,
+            "service_tier": "priority",
+            "tools": [ { "type": "file_search", "vector_store_ids": ["vs_1"] } ]
+        }))
+        .await;
+    assert_eq!(accepted.status_code(), 202, "{}", accepted.text());
+    let response_id = accepted.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
+    let request_id: Uuid = response_id.trim_start_matches("resp_").parse().unwrap();
+
+    let state = || async {
+        sqlx::query_scalar::<_, String>("SELECT state::text FROM fusillade.requests WHERE id = $1")
+            .bind(request_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut current = state().await;
+    while current == "processing" && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        current = state().await;
+    }
+    assert_eq!(current, "failed", "the refusal is recorded on the row");
+    assert!(
+        h.mock.received_requests().await.unwrap_or_default().is_empty(),
+        "the refused request never reached the upstream"
+    );
 }

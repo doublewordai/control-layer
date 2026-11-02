@@ -353,6 +353,14 @@ impl<P> AppState<P>
 where
     P: PoolProvider + Clone,
 {
+    /// What internal credentials are verified and resolved against.
+    pub(crate) fn internal_auth_state(&self) -> auth::internal_credential::InternalAuthState {
+        auth::internal_credential::InternalAuthState {
+            credentials: self.internal_credentials.clone(),
+            targets: self.onwards_targets.clone().unwrap_or_default(),
+        }
+    }
+
     pub fn current_config(&self) -> Arc<Config> {
         self.config.snapshot()
     }
@@ -1942,7 +1950,7 @@ pub async fn build_router(
                 recorder,
                 instance_id,
                 config.as_ref().clone(),
-                state.onwards_targets.clone().unwrap_or_default(),
+                state.internal_auth_state(),
             ));
         }
 
@@ -1955,7 +1963,7 @@ pub async fn build_router(
             let fusillade_handler = crate::inference::engine::outlet_handler::FusilladeOutletHandler::new(
                 sender,
                 rms.dwctl_pool.clone(),
-                state.onwards_targets.clone().unwrap_or_default(),
+                state.internal_auth_state(),
             );
             multi_handler = multi_handler.with(fusillade_handler);
         }
@@ -2692,10 +2700,7 @@ pub async fn build_router(
     // the request's key, and hand the authenticated key on to every layer
     // below. Inside the rejection recorder so a refused token is counted.
     let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
-        auth::internal_credential::InternalAuthState {
-            credentials: state.internal_credentials.clone(),
-            targets: state.onwards_targets.clone().unwrap_or_default(),
-        },
+        state.internal_auth_state(),
         auth::internal_credential::internal_credential_middleware,
     ));
 

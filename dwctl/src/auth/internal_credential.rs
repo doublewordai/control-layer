@@ -124,6 +124,16 @@ impl InternalCredentials {
     /// has not expired. The signature is checked, in constant time, before
     /// anything else in the token is read.
     pub fn verify(&self, token: &str) -> Result<ApiKeyId, InvalidCredential> {
+        let (id, expiry) = self.verify_signature(token)?;
+        if unix_now() > expiry {
+            return Err(InvalidCredential::Expired);
+        }
+        Ok(id)
+    }
+
+    /// The key id and expiry of a token this process minted, whether or not
+    /// it has expired.
+    fn verify_signature(&self, token: &str) -> Result<(ApiKeyId, u64), InvalidCredential> {
         let (payload, tag) = token.rsplit_once('.').ok_or(InvalidCredential::Malformed)?;
         if !is_internal(payload) {
             return Err(InvalidCredential::Malformed);
@@ -134,10 +144,7 @@ impl InternalCredentials {
         let (id, expiry) = payload[TOKEN_PREFIX.len()..].split_once('.').ok_or(InvalidCredential::Malformed)?;
         let id = Uuid::try_parse(id).map_err(|_| InvalidCredential::Malformed)?;
         let expiry: u64 = expiry.parse().map_err(|_| InvalidCredential::Malformed)?;
-        if unix_now() > expiry {
-            return Err(InvalidCredential::Expired);
-        }
-        Ok(id)
+        Ok((id, expiry))
     }
 
     fn mac(&self, payload: &str) -> HmacSha256 {
@@ -165,22 +172,6 @@ pub fn presented_key_hash(extensions: &Extensions, bearer: Option<&str>) -> Opti
     }
 }
 
-/// The hash of the key a request captured by request logging presented.
-///
-/// Request logging sees the request's headers but not its extensions, so it
-/// cannot see the key [`internal_credential_middleware`] authenticated. For
-/// an internal credential this uses the key onwards authenticated the request
-/// as (`authenticated`, from the response's
-/// [`onwards::AuthenticatedApiKeyId`]) instead, looked up in `targets`; the
-/// token itself is not trusted. Any other bearer is hashed.
-pub fn captured_key_hash(bearer: Option<&str>, authenticated: Option<ApiKeyId>, targets: &Targets) -> Option<ApiKeyHash> {
-    match bearer {
-        Some(token) if is_internal(token) => targets.key_ids.get(&authenticated?.to_string()).map(|hash| *hash.as_bytes()),
-        Some(token) => Some(hash_api_key(token)),
-        None => None,
-    }
-}
-
 /// What [`internal_credential_middleware`] checks tokens against.
 #[derive(Clone)]
 pub struct InternalAuthState {
@@ -190,6 +181,27 @@ pub struct InternalAuthState {
 }
 
 impl InternalAuthState {
+    /// The hash of the key a request captured by request logging presented.
+    ///
+    /// Request logging sees a request's headers but not its extensions, so it
+    /// cannot see the key [`internal_credential_middleware`] authenticated,
+    /// and a request an inner layer refused never reaches onwards to be
+    /// attributed there. So an internal credential is resolved again from the
+    /// header: its signature is checked, its expiry is not. Request logging
+    /// sits inside the middleware, so every token it captures was admitted
+    /// there before it expired; a long request may finish after expiry.
+    /// Any other bearer is hashed.
+    pub fn captured_key_hash(&self, bearer: Option<&str>) -> Option<ApiKeyHash> {
+        match bearer {
+            Some(token) if is_internal(token) => {
+                let (id, _expiry) = self.credentials.verify_signature(token).ok()?;
+                self.targets.key_ids.get(&id.to_string()).map(|hash| *hash.as_bytes())
+            }
+            Some(token) => Some(hash_api_key(token)),
+            None => None,
+        }
+    }
+
     /// The hash of the live key `token` authenticates as.
     fn resolve(&self, token: &str) -> Result<ApiKeyHash, &'static str> {
         let id = self.credentials.verify(token).map_err(|error| match error {
@@ -298,6 +310,29 @@ mod tests {
             .mint_expiring_at(Uuid::nil(), 0)
             .replace(&Uuid::nil().simple().to_string(), "x");
         assert!(credentials.verify(&unparseable).is_err());
+    }
+
+    /// Request logging resolves a captured token by signature alone (it was
+    /// checked in full on the way in), never trusting a foreign one.
+    #[test]
+    fn captured_key_hash_checks_the_signature_not_the_expiry() {
+        let state = InternalAuthState {
+            credentials: InternalCredentials::generate(),
+            targets: Targets::default(),
+        };
+        let id = Uuid::new_v4();
+        state.targets.key_ids.insert(id.to_string(), onwards::auth::KeyHash::of("sk-live"));
+        let live = Some(hash_api_key("sk-live"));
+
+        assert_eq!(
+            state.captured_key_hash(Some(&state.credentials.mint(id, Duration::from_secs(60)))),
+            live
+        );
+        assert_eq!(state.captured_key_hash(Some(&state.credentials.mint_expiring_at(id, 1))), live);
+        let foreign = InternalCredentials::generate().mint(id, Duration::from_secs(60));
+        assert_eq!(state.captured_key_hash(Some(&foreign)), None);
+        assert_eq!(state.captured_key_hash(Some("sk-other")), Some(hash_api_key("sk-other")));
+        assert_eq!(state.captured_key_hash(None), None);
     }
 
     #[test]

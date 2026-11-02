@@ -455,8 +455,8 @@ pub struct PrefixChainHandler {
     instance_id: Uuid,
     config: crate::config::Config,
     /// onwards' live key set, to attribute requests made with an internal
-    /// credential (see [`crate::auth::internal_credential::captured_key_hash`]).
-    targets: onwards::target::Targets,
+    /// credential (see [`crate::auth::internal_credential::InternalAuthState::captured_key_hash`]).
+    internal_auth: crate::auth::internal_credential::InternalAuthState,
 }
 
 impl PrefixChainHandler {
@@ -464,13 +464,13 @@ impl PrefixChainHandler {
         recorder: Arc<PrefixChainRecorder>,
         instance_id: Uuid,
         config: crate::config::Config,
-        targets: onwards::target::Targets,
+        internal_auth: crate::auth::internal_credential::InternalAuthState,
     ) -> Self {
         Self {
             recorder,
             instance_id,
             config,
-            targets,
+            internal_auth,
         }
     }
 }
@@ -494,8 +494,7 @@ impl outlet::RequestHandler for PrefixChainHandler {
             crate::request_logging::serializers::Auth::ApiKey { bearer_token } => Some(bearer_token),
             crate::request_logging::serializers::Auth::None => None,
         };
-        let authenticated = response_data.extensions.get::<onwards::AuthenticatedApiKeyId>().map(|id| id.0);
-        let api_key = crate::auth::internal_credential::captured_key_hash(bearer.as_deref(), authenticated, &self.targets);
+        let api_key = self.internal_auth.captured_key_hash(bearer.as_deref());
         let model = request_data
             .body
             .as_ref()
