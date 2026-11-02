@@ -324,14 +324,11 @@ def flows(app, connection, maintenance, pool_admin, model_url, roles, admin_dsn)
         return not acquired
 
     eventually("leader retains its advisory lock on a direct connection", leader_held)
-    api(
-        "POST",
-        "/authentication/login",
-        json={
-            "email": "pool-test@example.invalid",
-            "password": "local-pool-test-password",
-        },
-    )
+    # The local harness stands in for the trusted upstream SSO boundary.
+    session.headers.update({
+        "X-Doubleword-User": "pool-test@example.invalid",
+        "X-Doubleword-Email": "pool-test@example.invalid",
+    })
     user = api("GET", "/admin/api/v1/users/current")
     api(
         "POST",
@@ -777,7 +774,7 @@ ignore_startup_parameters=extra_float_digits
             "email": {"type": "file", "path": "/tmp/pool-test-emails"},
             "auth": {
                 "native": {"enabled": True, "session": {"cookie_secure": False}},
-                "proxy_header": {"enabled": False},
+                "proxy_header": {"enabled": True, "auto_create_users": True},
             },
             "background_services": {
                 "onwards_sync": {

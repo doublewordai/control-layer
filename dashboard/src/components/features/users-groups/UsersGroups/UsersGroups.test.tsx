@@ -115,7 +115,7 @@ describe("UsersGroups Component", () => {
   });
 
   describe("User Management Journey", () => {
-    it("navigates users tab, searches for users, opens create user modal", async () => {
+    it("searches users without offering account creation", async () => {
       const user = userEvent.setup();
       const { container } = render(<UsersGroups />, {
         wrapper: createWrapper(),
@@ -179,140 +179,21 @@ describe("UsersGroups Component", () => {
         { timeout: 3000, interval: 100 },
       );
 
-      // Step 5: Create new user → opens CreateUserModal
-      const addUserButton = within(container).getByRole("button", {
-        name: /add user/i,
-      });
-      await user.click(addUserButton);
-
-      // Wait for modal to open - check for this specific dialog by its title
-      await waitFor(() => {
-        expect(
-          screen.getByRole("dialog", { name: /create new user/i }),
-        ).toBeInTheDocument();
-      });
-
-      // Close modal using cancel button within the dialog
-      const dialog = screen.getByRole("dialog", { name: /create new user/i });
-      const cancelButton = within(dialog).getByRole("button", {
-        name: /cancel/i,
-      });
-      await user.click(cancelButton);
-
-      // Verify this specific modal is closed (not just any dialog)
-      await waitFor(() => {
-        expect(
-          screen.queryByRole("dialog", { name: /create new user/i }),
-        ).not.toBeInTheDocument();
-      });
+      expect(within(container).queryByRole("button", { name: /add user/i })).not.toBeInTheDocument();
     });
 
-    it("explores user actions dropdown and modal workflows", async () => {
+    it("offers ZDR support without profile, role, or deletion controls", async () => {
       const user = userEvent.setup();
-      const { container } = render(<UsersGroups />, {
-        wrapper: createWrapper(),
-      });
-
-      // Wait for users to load
-      await waitFor(() => {
-        expect(
-          within(container).getByRole("heading", { level: 1 }),
-        ).toBeInTheDocument();
-        expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
-      });
-
-      // Step 1: Verify user action buttons are present
-      const editButtons = screen.getAllByTitle("Edit user");
-      expect(editButtons.length).toBeGreaterThan(0);
-
-      const manageGroupsButtons = screen.getAllByTitle("Manage groups");
-      expect(manageGroupsButtons.length).toBeGreaterThan(0);
-
-      const deleteButtons = screen.getAllByTitle("Delete user");
-      expect(deleteButtons.length).toBeGreaterThan(0);
-
-      // Step 2: Test Edit User workflow
-      await user.click(editButtons[0]);
-
-      await waitFor(() => {
-        expect(
-          // assert on screen since modal renders outside of container
-          screen.getByRole("dialog", { name: /edit user/i }),
-        ).toBeInTheDocument();
-        // Verify form fields with injected user data
-        expect(screen.getByDisplayValue("Sarah Chen")).toBeInTheDocument(); // Display name (injected data)
-        expect(screen.getByText("github|109540503")).toBeInTheDocument(); // Username (injected data)
-        // Verify form structure by labels
-        expect(screen.getByLabelText("Display Name")).toBeInTheDocument();
-        expect(screen.getByLabelText("Avatar URL")).toBeInTheDocument();
-        // Verify role checkboxes exist
-        expect(
-          screen.getByRole("checkbox", { name: /standard user/i }),
-        ).toBeInTheDocument();
-      });
-
-      // Close edit modal
-      const cancelEditButton = screen.getByRole("button", {
-        name: /cancel/i,
-      });
-      await user.click(cancelEditButton);
-
-      await waitFor(() => {
-        expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-      });
-
-      // Step 3: Test Manage Groups workflow
-      const manageGroupsBtns = screen.getAllByTitle("Manage groups");
-      await user.click(manageGroupsBtns[0]);
-
-      await waitFor(() => {
-        expect(screen.getByRole("dialog")).toBeInTheDocument();
-        // Should show group management modal - verify by dialog structure
-        expect(
-          screen.getByRole("button", { name: /done/i }),
-        ).toBeInTheDocument();
-      });
-
-      // Close groups modal
-      const doneButton = screen.getByRole("button", {
-        name: /done/i,
-      });
-      await user.click(doneButton);
-
-      await waitFor(() => {
-        expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-      });
-
-      // Step 4: Test Delete User workflow
-      const deleteBtns = screen.getAllByTitle("Delete user");
-      await user.click(deleteBtns[0]);
-
-      await waitFor(() => {
-        expect(
-          screen.getByRole("dialog", { name: /delete user/i }),
-        ).toBeInTheDocument();
-        // Verify injected user data is shown in confirmation
-        expect(screen.getAllByText("Sarah Chen").length).toBeGreaterThan(0); // User name (injected data)
-        expect(
-          screen.getAllByText("sarah.chen@acme.com").length,
-        ).toBeGreaterThan(0); // Email (injected data)
-        // Verify delete action is available
-        expect(
-          screen.getByRole("button", { name: /delete user/i }),
-        ).toBeInTheDocument();
-      });
-
-      // Cancel deletion
-      const cancelDeleteButton = screen.getByRole("button", {
-        name: /cancel/i,
-      });
-      await user.click(cancelDeleteButton);
-
-      await waitFor(() => {
-        expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-        // User should still be in the list
-        expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
-      });
+      const { container } = render(<UsersGroups />, { wrapper: createWrapper() });
+      await within(container).findByText("Sarah Chen");
+      expect(within(container).queryByTitle("Delete user")).not.toBeInTheDocument();
+      await user.click(within(container).getAllByTitle("Edit user")[0]);
+      const dialog = await screen.findByRole("dialog", { name: /edit user/i });
+      expect(within(dialog).queryByRole("textbox", { name: /display name/i })).not.toBeInTheDocument();
+      expect(within(dialog).queryByRole("checkbox", { name: /standard user/i })).not.toBeInTheDocument();
+      expect(within(dialog).getByRole("switch", { name: /zero data retention/i })).toBeInTheDocument();
+      await user.click(within(dialog).getByRole("button", { name: /cancel/i }));
+      await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
     });
 
     it("tests Edit Group Modal through group dropdown", async () => {
@@ -497,104 +378,13 @@ describe("UsersGroups Component", () => {
       });
     });
 
-    it("associates users with groups through manage groups workflow", async () => {
+    it("retains model-group management in the SSO dashboard", async () => {
       const user = userEvent.setup();
-      const { container } = render(<UsersGroups />, {
-        wrapper: createWrapper(),
-      });
-
-      // Wait for initial load
-      await waitFor(() => {
-        expect(
-          within(container).getByRole("heading", { level: 1 }),
-        ).toBeInTheDocument();
-      });
-
-      // Step 1: Switch to Users tab to ensure we're on the correct tab
-      const usersTab = within(container).getByRole("tab", { name: "Users" });
-      await user.click(usersTab);
-
-      expect(usersTab).toHaveAttribute("aria-selected", "true");
-
-      // Wait for users to be visible
-      await waitFor(() => {
-        expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
-      });
-
-      // Step 2: Click Manage Groups button to open UserGroupManagementModal
-      const manageGroupsButtons = screen.getAllByTitle("Manage groups");
-      expect(manageGroupsButtons.length).toBeGreaterThan(0);
-
-      await user.click(manageGroupsButtons[0]);
-
-      await waitFor(() => {
-        expect(screen.getByRole("dialog")).toBeInTheDocument();
-        // Verify this is the group management modal with user context
-        expect(
-          screen.getByRole("button", { name: /done/i }),
-        ).toBeInTheDocument();
-      });
-
-      // Step 4: Verify group association interface shows available groups
-      // Should show groups that can be associated with the user
-      await waitFor(() => {
-        // Look for group names from mock data in the association interface
-        expect(screen.getAllByText("Engineering").length).toBeGreaterThan(0);
-        expect(screen.getAllByText("Data Science").length).toBeGreaterThan(0);
-        expect(screen.getAllByText("Product").length).toBeGreaterThan(0);
-      });
-
-      // Step 5: Test group selection/interaction interface
-      // Since checkboxes aren't found, test for the presence of interactive elements
-      const groupButtons = screen.getAllByRole("button");
-      expect(groupButtons.length).toBeGreaterThan(1); // At least Done button + group interaction buttons
-
-      // Verify group headers are present for interaction
-      expect(
-        screen.getByRole("heading", { name: "Engineering" }),
-      ).toBeInTheDocument();
-      expect(
-        screen.getByRole("heading", { name: "Data Science" }),
-      ).toBeInTheDocument();
-      expect(
-        screen.getByRole("heading", { name: "Product" }),
-      ).toBeInTheDocument();
-
-      // Test that group elements are clickable/interactable
-      const engineeringHeading = screen.getByRole("heading", {
-        name: "Engineering",
-      });
-      expect(engineeringHeading).toBeInTheDocument();
-
-      // If there are interactive buttons, test clicking one
-      const interactiveButtons = groupButtons.filter((btn) => {
-        const text = btn.textContent || "";
-        return (
-          !text.includes("Done") &&
-          !text.includes("Cancel") &&
-          !text.includes("Close")
-        );
-      });
-
-      if (interactiveButtons.length > 0) {
-        await user.click(interactiveButtons[0]);
-        // Wait for any state changes
-        await waitFor(() => {
-          expect(engineeringHeading).toBeInTheDocument();
-        });
-      }
-
-      // Step 6: Test save/done functionality
-      const doneButton = screen.getByRole("button", {
-        name: /done/i,
-      });
-      await user.click(doneButton);
-
-      await waitFor(() => {
-        expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-        // Should return to main users list with Sarah Chen still visible
-        expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
-      });
+      const { container } = render(<UsersGroups />, { wrapper: createWrapper() });
+      await within(container).findByText("Sarah Chen");
+      await user.click(within(container).getAllByTitle("Manage groups")[0]);
+      const dialog = await screen.findByRole("dialog");
+      expect(within(dialog).getByRole("button", { name: /done/i })).toBeInTheDocument();
     });
   });
 });

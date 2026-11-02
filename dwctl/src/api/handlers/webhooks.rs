@@ -86,7 +86,11 @@ pub async fn list_webhooks<P: PoolProvider>(
     let mut repo = Webhooks::new(&mut conn);
 
     let webhooks = repo.list_by_user(target_user_id).await?;
-    let responses: Vec<WebhookResponse> = webhooks.into_iter().map(Into::into).collect();
+    let responses: Vec<WebhookResponse> = webhooks
+        .into_iter()
+        .filter(|webhook| webhook.scope != "platform" || current_user.is_sso_platform_manager())
+        .map(Into::into)
+        .collect();
 
     Ok(Json(responses))
 }
@@ -165,7 +169,7 @@ pub async fn create_webhook<P: PoolProvider>(
     }
 
     // Platform scope requires PlatformManager role (fail fast before hitting DB trigger)
-    if request.scope == "platform" && !current_user.roles.contains(&crate::Role::PlatformManager) {
+    if request.scope == "platform" && !current_user.is_sso_platform_manager() {
         return Err(Error::InsufficientPermissions {
             required: Permission::Allow(Resource::Webhooks, Operation::CreateAll),
             action: Operation::CreateAll,
@@ -289,7 +293,7 @@ pub async fn get_webhook<P: PoolProvider>(
     })?;
 
     // Verify the webhook belongs to the specified user
-    if webhook.user_id != target_user_id {
+    if webhook.user_id != target_user_id || (webhook.scope == "platform" && !current_user.is_sso_platform_manager()) {
         return Err(Error::NotFound {
             resource: "Webhook".to_string(),
             id: params.webhook_id.to_string(),
@@ -392,7 +396,7 @@ pub async fn update_webhook<P: PoolProvider>(
         id: params.webhook_id.to_string(),
     })?;
 
-    if existing.user_id != target_user_id {
+    if existing.user_id != target_user_id || (existing.scope == "platform" && !current_user.is_sso_platform_manager()) {
         return Err(Error::NotFound {
             resource: "Webhook".to_string(),
             id: params.webhook_id.to_string(),
@@ -482,7 +486,7 @@ pub async fn delete_webhook<P: PoolProvider>(
         id: params.webhook_id.to_string(),
     })?;
 
-    if existing.user_id != target_user_id {
+    if existing.user_id != target_user_id || (existing.scope == "platform" && !current_user.is_sso_platform_manager()) {
         return Err(Error::NotFound {
             resource: "Webhook".to_string(),
             id: params.webhook_id.to_string(),
@@ -568,7 +572,7 @@ pub async fn rotate_secret<P: PoolProvider>(
         id: params.webhook_id.to_string(),
     })?;
 
-    if existing.user_id != target_user_id {
+    if existing.user_id != target_user_id || (existing.scope == "platform" && !current_user.is_sso_platform_manager()) {
         return Err(Error::NotFound {
             resource: "Webhook".to_string(),
             id: params.webhook_id.to_string(),
@@ -838,7 +842,7 @@ mod tests {
 
     #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn test_admin_can_access_other_users_webhooks(pool: PgPool) {
+    async fn test_admin_cannot_access_other_users_webhooks(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -857,14 +861,14 @@ mod tests {
 
         let created: WebhookWithSecretResponse = create_response.json();
 
-        // Admin can access the webhook
+        // Admin has no ownership override
         let response = app
             .get(&format!("/admin/api/v1/users/{}/webhooks/{}", user.id, created.id))
             .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
             .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
             .await;
 
-        response.assert_status_ok();
+        response.assert_status_forbidden();
     }
 
     // ── Read-only org member webhook access ────────────────────────────────

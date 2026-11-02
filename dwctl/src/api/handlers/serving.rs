@@ -424,7 +424,7 @@ mod tests {
     }
 
     #[dwctl_test_macros::test]
-    async fn organization_edits_are_visible_in_the_next_serving_read(pool: PgPool) {
+    async fn catalog_edits_are_visible_but_support_cannot_edit_serving_settings(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
         let member = create_test_user(&pool, Role::StandardUser).await;
@@ -437,7 +437,15 @@ mod tests {
                 .add_header(&headers[1].0, &headers[1].1)
                 .json(&settings)
                 .await
-                .assert_status_ok();
+                .assert_status_forbidden();
+            // Serving policy now comes from the controlled provisioning path,
+            // not a general support PATCH. Reads must still be current.
+            sqlx::query("UPDATE users SET self_hosted_only = $2 WHERE id = $1")
+                .bind(org.id)
+                .bind(settings["self_hosted_only"].as_bool().unwrap())
+                .execute(&pool)
+                .await
+                .unwrap();
             let response = get(&server, &format!("/admin/api/v1/organizations/{}/serving", org.id), &admin).await;
             response.assert_status_ok();
             let body: Value = response.json();
@@ -449,18 +457,19 @@ mod tests {
             }
         }
 
-        // The retired class fields are ignored on PATCH and never returned.
+        // An owner cannot re-enable retired class fields through their settings.
+        let headers = add_auth_headers(&member);
         server
             .patch(&format!("/admin/api/v1/organizations/{}", org.id))
             .add_header(&headers[0].0, &headers[0].1)
             .add_header(&headers[1].0, &headers[1].1)
-            .json(&json!({"granted_serving_classes": ["interactive"], "default_serving_class": "interactive", "self_hosted_only": true}))
+            .json(&json!({"granted_serving_classes": ["interactive"], "default_serving_class": "interactive"}))
             .await
             .assert_status_ok();
         let serving: Value = get(&server, &format!("/admin/api/v1/organizations/{}/serving", org.id), &admin)
             .await
             .json();
-        assert_eq!(serving["self_hosted_only"], json!(true));
+        assert_eq!(serving["self_hosted_only"], json!(false));
         let organization: Value = get(&server, &format!("/admin/api/v1/organizations/{}", org.id), &admin)
             .await
             .json();

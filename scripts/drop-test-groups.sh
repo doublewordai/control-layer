@@ -8,27 +8,15 @@ if [ -z "$ADMIN_EMAIL" ]; then
   exit 1
 fi
 
-# Check for admin password
-if [ -z "$ADMIN_PASSWORD" ]; then
-  echo "ADMIN_PASSWORD environment variable not set" >&2
-  exit 1
-fi
-
-# Generate admin cookie for authentication
-ADMIN_JWT=$(EMAIL="$ADMIN_EMAIL" PASSWORD="$ADMIN_PASSWORD" ./scripts/login.sh)
-
-if [ -z "$ADMIN_JWT" ]; then
-  echo "Failed to generate admin JWT" >&2
-  exit 1
-fi
-
+# These scripts run only against the local isolated HTTP-test stack, where
+# the harness supplies the trusted SSO headers for the configured admin.
 echo "Fetching all groups..." >&2
 
 # Get all groups (API returns paginated response, use max limit of 100)
-GROUPS=$(curl -s -X GET "https://localhost/admin/api/v1/groups?limit=100" \
-  -b "dwctl_session=${ADMIN_JWT}" | jq -r '.data[] | "\(.id):\(.name)"')
+TEST_GROUP_ROWS=$(curl -s -X GET "http://localhost:3001/admin/api/v1/groups?limit=100" \
+  -H "X-Doubleword-User: ${ADMIN_EMAIL}" -H "X-Doubleword-Email: ${ADMIN_EMAIL}" | jq -r '.data[] | "\(.id):\(.name)"')
 
-if [ -z "$GROUPS" ]; then
+if [ -z "$TEST_GROUP_ROWS" ]; then
   echo "No groups found or failed to fetch groups" >&2
   exit 0
 fi
@@ -44,8 +32,8 @@ while IFS=: read -r group_id group_name; do
 
     # Delete the group
     HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-      -X DELETE "https://localhost/admin/api/v1/groups/${group_id}" \
-      -b "dwctl_session=${ADMIN_JWT}")
+      -X DELETE "http://localhost:3001/admin/api/v1/groups/${group_id}" \
+      -H "X-Doubleword-User: ${ADMIN_EMAIL}" -H "X-Doubleword-Email: ${ADMIN_EMAIL}")
 
     if [ "$HTTP_STATUS" = "204" ]; then
       echo "✅ Successfully deleted $group_name" >&2
@@ -54,7 +42,7 @@ while IFS=: read -r group_id group_name; do
       echo "❌ Failed to delete $group_name (HTTP $HTTP_STATUS)" >&2
     fi
   fi
-done <<<"$GROUPS"
+done <<<"$TEST_GROUP_ROWS"
 
 echo "" >&2
 echo "Deleted $DELETED_COUNT test group(s)" >&2

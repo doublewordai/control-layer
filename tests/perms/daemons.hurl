@@ -21,8 +21,8 @@ HTTP 403
 
 # PlatformManager CAN list daemons
 GET http://localhost:3001/ai/v1/daemons
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.daemons" exists
@@ -30,8 +30,8 @@ jsonpath "$.daemons" isCollection
 
 # PlatformManager CAN list daemons with status filter
 GET http://localhost:3001/ai/v1/daemons?status=running
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.daemons" isCollection
