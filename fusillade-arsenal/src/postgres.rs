@@ -8369,18 +8369,38 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         use crate::batch::{BatchResultItem, BatchResultStatus};
         let (search, status) = filters;
 
-        // First, get the file_id and archive bucket from the batch.
+        // First, get the archive bucket and, while the input content is still
+        // available, the input file from the batch.
         //
-        // file_id is None once the input file has been deleted: delete_file
-        // unlinks the batch and the orphan-purge daemon later removes the
-        // templates. The requests themselves are self-contained (custom_id,
-        // model, state, response_body, error all live on the request row), so
-        // results stay downloadable; only the input body and the file's line
-        // ordering are lost. With a file we walk templates in line order and
-        // join each to its request; without one we walk requests in creation
-        // order and left-join whatever template still exists.
+        // The input is gone once the file is deleted (delete_file unlinks the
+        // batch and the orphan-purge daemon later removes the templates), once
+        // it passes its `expires_at` (`/files/{id}/content` answers 410, so its
+        // bodies must not come back here either), or once its template week
+        // has retired. The last can come before the file's expiry: retirement
+        // waits only for unfinished batches. The upload's week is the earliest
+        // its templates can be in, so it retires first. The requests themselves
+        // are self-contained (custom_id, model, state, response_body, error
+        // all live on the request row), so results stay downloadable; only the
+        // input body and the file's line ordering are lost. With the input we
+        // walk templates in line order and join each to its request; without
+        // it we walk requests in creation order and return no input body.
         let (file_id, archive_bucket) = match sqlx::query!(
-            r#"SELECT file_id, archive_bucket FROM batches WHERE id = $1 AND deleted_at IS NULL"#,
+            r#"
+            SELECT
+                b.archive_bucket,
+                CASE WHEN f.status <> 'expired'
+                       AND (f.expires_at IS NULL OR f.expires_at > NOW())
+                       AND NOT EXISTS (
+                           SELECT 1 FROM request_template_buckets bucket
+                           WHERE bucket.week_start = date_trunc('week', f.created_at AT TIME ZONE 'UTC')::date
+                             AND bucket.state <> 'active'
+                       )
+                     THEN f.id
+                END AS input_file_id
+            FROM batches b
+            LEFT JOIN files f ON f.id = b.file_id
+            WHERE b.id = $1 AND b.deleted_at IS NULL
+            "#,
             *batch_id as Uuid,
         )
         .fetch_optional(
@@ -8389,7 +8409,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         )
         .await
         {
-            Ok(Some(row)) => (row.file_id, row.archive_bucket),
+            Ok(Some(row)) => (row.input_file_id, row.archive_bucket),
             Ok(None) => {
                 let _ = tx
                     .send(Err(FusilladeError::Other(anyhow!("Batch not found"))))
@@ -8479,7 +8499,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 FROM "#,
             );
             if let Some(file_id) = file_id {
-                // Input file present: walk templates in file line order and
+                // Input available: walk templates in file line order and
                 // join each to its request for this batch.
                 query_builder.push("request_templates_all t JOIN (");
                 push_requests_union(&mut query_builder);
@@ -8491,17 +8511,14 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 query_builder.push_bind(line_filter);
                 query_builder.push(")");
             } else {
-                // Input file deleted: walk the batch's requests in creation
-                // order and attach whatever template still exists. The
-                // LATERAL ... LIMIT 1 probe mirrors get_request_detail so a
-                // template present in both generations cannot fan out.
+                // Input gone: walk the batch's requests in creation order.
+                // Templates the purge or retirement has not yet removed are
+                // not read: their content is no longer the user's to see.
                 query_builder.push("(");
                 push_requests_union(&mut query_builder);
                 query_builder.push(
                     r#") r
-                LEFT JOIN LATERAL (
-                    SELECT body, line_number FROM request_templates_all t WHERE t.id = r.template_id LIMIT 1
-                ) t ON TRUE
+                CROSS JOIN (SELECT NULL::text AS body, NULL::integer AS line_number) t
                 WHERE ("#,
                 );
                 query_builder.push_bind(cursor_time);

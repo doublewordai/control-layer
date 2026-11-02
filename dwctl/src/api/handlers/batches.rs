@@ -1445,7 +1445,7 @@ Supports pagination via `limit` and `skip` query parameters, and filtering by `c
     responses(
         (status = 200, description = "Batch results as newline-delimited JSON. Check the `X-Incomplete` header to determine if more results exist.", content_type = "application/x-ndjson"),
         (status = 404, description = "Batch not found or you don't have access to it."),
-        (status = 410, description = "The batch's output or error file has been deleted or has passed its `expires_at`, so its results are no longer available. Results whose input file was deleted are still returned, with `input_body` set to null."),
+        (status = 410, description = "The batch's output or error file has been deleted or has passed its `expires_at`, so its results are no longer available. Results whose input file was deleted or has expired are still returned, with `input_body` set to null."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
@@ -1487,8 +1487,9 @@ pub async fn get_batch_results<P: PoolProvider>(
     // missing id can only mean the user deleted that file. Deleting a results
     // file is the user's statement that those results should be gone, and this
     // endpoint must not serve them through a side door. Report 410 and say which
-    // file went. (A deleted *input* file is different: the results still exist,
-    // they just come back without input bodies, so that case streams normally.)
+    // file went. (A deleted or expired *input* file is different: the results
+    // still exist, they just come back without input bodies, so that case
+    // streams normally.)
     let deleted_results_files: Vec<&str> = [
         (batch.output_file_id.is_none(), "output file"),
         (batch.error_file_id.is_none(), "error file"),
@@ -3697,6 +3698,134 @@ mod tests {
             .await
             .unwrap();
         assert_results(StatusCode::GONE).await;
+    }
+
+    /// Results outlive their input: an input file that has passed its
+    /// `expires_at` answers 410 on `/files/{id}/content`, so its bodies must not
+    /// come back through the results either, and a template week can retire
+    /// while a finished batch's results are still valid. Either way every
+    /// request is still returned, with `input_body: null`, on both the
+    /// paginated and the streaming paths.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn batch_results_drop_input_bodies_once_the_input_is_gone(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let auth = add_auth_headers(&user);
+
+        let file_id = Uuid::new_v4();
+        let batch_id = Uuid::new_v4();
+        let num_requests = 3;
+        sqlx::query(
+            "INSERT INTO fusillade.files (id, name, status, expires_at, created_at, updated_at) VALUES ($1, 'input.jsonl', 'processed', NOW() + INTERVAL '1 day', NOW(), NOW())",
+        )
+        .bind(file_id)
+        .execute(&pool)
+        .await
+        .expect("Failed to create file");
+        sqlx::query(
+            "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at, total_requests, completed_at) VALUES ($1, $2, $3, '/v1/chat/completions', '24h', NOW() + interval '24 hours', NOW(), $4, NOW())",
+        )
+        .bind(batch_id)
+        .bind(user.id.to_string())
+        .bind(file_id)
+        .bind(num_requests as i32)
+        .execute(&pool)
+        .await
+        .expect("Failed to create batch");
+        attach_results_files(&pool, batch_id).await;
+        for i in 0..num_requests {
+            let template_id = Uuid::new_v4();
+            crate::test::utils::insert_fusillade_template(
+                &pool,
+                template_id,
+                Some(file_id),
+                "test-model",
+                "test-key",
+                "http://test",
+                "/v1/chat/completions",
+                &serde_json::json!({"prompt": i}).to_string(),
+                Some(&format!("req-{i}")),
+            )
+            .await;
+            sqlx::query(
+                "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, response_status, response_body, custom_id, created_at, completed_at) \
+                 VALUES ($1, $2, $3, 'test-model', 'completed', 200, $4, $5, NOW() + ($6 || ' seconds')::interval, NOW())",
+            )
+            .bind(Uuid::new_v4())
+            .bind(batch_id)
+            .bind(template_id)
+            .bind(format!(r#"{{"id":"chatcmpl-{i}"}}"#))
+            .bind(format!("req-{i}"))
+            .bind(i.to_string())
+            .execute(&pool)
+            .await
+            .expect("Failed to create request");
+        }
+
+        let results = |input_present: bool| {
+            let app = &app;
+            let auth = &auth;
+            async move {
+                for path in [
+                    format!("/ai/v1/batches/{batch_id}/results"),
+                    format!("/ai/v1/batches/{batch_id}/results?limit=10"),
+                ] {
+                    let response = app
+                        .get(&path)
+                        .add_header(&auth[0].0, &auth[0].1)
+                        .add_header(&auth[1].0, &auth[1].1)
+                        .await;
+                    response.assert_status(StatusCode::OK);
+                    let lines: Vec<serde_json::Value> = response
+                        .text()
+                        .lines()
+                        .map(|l| serde_json::from_str(l).expect("each line is JSON"))
+                        .collect();
+                    let custom_ids: Vec<&str> = lines.iter().map(|l| l["custom_id"].as_str().unwrap()).collect();
+                    assert_eq!(custom_ids, ["req-0", "req-1", "req-2"], "{path}: every request, in order");
+                    for (i, line) in lines.iter().enumerate() {
+                        assert_eq!(line["response_body"]["id"], format!("chatcmpl-{i}"), "{path}");
+                        if input_present {
+                            assert_eq!(line["input_body"]["prompt"], i, "{path}");
+                        } else {
+                            assert!(line["input_body"].is_null(), "{path}: input body served after the input went");
+                        }
+                    }
+                }
+            }
+        };
+
+        results(true).await;
+
+        // The input file passes its expiry.
+        sqlx::query("UPDATE fusillade.files SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+            .bind(file_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        results(false).await;
+        sqlx::query("UPDATE fusillade.files SET expires_at = NOW() + INTERVAL '1 day' WHERE id = $1")
+            .bind(file_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        results(true).await;
+
+        // The input's template week retires while the file is unexpired.
+        sqlx::query(
+            "UPDATE fusillade.request_template_buckets SET state = 'retired' \
+             WHERE week_start = date_trunc('week', NOW() AT TIME ZONE 'UTC')::date",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM fusillade.request_templates_g2 WHERE file_id = $1")
+            .bind(file_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        results(false).await;
     }
 
     /// Give a hand-inserted batch the virtual output and error files that
