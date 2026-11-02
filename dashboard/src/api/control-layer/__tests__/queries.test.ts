@@ -242,12 +242,8 @@ describe("dwctlApi.users", () => {
         server.use(
           http.post(`/admin/api/v1/users/${userId}/api-keys`, () =>
             HttpResponse.json(
-              {
-                error: "service_unavailable",
-                message: "No keystore configured",
-                retry_after_seconds: 30,
-              },
-              { status: 503 },
+              { message: "No keystore configured" },
+              { status: 501 },
             ),
           ),
         );
@@ -258,7 +254,7 @@ describe("dwctlApi.users", () => {
             userId,
           ),
         ).rejects.toThrow(
-          /^Failed to create API key: 503 - No keystore configured$/,
+          /^Failed to create API key: 501 - No keystore configured$/,
         );
       });
 

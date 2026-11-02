@@ -92,7 +92,7 @@ fn validate_cap_fields(spend_limit: Option<&Decimal>, spend_limit_interval: Opti
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden - can only manage own API keys unless admin"),
         (status = 500, description = "Internal server error"),
-        (status = 503, description = "Issuing a key to another user needs a keystore, and none is configured"),
+        (status = 501, description = "Issuing a key to another user needs a keystore, and none is configured"),
     ),
     security(
         ("BearerAuth" = []),
@@ -227,7 +227,7 @@ pub async fn create_user_api_key<P: PoolProvider>(
     let keystore = match (&state.keystore, issued_to_other) {
         (Some(keystore), true) => Some(keystore),
         (None, true) => {
-            return Err(Error::ServiceUnavailable {
+            return Err(Error::NotImplemented {
                 message: NO_KEYSTORE_FOR_ISSUED_KEY.to_string(),
             });
         }
@@ -2522,7 +2522,8 @@ mod tests {
                 .add_header(&add_auth_headers(issuer)[1].0, &add_auth_headers(issuer)[1].1)
                 .json(&body)
                 .await;
-            response.assert_status(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+            response.assert_status(axum::http::StatusCode::NOT_IMPLEMENTED);
+            assert!(response.maybe_header("retry-after").is_none(), "retrying cannot help");
             assert!(response.text().contains("keystore"), "error says why: {}", response.text());
         }
         let keys: i64 = sqlx::query_scalar!(

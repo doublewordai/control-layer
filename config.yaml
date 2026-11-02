@@ -421,7 +421,7 @@ scheduling:
 # Also REQUIRED to issue an API key to another user (an org manager issuing to a
 # member, or a PlatformManager creating a key on a user's behalf): the key's
 # secret is held in Postgres, wrapped with these wrap keys, until the holder's
-# one-off reveal. Without this section such requests are refused (503);
+# one-off reveal. Without this section such requests are refused (501);
 # self-created keys are unaffected. Those wrapped secrets have no TTL: a
 # background task re-wraps them with each instance's current wrap key every 15
 # minutes. During a rolling rotation an instance still on the old current key
