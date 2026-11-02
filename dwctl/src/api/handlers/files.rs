@@ -179,6 +179,7 @@ impl OpenAIBatchRequest {
         endpoint: &str,
         api_key: String,
         accessible_models: &HashMap<String, AccessibleBatchModel>,
+        retired_models: &HashMap<String, String>,
         allowed_url_paths: &[String],
         tolerations: &AccountTolerations,
         class_routes: &HashMap<String, String>,
@@ -213,9 +214,12 @@ impl OpenAIBatchRequest {
         }
 
         // Validate model access
-        let accessible_model = accessible_models.get(&model).ok_or_else(|| Error::ModelAccessDenied {
-            model_name: model.clone(),
-            message: format!("Model '{}' has not been configured or is not available to user.", model),
+        let accessible_model = accessible_models.get(&model).ok_or_else(|| match retired_models.get(&model) {
+            Some(message) => Error::Gone { message: message.clone() },
+            None => Error::ModelAccessDenied {
+                model_name: model.clone(),
+                message: format!("Model '{}' has not been configured or is not available to user.", model),
+            },
         })?;
 
         // Validate endpoint matches model type (skip if model type is unknown)
@@ -502,6 +506,8 @@ enum FileUploadError {
     EmptyFile,
     /// User doesn't have access to a model referenced in the file
     ModelAccessDenied { model: String, line: u64 },
+    /// A line names a model that has been retired
+    ModelRetired { line: u64, message: String },
     /// Per-line validation error (custom_id, method, url, etc.)
     ValidationError { line: u64, message: String },
     /// A well-formed line whose reasoning budget cannot be processed.
@@ -571,6 +577,7 @@ const UPLOAD_REJECTION_CODES: &[&str] = &[
     "no_file",
     "empty_file",
     "model_access_denied",
+    "model_retired",
     "validation_error",
     "unprocessable_line",
     "image_transient",
@@ -623,6 +630,7 @@ impl FileUploadError {
             FileUploadError::NoFile => "no_file",
             FileUploadError::EmptyFile => "empty_file",
             FileUploadError::ModelAccessDenied { .. } => "model_access_denied",
+            FileUploadError::ModelRetired { .. } => "model_retired",
             FileUploadError::ValidationError { .. } => "validation_error",
             FileUploadError::UnprocessableValidationError { .. } => "unprocessable_line",
             FileUploadError::ImageTransient { .. } => "image_transient",
@@ -696,6 +704,9 @@ impl FileUploadError {
                     "Line {}: Model '{}' has not been configured or is not available to user",
                     line, model
                 ),
+            },
+            FileUploadError::ModelRetired { line, message } => Error::Gone {
+                message: format!("Line {}: {}", line, message),
             },
             FileUploadError::ValidationError { line, message } => Error::BadRequest {
                 message: format!("Line {}: {}", line, message),
@@ -815,6 +826,7 @@ struct FileRequestContext {
     endpoint: String,
     api_key: String,
     accessible_models: HashMap<String, AccessibleBatchModel>,
+    retired_models: HashMap<String, String>,
     allowed_url_paths: Vec<String>,
     /// Class routes (`alias:<class>`) of class-routed models, refused in
     /// batch lines.
@@ -835,6 +847,10 @@ fn map_request_validation_error(error: &Error, line: u64) -> FileUploadError {
         Error::ModelAccessDenied { model_name, .. } => FileUploadError::ModelAccessDenied {
             model: model_name.clone(),
             line,
+        },
+        Error::Gone { message } => FileUploadError::ModelRetired {
+            line,
+            message: message.clone(),
         },
         Error::UnprocessableEntity { message } => FileUploadError::UnprocessableValidationError {
             line,
@@ -861,6 +877,7 @@ fn create_file_stream(
         endpoint,
         api_key,
         accessible_models,
+        retired_models,
         allowed_url_paths,
         tolerations,
         class_routes,
@@ -1072,6 +1089,7 @@ fn create_file_stream(
                                                 &endpoint,
                                                 api_key.clone(),
                                                 &accessible_models,
+                                                &retired_models,
                                                 &allowed_url_paths,
                                                 &tolerations,
                                                 &class_routes,
@@ -1176,6 +1194,7 @@ fn create_file_stream(
                                         &endpoint,
                                         api_key.clone(),
                                         &accessible_models,
+                                        &retired_models,
                                         &allowed_url_paths,
                                         &tolerations,
                                         &class_routes,
@@ -1455,6 +1474,9 @@ pub async fn upload_file<P: PoolProvider>(
             )
         })
         .collect();
+    let retired_models = crate::error_enrichment::retirement_messages(&mut conn)
+        .await
+        .map_err(Error::Database)?;
 
     // drop conn so it isn't persisted for entire upload process
     drop(conn);
@@ -1468,6 +1490,7 @@ pub async fn upload_file<P: PoolProvider>(
             endpoint,
             api_key: user_api_key,
             accessible_models,
+            retired_models,
             allowed_url_paths: config.batches.allowed_url_paths.clone(),
             tolerations,
             class_routes: state
@@ -4233,6 +4256,20 @@ mod tests {
     }
 
     #[test]
+    fn test_file_upload_error_into_http_error_model_retired() {
+        let error = super::FileUploadError::ModelRetired {
+            line: 3,
+            message: "The model `retired-model` was shut down.".to_string(),
+        };
+        match error.into_http_error() {
+            crate::errors::Error::Gone { message } => {
+                assert_eq!(message, "Line 3: The model `retired-model` was shut down.");
+            }
+            other => panic!("Expected Gone error, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_file_upload_error_into_http_error_validation_error() {
         let err = super::FileUploadError::ValidationError {
             line: 3,
@@ -4360,6 +4397,7 @@ mod tests {
             NoFile,
             EmptyFile,
             ModelAccessDenied { model: s(), line: 1 },
+            ModelRetired { line: 1, message: s() },
             ValidationError { line: 1, message: s() },
             UnprocessableValidationError { line: 1, message: s() },
             ImageTransient { line: 1, message: s() },

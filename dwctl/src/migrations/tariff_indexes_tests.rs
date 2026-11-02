@@ -6,11 +6,13 @@ const BEFORE_INDEXES: i64 = 20260924115950;
 const LAST_VALIDATION: i64 = 20260924120630;
 const ORG_BATCH: &str = "idx_model_tariffs_unique_active_org_batch_per_sla";
 
+/// Concurrent tariff index builds. Index builds on other tables are left to their
+/// own migrations: they may depend on columns added after `BEFORE_INDEXES`.
 fn index_builds() -> Vec<sqlx::migrate::Migration> {
     Target::main()
         .migrator
         .iter()
-        .filter(|m| m.version >= FIRST_INDEX && m.sql.contains("CREATE ") && m.no_tx)
+        .filter(|m| m.version >= FIRST_INDEX && m.sql.contains("CREATE ") && m.no_tx && m.sql.contains("tariffs"))
         .cloned()
         .collect()
 }

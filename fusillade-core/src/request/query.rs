@@ -218,7 +218,7 @@ pub struct RequestDetail {
 /// `processing` state with `batch_id = NULL` and `daemon_id = Uuid::nil()`.
 /// The proxy completes/fails the row directly via `complete_request` /
 /// `fail_request`; the daemon never claims it.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CreateRealtimeInput {
     /// Pre-generated request ID. Becomes the request's primary key.
     pub request_id: Uuid,
@@ -238,6 +238,16 @@ pub struct CreateRealtimeInput {
     pub created_by: String,
 }
 
+debug_with_redacted_api_key!(CreateRealtimeInput {
+    request_id,
+    body,
+    model,
+    endpoint,
+    method,
+    path,
+    created_by,
+});
+
 /// Input for persisting a batch of already-completed realtime responses.
 ///
 /// Used by the dwctl responses writer to flush a buffer of finished
@@ -253,7 +263,7 @@ pub struct CreateRealtimeInput {
 /// `completed_at`, etc.) are only consulted on the INSERT path. On the UPDATE
 /// path only `request_id`, `response_body`, and `status_code` are used — the
 /// pre-existing row already carries a real `started_at` from `create_realtime`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PersistCompletedRealtimeInput {
     /// The request UUID (primary key).
     pub request_id: Uuid,
@@ -290,12 +300,26 @@ pub struct PersistCompletedRealtimeInput {
     pub completed_at: DateTime<Utc>,
 }
 
+debug_with_redacted_api_key!(PersistCompletedRealtimeInput {
+    request_id,
+    response_body,
+    status_code,
+    request_body,
+    model,
+    endpoint,
+    method,
+    path,
+    created_by,
+    started_at,
+    completed_at,
+});
+
 /// Input for creating a flex (async) response that the daemon will process.
 ///
 /// Inserts a request template (no parent file) and a request row in `pending`
 /// state with `batch_id = NULL`. The daemon claims and processes it like any
 /// other pending request.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CreateFlexInput {
     /// Pre-generated request ID. Becomes the request's primary key.
     pub request_id: Uuid,
@@ -323,12 +347,23 @@ pub struct CreateFlexInput {
     pub metadata: Option<serde_json::Value>,
 }
 
+debug_with_redacted_api_key!(CreateFlexInput {
+    request_id,
+    body,
+    model,
+    endpoint,
+    method,
+    path,
+    created_by,
+    metadata,
+});
+
 /// Input for creating a background response that the daemon will process only
 /// when the target model has spare live capacity.
 ///
 /// Inserts a request template (no parent file) and a request row in `pending`
 /// state with `batch_id = NULL` and `service_tier = 'background'`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CreateBackgroundInput {
     /// Pre-generated request ID. Becomes the request's primary key.
     pub request_id: Uuid,
@@ -350,6 +385,17 @@ pub struct CreateBackgroundInput {
     /// [`CreateFlexInput::metadata`].
     pub metadata: Option<serde_json::Value>,
 }
+
+debug_with_redacted_api_key!(CreateBackgroundInput {
+    request_id,
+    body,
+    model,
+    endpoint,
+    method,
+    path,
+    created_by,
+    metadata,
+});
 
 /// Result of a paginated request list query.
 #[derive(Debug, Clone, Serialize, Deserialize)]

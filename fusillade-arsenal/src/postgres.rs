@@ -1876,7 +1876,18 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
     ) -> Result<i64> {
         // The archive-aware live/retained union always uses one primary
         // statement snapshot; `_strict` remains for Storage compatibility.
-        retained_response::count_owner_flex_requests_since(self, owner, cutoff).await
+        retained_response::count_owner_flex_requests_since(self, owner, cutoff, None).await
+    }
+
+    async fn count_owner_flex_requests_since_capped(
+        &self,
+        owner: &str,
+        cutoff: DateTime<Utc>,
+        _strict: bool,
+        limit: i64,
+    ) -> Result<i64> {
+        retained_response::count_owner_flex_requests_since(self, owner, cutoff, Some(limit.max(0)))
+            .await
     }
 
     async fn get_pending_request_counts_by_model_and_window(
@@ -4739,7 +4750,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             .await
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "debug", skip(self, input), fields(file_id = %input.file_id))]
     async fn create_batch_record(&self, input: BatchInput) -> Result<Batch> {
         let now = Utc::now();
         let std_duration = humantime::parse_duration(&input.completion_window).map_err(|e| {
@@ -4789,7 +4800,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             .await
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "debug", skip(self, input), fields(file_id = %input.file_id))]
     async fn create_background_batch_record(&self, input: BackgroundBatchInput) -> Result<Batch> {
         self.insert_batch_record(NewBatchRecord {
             file_id: input.file_id,

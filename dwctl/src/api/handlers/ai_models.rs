@@ -13,6 +13,7 @@ use serde_json::json;
 use sqlx::{QueryBuilder, Row};
 use sqlx_pool_router::PoolProvider;
 
+use crate::crypto::hash_api_key;
 use crate::{
     AppState,
     api::models::{
@@ -177,27 +178,22 @@ pub async fn list_ai_models<P: PoolProvider>(
         .as_deref()
         .is_some_and(|includes| includes.split(',').any(|include| include.trim() == "pricing"));
 
-    let mut conn = state
-        .db
-        .read()
-        .acquire()
-        .await
-        .map_err(|e| database_error("acquire_read_connection", e))?;
-
+    // Resolve the key on the primary: replica lag must not reject a just-created
+    // key or accept a just-deleted one. The model listing below stays on the replica.
     let user_id = sqlx::query_scalar::<_, uuid::Uuid>(
         r#"
         SELECT ak.user_id
         FROM api_keys ak
         INNER JOIN users u ON u.id = ak.user_id
-        WHERE ak.secret = $1
+        WHERE ak.secret_hash = $1
           AND ak.is_deleted = FALSE
           AND u.is_deleted = FALSE
           AND ak.purpose IN ('realtime', 'batch', 'playground', 'continuation')
         LIMIT 1
         "#,
     )
-    .bind(token)
-    .fetch_optional(&mut *conn)
+    .bind(&hash_api_key(token)[..])
+    .fetch_optional(&state.db.write())
     .await
     .map_err(|e| database_error("lookup_api_key", e))?;
 
@@ -212,6 +208,13 @@ pub async fn list_ai_models<P: PoolProvider>(
         );
         return Err(rejections::refuse(origin, response, "invalid_api_key", None, None));
     };
+
+    let mut conn = state
+        .db
+        .read()
+        .acquire()
+        .await
+        .map_err(|e| database_error("acquire_read_connection", e))?;
 
     let mut models_query = QueryBuilder::new(
         r#"

@@ -5,7 +5,7 @@
 
 use crate::AppState;
 use crate::affinity;
-use crate::auth;
+use crate::auth::{self, KeyHash};
 use crate::client::HttpClient;
 use crate::errors::{ErrorResponseBody, OnwardsErrorResponse};
 use crate::inflight::{BATCH_INFLIGHT_SCOPE, InflightSlot};
@@ -613,11 +613,14 @@ pub async fn target_message_handler<T: HttpClient>(
         .headers()
         .get("authorization")
         .and_then(|auth_header| auth_header.to_str().ok())
-        .and_then(|auth_value| auth_value.strip_prefix("Bearer "));
+        .and_then(|auth_value| auth_value.strip_prefix("Bearer "))
+        // Keys are held by hash: hash the token once and use the hash for
+        // validation and every per-key lookup below.
+        .map(KeyHash::of);
 
     // Validate API key using pool-level keys
     if let Some(keys) = pool.keys() {
-        match bearer_token {
+        match bearer_token.as_ref() {
             Some(token) => {
                 trace!("Validating bearer token against pool keys");
                 if auth::validate_bearer_token(keys, token) {
@@ -641,9 +644,8 @@ pub async fn target_message_handler<T: HttpClient>(
         );
     }
 
-    let bearer_token = bearer_token.map(str::to_owned);
     let authenticated_api_key_id = bearer_token
-        .as_deref()
+        .as_ref()
         .filter(|token| {
             pool.keys()
                 .is_some_and(|keys| auth::validate_bearer_token(keys, token))
@@ -658,7 +660,7 @@ pub async fn target_message_handler<T: HttpClient>(
     // Rules on the pool are matched against the authenticated key's labels.
     // Note: routing rules are NOT re-evaluated on the redirect target pool.
     if !pool.routing_rules().is_empty()
-        && let Some(token) = bearer_token.as_deref()
+        && let Some(token) = bearer_token.as_ref()
     {
             let labels = state
                 .targets
@@ -969,7 +971,7 @@ pub async fn target_message_handler<T: HttpClient>(
         }
 
         // Check per-key rate limits if bearer token is present
-        if let Some(token) = bearer_token.as_deref()
+        if let Some(token) = bearer_token.as_ref()
             && let Some(limiter) = state.targets.key_rate_limiters.get(token)
             && limiter.check().is_err()
         {
@@ -1012,7 +1014,7 @@ pub async fn target_message_handler<T: HttpClient>(
         };
 
         // Acquire per-key concurrency permit
-        let key_guard = if let Some(token) = bearer_token.as_deref() {
+        let key_guard = if let Some(token) = bearer_token.as_ref() {
             if let Some(limiter) = state.targets.key_concurrency_limiters.get(token) {
                 match limiter.try_acquire() {
                     Some(guard) => Some(guard),
@@ -1165,6 +1167,9 @@ pub async fn target_message_handler<T: HttpClient>(
     } else {
         None
     };
+    // The prices the embedding application charges this request at, if it
+    // attached them. Written for `dynamo` members only.
+    let billing_prices = req.extensions().get::<serving::BillingPrices>().copied();
     let mut providers = pool
         .select_iter_routed(aimd_eligible, conversation, &model_name, resolved_pool_name.unwrap_or("default"))
         .excluding_members(ineligible_members.iter().copied());
@@ -1357,18 +1362,29 @@ pub async fn target_message_handler<T: HttpClient>(
         // values are scrubbed at dwctl's ingress, alongside the body priority
         // (the same perimeter the priority strip relies on).
         // A non-JSON body (a multipart upload) carries no hints and is
-        // forwarded as it came.
+        // forwarded as it came. The request's prices are written as
+        // `nvext.billing` on every JSON request to a `dynamo` member, replacing
+        // any value already in the body. They are not a scheduling field, so a
+        // member that refuses those still receives them. Without attached
+        // prices the body's own value (a first hop's) is forwarded, except to a
+        // member the strip above removed `nvext` for.
+        let stamp_scheduling = !scheduling_fields_refused;
         if target.kind == ProviderKind::Dynamo
-            && !scheduling_fields_refused
+            && (stamp_scheduling || billing_prices.is_some())
             && !attempt_body.is_empty()
             && let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(&attempt_body)
             && let Some(object) = body.as_object_mut()
         {
-            serving_resolution.hints.stamp(object);
-            if !serving_resolution.hints.is_empty() {
-                tracing::Span::current().record("onwards.hints_sent", true);
+            if stamp_scheduling {
+                serving_resolution.hints.stamp(object);
+                if !serving_resolution.hints.is_empty() {
+                    tracing::Span::current().record("onwards.hints_sent", true);
+                }
+                serving::stamp_default_priority(object);
             }
-            serving::stamp_default_priority(object);
+            if let Some(prices) = billing_prices {
+                prices.stamp(object);
+            }
             attempt_body = match serde_json::to_vec(&body) {
                 Ok(bytes) => axum::body::Bytes::from(bytes),
                 Err(_) => return LoopAction::Done(Err(OnwardsErrorResponse::internal())),
@@ -2385,7 +2401,8 @@ pub async fn models<T: HttpClient>(State(state): State<AppState<T>>, req: Reques
         .headers()
         .get("authorization")
         .and_then(|auth_header| auth_header.to_str().ok())
-        .and_then(|auth_value| auth_value.strip_prefix("Bearer "));
+        .and_then(|auth_value| auth_value.strip_prefix("Bearer "))
+        .map(KeyHash::of);
 
     // Filter targets based on bearer token permissions using pool-level keys
     let accessible_models: Vec<String> = state
@@ -2404,7 +2421,7 @@ pub async fn models<T: HttpClient>(State(state): State<AppState<T>>, req: Reques
             };
 
             // If pool has keys but no bearer token provided, deny access
-            let Some(token) = bearer_token else {
+            let Some(token) = bearer_token.as_ref() else {
                 return false;
             };
 
@@ -2415,6 +2432,7 @@ pub async fn models<T: HttpClient>(State(state): State<AppState<T>>, req: Reques
         .collect();
 
     let authenticated_api_key_id = bearer_token
+        .as_ref()
         .and_then(|token| state.targets.key_labels.get(token))
         .and_then(|labels| labels.get("api_key_id").cloned())
         .and_then(|id| id.parse::<Uuid>().ok());

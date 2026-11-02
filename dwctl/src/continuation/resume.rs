@@ -12,7 +12,12 @@
 //!
 //! Because the leg enters BELOW outlet and the cache layer, it produces no second
 //! analytics row, no second billing record and no second cache classify — the
-//! customer's request stays exactly one logical request.
+//! customer's request stays exactly one logical request. The leg carries the
+//! original request's output price as its [`onwards::serving::BillingPrices`]
+//! extension, with its prompt and cached prices at zero, so a `dynamo` member is
+//! told what the customer pays for its tokens: the leg's prompt is the original
+//! prompt and everything generated so far, re-prefilled, which the customer
+//! doesn't pay for.
 
 use std::pin::Pin;
 use std::time::Duration;
@@ -22,6 +27,7 @@ use axum::http::{Method, Request, StatusCode, header};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http_body_util::BodyExt;
+use onwards::serving::BillingPrices;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -137,16 +143,31 @@ pub fn build_leg_body(ctx: &RequestContext, token_ids: &[u32], max_tokens: Optio
     body
 }
 
-fn build_leg_request(path: &str, key_secret: &str, body: &Value) -> Request<Body> {
+/// What a leg's tokens are billed at: only its output, at the original request's
+/// output price. Its prompt (the original prompt and what was generated so far,
+/// re-prefilled) costs the customer nothing.
+fn leg_prices(original: BillingPrices) -> BillingPrices {
+    BillingPrices {
+        prompt: 0.0,
+        cached: 0.0,
+        output: original.output,
+    }
+}
+
+fn build_leg_request(path: &str, key_secret: &str, body: &Value, prices: Option<BillingPrices>) -> Request<Body> {
     let bytes = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
-    Request::builder()
+    let mut request = Request::builder()
         .method(Method::POST)
         .uri(resume_path(path))
         .header(header::AUTHORIZATION, format!("Bearer {key_secret}"))
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::ACCEPT, "text/event-stream")
         .body(Body::from(bytes))
-        .expect("a POST with static headers always builds")
+        .expect("a POST with static headers always builds");
+    if let Some(prices) = prices {
+        request.extensions_mut().insert(prices);
+    }
+    request
 }
 
 fn is_sse(response: &axum::response::Response) -> bool {
@@ -199,7 +220,7 @@ pub async fn attempt(state: &ContinuationState, ctx: &RequestContext, continuati
     // [`super::RouteInfo::strip_leading_bos`]: BOS-prepending is a per-MEMBER
     // property, and this body is built once, before onwards picks a member.
     let body = build_leg_body(ctx, &render.token_ids, max_tokens, state.cfg.priority);
-    let request = build_leg_request(&ctx.path, &state.key_secret, &body);
+    let request = build_leg_request(&ctx.path, &state.key_secret, &body, ctx.prices.map(leg_prices));
 
     // Dispatch accounting happens BEFORE the await: a leg that times out,
     // 4xxs, or comes back non-streaming still re-prefilled the prompt
@@ -241,6 +262,7 @@ mod tests {
             response_id: None,
             route: crate::continuation::RouteInfo::default(),
             origin: "realtime",
+            prices: None,
         }
     }
 
@@ -309,7 +331,7 @@ mod tests {
     #[test]
     fn leg_request_carries_the_global_key_and_asks_for_a_stream() {
         let body = build_leg_body(&ctx(json!({})), &[1], None, 100);
-        let request = build_leg_request("/v1/chat/completions", "dw-continuation-secret", &body);
+        let request = build_leg_request("/v1/chat/completions", "dw-continuation-secret", &body, None);
         assert_eq!(request.method(), Method::POST);
         assert_eq!(request.uri().path(), "/v1/completions");
         assert_eq!(
@@ -319,5 +341,18 @@ mod tests {
         );
         assert_eq!(request.headers().get(header::CONTENT_TYPE).unwrap(), "application/json");
         assert_eq!(request.headers().get(header::ACCEPT).unwrap(), "text/event-stream");
+        assert!(request.extensions().get::<BillingPrices>().is_none());
+
+        let prices = BillingPrices {
+            prompt: 1e-6,
+            cached: 1e-7,
+            output: 3e-6,
+        };
+        let request = build_leg_request("/v1/chat/completions", "dw-continuation-secret", &body, Some(prices));
+        assert_eq!(
+            request.extensions().get::<BillingPrices>(),
+            Some(&prices),
+            "the leg is sent at the original request's prices, not the continuation key's"
+        );
     }
 }

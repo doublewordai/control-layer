@@ -1,0 +1,50 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT ak.secret_hash, ak.user_id, ak.purpose, u.zero_data_retention, u.disabled_modalities, u.toleration_preset\n        FROM api_keys ak\n        JOIN users u ON u.id = ak.user_id\n        WHERE NOT ak.is_deleted\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "secret_hash",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 1,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "purpose",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "zero_data_retention",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 4,
+        "name": "disabled_modalities",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 5,
+        "name": "toleration_preset",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "d65359321bfcda4990d651920223eb64e63cb05b5bb64fee9b699a97de42e032"
+}

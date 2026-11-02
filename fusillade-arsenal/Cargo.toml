@@ -43,3 +43,6 @@ sqlx-pool-router = "1.0"
 percent-encoding = "2"
 test-log = "0.2.18"
 axum = "0.8"
+
+[lints]
+workspace = true

@@ -2929,6 +2929,8 @@ pub struct BackgroundServicesConfig {
     pub leader_election: LeaderElectionConfig,
     /// Configuration for database pool metrics sampling
     pub pool_metrics: PoolMetricsSamplerConfig,
+    /// Aggregate-only batch alert collector (opt-in).
+    pub batch_sla_metrics: crate::metrics::batch_sla::BatchSlaMetricsConfig,
     /// jemalloc statistics sampling for the allocator Prometheus gauges.
     /// See [`crate::metrics::allocator::AllocatorMetricsConfig`].
     pub allocator_metrics: crate::metrics::allocator::AllocatorMetricsConfig,
@@ -3119,12 +3121,13 @@ pub struct OnwardsSyncConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct KeyPolicySyncConfig {
     /// Keep the map fresh after startup (default: true). With this off, a
-    /// change to an account's ZDR flag or disabled modalities only reaches
-    /// this instance on restart.
+    /// change to an account's ZDR flag, disabled modalities or prices only
+    /// reaches this instance on restart.
     pub enabled: bool,
     /// Fallback full-reload interval in milliseconds (default: 300000). The
-    /// reload is one small two-table join, and NOTIFY carries real changes,
-    /// so this only guards against a missed notification. `0` disables it.
+    /// reload is one small two-table join plus the tariff lookups, and NOTIFY
+    /// carries real changes (cache tariffs excepted), so this mostly guards
+    /// against a missed notification. `0` disables it.
     pub fallback_interval_milliseconds: u64,
 }
 
@@ -3769,6 +3772,10 @@ impl Config {
 
     /// Validate the configuration for consistency and required fields
     pub fn validate(&self) -> Result<(), Error> {
+        self.background_services
+            .batch_sla_metrics
+            .validate()
+            .map_err(|operation| Error::Internal { operation })?;
         for (name, component) in [("fusillade", self.database.fusillade()), ("outlet", self.database.outlet())] {
             component
                 .validate_schema_pooling(name, self.database.external_pooled_url().is_some())

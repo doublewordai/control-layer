@@ -82,10 +82,35 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # Sending a repository_dispatch needs contents: write on the target repo,
+      # so mint a release-app token scoped to that repo alone rather than
+      # holding a long-lived personal token.
+      # Fail closed: with an empty repository list the minted token would
+      # cover every repository in the installation, not just the target.
+      - name: Require the deployment target
+        env:
+          DEPLOY_TARGET_OWNER: ${{ secrets.DEPLOY_TARGET_OWNER }}
+          DEPLOY_TARGET_REPO: ${{ secrets.DEPLOY_TARGET_REPO }}
+        run: |
+          if [[ -z "$DEPLOY_TARGET_OWNER" || -z "$DEPLOY_TARGET_REPO" ]]; then
+            echo "DEPLOY_TARGET_OWNER and DEPLOY_TARGET_REPO must both be set" >&2
+            exit 1
+          fi
+
+      - name: Mint deploy dispatch token
+        id: dispatch-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.RELEASE_PLEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY }}
+          owner: ${{ secrets.DEPLOY_TARGET_OWNER }}
+          repositories: ${{ secrets.DEPLOY_TARGET_REPO }}
+          permission-contents: write
+
       - name: Trigger deployment
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         with:
-          github-token: ${{ secrets.PREVIEW_DISPATCH_TOKEN }}
+          github-token: ${{ steps.dispatch-token.outputs.token }}
           script: |
             await github.rest.repos.createDispatchEvent({
               owner: '${{ secrets.DEPLOY_TARGET_OWNER }}',
