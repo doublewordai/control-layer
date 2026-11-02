@@ -1674,8 +1674,6 @@ async fn setup_database(
     ))
 }
 
-/// Build the base CORS layer (methods, headers, max-age, exposed headers) from
-/// configuration. Origin/credential handling differs by mode — see [`apply_cors`].
 /// The base URL of this process's own `/ai`, for the calls dwctl makes to
 /// itself (fusillade daemon dispatch).
 ///
@@ -1695,6 +1693,8 @@ pub(crate) fn loopback_base_url(host: &str, port: u16) -> String {
     format!("http://{host}:{port}/ai")
 }
 
+/// Build the base CORS layer (methods, headers, max-age, exposed headers) from
+/// configuration. Origin/credential handling differs by mode — see [`apply_cors`].
 fn create_cors_layer(cors: &CorsConfig) -> anyhow::Result<CorsLayer> {
     // Parse exposed headers as HeaderName
     let mut exposed: Vec<http::HeaderName> = cors.exposed_headers.iter().filter_map(|h| h.parse().ok()).collect();
@@ -2663,6 +2663,7 @@ pub async fn build_router(
     // hands to the client and can tell a disconnect from an early end.
     let onwards_router = if let Some(outlet_layer) = outlet_layer.clone() {
         onwards_router
+            .layer(middleware::from_fn(auth::internal_credential::carry_presented_key))
             .layer(middleware::from_fn(request_logging::stream_completion::track_stream_completion))
             .layer(outlet_layer)
     } else {

@@ -125,7 +125,7 @@ impl InternalCredentials {
     /// anything else in the token is read.
     pub fn verify(&self, token: &str) -> Result<ApiKeyId, InvalidCredential> {
         let (id, expiry) = self.verify_signature(token)?;
-        if unix_now() > expiry {
+        if unix_now() >= expiry {
             return Err(InvalidCredential::Expired);
         }
         Ok(id)
@@ -183,20 +183,23 @@ pub struct InternalAuthState {
 impl InternalAuthState {
     /// The hash of the key a request captured by request logging presented.
     ///
-    /// Request logging sees a request's headers but not its extensions, so it
-    /// cannot see the key [`internal_credential_middleware`] authenticated,
-    /// and a request an inner layer refused never reaches onwards to be
-    /// attributed there. So an internal credential is resolved again from the
-    /// header: its signature is checked, its expiry is not. Request logging
-    /// sits inside the middleware, so every token it captures was admitted
-    /// there before it expired; a long request may finish after expiry.
-    /// Any other bearer is hashed.
-    pub fn captured_key_hash(&self, bearer: Option<&str>) -> Option<ApiKeyHash> {
+    /// Request logging sees a request's headers but not its extensions, so
+    /// the key [`internal_credential_middleware`] authenticated reaches it on
+    /// the response instead ([`carry_presented_key`]): pass that as
+    /// `authenticated`. It is set however the request ended, including when
+    /// an inner layer refused it before onwards saw it, and does not depend
+    /// on the key still being live.
+    ///
+    /// Without a response (an abandoned request) an internal credential is
+    /// resolved again from the header: its signature is checked, its expiry
+    /// is not, since request logging sits inside the middleware and so only
+    /// ever captures tokens it admitted. Any other bearer is hashed.
+    pub fn captured_key_hash(&self, bearer: Option<&str>, authenticated: Option<ApiKeyHash>) -> Option<ApiKeyHash> {
         match bearer {
-            Some(token) if is_internal(token) => {
+            Some(token) if is_internal(token) => authenticated.or_else(|| {
                 let (id, _expiry) = self.credentials.verify_signature(token).ok()?;
                 self.targets.key_ids.get(&id.to_string()).map(|hash| *hash.as_bytes())
-            }
+            }),
             Some(token) => Some(hash_api_key(token)),
             None => None,
         }
@@ -215,6 +218,25 @@ impl InternalAuthState {
             .map(|hash| *hash.as_bytes())
             .ok_or("unknown_key")
     }
+}
+
+/// Copies the key a request was authenticated as onto its response, so
+/// request logging, which sees a response's extensions but not the
+/// request's, can attribute the request to it (see
+/// [`InternalAuthState::captured_key_hash`]). Runs just inside request
+/// logging. Response extensions are never sent to the client.
+pub async fn carry_presented_key(request: Request, next: Next) -> Response {
+    let key = request.extensions().get::<PresentedKey>().copied();
+    let mut response = next.run(request).await;
+    if let Some(key) = key {
+        response.extensions_mut().insert(key);
+    }
+    response
+}
+
+/// The key hash [`carry_presented_key`] put on a captured response.
+pub fn carried_key_hash(extensions: &Extensions) -> Option<ApiKeyHash> {
+    extensions.get::<PresentedKey>().map(|PresentedKey(hash)| *hash.as_bytes())
 }
 
 /// Verifies an internal credential at the front of the `/ai` stack and hands
@@ -325,14 +347,50 @@ mod tests {
         let live = Some(hash_api_key("sk-live"));
 
         assert_eq!(
-            state.captured_key_hash(Some(&state.credentials.mint(id, Duration::from_secs(60)))),
+            state.captured_key_hash(Some(&state.credentials.mint(id, Duration::from_secs(60))), None),
             live
         );
-        assert_eq!(state.captured_key_hash(Some(&state.credentials.mint_expiring_at(id, 1))), live);
+        assert_eq!(
+            state.captured_key_hash(Some(&state.credentials.mint_expiring_at(id, 1)), None),
+            live
+        );
         let foreign = InternalCredentials::generate().mint(id, Duration::from_secs(60));
-        assert_eq!(state.captured_key_hash(Some(&foreign)), None);
-        assert_eq!(state.captured_key_hash(Some("sk-other")), Some(hash_api_key("sk-other")));
-        assert_eq!(state.captured_key_hash(None), None);
+        assert_eq!(state.captured_key_hash(Some(&foreign), None), None);
+        assert_eq!(state.captured_key_hash(Some("sk-other"), None), Some(hash_api_key("sk-other")));
+        assert_eq!(state.captured_key_hash(None, None), None);
+
+        // The key carried on the response wins, and needs no live key: a key
+        // deleted while its request was in flight is still attributed.
+        let deleted = Uuid::new_v4();
+        let carried = Some(hash_api_key("sk-deleted"));
+        let token = state.credentials.mint(deleted, Duration::from_secs(60));
+        assert_eq!(state.captured_key_hash(Some(&token), None), None);
+        assert_eq!(state.captured_key_hash(Some(&token), carried), carried);
+        // Only for internal credentials: a plain bearer is its own key.
+        assert_eq!(state.captured_key_hash(Some("sk-other"), carried), Some(hash_api_key("sk-other")));
+    }
+
+    /// The authenticated key reaches request logging on the response, also
+    /// when an inner layer refuses the request.
+    #[tokio::test]
+    async fn carry_presented_key_puts_the_key_on_the_response() {
+        use tower::ServiceExt;
+
+        async fn refuse() -> StatusCode {
+            StatusCode::BAD_REQUEST
+        }
+        let app = Router::new()
+            .route("/ai", post(refuse))
+            .layer(axum::middleware::from_fn(carry_presented_key));
+        let key = onwards::auth::KeyHash::of("sk-live");
+        let mut request = Request::builder().method("POST").uri("/ai").body(Body::empty()).unwrap();
+        request.extensions_mut().insert(PresentedKey(key));
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(carried_key_hash(response.extensions()), Some(hash_api_key("sk-live")));
+
+        let plain = Request::builder().method("POST").uri("/ai").body(Body::empty()).unwrap();
+        assert_eq!(carried_key_hash(app.oneshot(plain).await.unwrap().extensions()), None);
     }
 
     #[test]

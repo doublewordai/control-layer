@@ -494,7 +494,8 @@ impl outlet::RequestHandler for PrefixChainHandler {
             crate::request_logging::serializers::Auth::ApiKey { bearer_token } => Some(bearer_token),
             crate::request_logging::serializers::Auth::None => None,
         };
-        let api_key = self.internal_auth.captured_key_hash(bearer.as_deref());
+        let carried = crate::auth::internal_credential::carried_key_hash(&response_data.extensions);
+        let api_key = self.internal_auth.captured_key_hash(bearer.as_deref(), carried);
         let model = request_data
             .body
             .as_ref()

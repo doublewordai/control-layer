@@ -20,7 +20,8 @@ use tokio::sync::mpsc::error::TrySendError;
 use uuid::Uuid;
 
 use super::writer::{RawCompletedRequest, RequestsWriterSender};
-use crate::auth::internal_credential::{InternalAuthState, is_internal};
+use crate::auth::internal_credential::{InternalAuthState, carried_key_hash, is_internal};
+use crate::crypto::ApiKeyHash;
 use crate::inference::store::{ONWARDS_RESPONSE_ID_HEADER, lookup_created_by};
 
 /// Outlet handler that forwards completion records to the in-process writer.
@@ -142,7 +143,7 @@ impl FusilladeOutletHandler {
     /// An internal credential is attributed to the key it was minted for,
     /// including when an inner layer refused the request before onwards saw
     /// it. Its token is not stored.
-    async fn resolve_attribution(&self, ctx: &CompleteResponseCtx) -> Option<(String, String)> {
+    async fn resolve_attribution(&self, ctx: &CompleteResponseCtx, carried: Option<ApiKeyHash>) -> Option<(String, String)> {
         let api_key = match ctx.api_key.as_deref() {
             Some(key) if !key.is_empty() => key.to_string(),
             _ => {
@@ -154,7 +155,7 @@ impl FusilladeOutletHandler {
                 return None;
             }
         };
-        let key_hash = self.internal_auth.captured_key_hash(Some(&api_key));
+        let key_hash = self.internal_auth.captured_key_hash(Some(&api_key), carried);
         let created_by = lookup_created_by(&self.dwctl_pool.write(), key_hash.as_ref()).await;
         let stored_key = if is_internal(&api_key) { String::new() } else { api_key };
         match created_by {
@@ -206,7 +207,8 @@ impl RequestHandler for FusilladeOutletHandler {
             let Some(ctx) = Self::extract_complete_response_ctx(&request_data) else {
                 return;
             };
-            let Some((api_key, created_by)) = handler.resolve_attribution(&ctx).await else {
+            let carried = carried_key_hash(&response_data.extensions);
+            let Some((api_key, created_by)) = handler.resolve_attribution(&ctx, carried).await else {
                 return;
             };
 
@@ -271,7 +273,7 @@ impl RequestHandler for FusilladeOutletHandler {
             let Some(ctx) = Self::extract_complete_response_ctx(&request_data) else {
                 return;
             };
-            let Some((api_key, created_by)) = handler.resolve_attribution(&ctx).await else {
+            let Some((api_key, created_by)) = handler.resolve_attribution(&ctx, None).await else {
                 return;
             };
 

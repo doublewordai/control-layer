@@ -1,14 +1,17 @@
-//! Resolve a request's (validated) bearer token to its billing principal — the
-//! cache scope's `principal_id` (= `api_keys.user_id`, the `target_user_id`: org or
-//! personal user). Two-tier, per the design:
+//! Resolve the (validated) key a request presents, by its SHA-256 hash, to its
+//! billing principal — the cache scope's `principal_id` (= `api_keys.user_id`, the
+//! `target_user_id`: org or personal user). Callers pass the hash from
+//! `presented_key_hash`, so a key authenticated by internal credential resolves
+//! like any other. Two-tier, per the design:
 //!
-//! - **L1**: an in-process memo keyed by the token's SHA-256 hash, so it holds no
-//!   plaintext secrets. The `api_key -> user_id` mapping is **immutable**
+//! - **L1**: an in-process memo keyed by the key hash, so it holds no plaintext
+//!   secrets. The `api_key -> user_id` mapping is **immutable**
 //!   (a key's `user_id` never changes), so the memo needs no invalidation; a modest
-//!   TTL is kept only for memory hygiene. onwards passes only *validated* tokens and
+//!   TTL is kept only for memory hygiene. onwards passes only *validated* keys and
 //!   a deleted key fails that validation, so a stale memo entry can never be used.
-//! - **Read-through** to the DB on a miss via `get_user_id_by_secret` — one indexed
-//!   point lookup. No bulk key sync (that LISTEN/NOTIFY load is what we avoid).
+//! - **Read-through** to the DB on a miss via `get_user_id_by_hash` — one indexed
+//!   point lookup on `secret_hash`. No bulk key sync (that LISTEN/NOTIFY load is
+//!   what we avoid).
 //!
 //! Scoping on `user_id` (not the key) is deliberate: all of a customer's modalities
 //! (realtime / batch / playground keys) share one `user_id`, so their requests cache
@@ -25,7 +28,7 @@ use crate::types::UserId;
 use super::index::CacheResult;
 use super::metrics as cache_metrics;
 
-/// Resolves bearer tokens to billing principals, backed by an in-process L1 memo
+/// Resolves key hashes to billing principals, backed by an in-process L1 memo
 /// over a DB read-through.
 #[derive(Clone)]
 pub struct PrincipalResolver {
@@ -54,15 +57,15 @@ impl PrincipalResolver {
         }
     }
 
-    /// Resolve a validated bearer token to its billing principal. `None` => the token
-    /// is not a live key (→ un-scopable → no caching). Hits and misses are both
+    /// Resolve the hash of a validated key to its billing principal. `None` => the
+    /// hash is not a live key's (→ un-scopable → no caching). Hits and misses are both
     /// memoised; both are safe (immutable mapping; secrets are never reused).
     ///
     /// Threat model for memoising `None`: an attacker probing invalid tokens can only
     /// fill `None` entries, which grant no access — onwards validates the key *before*
     /// this is ever reached, so a polluting probe never corresponds to a request that
     /// caches or bills. The blast radius is at worst a wasted DB miss on the first real
-    /// lookup of a key that happened to collide with a probed string (negligible:
+    /// lookup of a key whose hash happened to collide with a probed one (negligible:
     /// secrets are crypto-random), and the TTL bounds even that. So caching `None` is fine.
     pub async fn resolve(&self, token_hash: &ApiKeyHash) -> CacheResult<Option<UserId>> {
         if let Some(cached) = self.l1.get(token_hash).await {
