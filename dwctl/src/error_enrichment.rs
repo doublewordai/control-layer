@@ -182,7 +182,7 @@ pub async fn error_enrichment_middleware(
             && let Ok(has_access) = check_user_has_model_access(pools.write().into_inner(), *user_id, lookup).await
             && !has_access
         {
-            if let Ok(Some(message)) = retirement_message(pools.write().into_inner(), model).await {
+            if let Ok(Some(message)) = retirement_message(pools.write().into_inner(), lookup).await {
                 return tag(retired_model_response(&message), "model_retired");
             }
             return tag(

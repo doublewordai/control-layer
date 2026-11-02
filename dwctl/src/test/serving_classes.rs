@@ -407,6 +407,7 @@ async fn activate_policy_classes(f: &Fixture, pool: &PgPool) {
         .await
         .unwrap();
     f.services.sync_onwards_config(pool).await.unwrap();
+    f.services.sync_key_policy(pool).await.unwrap();
 }
 
 #[dwctl_test_macros::test]
@@ -425,11 +426,24 @@ async fn class_routes_serve_realtime_by_class_and_bill_the_class(pool: PgPool) {
     assert!(ids.contains(&"policy") && ids.contains(&"policy:fast"), "{ids:?}");
     assert!(!ids.contains(&"policy:standard"));
 
-    // Realtime: the alias reaches standard's upstream, alias:fast reaches fast's.
+    // Realtime: the alias reaches standard's upstream, alias:fast reaches fast's,
+    // each carrying its own class's prices to the engine.
     f.post("chat/completions", "policy", false).await.assert_status_ok();
-    assert_eq!(f.last_body().await["model"], "pool-standard");
+    let body = f.last_body().await;
+    assert_eq!(body["model"], "pool-standard");
+    assert_eq!(
+        body["nvext"]["billing"],
+        json!({"prompt": 2e-6, "cached": 2e-6, "output": 2e-6}),
+        "{body}"
+    );
     f.post("chat/completions", "policy:fast", false).await.assert_status_ok();
-    assert_eq!(f.last_body().await["model"], "pool-fast");
+    let body = f.last_body().await;
+    assert_eq!(body["model"], "pool-fast");
+    assert_eq!(
+        body["nvext"]["billing"],
+        json!({"prompt": 4e-6, "cached": 4e-6, "output": 4e-6}),
+        "{body}"
+    );
 
     // Flex never runs on a non-standard class.
     let response = f
