@@ -168,6 +168,27 @@ impl Default for BatchInsertStrategy {
     }
 }
 
+/// How long file content stays available.
+///
+/// `default` is the `expires_at` given to an upload that sends no
+/// `expires_after`, and to a batch's output and error files (from the batch's
+/// creation). `max` is the longest `expires_after` an upload may ask for, so
+/// no file ever shows a date later than content retention allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileExpiry {
+    pub default: chrono::Duration,
+    pub max: chrono::Duration,
+}
+
+impl Default for FileExpiry {
+    fn default() -> Self {
+        Self {
+            default: chrono::Duration::days(30),
+            max: chrono::Duration::days(30),
+        }
+    }
+}
+
 /// Server-side budget for one daemon maintenance call, derived from the
 /// daemon's client-side query timeout.
 ///
@@ -221,6 +242,7 @@ pub struct PostgresRequestManager<P: PoolProvider> {
     query_schema: Option<Arc<str>>,
     download_buffer_size: usize,
     batch_insert_strategy: BatchInsertStrategy,
+    file_expiry: FileExpiry,
     /// TRANSITIONAL ZDR hook - see [`crate::transform`]. Transforms response/
     /// error bodies before persistence; `None` is identity. Remove when stream
     /// reassembly moves into dwctl.
@@ -457,6 +479,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             query_schema: None,
             download_buffer_size: 100,
             batch_insert_strategy: BatchInsertStrategy::default(),
+            file_expiry: FileExpiry::default(),
             response_transformer: std::sync::OnceLock::new(),
             maintenance_budget: maintenance_budget(DEFAULT_MAINTENANCE_QUERY_TIMEOUT),
         }
@@ -858,11 +881,14 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to create batch record: {}", e)))?;
 
         let created_by = input.created_by.as_deref().unwrap_or("");
+        // Results live as long as an upload would: content retention is one
+        // clock for prompts and completions, measured from the batch.
+        let results_expire_at = row.created_at + self.file_expiry.default;
         let output_file_id = self
-            .create_virtual_output_file(&mut tx, row.id, created_by)
+            .create_virtual_output_file(&mut tx, row.id, created_by, results_expire_at)
             .await?;
         let error_file_id = self
-            .create_virtual_error_file(&mut tx, row.id, created_by)
+            .create_virtual_error_file(&mut tx, row.id, created_by, results_expire_at)
             .await?;
 
         sqlx::query!(
@@ -1119,6 +1145,35 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
 
     pub fn set_download_buffer_size(&mut self, buffer_size: usize) {
         self.download_buffer_size = buffer_size;
+    }
+
+    /// Set how long file content stays available; see [`FileExpiry`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if either duration is not positive or `default` exceeds `max`.
+    pub fn with_file_expiry(mut self, file_expiry: FileExpiry) -> Self {
+        assert!(
+            file_expiry.default > chrono::Duration::zero()
+                && file_expiry.max >= file_expiry.default,
+            "file expiry must be positive and default must not exceed max, got {file_expiry:?}"
+        );
+        self.file_expiry = file_expiry;
+        self
+    }
+
+    /// Output and error files created before they carried an expiry read as
+    /// expiring `file_expiry.default` after creation: the value they would
+    /// have been given.
+    fn derive_expiry(&self, file: &mut File) {
+        if file.expires_at.is_none()
+            && matches!(
+                file.purpose,
+                Some(crate::batch::Purpose::BatchOutput | crate::batch::Purpose::BatchError)
+            )
+        {
+            file.expires_at = Some(file.created_at + self.file_expiry.default);
+        }
     }
 
     /// Set the batch insert strategy for template insertion.
@@ -4146,6 +4201,15 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
 
         // Use provided anchor time if available, otherwise use now
         let expires_at = if let Some(seconds) = metadata.expires_after_seconds {
+            // The API layer rejects out-of-range values before any bytes are
+            // read; this keeps a direct caller from recording a date that
+            // content retention cannot honour.
+            if seconds < 1 || seconds > self.file_expiry.max.num_seconds() {
+                return Err(FusilladeError::ValidationError(format!(
+                    "expires_after[seconds] must be between 1 and {}",
+                    self.file_expiry.max.num_seconds()
+                )));
+            }
             // Calculate expires_at from expires_after if provided
             let anchor = if let Some(anchor_str) = metadata.expires_after_anchor.as_ref() {
                 match anchor_str.as_str() {
@@ -4164,8 +4228,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
 
             anchor.checked_add_signed(chrono::Duration::seconds(seconds))
         } else {
-            // Default expiration: 30 days from now when no explicit expires_after_seconds is provided
-            Utc::now().checked_add_signed(chrono::Duration::days(30))
+            Utc::now().checked_add_signed(self.file_expiry.default)
         };
 
         let description = metadata.description.clone();
@@ -4230,6 +4293,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 .get_file_from_pool(file_id, self.read_executor())
                 .await?;
 
+            self.derive_expiry(&mut file);
             // Check and mark as expired if needed (passive expiration)
             self.check_and_mark_expired(&mut file).await?;
 
@@ -4248,6 +4312,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 .get_file_from_pool(file_id, self.write_executor())
                 .await?;
 
+            self.derive_expiry(&mut file);
             // Check and mark as expired if needed (passive expiration)
             self.check_and_mark_expired(&mut file).await?;
 
@@ -4608,6 +4673,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 source_external_key,
             };
 
+            self.derive_expiry(&mut file);
             // Check and mark as expired if needed (passive expiration)
             self.check_and_mark_expired(&mut file).await?;
 
@@ -8303,18 +8369,38 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         use crate::batch::{BatchResultItem, BatchResultStatus};
         let (search, status) = filters;
 
-        // First, get the file_id and archive bucket from the batch.
+        // First, get the archive bucket and, while the input content is still
+        // available, the input file from the batch.
         //
-        // file_id is None once the input file has been deleted: delete_file
-        // unlinks the batch and the orphan-purge daemon later removes the
-        // templates. The requests themselves are self-contained (custom_id,
-        // model, state, response_body, error all live on the request row), so
-        // results stay downloadable; only the input body and the file's line
-        // ordering are lost. With a file we walk templates in line order and
-        // join each to its request; without one we walk requests in creation
-        // order and left-join whatever template still exists.
+        // The input is gone once the file is deleted (delete_file unlinks the
+        // batch and the orphan-purge daemon later removes the templates), once
+        // it passes its `expires_at` (`/files/{id}/content` answers 410, so its
+        // bodies must not come back here either), or once its template week
+        // has retired. The last can come before the file's expiry: retirement
+        // waits only for unfinished batches. The upload's week is the earliest
+        // its templates can be in, so it retires first. The requests themselves
+        // are self-contained (custom_id, model, state, response_body, error
+        // all live on the request row), so results stay downloadable; only the
+        // input body and the file's line ordering are lost. With the input we
+        // walk templates in line order and join each to its request; without
+        // it we walk requests in creation order and return no input body.
         let (file_id, archive_bucket) = match sqlx::query!(
-            r#"SELECT file_id, archive_bucket FROM batches WHERE id = $1 AND deleted_at IS NULL"#,
+            r#"
+            SELECT
+                b.archive_bucket,
+                CASE WHEN f.status <> 'expired'
+                       AND (f.expires_at IS NULL OR f.expires_at > NOW())
+                       AND NOT EXISTS (
+                           SELECT 1 FROM request_template_buckets bucket
+                           WHERE bucket.week_start = date_trunc('week', f.created_at AT TIME ZONE 'UTC')::date
+                             AND bucket.state <> 'active'
+                       )
+                     THEN f.id
+                END AS input_file_id
+            FROM batches b
+            LEFT JOIN files f ON f.id = b.file_id
+            WHERE b.id = $1 AND b.deleted_at IS NULL
+            "#,
             *batch_id as Uuid,
         )
         .fetch_optional(
@@ -8323,7 +8409,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         )
         .await
         {
-            Ok(Some(row)) => (row.file_id, row.archive_bucket),
+            Ok(Some(row)) => (row.input_file_id, row.archive_bucket),
             Ok(None) => {
                 let _ = tx
                     .send(Err(FusilladeError::Other(anyhow!("Batch not found"))))
@@ -8413,7 +8499,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 FROM "#,
             );
             if let Some(file_id) = file_id {
-                // Input file present: walk templates in file line order and
+                // Input available: walk templates in file line order and
                 // join each to its request for this batch.
                 query_builder.push("request_templates_all t JOIN (");
                 push_requests_union(&mut query_builder);
@@ -8425,17 +8511,14 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 query_builder.push_bind(line_filter);
                 query_builder.push(")");
             } else {
-                // Input file deleted: walk the batch's requests in creation
-                // order and attach whatever template still exists. The
-                // LATERAL ... LIMIT 1 probe mirrors get_request_detail so a
-                // template present in both generations cannot fan out.
+                // Input gone: walk the batch's requests in creation order.
+                // Templates the purge or retirement has not yet removed are
+                // not read: their content is no longer the user's to see.
                 query_builder.push("(");
                 push_requests_union(&mut query_builder);
                 query_builder.push(
                     r#") r
-                LEFT JOIN LATERAL (
-                    SELECT body, line_number FROM request_templates_all t WHERE t.id = r.template_id LIMIT 1
-                ) t ON TRUE
+                CROSS JOIN (SELECT NULL::text AS body, NULL::integer AS line_number) t
                 WHERE ("#,
                 );
                 query_builder.push_bind(cursor_time);
@@ -8557,19 +8640,21 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         batch_id: Uuid,
         created_by: &str,
+        expires_at: DateTime<Utc>,
     ) -> Result<Uuid> {
         let name = format!("batch-{}-output.jsonl", batch_id);
         let description = format!("Output file for batch {}", batch_id);
 
         let file_id = sqlx::query_scalar!(
             r#"
-            INSERT INTO files (name, description, size_bytes, size_finalized, status, purpose, uploaded_by)
-            VALUES ($1, $2, 0, FALSE, 'processed', 'batch_output', NULLIF($3, ''))
+            INSERT INTO files (name, description, size_bytes, size_finalized, status, purpose, uploaded_by, expires_at)
+            VALUES ($1, $2, 0, FALSE, 'processed', 'batch_output', NULLIF($3, ''), $4)
             RETURNING id
             "#,
             name,
             description,
             created_by,
+            expires_at,
         )
         .fetch_one(&mut **tx)
         .await
@@ -8584,19 +8669,21 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         batch_id: Uuid,
         created_by: &str,
+        expires_at: DateTime<Utc>,
     ) -> Result<Uuid> {
         let name = format!("batch-{}-error.jsonl", batch_id);
         let description = format!("Error file for batch {}", batch_id);
 
         let file_id = sqlx::query_scalar!(
             r#"
-            INSERT INTO files (name, description, size_bytes, size_finalized, status, purpose, uploaded_by)
-            VALUES ($1, $2, 0, FALSE, 'processed', 'batch_error', NULLIF($3, ''))
+            INSERT INTO files (name, description, size_bytes, size_finalized, status, purpose, uploaded_by, expires_at)
+            VALUES ($1, $2, 0, FALSE, 'processed', 'batch_error', NULLIF($3, ''), $4)
             RETURNING id
             "#,
             name,
             description,
             created_by,
+            expires_at,
         )
         .fetch_one(&mut **tx)
         .await
@@ -22352,6 +22439,134 @@ mod tests {
         .unwrap();
         assert!(state.0.is_some());
         assert_eq!(state.1, 1);
+    }
+
+    // =========================================================================
+    // FILE EXPIRY
+    // =========================================================================
+
+    #[sqlx::test]
+    async fn results_files_expire_the_default_lifetime_after_the_batch(pool: sqlx::PgPool) {
+        let manager = Arc::new(PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        ));
+        let batch = create_background_batch_for_test(&manager, "expiry", "owner").await;
+
+        for file_id in [batch.output_file_id.unwrap(), batch.error_file_id.unwrap()] {
+            let file = manager.get_file(file_id).await.unwrap();
+            assert_eq!(
+                file.expires_at,
+                Some(batch.created_at + FileExpiry::default().default),
+                "results files carry the batch's clock"
+            );
+        }
+    }
+
+    #[sqlx::test]
+    async fn results_files_without_an_expiry_read_as_the_default(pool: sqlx::PgPool) {
+        let manager = Arc::new(PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        ));
+        let batch = create_background_batch_for_test(&manager, "legacy", "owner").await;
+        let output_file_id = batch.output_file_id.unwrap();
+        // Files created before results carried an expiry.
+        sqlx::query("UPDATE files SET expires_at = NULL WHERE id = $1")
+            .bind(*output_file_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let file = manager.get_file(output_file_id).await.unwrap();
+        assert_eq!(
+            file.expires_at,
+            Some(file.created_at + FileExpiry::default().default)
+        );
+        let listed = manager
+            .list_files(crate::batch::FileFilter::default())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|f| f.id == output_file_id)
+            .unwrap();
+        assert_eq!(listed.expires_at, file.expires_at);
+
+        // Input files are never given a derived date.
+        let input = manager.get_file(batch.file_id.unwrap()).await.unwrap();
+        sqlx::query("UPDATE files SET expires_at = NULL WHERE id = $1")
+            .bind(*input.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(manager.get_file(input.id).await.unwrap().expires_at, None);
+    }
+
+    #[sqlx::test]
+    async fn upload_refuses_an_expiry_beyond_the_maximum(pool: sqlx::PgPool) {
+        use crate::batch::{FileMetadata, FileStreamItem};
+        use futures::stream;
+
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_file_expiry(FileExpiry {
+            default: chrono::Duration::days(1),
+            max: chrono::Duration::days(2),
+        });
+        let metadata = |seconds: Option<i64>| {
+            FileStreamItem::Metadata(FileMetadata {
+                filename: Some("expiry".to_string()),
+                expires_after_seconds: seconds,
+                uploaded_by: Some("test-user".to_string()),
+                ..Default::default()
+            })
+        };
+        let template = || {
+            FileStreamItem::Template(RequestTemplateInput {
+                custom_id: Some("expiry".to_string()),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/completions".to_string(),
+                body: "{}".to_string(),
+                model: "gpt-4".to_string(),
+                api_key: "key".to_string(),
+            })
+        };
+
+        let error = manager
+            .create_file_stream(stream::iter(vec![
+                metadata(Some(3 * 24 * 60 * 60)),
+                template(),
+            ]))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, FusilladeError::ValidationError(ref message) if message.contains("172800")),
+            "unexpected error: {error:?}"
+        );
+        let files: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(files, 0, "a refused upload leaves no file behind");
+
+        let before = Utc::now();
+        let file_id = expect_stream_success(
+            manager
+                .create_file_stream(stream::iter(vec![metadata(None), template()]))
+                .await
+                .unwrap(),
+        );
+        let expires_at = manager.get_file(file_id).await.unwrap().expires_at.unwrap();
+        // `before` precedes the upload's own clock reading by a few milliseconds.
+        let lifetime = expires_at - before;
+        assert!(
+            lifetime >= chrono::Duration::days(1)
+                && lifetime < chrono::Duration::days(1) + chrono::Duration::minutes(1),
+            "default lifetime applies, got {lifetime}"
+        );
     }
 
     // =========================================================================
