@@ -99,6 +99,26 @@ impl From<(Vec<DeploymentId>, ApiKey)> for ApiKeyDBResponse {
     }
 }
 
+/// A key's one-off reveal as stored: the wrapped pending secret, the hash it
+/// must match, and (until the plaintext column is dropped) the plaintext
+/// secret for keys issued before pending secrets were wrapped.
+pub struct PendingReveal {
+    pub id: ApiKeyId,
+    pub pending_secret: Option<Vec<u8>>,
+    pub secret_hash: Option<Vec<u8>>,
+    pub secret: Option<String>,
+}
+
+// Manual Debug so neither secret is ever printed.
+impl std::fmt::Debug for PendingReveal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingReveal")
+            .field("id", &self.id)
+            .field("has_pending_secret", &self.pending_secret.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 pub struct ApiKeys<'c> {
     db: &'c mut PgConnection,
 }
@@ -224,7 +244,7 @@ impl<'c> Repository for ApiKeys<'c> {
         let deleted = sqlx::query_scalar!(
             r#"
             WITH deleted AS (
-                UPDATE api_keys SET is_deleted = true
+                UPDATE api_keys SET is_deleted = true, pending_secret = NULL
                 WHERE (id = $1 OR parent_api_key_id = $1) AND is_deleted = false
                 RETURNING id
             )
@@ -684,6 +704,10 @@ impl<'c> ApiKeys<'c> {
     /// Note the inverse is the useful property: rotating a VISIBLE key does
     /// NOT stop batches already submitted with it — they execute on the
     /// hidden child. Callers must surface that to users.
+    ///
+    /// Clears any wrapped pending secret, which holds the old secret; a caller
+    /// with a keystore re-wraps the new one with
+    /// [`ApiKeys::set_pending_secret`] in the same transaction.
     #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
     pub async fn rotate_secret(&mut self, id: ApiKeyId) -> Result<String> {
         let secret = generate_api_key();
@@ -691,7 +715,7 @@ impl<'c> ApiKeys<'c> {
         let secret_prefix = api_key_prefix(&secret);
         let result = sqlx::query!(
             r#"
-            UPDATE api_keys SET secret = $2, secret_hash = $3, secret_prefix = $4
+            UPDATE api_keys SET secret = $2, secret_hash = $3, secret_prefix = $4, pending_secret = NULL
             WHERE id = $1 AND is_deleted = false AND hidden = false AND parent_api_key_id IS NULL
             "#,
             id,
@@ -709,14 +733,16 @@ impl<'c> ApiKeys<'c> {
     }
 
     /// Flag a freshly-issued key as awaiting its holder's one-off reveal
-    /// (see migration 131). Called only by the create handler when a manager
-    /// issues a key to a different user — every other insert path leaves the
-    /// column at its born-revealed default.
-    #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
-    pub async fn mark_secret_reveal_pending(&mut self, id: ApiKeyId) -> Result<()> {
+    /// (see migration 131) and store its keystore-wrapped secret for that
+    /// reveal. Called only by the create handler when a manager issues a key
+    /// to a different user — every other insert path leaves the key at its
+    /// born-revealed default with no pending secret.
+    #[instrument(level = "debug", skip(self, pending_secret), fields(api_key_id = %abbrev_uuid(&id)), err)]
+    pub async fn mark_secret_reveal_pending(&mut self, id: ApiKeyId, pending_secret: &[u8]) -> Result<()> {
         let result = sqlx::query!(
-            "UPDATE api_keys SET secret_revealed_at = NULL WHERE id = $1 AND is_deleted = false",
-            id
+            "UPDATE api_keys SET secret_revealed_at = NULL, pending_secret = $2 WHERE id = $1 AND is_deleted = false",
+            id,
+            pending_secret
         )
         .execute(&mut *self.db)
         .await?;
@@ -727,25 +753,95 @@ impl<'c> ApiKeys<'c> {
         Ok(())
     }
 
-    /// Consume a key's one-off reveal: atomically stamp `secret_revealed_at`
-    /// and return the secret. The `IS NULL` guard makes this race-safe —
-    /// exactly one caller ever gets the secret; a concurrent second reveal
-    /// matches zero rows and returns None (handler surfaces a conflict). The
-    /// caller performs holder/authorization checks BEFORE calling this.
-    #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
-    pub async fn reveal_secret_once(&mut self, id: ApiKeyId) -> Result<Option<String>> {
-        let secret = sqlx::query_scalar!(
+    /// Store a keystore-wrapped secret for a key whose reveal is still
+    /// pending. Guarded on `secret_hash`, so a wrap of a secret that has since
+    /// been rotated away is never stored. Returns whether a row was updated
+    /// (false if the key was revealed, deleted or rotated meanwhile).
+    #[instrument(level = "debug", skip(self, pending_secret, secret_hash), fields(api_key_id = %abbrev_uuid(&id)), err)]
+    pub async fn set_pending_secret(&mut self, id: ApiKeyId, pending_secret: &[u8], secret_hash: &[u8]) -> Result<bool> {
+        let result = sqlx::query!(
             r#"
-            UPDATE api_keys SET secret_revealed_at = NOW()
-            WHERE id = $1 AND secret_revealed_at IS NULL
+            UPDATE api_keys SET pending_secret = $2
+            WHERE id = $1 AND secret_hash = $3 AND secret_revealed_at IS NULL
               AND is_deleted = false AND hidden = false AND parent_api_key_id IS NULL
-            RETURNING secret
+            "#,
+            id,
+            pending_secret,
+            secret_hash
+        )
+        .execute(&mut *self.db)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Consume a key's one-off reveal: atomically stamp `secret_revealed_at`,
+    /// clear the wrapped pending secret, and return what the reveal needs.
+    /// The `IS NULL` guard under the row lock makes this race-safe — exactly
+    /// one caller ever gets the secret; a concurrent second reveal matches
+    /// zero rows and returns None (handler surfaces a conflict). The caller
+    /// performs holder/authorization checks BEFORE calling this, and unwraps
+    /// the secret before committing, so a failed unwrap does not consume the
+    /// reveal.
+    #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
+    pub async fn reveal_secret_once(&mut self, id: ApiKeyId) -> Result<Option<PendingReveal>> {
+        // The CTE reads the pre-update pending_secret (RETURNING alone would
+        // see the NULL written here). FOR UPDATE re-checks the guard against
+        // the latest row version after waiting on a concurrent reveal.
+        let reveal = sqlx::query_as!(
+            PendingReveal,
+            r#"
+            WITH pending AS (
+                SELECT id, pending_secret, secret
+                FROM api_keys
+                WHERE id = $1 AND secret_revealed_at IS NULL
+                  AND is_deleted = false AND hidden = false AND parent_api_key_id IS NULL
+                FOR UPDATE
+            )
+            UPDATE api_keys ak SET secret_revealed_at = NOW(), pending_secret = NULL
+            FROM pending
+            WHERE ak.id = pending.id
+            RETURNING ak.id, pending.pending_secret, ak.secret_hash, pending.secret AS "secret?"
             "#,
             id
         )
         .fetch_optional(&mut *self.db)
         .await?;
-        Ok(secret)
+        Ok(reveal)
+    }
+
+    /// Every visible root key whose one-off reveal is still pending, with what
+    /// the pending-secret reconcile needs to wrap or re-wrap it.
+    #[instrument(level = "debug", skip(self), err)]
+    pub async fn list_pending_reveals(&mut self) -> Result<Vec<PendingReveal>> {
+        let rows = sqlx::query_as!(
+            PendingReveal,
+            r#"
+            SELECT id, pending_secret, secret_hash, secret AS "secret?"
+            FROM api_keys
+            WHERE secret_revealed_at IS NULL
+              AND is_deleted = false AND hidden = false AND parent_api_key_id IS NULL
+            "#
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Clear wrapped secrets left on keys that can no longer be revealed:
+    /// revealed or deleted by a release that predates `pending_secret`, or
+    /// deleted by a path that doesn't clear it.
+    #[instrument(level = "debug", skip(self), err)]
+    pub async fn clear_orphaned_pending_secrets(&mut self) -> Result<u64> {
+        let result = sqlx::query!(
+            r#"
+            UPDATE api_keys SET pending_secret = NULL
+            WHERE pending_secret IS NOT NULL
+              AND (secret_revealed_at IS NOT NULL OR is_deleted OR hidden OR parent_api_key_id IS NOT NULL)
+            "#
+        )
+        .execute(&mut *self.db)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     /// Fire the onwards config NOTIFY after a spend-window re-arm.

@@ -1,4 +1,5 @@
 import { beforeAll, afterEach, afterAll, describe, it, expect } from "vitest";
+import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { handlers } from "../mocks/handlers";
 import { dwctlApi } from "../client";
@@ -234,6 +235,28 @@ describe("dwctlApi.users", () => {
 
         expect(createdKey).toHaveProperty("key");
         expect(createdKey.name).toBe(keyData.name);
+      });
+
+      it("should surface the server's reason when creation is refused", async () => {
+        const userId = "550e8400-e29b-41d4-a716-446655440001";
+        server.use(
+          http.post(
+            `/admin/api/v1/users/${userId}/api-keys`,
+            () =>
+              new HttpResponse("No keystore configured", {
+                status: 503,
+              }),
+          ),
+        );
+
+        await expect(
+          dwctlApi.users.apiKeys.create(
+            { name: "Issued Key", purpose: "realtime" },
+            userId,
+          ),
+        ).rejects.toThrow(
+          "Failed to create API key: 503 - No keystore configured",
+        );
       });
     });
 

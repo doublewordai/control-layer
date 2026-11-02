@@ -170,6 +170,7 @@ mod notifications;
 mod openapi;
 pub mod org_overlays;
 mod payment_providers;
+mod pending_secrets;
 pub mod prefix_chain;
 pub mod pricing;
 mod probes;
@@ -3803,6 +3804,18 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
             crate::sync::key_policy::run(policy_pool, policy_listener_pool, policy_cache, policy_fallback, policy_shutdown)
                 .await
                 .context("key policy sync failed")
+        });
+    }
+
+    // Wrap the secrets of issued keys awaiting their one-off reveal that have
+    // no keystore wrap yet (issued before it existed, or by a previous-release
+    // pod mid-rollout). Every instance runs it; its writes are idempotent.
+    {
+        let pending_secrets_pool = dyn_pools.clone();
+        let pending_secrets_keystore = keystore.clone();
+        let pending_secrets_shutdown = shutdown_token.clone();
+        background_tasks.spawn("pending-secrets-reconcile", async move {
+            pending_secrets::run(pending_secrets_pool, pending_secrets_keystore, pending_secrets_shutdown).await
         });
     }
 

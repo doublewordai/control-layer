@@ -129,16 +129,28 @@ impl WrapKeyring {
     /// Unwrap a blob produced by [`WrapKeyring::wrap`], selecting the wrap key by
     /// the id tag it carries.
     pub fn unwrap(&self, blob: &[u8]) -> Result<Vec<u8>, KeystoreError> {
-        let (&id_len, rest) = blob.split_first().ok_or(KeystoreError::MalformedWrappedValue)?;
-        let id_len = id_len as usize;
-        if rest.len() < id_len {
-            return Err(KeystoreError::MalformedWrappedValue);
-        }
-        let (id_bytes, sealed) = rest.split_at(id_len);
-        let id = std::str::from_utf8(id_bytes).map_err(|_| KeystoreError::MalformedWrappedValue)?;
+        let (id, sealed) = split_wrapped(blob)?;
         let wrap_key = self.keys.get(id).ok_or_else(|| KeystoreError::UnknownWrapKeyId(id.to_string()))?;
         Ok(encryption::decrypt(wrap_key, sealed)?)
     }
+
+    /// True when `blob` was sealed with the current wrap key, so it does not need
+    /// re-wrapping before an older key is retired.
+    pub fn is_current(&self, blob: &[u8]) -> bool {
+        split_wrapped(blob).is_ok_and(|(id, _)| id == self.current_id)
+    }
+}
+
+/// Split a wrapped blob into its wrap-key id and the sealed payload.
+fn split_wrapped(blob: &[u8]) -> Result<(&str, &[u8]), KeystoreError> {
+    let (&id_len, rest) = blob.split_first().ok_or(KeystoreError::MalformedWrappedValue)?;
+    let id_len = id_len as usize;
+    if rest.len() < id_len {
+        return Err(KeystoreError::MalformedWrappedValue);
+    }
+    let (id_bytes, sealed) = rest.split_at(id_len);
+    let id = std::str::from_utf8(id_bytes).map_err(|_| KeystoreError::MalformedWrappedValue)?;
+    Ok((id, sealed))
 }
 
 /// Encrypt a string value with a key, returning a base64 string suitable for a
@@ -224,6 +236,24 @@ impl Keystore {
         })
     }
 
+    /// Wrap a small value with the current wrap key for storage outside Redis,
+    /// such as an issued API key's pending secret in the database. Nothing
+    /// expires these, so before retiring a wrap key every value it sealed must be
+    /// re-wrapped (see [`Keystore::is_current`]).
+    pub fn wrap(&self, value: &[u8]) -> Result<Vec<u8>, KeystoreError> {
+        self.keyring.wrap(value)
+    }
+
+    /// Unwrap a value produced by [`Keystore::wrap`].
+    pub fn unwrap(&self, blob: &[u8]) -> Result<Vec<u8>, KeystoreError> {
+        self.keyring.unwrap(blob)
+    }
+
+    /// True when `blob` was wrapped with the current wrap key.
+    pub fn is_current(&self, blob: &[u8]) -> bool {
+        self.keyring.is_current(blob)
+    }
+
     /// The configured default TTL, applied when `put` is called with `None`.
     pub fn default_ttl(&self) -> Duration {
         self.default_ttl
@@ -293,6 +323,23 @@ impl Keystore {
     }
 }
 
+/// Keystore config for tests that only wrap and unwrap: the Redis pool
+/// connects lazily, so the unreachable URL is never dialled.
+#[cfg(test)]
+pub(crate) fn test_keystore_config(current_id: &str, wrap_keys: &[(&str, &str)]) -> KeystoreConfig {
+    KeystoreConfig {
+        redis_url: "redis://127.0.0.1:1".into(),
+        default_ttl_seconds: 300,
+        current_wrap_key_id: current_id.into(),
+        wrap_keys: wrap_keys.iter().map(|(id, secret)| (id.to_string(), secret.to_string())).collect(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_keystore(current_id: &str, wrap_keys: &[(&str, &str)]) -> Keystore {
+    Keystore::from_config(&test_keystore_config(current_id, wrap_keys)).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,6 +370,18 @@ mod tests {
         keys.insert("k3".to_string(), encryption::derive_encryption_key("secret-three"));
         let rotated = WrapKeyring::new("k3".to_string(), keys).unwrap();
         assert!(rotated.unwrap(&sealed).is_ok());
+    }
+
+    #[test]
+    fn is_current_tracks_the_sealing_key() {
+        let sealed = keyring().wrap(&generate_key()).unwrap();
+        assert!(keyring().is_current(&sealed));
+        let mut keys = HashMap::new();
+        keys.insert("k2".to_string(), encryption::derive_encryption_key("secret-two"));
+        keys.insert("k3".to_string(), encryption::derive_encryption_key("secret-three"));
+        let rotated = WrapKeyring::new("k3".to_string(), keys).unwrap();
+        assert!(!rotated.is_current(&sealed));
+        assert!(!rotated.is_current(&[]));
     }
 
     #[test]

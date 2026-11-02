@@ -436,9 +436,15 @@ pub fn create_test_config() -> crate::config::Config {
         cache: Default::default(),
         continuation: Default::default(),
         heap_profiling: Default::default(),
-        keystore: None,
+        // Issuing a key to another user needs a keystore to wrap its pending
+        // secret. Its Redis is never dialled unless a test sends ZDR flex
+        // traffic, so the URL can be unreachable.
+        keystore: Some(crate::keystore::test_keystore_config("test-1", TEST_WRAP_KEYS)),
     }
 }
+
+/// Wrap keyring of the keystore in [`create_test_config`].
+pub const TEST_WRAP_KEYS: &[(&str, &str)] = &[("test-1", "test-wrap-secret")];
 
 /// A test user on a caller-chosen email domain.
 ///
