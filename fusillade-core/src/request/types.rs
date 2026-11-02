@@ -75,9 +75,11 @@ pub struct Request<T: RequestState> {
 
 /// [`RequestData::batch_metadata`] entry naming the API key a claimed request
 /// is dispatched as (a UUID): the batch's `api_key_id`, or the one a batchless
-/// request was created with. Present only when the request has one.
+/// request was created with. Present only when the request has one. The name
+/// is reserved: a claim fills it from the database only, never from batch or
+/// template metadata or the configured metadata fields.
 ///
-/// Like every metadata entry it rides out as an `x-fusillade-batch-api_key_id`
+/// Like every metadata entry it rides out as an `x-fusillade-batch-api-key-id`
 /// header unless a request processor removes it. A processor that
 /// authenticates dispatches by key id takes it out and sets
 /// [`RequestData::api_key`] from it, in preference to a stored key.

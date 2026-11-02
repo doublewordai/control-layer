@@ -1116,6 +1116,11 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 };
 
                 for field_name in &self.config.batch_metadata_fields {
+                    // Reserved for the key id from the database (below):
+                    // never filled from configuration or caller metadata.
+                    if field_name == API_KEY_ID_METADATA_KEY {
+                        continue;
+                    }
                     let value: Option<&str> = if row.batch_id.is_some() {
                         match field_name.as_str() {
                             "id" => Some(&row.batch_id_str),
@@ -1161,6 +1166,10 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                     .or_insert_with(|| row.batch_created_at.clone());
                 // The key the request is dispatched as, for a processor that
                 // authenticates by key id rather than with the stored key.
+                // Only the database supplies it: anything already under the
+                // reserved name is dropped, so caller metadata can never name
+                // the key a request runs as.
+                batch_metadata.remove(API_KEY_ID_METADATA_KEY);
                 if let Some(api_key_id) = row.api_key_id {
                     batch_metadata
                         .insert(API_KEY_ID_METADATA_KEY.to_string(), api_key_id.to_string());
@@ -10494,6 +10503,101 @@ mod tests {
             ("batch-secret".to_string(), Some(batch_key))
         );
         assert_eq!(by_batch[&legacy.id], ("uploader-key".to_string(), None));
+    }
+
+    /// The key id in a claimed request's metadata comes only from the
+    /// database. Caller metadata under the same name, even with the name
+    /// configured as a forwarded field, never reaches the processor: a legacy
+    /// row reports no id, and a row with one reports its own.
+    #[sqlx::test]
+    async fn caller_metadata_cannot_name_the_dispatch_key(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(DaemonConfig {
+            batch_metadata_fields: vec![API_KEY_ID_METADATA_KEY.to_string(), "id".to_string()],
+            ..Default::default()
+        });
+        let spoofed = serde_json::json!({ API_KEY_ID_METADATA_KEY: Uuid::new_v4().to_string() });
+        let file_id = manager
+            .create_file(
+                "spoof.jsonl".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "spoof-model".to_string(),
+                    api_key: "uploader-key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+        let batch_key = Uuid::new_v4();
+        let batch_input = |api_key_id| crate::batch::BatchInput {
+            file_id,
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: Some(spoofed.clone()),
+            created_by: Some("owner".to_string()),
+            api_key_id,
+            api_key: None,
+            total_requests: None,
+        };
+        let legacy_batch = manager.create_batch(batch_input(None)).await.unwrap();
+        let keyed_batch = manager
+            .create_batch(batch_input(Some(batch_key)))
+            .await
+            .unwrap();
+        let legacy_flex = manager
+            .create_flex(CreateFlexInput {
+                request_id: Uuid::new_v4(),
+                body: "{}".to_string(),
+                model: "spoof-model".to_string(),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                api_key: "flex-secret".to_string(),
+                created_by: "owner".to_string(),
+                metadata: Some(spoofed.clone()),
+            })
+            .await
+            .unwrap();
+
+        let capacity = HashMap::from([("spoof-model".to_string(), 10)]);
+        let batch_rows = claim_batch_requests_for_test(
+            &manager,
+            10,
+            10,
+            DaemonId::from(Uuid::new_v4()),
+            &capacity,
+            &HashMap::new(),
+        )
+        .await;
+        let by_batch: HashMap<BatchId, Option<Uuid>> = batch_rows
+            .iter()
+            .map(|r| (r.data.batch_id.unwrap(), key_id_of(r)))
+            .collect();
+        assert_eq!(by_batch.len(), 2);
+        assert_eq!(by_batch[&legacy_batch.id], None);
+        assert_eq!(by_batch[&keyed_batch.id], Some(batch_key));
+
+        let flex = manager
+            .claim_batchless_requests(
+                10,
+                DaemonId::from(Uuid::new_v4()),
+                &capacity,
+                &HashMap::new(),
+                &HashSet::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(flex.len(), 1);
+        assert_eq!(flex[0].data.id, legacy_flex);
+        assert_eq!(key_id_of(&flex[0]), None);
     }
 
     #[sqlx::test]
