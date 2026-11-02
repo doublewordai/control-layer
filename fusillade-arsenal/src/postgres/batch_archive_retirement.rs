@@ -9,8 +9,9 @@
 //! stamped at retirement: a write to every batch in the week grows with the
 //! week (a million rows in one statement, cancelled by the statement timeout)
 //! and the week could never retire. Only the week's explicitly deleted
-//! batches are stamped, which takes them out of the erasure purge's
-//! tombstone set once their archived rows are gone; there are few of them.
+//! batches with nothing left in `requests` are stamped, which takes them out
+//! of the erasure purge's tombstone set once their archived rows are gone;
+//! there are few of them.
 
 use crate::error::Result;
 use crate::manager::RetainedResponseRetirementOutcome;
@@ -78,18 +79,17 @@ const BATCH_ARCHIVE_FAMILY: FamilySpec = FamilySpec {
     // the week for every batch in it. The guard reads only unfinished
     // batches, a few dozen rows under idx_batches_unfinished_created_at.
     //
-    // The guard keys on the week a batch was *created* in, while archived
-    // rows are partitioned by `batches.archive_bucket`. The two differ only
-    // for a batch whose creation week had already been fenced when it
-    // archived: archive_batch then places it in the current week. Such a
-    // batch, once retried, does not hold that later week through this
-    // guard. Retry bounds the gap instead: it share-locks the batch's own
-    // archive_bucket row and refuses unless that week is active, and the
-    // retry age cut-off (with_retry_age_limit) stops retries a day before the
-    // creation week can drop. The later week drops at least a week after
-    // the creation week, so a retried batch has that long to finish before
-    // its archived completions could go. Not worth an expression index on
-    // COALESCE(archive_bucket, creation week) for this edge.
+    // A retried archived batch ('split') also holds the week its rows were
+    // archived into, finished or not: its retried rows are back in
+    // `requests` and archive_batch re-archives them into that same
+    // `archive_bucket`, which it refuses once the week is retired. Without
+    // this the rows would stay in `requests`, outside retention, for good.
+    // Retry share-locks the bucket row and refuses unless the week is
+    // active, so a week cannot be fenced under a batch going 'split'. The
+    // two arms read split batches through the partial indexes that already
+    // hold them: idx_batches_unfinished_created_at for running ones,
+    // idx_batches_archivable for finished ones awaiting re-archive. A
+    // deleted split batch holds nothing: the erasure purge removes its rows.
     candidate_sql: r#"
         SELECT bucket.partition_schema,
                namespace.oid AS partition_schema_oid,
@@ -115,11 +115,28 @@ const BATCH_ARCHIVE_FAMILY: FamilySpec = FamilySpec {
                 AND b.created_at >= (bucket.week_start::timestamp AT TIME ZONE 'UTC')
                 AND b.created_at < ((bucket.week_start + 7)::timestamp AT TIME ZONE 'UTC')
           )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM batches b
+              WHERE b.counts_frozen_at IS NULL
+                AND b.deleted_at IS NULL
+                AND b.location = 'split'
+                AND b.archive_bucket = bucket.week_start
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM batches b
+              WHERE b.location IN ('live', 'split')
+                AND b.counts_frozen_at IS NOT NULL
+                AND b.deleted_at IS NULL
+                AND b.location = 'split'
+                AND b.archive_bucket = bucket.week_start
+          )
         ORDER BY bucket.week_start
         LIMIT 1
         "#,
     candidate_binds_retention: true,
-    // The candidate's unfinished-batch guard, re-run under the bucket lock.
+    // The candidate's guards, re-run under the bucket lock.
     recheck_sql: Some(
         r#"
         SELECT EXISTS (
@@ -129,6 +146,21 @@ const BATCH_ARCHIVE_FAMILY: FamilySpec = FamilySpec {
               AND b.deleted_at IS NULL
               AND b.created_at >= ($1::date::timestamp AT TIME ZONE 'UTC')
               AND b.created_at < (($1::date + 7)::timestamp AT TIME ZONE 'UTC')
+        ) OR EXISTS (
+            SELECT 1
+            FROM batches b
+            WHERE b.counts_frozen_at IS NULL
+              AND b.deleted_at IS NULL
+              AND b.location = 'split'
+              AND b.archive_bucket = $1::date
+        ) OR EXISTS (
+            SELECT 1
+            FROM batches b
+            WHERE b.location IN ('live', 'split')
+              AND b.counts_frozen_at IS NOT NULL
+              AND b.deleted_at IS NULL
+              AND b.location = 'split'
+              AND b.archive_bucket = $1::date
         )
         "#,
     ),
@@ -138,11 +170,15 @@ const BATCH_ARCHIVE_FAMILY: FamilySpec = FamilySpec {
     // otherwise every purge tick would probe them forever. Only deleted
     // batches are stamped, read through that set's partial index
     // idx_batches_explicitly_deleted, so the write stays small however large
-    // the week; finished batches are left alone.
+    // the week; finished batches are left alone. A deleted batch that was
+    // retried can still have rows in `requests`, and the purge erases those
+    // only while the batch is in the set, so it is not stamped: it stays a
+    // tombstone, at the cost of one empty probe per purge tick.
     completion_sql: Some(
         "UPDATE batches SET retention_expired_at = $3 \
          WHERE deleted_at IS NOT NULL AND retention_expired_at IS NULL \
-           AND archive_bucket >= $1 AND archive_bucket < $2",
+           AND archive_bucket >= $1 AND archive_bucket < $2 \
+           AND NOT EXISTS (SELECT 1 FROM requests r WHERE r.batch_id = batches.id)",
     ),
 };
 

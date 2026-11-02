@@ -219,38 +219,23 @@ async fn a_young_week_is_not_a_candidate(pool: PgPool) {
     assert_eq!(outcome, RetainedResponseRetirementOutcome::NoCandidate);
 }
 
-/// Only a batch that is still running, and was created in the week, holds
-/// it open: it may yet write results into the partition. A finished batch
-/// holds nothing open whatever its location, and a running batch from
-/// another week is not this week's concern.
+/// A batch that is still running and was created in the week holds it open:
+/// it may yet write results into the partition. So does a retried archived
+/// batch ('split'), running or finished, whose rows must be re-archived into
+/// the week. A finished batch otherwise holds nothing open, a running batch
+/// from another week is not this week's concern, and a deleted split batch
+/// is the erasure purge's.
 #[sqlx::test]
-async fn only_an_unfinished_batch_created_in_the_week_blocks(pool: PgPool) {
+async fn only_running_or_split_batches_block(pool: PgPool) {
+    use RetainedResponseRetirementOutcome::{NoCandidate, Retired};
     let frozen = Some(Utc::now() - Duration::days(60));
-    for (index, (location, frozen, created_in_week, expected)) in [
-        (
-            "live",
-            frozen,
-            true,
-            RetainedResponseRetirementOutcome::Retired,
-        ),
-        (
-            "split",
-            frozen,
-            true,
-            RetainedResponseRetirementOutcome::Retired,
-        ),
-        (
-            "archive",
-            None,
-            true,
-            RetainedResponseRetirementOutcome::NoCandidate,
-        ),
-        (
-            "archive",
-            None,
-            false,
-            RetainedResponseRetirementOutcome::Retired,
-        ),
+    for (index, (location, frozen, created_in_week, deleted, expected)) in [
+        ("live", frozen, true, false, Retired),
+        ("split", frozen, true, false, NoCandidate),
+        ("split", frozen, true, true, Retired),
+        ("split", None, false, false, NoCandidate),
+        ("archive", None, true, false, NoCandidate),
+        ("archive", None, false, false, Retired),
     ]
     .into_iter()
     .enumerate()
@@ -260,13 +245,15 @@ async fn only_an_unfinished_batch_created_in_the_week_blocks(pool: PgPool) {
         let batch = archived_batch(&pool, week, Utc::now() - Duration::days(60)).await;
         sqlx::query(
             "UPDATE batches SET location = $2, counts_frozen_at = $3, \
-                 created_at = CASE WHEN $4 THEN created_at ELSE NOW() END \
+                 created_at = CASE WHEN $4 THEN created_at ELSE NOW() END, \
+                 deleted_at = CASE WHEN $5 THEN NOW() END \
              WHERE id = $1",
         )
         .bind(batch.batch_id)
         .bind(location)
         .bind(frozen)
         .bind(created_in_week)
+        .bind(deleted)
         .execute(&pool)
         .await
         .unwrap();
@@ -278,9 +265,9 @@ async fn only_an_unfinished_batch_created_in_the_week_blocks(pool: PgPool) {
             .unwrap();
         assert_eq!(
             outcome, expected,
-            "location={location} frozen={frozen:?} created_in_week={created_in_week}"
+            "location={location} frozen={frozen:?} created_in_week={created_in_week} deleted={deleted}"
         );
-        if expected == RetainedResponseRetirementOutcome::Retired {
+        if expected == Retired {
             continue;
         }
         sqlx::query(&format!(
@@ -300,6 +287,107 @@ async fn only_an_unfinished_batch_created_in_the_week_blocks(pool: PgPool) {
             .await
             .unwrap();
     }
+}
+
+/// Make `batch` a retried archived batch: its completed row stays in the
+/// archive and a retried row is back in `requests`.
+async fn split_with_live_row(pool: &PgPool, batch: &ArchivedBatch) -> Uuid {
+    sqlx::query("UPDATE batches SET location = 'split' WHERE id = $1")
+        .bind(batch.batch_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query_scalar(
+        "INSERT INTO requests (id, batch_id, model, state, retry_attempt, created_at, updated_at, \
+                               completed_at, response_status, response_body, response_size) \
+         VALUES (gen_random_uuid(), $1, 'test-model', 'completed', 1, NOW(), NOW(), NOW(), \
+                 200, '{\"retried\":true}', 16) RETURNING id",
+    )
+    .bind(batch.batch_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// A finished retried batch holds its archive week until its retried rows
+/// are archived again: archive_batch refuses a retired week, so retiring
+/// first would leave them in `requests` past retention for good.
+#[sqlx::test]
+async fn a_retried_batch_holds_its_week_until_rearchived(pool: PgPool) {
+    let week = monday(10);
+    ensure_week(&pool, week).await;
+    let batch = archived_batch(&pool, week, Utc::now() - Duration::days(60)).await;
+    split_with_live_row(&pool, &batch).await;
+    let manager = manager(&pool).await;
+
+    assert_eq!(
+        manager
+            .retire_expired_batch_archive_partition(true, 30)
+            .await
+            .unwrap(),
+        RetainedResponseRetirementOutcome::NoCandidate
+    );
+
+    assert_eq!(
+        manager
+            .archive_batch(fusillade_arsenal::batch::BatchId(batch.batch_id))
+            .await
+            .unwrap(),
+        fusillade_arsenal::ArchiveOutcome::Archived { rows: 1 }
+    );
+    assert_eq!(
+        manager
+            .retire_expired_batch_archive_partition(true, 30)
+            .await
+            .unwrap(),
+        RetainedResponseRetirementOutcome::Retired
+    );
+    let live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests WHERE batch_id = $1")
+        .bind(batch.batch_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(live, 0);
+}
+
+/// A deleted batch that was retried still has rows in `requests` when its
+/// archive week drops. The purge erases those only while the batch is in its
+/// tombstone set, so retirement must leave it there.
+#[sqlx::test]
+async fn a_deleted_batch_with_live_rows_stays_in_the_purge_set(pool: PgPool) {
+    let week = monday(10);
+    ensure_week(&pool, week).await;
+    let batch = archived_batch(&pool, week, Utc::now() - Duration::days(60)).await;
+    let live_row = split_with_live_row(&pool, &batch).await;
+    sqlx::query("UPDATE batches SET deleted_at = NOW() WHERE id = $1")
+        .bind(batch.batch_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let manager = manager(&pool).await;
+
+    assert_eq!(
+        manager
+            .retire_expired_batch_archive_partition(true, 30)
+            .await
+            .unwrap(),
+        RetainedResponseRetirementOutcome::Retired
+    );
+    let expired_at: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT retention_expired_at FROM batches WHERE id = $1")
+            .bind(batch.batch_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(expired_at, None, "still a tombstone while it has live rows");
+
+    while manager.purge_orphaned_rows(100).await.unwrap() > 0 {}
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests WHERE id = $1")
+        .bind(live_row)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0, "the purge erased the live row");
 }
 
 /// The candidate query runs before the week's registry row is locked. A
