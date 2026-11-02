@@ -8,11 +8,37 @@ The Control Layer uses a YAML configuration file with environment variable overr
 
 The configuration file is named `config.yaml` by default. The system checks:
 
-1. Path specified via `--config` CLI flag
-2. Path in `DWCTL_CONFIG` environment variable
-3. `./config.yaml` in the current directory
+1. Paths given with the `--config` (`-f`) CLI flag
+2. Paths in the `DWCTL_CONFIG` environment variable, separated by `:`
+3. `./config.yaml` in the current directory, if it exists
 
 For Docker deployments, mount your config at `/app/config.yaml`.
+
+## Multiple Configuration Files
+
+You can split the configuration across several files, as with docker-compose's `-f`. They are
+merged in the order given: each file deep-merges over the ones before it, so a later file only
+needs the keys it changes. Environment variables still override every file.
+
+```bash
+dwctl -f /app/config.yaml -f /run/secrets/dwctl.yaml
+# or
+DWCTL_CONFIG=/app/config.yaml:/run/secrets/dwctl.yaml dwctl
+```
+
+This lets a secrets manager write a file holding only the secret values, for example:
+
+```yaml
+# /run/secrets/dwctl.yaml
+secret_key: "..."
+database:
+  type: external
+  url: "postgres://..."
+```
+
+while the main file holds everything else and leaves those keys unset. Every file you name must
+exist; a missing one stops startup with an error rather than loading as empty. When any of the
+files changes, the running server reloads all of them, merged in the same order.
 
 ## Environment Variable Overrides
 

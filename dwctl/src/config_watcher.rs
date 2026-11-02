@@ -10,8 +10,8 @@ use tracing::info;
 use crate::{Config, SharedConfig};
 
 struct WatcherState {
-    config_path: PathBuf,
-    watch_dir: PathBuf,
+    /// Each config file (canonical) with the directory watched for it, in merge order.
+    files: Vec<(PathBuf, PathBuf)>,
     rx: mpsc::Receiver<()>,
     _watcher: RecommendedWatcher,
 }
@@ -73,69 +73,89 @@ fn event_touches_config_file(event: &Event, watch_dir: &Path, config_path: &Path
     })
 }
 
-fn initialize_watcher(config_path: PathBuf) -> anyhow::Result<WatcherState> {
+fn event_touches_any_config_file(event: &Event, files: &[(PathBuf, PathBuf)]) -> bool {
+    files
+        .iter()
+        .any(|(config_path, watch_dir)| event_touches_config_file(event, watch_dir, config_path))
+}
+
+fn display_paths(files: &[(PathBuf, PathBuf)]) -> String {
+    files
+        .iter()
+        .map(|(path, _)| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn initialize_watcher(config_paths: &[PathBuf]) -> anyhow::Result<WatcherState> {
     let current_dir = std::env::current_dir().context("failed to determine current directory for config watcher")?;
-    let (config_path, watch_dir) = resolve_watch_paths(&config_path, &current_dir)?;
-    let callback_config_path = config_path.clone();
-    let callback_watch_dir = watch_dir.clone();
+    let files = config_paths
+        .iter()
+        .map(|path| resolve_watch_paths(path, &current_dir))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let callback_files = files.clone();
     let (tx, rx) = mpsc::channel(1);
 
     let mut watcher = RecommendedWatcher::new(
         move |event: notify::Result<Event>| match event {
             Ok(event) if event.kind.is_modify() || event.kind.is_create() => {
-                if event_touches_config_file(&event, &callback_watch_dir, &callback_config_path) {
+                if event_touches_any_config_file(&event, &callback_files) {
                     let _ = tx.try_send(());
                 }
             }
             Ok(_) => {}
             Err(error) => {
-                crate::background_error!(CONFIG_WATCHER, "watch_error", Error, path = %callback_config_path.display(), error = %error, "Config watch error");
+                crate::background_error!(CONFIG_WATCHER, "watch_error", Error, paths = %display_paths(&callback_files), error = %error, "Config watch error");
             }
         },
         NotifyConfig::default(),
     )?;
 
-    watcher.watch(&watch_dir, RecursiveMode::NonRecursive)?;
+    // Several files may share a directory; watch each directory once.
+    let mut watched: Vec<&PathBuf> = Vec::new();
+    for (_, watch_dir) in &files {
+        if !watched.contains(&watch_dir) {
+            watcher.watch(watch_dir, RecursiveMode::NonRecursive)?;
+            watched.push(watch_dir);
+        }
+    }
 
     Ok(WatcherState {
-        config_path,
-        watch_dir,
+        files,
         rx,
         _watcher: watcher,
     })
 }
 
-pub async fn watch_config_file(
-    config_path: PathBuf,
+/// Watch the config files and, when any of them changes, reload all of them (merged in order,
+/// as at startup) into `shared_config`.
+pub async fn watch_config_files(
+    config_paths: Vec<PathBuf>,
     shared_config: SharedConfig,
     key_policy_cache: crate::sync::key_policy::KeyPolicyCache,
     shutdown_token: CancellationToken,
 ) -> anyhow::Result<()> {
-    let Some(WatcherState {
-        config_path,
-        watch_dir,
-        mut rx,
-        _watcher,
-    }) = initialize_watcher(config_path.clone()).map(Some).unwrap_or_else(|error| {
+    let Some(WatcherState { files, mut rx, _watcher }) = initialize_watcher(&config_paths).map(Some).unwrap_or_else(|error| {
         crate::background_error!(
             CONFIG_WATCHER, "setup_failed", Critical,
-            path = %config_path.display(),
+            paths = %config_paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(", "),
             error = %error,
             "Config watcher setup failed; live config reload disabled"
         );
         None
-    })
-    else {
+    }) else {
         shutdown_token.cancelled().await;
         return Ok(());
     };
 
-    info!(path = %config_path.display(), watch_dir = %watch_dir.display(), "Watching config file for changes");
+    let paths = display_paths(&files);
+    let load_paths: Vec<PathBuf> = files.iter().map(|(path, _)| path.clone()).collect();
+    info!(paths = %paths, "Watching config files for changes");
 
     loop {
         tokio::select! {
             _ = shutdown_token.cancelled() => {
-                info!(path = %config_path.display(), "Stopping config watcher");
+                info!(paths = %paths, "Stopping config watcher");
                 break;
             }
             maybe_reload = rx.recv() => {
@@ -143,10 +163,10 @@ pub async fn watch_config_file(
                     break;
                 };
 
-                info!(path = %config_path.display(), "Config file changed, reloading");
-                let load_path = config_path.clone();
+                info!(paths = %paths, "Config file changed, reloading");
+                let load_paths = load_paths.clone();
                 match tokio::task::spawn_blocking(move || {
-                    Config::load_from_path(&load_path).map_err(anyhow::Error::from)
+                    Config::load_from_paths(&load_paths).map_err(anyhow::Error::from)
                 })
                 .await
                 {
@@ -158,13 +178,13 @@ pub async fn watch_config_file(
                         // resolving to a stale value. The per-key map is left
                         // alone (its own trigger-driven refresh reloads it).
                         key_policy_cache.replace_presets(crate::scheduling::TolerationPresets::new(&config.scheduling));
-                        info!(path = %config_path.display(), "Reloaded config from disk");
+                        info!(paths = %paths, "Reloaded config from disk");
                     }
                     Ok(Err(error)) => {
-                        crate::background_error!(CONFIG_WATCHER, "reload_invalid", Warning, path = %config_path.display(), error = %error, "Config reload failed; continuing with previous config");
+                        crate::background_error!(CONFIG_WATCHER, "reload_invalid", Warning, paths = %paths, error = %error, "Config reload failed; continuing with previous config");
                     }
                     Err(error) => {
-                        crate::background_error!(CONFIG_WATCHER, "reload_join", Error, path = %config_path.display(), error = %error, "Config reload task failed");
+                        crate::background_error!(CONFIG_WATCHER, "reload_join", Error, paths = %paths, error = %error, "Config reload task failed");
                     }
                 }
             }
@@ -176,7 +196,7 @@ pub async fn watch_config_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{event_touches_config_file, resolve_watch_paths, watch_config_file};
+    use super::{event_touches_any_config_file, event_touches_config_file, resolve_watch_paths, watch_config_files};
     use notify::{Event, EventKind, event::CreateKind};
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
@@ -242,6 +262,32 @@ mod tests {
     }
 
     #[test]
+    fn an_event_on_any_of_several_config_files_triggers_a_reload() {
+        let tempdir = tempdir().expect("failed to create temp dir");
+        let base_dir = tempdir.path().join("app");
+        let secrets_dir = tempdir.path().join("secrets");
+        std::fs::create_dir_all(&base_dir).expect("failed to create base dir");
+        std::fs::create_dir_all(&secrets_dir).expect("failed to create secrets dir");
+        std::fs::write(base_dir.join("config.yaml"), "port = 8080\n").expect("failed to write base config");
+        std::fs::write(secrets_dir.join("dwctl.yaml"), "secret_key: x\n").expect("failed to write secrets config");
+
+        let files: Vec<(PathBuf, PathBuf)> = [base_dir.join("config.yaml"), secrets_dir.join("dwctl.yaml")]
+            .iter()
+            .map(|path| resolve_watch_paths(path, tempdir.path()).expect("failed to resolve watch paths"))
+            .collect();
+
+        let event_on = |path: PathBuf| Event {
+            kind: EventKind::Create(CreateKind::File),
+            paths: vec![path],
+            attrs: Default::default(),
+        };
+
+        assert!(event_touches_any_config_file(&event_on(secrets_dir.join("dwctl.yaml")), &files));
+        assert!(event_touches_any_config_file(&event_on(base_dir.join("config.yaml")), &files));
+        assert!(!event_touches_any_config_file(&event_on(secrets_dir.join("other.yaml")), &files));
+    }
+
+    #[test]
     fn normalize_path_does_not_pop_past_root() {
         let normalized = super::normalize_path(Path::new("/../configs/./dwctl.toml"));
         assert_eq!(normalized, PathBuf::from("/configs/dwctl.toml"));
@@ -274,8 +320,8 @@ mod tests {
         let shutdown = CancellationToken::new();
         shutdown.cancel();
 
-        let result = watch_config_file(
-            PathBuf::from("/definitely/missing/dwctl.toml"),
+        let result = watch_config_files(
+            vec![PathBuf::from("/definitely/missing/dwctl.toml")],
             SharedConfig::new(Config::default()),
             crate::sync::key_policy::KeyPolicyCache::empty(),
             shutdown,

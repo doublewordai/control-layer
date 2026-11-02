@@ -336,7 +336,7 @@ onwards:
         write_test_config(&config_path, "Initial Org", "https://docs.example.com/initial");
 
         let config = crate::config::Config::load_from_path(&config_path).expect("failed to load initial test config");
-        let app = Application::new_with_pool_and_config_path(config, Some(config_path.clone()), Some(pool.clone()), None)
+        let app = Application::new_with_pool_and_config_path(config, vec![config_path.clone()], Some(pool.clone()), None)
             .await
             .expect("failed to create application");
         let (server, bg_services) = app.into_test_server();

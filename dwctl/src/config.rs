@@ -1,14 +1,16 @@
 //! Application configuration management.
 //!
-//! Configuration is loaded from a YAML file with environment variable overrides. The configuration
-//! file path defaults to `config.yaml` but can be specified via `-f` flag or `DWCTL_CONFIG`
-//! environment variable.
+//! Configuration is loaded from one or more YAML files with environment variable overrides. Name
+//! the files with `-f` (repeatable) or a `:`-separated list in `DWCTL_CONFIG`; with none named,
+//! `config.yaml` is used if it exists. Every file named explicitly must exist.
 //!
 //! ## Loading Priority
 //!
 //! Configuration sources are merged in the following order (later sources override earlier ones):
 //!
-//! 1. **YAML config file** - Base configuration (default: `config.yaml`)
+//! 1. **YAML config files** - In the order given, like docker-compose's `-f`: each file
+//!    deep-merges over the ones before it, so a later file can set just a few nested keys (for
+//!    example a secrets file holding only `database.url` and `secret_key`)
 //! 2. **Environment variables** - Variables prefixed with `DWCTL_` override YAML values
 //! 3. **DATABASE_URL** - Special case: overrides `database.url` if set
 //!
@@ -92,14 +94,30 @@ pub static ONWARDS_CONFIG_CHANGED_CHANNEL: &str = "auth_config_changed";
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct Args {
-    /// Path to configuration file
-    #[arg(short = 'f', long, env = "DWCTL_CONFIG", default_value = "config.yaml")]
-    pub config: PathBuf,
+    /// Configuration files, merged in order: each deep-merges over the ones before it. Repeat
+    /// `-f`, or give a `:`-separated list in `DWCTL_CONFIG`. Every file named must exist; with
+    /// none named, `config.yaml` is used if present.
+    #[arg(short = 'f', long, env = "DWCTL_CONFIG", value_delimiter = ':')]
+    pub config: Vec<PathBuf>,
 
     /// Validate configuration and exit without starting the server.
     /// Useful for CI/CD pipelines to catch config errors before deployment.
     #[arg(long)]
     pub validate: bool,
+}
+
+/// The configuration file read when none is named. Unlike a named file, it may be absent.
+pub const DEFAULT_CONFIG_FILE: &str = "config.yaml";
+
+impl Args {
+    /// The configuration files to load, in merge order: those named, or the default file.
+    pub fn config_files(&self) -> Vec<PathBuf> {
+        if self.config.is_empty() {
+            vec![PathBuf::from(DEFAULT_CONFIG_FILE)]
+        } else {
+            self.config.clone()
+        }
+    }
 }
 
 /// Main application configuration.
@@ -3690,14 +3708,26 @@ impl ModelSource {
 impl Config {
     #[allow(clippy::result_large_err)]
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, figment::Error> {
+        Self::load_from_paths(&[path.as_ref().to_path_buf()])
+    }
+
+    /// Load from these files, merged in order, then the environment.
+    #[allow(clippy::result_large_err)]
+    pub fn load_from_paths(paths: &[PathBuf]) -> Result<Self, figment::Error> {
         Self::load(&Args {
-            config: path.as_ref().to_path_buf(),
+            config: paths.to_vec(),
             validate: false,
         })
     }
 
     #[allow(clippy::result_large_err)]
     pub fn load(args: &Args) -> Result<Self, figment::Error> {
+        // A named file that is missing is an error, not an empty layer: a deployment that splits
+        // its secrets into their own file must not start without them.
+        if let Some(missing) = args.config.iter().find(|path| !path.is_file()) {
+            return Err(figment::Error::from(format!("config file {} does not exist", missing.display())));
+        }
+
         let mut config: Self = Self::figment(args).extract()?;
 
         // if database_url is set, use it (preserving existing pool and component settings)
@@ -4243,10 +4273,18 @@ impl Config {
     }
 
     pub fn figment(args: &Args) -> Figment {
-        let config_path: OsString = args.config.as_os_str().to_owned();
-        Figment::new()
-            // Load base config file
-            .merge(Yaml::file(config_path))
+        let mut figment = Figment::new();
+        if args.config.is_empty() {
+            // The default file, found as before (searching parent directories), if it exists.
+            figment = figment.merge(Yaml::file(DEFAULT_CONFIG_FILE));
+        } else {
+            // Named files, exactly where named, each deep-merged over the ones before it.
+            for path in &args.config {
+                let path: OsString = path.as_os_str().to_owned();
+                figment = figment.merge(Yaml::file_exact(path));
+            }
+        }
+        figment
             // Environment variables can still override specific values
             .merge(Env::prefixed("DWCTL_").split("__"))
             // Common DATABASE_URL and DATABASE_REPLICA_URL patterns
@@ -4691,7 +4729,7 @@ model_sources:
             )?;
 
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
 
@@ -4731,7 +4769,7 @@ auth:
             )?;
 
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
             let config = Config::load(&args)?;
@@ -4744,12 +4782,127 @@ auth:
     }
 
     #[test]
+    fn later_config_files_deep_merge_over_earlier_ones() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "base.yaml",
+                r#"
+secret_key: placeholder
+dashboard_url: https://app.example.com
+auth:
+  security:
+    cors:
+      allowed_origins:
+        - "https://app.example.com"
+"#,
+            )?;
+            // A file holding only secrets: it sets a few nested keys and nothing else.
+            jail.create_file(
+                "secrets.yaml",
+                r#"
+secret_key: from-secrets
+auth:
+  security:
+    cors:
+      allow_credentials: true
+"#,
+            )?;
+
+            let config = Config::load(&Args {
+                config: vec!["base.yaml".into(), "secrets.yaml".into()],
+                validate: false,
+            })?;
+
+            assert_eq!(config.secret_key.as_deref(), Some("from-secrets"), "the later file wins");
+            assert_eq!(
+                config.dashboard_url, "https://app.example.com",
+                "keys only the earlier file sets survive"
+            );
+            // Nested maps merge key by key rather than the later one replacing the whole map.
+            assert!(config.auth.security.cors.allow_credentials);
+            assert_eq!(config.auth.security.cors.allowed_origins.len(), 1);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn environment_overrides_every_config_file() {
+        Jail::expect_with(|jail| {
+            jail.create_file("base.yaml", "secret_key: base\n")?;
+            jail.create_file("secrets.yaml", "secret_key: from-secrets\n")?;
+            jail.set_env("DWCTL_SECRET_KEY", "from-env");
+
+            let config = Config::load(&Args {
+                config: vec!["base.yaml".into(), "secrets.yaml".into()],
+                validate: false,
+            })?;
+
+            assert_eq!(config.secret_key.as_deref(), Some("from-env"));
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn a_missing_named_config_file_is_an_error() {
+        Jail::expect_with(|jail| {
+            jail.create_file("base.yaml", "secret_key: base\n")?;
+
+            let error = Config::load(&Args {
+                config: vec!["base.yaml".into(), "secrets.yaml".into()],
+                validate: false,
+            })
+            .expect_err("a named file that does not exist must not load as empty");
+
+            assert!(error.to_string().contains("secrets.yaml"), "{error}");
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn the_default_config_file_is_optional() {
+        Jail::expect_with(|jail| {
+            jail.set_env("DWCTL_SECRET_KEY", "from-env");
+
+            let args = Args {
+                config: vec![],
+                validate: false,
+            };
+            assert_eq!(args.config_files(), vec![PathBuf::from(DEFAULT_CONFIG_FILE)]);
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.secret_key.as_deref(), Some("from-env"));
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn config_files_come_from_repeated_flags_or_a_colon_separated_variable() {
+        Jail::expect_with(|jail| {
+            let args = Args::try_parse_from(["dwctl", "-f", "base.yaml", "-f", "secrets.yaml"]).map_err(|e| e.to_string())?;
+            assert_eq!(args.config, vec![PathBuf::from("base.yaml"), PathBuf::from("secrets.yaml")]);
+
+            jail.set_env("DWCTL_CONFIG", "/app/config.yaml:/run/secrets/dwctl.yaml");
+            let args = Args::try_parse_from(["dwctl"]).map_err(|e| e.to_string())?;
+            assert_eq!(
+                args.config,
+                vec![PathBuf::from("/app/config.yaml"), PathBuf::from("/run/secrets/dwctl.yaml")]
+            );
+
+            Ok(())
+        });
+    }
+
+    #[test]
     fn cors_allow_any_origin_without_credentials_defaults_false() {
         Jail::expect_with(|jail| {
             jail.create_file("test.yaml", "secret_key: hello\n")?;
 
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
             let config = Config::load(&args)?;
@@ -4785,7 +4938,7 @@ database:
 "#,
             )?;
             let config = Config::load(&Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             })?;
             assert_eq!(config.database.external_url(), Some("postgres://direct/db"));
@@ -4803,7 +4956,7 @@ database:
             jail.set_env("DATABASE_URL", "postgres://env-direct/db");
             jail.set_env("DWCTL_DATABASE_POOLED_URL", "postgres://env-pooled/db");
             let config = Config::load(&Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             })?;
             assert_eq!(config.database.external_url(), Some("postgres://env-direct/db"));
@@ -4883,7 +5036,7 @@ metadata:
             jail.set_env("DWCTL_PORT", "8080");
 
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
 
@@ -4923,7 +5076,7 @@ auth:
             )?;
 
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
 
@@ -5017,7 +5170,7 @@ batches:
             )?;
 
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
 
@@ -5041,7 +5194,7 @@ secret_key: "test-secret-key"
             jail.set_env("DWCTL_BATCHES__FILES__BATCH_INSERT_SIZE", "7500");
 
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
 
@@ -5314,7 +5467,7 @@ batches:
             )?;
 
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
 
@@ -5338,7 +5491,7 @@ batches:
             )?;
 
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
 
@@ -5362,7 +5515,7 @@ batches:
             )?;
 
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
 
@@ -5386,7 +5539,7 @@ batches:
             )?;
 
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
 
@@ -5412,7 +5565,7 @@ batches:
             )?;
 
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
 
@@ -5438,7 +5591,7 @@ secret_key: "test-secret-key"
             jail.set_env("DWCTL_BATCHES__DEFAULT_THROUGHPUT", "75.5");
 
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
 
@@ -5460,7 +5613,7 @@ secret_key: "test-secret-key"
             )?;
 
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
             assert!(!Config::load(&args)?.limits.batch_inflight.enforce, "default is off");
@@ -5484,7 +5637,7 @@ secret_key: "test-secret-key"
             )?;
 
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
             assert_eq!(
@@ -5521,7 +5674,7 @@ batches:
             )?;
 
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
             let result = Config::load(&args);
@@ -5545,7 +5698,7 @@ batches:
             )?;
 
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
             let result = Config::load(&args);
@@ -5569,7 +5722,7 @@ batches:
             )?;
 
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
             let config = Config::load(&args)?;
@@ -5613,7 +5766,7 @@ batches:
 "#,
             )?;
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
             let config = Config::load(&args)?;
@@ -5637,7 +5790,7 @@ batches:
 "#,
             )?;
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
             let result = Config::load(&args);
@@ -5661,7 +5814,7 @@ batches:
 "#,
             )?;
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
             let result = Config::load(&args);
@@ -5685,7 +5838,7 @@ batches:
 "#,
             )?;
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
             let config = Config::load(&args)?;
@@ -5706,7 +5859,7 @@ batches:
 "#,
             )?;
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
             let config = Config::load(&args)?;
@@ -5735,7 +5888,7 @@ auth:
             jail.set_env("DWCTL_AUTH__NATIVE__SESSION__COOKIE_DOMAIN", "");
 
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
 
@@ -5751,7 +5904,7 @@ auth:
         Jail::expect_with(|jail| {
             jail.create_file("test.yaml", "secret_key: test-secret-key\n")?;
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
 
@@ -5795,7 +5948,7 @@ background_services:
         Jail::expect_with(|jail| {
             jail.create_file("test.yaml", "secret_key: test-secret-key\n")?;
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
 
@@ -5846,7 +5999,7 @@ background_services:
 "#,
             )?;
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
 
@@ -5882,7 +6035,7 @@ secret_key: "test-secret-key"
             )?;
 
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
 
@@ -5907,7 +6060,7 @@ background_services:
             )?;
 
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
 
@@ -5932,7 +6085,7 @@ background_services:
             )?;
 
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
 
@@ -5959,7 +6112,7 @@ background_services:
             )?;
 
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
 
@@ -5982,7 +6135,7 @@ secret_key: "test-secret-key"
 "#,
             )?;
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
             let config = Config::load(&args)?;
@@ -6033,7 +6186,7 @@ background_services:
         Jail::expect_with(|jail| {
             jail.create_file("test.yaml", "secret_key: test-secret-key\n")?;
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
 
@@ -6105,7 +6258,7 @@ background_services:
         Jail::expect_with(|jail| {
             jail.create_file("test.yaml", "secret_key: test-secret-key")?;
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
             let config = Config::load(&args)?;
@@ -6143,7 +6296,7 @@ background_services:
     fn test_leak_interval_rejects_invalid_values() {
         Jail::expect_with(|jail| {
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
             for value in ["0", "-1", "1.5", ".nan", "4294967296"] {
@@ -6172,7 +6325,7 @@ secret_key: "test-secret-key"
 "#,
             )?;
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
             let config = Config::load(&args)?;
@@ -6204,7 +6357,7 @@ secret_key: "test-secret-key"
 "#,
             )?;
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
             let config = Config::load(&args)?;
@@ -6250,7 +6403,7 @@ secret_key: "test-secret-key"
 "#,
             )?;
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
             let config = Config::load(&args)?;
@@ -6285,7 +6438,7 @@ background_services:
 "#,
             )?;
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
             let result = Config::load(&args);
@@ -6310,7 +6463,7 @@ background_services:
 "#,
             )?;
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
             let result = Config::load(&args);
@@ -6339,7 +6492,7 @@ background_services:
             )?;
 
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
 
@@ -6363,7 +6516,7 @@ background_services:
 "#,
             )?;
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
             let result = Config::load(&args);
@@ -6391,7 +6544,7 @@ background_services:
 "#,
             )?;
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
             let result = Config::load(&args);
@@ -6419,7 +6572,7 @@ background_services:
 "#,
             )?;
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
             let config = Config::load(&args)?;
@@ -6442,7 +6595,7 @@ background_services:
 "#,
             )?;
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
             let result = Config::load(&args);
@@ -6467,7 +6620,7 @@ background_services:
 "#,
             )?;
             let args = Args {
-                config: "test.yaml".into(),
+                config: vec!["test.yaml".into()],
                 validate: false,
             };
             let result = Config::load(&args);

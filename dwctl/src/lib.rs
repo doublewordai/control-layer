@@ -832,7 +832,11 @@ mod pooled_schema_tests {
             .unwrap(),
             ..Config::default()
         };
-        assert!(Application::new_with_pool_and_config_path(config, None, None, None).await.is_err());
+        assert!(
+            Application::new_with_pool_and_config_path(config, Vec::new(), None, None)
+                .await
+                .is_err()
+        );
         let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
         assert!(logs.contains("Starting control layer"), "startup logging must be captured");
         assert!(
@@ -4386,15 +4390,17 @@ impl Application {
     /// If `pool` is provided, it will be used directly instead of creating a new connection.
     /// This is useful for tests where sqlx::test provides a pool.
     pub async fn new(config: Config, tracer_provider: Option<telemetry::SdkTracerProvider>) -> anyhow::Result<Self> {
-        Self::new_with_pool_and_config_path(config, None, None, tracer_provider).await
+        Self::new_with_pool_and_config_path(config, Vec::new(), None, tracer_provider).await
     }
 
+    /// Like [`Application::new`], and reloads `config` live when any of `config_paths` changes
+    /// (the files it was loaded from, in merge order; empty disables live reload).
     pub async fn new_with_config_path(
         config: Config,
-        config_path: Option<PathBuf>,
+        config_paths: Vec<PathBuf>,
         tracer_provider: Option<telemetry::SdkTracerProvider>,
     ) -> anyhow::Result<Self> {
-        Self::new_with_pool_and_config_path(config, config_path, None, tracer_provider).await
+        Self::new_with_pool_and_config_path(config, config_paths, None, tracer_provider).await
     }
 
     /// Create a new application instance with an existing database pool
@@ -4406,12 +4412,12 @@ impl Application {
         pool: Option<PgPool>,
         tracer_provider: Option<telemetry::SdkTracerProvider>,
     ) -> anyhow::Result<Self> {
-        Self::new_with_pool_and_config_path(config, None, pool, tracer_provider).await
+        Self::new_with_pool_and_config_path(config, Vec::new(), pool, tracer_provider).await
     }
 
     pub async fn new_with_pool_and_config_path(
         config: Config,
-        config_path: Option<PathBuf>,
+        config_paths: Vec<PathBuf>,
         pool: Option<PgPool>,
         tracer_provider: Option<telemetry::SdkTracerProvider>,
     ) -> anyhow::Result<Self> {
@@ -4763,11 +4769,11 @@ impl Application {
             .onwards_targets(bg_services.onwards_targets.clone())
             .build();
 
-        if let Some(config_path) = config_path {
+        if !config_paths.is_empty() {
             bg_services.spawn(
                 "config-watcher",
-                config_watcher::watch_config_file(
-                    config_path,
+                config_watcher::watch_config_files(
+                    config_paths,
                     shared_config,
                     bg_services.key_policy_cache.clone(),
                     bg_services.shutdown_token(),
