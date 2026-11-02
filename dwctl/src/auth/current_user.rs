@@ -3,7 +3,6 @@
 use crate::crypto::hash_api_key;
 use crate::db::errors::DbError;
 use crate::{
-    AppState,
     api::models::users::{AuthMethod, CurrentUser, Role},
     auth::session,
     db::handlers::{Repository, Users},
