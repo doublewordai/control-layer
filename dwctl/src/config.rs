@@ -233,6 +233,11 @@ pub struct Config {
     /// See [`crate::prefix_chain::PrefixChainConfig`].
     #[serde(default)]
     pub prefix_chain: crate::prefix_chain::PrefixChainConfig,
+    /// Shadow reference-cache estimate (`http_analytics.reference_cached_tokens`) for
+    /// allowlisted principals. Off by default. See
+    /// [`crate::reference_cache::ReferenceCacheConfig`].
+    #[serde(default)]
+    pub reference_cache: crate::reference_cache::ReferenceCacheConfig,
     /// Mid-stream continuation (stream resume): the on/off flag, per-origin gates,
     /// and resume-behavior knobs. See [`ContinuationConfig`].
     #[serde(default)]
@@ -3519,6 +3524,7 @@ impl Default for Config {
             cache: CacheConfig::default(),
             clickhouse: None,
             prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),
+            reference_cache: crate::reference_cache::ReferenceCacheConfig::default(),
             continuation: ContinuationConfig::default(),
             heap_profiling: crate::profiling::HeapProfilingConfig::default(),
             scheduling: SchedulingConfig::default(),
@@ -3989,6 +3995,11 @@ impl Config {
         // Prefix-chain capture, when on, needs the warehouse connection, tokenizer-svc and a
         // usable key — every missing piece is a startup error, never a sink that records nothing.
         if let Err(e) = self.prefix_chain.validate(self.clickhouse.as_ref(), &self.cache.tokenizer_url) {
+            return Err(Error::Internal {
+                operation: format!("Config validation: {e}"),
+            });
+        }
+        if let Err(e) = self.reference_cache.validate(self.enable_analytics) {
             return Err(Error::Internal {
                 operation: format!("Config validation: {e}"),
             });

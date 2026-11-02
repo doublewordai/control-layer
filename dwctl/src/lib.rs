@@ -178,6 +178,7 @@ pub mod prompt_cache;
 pub mod realtime_inflight;
 pub mod reasoning;
 mod recompute;
+pub mod reference_cache;
 mod request_logging;
 pub mod sample_files;
 pub mod scheduling;
@@ -1867,6 +1868,20 @@ pub async fn build_router(
     let request_logging_enabled = state.outlet_db.is_some() && config.enable_request_logging;
     let analytics_enabled = config.enable_analytics;
 
+    // Shadow reference-cache estimate: one instance shared by the first-token hook (inside
+    // outlet, below) and the analytics handler that records the estimate.
+    let reference_cache = (config.reference_cache.enabled && analytics_writer.is_some()).then(|| {
+        tracing::info!(principals = config.reference_cache.orgs.len(), models = ?config.reference_cache.models, "Reference-cache estimate enabled");
+        Arc::new(crate::reference_cache::ReferenceCache::new(
+            &config.reference_cache,
+            sqlx_pool_router::DynPools::new(state.db.clone()),
+            crate::prompt_cache::TelemetryPolicy::from_config(
+                config.cache.telemetry_blocks.strip_from_prompt,
+                &config.cache.telemetry_blocks.prefixes,
+            ),
+        ))
+    });
+
     let outlet_layer = if request_logging_enabled || analytics_enabled || prefix_chain.is_some() {
         // Store the metrics recorder in state (created earlier in Application::new)
         state.metrics_recorder = metrics_recorder;
@@ -1907,7 +1922,10 @@ pub async fn build_router(
             // parse (the same value request logging stores), via `TokenMetrics::from`.
             // The outlet sits outer to translation, so it captures the foreign
             // response body; `AiResponse` covers each protocol's own shape.
-            let analytics_handler = request_logging::AnalyticsHandler::new(writer, instance_id, config.as_ref().clone());
+            let mut analytics_handler = request_logging::AnalyticsHandler::new(writer, instance_id, config.as_ref().clone());
+            if let Some(cache) = &reference_cache {
+                analytics_handler = analytics_handler.with_reference_cache(cache.clone());
+            }
             multi_handler = multi_handler.with(analytics_handler);
         }
 
@@ -2622,7 +2640,24 @@ pub async fn build_router(
     // (`x-onwards-response-id` / `x-fusillade-request-id`) are already set.
     // Stream completion sits just inside outlet, so it tracks the body outlet
     // hands to the client and can tell a disconnect from an early end.
+    //
+    // The reference-cache hook sits inside outlet too, so it hashes the request exactly as
+    // outlet captures it for the estimate, and sees the first chunk of the stream outlet
+    // forwards.
     let onwards_router = if let Some(outlet_layer) = outlet_layer.clone() {
+        let onwards_router = match &reference_cache {
+            Some(cache) => onwards_router.layer(middleware::from_fn_with_state(
+                crate::reference_cache::layer::ReferenceLayerState {
+                    cache: cache.clone(),
+                    body_limit: match config.limits.requests.max_body_size {
+                        0 => usize::MAX,
+                        n => usize::try_from(n).unwrap_or(usize::MAX),
+                    },
+                },
+                crate::reference_cache::reference_cache_middleware,
+            )),
+            None => onwards_router,
+        };
         onwards_router
             .layer(middleware::from_fn(request_logging::stream_completion::track_stream_completion))
             .layer(outlet_layer)
@@ -4223,6 +4258,18 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         let daemon_shutdown = shutdown_token.clone();
         background_tasks.spawn("prompt-cache-retention", async move {
             prompt_cache::retention::run_prompt_cache_retention_daemon(daemon_pool, daemon_config, daemon_shutdown).await;
+            Ok(())
+        });
+    }
+
+    // Delete expired reference-cache entries. Every replica sweeps; SKIP LOCKED shares
+    // the work, and the table holds only minutes of entries.
+    if config.reference_cache.enabled {
+        let store = crate::reference_cache::ReferenceStore::new(dyn_pools.clone(), config.reference_cache.ttl());
+        let interval = std::time::Duration::from_secs(config.reference_cache.sweep_interval_secs);
+        let sweep_shutdown = shutdown_token.clone();
+        background_tasks.spawn("reference-cache-sweep", async move {
+            crate::reference_cache::run_sweeper(store, interval, sweep_shutdown).await;
             Ok(())
         });
     }

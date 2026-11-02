@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH victims AS (\n                SELECT principal_id, virtual_model, prefix_hash\n                FROM reference_cache_entries\n                WHERE expires_at <= now()\n                LIMIT $1\n                FOR UPDATE SKIP LOCKED\n            )\n            DELETE FROM reference_cache_entries e\n            USING victims v\n            WHERE e.principal_id = v.principal_id AND e.virtual_model = v.virtual_model\n              AND e.prefix_hash = v.prefix_hash\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6453c2c1038f227493340a05a133593ad1268225de2b8f92da199f9d1b95c3f1"
+}

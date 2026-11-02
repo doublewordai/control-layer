@@ -2663,6 +2663,7 @@ mod tests {
             cache: Default::default(),
             clickhouse: None,
             prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),
+            reference_cache: crate::reference_cache::ReferenceCacheConfig::default(),
             continuation: Default::default(),
             heap_profiling: Default::default(),
             keystore: None,
