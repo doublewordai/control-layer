@@ -79,17 +79,20 @@ const BATCH_ARCHIVE_FAMILY: FamilySpec = FamilySpec {
     // the week for every batch in it. The guard reads only unfinished
     // batches, a few dozen rows under idx_batches_unfinished_created_at.
     //
-    // A retried archived batch ('split') also holds the week its rows were
-    // archived into, finished or not: its retried rows are back in
-    // `requests` and archive_batch re-archives them into that same
-    // `archive_bucket`, which it refuses once the week is retired. Without
-    // this the rows would stay in `requests`, outside retention, for good.
-    // Retry share-locks the bucket row and refuses unless the week is
-    // active, so a week cannot be fenced under a batch going 'split'. The
-    // two arms read split batches through the partial indexes that already
-    // hold them: idx_batches_unfinished_created_at for running ones,
-    // idx_batches_archivable for finished ones awaiting re-archive. A
-    // deleted split batch holds nothing: the erasure purge removes its rows.
+    // A retried archived batch also holds the week its rows were archived
+    // into, finished or not: its retried rows are back in `requests` and
+    // archive_batch re-archives them into that same `archive_bucket`, which
+    // it refuses once the week is retired. Without this the rows would stay
+    // in `requests`, outside retention, for good. Such a batch is 'split',
+    // or 'live' when nothing had completed and the retry moved every row
+    // back; either way it keeps its `archive_bucket`. A batch never archived
+    // has none, so the equality leaves it out. Retry share-locks the bucket
+    // row and refuses unless the week is active, so a week cannot be fenced
+    // under a retry. The two arms read these batches through the partial
+    // indexes that already hold them: idx_batches_unfinished_created_at for
+    // running ones, idx_batches_archivable for finished ones awaiting
+    // re-archive. A deleted batch holds nothing: the erasure purge removes
+    // its rows.
     candidate_sql: r#"
         SELECT bucket.partition_schema,
                namespace.oid AS partition_schema_oid,
@@ -118,9 +121,9 @@ const BATCH_ARCHIVE_FAMILY: FamilySpec = FamilySpec {
           AND NOT EXISTS (
               SELECT 1
               FROM batches b
-              WHERE b.counts_frozen_at IS NULL
+              WHERE b.location IN ('live', 'split')
+                AND b.counts_frozen_at IS NULL
                 AND b.deleted_at IS NULL
-                AND b.location = 'split'
                 AND b.archive_bucket = bucket.week_start
           )
           AND NOT EXISTS (
@@ -129,7 +132,6 @@ const BATCH_ARCHIVE_FAMILY: FamilySpec = FamilySpec {
               WHERE b.location IN ('live', 'split')
                 AND b.counts_frozen_at IS NOT NULL
                 AND b.deleted_at IS NULL
-                AND b.location = 'split'
                 AND b.archive_bucket = bucket.week_start
           )
         ORDER BY bucket.week_start
@@ -149,9 +151,9 @@ const BATCH_ARCHIVE_FAMILY: FamilySpec = FamilySpec {
         ) OR EXISTS (
             SELECT 1
             FROM batches b
-            WHERE b.counts_frozen_at IS NULL
+            WHERE b.location IN ('live', 'split')
+              AND b.counts_frozen_at IS NULL
               AND b.deleted_at IS NULL
-              AND b.location = 'split'
               AND b.archive_bucket = $1::date
         ) OR EXISTS (
             SELECT 1
@@ -159,7 +161,6 @@ const BATCH_ARCHIVE_FAMILY: FamilySpec = FamilySpec {
             WHERE b.location IN ('live', 'split')
               AND b.counts_frozen_at IS NOT NULL
               AND b.deleted_at IS NULL
-              AND b.location = 'split'
               AND b.archive_bucket = $1::date
         )
         "#,
