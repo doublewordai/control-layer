@@ -58,7 +58,7 @@ use super::metrics as cache_metrics;
 use super::parse::{ParseError, validate_markers};
 use super::query::{self, Inject, InvalidBreakpointValue};
 use super::sse::SseBufferedStream;
-use super::stats::CacheBilling;
+use super::stats::{CacheBilling, CacheReadSource};
 use crate::inference::rejections;
 
 /// Bound on the index commit (off the response path). A slow/hung DB can't leak the
@@ -345,6 +345,18 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     // stale Transfer-Encoding (sending both is invalid HTTP). `from(u64)` is the numeric ctor.
     let (stripped, had_markers) = strip_cache_control(&body_bytes, state.classifier.telemetry_policy());
     cache_metrics::record_marker_request(had_markers);
+    // Where this request's billed cache reads will come from, for pricing it
+    // before it is sent: the engine's report on an unmarked request, the
+    // module's on a marked chat request. A marked plain completion has no
+    // module reads to bill.
+    let read_source = match (had_markers, chat_route) {
+        (false, _) => Some(CacheReadSource::Engine),
+        (true, true) => Some(CacheReadSource::Module),
+        (true, false) => None,
+    };
+    if let Some(source) = read_source {
+        parts.extensions.insert(source);
+    }
     let forward = stripped.unwrap_or(body_bytes);
     parts.headers.remove(header::TRANSFER_ENCODING);
     parts

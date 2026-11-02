@@ -640,6 +640,14 @@ pub async fn create_batch<P: PoolProvider>(
         });
     }
 
+    // The repository refuses an unprocessed, deleted or expired source as
+    // well; this check only gives the client a precise message.
+    if file.status != fusillade::batch::FileStatus::Processed {
+        return Err(Error::BadRequest {
+            message: format!("Input file {} is {} and cannot be used for a batch", req.input_file_id, file.status),
+        });
+    }
+
     // Check that the file owner (whose API key is embedded in the request templates)
     // has sufficient balance. This catches cases where an admin creates a batch from
     // a file owned by another user/org that has negative balance.
@@ -906,8 +914,11 @@ pub async fn create_batch<P: PoolProvider>(
                 total_requests: Some(total_requests),
             })
             .await
-            .map_err(|e| Error::Internal {
-                operation: format!("create background batch record: {e}"),
+            .map_err(|e| match e {
+                fusillade::FusilladeError::ValidationError(message) => Error::BadRequest { message },
+                e => Error::Internal {
+                    operation: format!("create background batch record: {e}"),
+                },
             })?
     } else {
         // Bound how much an unverified creditor can queue. Checked before
@@ -961,13 +972,12 @@ pub async fn create_batch<P: PoolProvider>(
             });
         });
 
-        state
-            .request_manager
-            .create_batch_record(batch_input)
-            .await
-            .map_err(|e| Error::Internal {
+        state.request_manager.create_batch_record(batch_input).await.map_err(|e| match e {
+            fusillade::FusilladeError::ValidationError(message) => Error::BadRequest { message },
+            e => Error::Internal {
                 operation: format!("create batch record: {e}"),
-            })?
+            },
+        })?
     };
 
     // Enqueue background job to populate requests from templates.
@@ -1434,7 +1444,7 @@ Supports pagination via `limit` and `skip` query parameters, and filtering by `c
     responses(
         (status = 200, description = "Batch results as newline-delimited JSON. Check the `X-Incomplete` header to determine if more results exist.", content_type = "application/x-ndjson"),
         (status = 404, description = "Batch not found or you don't have access to it."),
-        (status = 410, description = "The batch's output or error file has been deleted, so its results are no longer available. Results whose input file was deleted are still returned, with `input_body` set to null."),
+        (status = 410, description = "The batch's output or error file has been deleted or has passed its `expires_at`, so its results are no longer available. Results whose input file was deleted or has expired are still returned, with `input_body` set to null."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
@@ -1476,8 +1486,9 @@ pub async fn get_batch_results<P: PoolProvider>(
     // missing id can only mean the user deleted that file. Deleting a results
     // file is the user's statement that those results should be gone, and this
     // endpoint must not serve them through a side door. Report 410 and say which
-    // file went. (A deleted *input* file is different: the results still exist,
-    // they just come back without input bodies, so that case streams normally.)
+    // file went. (A deleted or expired *input* file is different: the results
+    // still exist, they just come back without input bodies, so that case
+    // streams normally.)
     let deleted_results_files: Vec<&str> = [
         (batch.output_file_id.is_none(), "output file"),
         (batch.error_file_id.is_none(), "error file"),
@@ -1485,7 +1496,7 @@ pub async fn get_batch_results<P: PoolProvider>(
     .into_iter()
     .filter_map(|(deleted, name)| deleted.then_some(name))
     .collect();
-    if !deleted_results_files.is_empty() {
+    let (Some(output_file_id), Some(error_file_id)) = (batch.output_file_id, batch.error_file_id) else {
         return Err(Error::Gone {
             message: format!(
                 "Results for batch {} are no longer available: its {} deleted.",
@@ -1495,6 +1506,27 @@ pub async fn get_batch_results<P: PoolProvider>(
                     _ => "output and error files have been".to_string(),
                 }
             ),
+        });
+    };
+
+    // Past the results files' `expires_at` their content is gone from
+    // `/files/{id}/content`, so it is gone here too. The repository's read
+    // supplies the date older results files are given, and marks them expired.
+    // Output and error files share one expiry; both are checked so neither
+    // can be served once its own date has passed.
+    let (output_file, error_file) = futures::try_join!(
+        state.request_manager.get_file(output_file_id),
+        state.request_manager.get_file(error_file_id),
+    )
+    .map_err(|e| Error::Internal {
+        operation: format!("fetch results files for batch {batch_id_str}: {e}"),
+    })?;
+    let now = chrono::Utc::now();
+    let is_expired =
+        |file: &fusillade::File| file.status == fusillade::batch::FileStatus::Expired || file.expires_at.is_some_and(|at| at <= now);
+    if is_expired(&output_file) || is_expired(&error_file) {
+        return Err(Error::Gone {
+            message: format!("Results for batch {batch_id_str} are no longer available: its results files have expired."),
         });
     }
 
@@ -1755,7 +1787,7 @@ pub async fn delete_batch<P: PoolProvider>(
     description = "Retry a batch: failed AND canceled requests are reset to pending and will be processed again; completed work is never redone. Retrying a cancelled batch overturns the cancellation (cancel-then-retry acts as pause/resume), so this also succeeds on a just-cancelled batch whose requests had not yet settled. Use it after fixing transient issues, increasing rate limits, or to resume a cancelled batch.",
     responses(
         (status = 200, description = "Requests queued for retry (or a cancellation was overturned and the batch resumed).", body = BatchResponse),
-        (status = 400, description = "Nothing to retry: no failed or canceled requests, and the batch was not cancelled."),
+        (status = 400, description = "The batch cannot be retried: it has no failed or canceled requests and was not cancelled, it is past the retry age cut-off, or its input or results have been deleted by content retention."),
         (status = 404, description = "Batch not found or you don't have access to it."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
@@ -1797,8 +1829,13 @@ pub async fn retry_failed_batch_requests<P: PoolProvider>(
         .request_manager
         .retry_failed_requests_for_batch(fusillade::BatchId(batch_id))
         .await
-        .map_err(|e| Error::Internal {
-            operation: format!("retry failed requests: {}", e),
+        .map_err(|e| match e {
+            // Refusals the client can act on: the batch is past its retry
+            // age cut-off, or its input or results have been retired.
+            fusillade::FusilladeError::ValidationError(message) => Error::BadRequest { message },
+            e => Error::Internal {
+                operation: format!("retry failed requests: {}", e),
+            },
         })?;
 
     // retried_count == 0 is still SUCCESS when the retry overturned a
@@ -1847,7 +1884,7 @@ Use this for fine-grained control over which requests to retry, rather than retr
     request_body = RetryRequestsRequest,
     responses(
         (status = 200, description = "Specified requests queued for retry.", body = BatchResponse),
-        (status = 400, description = "No valid request IDs provided."),
+        (status = 400, description = "No valid request IDs provided, or the batch is past the retry age cut-off. Requests whose input has been deleted by content retention are left as they are; the batch is returned with status 200."),
         (status = 404, description = "Batch not found or you don't have access to it."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
@@ -1909,8 +1946,13 @@ pub async fn retry_specific_requests<P: PoolProvider>(
         .request_manager
         .retry_failed_requests(fusillade::BatchId(batch_id), request_ids.clone())
         .await
-        .map_err(|e| Error::Internal {
-            operation: format!("retry failed requests: {}", e),
+        .map_err(|e| match e {
+            // The batch is past its retry age cut-off. A request whose input
+            // has been retired is refused on its own, in `results`.
+            fusillade::FusilladeError::ValidationError(message) => Error::BadRequest { message },
+            e => Error::Internal {
+                operation: format!("retry failed requests: {}", e),
+            },
         })?;
 
     // Check for any failures
@@ -3497,6 +3539,302 @@ mod tests {
         // Note: We can't easily verify the exact failed count since we didn't actually
         // create failed requests in the DB (just set the errors field). But we verified
         // it was hidden before, so the logic is working.
+    }
+
+    /// Upload a one-line `gpt-4` batch file for a user who can use the model.
+    async fn upload_input_file(app: &axum_test::TestServer, pool: &PgPool) -> (crate::api::models::users::UserResponse, String) {
+        let user = create_test_user_with_roles(pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(pool).await;
+        add_user_to_group(pool, user.id, group.id).await;
+        let deployment = create_test_deployment(pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(pool, deployment.id, group.id, user.id).await;
+
+        let jsonl = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let upload = app
+            .post("/ai/v1/files")
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", axum_test::multipart::Part::bytes(jsonl.as_bytes()).file_name("batch.jsonl")),
+            )
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload.json();
+        (user, file["id"].as_str().unwrap().to_string())
+    }
+
+    fn create_batch_request(input_file_id: &str, completion_window: &str) -> CreateBatchRequest {
+        CreateBatchRequest {
+            input_file_id: input_file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: completion_window.to_string(),
+            metadata: None,
+            api_key_id: None,
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn create_batch_rejects_an_expired_input_with_400(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let (user, file_id) = upload_input_file(&app, &pool).await;
+        sqlx::query("UPDATE fusillade.files SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+            .bind(Uuid::parse_str(&file_id).unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let response = app
+            .post("/ai/v1/batches")
+            .json(&create_batch_request(&file_id, "24h"))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+        assert!(response.text().contains("expired"), "unexpected response: {}", response.text());
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn results_files_show_an_expiry(pool: PgPool) {
+        // Not the built-in default, so this proves the setting reaches the
+        // repository rather than matching its own fallback.
+        let default_seconds = 2 * 24 * 60 * 60;
+        let mut config = create_test_config();
+        config.batches.files.default_expiry_seconds = default_seconds;
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let (user, file_id) = upload_input_file(&app, &pool).await;
+
+        let response = app
+            .post("/ai/v1/batches")
+            .json(&create_batch_request(&file_id, "24h"))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        response.assert_status(StatusCode::CREATED);
+        let batch: crate::api::models::batches::BatchResponse = response.json();
+
+        for results_file_id in [batch.output_file_id.unwrap(), batch.error_file_id.unwrap()] {
+            let file = app
+                .get(&format!("/ai/v1/files/{results_file_id}"))
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                .await;
+            file.assert_status_ok();
+            let file: serde_json::Value = file.json();
+            let expires_at = file["expires_at"].as_i64().expect("results files carry an expiry");
+            assert_eq!(expires_at, batch.created_at + default_seconds);
+        }
+    }
+
+    /// Past the results files' `expires_at`, `/files/{id}/content` answers 410;
+    /// the results endpoint must not serve the same content. Covers a stored
+    /// date on either file and the date derived for results files created
+    /// before they carried one, on both the paginated and the streaming paths.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn batch_results_are_gone_once_the_results_files_expire(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let (user, file_id) = upload_input_file(&app, &pool).await;
+        let auth = add_auth_headers(&user);
+
+        let response = app
+            .post("/ai/v1/batches")
+            .json(&create_batch_request(&file_id, "24h"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        response.assert_status(StatusCode::CREATED);
+        let batch: crate::api::models::batches::BatchResponse = response.json();
+        let output_file_id = Uuid::parse_str(&batch.output_file_id.unwrap()).unwrap();
+        let error_file_id = Uuid::parse_str(&batch.error_file_id.unwrap()).unwrap();
+        let paths = [
+            format!("/ai/v1/batches/{}/results", batch.id),
+            format!("/ai/v1/batches/{}/results?limit=10", batch.id),
+        ];
+        let assert_results = |status: StatusCode| {
+            let app = &app;
+            let auth = &auth;
+            let paths = &paths;
+            async move {
+                for path in paths {
+                    let response = app
+                        .get(path)
+                        .add_header(&auth[0].0, &auth[0].1)
+                        .add_header(&auth[1].0, &auth[1].1)
+                        .await;
+                    response.assert_status(status);
+                    if status == StatusCode::GONE {
+                        assert!(response.text().contains("expired"), "{path}: {}", response.text());
+                    }
+                }
+            }
+        };
+        let restore = |id: Uuid| {
+            let pool = &pool;
+            async move {
+                sqlx::query("UPDATE fusillade.files SET expires_at = NOW() + INTERVAL '1 day', status = 'processed' WHERE id = $1")
+                    .bind(id)
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            }
+        };
+
+        assert_results(StatusCode::OK).await;
+
+        // A stored date in the past on either file.
+        for id in [output_file_id, error_file_id] {
+            sqlx::query("UPDATE fusillade.files SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert_results(StatusCode::GONE).await;
+            restore(id).await;
+            assert_results(StatusCode::OK).await;
+        }
+
+        // A results file from before results carried an expiry reads as
+        // created_at + default; once that has passed, results are gone.
+        let default_seconds = crate::config::FilesConfig::default().default_expiry_seconds;
+        sqlx::query("UPDATE fusillade.files SET expires_at = NULL, created_at = NOW() - make_interval(secs => $2) WHERE id = $1")
+            .bind(output_file_id)
+            .bind((default_seconds + 1) as f64)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_results(StatusCode::GONE).await;
+    }
+
+    /// Results outlive their input: an input file that has passed its
+    /// `expires_at` answers 410 on `/files/{id}/content`, so its bodies must not
+    /// come back through the results either, and a template week can retire
+    /// while a finished batch's results are still valid. Either way every
+    /// request is still returned, with `input_body: null`, on both the
+    /// paginated and the streaming paths.
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn batch_results_drop_input_bodies_once_the_input_is_gone(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let auth = add_auth_headers(&user);
+
+        let file_id = Uuid::new_v4();
+        let batch_id = Uuid::new_v4();
+        let num_requests = 3;
+        sqlx::query(
+            "INSERT INTO fusillade.files (id, name, status, expires_at, created_at, updated_at) VALUES ($1, 'input.jsonl', 'processed', NOW() + INTERVAL '1 day', NOW(), NOW())",
+        )
+        .bind(file_id)
+        .execute(&pool)
+        .await
+        .expect("Failed to create file");
+        sqlx::query(
+            "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at, total_requests, completed_at) VALUES ($1, $2, $3, '/v1/chat/completions', '24h', NOW() + interval '24 hours', NOW(), $4, NOW())",
+        )
+        .bind(batch_id)
+        .bind(user.id.to_string())
+        .bind(file_id)
+        .bind(num_requests as i32)
+        .execute(&pool)
+        .await
+        .expect("Failed to create batch");
+        attach_results_files(&pool, batch_id).await;
+        for i in 0..num_requests {
+            let template_id = Uuid::new_v4();
+            crate::test::utils::insert_fusillade_template(
+                &pool,
+                template_id,
+                Some(file_id),
+                "test-model",
+                "test-key",
+                "http://test",
+                "/v1/chat/completions",
+                &serde_json::json!({"prompt": i}).to_string(),
+                Some(&format!("req-{i}")),
+            )
+            .await;
+            sqlx::query(
+                "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, response_status, response_body, custom_id, created_at, completed_at) \
+                 VALUES ($1, $2, $3, 'test-model', 'completed', 200, $4, $5, NOW() + ($6 || ' seconds')::interval, NOW())",
+            )
+            .bind(Uuid::new_v4())
+            .bind(batch_id)
+            .bind(template_id)
+            .bind(format!(r#"{{"id":"chatcmpl-{i}"}}"#))
+            .bind(format!("req-{i}"))
+            .bind(i.to_string())
+            .execute(&pool)
+            .await
+            .expect("Failed to create request");
+        }
+
+        let results = |input_present: bool| {
+            let app = &app;
+            let auth = &auth;
+            async move {
+                for path in [
+                    format!("/ai/v1/batches/{batch_id}/results"),
+                    format!("/ai/v1/batches/{batch_id}/results?limit=10"),
+                ] {
+                    let response = app
+                        .get(&path)
+                        .add_header(&auth[0].0, &auth[0].1)
+                        .add_header(&auth[1].0, &auth[1].1)
+                        .await;
+                    response.assert_status(StatusCode::OK);
+                    let lines: Vec<serde_json::Value> = response
+                        .text()
+                        .lines()
+                        .map(|l| serde_json::from_str(l).expect("each line is JSON"))
+                        .collect();
+                    let custom_ids: Vec<&str> = lines.iter().map(|l| l["custom_id"].as_str().unwrap()).collect();
+                    assert_eq!(custom_ids, ["req-0", "req-1", "req-2"], "{path}: every request, in order");
+                    for (i, line) in lines.iter().enumerate() {
+                        assert_eq!(line["response_body"]["id"], format!("chatcmpl-{i}"), "{path}");
+                        if input_present {
+                            assert_eq!(line["input_body"]["prompt"], i, "{path}");
+                        } else {
+                            assert!(line["input_body"].is_null(), "{path}: input body served after the input went");
+                        }
+                    }
+                }
+            }
+        };
+
+        results(true).await;
+
+        // The input file passes its expiry.
+        sqlx::query("UPDATE fusillade.files SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+            .bind(file_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        results(false).await;
+        sqlx::query("UPDATE fusillade.files SET expires_at = NOW() + INTERVAL '1 day' WHERE id = $1")
+            .bind(file_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        results(true).await;
+
+        // The input's template week retires while the file is unexpired.
+        sqlx::query(
+            "UPDATE fusillade.request_template_buckets SET state = 'retired' \
+             WHERE week_start = date_trunc('week', NOW() AT TIME ZONE 'UTC')::date",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM fusillade.request_templates_g2 WHERE file_id = $1")
+            .bind(file_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        results(false).await;
     }
 
     /// Give a hand-inserted batch the virtual output and error files that

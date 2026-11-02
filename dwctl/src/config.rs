@@ -1267,11 +1267,16 @@ pub enum EmailTransportConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FilesConfig {
-    /// Default expiration time in seconds (default: 24 hours)
+    /// `expires_at` given to an upload that sends no `expires_after`, and to a
+    /// batch's output and error files from the batch's creation (default: 30
+    /// days). Uploads may request up to `max_expiry_seconds`, so content
+    /// retention must cover that maximum, not this default.
     pub default_expiry_seconds: i64,
-    /// Minimum expiration time in seconds (default: 1 hour)
+    /// Smallest `expires_after[seconds]` an upload may request (default: 1 hour)
     pub min_expiry_seconds: i64,
-    /// Maximum expiration time in seconds (default: 30 days)
+    /// Largest `expires_after[seconds]` an upload may request (default: 30
+    /// days). Content retention is this rounded up to whole days, so no
+    /// `expires_at` outlives the content.
     pub max_expiry_seconds: i64,
     /// Buffer size for file upload streams (default: 100)
     pub upload_buffer_size: usize,
@@ -1284,9 +1289,9 @@ pub struct FilesConfig {
 impl Default for FilesConfig {
     fn default() -> Self {
         Self {
-            default_expiry_seconds: 24 * 60 * 60,  // 24 hours
-            min_expiry_seconds: 60 * 60,           // 1 hour
-            max_expiry_seconds: 30 * 24 * 60 * 60, // 30 days
+            default_expiry_seconds: 30 * 24 * 60 * 60, // 30 days
+            min_expiry_seconds: 60 * 60,               // 1 hour
+            max_expiry_seconds: 30 * 24 * 60 * 60,     // 30 days
             upload_buffer_size: 100,
             download_buffer_size: 100,
             batch_insert_size: 5000,
@@ -2334,8 +2339,9 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub retained_response_retirement_enabled: bool,
 
-    /// Allow weekly batch-archive partition retirement. Disabled by default
-    /// and additionally requires an explicit retention period.
+    /// Allow weekly batch-archive partition retirement. Disabled by default.
+    /// Retention follows `batches.files.max_expiry_seconds`; see
+    /// [`content_retention_days`].
     #[serde(default)]
     pub batch_archive_retirement_enabled: bool,
 
@@ -2346,20 +2352,21 @@ pub struct DaemonConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_generation_writes_enabled: Option<bool>,
 
-    /// Allow file-content expiry and weekly template partition retirement.
-    /// Disabled by default and additionally requires an explicit retention
-    /// period.
+    /// Allow weekly template partition retirement. Disabled by default.
+    /// Retention follows `batches.files.max_expiry_seconds`; see
+    /// [`content_retention_days`].
     #[serde(default)]
     pub template_retirement_enabled: bool,
 
-    /// Creation-anchored input-content retention period in days. No default:
-    /// enabling template retirement without it fails startup.
-    #[serde(default)]
+    /// Deprecated and ignored: content retention follows
+    /// `batches.files.max_expiry_seconds`. The key is still accepted so
+    /// existing values files keep parsing; a warning is logged at startup
+    /// when it is set. Remove it from your configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_retention_days: Option<u32>,
 
-    /// Finalization-anchored batch content retention period in days. No
-    /// default: enabling batch-archive retirement without it fails startup.
-    #[serde(default)]
+    /// Deprecated and ignored; see `template_retention_days`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_archive_retention_days: Option<u32>,
 
     /// Explicit direct/session-capable primary endpoint used only for
@@ -2750,8 +2757,24 @@ impl Default for DaemonConfig {
     }
 }
 
+/// Content retention in whole days, derived from the longest file expiry an
+/// upload may ask for, rounded up: `ceil(max_expiry_seconds / 1 day)`.
+///
+/// Both weekly content families (batch archive and request templates) drop a
+/// week once `week_start + 7 days + this` has passed. Every file's
+/// `expires_at` is at most `created_at + max_expiry_seconds`, which is at
+/// most the week's end plus this, so the date the API shows can never
+/// outrun the content.
+pub fn content_retention_days(max_expiry_seconds: i64) -> u32 {
+    const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
+    let days = max_expiry_seconds.max(1).saturating_add(SECONDS_PER_DAY - 1) / SECONDS_PER_DAY;
+    u32::try_from(days.min(i64::from(i32::MAX))).unwrap_or(i32::MAX as u32)
+}
+
 impl DaemonConfig {
-    pub fn to_fusillade_retention_maintenance_config(&self) -> fusillade::RetentionMaintenanceConfig {
+    /// Build the daemon's retention maintenance controls. Content retention
+    /// is derived from `max_expiry_seconds`; see [`content_retention_days`].
+    pub fn to_fusillade_retention_maintenance_config(&self, max_expiry_seconds: i64) -> fusillade::RetentionMaintenanceConfig {
         fusillade::RetentionMaintenanceConfig::new(self.retention.clone())
             .with_batchless_archive_sweep_enabled(self.batchless_archive_sweep_enabled)
             .with_batchless_archive_backfill_enabled(self.batchless_archive_backfill_enabled)
@@ -2760,9 +2783,8 @@ impl DaemonConfig {
             .with_retained_response_partitions_days_ahead(self.retained_response_partitions_days_ahead)
             .with_retained_response_retirement_enabled(self.retained_response_retirement_enabled)
             .with_batch_archive_retirement_enabled(self.batch_archive_retirement_enabled)
-            .with_batch_archive_retention_days(self.batch_archive_retention_days)
             .with_template_retirement_enabled(self.template_retirement_enabled)
-            .with_template_retention_days(self.template_retention_days)
+            .with_content_retention_days(Some(content_retention_days(max_expiry_seconds)))
     }
 
     /// Convert to fusillade daemon config
@@ -2929,6 +2951,8 @@ pub struct BackgroundServicesConfig {
     pub leader_election: LeaderElectionConfig,
     /// Configuration for database pool metrics sampling
     pub pool_metrics: PoolMetricsSamplerConfig,
+    /// Aggregate-only batch alert collector (opt-in).
+    pub batch_sla_metrics: crate::metrics::batch_sla::BatchSlaMetricsConfig,
     /// jemalloc statistics sampling for the allocator Prometheus gauges.
     /// See [`crate::metrics::allocator::AllocatorMetricsConfig`].
     pub allocator_metrics: crate::metrics::allocator::AllocatorMetricsConfig,
@@ -3119,12 +3143,13 @@ pub struct OnwardsSyncConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct KeyPolicySyncConfig {
     /// Keep the map fresh after startup (default: true). With this off, a
-    /// change to an account's ZDR flag or disabled modalities only reaches
-    /// this instance on restart.
+    /// change to an account's ZDR flag, disabled modalities or prices only
+    /// reaches this instance on restart.
     pub enabled: bool,
     /// Fallback full-reload interval in milliseconds (default: 300000). The
-    /// reload is one small two-table join, and NOTIFY carries real changes,
-    /// so this only guards against a missed notification. `0` disables it.
+    /// reload is one small two-table join plus the tariff lookups, and NOTIFY
+    /// carries real changes (cache tariffs excepted), so this mostly guards
+    /// against a missed notification. `0` disables it.
     pub fallback_interval_milliseconds: u64,
 }
 
@@ -3769,6 +3794,10 @@ impl Config {
 
     /// Validate the configuration for consistency and required fields
     pub fn validate(&self) -> Result<(), Error> {
+        self.background_services
+            .batch_sla_metrics
+            .validate()
+            .map_err(|operation| Error::Internal { operation })?;
         for (name, component) in [("fusillade", self.database.fusillade()), ("outlet", self.database.outlet())] {
             component
                 .validate_schema_pooling(name, self.database.external_pooled_url().is_some())
@@ -3849,22 +3878,6 @@ impl Config {
         {
             return Err(Error::Internal {
                 operation: "Config validation: partition retirement on a dedicated database requires an explicit direct session endpoint using the same role as fusillade query traffic".to_string(),
-            });
-        }
-        if owns_archive_maintenance
-            && daemon.batch_archive_retirement_enabled
-            && daemon.batch_archive_retention_days.is_none_or(|days| days < 1)
-        {
-            return Err(Error::Internal {
-                operation:
-                    "Config validation: batch-archive partition retirement requires an explicit positive batch_archive_retention_days"
-                        .to_string(),
-            });
-        }
-        if owns_archive_maintenance && daemon.template_retirement_enabled && daemon.template_retention_days.is_none_or(|days| days < 1) {
-            return Err(Error::Internal {
-                operation: "Config validation: template partition retirement requires an explicit positive template_retention_days"
-                    .to_string(),
             });
         }
         if owns_archive_maintenance
@@ -4183,53 +4196,56 @@ impl Config {
 
             // Validate file size limits are sensible (0 = unlimited is allowed but not recommended)
             // Note: max_file_size is now in limits.files, not batches.files
+        }
 
-            // Validate expiry times are positive and in sensible order
-            if self.batches.files.min_expiry_seconds <= 0 {
-                return Err(Error::Internal {
-                    operation: "Config validation: min_expiry_seconds must be positive (default: 3600 = 1 hour).".to_string(),
-                });
-            }
+        // Validate expiry times are positive and in sensible order. The request
+        // manager takes these whether or not the batches API is enabled, and it
+        // refuses a non-positive or misordered expiry, so check them here to
+        // report a config error rather than fail at startup.
+        if self.batches.files.min_expiry_seconds <= 0 {
+            return Err(Error::Internal {
+                operation: "Config validation: min_expiry_seconds must be positive (default: 3600 = 1 hour).".to_string(),
+            });
+        }
 
-            if self.batches.files.default_expiry_seconds <= 0 {
-                return Err(Error::Internal {
-                    operation: "Config validation: default_expiry_seconds must be positive (default: 86400 = 24 hours).".to_string(),
-                });
-            }
+        if self.batches.files.default_expiry_seconds <= 0 {
+            return Err(Error::Internal {
+                operation: "Config validation: default_expiry_seconds must be positive (default: 2592000 = 30 days).".to_string(),
+            });
+        }
 
-            if self.batches.files.max_expiry_seconds <= 0 {
-                return Err(Error::Internal {
-                    operation: "Config validation: max_expiry_seconds must be positive (default: 2592000 = 30 days).".to_string(),
-                });
-            }
+        if self.batches.files.max_expiry_seconds <= 0 {
+            return Err(Error::Internal {
+                operation: "Config validation: max_expiry_seconds must be positive (default: 2592000 = 30 days).".to_string(),
+            });
+        }
 
-            // Validate expiry times are in correct order
-            if self.batches.files.min_expiry_seconds > self.batches.files.default_expiry_seconds {
-                return Err(Error::Internal {
-                    operation: format!(
-                        "Config validation: min_expiry_seconds ({}) cannot be greater than default_expiry_seconds ({})",
-                        self.batches.files.min_expiry_seconds, self.batches.files.default_expiry_seconds
-                    ),
-                });
-            }
+        // Validate expiry times are in correct order
+        if self.batches.files.min_expiry_seconds > self.batches.files.default_expiry_seconds {
+            return Err(Error::Internal {
+                operation: format!(
+                    "Config validation: min_expiry_seconds ({}) cannot be greater than default_expiry_seconds ({})",
+                    self.batches.files.min_expiry_seconds, self.batches.files.default_expiry_seconds
+                ),
+            });
+        }
 
-            if self.batches.files.default_expiry_seconds > self.batches.files.max_expiry_seconds {
-                return Err(Error::Internal {
-                    operation: format!(
-                        "Config validation: default_expiry_seconds ({}) cannot be greater than max_expiry_seconds ({})",
-                        self.batches.files.default_expiry_seconds, self.batches.files.max_expiry_seconds
-                    ),
-                });
-            }
+        if self.batches.files.default_expiry_seconds > self.batches.files.max_expiry_seconds {
+            return Err(Error::Internal {
+                operation: format!(
+                    "Config validation: default_expiry_seconds ({}) cannot be greater than max_expiry_seconds ({})",
+                    self.batches.files.default_expiry_seconds, self.batches.files.max_expiry_seconds
+                ),
+            });
+        }
 
-            if self.batches.files.min_expiry_seconds > self.batches.files.max_expiry_seconds {
-                return Err(Error::Internal {
-                    operation: format!(
-                        "Config validation: min_expiry_seconds ({}) cannot be greater than max_expiry_seconds ({})",
-                        self.batches.files.min_expiry_seconds, self.batches.files.max_expiry_seconds
-                    ),
-                });
-            }
+        if self.batches.files.min_expiry_seconds > self.batches.files.max_expiry_seconds {
+            return Err(Error::Internal {
+                operation: format!(
+                    "Config validation: min_expiry_seconds ({}) cannot be greater than max_expiry_seconds ({})",
+                    self.batches.files.min_expiry_seconds, self.batches.files.max_expiry_seconds
+                ),
+            });
         }
 
         Ok(())
@@ -4389,7 +4405,7 @@ mod tests {
         assert_eq!(daemon.batchless_archive_backfill_concurrency, 1);
         assert!(daemon.retained_response_partitions_days_ahead > 0);
 
-        let mapped = daemon.to_fusillade_retention_maintenance_config();
+        let mapped = daemon.to_fusillade_retention_maintenance_config(30 * 24 * 60 * 60 + 1);
         assert_eq!(mapped.policy(), &daemon.retention);
         assert_eq!(mapped.batchless_archive_sweep_enabled(), daemon.batchless_archive_sweep_enabled);
         assert_eq!(
@@ -4411,7 +4427,12 @@ mod tests {
             daemon.retained_response_retirement_enabled
         );
         assert_eq!(mapped.batch_archive_retirement_enabled(), daemon.batch_archive_retirement_enabled);
-        assert_eq!(mapped.batch_archive_retention_days(), daemon.batch_archive_retention_days);
+        assert_eq!(mapped.template_retirement_enabled(), daemon.template_retirement_enabled);
+        assert_eq!(
+            mapped.content_retention_days(),
+            Some(31),
+            "retention rounds max expiry up to whole days"
+        );
     }
 
     #[test]
@@ -5146,6 +5167,16 @@ secret_key: "test-secret-key"
     }
 
     #[test]
+    fn content_retention_rounds_max_expiry_up_to_whole_days() {
+        let day = 24 * 60 * 60;
+        assert_eq!(content_retention_days(1), 1);
+        assert_eq!(content_retention_days(day), 1);
+        assert_eq!(content_retention_days(day + 1), 2);
+        assert_eq!(content_retention_days(30 * day), 30);
+        assert_eq!(content_retention_days(i64::MAX), i32::MAX as u32);
+    }
+
+    #[test]
     fn retention_config_is_accepted_on_an_instance_that_never_runs_the_daemon() {
         // Split topology: API pods share the daemon pods' environment but run
         // with the daemon disabled. They own no maintenance and must not
@@ -5160,10 +5191,12 @@ secret_key: "test-secret-key"
         daemon.batchless_archive_sweep_enabled = true;
         daemon.retained_response_retirement_enabled = true;
         daemon.batch_archive_retirement_enabled = true;
+        // Deprecated no-op key: still parses, never rejects.
         daemon.batch_archive_retention_days = Some(1);
         // Deprecated no-op key: still parses, never rejects.
         daemon.template_generation_writes_enabled = Some(true);
         daemon.template_retirement_enabled = true;
+        // Deprecated no-op key: still parses, never rejects.
         daemon.template_retention_days = Some(1);
         assert!(config.validate().is_ok(), "{:?}", config.validate().err());
     }
@@ -5179,6 +5212,30 @@ secret_key: "test-secret-key"
 
         let result = config.validate();
         assert!(result.is_ok()); // Should pass because both batches AND daemon are disabled
+    }
+
+    #[test]
+    fn expiry_validated_when_batches_and_daemon_are_disabled() {
+        // The request manager is built from these keys on every instance and
+        // refuses a non-positive or misordered expiry, so a bad value must be
+        // a config error here rather than a failure at startup.
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = false;
+        config.background_services.batch_daemon.enabled = DaemonEnabled::Never;
+        assert!(config.validate().is_ok(), "{:?}", config.validate().err());
+
+        config.batches.files.default_expiry_seconds = config.batches.files.max_expiry_seconds + 1;
+        let err_msg = config.validate().unwrap_err().to_string();
+        assert!(
+            err_msg.contains("default_expiry_seconds") && err_msg.contains("max_expiry_seconds"),
+            "{err_msg}"
+        );
+
+        config.batches.files.default_expiry_seconds = 0;
+        let err_msg = config.validate().unwrap_err().to_string();
+        assert!(err_msg.contains("default_expiry_seconds must be positive"), "{err_msg}");
     }
 
     /// Helper: a config that passes validation up to the cache checks, with caching on.

@@ -39,6 +39,7 @@ use super::image_normalizer_middleware::{normalize_error_response, normalize_val
 use super::rejections;
 use super::store::{self as response_store, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
 use super::streaming::{ReplayFrame, flex_stream_response};
+use crate::crypto::hash_api_key;
 use crate::db::{errors::DbError, handlers::api_keys::ApiKeys, models::api_keys::ApiKeyPurpose};
 use crate::image_normalizer::ImageNormalizer;
 
@@ -328,8 +329,8 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         // owner first, and treat an unresolvable key as "no such response".
         let owner: Option<String> = match api_key.as_deref() {
             Some(secret) => {
-                sqlx::query_scalar("SELECT user_id::text FROM public.api_keys WHERE secret = $1 AND is_deleted = false LIMIT 1")
-                    .bind(secret)
+                sqlx::query_scalar("SELECT user_id::text FROM public.api_keys WHERE secret_hash = $1 AND is_deleted = false LIMIT 1")
+                    .bind(&hash_api_key(secret)[..])
                     .fetch_optional(&state.dwctl_pool)
                     .await
                     .unwrap_or(None)
@@ -448,17 +449,21 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 return refuse(response, "unauthenticated", None);
             }
             Some(key) => {
-                if let Err(msg) =
-                    crate::error_enrichment::validate_api_key_model_access(state.dwctl_pool.write().into_inner(), key, model).await
-                {
-                    let response = Response::builder()
-                        .status(StatusCode::FORBIDDEN)
-                        .header("content-type", "application/json")
-                        .body(Body::from(
-                            serde_json::json!({"error": {"message": msg, "type": "invalid_request_error"}}).to_string(),
-                        ))
-                        .unwrap();
-                    return refuse(response, "forbidden", None);
+                match crate::error_enrichment::validate_api_key_model_access(state.dwctl_pool.write().into_inner(), key, model).await {
+                    Ok(()) => {}
+                    Err(crate::error_enrichment::ModelAccessRefusal::Retired(message)) => {
+                        return refuse(crate::error_enrichment::retired_model_response(&message), "model_retired", None);
+                    }
+                    Err(crate::error_enrichment::ModelAccessRefusal::Denied(msg)) => {
+                        let response = Response::builder()
+                            .status(StatusCode::FORBIDDEN)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                serde_json::json!({"error": {"message": msg, "type": "invalid_request_error"}}).to_string(),
+                            ))
+                            .unwrap();
+                        return refuse(response, "forbidden", None);
+                    }
                 }
             }
         }
@@ -858,11 +863,11 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) 
               AND child.purpose = 'batch'
               AND child.hidden = true
               AND child.is_deleted = false
-        WHERE ak.secret = $1 AND ak.is_deleted = false
+        WHERE ak.secret_hash = $1 AND ak.is_deleted = false
         LIMIT 1
         "#,
     )
-    .bind(api_key)
+    .bind(&hash_api_key(api_key)[..])
     .fetch_optional(pool)
     .await?;
 
@@ -916,11 +921,11 @@ async fn api_key_creator_can_run_background(pool: &sqlx::PgPool, api_key: Option
               AND ur.role = 'BACKGROUNDINFERENCEUSER'
         )
         FROM api_keys ak
-        WHERE ak.secret = $1 AND ak.is_deleted = false
+        WHERE ak.secret_hash = $1 AND ak.is_deleted = false
         LIMIT 1
         "#,
     )
-    .bind(api_key)
+    .bind(&hash_api_key(api_key)[..])
     .fetch_optional(pool)
     .await
     .map_err(Into::into)
@@ -1466,7 +1471,8 @@ fn scrub_request_id_fields(value: &mut serde_json::Value) -> bool {
 ///
 /// Also removes the serving router targets (`nvext.router.{ttft_target,
 /// itl_target}`): those are the resolver's to set (onwards writes them after
-/// resolution), never the caller's.
+/// resolution), never the caller's. Likewise `nvext.billing`, the prices the
+/// request is charged at.
 ///
 /// Returns whether anything was removed. Onwards validates and then forwards
 /// the ORIGINAL bytes (COR-522), so a removal only takes effect if the caller
@@ -1493,6 +1499,9 @@ pub(crate) fn strip_scheduling_priority(value: &mut serde_json::Value) -> bool {
             if let Some(routing) = nvext.get_mut("routing_constraints").and_then(|r| r.as_object_mut()) {
                 scrubbed |= routing.shift_remove("tolerations").is_some();
             }
+            // The prices a request is charged at are attached on the way out;
+            // a caller cannot state its own.
+            scrubbed |= onwards::serving::scrub_billing(nvext);
         }
     }
     scrubbed
@@ -1706,6 +1715,16 @@ mod tests {
 
         let mut clean = serde_json::json!({"model": "m", "nvext": {"routing_constraints": {"region": "eu"}}});
         assert!(!strip_scheduling_priority(&mut clean), "nothing removed, nothing to rebuild");
+    }
+
+    #[test]
+    fn strip_scheduling_priority_also_scrubs_client_prices() {
+        let mut body = serde_json::json!({
+            "model": "m",
+            "nvext": {"billing": {"prompt": 0, "cached": 0, "output": 0}, "cache_control": {"enabled": true}}
+        });
+        assert!(strip_scheduling_priority(&mut body), "the prices were present and removed");
+        assert_eq!(body["nvext"], serde_json::json!({"cache_control": {"enabled": true}}));
     }
 
     #[test]

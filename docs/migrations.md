@@ -213,6 +213,15 @@ WHERE id IN (SELECT ... LIMIT 10000)` in a loop from a background task) or, if
 they must be a migration, in their own `-- no-transaction` file so a lock is
 never held across the whole table.
 
+### Rollback floors
+
+A contract step sets the oldest release you can roll back to: any release
+before its expand step fails against the contracted schema.
+
+| from release | earliest safe rollback | why |
+|--------------|------------------------|-----|
+| 15.8.0 | 15.6.0 | `api_keys.secret_hash` must be non-NULL; releases before 15.6.0 create keys without it |
+
 ## Checklist before opening a PR
 
 * `cargo test -p dwctl --lib migrations::` passes.

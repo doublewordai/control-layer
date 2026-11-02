@@ -1,8 +1,14 @@
-//! Cryptographic utilities for API key generation.
+//! Cryptographic utilities for API key generation and storage.
 
 use base64::{Engine as _, engine::general_purpose};
 use rand::prelude::RngExt;
 use rand::rng;
+use sha2::{Digest, Sha256};
+
+/// Number of leading characters of an API key kept in `api_keys.secret_prefix`:
+/// `sk-` plus five random characters (30 bits), enough for a person to tell
+/// keys apart without meaningfully weakening the rest of the secret.
+pub const API_KEY_PREFIX_LEN: usize = 8;
 
 /// Generates a cryptographically secure API key with 256 bits of entropy.
 ///
@@ -28,6 +34,22 @@ pub fn generate_api_key() -> String {
     rng().fill(&mut key_bytes);
 
     format!("sk-{}", general_purpose::URL_SAFE_NO_PAD.encode(key_bytes))
+}
+
+/// Hashes an API key secret for storage in `api_keys.secret_hash`.
+///
+/// Plain SHA-256 over the UTF-8 bytes, with no salt or pepper: generated keys
+/// carry 256 bits of entropy, so a slow or keyed hash adds nothing, and this
+/// form is reproducible in SQL as `sha256(convert_to(secret, 'UTF8'))`.
+pub fn hash_api_key(secret: &str) -> [u8; 32] {
+    Sha256::digest(secret.as_bytes()).into()
+}
+
+/// The displayable prefix of an API key secret stored in `api_keys.secret_prefix`.
+///
+/// Takes the first [`API_KEY_PREFIX_LEN`] characters (fewer if the secret is shorter).
+pub fn api_key_prefix(secret: &str) -> String {
+    secret.chars().take(API_KEY_PREFIX_LEN).collect()
 }
 
 #[cfg(test)]
@@ -59,6 +81,28 @@ mod tests {
             let key = generate_api_key();
             assert!(keys.insert(key), "Generated duplicate API key");
         }
+    }
+
+    #[test]
+    fn test_hash_api_key_is_sha256() {
+        // SHA-256("abc"), FIPS 180-2 test vector.
+        assert_eq!(
+            hex::encode(hash_api_key("abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let key = generate_api_key();
+        assert_eq!(hash_api_key(&key), hash_api_key(&key));
+        assert_ne!(hash_api_key(&key), hash_api_key(&generate_api_key()));
+    }
+
+    #[test]
+    fn test_api_key_prefix() {
+        let key = generate_api_key();
+        let prefix = api_key_prefix(&key);
+        assert_eq!(prefix.len(), API_KEY_PREFIX_LEN);
+        assert!(prefix.starts_with("sk-"));
+        assert!(key.starts_with(&prefix));
+        assert_eq!(api_key_prefix("sk-ab"), "sk-ab");
     }
 
     #[test]

@@ -17,6 +17,7 @@
 # Reference
 
 - [Configuration Reference](reference/configuration.md)
+- [Aggregate Batch SLA Metrics](reference/batch-sla-metrics.md)
 - [Model Provisioning](reference/model-provisioning.md)
 
 # Conceptual Guides

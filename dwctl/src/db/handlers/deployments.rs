@@ -1742,6 +1742,7 @@ impl<'c> Deployments<'c> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::{api_key_prefix, hash_api_key};
     use crate::{
         api::models::users::{Role, UserCreate, UserResponse},
         db::{
@@ -2884,10 +2885,12 @@ mod tests {
         } else {
             // If system key doesn't exist in test environment, create it
             sqlx::query!(
-                "INSERT INTO api_keys (id, name, secret, user_id, created_by) VALUES ($1, $2, $3, $4, $5)",
+                "INSERT INTO api_keys (id, name, secret, secret_hash, secret_prefix, user_id, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7)",
                 uuid::Uuid::from_u128(0), // 00000000-0000-0000-0000-000000000000
                 "System Key",
                 "test_system_secret",
+                &hash_api_key("test_system_secret")[..],
+                api_key_prefix("test_system_secret"),
                 user.id,
                 user.id
             )

@@ -44,6 +44,12 @@ pub(super) struct FamilySpec {
     /// when `candidate_binds_retention`.
     pub candidate_sql: &'static str,
     pub candidate_binds_retention: bool,
+    /// Optional boolean query, `$1 = lower bound`, that is true while
+    /// something still holds the bucket open (the family's unfinished-batch
+    /// guard). It is re-run after the bucket row is locked and before the
+    /// bucket is fenced, so a writer that committed while the claim waited
+    /// for that lock is not missed; see [`claim`].
+    pub recheck_sql: Option<&'static str>,
     /// Optional metadata statement committed atomically with journal/bucket
     /// completion. Binds: $1 lower bound, $2 upper bound, $3 completion
     /// timestamp. Must touch only content-free metadata.
@@ -474,6 +480,30 @@ async fn claim(
         ))
     {
         return Err(mismatch());
+    }
+
+    // The candidate query read the guard before the bucket row was locked.
+    // Writers that make content depend on a bucket (batch creation, retry)
+    // share-lock its row until they commit, so the FOR UPDATE above waited
+    // for any of them still in flight. Under READ COMMITTED each statement
+    // takes a fresh snapshot, so this new statement sees what they
+    // committed; reusing the candidate's answer would not. A writer that
+    // arrives after this point waits for the fence to commit and then reads
+    // the bucket as no longer active. A recovering claim already fenced the
+    // bucket earlier and must finish.
+    if !recovering && let Some(recheck_sql) = family.recheck_sql {
+        let held: bool = sqlx::query_scalar(recheck_sql)
+            .bind(identity.lower)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(retirement_database_error)?;
+        if held {
+            transaction
+                .rollback()
+                .await
+                .map_err(retirement_database_error)?;
+            return Ok(Claim::None);
+        }
     }
 
     if recovering {

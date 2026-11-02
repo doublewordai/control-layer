@@ -937,6 +937,8 @@ jobs:
             name,
             description,
             secret,
+            secret_hash,
+            secret_prefix,
             purpose,
             user_id,
             created_by,
@@ -948,6 +950,8 @@ jobs:
             'Open Responses compliance key',
             'Realtime key for Open Responses compliance tests',
             :'test_api_key',
+            sha256(convert_to(:'test_api_key', 'UTF8')),
+            left(:'test_api_key', 8),
             'realtime',
             '10000000-0000-0000-0000-000000000001',
             '10000000-0000-0000-0000-000000000001',
@@ -956,6 +960,8 @@ jobs:
           )
           ON CONFLICT (id) DO UPDATE SET
             secret = EXCLUDED.secret,
+            secret_hash = EXCLUDED.secret_hash,
+            secret_prefix = EXCLUDED.secret_prefix,
             purpose = EXCLUDED.purpose,
             requests_per_second = EXCLUDED.requests_per_second,
             burst_size = EXCLUDED.burst_size,

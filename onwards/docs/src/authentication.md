@@ -51,6 +51,8 @@ If both global and local keys are supplied, either global or local keys will be 
 
 When a target has `keys` configured, requests must include a valid `Authorization: Bearer <token>` header where `<token>` matches one of the configured keys. If global keys are configured, they are automatically added to each target's key set.
 
+Onwards keeps only the SHA-256 hash of each configured key in memory: keys are hashed when the config is loaded, and each request's bearer token is hashed once and compared against those hashes in constant time. Any key in `keys`, `global_keys` or `key_definitions` may also be written already hashed, as `sha256:` followed by the 64 lowercase hex digits of the key's SHA-256 hash, so a config file need not contain the plaintext key.
+
 **Successful authenticated request:**
 
 ```bash
