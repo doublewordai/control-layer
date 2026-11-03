@@ -1065,11 +1065,17 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
             "output": [],
         });
 
+        // The client gets the 202 below, not onwards' response, so note the
+        // key onwards authenticated here rather than in `record_proxy_key_use`.
+        let api_key_usage = state.api_key_usage.clone();
         // Spawned tasks do not inherit the current span; keep the background
         // dispatch under the gateway span so its provider attempts stay in the trace.
         tokio::spawn(
             async move {
                 let response = next.run(req).await;
+                if let Some(onwards::AuthenticatedApiKeyId(api_key_id)) = response.extensions().get() {
+                    api_key_usage.record(*api_key_id);
+                }
                 let (_parts, body) = response.into_parts();
                 let _ = axum::body::to_bytes(body, usize::MAX).await;
             }

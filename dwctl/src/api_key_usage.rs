@@ -13,7 +13,10 @@
 //! - flex and background submissions, which the inference middleware accepts
 //!   without passing through onwards, noted once the key is resolved so later
 //!   refusals still count,
-//! - `/ai/v1/models`, which dwctl answers itself,
+//! - realtime `background: true` Responses requests, noted when onwards
+//!   answers the detached dispatch,
+//! - `/ai/v1/models` and `GET`/`DELETE /ai/v1/responses/{id}`, which dwctl
+//!   answers itself,
 //! - every route that authenticates with the `CurrentUser` extractor: files,
 //!   batches and the management API.
 //!
@@ -86,6 +89,23 @@ impl ApiKeyUsage {
         tracing::Span::current().record("keys", seen.len());
         let (ids, timestamps): (Vec<Uuid>, Vec<DateTime<Utc>>) = seen.iter().map(|(id, at)| (*id, *at)).unzip();
 
+        let result = Self::write(pool, &ids, &timestamps).await;
+        match result {
+            Ok(updated) => Ok(updated),
+            Err(e) => {
+                for (id, at) in seen {
+                    self.record_at(id, at);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    async fn write(pool: &PgPool, ids: &[Uuid], timestamps: &[DateTime<Utc>]) -> Result<u64, sqlx::Error> {
+        let mut tx = pool.begin().await?;
+        // A long transaction holding an api_keys row must not stall the
+        // flush, or the final flush at shutdown; a timed-out flush retries.
+        sqlx::query("SET LOCAL lock_timeout = '5s'").execute(&mut *tx).await?;
         // Rows are locked in id order so concurrent flushes from other
         // replicas cannot deadlock on each other.
         let result = sqlx::query!(
@@ -103,22 +123,14 @@ impl ApiKeyUsage {
             FROM due
             WHERE ak.id = due.id
             "#,
-            &ids,
-            &timestamps,
+            ids,
+            timestamps,
             FLUSH_INTERVAL.as_secs_f64(),
         )
-        .execute(pool)
-        .await;
-
-        match result {
-            Ok(result) => Ok(result.rows_affected()),
-            Err(e) => {
-                for (id, at) in seen {
-                    self.record_at(id, at);
-                }
-                Err(e)
-            }
-        }
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected())
     }
 }
 

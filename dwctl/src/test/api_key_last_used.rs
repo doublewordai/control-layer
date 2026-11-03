@@ -77,6 +77,8 @@ async fn every_authentication_path_records_last_used(pool: PgPool) {
     let flex = create_test_api_key_for_user(&pool, user.id).await;
     let files = create_test_api_key_for_user(&pool, user.id).await;
     let models = create_test_api_key_for_user(&pool, user.id).await;
+    let background = create_test_api_key_for_user(&pool, user.id).await;
+    let retrieve = create_test_api_key_for_user(&pool, user.id).await;
     let unused = create_test_api_key_for_user(&pool, user.id).await;
     let platform = create_test_api_key_for_user(&pool, user.id).await;
     sqlx::query("UPDATE api_keys SET purpose = 'platform' WHERE id = $1")
@@ -105,12 +107,28 @@ async fn every_authentication_path_records_last_used(pool: PgPool) {
     assert_eq!(response.status_code(), 200, "{}", response.text());
 
     // Flex, accepted by the inference middleware without reaching onwards.
-    server
+    let queued = server
         .post("/ai/v1/responses")
         .add_header("Authorization", bearer(&flex.secret))
         .json(&json!({ "model": "gpt-4", "input": "hi", "service_tier": "flex", "background": true }))
+        .await;
+    queued.assert_status(axum::http::StatusCode::ACCEPTED);
+    let response_id = queued.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
+
+    // Realtime background: the client gets a 202 while onwards runs detached.
+    server
+        .post("/ai/v1/responses")
+        .add_header("Authorization", bearer(&background.secret))
+        .json(&json!({ "model": "gpt-4", "input": "hi", "background": true }))
         .await
         .assert_status(axum::http::StatusCode::ACCEPTED);
+
+    // Response retrieval, which checks the key itself.
+    server
+        .get(&format!("/ai/v1/responses/{response_id}"))
+        .add_header("Authorization", bearer(&retrieve.secret))
+        .await
+        .assert_status_ok();
 
     // Files, authenticated by the CurrentUser extractor.
     server
@@ -133,10 +151,17 @@ async fn every_authentication_path_records_last_used(pool: PgPool) {
         .await
         .assert_status_ok();
 
-    for key in [realtime.id, flex.id, files.id, models.id, platform.id, unused.id] {
+    for key in [realtime.id, flex.id, files.id, models.id, platform.id, retrieve.id, unused.id] {
         assert_eq!(last_used(&pool, key).await, None, "nothing is written before the flush");
     }
     bg.flush_api_key_usage(&pool).await.unwrap();
+
+    // The detached background dispatch notes its key once onwards answers.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while last_used(&pool, background.id).await.is_none() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        bg.flush_api_key_usage(&pool).await.unwrap();
+    }
 
     let before = chrono::Utc::now();
     for (name, key) in [
@@ -145,6 +170,8 @@ async fn every_authentication_path_records_last_used(pool: PgPool) {
         ("files", files.id),
         ("models", models.id),
         ("platform", platform.id),
+        ("realtime background", background.id),
+        ("response retrieval", retrieve.id),
     ] {
         let used = last_used(&pool, key).await.unwrap_or_else(|| panic!("{name} key has no last_used"));
         assert!(used <= before && before - used < chrono::Duration::minutes(1), "{name}: {used}");
