@@ -83,6 +83,7 @@
 //! ```
 
 pub mod current_user;
+pub mod internal_credential;
 pub mod middleware;
 pub mod password;
 pub mod permissions;

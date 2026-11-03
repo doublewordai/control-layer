@@ -4,6 +4,7 @@ pub mod api_key_hash_auth;
 pub mod batch_trace_attributes;
 pub mod cache_classifier;
 pub mod databases;
+pub mod internal_credential;
 pub mod modalities;
 pub mod nvext_billing;
 pub mod rejections;

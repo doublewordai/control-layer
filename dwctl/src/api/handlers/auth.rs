@@ -206,10 +206,12 @@ pub async fn create_sample_files_for_new_user<P: PoolProvider>(state: &AppState<
 
     // Get the user's batch API key
     let mut api_keys_repo = ApiKeys::new(&mut conn);
-    let api_key = api_keys_repo
+    let api_key_id = api_keys_repo
         .get_or_create_hidden_key(user_id, ApiKeyPurpose::Batch, user_id)
         .await
         .map_err(Error::Database)?;
+    // Fusillade still dispatches request templates with a stored key (until DW-1010).
+    let api_key = api_keys_repo.legacy_dispatch_secret(api_key_id).await.map_err(Error::Database)?;
 
     // Get deployments accessible to this user
     let mut deployments_repo = Deployments::new(&mut conn);

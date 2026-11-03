@@ -38,8 +38,8 @@ pub const ZDR_MARKER_HEADER: &str = "x-fusillade-batch-zdr";
 ///
 /// This answers per-key policy only. Callers that must encrypt (the flex path)
 /// additionally require a configured keystore.
-pub fn is_zdr_request(zdr_cache: &crate::sync::key_policy::KeyPolicyCache, api_key: Option<&str>) -> bool {
-    api_key.is_some_and(|key| zdr_cache.is_zdr(key))
+pub fn is_zdr_request(zdr_cache: &crate::sync::key_policy::KeyPolicyCache, key: Option<&crate::crypto::ApiKeyHash>) -> bool {
+    key.is_some_and(|key| zdr_cache.is_zdr(key))
 }
 
 /// The two per-request keys of a ZDR flex request. Generated before anything
@@ -274,10 +274,10 @@ mod tests {
     #[test]
     fn is_zdr_request_reads_the_key_map() {
         let cache = crate::sync::key_policy::KeyPolicyCache::from_pairs([("sk-on".to_string(), true), ("sk-off".to_string(), false)]);
-        assert!(is_zdr_request(&cache, Some("sk-on")));
-        assert!(!is_zdr_request(&cache, Some("sk-off")));
+        assert!(is_zdr_request(&cache, Some(&crate::crypto::hash_api_key("sk-on"))));
+        assert!(!is_zdr_request(&cache, Some(&crate::crypto::hash_api_key("sk-off"))));
         // Absent key (deleted/invalid, auth-rejected) reads as non-ZDR.
-        assert!(!is_zdr_request(&cache, Some("sk-unknown")));
+        assert!(!is_zdr_request(&cache, Some(&crate::crypto::hash_api_key("sk-unknown"))));
         // No key never opts in.
         assert!(!is_zdr_request(&cache, None));
     }

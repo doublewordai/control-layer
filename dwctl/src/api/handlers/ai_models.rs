@@ -151,11 +151,17 @@ pub async fn list_ai_models<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Query(query): Query<ModelsListQuery>,
     recorder: Option<Extension<Recorder>>,
+    presented: Option<Extension<onwards::auth::PresentedKey>>,
     uri: Uri,
     headers: HeaderMap,
 ) -> Result<Json<ModelsListResponse>, Response> {
     let origin = Origin::new(recorder.as_ref().map(|Extension(recorder)| recorder), &headers, uri.path());
-    let Some(token) = bearer_token(&headers) else {
+    // A key authenticated by internal credential, else the bearer's hash.
+    let key_hash = match presented {
+        Some(Extension(onwards::auth::PresentedKey(hash))) => Some(*hash.as_bytes()),
+        None => bearer_token(&headers).map(hash_api_key),
+    };
+    let Some(key_hash) = key_hash else {
         let response = openai_error(
             StatusCode::UNAUTHORIZED,
             "Missing Authorization header",
@@ -192,7 +198,7 @@ pub async fn list_ai_models<P: PoolProvider>(
         LIMIT 1
         "#,
     )
-    .bind(&hash_api_key(token)[..])
+    .bind(&key_hash[..])
     .fetch_optional(&state.db.write())
     .await
     .map_err(|e| database_error("lookup_api_key", e))?;

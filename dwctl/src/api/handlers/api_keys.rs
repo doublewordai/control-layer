@@ -1072,7 +1072,7 @@ mod tests {
         assert_eq!(window_spend, rust_decimal::Decimal::ZERO);
 
         // The resolver now routes this key's batch/flex work to the child.
-        let (_, resolved) = ApiKeys::new(&mut conn)
+        let resolved = ApiKeys::new(&mut conn)
             .resolve_batch_execution_key(user.id, user.id, Some(created.id))
             .await
             .unwrap();
@@ -1247,9 +1247,9 @@ mod tests {
         // shared hidden batch key both 404 even for their own user.
         let mut conn = pool.acquire().await.unwrap();
         let mut repo = ApiKeys::new(&mut conn);
-        let (_, child_id) = repo.get_or_create_child_hidden_key(key.id).await.unwrap();
-        let (_, shared_id) = repo
-            .get_or_create_hidden_key_with_id(owner.id, ApiKeyPurpose::Batch, owner.id)
+        let child_id = repo.get_or_create_child_hidden_key(key.id).await.unwrap();
+        let shared_id = repo
+            .get_or_create_hidden_key(owner.id, ApiKeyPurpose::Batch, owner.id)
             .await
             .unwrap();
         drop(conn);
@@ -1586,8 +1586,7 @@ mod tests {
         // Mint a cap-scope child for the visible key.
         let child_id = {
             let mut conn = pool.acquire().await.unwrap();
-            let (_, child_id) = ApiKeys::new(&mut conn).get_or_create_child_hidden_key(api_key.id).await.unwrap();
-            child_id
+            ApiKeys::new(&mut conn).get_or_create_child_hidden_key(api_key.id).await.unwrap()
         };
 
         // Children are system-managed: direct deletion is rejected (404), even
@@ -2961,11 +2960,10 @@ mod tests {
             use crate::db::handlers::api_keys::ApiKeys;
             use crate::db::models::api_keys::ApiKeyPurpose;
             let mut conn = pool.acquire().await.unwrap();
-            let (_, id) = ApiKeys::new(&mut conn)
-                .get_or_create_hidden_key_with_id(user.id, ApiKeyPurpose::Batch, user.id)
+            ApiKeys::new(&mut conn)
+                .get_or_create_hidden_key(user.id, ApiKeyPurpose::Batch, user.id)
                 .await
-                .unwrap();
-            id
+                .unwrap()
         };
         let response = app
             .post(&format!("/admin/api/v1/users/current/api-keys/{}/rotate", hidden_root_id))

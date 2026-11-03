@@ -39,7 +39,8 @@ use super::image_normalizer_middleware::{normalize_error_response, normalize_val
 use super::rejections;
 use super::store::{self as response_store, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
 use super::streaming::{ReplayFrame, flex_stream_response};
-use crate::crypto::hash_api_key;
+use crate::auth::internal_credential::presented_key_hash;
+use crate::crypto::ApiKeyHash;
 use crate::db::{errors::DbError, handlers::api_keys::ApiKeys, models::api_keys::ApiKeyPurpose};
 use crate::image_normalizer::ImageNormalizer;
 
@@ -177,6 +178,9 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(|s| s.to_string());
+    // The key the request presents, by hash: every lookup below identifies the
+    // caller by this, so an internal credential resolves to the key it names.
+    let key_hash = presented_key_hash(&parts.extensions, api_key.as_deref());
 
     // Asynchronous requests are scheduled by their deadline, so a model
     // suffix (`alias:suffix`) is discarded here, at the outermost layer, and
@@ -210,7 +214,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // every unpinned account are unchanged.
     let scrubbed_pinned = match pinned_tolerations(
         &state.key_policy_cache,
-        api_key.as_deref(),
+        key_hash.as_ref(),
         request_value["model"].as_str().unwrap_or_default(),
     ) {
         Some(tolerations) => set_routing_tolerations(&mut request_value, &tolerations),
@@ -243,7 +247,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // so reject the contract before touching the response store. Besides being
     // clearer for callers, this avoids turning an unavailable/minimal stored
     // object into a hydration 5xx.
-    let zdr = crate::inference::zdr::is_zdr_request(&state.key_policy_cache, api_key.as_deref());
+    let zdr = crate::inference::zdr::is_zdr_request(&state.key_policy_cache, key_hash.as_ref());
 
     // An organization owner may have switched realtime inference off for
     // every key the organization owns. Every service tier arrives on these
@@ -251,7 +255,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // batch execution re-enters with `x-fusillade-request-id` and was skipped
     // above. Answered from the per-key policy map: no DB round-trip, and a
     // key auth will reject anyway reads as nothing disabled.
-    if let Some(key) = api_key.as_deref()
+    if let Some(key) = key_hash.as_ref()
         && state
             .key_policy_cache
             .disabled_modalities(key)
@@ -327,10 +331,10 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         use crate::inference::translation::responses::hydrate::{HydrationError, hydrate_previous_response};
         // The prior turn is only ever the caller's own: resolve the key's
         // owner first, and treat an unresolvable key as "no such response".
-        let owner: Option<String> = match api_key.as_deref() {
-            Some(secret) => {
+        let owner: Option<String> = match key_hash.as_ref() {
+            Some(key_hash) => {
                 sqlx::query_scalar("SELECT user_id::text FROM public.api_keys WHERE secret_hash = $1 AND is_deleted = false LIMIT 1")
-                    .bind(&hash_api_key(secret)[..])
+                    .bind(&key_hash[..])
                     .fetch_optional(&state.dwctl_pool)
                     .await
                     .unwrap_or(None)
@@ -437,7 +441,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // by onwards). Queued requests bypass onwards at submission time, so auth
     // and model access must be enforced here.
     if is_daemon_processed {
-        match api_key.as_deref() {
+        match key_hash.as_ref() {
             None => {
                 let response = Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
@@ -470,7 +474,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     }
 
     if matches!(service_tier, ServiceTier::Background) {
-        match api_key_creator_can_run_background(&state.dwctl_pool.write(), api_key.as_deref()).await {
+        match api_key_creator_can_run_background(&state.dwctl_pool.write(), key_hash.as_ref()).await {
             Ok(Some(true)) => {}
             Ok(Some(false)) => {
                 let response = Response::builder()
@@ -515,12 +519,12 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // exist before returning 202). Flex uses the key owner's hidden batch key
     // below, so resolving it there also supplies the attribution target.
     let created_by = if background && matches!(service_tier, ServiceTier::Realtime) {
-        response_store::lookup_created_by(&state.dwctl_pool.write(), api_key.as_deref()).await
+        response_store::lookup_created_by(&state.dwctl_pool.write(), key_hash.as_ref()).await
     } else {
         None
     };
     let queued_batch_key = if is_daemon_processed {
-        match resolve_flex_batch_api_key(&state.dwctl_pool.write(), api_key.as_deref()).await {
+        match resolve_flex_batch_api_key(&state.dwctl_pool.write(), key_hash.as_ref()).await {
             Ok(Some(key)) => Some(key),
             Ok(None) => {
                 tracing::warn!(service_tier = %service_tier, "Queued API key disappeared before hidden batch-key resolution");
@@ -605,7 +609,11 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 endpoint: state.loopback_base_url.clone(),
                 method: "POST".to_string(),
                 path: endpoint.clone(),
-                api_key: api_key.clone().unwrap_or_default(),
+                // An internal credential is not a key and is never stored.
+                api_key: api_key
+                    .clone()
+                    .filter(|key| !crate::auth::internal_credential::is_internal(key))
+                    .unwrap_or_default(),
                 created_by: created_by.unwrap_or_default(),
             };
             let client_usage = super::stream_usage::requested_usage(&endpoint, &request_value);
@@ -665,7 +673,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 // the tokens at dispatch (and on a later client re-send), so a
                 // lookup failure fails the submission (retryable) instead of
                 // silently persisting tokens without it.
-                let attribution = match api_key.as_deref() {
+                let attribution = match key_hash.as_ref() {
                     Some(key) => match crate::api::handlers::images::try_resolve_caller(&state.dwctl_pool.write(), key).await {
                         Ok(caller) => caller.map(|c| c.attribution),
                         Err(e) => {
@@ -835,7 +843,7 @@ struct FlexBatchApiKey {
     verified: bool,
 }
 
-async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) -> Result<Option<FlexBatchApiKey>, DbError> {
+async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&ApiKeyHash>) -> Result<Option<FlexBatchApiKey>, DbError> {
     let Some(api_key) = api_key else {
         return Ok(None);
     };
@@ -852,10 +860,12 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) 
     // only traffic that carries hidden batch keys (shared or cap-scope child)
     // is the fusillade daemon loopback, which bypasses this middleware via the
     // `x-fusillade-request-id` guard at the top of `inference_middleware`, and
-    // hidden-key secrets are never exposed to clients.
+    // hidden-key secrets are never exposed to clients. (The playground's own
+    // hidden key arrives here as an internal credential and is treated like
+    // any other caller key.)
     let row = sqlx::query(
         r#"
-        SELECT ak.user_id, ak.created_by, u.verified, child.secret AS child_secret
+        SELECT ak.user_id, ak.created_by, u.verified, child.id AS child_id
         FROM api_keys ak
         LEFT JOIN users u ON u.id = ak.user_id
         LEFT JOIN api_keys child
@@ -867,7 +877,7 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) 
         LIMIT 1
         "#,
     )
-    .bind(&hash_api_key(api_key)[..])
+    .bind(&api_key[..])
     .fetch_optional(pool)
     .await?;
 
@@ -882,18 +892,20 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) 
     // NULL (no child) decodes as None via the Option; genuine decode errors
     // propagate rather than silently downgrading a capped key to the shared
     // (uncapped) execution key.
-    let child_secret: Option<String> = sqlx::Row::try_get(&row, "child_secret")?;
+    let child_id: Option<uuid::Uuid> = sqlx::Row::try_get(&row, "child_id")?;
 
-    let secret = match child_secret {
-        Some(secret) => secret,
+    let mut conn = pool.acquire().await?;
+    let mut api_keys_repo = ApiKeys::new(&mut conn);
+    let key_id = match child_id {
+        Some(id) => id,
         None => {
-            let mut conn = pool.acquire().await?;
-            let mut api_keys_repo = ApiKeys::new(&mut conn);
             api_keys_repo
                 .get_or_create_hidden_key(key_owner_id, ApiKeyPurpose::Batch, created_by)
                 .await?
         }
     };
+    // Fusillade still dispatches with a stored key (until DW-1010).
+    let secret = api_keys_repo.legacy_dispatch_secret(key_id).await?;
 
     Ok(Some(FlexBatchApiKey {
         secret,
@@ -907,7 +919,7 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) 
 /// For organization-owned keys, `api_keys.user_id` is the organization while
 /// `api_keys.created_by` is the acting member. Background authorization follows
 /// the latter so an organization role cannot accidentally grant the capability.
-async fn api_key_creator_can_run_background(pool: &sqlx::PgPool, api_key: Option<&str>) -> Result<Option<bool>, DbError> {
+async fn api_key_creator_can_run_background(pool: &sqlx::PgPool, api_key: Option<&ApiKeyHash>) -> Result<Option<bool>, DbError> {
     let Some(api_key) = api_key else {
         return Ok(None);
     };
@@ -925,7 +937,7 @@ async fn api_key_creator_can_run_background(pool: &sqlx::PgPool, api_key: Option
         LIMIT 1
         "#,
     )
-    .bind(&hash_api_key(api_key)[..])
+    .bind(&api_key[..])
     .fetch_optional(pool)
     .await
     .map_err(Into::into)
@@ -1511,10 +1523,10 @@ pub(crate) fn strip_scheduling_priority(value: &mut serde_json::Value) -> bool {
 /// policy map, or `None` when the account is on "Default". Hot-path safe.
 pub(crate) fn pinned_tolerations(
     cache: &crate::sync::key_policy::KeyPolicyCache,
-    api_key: Option<&str>,
+    key: Option<&ApiKeyHash>,
     model: &str,
 ) -> Option<std::sync::Arc<serde_json::Value>> {
-    api_key.and_then(|secret| cache.tolerations(secret, model))
+    key.and_then(|key| cache.tolerations(key, model))
 }
 
 /// Write `tolerations` to `nvext.routing_constraints.tolerations`, in place,
@@ -1571,6 +1583,7 @@ fn strip_async_model_suffix(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::hash_api_key;
 
     #[test]
     fn set_routing_tolerations_writes_the_preset_list_and_preserves_the_rest() {
@@ -1620,8 +1633,8 @@ mod tests {
                 },
             )],
         );
-        assert!(pinned_tolerations(&cache, Some("sk-pinned"), "any/model").is_some());
-        assert!(pinned_tolerations(&cache, Some("sk-other"), "any/model").is_none());
+        assert!(pinned_tolerations(&cache, Some(&hash_api_key("sk-pinned")), "any/model").is_some());
+        assert!(pinned_tolerations(&cache, Some(&hash_api_key("sk-other")), "any/model").is_none());
         assert!(pinned_tolerations(&cache, None, "any/model").is_none());
     }
 
@@ -1895,7 +1908,7 @@ mod tests {
             .secret
         };
 
-        let flex_key = resolve_flex_batch_api_key(&pool, Some(&realtime_key))
+        let flex_key = resolve_flex_batch_api_key(&pool, Some(&hash_api_key(&realtime_key)))
             .await
             .expect("resolve flex key")
             .expect("known realtime key should resolve");
@@ -1957,7 +1970,7 @@ mod tests {
         };
 
         assert_eq!(
-            api_key_creator_can_run_background(&pool, Some(&org_key))
+            api_key_creator_can_run_background(&pool, Some(&hash_api_key(&org_key)))
                 .await
                 .expect("resolve creator role"),
             Some(true)
@@ -2005,13 +2018,13 @@ mod tests {
         };
 
         assert_eq!(
-            api_key_creator_can_run_background(&pool, Some(&key))
+            api_key_creator_can_run_background(&pool, Some(&hash_api_key(&key)))
                 .await
                 .expect("resolve creator role"),
             Some(false)
         );
         assert_eq!(
-            api_key_creator_can_run_background(&pool, Some("unknown-key"))
+            api_key_creator_can_run_background(&pool, Some(&hash_api_key("unknown-key")))
                 .await
                 .expect("resolve unknown key"),
             None
