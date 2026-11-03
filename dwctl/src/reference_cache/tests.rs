@@ -6,6 +6,7 @@ use axum::http::{Method, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::routing::post;
 use chrono::{DateTime, Utc};
+use futures::StreamExt;
 use outlet::{RequestData, RequestHandler, ResponseData};
 use tokio::sync::mpsc;
 use tower::ServiceExt;
@@ -162,8 +163,26 @@ fn config_validation() {
         ..enabled.clone()
     };
     assert!(no_models.validate(true).unwrap_err().contains("models"));
-    let no_ttl = ReferenceCacheConfig { ttl_secs: 0, ..enabled };
+    let no_ttl = ReferenceCacheConfig {
+        ttl_secs: 0,
+        ..enabled.clone()
+    };
     assert!(no_ttl.validate(true).unwrap_err().contains("ttl_secs"));
+    let no_timeout = ReferenceCacheConfig {
+        estimate_timeout_ms: 0,
+        ..enabled.clone()
+    };
+    assert!(no_timeout.validate(true).unwrap_err().contains("estimate_timeout_ms"));
+    let no_sweep = ReferenceCacheConfig {
+        sweep_interval_secs: 0,
+        ..enabled.clone()
+    };
+    assert!(no_sweep.validate(true).unwrap_err().contains("sweep_interval_secs"));
+    let no_connections = ReferenceCacheConfig {
+        max_connections: 0,
+        ..enabled
+    };
+    assert!(no_connections.validate(true).unwrap_err().contains("max_connections"));
 }
 
 #[test]
@@ -393,24 +412,23 @@ async fn uncovered_or_unusable_requests_record_null(pool: sqlx::PgPool) {
 
 // ===== Wiring =====
 
-/// The layer makes a streamed request visible once output starts, without touching
-/// the stream; a non-streaming response writes nothing at that point.
+/// The layer makes a streamed request visible once output starts, while the stream is
+/// still open and without touching it; a non-streaming response writes nothing then.
 #[dwctl_test_macros::test]
 async fn the_layer_writes_at_the_first_streamed_chunk(pool: sqlx::PgPool) {
     let f = fixture(pool, true, 0).await;
+    // The upstream stream stays open until the test sends its remaining chunks.
+    let (chunks_tx, chunks_rx) = futures::channel::mpsc::unbounded::<Result<Bytes, std::io::Error>>();
+    let chunks_rx = std::sync::Arc::new(std::sync::Mutex::new(Some(chunks_rx)));
     let app = |stream: bool| {
+        let chunks_rx = chunks_rx.clone();
         Router::new()
             .route(
                 "/ai/v1/chat/completions",
                 post(move || async move {
                     if stream {
-                        let chunks = ["data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n", "data: [DONE]\n\n"]
-                            .map(|c| Ok::<_, std::io::Error>(Bytes::from_static(c.as_bytes())));
-                        (
-                            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
-                            Body::from_stream(futures::stream::iter(chunks)),
-                        )
-                            .into_response()
+                        let rx = chunks_rx.lock().unwrap().take().expect("one streamed request");
+                        ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], Body::from_stream(rx)).into_response()
                     } else {
                         axum::Json(serde_json::json!({"choices": []})).into_response()
                     }
@@ -435,13 +453,27 @@ async fn the_layer_writes_at_the_first_streamed_chunk(pool: sqlx::PgPool) {
     let response = app(false).oneshot(request(&plain)).await.unwrap();
     axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
 
+    assert_eq!(f.rows().await, 0, "a non-streaming response writes nothing in the layer");
+
     let streamed = body(&[SYSTEM, USER_1]);
     let response = app(true).oneshot(request(&streamed)).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let forwarded = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    assert!(forwarded.ends_with(b"data: [DONE]\n\n"));
+    let mut forwarded = response.into_body().into_data_stream();
+    let send = |c: &'static str| chunks_tx.unbounded_send(Ok(Bytes::from_static(c.as_bytes()))).unwrap();
+
+    send(": keep-alive\n\n");
+    assert_eq!(forwarded.next().await.unwrap().unwrap(), ": keep-alive\n\n");
+    assert_eq!(f.rows().await, 0, "nothing before output starts");
+
+    send("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n");
+    assert!(forwarded.next().await.unwrap().unwrap().starts_with(b"data: {\"choices\""));
     f.wait_for(&streamed, false).await;
-    assert_eq!(f.rows().await, 2, "only the streamed request's two boundaries");
+    assert_eq!(f.rows().await, 2, "the streamed request's two boundaries, while it is still open");
+
+    send("data: [DONE]\n\n");
+    drop(chunks_tx);
+    assert_eq!(forwarded.next().await.unwrap().unwrap(), "data: [DONE]\n\n");
+    assert!(forwarded.next().await.is_none());
 }
 
 /// The analytics handler puts the estimate on the record it publishes.

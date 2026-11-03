@@ -29,9 +29,10 @@
 //! - A request that fails before its first chunk writes nothing; one that fails after it
 //!   keeps the provisional entries until they expire.
 //!
-//! A request only matches entries that became visible no later than it arrived, so two
-//! concurrent requests sharing a prefix do not credit each other, and a streaming request
-//! never matches its own first-token write. `visible_at` is the database clock and the
+//! A request only matches entries that became visible no later than it arrived and were
+//! still live then, so two concurrent requests sharing a prefix do not credit each other,
+//! a streaming request never matches its own first-token write, and a long generation
+//! does not lose a prefix that expired while it ran. `visible_at` is the database clock and the
 //! arrival time is the gateway's; skew between the two shifts that cut-off by the same
 //! amount.
 //!
@@ -40,7 +41,9 @@
 //! The first-token write is spawned off the response stream. The estimate runs in the
 //! analytics handler after the response, bounded by `estimate_timeout_ms`, before the
 //! record goes to the outbox; the completion write is spawned from there. Any failure
-//! records NULL and increments `dwctl_reference_cache_estimates_total{outcome}`.
+//! records NULL and increments `dwctl_reference_cache_estimates_total{outcome}`. The store
+//! holds at most `max_connections` pool connections, so a slow or stuck reference table
+//! cannot take the connections the outbox needs to publish the record.
 
 pub mod layer;
 pub mod store;
@@ -71,6 +74,11 @@ pub use store::{EntryWrite, LiveEntry, ReferenceStore};
 const MAX_IN_FLIGHT_WRITES: usize = 256;
 /// Rows deleted per sweep batch.
 const SWEEP_BATCH: i64 = 10_000;
+/// How long the sweep keeps a row past its expiry, so a request that arrived inside the
+/// window still finds it when it completes. Covers long generations; a request running
+/// longer loses only prefixes that expired while it ran. Rows linger this long, so the
+/// table holds about (ttl + grace) / ttl times the live set.
+const SWEEP_GRACE: Duration = Duration::from_secs(10 * 60);
 
 /// The `reference_cache` config section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,10 +101,14 @@ pub struct ReferenceCacheConfig {
     /// continuation does not reuse.
     pub template_allowance_tokens: HashMap<String, u32>,
     /// Bound on the estimate (principal lookup, parse and the entry lookup) in the
-    /// analytics handler. Past it the request records NULL.
+    /// analytics handler, past which the request records NULL; also bounds each write.
     pub estimate_timeout_ms: u64,
     /// How often each replica deletes expired entries.
     pub sweep_interval_secs: u64,
+    /// Connections of the application pool the estimate may hold at once (lookups and
+    /// writes together; the sweeper takes one more). Work beyond it waits within the
+    /// estimate timeout or is skipped, so the shadow estimate cannot starve the pool.
+    pub max_connections: u32,
 }
 
 impl Default for ReferenceCacheConfig {
@@ -109,6 +121,7 @@ impl Default for ReferenceCacheConfig {
             template_allowance_tokens: HashMap::new(),
             estimate_timeout_ms: 2_000,
             sweep_interval_secs: 60,
+            max_connections: 4,
         }
     }
 }
@@ -149,6 +162,15 @@ impl ReferenceCacheConfig {
         }
         if self.ttl_secs == 0 {
             return Err("reference_cache.ttl_secs must be greater than 0".to_string());
+        }
+        if self.estimate_timeout_ms == 0 {
+            return Err("reference_cache.estimate_timeout_ms must be greater than 0; 0 would record NULL for every request".to_string());
+        }
+        if self.sweep_interval_secs == 0 {
+            return Err("reference_cache.sweep_interval_secs must be greater than 0".to_string());
+        }
+        if self.max_connections == 0 {
+            return Err("reference_cache.max_connections must be greater than 0".to_string());
         }
         if let Some(models) = &self.models
             && models.is_empty()
@@ -315,7 +337,7 @@ impl std::fmt::Debug for ReferenceCache {
 impl ReferenceCache {
     pub fn new(config: &ReferenceCacheConfig, pool: impl sqlx_pool_router::PoolProvider, telemetry: TelemetryPolicy) -> Self {
         Self {
-            store: ReferenceStore::new(pool.clone(), config.ttl()),
+            store: ReferenceStore::new(pool.clone(), config.ttl(), config.max_connections as usize),
             principal: PrincipalResolver::new(pool),
             orgs: config.orgs.iter().copied().collect(),
             models: ModelFilter::from_config(&config.models),
@@ -397,12 +419,13 @@ impl ReferenceCache {
             exact_tokens: &exact,
             tokens_per_byte: None,
         };
-        match self.store.upsert(&write).await {
-            Ok(_) => write_outcome("first_token", "ok"),
-            Err(e) => {
+        match tokio::time::timeout(self.estimate_timeout, self.store.upsert(&write)).await {
+            Ok(Ok(_)) => write_outcome("first_token", "ok"),
+            Ok(Err(e)) => {
                 crate::background_error!(REFERENCE_CACHE, "first_token_write", Warning, error = %e, "reference cache: first-token write failed");
                 write_outcome("first_token", "error");
             }
+            Err(_) => write_outcome("first_token", "timeout"),
         }
     }
 
@@ -431,7 +454,7 @@ impl ReferenceCache {
             let b = self.boundaries(&body)?;
             let live = self
                 .store
-                .lookup(principal_id, &model, &b.hashes)
+                .lookup(principal_id, &model, &b.hashes, arrival)
                 .await
                 .map_err(Unavailable::Backend)?;
             let allowance = self.template_allowance.get(&model).copied().unwrap_or(0);
@@ -487,6 +510,7 @@ impl ReferenceCache {
         let bytes: Vec<i64> = idx.iter().map(|&i| b.cumulative_bytes[i]).collect();
         let exact: Vec<Option<i32>> = idx.iter().map(|&i| if i == last { exact_final } else { None }).collect();
         let store = self.store.clone();
+        let timeout = self.estimate_timeout;
         tokio::spawn(async move {
             let _permit = permit;
             let write = EntryWrite {
@@ -497,12 +521,13 @@ impl ReferenceCache {
                 exact_tokens: &exact,
                 tokens_per_byte,
             };
-            match store.upsert(&write).await {
-                Ok(_) => write_outcome("completion", "ok"),
-                Err(e) => {
+            match tokio::time::timeout(timeout, store.upsert(&write)).await {
+                Ok(Ok(_)) => write_outcome("completion", "ok"),
+                Ok(Err(e)) => {
                     crate::background_error!(REFERENCE_CACHE, "completion_write", Warning, error = %e, "reference cache: completion write failed");
                     write_outcome("completion", "error");
                 }
+                Err(_) => write_outcome("completion", "timeout"),
             }
         });
     }
@@ -521,7 +546,7 @@ pub async fn run_sweeper(store: ReferenceStore, interval: Duration, shutdown: Ca
             _ = ticker.tick() => {}
         }
         loop {
-            match store.sweep_expired(SWEEP_BATCH).await {
+            match store.sweep_expired(SWEEP_BATCH, SWEEP_GRACE).await {
                 Ok(n) if n < SWEEP_BATCH as u64 => break,
                 Ok(_) if shutdown.is_cancelled() => break,
                 Ok(_) => continue,

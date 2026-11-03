@@ -5,10 +5,16 @@
 //! [`ReferenceStore::lookup`] reads every live boundary of a request and slides the
 //! expiry of the ones it found; [`ReferenceStore::upsert`] makes a request's boundaries
 //! visible; [`ReferenceStore::sweep_expired`] deletes expired rows in bounded batches.
+//!
+//! The store shares the application's pool, so it holds at most `max_connections` of
+//! its connections at once: however many requests are in flight, the shadow estimate
+//! cannot starve the analytics outbox or anything else on that pool.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::types::UserId;
 
@@ -42,17 +48,31 @@ pub struct ReferenceStore {
     /// primary: the table is unlogged, so a replica has no rows.
     pool: sqlx_pool_router::DynPools,
     ttl: Duration,
+    /// One permit per pool connection this store may hold.
+    connections: Arc<Semaphore>,
 }
 
 impl ReferenceStore {
-    pub fn new(pool: impl sqlx_pool_router::PoolProvider, ttl: Duration) -> Self {
+    pub fn new(pool: impl sqlx_pool_router::PoolProvider, ttl: Duration, max_connections: usize) -> Self {
         Self {
             pool: sqlx_pool_router::DynPools::new(pool),
             ttl,
+            connections: Arc::new(Semaphore::new(max_connections.max(1))),
         }
     }
 
-    /// Every live entry among `prefix_hashes`, and slide their expiry to `now() + ttl`.
+    async fn connection_permit(&self) -> SemaphorePermit<'_> {
+        self.connections.acquire().await.expect("the semaphore is never closed")
+    }
+
+    /// Every entry among `prefix_hashes` that was live when the request arrived, and slide
+    /// the expiry of those also visible by then to `now() + ttl`.
+    ///
+    /// Liveness is judged at `arrival`, not now: a request that arrived inside an entry's
+    /// window still uses it when it completes after the window closed (the sweep keeps
+    /// expired rows for a grace period for this). Entries that became visible after
+    /// `arrival` are returned, so the completion write knows they exist, but not
+    /// refreshed: the request cannot use them, so it must not keep them alive either.
     ///
     /// The slide is skipped for an entry that still has more than 90% of its window
     /// left, so a hot prefix (a shared system prompt) is rewritten at most once per
@@ -63,10 +83,12 @@ impl ReferenceStore {
         principal_id: UserId,
         virtual_model: &str,
         prefix_hashes: &[Vec<u8>],
+        arrival: DateTime<Utc>,
     ) -> Result<Vec<LiveEntry>, sqlx::Error> {
         if prefix_hashes.is_empty() {
             return Ok(Vec::new());
         }
+        let _permit = self.connection_permit().await;
         // The UPDATE runs even though the final SELECT does not reference it: Postgres
         // always executes data-modifying CTEs.
         sqlx::query_as!(
@@ -76,12 +98,13 @@ impl ReferenceStore {
                 SELECT prefix_hash, cumulative_bytes, tokens_per_byte, exact_tokens, visible_at, expires_at
                 FROM reference_cache_entries
                 WHERE principal_id = $1 AND virtual_model = $2
-                  AND prefix_hash = ANY($3) AND expires_at > now()
+                  AND prefix_hash = ANY($3) AND expires_at > $5
             ), refreshed AS (
                 UPDATE reference_cache_entries e
                 SET expires_at = now() + make_interval(secs => $4::float8)
                 FROM live
                 WHERE e.principal_id = $1 AND e.virtual_model = $2 AND e.prefix_hash = live.prefix_hash
+                  AND live.visible_at <= $5
                   AND live.expires_at < now() + make_interval(secs => $4::float8 * 0.9)
                 RETURNING e.prefix_hash
             )
@@ -97,6 +120,7 @@ impl ReferenceStore {
             virtual_model,
             prefix_hashes,
             self.ttl.as_secs_f64(),
+            arrival,
         )
         .fetch_all(&self.pool)
         .await
@@ -113,6 +137,7 @@ impl ReferenceStore {
         if write.prefix_hashes.is_empty() {
             return Ok(0);
         }
+        let _permit = self.connection_permit().await;
         // The NOT EXISTS filter keeps rows that need nothing out of ON CONFLICT, which
         // would otherwise lock each of them. A row that turns live between the filter and
         // the insert just takes the CASE branches below.
@@ -154,15 +179,18 @@ impl ReferenceStore {
         Ok(result.rows_affected())
     }
 
-    /// Delete up to `batch_size` expired rows. `SKIP LOCKED` keeps the sweep off rows a
-    /// request is writing at that moment.
-    pub async fn sweep_expired(&self, batch_size: i64) -> Result<u64, sqlx::Error> {
+    /// Delete up to `batch_size` rows expired for longer than `grace`. The grace keeps a
+    /// row for requests that arrived before it expired and complete after (see
+    /// [`Self::lookup`]). `SKIP LOCKED` keeps the sweep off rows a request is writing at
+    /// that moment.
+    pub async fn sweep_expired(&self, batch_size: i64, grace: Duration) -> Result<u64, sqlx::Error> {
+        let _permit = self.connection_permit().await;
         let result = sqlx::query!(
             r#"
             WITH victims AS (
                 SELECT principal_id, virtual_model, prefix_hash
                 FROM reference_cache_entries
-                WHERE expires_at <= now()
+                WHERE expires_at <= now() - make_interval(secs => $2::float8)
                 LIMIT $1
                 FOR UPDATE SKIP LOCKED
             )
@@ -172,6 +200,7 @@ impl ReferenceStore {
               AND e.prefix_hash = v.prefix_hash
             "#,
             batch_size,
+            grace.as_secs_f64(),
         )
         .execute(&self.pool)
         .await?;
@@ -206,7 +235,7 @@ mod tests {
 
     #[dwctl_test_macros::test]
     async fn upsert_then_lookup_returns_only_live_entries_in_scope(pool: sqlx::PgPool) {
-        let store = ReferenceStore::new(pool, Duration::from_secs(300));
+        let store = ReferenceStore::new(pool, Duration::from_secs(300), 2);
         let principal = uuid::Uuid::new_v4();
         let hs = hashes(&["a", "ab"]);
         store
@@ -214,22 +243,31 @@ mod tests {
             .await
             .unwrap();
 
-        let mut live = store.lookup(principal, "model-a", &hashes(&["a", "ab", "abc"])).await.unwrap();
+        let mut live = store
+            .lookup(principal, "model-a", &hashes(&["a", "ab", "abc"]), Utc::now())
+            .await
+            .unwrap();
         live.sort_by_key(|e| e.cumulative_bytes);
         assert_eq!(live.len(), 2);
         assert_eq!((live[0].cumulative_bytes, live[0].exact_tokens), (10, None));
         assert_eq!((live[1].cumulative_bytes, live[1].exact_tokens), (20, Some(7)));
         assert_eq!(live[1].tokens_per_byte, Some(0.25));
 
-        assert!(store.lookup(uuid::Uuid::new_v4(), "model-a", &hs).await.unwrap().is_empty());
-        assert!(store.lookup(principal, "model-b", &hs).await.unwrap().is_empty());
+        assert!(
+            store
+                .lookup(uuid::Uuid::new_v4(), "model-a", &hs, Utc::now())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.lookup(principal, "model-b", &hs, Utc::now()).await.unwrap().is_empty());
     }
 
     /// The provisional first-token write and the exact completion write land in either
     /// order with the same result, and neither overwrites what the other supplied.
     #[dwctl_test_macros::test]
     async fn provisional_and_exact_writes_commute(pool: sqlx::PgPool) {
-        let store = ReferenceStore::new(pool, Duration::from_secs(300));
+        let store = ReferenceStore::new(pool, Duration::from_secs(300), 2);
         let hs = hashes(&["a", "ab"]);
         for provisional_first in [true, false] {
             let principal = uuid::Uuid::new_v4();
@@ -242,7 +280,7 @@ mod tests {
                 store.upsert(&exact).await.unwrap();
                 assert_eq!(store.upsert(&provisional).await.unwrap(), 0, "nothing to add");
             }
-            let mut live = store.lookup(principal, "model-a", &hs).await.unwrap();
+            let mut live = store.lookup(principal, "model-a", &hs, Utc::now()).await.unwrap();
             live.sort_by_key(|e| e.cumulative_bytes);
             assert_eq!(live[0].tokens_per_byte, Some(0.5));
             assert_eq!(live[1].exact_tokens, Some(9));
@@ -253,20 +291,20 @@ mod tests {
     /// boundary keeps the time it first became visible.
     #[dwctl_test_macros::test]
     async fn live_entries_keep_their_first_values(pool: sqlx::PgPool) {
-        let store = ReferenceStore::new(pool, Duration::from_secs(300));
+        let store = ReferenceStore::new(pool, Duration::from_secs(300), 2);
         let principal = uuid::Uuid::new_v4();
         let hs = hashes(&["a"]);
         store.upsert(&write(principal, &hs, &[10], &[Some(5)], Some(0.5))).await.unwrap();
-        let first = store.lookup(principal, "model-a", &hs).await.unwrap().remove(0);
+        let first = store.lookup(principal, "model-a", &hs, Utc::now()).await.unwrap().remove(0);
 
         assert_eq!(store.upsert(&write(principal, &hs, &[10], &[Some(6)], Some(0.6))).await.unwrap(), 0);
-        let again = store.lookup(principal, "model-a", &hs).await.unwrap().remove(0);
+        let again = store.lookup(principal, "model-a", &hs, Utc::now()).await.unwrap().remove(0);
         assert_eq!(again, first);
     }
 
     #[dwctl_test_macros::test]
     async fn expired_entries_are_invisible_overwritten_and_swept(pool: sqlx::PgPool) {
-        let store = ReferenceStore::new(pool.clone(), Duration::from_secs(300));
+        let store = ReferenceStore::new(pool.clone(), Duration::from_secs(300), 2);
         let principal = uuid::Uuid::new_v4();
         let hs = hashes(&["a"]);
         store.upsert(&write(principal, &hs, &[10], &[Some(5)], Some(0.5))).await.unwrap();
@@ -277,11 +315,29 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        assert!(store.lookup(principal, "model-a", &hs).await.unwrap().is_empty());
+        assert!(store.lookup(principal, "model-a", &hs, Utc::now()).await.unwrap().is_empty());
+        let arrived_in_window = Utc::now() - chrono::Duration::seconds(30);
+        assert_eq!(
+            store.lookup(principal, "model-a", &hs, arrived_in_window).await.unwrap().len(),
+            1,
+            "a request that arrived before the expiry still finds it at completion"
+        );
+        assert_eq!(
+            store.lookup(principal, "model-a", &hs, Utc::now()).await.unwrap().len(),
+            1,
+            "and its use at arrival slid the window"
+        );
+        sqlx::query!(
+            "UPDATE reference_cache_entries SET expires_at = now() - interval '1 second' WHERE principal_id = $1",
+            principal
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         // A new write replaces the expired row wholesale, visibility included.
         store.upsert(&write(principal, &hs, &[10], &[Some(8)], Some(0.8))).await.unwrap();
-        let live = store.lookup(principal, "model-a", &hs).await.unwrap();
+        let live = store.lookup(principal, "model-a", &hs, Utc::now()).await.unwrap();
         assert_eq!(live[0].exact_tokens, Some(8));
         assert!(live[0].visible_at > Utc::now() - chrono::Duration::minutes(1));
 
@@ -292,15 +348,20 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        assert_eq!(store.sweep_expired(100).await.unwrap(), 1);
-        assert_eq!(store.sweep_expired(100).await.unwrap(), 0);
+        assert_eq!(
+            store.sweep_expired(100, Duration::from_secs(600)).await.unwrap(),
+            0,
+            "kept through the grace period"
+        );
+        assert_eq!(store.sweep_expired(100, Duration::ZERO).await.unwrap(), 1);
+        assert_eq!(store.sweep_expired(100, Duration::ZERO).await.unwrap(), 0);
     }
 
     /// Reading an entry slides its window; a read that would barely move it does not
     /// rewrite the row.
     #[dwctl_test_macros::test]
     async fn lookup_slides_the_window(pool: sqlx::PgPool) {
-        let store = ReferenceStore::new(pool.clone(), Duration::from_secs(300));
+        let store = ReferenceStore::new(pool.clone(), Duration::from_secs(300), 2);
         let principal = uuid::Uuid::new_v4();
         let hs = hashes(&["a"]);
         store.upsert(&write(principal, &hs, &[10], &[None], Some(0.5))).await.unwrap();
@@ -312,7 +373,7 @@ mod tests {
         };
 
         let fresh = expiry().await;
-        store.lookup(principal, "model-a", &hs).await.unwrap();
+        store.lookup(principal, "model-a", &hs, Utc::now()).await.unwrap();
         assert_eq!(expiry().await, fresh, "a fresh entry is not rewritten");
 
         sqlx::query!(
@@ -322,10 +383,25 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        store.lookup(principal, "model-a", &hs).await.unwrap();
+        store.lookup(principal, "model-a", &hs, Utc::now()).await.unwrap();
         assert!(
             expiry().await > Utc::now() + chrono::Duration::minutes(4),
             "a read slides it to a full window"
+        );
+
+        sqlx::query!(
+            "UPDATE reference_cache_entries SET expires_at = now() + interval '10 seconds' WHERE principal_id = $1",
+            principal
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let early = Utc::now() - chrono::Duration::hours(1);
+        let live = store.lookup(principal, "model-a", &hs, early).await.unwrap();
+        assert_eq!(live.len(), 1, "an entry visible after arrival is still returned");
+        assert!(
+            expiry().await < Utc::now() + chrono::Duration::minutes(1),
+            "but a request that arrived before it cannot keep it alive"
         );
     }
 }

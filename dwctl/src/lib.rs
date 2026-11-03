@@ -4265,7 +4265,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
     // Delete expired reference-cache entries. Every replica sweeps; SKIP LOCKED shares
     // the work, and the table holds only minutes of entries.
     if config.reference_cache.enabled {
-        let store = crate::reference_cache::ReferenceStore::new(dyn_pools.clone(), config.reference_cache.ttl());
+        let store = crate::reference_cache::ReferenceStore::new(dyn_pools.clone(), config.reference_cache.ttl(), 1);
         let interval = std::time::Duration::from_secs(config.reference_cache.sweep_interval_secs);
         let sweep_shutdown = shutdown_token.clone();
         background_tasks.spawn("reference-cache-sweep", async move {
