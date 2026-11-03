@@ -79,6 +79,14 @@ const BATCH_ARCHIVE_FAMILY: FamilySpec = FamilySpec {
     // the week for every batch in it. The guard reads only unfinished
     // batches, a few dozen rows under idx_batches_unfinished_created_at.
     //
+    // A cancelled batch holds nothing either, frozen or not. Nothing claims
+    // its requests, and the only way back is a retry, which the retry age
+    // cut-off refuses a day before the week can drop. This matters because
+    // a batch cancelled while its requests were still being created never
+    // freezes (its rows cannot add up to total_requests), and would
+    // otherwise hold its week for good. If it does freeze later,
+    // archive_batch routes it to the current week once this one is retired.
+    //
     // A retried archived batch also holds the week its rows were archived
     // into, finished or not: its retried rows are back in `requests` and
     // archive_batch re-archives them into that same `archive_bucket`, which
@@ -115,6 +123,7 @@ const BATCH_ARCHIVE_FAMILY: FamilySpec = FamilySpec {
               FROM batches b
               WHERE b.counts_frozen_at IS NULL
                 AND b.deleted_at IS NULL
+                AND b.cancelled_at IS NULL
                 AND b.created_at >= (bucket.week_start::timestamp AT TIME ZONE 'UTC')
                 AND b.created_at < ((bucket.week_start + 7)::timestamp AT TIME ZONE 'UTC')
           )
@@ -146,6 +155,7 @@ const BATCH_ARCHIVE_FAMILY: FamilySpec = FamilySpec {
             FROM batches b
             WHERE b.counts_frozen_at IS NULL
               AND b.deleted_at IS NULL
+              AND b.cancelled_at IS NULL
               AND b.created_at >= ($1::date::timestamp AT TIME ZONE 'UTC')
               AND b.created_at < (($1::date + 7)::timestamp AT TIME ZONE 'UTC')
         ) OR EXISTS (

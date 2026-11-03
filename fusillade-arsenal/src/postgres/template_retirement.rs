@@ -73,7 +73,11 @@ const TEMPLATE_FAMILY: FamilySpec = FamilySpec {
     // only batches created since the week began can read it; that bound is
     // what lets the guard range-scan idx_batches_unfinished_created_at
     // rather than read every unfinished batch. A finished batch
-    // holds nothing open; its results do not need the templates. A dedicated
+    // holds nothing open; its results do not need the templates. Nor does a
+    // cancelled one, frozen or not: nothing claims its requests, and a retry
+    // (the only way back) is refused from a day before the input's week can
+    // drop. A batch cancelled while its requests were still being created
+    // never freezes, and would otherwise hold its input week for good. A dedicated
     // (file-less) template row still fails the gate closed: nothing
     // unmanaged is dropped implicitly.
     candidate_sql: r#"
@@ -99,6 +103,7 @@ const TEMPLATE_FAMILY: FamilySpec = FamilySpec {
               JOIN files f ON f.id = b.file_id
               WHERE b.counts_frozen_at IS NULL
                 AND b.deleted_at IS NULL
+                AND b.cancelled_at IS NULL
                 AND b.created_at >= (bucket.week_start::timestamp AT TIME ZONE 'UTC')
                 AND f.created_at >= (bucket.week_start::timestamp AT TIME ZONE 'UTC')
                 AND f.created_at < ((bucket.week_start + 7)::timestamp AT TIME ZONE 'UTC')
@@ -123,6 +128,7 @@ const TEMPLATE_FAMILY: FamilySpec = FamilySpec {
             JOIN files f ON f.id = b.file_id
             WHERE b.counts_frozen_at IS NULL
               AND b.deleted_at IS NULL
+              AND b.cancelled_at IS NULL
               AND b.created_at >= ($1::date::timestamp AT TIME ZONE 'UTC')
               AND f.created_at >= ($1::date::timestamp AT TIME ZONE 'UTC')
               AND f.created_at < (($1::date + 7)::timestamp AT TIME ZONE 'UTC')

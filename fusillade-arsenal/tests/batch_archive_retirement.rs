@@ -293,6 +293,35 @@ async fn only_running_or_retried_batches_block(pool: PgPool) {
     }
 }
 
+/// A batch cancelled while its requests were still being created never
+/// freezes: its rows cannot add up to total_requests. Nothing claims a
+/// cancelled batch's requests, so it must not hold the week it was created
+/// in.
+#[sqlx::test]
+async fn a_cancelled_unfrozen_batch_does_not_hold_its_week(pool: PgPool) {
+    let week = monday(10);
+    ensure_week(&pool, week).await;
+    archived_batch(&pool, week, Utc::now() - Duration::days(60)).await;
+    sqlx::query(
+        "INSERT INTO batches (endpoint, completion_window, expires_at, created_at, \
+                              total_requests, cancelling_at, cancelled_at) \
+         VALUES ('/v1/x', '24h', NOW(), ($1::timestamp AT TIME ZONE 'UTC') + INTERVAL '1 day', \
+                 100, ($1::timestamp AT TIME ZONE 'UTC') + INTERVAL '1 day', \
+                 ($1::timestamp AT TIME ZONE 'UTC') + INTERVAL '1 day')",
+    )
+    .bind(week)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let outcome = manager(&pool)
+        .await
+        .retire_expired_batch_archive_partition(true, 30)
+        .await
+        .unwrap();
+    assert_eq!(outcome, RetainedResponseRetirementOutcome::Retired);
+}
+
 /// Make `batch` a retried archived batch with a retried row back in
 /// `requests`. A 'split' batch keeps its completed row in the archive; a
 /// 'live' one had nothing completed, so the retry moved every row back.
