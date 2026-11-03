@@ -419,7 +419,7 @@ scheduling:
 # keystore - it is non-persistence (bodies are suppressed, not encrypted).
 #
 # Also REQUIRED to issue an API key to another user (an org manager issuing to a
-# member, or a PlatformManager creating a key on a user's behalf): the key's
+# member): the key's
 # secret is held in Postgres, wrapped with these wrap keys, until the holder's
 # one-off reveal. Without this section such requests are refused (501);
 # self-created keys are unaffected. Those wrapped secrets have no TTL: a

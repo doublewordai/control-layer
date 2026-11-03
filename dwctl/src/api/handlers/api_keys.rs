@@ -207,16 +207,11 @@ pub async fn create_user_api_key<P: PoolProvider>(
         }
     }
 
-    // Determine created_by based on target type:
-    // - Organization target: attribute to specified member_id, or current user
-    // - Individual target (PM creating on behalf): attribute to the target user
-    //   so the key is visible to them
-    // - Self: attribute to current user
-    let pm_creating_for_other = can_create_all && target_user_id != current_user.id;
+    // Attribute the key: an organization key to the named member (or the
+    // caller); a personal key only ever belongs to its caller, since no
+    // platform role may issue keys for another account.
     let created_by = if target_is_org {
         data.member_id.unwrap_or(current_user.id)
-    } else if pm_creating_for_other {
-        target_user_id
     } else {
         current_user.id
     };
@@ -251,8 +246,8 @@ pub async fn create_user_api_key<P: PoolProvider>(
 
     let mut api_key = repo.create(&db_request).await?;
 
-    // Issued to a DIFFERENT user (manager issuing to a member, or a PM
-    // creating on a user's behalf): the holder gets a one-off "reveal" of
+    // Issued to a DIFFERENT user (an org manager issuing to a member): the
+    // holder gets a one-off "reveal" of
     // the secret from their own account (migration 131), held wrapped until
     // then. The issuer still receives the secret in this response — that is
     // deliberate (e.g. to stash it in a vault) and does not count as the
@@ -374,9 +369,7 @@ pub async fn list_user_api_keys<P: PoolProvider>(
     let skip = query.pagination.skip();
     let limit = query.pagination.limit();
 
-    // Scope to keys created by this user, unless they have ReadAll (PlatformManager).
-    // PM-created keys on behalf of users have created_by = target_user_id, so the target
-    // user can always see them. PMs bypass the filter to see all keys for any user.
+    // Scope to keys created by this user, unless they manage the organization.
     //
     // ?created_by narrows the list to one holder SERVER-SIDE, so pagination
     // and total_count cover the filtered set ("all of member X's keys" — an
@@ -2488,28 +2481,18 @@ mod tests {
         let bob = create_test_user(&pool, Role::StandardUser).await;
         let org = create_test_org(&pool, alice.id).await;
         add_org_member(&pool, org.id, bob.id, "member").await;
-        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
 
-        // Issued to another org member, or by a PM on a user's behalf: no keystore
-        // to hold the pending secret, so refused before anything is created.
-        for (issuer, path, body) in [
-            (
-                &alice,
-                org.id,
-                json!({"name": "Issued", "purpose": "realtime", "member_id": bob.id}),
-            ),
-            (&pm, bob.id, json!({"name": "On behalf", "purpose": "realtime"})),
-        ] {
-            let response = app
-                .post(&format!("/admin/api/v1/users/{path}/api-keys"))
-                .add_header(&add_auth_headers(issuer)[0].0, &add_auth_headers(issuer)[0].1)
-                .add_header(&add_auth_headers(issuer)[1].0, &add_auth_headers(issuer)[1].1)
-                .json(&body)
-                .await;
-            response.assert_status(axum::http::StatusCode::NOT_IMPLEMENTED);
-            assert!(response.maybe_header("retry-after").is_none(), "retrying cannot help");
-            assert!(response.text().contains("keystore"), "error says why: {}", response.text());
-        }
+        // An org manager issuing a key to a member: no keystore to hold the
+        // pending secret, so refused before anything is created.
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&alice)[0].0, &add_auth_headers(&alice)[0].1)
+            .add_header(&add_auth_headers(&alice)[1].0, &add_auth_headers(&alice)[1].1)
+            .json(&json!({"name": "Issued", "purpose": "realtime", "member_id": bob.id}))
+            .await;
+        response.assert_status(axum::http::StatusCode::NOT_IMPLEMENTED);
+        assert!(response.maybe_header("retry-after").is_none(), "retrying cannot help");
+        assert!(response.text().contains("keystore"), "error says why: {}", response.text());
         let keys: i64 = sqlx::query_scalar!(
             r#"SELECT COUNT(*) AS "count!" FROM api_keys WHERE user_id IN ($1, $2) AND hidden = false"#,
             org.id,
