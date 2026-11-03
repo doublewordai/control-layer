@@ -39,6 +39,7 @@ pub mod component {
     pub const ALLOCATOR_METRICS: &str = "allocator_metrics";
     pub const HEAP_PROFILING: &str = "heap_profiling";
     pub const REALTIME_INFLIGHT: &str = "realtime_inflight";
+    pub const API_KEY_USAGE: &str = "api_key_usage";
 }
 
 /// Increment `dwctl_background_errors_total`. `component`/`reason`/`severity` are `&'static str`

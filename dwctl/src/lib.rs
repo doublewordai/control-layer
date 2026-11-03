@@ -142,6 +142,7 @@ fn install_crypto_provider() {
 
 pub mod account_limits;
 pub mod api;
+pub mod api_key_usage;
 pub mod auth;
 pub mod clickhouse;
 pub mod config;
@@ -342,6 +343,10 @@ where
     /// labelled from (see [`crate::inference::rejections`]). `None` labels them
     /// with neither model nor account.
     pub onwards_targets: Option<onwards::target::Targets>,
+    /// Latest use of each API key, flushed to `api_keys.last_used` by
+    /// [`api_key_usage::run_api_key_usage_flusher`].
+    #[builder(default)]
+    pub api_key_usage: api_key_usage::ApiKeyUsage,
 }
 
 impl<P> AppState<P>
@@ -2644,6 +2649,13 @@ pub async fn build_router(
         onwards_router
     };
 
+    // Outer to inference routing, so it sees the key on queued submissions
+    // that inference routing answers itself as well as on onwards responses.
+    let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
+        state.api_key_usage.clone(),
+        api_key_usage::record_proxy_key_use,
+    ));
+
     // Bound the raw body before inference routing parses it or outlet captures
     // it. Inner limits are too late to prevent allocation amplification. Keep
     // this on the onwards router so files/batches retain their separate limits.
@@ -3127,6 +3139,8 @@ pub struct BackgroundServices {
     connections_encryption_key: Option<Vec<u8>>,
     /// Encrypted key custody, built once at startup. `None` when unconfigured.
     keystore: Option<crate::keystore::Keystore>,
+    /// Latest API key uses, flushed by the `api-key-usage` task.
+    api_key_usage: api_key_usage::ApiKeyUsage,
 }
 
 impl BackgroundServices {
@@ -3421,6 +3435,12 @@ impl BackgroundServices {
     pub async fn sync_key_policy(&self, pool: &sqlx::PgPool) -> anyhow::Result<()> {
         crate::sync::key_policy::refresh(pool, &self.key_policy_cache).await?;
         Ok(())
+    }
+
+    /// Write noted API key uses now instead of waiting for the flush interval.
+    #[cfg(test)]
+    pub async fn flush_api_key_usage(&self, pool: &sqlx::PgPool) -> anyhow::Result<u64> {
+        Ok(self.api_key_usage.flush(pool).await?)
     }
 }
 
@@ -4201,6 +4221,19 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         });
     }
 
+    // Every replica notes the API keys it authenticates and writes their
+    // latest use to `api_keys.last_used` once a minute.
+    let api_key_usage = api_key_usage::ApiKeyUsage::default();
+    {
+        let flusher_pool = dyn_pools.clone();
+        let flusher_usage = api_key_usage.clone();
+        let flusher_shutdown = shutdown_token.clone();
+        background_tasks.spawn("api-key-usage", async move {
+            api_key_usage::run_api_key_usage_flusher(flusher_pool, flusher_usage, flusher_shutdown).await;
+            Ok(())
+        });
+    }
+
     // Start the task-retention daemon: bounded, oldest-first deletion of expired
     // Underway tasks. Without it the task table only ever grows.
     if config.background_services.task_retention.enabled {
@@ -4347,6 +4380,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         drop_guard: Some(drop_guard),
         connections_encryption_key: encryption_key.clone(),
         keystore,
+        api_key_usage,
         // Application::new_with_pool wires these once the onwards-
         // instance daemon row is registered. Kept Optional here so
         // tests that bypass that wiring still construct cleanly.
@@ -4789,6 +4823,7 @@ impl Application {
             .response_store(response_store)
             .image_normalizer(image_normalizer)
             .onwards_targets(bg_services.onwards_targets.clone())
+            .api_key_usage(bg_services.api_key_usage.clone())
             .build();
 
         if let Some(config_path) = config_path {

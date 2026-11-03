@@ -744,6 +744,9 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 request_value.to_string()
             };
 
+            // Queued submissions bypass onwards, so name the client's key on the
+            // response here for `api_key_usage` to note.
+            let queued_key_id = queued_batch_key.as_ref().map(|key| key.api_key_id);
             let queued_api_key = queued_batch_key
                 .as_ref()
                 .map(|key| key.secret.clone())
@@ -778,7 +781,8 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                     created_by: queued_created_by,
                     metadata: queued_metadata,
                 };
-                return handle_background(&state, background_input, &resp_id, model).await;
+                let response = handle_background(&state, background_input, &resp_id, model).await;
+                return with_authenticated_key(response, queued_key_id);
             }
 
             // INVARIANT: the daemon dispatches this job back through the loopback
@@ -803,13 +807,14 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 metadata: queued_metadata,
             };
 
-            match (is_chat_completions_api, flex_stream) {
+            let response = match (is_chat_completions_api, flex_stream) {
                 (true, true) => handle_chat_completion_flex_streaming(&state, flex_input, request_id, flex_stream_include_usage).await,
                 (true, false) => handle_chat_completion_flex(&state, flex_input, request_id).await,
                 // Responses (embeddings flex was downgraded to realtime above).
                 (false, true) => handle_responses_flex_streaming(&state, flex_input, request_id).await,
                 (false, false) => handle_flex(&state, flex_input, &resp_id, model, background).await,
-            }
+            };
+            with_authenticated_key(response, queued_key_id)
         }
     }
 }
@@ -827,6 +832,8 @@ enum ServiceTier {
 
 #[derive(Debug, Clone)]
 struct FlexBatchApiKey {
+    /// The client's key, not the hidden key in `secret`.
+    api_key_id: uuid::Uuid,
     secret: String,
     key_owner_id: uuid::Uuid,
     /// The key owner's `users.verified` flag (organizations are `users` rows
@@ -855,7 +862,7 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) 
     // hidden-key secrets are never exposed to clients.
     let row = sqlx::query(
         r#"
-        SELECT ak.user_id, ak.created_by, u.verified, child.secret AS child_secret
+        SELECT ak.id, ak.user_id, ak.created_by, u.verified, child.secret AS child_secret
         FROM api_keys ak
         LEFT JOIN users u ON u.id = ak.user_id
         LEFT JOIN api_keys child
@@ -874,6 +881,7 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) 
     let Some(row) = row else {
         return Ok(None);
     };
+    let api_key_id: uuid::Uuid = sqlx::Row::get(&row, "id");
     let key_owner_id: uuid::Uuid = sqlx::Row::get(&row, "user_id");
     let created_by: uuid::Uuid = sqlx::Row::get(&row, "created_by");
     // NULL when the LEFT JOIN found no user row; a missing row counts as
@@ -896,10 +904,18 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) 
     };
 
     Ok(Some(FlexBatchApiKey {
+        api_key_id,
         secret,
         key_owner_id,
         verified,
     }))
+}
+
+fn with_authenticated_key(mut response: Response, api_key_id: Option<uuid::Uuid>) -> Response {
+    if let Some(api_key_id) = api_key_id {
+        response.extensions_mut().insert(onwards::AuthenticatedApiKeyId(api_key_id));
+    }
+    response
 }
 
 /// Resolve the background capability from the human who created an API key.
