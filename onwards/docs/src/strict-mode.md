@@ -166,13 +166,15 @@ Legacy completions requests have their own, shorter catalog: `n` and `best_of` v
 
 Strict mode checks every Chat Completions and legacy completions request against its surface's catalog after schema validation (on chat, before reasoning validation):
 
-- Each matching parameter increments `onwards_unsupported_params_total{param, model, traffic, action}`. `action` is `logged` or `rejected`. A `logged` request can still be refused by a later check, such as reasoning validation.
+- Each matching parameter increments `onwards_unsupported_params_total{param, model, traffic, action}`. `action` is `rejected`, `allowed` (on the reject list but allowed for this model) or `logged`. A `logged` request can still be refused by a later check, such as reasoning validation.
 - The `onwards.request` trace span gets `onwards.unsupported_params`, the matching parameter names joined by commas, and `onwards.account` and `onwards.api_key_id` from the labels of the key the request presented, when it has them. Values and request bodies are never recorded.
 - If any parameter is in the gateway's reject list, the whole request gets a `400` with code `unsupported_parameter` naming the rejected parameters, for example ``Unsupported parameter(s): `logprobs` ``, and is not forwarded. A request whose flagged parameters are all outside the reject list is forwarded unchanged.
 
 The check covers Chat Completions requests, including Responses and Messages requests that an edge such as dwctl has translated into Chat Completions before they reach onwards, and legacy `/v1/completions` requests. Native `/v1/responses` requests are forwarded to an upstream that speaks the Responses API itself and aren't checked.
 
 The reject list is empty by default, so the check only observes. Set it with `AppState::with_rejected_params`; in dwctl, use `onwards.rejected_params`. The list holds names, so a listed name is refused on every surface whose catalog has it: rejecting `logprobs` refuses `logprobs: true` on chat and any `logprobs` count on legacy completions. A name outside both catalogs is a configuration error.
+
+A model can be exempted from part of the reject list with `AppState::with_model_allowed_params` (in dwctl, `onwards.model_allowed_params`), keyed by the model name the client requests. The listed parameters are forwarded for that model and refused for every other. Use it for a model whose every worker honours a parameter the rest of the fleet can't. The same name check applies.
 
 ## Comparison with response sanitization
 

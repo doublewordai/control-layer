@@ -122,6 +122,60 @@ async fn rejected_params_get_a_400_and_are_not_forwarded() {
 }
 
 #[tokio::test]
+async fn a_model_allowed_param_is_forwarded_only_for_that_model() {
+    let allowed = "allow-model";
+    let other = "allow-other-model";
+    LazyLock::force(&METRICS);
+    let mock = MockHttpClient::new(StatusCode::OK, COMPLETION);
+    let targets = Targets::from_config(
+        serde_json::from_value(json!({
+            "strict_mode": true,
+            "targets": {
+                allowed: {"url": "https://upstream.example.com/v1/"},
+                other: {"url": "https://upstream.example.com/v1/"}
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let state = AppState::with_client(targets, mock.clone())
+        .with_rejected_params(["logprobs", "top_logprobs"])
+        .unwrap()
+        .with_model_allowed_params([(allowed, ["logprobs", "top_logprobs"])])
+        .unwrap();
+    let server = TestServer::new(build_strict_router(state)).unwrap();
+    let fields = json!({"logprobs": true, "top_logprobs": 20});
+
+    let response = server
+        .post("/chat/completions")
+        .json(&request(allowed, fields.clone()))
+        .await;
+    response.assert_status_ok();
+    assert_eq!(mock.get_requests().len(), 1);
+    assert_eq!(count(allowed, "logprobs", "allowed"), Some(1.0));
+    assert_eq!(count(allowed, "top_logprobs", "allowed"), Some(1.0));
+
+    let response = server
+        .post("/chat/completions")
+        .json(&request(other, fields))
+        .await;
+    response.assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(mock.get_requests().len(), 1);
+    assert_eq!(count(other, "logprobs", "rejected"), Some(1.0));
+}
+
+#[test]
+fn an_unknown_name_in_a_model_allow_list_is_an_error() {
+    let error = AppState::with_client(
+        targets("allow-typo-model"),
+        MockHttpClient::new(StatusCode::OK, COMPLETION),
+    )
+    .with_model_allowed_params([("allow-typo-model", ["logprob"])])
+    .unwrap_err();
+    assert!(error.contains("logprob"), "{error}");
+}
+
+#[tokio::test]
 async fn neutral_values_are_neither_counted_nor_rejected() {
     let alias = "neutral-model";
     let mock = MockHttpClient::new(StatusCode::OK, COMPLETION);

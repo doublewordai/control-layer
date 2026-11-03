@@ -174,6 +174,10 @@ pub struct AppState<T: HttpClient> {
     /// Parameters from [`unsupported_params::params`] that get a 400 instead of
     /// being forwarded. Every other flagged parameter is only counted and traced.
     pub rejected_params: Vec<&'static str>,
+    /// Per-model exceptions to `rejected_params`, keyed by the requested model
+    /// name: these parameters are forwarded for that model although the reject
+    /// list names them. They are still counted and traced.
+    pub model_allowed_params: std::collections::HashMap<String, Vec<&'static str>>,
     pub inflight_limiter: Arc<dyn inflight::InflightLimiter>,
     /// Enforces the per-model batch in-flight cap. Off, dispatched batch
     /// requests are never refused and the batch limiter is never consulted, so
@@ -214,6 +218,7 @@ impl<T: HttpClient> std::fmt::Debug for AppState<T> {
                 &self.first_token_timeout_exempt_header,
             )
             .field("rejected_params", &self.rejected_params)
+            .field("model_allowed_params", &self.model_allowed_params)
             .field("inflight_limiter", &self.inflight_limiter)
             .field("batch_inflight_enforce", &self.batch_inflight_enforce)
             .field("batch_inflight_limiter", &self.batch_inflight_limiter)
@@ -242,6 +247,7 @@ impl AppState<HyperClient> {
             first_token_timeout: None,
             first_token_timeout_exempt_header: None,
             rejected_params: Vec::new(),
+            model_allowed_params: std::collections::HashMap::new(),
             inflight_limiter: Arc::new(inflight::LocalInflightLimiter::default()),
             batch_inflight_enforce: false,
             batch_inflight_limiter: Arc::new(inflight::LocalInflightLimiter::default()),
@@ -263,6 +269,7 @@ impl<T: HttpClient> AppState<T> {
             first_token_timeout: None,
             first_token_timeout_exempt_header: None,
             rejected_params: Vec::new(),
+            model_allowed_params: std::collections::HashMap::new(),
             inflight_limiter: Arc::new(inflight::LocalInflightLimiter::default()),
             batch_inflight_enforce: false,
             batch_inflight_limiter: Arc::new(inflight::LocalInflightLimiter::default()),
@@ -315,6 +322,47 @@ impl<T: HttpClient> AppState<T> {
         }
         self.rejected_params = rejected;
         Ok(self)
+    }
+
+    /// Set per-model exceptions to the reject list (builder pattern): for each
+    /// model name, the parameters forwarded for that model even when
+    /// [`with_rejected_params`](Self::with_rejected_params) names them. Names
+    /// outside [`unsupported_params::params`] are an error, as for the reject
+    /// list.
+    pub fn with_model_allowed_params<I, M, P, S>(mut self, models: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = (M, P)>,
+        M: Into<String>,
+        P: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut allowed = std::collections::HashMap::new();
+        for (model, params) in models {
+            let model = model.into();
+            let mut known: Vec<&'static str> = Vec::new();
+            for name in params {
+                let name = name.as_ref();
+                let param = unsupported_params::known_param(name).ok_or_else(|| {
+                    format!("unknown parameter in the allow list for {model}: {name}")
+                })?;
+                if !known.contains(&param) {
+                    known.push(param);
+                }
+            }
+            allowed.insert(model, known);
+        }
+        self.model_allowed_params = allowed;
+        Ok(self)
+    }
+
+    /// Whether `param` is rejected for `model`: on the reject list and not
+    /// allowed for that model.
+    pub fn rejects_param(&self, model: &str, param: &str) -> bool {
+        self.rejected_params.contains(&param)
+            && !self
+                .model_allowed_params
+                .get(model)
+                .is_some_and(|allowed| allowed.contains(&param))
     }
 
     pub fn with_inflight_limiter(mut self, limiter: Arc<dyn inflight::InflightLimiter>) -> Self {
