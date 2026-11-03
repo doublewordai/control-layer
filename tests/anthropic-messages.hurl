@@ -13,8 +13,8 @@
 
 # --- identities -------------------------------------------------------------
 GET http://localhost:3001/admin/api/v1/users/current
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Captures]
 admin_user_id: jsonpath "$.id"
@@ -28,8 +28,8 @@ user1_id: jsonpath "$.id"
 
 # --- admin: endpoint -> model (mock-served name) -> group -> membership ------
 POST http://localhost:3001/admin/api/v1/endpoints
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "name": "anthropic-e2e-mock-{{newUuid}}",
   "url": "http://mock-llm-server:3000",
@@ -43,8 +43,8 @@ status < 300
 endpoint_id: jsonpath "$.id"
 
 POST http://localhost:3001/admin/api/v1/models
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "type": "standard",
   "model_name": "gpt-4-mock",
@@ -60,8 +60,8 @@ deployment_id: jsonpath "$.id"
 model_alias: jsonpath "$.alias"
 
 POST http://localhost:3001/admin/api/v1/groups
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "name": "anthropic-e2e-group-{{newUuid}}",
   "description": "anthropic e2e access"
@@ -71,13 +71,13 @@ HTTP 201
 group_id: jsonpath "$.id"
 
 POST http://localhost:3001/admin/api/v1/groups/{{group_id}}/users/{{user1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 POST http://localhost:3001/admin/api/v1/groups/{{group_id}}/models/{{deployment_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP *
 [Asserts]
 status >= 200
@@ -85,8 +85,8 @@ status < 300
 
 # Grant the user credits so paid-model checks pass.
 POST http://localhost:3001/admin/api/v1/transactions
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "user_id": "{{user1_id}}",
   "transaction_type": "admin_grant",
@@ -205,18 +205,18 @@ dwctl_session: {{user_jwt}}
 HTTP 204
 
 DELETE http://localhost:3001/admin/api/v1/groups/{{group_id}}/models/{{deployment_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 DELETE http://localhost:3001/admin/api/v1/groups/{{group_id}}/users/{{user1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 POST http://localhost:3001/admin/api/v1/transactions
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "user_id": "{{user1_id}}",
   "transaction_type": "admin_removal",
@@ -230,16 +230,16 @@ status >= 200
 status < 300
 
 DELETE http://localhost:3001/admin/api/v1/models/{{deployment_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 
 DELETE http://localhost:3001/admin/api/v1/groups/{{group_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 DELETE http://localhost:3001/admin/api/v1/endpoints/{{endpoint_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204

@@ -52,7 +52,7 @@ use uuid::Uuid;
 #[tracing::instrument(skip_all)]
 pub async fn create_transaction<P: PoolProvider>(
     State(state): State<AppState<P>>,
-    _perm: RequiresPermission<resource::Credits, operation::CreateAll>,
+    actor: RequiresPermission<resource::Credits, operation::CreateAll>,
     Json(data): Json<CreditTransactionCreate>,
 ) -> Result<(StatusCode, Json<CreditTransactionResponse>)> {
     // Validate amount is positive
@@ -77,6 +77,8 @@ pub async fn create_transaction<P: PoolProvider>(
     };
 
     let transaction = repo.create_transaction(&db_request).await?;
+    tracing::info!(actor_id = %actor.id, target_user_id = %data.user_id,
+        transaction_id = %transaction.id, "credit transaction created");
 
     Ok((StatusCode::CREATED, Json(CreditTransactionResponse::from(transaction))))
 }

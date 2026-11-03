@@ -1,5 +1,13 @@
 # Changelog
 
+## [15.11.0](https://github.com/doublewordai/control-layer/compare/v15.10.0...v15.11.0) (2026-11-02)
+
+
+### Features
+
+* **files:** make expires_at the truth for file content (DW-992) ([#2113](https://github.com/doublewordai/control-layer/issues/2113)) ([03b5467](https://github.com/doublewordai/control-layer/commit/03b5467c9ded7271b72856b2acc50bfcb8e50b44))
+* **retention:** retire content weeks on one creation-anchored clock (DW-992) ([#2115](https://github.com/doublewordai/control-layer/issues/2115)) ([1a57f82](https://github.com/doublewordai/control-layer/commit/1a57f8267bc34198ceaa87917965960e2d0f9a6e))
+
 ## [15.10.0](https://github.com/doublewordai/control-layer/compare/v15.9.0...v15.10.0) (2026-11-01)
 
 

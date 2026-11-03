@@ -417,7 +417,7 @@ pub async fn remove_user_from_group<P: PoolProvider>(
 pub async fn add_group_to_user<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path((user_id, group_id)): Path<(UserId, GroupId)>,
-    _: RequiresPermission<resource::Users, operation::UpdateAll>,
+    _: RequiresPermission<resource::Groups, operation::UpdateAll>,
 ) -> Result<StatusCode> {
     let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Groups::new(&mut pool_conn);
@@ -450,7 +450,7 @@ pub async fn add_group_to_user<P: PoolProvider>(
 pub async fn remove_group_from_user<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path((user_id, group_id)): Path<(UserId, GroupId)>,
-    _: RequiresPermission<resource::Users, operation::UpdateAll>,
+    _: RequiresPermission<resource::Groups, operation::UpdateAll>,
 ) -> Result<StatusCode> {
     let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Groups::new(&mut pool_conn);

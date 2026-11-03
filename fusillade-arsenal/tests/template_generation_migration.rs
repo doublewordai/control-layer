@@ -342,85 +342,24 @@ async fn retirement_manager(
     .unwrap()
 }
 
-async fn aged_file(pool: &PgPool, days_old: i64) -> Uuid {
+/// A processed input file uploaded on the first day of `week`.
+async fn file_uploaded_in(pool: &PgPool, week: chrono::NaiveDate) -> Uuid {
     sqlx::query_scalar(
         "INSERT INTO files (name, size_bytes, size_finalized, status, purpose, created_at) \
-         VALUES ('aged-' || gen_random_uuid(), 0, TRUE, 'processed', 'batch', \
-                 NOW() - make_interval(days => $1::int)) RETURNING id",
+         VALUES ('upload-' || gen_random_uuid(), 0, TRUE, 'processed', 'batch', \
+                 ($1::timestamp AT TIME ZONE 'UTC') + INTERVAL '1 day') RETURNING id",
     )
-    .bind(days_old as i32)
+    .bind(week)
     .fetch_one(pool)
     .await
     .unwrap()
 }
 
+/// A template week drops on age alone; neither the file row nor any finished
+/// batch holds it. Only a batch still running on input from that week does,
+/// since its requests still read the templates.
 #[sqlx::test]
-async fn file_content_expiry_tombstones_only_released_files(pool: PgPool) {
-    use fusillade_arsenal::manager::DaemonStorage;
-
-    let released = aged_file(&pool, 400).await;
-    let pinned = aged_file(&pool, 400).await;
-    sqlx::query(
-        "INSERT INTO batches (file_id, endpoint, completion_window, expires_at, \
-                              location, archive_bucket, counts_frozen_at) \
-         VALUES ($1, '/v1/x', '24h', NOW(), 'archive', \
-                 date_trunc('week', NOW() AT TIME ZONE 'UTC')::date, \
-                 NOW() - INTERVAL '10 days')",
-    )
-    .bind(pinned)
-    .execute(&pool)
-    .await
-    .unwrap();
-    let young = aged_file(&pool, 5).await;
-
-    let manager = retirement_manager(&pool).await;
-    let step = manager.expire_file_content(365, 100, None).await.unwrap();
-    assert_eq!(step.expired, 1, "only the released aged file may expire");
-    assert_eq!(step.next, None, "one short slice covers every due file");
-
-    let rows: Vec<(Uuid, Option<String>, bool, bool)> = sqlx::query_as(
-        "SELECT id, name, deleted_at IS NOT NULL, retention_expired_at IS NOT NULL \
-         FROM files WHERE id = ANY($1) ORDER BY created_at",
-    )
-    .bind(vec![released, pinned, young])
-    .fetch_all(&pool)
-    .await
-    .unwrap();
-    for (id, name, deleted, stamped) in rows {
-        assert!(name.is_some(), "file metadata (name) must be retained");
-        if id == released {
-            assert!(deleted && stamped, "released aged file must be tombstoned");
-        } else {
-            assert!(!deleted && !stamped, "pinned/young files must survive");
-        }
-    }
-
-    // Once the pinned file's batch content expires, the next pass releases it.
-    sqlx::query("UPDATE batches SET retention_expired_at = NOW() WHERE file_id = $1")
-        .bind(pinned)
-        .execute(&pool)
-        .await
-        .unwrap();
-    assert_eq!(
-        manager
-            .expire_file_content(365, 100, None)
-            .await
-            .unwrap()
-            .expired,
-        1
-    );
-    assert_eq!(
-        manager
-            .expire_file_content(365, 100, None)
-            .await
-            .unwrap()
-            .expired,
-        0
-    );
-}
-
-#[sqlx::test]
-async fn template_week_retires_only_after_every_file_releases(pool: PgPool) {
+async fn template_week_retires_on_age_unless_an_unfinished_batch_reads_it(pool: PgPool) {
     use fusillade_arsenal::manager::{DaemonStorage, RetainedResponseRetirementOutcome};
 
     let week = monday(&pool, -60).await;
@@ -429,31 +368,38 @@ async fn template_week_retires_only_after_every_file_releases(pool: PgPool) {
         .execute(&pool)
         .await
         .unwrap();
-    let file = aged_file(&pool, 500).await;
+    let file = file_uploaded_in(&pool, week).await;
     let template_id = insert_g2_template(&pool, week, file).await;
+    let batch_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO batches (file_id, endpoint, completion_window, expires_at, created_at) \
+         VALUES ($1, '/v1/x', '24h', NOW() + INTERVAL '24 hours', \
+                 ($2::timestamp AT TIME ZONE 'UTC') + INTERVAL '1 day') RETURNING id",
+    )
+    .bind(file)
+    .bind(week)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
 
     let manager = retirement_manager(&pool).await;
     let blocked = manager
-        .retire_expired_template_partition(true, 365)
+        .retire_expired_template_partition(true, 30)
         .await
         .unwrap();
     assert_eq!(
         blocked,
         RetainedResponseRetirementOutcome::NoCandidate,
-        "a live file must pin its template week"
+        "an unfinished batch must pin its input's template week"
     );
 
-    // File-content expiry releases the window (no batches reference it).
-    assert_eq!(
-        manager
-            .expire_file_content(365, 100, None)
-            .await
-            .unwrap()
-            .expired,
-        1
-    );
+    // Finishing the batch releases the week; the file row is not consulted.
+    sqlx::query("UPDATE batches SET counts_frozen_at = NOW(), completed_at = NOW() WHERE id = $1")
+        .bind(batch_id)
+        .execute(&pool)
+        .await
+        .unwrap();
     let retired = manager
-        .retire_expired_template_partition(true, 365)
+        .retire_expired_template_partition(true, 30)
         .await
         .unwrap();
     assert_eq!(retired, RetainedResponseRetirementOutcome::Retired);
@@ -476,6 +422,14 @@ async fn template_week_retires_only_after_every_file_releases(pool: PgPool) {
         child_exists, None,
         "the weekly template partition must drop"
     );
+    let (deleted, status): (bool, String) =
+        sqlx::query_as("SELECT deleted_at IS NOT NULL, status FROM files WHERE id = $1")
+            .bind(file)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(!deleted, "file metadata is never tombstoned by retirement");
+    assert_eq!(status, "processed");
 
     // Routes survive the drop and are removed by the bounded cleanup phase.
     let routed: i64 =
@@ -492,6 +446,90 @@ async fn template_week_retires_only_after_every_file_releases(pool: PgPool) {
     assert_eq!(
         manager.cleanup_retired_template_routes(10).await.unwrap(),
         0
+    );
+}
+
+/// The week is not yet past `week end + retention days`, so nothing holds it
+/// but its age.
+#[sqlx::test]
+async fn a_young_template_week_is_not_a_candidate(pool: PgPool) {
+    use fusillade_arsenal::manager::{DaemonStorage, RetainedResponseRetirementOutcome};
+
+    let week = monday(&pool, -4).await;
+    sqlx::query("SELECT ensure_request_template_partition($1, NULL)")
+        .bind(week)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let file = file_uploaded_in(&pool, week).await;
+    insert_g2_template(&pool, week, file).await;
+
+    let outcome = retirement_manager(&pool)
+        .await
+        .retire_expired_template_partition(true, 30)
+        .await
+        .unwrap();
+    assert_eq!(outcome, RetainedResponseRetirementOutcome::NoCandidate);
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM request_template_buckets WHERE week_start = $1")
+            .bind(week)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "active");
+}
+
+/// An unfinished batch holds only the week its own input was uploaded in.
+#[sqlx::test]
+async fn an_unfinished_batch_on_input_from_another_week_does_not_block(pool: PgPool) {
+    use fusillade_arsenal::manager::{DaemonStorage, RetainedResponseRetirementOutcome};
+
+    let week = monday(&pool, -60).await;
+    let other_week = monday(&pool, -59).await;
+    for monday in [week, other_week] {
+        sqlx::query("SELECT ensure_request_template_partition($1, NULL)")
+            .bind(monday)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let file = file_uploaded_in(&pool, week).await;
+    insert_g2_template(&pool, week, file).await;
+    let other_file = file_uploaded_in(&pool, other_week).await;
+    insert_g2_template(&pool, other_week, other_file).await;
+    // Still running, but on input uploaded the following week.
+    sqlx::query(
+        "INSERT INTO batches (file_id, endpoint, completion_window, expires_at, created_at) \
+         VALUES ($1, '/v1/x', '24h', NOW() + INTERVAL '24 hours', \
+                 ($2::timestamp AT TIME ZONE 'UTC') + INTERVAL '1 day')",
+    )
+    .bind(other_file)
+    .bind(other_week)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let manager = retirement_manager(&pool).await;
+    let outcome = manager
+        .retire_expired_template_partition(true, 30)
+        .await
+        .unwrap();
+    assert_eq!(outcome, RetainedResponseRetirementOutcome::Retired);
+    let states: Vec<(chrono::NaiveDate, String)> = sqlx::query_as(
+        "SELECT week_start, state FROM request_template_buckets \
+         WHERE week_start = ANY($1) ORDER BY week_start",
+    )
+    .bind(vec![week, other_week])
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        states,
+        vec![
+            (week, "retired".to_string()),
+            (other_week, "active".to_string())
+        ],
+        "only the week the running batch reads stays"
     );
 }
 

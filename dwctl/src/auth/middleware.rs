@@ -556,6 +556,7 @@ mod tests {
 
         // Create JWT session token
         let current_user = CurrentUser {
+            auth_method: crate::api::models::users::AuthMethod::TrustedSso,
             id: user.id,
             username: user.username,
             email: user.email,
@@ -674,6 +675,7 @@ mod tests {
 
         // Create JWT session token for the JWT user
         let current_user = CurrentUser {
+            auth_method: crate::api::models::users::AuthMethod::TrustedSso,
             id: jwt_user.id,
             username: jwt_user.username,
             email: jwt_user.email.clone(),
@@ -794,6 +796,7 @@ mod tests {
 
         // Create JWT session token
         let current_user = CurrentUser {
+            auth_method: crate::api::models::users::AuthMethod::TrustedSso,
             id: user.id,
             username: user.username.clone(),
             email: user.email.clone(),
@@ -1103,6 +1106,7 @@ mod tests {
 
         // Create JWT session token
         let current_user = CurrentUser {
+            auth_method: crate::api::models::users::AuthMethod::TrustedSso,
             id: user.id,
             username: user.username,
             email: user.email.clone(),
@@ -1150,9 +1154,10 @@ mod tests {
             )
             .unwrap();
 
-        // Should succeed via JWT session despite invalid API key
-        let request = admin_ai_proxy(state, request).await.unwrap();
-        assert_eq!(request.uri().path(), "/ai/v1/chat/completions");
-        assert!(request.headers().get("authorization").is_some());
+        // Explicit invalid credentials must not inherit browser-session authority.
+        assert!(matches!(
+            admin_ai_proxy(state, request).await,
+            Err(crate::errors::Error::Unauthenticated { .. })
+        ));
     }
 }

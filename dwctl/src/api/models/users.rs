@@ -83,7 +83,7 @@ pub struct UserUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub auto_topup_monthly_limit: Option<Option<f32>>,
     /// Account-wide zero-data-retention flag. Users may set this on their own
-    /// account; callers with UpdateAll on users may set it for any account.
+    /// account; trusted SSO platform managers may enable it for another account.
     /// Omit to leave unchanged.
     pub zero_data_retention: Option<bool>,
     /// Account setting: never fall over to an external provider. When on,
@@ -104,6 +104,28 @@ pub struct UserUpdate {
     /// by callers with UpdateAll on users. Omit to leave unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub toleration_preset: Option<Option<String>>,
+}
+
+impl UserUpdate {
+    /// Cross-account support updates may only enable retention protection.
+    pub fn is_enable_zdr_only(&self) -> bool {
+        matches!(
+            self,
+            Self {
+                zero_data_retention: Some(true),
+                display_name: None,
+                avatar_url: None,
+                roles: None,
+                batch_notifications_enabled: None,
+                low_balance_threshold: None,
+                auto_topup_amount: None,
+                auto_topup_threshold: None,
+                auto_topup_monthly_limit: None,
+                self_hosted_only: None,
+                toleration_preset: None,
+            }
+        )
+    }
 }
 
 /// Full user details returned by the API.
@@ -225,11 +247,22 @@ pub struct ListUsersQuery {
     pub search: Option<String>,
 }
 
+/// Verified authentication provenance. Never accepted from API input or serialized.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AuthMethod {
+    #[default]
+    NativeSession,
+    ApiKey,
+    TrustedSso,
+}
+
 /// The currently authenticated user's information.
 /// This is a subset of UserResponse containing only the fields relevant
 /// to the current session.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CurrentUser {
+    #[serde(skip)]
+    pub auth_method: AuthMethod,
     /// Unique identifier for the user
     #[schema(value_type = String, format = "uuid")]
     pub id: UserId,
@@ -277,6 +310,25 @@ pub struct UserOrganizationContext {
 }
 
 impl CurrentUser {
+    /// Resolve request privileges without changing the roles stored on the account.
+    /// Direct role checks must see the same ceiling as RequiresPermission.
+    pub fn with_auth_method(mut self, method: AuthMethod) -> Self {
+        self.auth_method = method;
+        if method != AuthMethod::TrustedSso {
+            self.is_admin = false;
+            self.roles
+                .retain(|role| !matches!(role, Role::PlatformManager | Role::BillingManager | Role::RequestViewer));
+            if !self.roles.contains(&Role::StandardUser) {
+                self.roles.push(Role::StandardUser);
+            }
+        }
+        self
+    }
+
+    pub fn is_sso_platform_manager(&self) -> bool {
+        self.auth_method == AuthMethod::TrustedSso && (self.is_admin || self.roles.contains(&Role::PlatformManager))
+    }
+
     #[cfg(test)]
     pub fn is_admin(&self) -> bool {
         self.is_admin
@@ -370,6 +422,7 @@ impl UserResponse {
 impl From<UserDBResponse> for CurrentUser {
     fn from(db: UserDBResponse) -> Self {
         Self {
+            auth_method: AuthMethod::NativeSession,
             id: db.id,
             username: db.username,
             email: db.email,
