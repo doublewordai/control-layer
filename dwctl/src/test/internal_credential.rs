@@ -15,7 +15,7 @@ use crate::auth::internal_credential::InternalCredentials;
 use crate::db::handlers::{Repository as _, api_keys::ApiKeys};
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::probes::db::ProbeManager;
-use crate::test::utils::{add_auth_headers, create_test_admin_user, create_test_config, create_test_user};
+use crate::test::utils::{add_auth_headers, create_test_admin_user, create_test_config, create_test_user_with_roles};
 
 const MODEL: &str = "gpt-4";
 
@@ -33,6 +33,11 @@ impl Harness {
     /// A live app on a real port (probes call `localhost:{port}/ai`), with one
     /// model on a mock upstream, granted to everyone, and a user with credit.
     async fn start(pool: &PgPool) -> Self {
+        Self::start_with(pool, |_| {}).await
+    }
+
+    /// As [`Self::start`], with `configure` applied to the config first.
+    async fn start_with(pool: &PgPool, configure: impl FnOnce(&mut crate::config::Config)) -> Self {
         let mock = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/chat/completions"))
@@ -51,6 +56,7 @@ impl Harness {
         config.background_services.onwards_sync.enabled = true;
         // Write each completed response row as soon as it arrives.
         config.background_services.task_workers.response_writer_batch_size = 1;
+        configure(&mut config);
         let app = crate::Application::new_with_pool(config.clone(), Some(pool.clone()), None)
             .await
             .expect("app");
@@ -93,7 +99,7 @@ impl Harness {
             .add_header(&h[1].0, &h[1].1)
             .await
             .assert_status_success();
-        let user = create_test_user(pool, Role::StandardUser).await;
+        let user = create_test_user_with_roles(pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
         server
             .post("/admin/api/v1/transactions")
             .add_header(&h[0].0, &h[0].1)
@@ -290,4 +296,150 @@ async fn background_playground_request_refused_inside_the_stack_is_recorded(pool
         h.mock.received_requests().await.unwrap_or_default().is_empty(),
         "the refused request never reached the upstream"
     );
+}
+
+/// The analytics row of the daemon's successful dispatch of a fusillade
+/// request: the key it authenticated as. Analytics are written asynchronously, so poll.
+async fn dispatched_as(pool: &PgPool, request_filter: &str, bind: Uuid) -> Option<Uuid> {
+    let query = format!(
+        "SELECT api_key_id FROM http_analytics WHERE {request_filter} AND fusillade_request_id IS NOT NULL AND status_code = 200 LIMIT 1"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let row: Option<Option<Uuid>> = sqlx::query_scalar(&query).bind(bind).fetch_optional(pool).await.unwrap();
+        if let Some(key) = row {
+            return key;
+        }
+        assert!(std::time::Instant::now() < deadline, "no analytics row for the dispatch");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Replace a key's stored plaintext with a decoy, keeping its hash. The key
+/// still authenticates, but a dispatch that presented the stored secret
+/// would now be refused, so only a dispatch by key id can succeed.
+async fn plant_decoy_secret(pool: &PgPool, id: Uuid) -> String {
+    let decoy = format!("sk-decoy-{}", Uuid::new_v4().simple());
+    sqlx::query("UPDATE api_keys SET secret = $2 WHERE id = $1")
+        .bind(id)
+        .bind(&decoy)
+        .execute(pool)
+        .await
+        .unwrap();
+    decoy
+}
+
+/// Batch and flex requests record the key id they run as (next to the key's
+/// secret, which the previous release still dispatches with), and the
+/// daemon's dispatch authenticates as that key with a fresh internal
+/// credential: a flex request as the caller's hidden batch key (or the
+/// caller's cap-scope child), a batch as the key the batch names. Each
+/// key's stored secret is a decoy, so the requests only succeed if the
+/// dispatch authenticates by key id rather than with what is stored.
+#[dwctl_test_macros::test]
+async fn daemon_dispatches_batch_and_flex_requests_as_their_key_id(pool: PgPool) {
+    let h = Harness::start_with(&pool, |config| {
+        config.background_services.batch_daemon.enabled = crate::config::DaemonEnabled::Always;
+        config.background_services.batch_daemon.claim_interval_ms = 50;
+    })
+    .await;
+    let caller = crate::test::utils::create_test_api_key_for_user(&pool, h.user.id).await;
+    let batch_key = hidden_key(&pool, h.user.id, ApiKeyPurpose::Batch).await;
+    let batch_secret = plant_decoy_secret(&pool, batch_key).await;
+    h.bg.sync_onwards_config(&pool).await.unwrap();
+
+    // Flex: the caller's key is resolved to the hidden batch key at submit.
+    let flex = || {
+        h.server
+            .post("/ai/v1/chat/completions")
+            .add_header("Authorization", format!("Bearer {}", caller.secret))
+            .json(&serde_json::json!({ "model": MODEL, "service_tier": "flex", "messages": [ { "role": "user", "content": "hi" } ] }))
+    };
+    let response = flex().await;
+    assert_eq!(response.status_code(), 200, "flex: {}", response.text());
+    assert_eq!(response.json::<serde_json::Value>()["choices"][0]["message"]["content"], "hi");
+    let stored: Vec<(String, Option<Uuid>)> =
+        sqlx::query_as("SELECT api_key, api_key_id FROM fusillade.request_templates_all WHERE file_id IS NULL")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stored,
+        vec![(batch_secret, Some(batch_key))],
+        "flex stores the key id and, for now, the (decoy) secret"
+    );
+    assert_eq!(
+        dispatched_as(&pool, "api_key_id = $1", batch_key).await,
+        Some(batch_key),
+        "flex dispatch authenticates as the hidden batch key"
+    );
+
+    // A capped caller's flex request runs on its cap-scope child.
+    let child = {
+        let mut conn = pool.acquire().await.unwrap();
+        ApiKeys::new(&mut conn).get_or_create_child_hidden_key(caller.id).await.unwrap()
+    };
+    plant_decoy_secret(&pool, child).await;
+    h.bg.sync_onwards_config(&pool).await.unwrap();
+    let response = flex().await;
+    assert_eq!(response.status_code(), 200, "capped flex: {}", response.text());
+    assert_eq!(dispatched_as(&pool, "api_key_id = $1", child).await, Some(child));
+
+    // Batch: the batch names the key it runs as.
+    let session = add_auth_headers(&h.user);
+    let jsonl = format!(
+        "{}\n",
+        serde_json::json!({ "custom_id": "r1", "method": "POST", "url": "/v1/chat/completions",
+            "body": { "model": MODEL, "messages": [ { "role": "user", "content": "hi" } ] } })
+    );
+    let file = h
+        .server
+        .post("/ai/v1/files")
+        .add_header(&session[0].0, &session[0].1)
+        .add_header(&session[1].0, &session[1].1)
+        .multipart(
+            axum_test::multipart::MultipartForm::new()
+                .add_text("purpose", "batch")
+                .add_part("file", axum_test::multipart::Part::bytes(jsonl.into_bytes()).file_name("in.jsonl")),
+        )
+        .await;
+    assert_eq!(file.status_code(), 201, "upload: {}", file.text());
+    let file = file.json::<serde_json::Value>();
+    let batch = h
+        .server
+        .post("/ai/v1/batches")
+        .add_header(&session[0].0, &session[0].1)
+        .add_header(&session[1].0, &session[1].1)
+        .json(&serde_json::json!({ "input_file_id": file["id"], "endpoint": "/v1/chat/completions", "completion_window": "24h" }))
+        .await;
+    assert_eq!(batch.status_code(), 201, "batch: {}", batch.text());
+    let batch_id: Uuid = batch.json::<serde_json::Value>()["id"]
+        .as_str()
+        .unwrap()
+        .trim_start_matches("batch_")
+        .parse()
+        .unwrap();
+    let (stored_key, named_key): (Option<String>, Option<Uuid>) =
+        sqlx::query_as("SELECT api_key, api_key_id FROM fusillade.batches WHERE id = $1")
+            .bind(batch_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let named_key = named_key.expect("the batch names its key");
+    assert_eq!(
+        named_key, batch_key,
+        "the batch runs as the hidden batch key, whose secret is a decoy"
+    );
+    assert_eq!(
+        stored_key,
+        Some(crate::test::utils::stored_secret(&pool, named_key).await),
+        "batches store the key id and, for now, its secret"
+    );
+    assert_eq!(
+        dispatched_as(&pool, "fusillade_batch_id = $1", batch_id).await,
+        Some(named_key),
+        "batch dispatch authenticates as the batch's key"
+    );
+
+    h.assert_no_token_reached_upstream().await;
 }

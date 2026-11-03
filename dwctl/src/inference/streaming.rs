@@ -60,6 +60,7 @@ impl ReplayFrame {
 pub async fn flex_stream_response<P, F>(
     request_manager: Arc<fusillade_arsenal::PostgresRequestManager<P>>,
     flex_input: fusillade::CreateFlexInput,
+    api_key_id: Option<uuid::Uuid>,
     request_id: uuid::Uuid,
     done_sentinel: bool,
     keystore: Option<crate::keystore::Keystore>,
@@ -73,7 +74,7 @@ where
 
     // Enqueue synchronously so an enqueue failure is a clean JSON 500 — it
     // happens before the stream opens, so we're not yet committed to a 200.
-    if let Err(e) = fusillade::Storage::create_flex(&*request_manager, flex_input).await {
+    if let Err(e) = request_manager.create_flex_as(flex_input, api_key_id).await {
         tracing::error!(error = %e, "Failed to create streaming flex batch in fusillade");
         return axum::response::Response::builder()
             .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
