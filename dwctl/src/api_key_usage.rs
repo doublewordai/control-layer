@@ -11,7 +11,9 @@
 //! - realtime inference through onwards (the response carries
 //!   [`onwards::AuthenticatedApiKeyId`]),
 //! - flex and background submissions, which the inference middleware accepts
-//!   without passing through onwards,
+//!   without passing through onwards, noted once the key is resolved so later
+//!   refusals still count,
+//! - `/ai/v1/models`, which dwctl answers itself,
 //! - every route that authenticates with the `CurrentUser` extractor: files,
 //!   batches and the management API.
 //!
@@ -25,9 +27,9 @@
 //! `last_used` can be up to two minutes behind the latest use: a use waits up
 //! to [`FLUSH_INTERVAL`] in memory, and a flush skips a key whose stored value
 //! is less than [`FLUSH_INTERVAL`] older than the new one, so several replicas
-//! do not all rewrite the same row each minute. Uses noted after shutdown
-//! begins, and uses whose flush fails at shutdown, are lost. Keys not used
-//! since this feature shipped stay `NULL`.
+//! do not all rewrite the same row each minute. The flusher stops after HTTP
+//! draining, so its last flush includes drained requests; uses are lost only
+//! if that flush fails. Keys not used since this feature shipped stay `NULL`.
 //!
 //! Updates that touch only `last_used` do not reload the onwards key cache:
 //! `notify_api_keys_config_change()` ignores that column.
@@ -121,8 +123,7 @@ impl ApiKeyUsage {
 }
 
 /// AI proxy middleware: notes the key named by the response's
-/// [`AuthenticatedApiKeyId`], which onwards sets for realtime requests and the
-/// inference middleware sets for queued submissions.
+/// [`AuthenticatedApiKeyId`], which onwards sets on the requests it authenticates.
 pub async fn record_proxy_key_use(State(usage): State<ApiKeyUsage>, request: Request, next: Next) -> Response {
     let response = next.run(request).await;
     if let Some(AuthenticatedApiKeyId(api_key_id)) = response.extensions().get() {
@@ -238,6 +239,32 @@ mod tests {
 
         assert_eq!(usage.flush(&pool).await.unwrap(), 1);
         assert!(last_used(&pool, key).await.is_some());
+    }
+
+    #[dwctl_test_macros::test]
+    async fn flusher_writes_uses_noted_while_http_drains(pool: PgPool) {
+        let key = new_key(&pool).await;
+        let usage = ApiKeyUsage::default();
+        let shutdown = crate::BackgroundShutdownTokens::new(CancellationToken::new());
+        let flusher = tokio::spawn(run_api_key_usage_flusher(pool.clone(), usage.clone(), shutdown.after_http_drain()));
+
+        // SIGTERM stops ordinary services, but accepted requests still
+        // authenticate keys until the HTTP drain completes.
+        shutdown.begin_http_drain();
+        assert!(!shutdown.task_is_shutting_down(crate::API_KEY_USAGE_TASK_NAME));
+        usage.record(key);
+        assert_eq!(last_used(&pool, key).await, None);
+
+        shutdown.finish_http_drain();
+        assert!(shutdown.task_is_shutting_down(crate::API_KEY_USAGE_TASK_NAME));
+        tokio::time::timeout(Duration::from_secs(5), flusher)
+            .await
+            .expect("flusher stops after the HTTP drain")
+            .expect("flusher does not panic");
+        assert!(
+            last_used(&pool, key).await.is_some(),
+            "the final flush includes the drained request"
+        );
     }
 
     #[dwctl_test_macros::test]

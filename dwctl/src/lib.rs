@@ -2649,8 +2649,8 @@ pub async fn build_router(
         onwards_router
     };
 
-    // Outer to inference routing, so it sees the key on queued submissions
-    // that inference routing answers itself as well as on onwards responses.
+    // Notes the key onwards authenticated. Queued submissions skip onwards;
+    // the inference middleware notes their key itself.
     let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
         state.api_key_usage.clone(),
         api_key_usage::record_proxy_key_use,
@@ -3050,17 +3050,22 @@ async fn record_provider_request_id(request: axum::extract::Request, next: middl
 struct BackgroundShutdownTokens {
     /// Stops daemons and other background work as soon as HTTP draining begins.
     services: tokio_util::sync::CancellationToken,
-    /// Stops the responses writer only after accepted HTTP requests have drained.
-    responses_writer: tokio_util::sync::CancellationToken,
+    /// Stops the tasks in [`AFTER_HTTP_DRAIN_TASKS`] only after accepted HTTP
+    /// requests have drained.
+    after_http_drain: tokio_util::sync::CancellationToken,
 }
 
 const RESPONSES_WRITER_TASK_NAME: &str = "responses-writer";
+const API_KEY_USAGE_TASK_NAME: &str = "api-key-usage";
+/// Tasks that persist what accepted HTTP requests produce, so they keep
+/// running until those requests have finished.
+const AFTER_HTTP_DRAIN_TASKS: [&str; 2] = [RESPONSES_WRITER_TASK_NAME, API_KEY_USAGE_TASK_NAME];
 
 impl BackgroundShutdownTokens {
     fn new(services: tokio_util::sync::CancellationToken) -> Self {
         Self {
             services,
-            responses_writer: tokio_util::sync::CancellationToken::new(),
+            after_http_drain: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -3068,8 +3073,8 @@ impl BackgroundShutdownTokens {
         self.services.clone()
     }
 
-    fn responses_writer(&self) -> tokio_util::sync::CancellationToken {
-        self.responses_writer.clone()
+    fn after_http_drain(&self) -> tokio_util::sync::CancellationToken {
+        self.after_http_drain.clone()
     }
 
     /// Stop new background work while the HTTP server drains accepted requests.
@@ -3077,18 +3082,18 @@ impl BackgroundShutdownTokens {
         self.services.cancel();
     }
 
-    /// Stop and flush the responses writer after every accepted request has finished.
+    /// Stop and flush the post-drain tasks after every accepted request has finished.
     fn finish_http_drain(&self) {
         self.services.cancel();
-        self.responses_writer.cancel();
+        self.after_http_drain.cancel();
     }
 
-    /// Whether a task's own shutdown phase has begun. The responses writer
-    /// remains supervised while HTTP requests drain because it is still
-    /// responsible for persisting their completion records.
+    /// Whether a task's own shutdown phase has begun. Post-drain tasks remain
+    /// supervised while HTTP requests drain because they still persist what
+    /// those requests produce (completion records, API key uses).
     fn task_is_shutting_down(&self, task_name: &str) -> bool {
-        if task_name == RESPONSES_WRITER_TASK_NAME {
-            self.responses_writer.is_cancelled()
+        if AFTER_HTTP_DRAIN_TASKS.contains(&task_name) {
+            self.after_http_drain.is_cancelled()
         } else {
             self.services.is_cancelled()
         }
@@ -4222,13 +4227,14 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
     }
 
     // Every replica notes the API keys it authenticates and writes their
-    // latest use to `api_keys.last_used` once a minute.
+    // latest use to `api_keys.last_used` once a minute. It stops after HTTP
+    // draining so its final flush includes the requests that drained.
     let api_key_usage = api_key_usage::ApiKeyUsage::default();
     {
         let flusher_pool = dyn_pools.clone();
         let flusher_usage = api_key_usage.clone();
-        let flusher_shutdown = shutdown_token.clone();
-        background_tasks.spawn("api-key-usage", async move {
+        let flusher_shutdown = shutdown_tokens.after_http_drain();
+        background_tasks.spawn(API_KEY_USAGE_TASK_NAME, async move {
             api_key_usage::run_api_key_usage_flusher(flusher_pool, flusher_usage, flusher_shutdown).await;
             Ok(())
         });
@@ -4320,7 +4326,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
             request_manager.clone(),
             config.background_services.task_workers.response_writer_batch_size,
         );
-        let writer_shutdown = shutdown_tokens.responses_writer();
+        let writer_shutdown = shutdown_tokens.after_http_drain();
         background_tasks.spawn(RESPONSES_WRITER_TASK_NAME, async move {
             writer.run(writer_shutdown).await;
             Ok(())
@@ -4741,6 +4747,7 @@ impl Application {
             keystore: bg_services.keystore.clone(),
             key_policy_cache: bg_services.key_policy_cache.clone(),
             sse_buffer_limit: config.onwards.sse_buffer_limit,
+            api_key_usage: bg_services.api_key_usage.clone(),
         };
 
         // Build onwards router from targets with body transform + response sanitization.

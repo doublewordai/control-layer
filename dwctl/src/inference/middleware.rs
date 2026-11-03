@@ -85,6 +85,8 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     /// Pending-byte limit for an unfinished SSE event (`onwards.sse_buffer_limit`),
     /// used when applying the client's usage choice to a realtime stream.
     pub sse_buffer_limit: usize,
+    /// Notes the client's key on queued submissions, which skip onwards.
+    pub api_key_usage: crate::api_key_usage::ApiKeyUsage,
 }
 
 /// Middleware that routes inference requests based on service_tier and background.
@@ -521,7 +523,12 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     };
     let queued_batch_key = if is_daemon_processed {
         match resolve_flex_batch_api_key(&state.dwctl_pool.write(), api_key.as_deref()).await {
-            Ok(Some(key)) => Some(key),
+            Ok(Some(key)) => {
+                // Queued requests skip onwards, so note the client's key here,
+                // before later checks can refuse the request.
+                state.api_key_usage.record(key.api_key_id);
+                Some(key)
+            }
             Ok(None) => {
                 tracing::warn!(service_tier = %service_tier, "Queued API key disappeared before hidden batch-key resolution");
                 let response = Response::builder()
@@ -744,9 +751,6 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 request_value.to_string()
             };
 
-            // Queued submissions bypass onwards, so name the client's key on the
-            // response here for `api_key_usage` to note.
-            let queued_key_id = queued_batch_key.as_ref().map(|key| key.api_key_id);
             let queued_api_key = queued_batch_key
                 .as_ref()
                 .map(|key| key.secret.clone())
@@ -781,8 +785,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                     created_by: queued_created_by,
                     metadata: queued_metadata,
                 };
-                let response = handle_background(&state, background_input, &resp_id, model).await;
-                return with_authenticated_key(response, queued_key_id);
+                return handle_background(&state, background_input, &resp_id, model).await;
             }
 
             // INVARIANT: the daemon dispatches this job back through the loopback
@@ -807,14 +810,13 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 metadata: queued_metadata,
             };
 
-            let response = match (is_chat_completions_api, flex_stream) {
+            match (is_chat_completions_api, flex_stream) {
                 (true, true) => handle_chat_completion_flex_streaming(&state, flex_input, request_id, flex_stream_include_usage).await,
                 (true, false) => handle_chat_completion_flex(&state, flex_input, request_id).await,
                 // Responses (embeddings flex was downgraded to realtime above).
                 (false, true) => handle_responses_flex_streaming(&state, flex_input, request_id).await,
                 (false, false) => handle_flex(&state, flex_input, &resp_id, model, background).await,
-            };
-            with_authenticated_key(response, queued_key_id)
+            }
         }
     }
 }
@@ -909,13 +911,6 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) 
         key_owner_id,
         verified,
     }))
-}
-
-fn with_authenticated_key(mut response: Response, api_key_id: Option<uuid::Uuid>) -> Response {
-    if let Some(api_key_id) = api_key_id {
-        response.extensions_mut().insert(onwards::AuthenticatedApiKeyId(api_key_id));
-    }
-    response
 }
 
 /// Resolve the background capability from the human who created an API key.
