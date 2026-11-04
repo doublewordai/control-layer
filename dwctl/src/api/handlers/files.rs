@@ -168,22 +168,9 @@ fn validate_endpoint_model_type(url: &str, model: &str, model_type: &ModelType) 
 }
 
 impl OpenAIBatchRequest {
-    /// Transform OpenAI format to internal format
-    ///
-    /// # Arguments
-    /// * `endpoint` - The target endpoint (e.g., "http://localhost:8080/ai")
-    /// * `api_key` - The API key to inject for request execution
-    /// * `accessible_models` - Model type and effective reasoning policy by alias
-    fn to_internal(
-        &self,
-        endpoint: &str,
-        api_key: String,
-        accessible_models: &HashMap<String, AccessibleBatchModel>,
-        retired_models: &HashMap<String, String>,
-        allowed_url_paths: &[String],
-        tolerations: &AccountTolerations,
-        class_routes: &HashMap<String, String>,
-    ) -> Result<fusillade::RequestTemplateInput> {
+    /// Transform OpenAI format to internal format, validated and routed by the
+    /// upload's context (target endpoint, API key, accessible models and so on).
+    fn to_internal(&self, ctx: &FileRequestContext) -> Result<fusillade::RequestTemplateInput> {
         // Validate custom_id is safe for HTTP headers
         validate_custom_id(&self.custom_id)?;
 
@@ -191,7 +178,7 @@ impl OpenAIBatchRequest {
         let _validated_method = self.method.parse::<AllowedHttpMethod>()?;
 
         // Validate URL path
-        validate_url_path(&self.url, allowed_url_paths)?;
+        validate_url_path(&self.url, &ctx.allowed_url_paths)?;
 
         // Extract model from body if present
         let model = self
@@ -206,7 +193,7 @@ impl OpenAIBatchRequest {
         // Batch work always runs on the model's standard class, and model
         // aliases never contain ':', so any suffix is refused.
         if has_class_suffix(&model) {
-            let message = match class_routes.get(&model) {
+            let message = match ctx.class_routes.get(&model) {
                 Some(standard) => format!("Model '{model}' is available for realtime requests only; use '{standard}' in batch files."),
                 None => format!("Model '{model}' has not been configured or is not available to user."),
             };
@@ -214,13 +201,16 @@ impl OpenAIBatchRequest {
         }
 
         // Validate model access
-        let accessible_model = accessible_models.get(&model).ok_or_else(|| match retired_models.get(&model) {
-            Some(message) => Error::Gone { message: message.clone() },
-            None => Error::ModelAccessDenied {
-                model_name: model.clone(),
-                message: format!("Model '{}' has not been configured or is not available to user.", model),
-            },
-        })?;
+        let accessible_model = ctx
+            .accessible_models
+            .get(&model)
+            .ok_or_else(|| match ctx.retired_models.get(&model) {
+                Some(message) => Error::Gone { message: message.clone() },
+                None => Error::ModelAccessDenied {
+                    model_name: model.clone(),
+                    message: format!("Model '{}' has not been configured or is not available to user.", model),
+                },
+            })?;
 
         // Validate endpoint matches model type (skip if model type is unknown)
         if let Some(model_type) = &accessible_model.model_type {
@@ -250,7 +240,7 @@ impl OpenAIBatchRequest {
         // toleration list for this line's model, exactly as its realtime and
         // flex requests do. Applied after the strip above so the client can
         // never override it.
-        if let Some(tolerations) = tolerations.for_model(&model) {
+        if let Some(tolerations) = ctx.tolerations.for_model(&model) {
             crate::inference::middleware::set_routing_tolerations(&mut sanitized_body, &tolerations);
         }
 
@@ -261,12 +251,12 @@ impl OpenAIBatchRequest {
 
         Ok(fusillade::RequestTemplateInput {
             custom_id: Some(self.custom_id.clone()),
-            endpoint: endpoint.to_string(),
+            endpoint: ctx.endpoint.clone(),
             method: self.method.clone(),
             path: self.url.clone(),
             body,
             model,
-            api_key: api_key.to_string(),
+            api_key: ctx.api_key.clone(),
         })
     }
 
@@ -889,15 +879,6 @@ fn create_file_stream(
     req_ctx: FileRequestContext,
     api_key_id: Option<uuid::Uuid>,
 ) -> FileStreamResult {
-    let FileRequestContext {
-        endpoint,
-        api_key,
-        accessible_models,
-        retired_models,
-        allowed_url_paths,
-        tolerations,
-        class_routes,
-    } = req_ctx;
     let normalizer = config.normalizer.clone();
     let normalizer_mode = config.normalizer_mode;
     let expiry_seconds = config.expiry_seconds.clone();
@@ -1111,15 +1092,7 @@ fn create_file_stream(
                                     match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
                                         Ok(openai_req) => {
                                             // Transform to internal format (includes model access validation)
-                                            match openai_req.to_internal(
-                                                &endpoint,
-                                                api_key.clone(),
-                                                &accessible_models,
-                                                &retired_models,
-                                                &allowed_url_paths,
-                                                &tolerations,
-                                                &class_routes,
-                                            ) {
+                                            match openai_req.to_internal(&req_ctx) {
                                                 Ok(mut template) => {
                                                     // Normalise image URLs in the per-template body
                                                     // before the size cap check, since substitution
@@ -1216,15 +1189,7 @@ fn create_file_stream(
 
                             match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
                                 Ok(openai_req) => {
-                                    match openai_req.to_internal(
-                                        &endpoint,
-                                        api_key.clone(),
-                                        &accessible_models,
-                                        &retired_models,
-                                        &allowed_url_paths,
-                                        &tolerations,
-                                        &class_routes,
-                                    ) {
+                                    match openai_req.to_internal(&req_ctx) {
                                         Ok(mut template) => {
                                             // Normalise image URLs in the trailing line as well.
                                             if let Err(e) = normalize_template_body_in_place(
