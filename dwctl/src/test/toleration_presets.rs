@@ -412,45 +412,29 @@ async fn a_model_preset_pins_an_otherwise_default_account(pool: PgPool) {
     assert_eq!(f.post_realtime().await["nvext"]["routing_constraints"]["tolerations"], json!([]));
 }
 
-/// A platform manager sets the preset through the admin API; a non-manager
-/// cannot, an unknown id is refused, and the preset is only visible back to a
-/// platform manager.
+/// Support cannot change a customer's serving policy. Provisioned presets still
+/// reach inference, and remain hidden from ordinary users.
 #[dwctl_test_macros::test]
-async fn a_platform_manager_sets_the_preset_through_the_admin_api(pool: PgPool) {
+async fn support_cannot_change_a_customer_preset(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let headers = add_auth_headers(&create_test_admin_user(&pool, Role::PlatformManager).await);
     let member = create_test_user_with_roles(&pool, vec![Role::StandardUser]).await;
     let member_headers = add_auth_headers(&member);
 
-    // Setting the preset; the GET must show it back to the manager.
-    let response = f
-        .server
-        .patch(&format!("/admin/api/v1/users/{}", f.user))
-        .add_header(&headers[0].0, &headers[0].1)
-        .add_header(&headers[1].0, &headers[1].1)
-        .json(&json!({"toleration_preset": "no-overflow"}))
-        .await;
-    response.assert_status_ok();
-    let updated = response.json::<Value>();
-    assert_eq!(updated["toleration_preset"], json!("no-overflow"), "{updated}");
+    for preset in [json!("no-overflow"), json!("does-not-exist"), Value::Null] {
+        f.server
+            .patch(&format!("/admin/api/v1/users/{}", f.user))
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"toleration_preset": preset}))
+            .await
+            .assert_status(StatusCode::FORBIDDEN);
+    }
 
-    // The preset reaches the request path on the next sync (the API write fires
-    // the notify trigger; refresh the cache the way the LISTEN/NOTIFY loop
-    // would, as `set_preset` does).
-    f.services.sync_key_policy(&pool).await.unwrap();
+    f.set_preset(Some("no-overflow")).await;
     let body = f.post_realtime().await;
     assert_eq!(body["nvext"]["routing_constraints"]["tolerations"], json!([]), "{body}");
 
-    // An unknown id is refused with a 400.
-    f.server
-        .patch(&format!("/admin/api/v1/users/{}", f.user))
-        .add_header(&headers[0].0, &headers[0].1)
-        .add_header(&headers[1].0, &headers[1].1)
-        .json(&json!({"toleration_preset": "does-not-exist"}))
-        .await
-        .assert_status(StatusCode::BAD_REQUEST);
-
-    // A plain member's GET omits the operator's routing decision entirely.
     let as_member_response = f
         .server
         .get(&format!("/admin/api/v1/users/{}", member.id))
@@ -458,10 +442,7 @@ async fn a_platform_manager_sets_the_preset_through_the_admin_api(pool: PgPool) 
         .add_header(&member_headers[1].0, &member_headers[1].1)
         .await;
     as_member_response.assert_status_ok();
-    let as_member = as_member_response.json::<Value>();
-    assert!(as_member.get("toleration_preset").is_none(), "{as_member}");
-
-    // A plain member cannot set a preset on their own account.
+    assert!(as_member_response.json::<Value>().get("toleration_preset").is_none());
     f.server
         .patch(&format!("/admin/api/v1/users/{}", member.id))
         .add_header(&member_headers[0].0, &member_headers[0].1)
@@ -469,19 +450,7 @@ async fn a_platform_manager_sets_the_preset_through_the_admin_api(pool: PgPool) 
         .json(&json!({"toleration_preset": "no-overflow"}))
         .await
         .assert_status(StatusCode::FORBIDDEN);
-
-    // Clearing the preset: `null` maps to no preset.
-    let cleared_response = f
-        .server
-        .patch(&format!("/admin/api/v1/users/{}", f.user))
-        .add_header(&headers[0].0, &headers[0].1)
-        .add_header(&headers[1].0, &headers[1].1)
-        .json(&json!({"toleration_preset": null}))
-        .await;
-    cleared_response.assert_status_ok();
-    let cleared = cleared_response.json::<Value>();
-    assert!(cleared["toleration_preset"].is_null(), "{cleared}");
-    f.services.sync_key_policy(&pool).await.unwrap();
+    f.set_preset(None).await;
     let body = f.post_realtime().await;
     assert!(body["nvext"]["routing_constraints"]["tolerations"].is_null(), "{body}");
 }

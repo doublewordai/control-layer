@@ -7,6 +7,7 @@ use onwards::{
 use tokio::{sync::mpsc, time::timeout};
 use tokio_util::sync::CancellationToken;
 
+use crate::db::handlers::api_keys::ApiKeys;
 use crate::sync::onwards_config::{OnwardsTarget, SyncConfig, convert_to_config_file, parse_notify_payload};
 
 #[test]
@@ -68,11 +69,22 @@ const KEY_B_SECRET: &str = "sk-cache-b";
 const KEY_BATCH_SECRET: &str = "sk-cache-batch";
 
 fn pool_has_key(pools: &onwards::target::TargetPools, key: &str) -> bool {
-    let expected = KeyHash::from(key.to_string());
+    pool_has_key_hash(pools, KeyHash::from(key.to_string()))
+}
+
+fn pool_has_key_hash(pools: &onwards::target::TargetPools, expected: KeyHash) -> bool {
     pools
         .default_pool()
         .keys()
         .is_some_and(|keys| keys.iter().any(|candidate| candidate == &expected))
+}
+
+/// The stored secret of `parent`'s cap-scope child key, created if missing.
+async fn child_secret(pool: &sqlx::PgPool, parent: uuid::Uuid) -> String {
+    let mut conn = pool.acquire().await.unwrap();
+    let mut keys = ApiKeys::new(&mut conn);
+    let id = keys.get_or_create_child_hidden_key(parent).await.unwrap();
+    keys.legacy_dispatch_secret(id).await.unwrap()
 }
 
 fn pool_keys_len(pools: &onwards::target::TargetPools) -> usize {
@@ -777,8 +789,6 @@ async fn test_allow_negative_balance_preserves_access_restrictions(pool: sqlx::P
 /// sync provides).
 #[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered", "cache_balance_user_a_positive")))]
 async fn test_spend_cap_toggles_scope_access_on_reload(pool: sqlx::PgPool) {
-    use crate::db::handlers::api_keys::ApiKeys;
-
     let key_a_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE secret = $1")
         .bind(KEY_A_SECRET)
         .fetch_one(&pool)
@@ -791,11 +801,7 @@ async fn test_spend_cap_toggles_scope_access_on_reload(pool: sqlx::PgPool) {
         .execute(&pool)
         .await
         .unwrap();
-    let child_secret = {
-        let mut conn = pool.acquire().await.unwrap();
-        let (secret, _) = ApiKeys::new(&mut conn).get_or_create_child_hidden_key(key_a_id).await.unwrap();
-        secret
-    };
+    let child_secret = child_secret(&pool, key_a_id).await;
 
     // Under the cap: both scope keys are eligible for the paid pool.
     let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
@@ -873,7 +879,7 @@ async fn test_cache_shape_batch_escalation_access_for_private_alias(pool: sqlx::
 /// them would 403 at onwards key auth.
 #[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_composite")))]
 async fn test_continuation_key_reaches_gated_and_priced_composites(pool: sqlx::PgPool) {
-    let secret = crate::continuation::provision_global_key(&pool).await.unwrap();
+    let key_hash = KeyHash::from_bytes(crate::continuation::provision_global_key(&pool).await.unwrap());
 
     let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
 
@@ -882,7 +888,7 @@ async fn test_continuation_key_reaches_gated_and_priced_composites(pool: sqlx::P
     // key fails the gates.
     let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
     assert!(
-        pool_has_key(composite.value(), &secret),
+        pool_has_key_hash(composite.value(), key_hash),
         "the continuation key must be in a gated, priced composite's keyset"
     );
 
@@ -890,7 +896,7 @@ async fn test_continuation_key_reaches_gated_and_priced_composites(pool: sqlx::P
     // exemption through the second (non-composite) keyset query.
     let private = targets.targets.get("regular-private").expect("regular-private should exist");
     assert!(
-        pool_has_key(private.value(), &secret),
+        pool_has_key_hash(private.value(), key_hash),
         "the continuation key must be in a group-restricted regular model's keyset"
     );
 }
@@ -1486,8 +1492,8 @@ async fn test_api_keys_noop_upsert_does_not_trigger_notify(pool: sqlx::PgPool) {
     let key_id = {
         let mut tx = pool.begin().await.unwrap();
         let mut repo = ApiKeys::new(&mut tx);
-        let (_secret, id) = repo
-            .get_or_create_hidden_key_with_id(user.id, ApiKeyPurpose::Realtime, user.id)
+        let id = repo
+            .get_or_create_hidden_key(user.id, ApiKeyPurpose::Realtime, user.id)
             .await
             .unwrap();
         tx.commit().await.unwrap();
@@ -2158,7 +2164,9 @@ async fn organisation_prices_gate_balance_and_capped_root_and_child(pool: sqlx::
         .unwrap();
     let child = {
         let mut db = pool.acquire().await.unwrap();
-        ApiKeys::new(&mut db).get_or_create_child_hidden_key(key_id).await.unwrap().0
+        let mut keys = ApiKeys::new(&mut db);
+        let id = keys.get_or_create_child_hidden_key(key_id).await.unwrap();
+        keys.legacy_dispatch_secret(id).await.unwrap()
     };
     // These aliases are generally free: only this customer's deal is paid.
     sqlx::query("INSERT INTO model_tariffs(deployed_model_id,user_id,name,input_price_per_token,output_price_per_token,api_key_purpose) SELECT id,$1,'org-paid',1,1,'realtime' FROM deployed_models WHERE alias IN ('regular-public','composite-priority')")
@@ -2265,7 +2273,9 @@ async fn zero_customer_deals_on_paid_models_do_not_bypass_credit_or_caps(pool: s
         .unwrap();
     let child = {
         let mut db = pool.acquire().await.unwrap();
-        ApiKeys::new(&mut db).get_or_create_child_hidden_key(key_id).await.unwrap().0
+        let mut keys = ApiKeys::new(&mut db);
+        let id = keys.get_or_create_child_hidden_key(key_id).await.unwrap();
+        keys.legacy_dispatch_secret(id).await.unwrap()
     };
     // A generally paid model stays credit-gated even when this customer's
     // all-class or class-specific deal is zero.

@@ -64,31 +64,32 @@ pub struct RejectionContext {
 }
 
 impl RejectionContext {
-    /// The caller and traffic kind, from the request's bearer token and
-    /// headers. The model is added once it resolves to a configured alias.
-    pub(crate) fn from_request<T: HttpClient>(state: &AppState<T>, headers: &HeaderMap) -> Self {
+    /// The caller and traffic kind, from the key the request presents (see
+    /// [`crate::auth::presented_key`]) and its headers. The model is added
+    /// once it resolves to a configured alias.
+    pub(crate) fn from_request<T: HttpClient>(
+        state: &AppState<T>,
+        headers: &HeaderMap,
+        key: Option<KeyHash>,
+    ) -> Self {
         let dispatched = state
             .first_token_timeout_exempt_header
             .as_deref()
             .is_some_and(|header| headers.contains_key(header));
-        Self::new(&state.targets, headers, dispatched)
+        Self::for_key(&state.targets, key.as_ref(), dispatched)
     }
 
-    /// The caller, from the request's bearer token and `targets`' key labels.
-    /// `dispatched` marks traffic sent by a batch dispatcher rather than a
-    /// client waiting for the answer.
-    pub(crate) fn new(targets: &Targets, headers: &HeaderMap, dispatched: bool) -> Self {
-        let api_key = headers
-            .get("authorization")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "));
-        Self::for_api_key(targets, api_key, dispatched)
-    }
-
-    /// As [`new`](Self::new), for a gateway that has already resolved the
-    /// request's API key under its own protocol's rules.
+    /// As [`for_key`](Self::for_key), for a gateway that has already resolved
+    /// the request's API key under its own protocol's rules.
     pub fn for_api_key(targets: &Targets, api_key: Option<&str>, dispatched: bool) -> Self {
-        let labels = api_key.and_then(|key| targets.key_labels.get(&KeyHash::of(key)));
+        Self::for_key(targets, api_key.map(KeyHash::of).as_ref(), dispatched)
+    }
+
+    /// The caller, from the hash of the key it presents and `targets`' key
+    /// labels. `dispatched` marks traffic sent by a batch dispatcher rather
+    /// than a client waiting for the answer.
+    pub fn for_key(targets: &Targets, key: Option<&KeyHash>, dispatched: bool) -> Self {
+        let labels = key.and_then(|key| targets.key_labels.get(key));
         let label = |name: &str| labels.as_ref().and_then(|labels| labels.get(name).cloned());
         Self {
             authenticated: labels.is_some(),
@@ -97,7 +98,7 @@ impl RejectionContext {
                 account_id: label(serving::ACCOUNT_LABEL),
                 account_name: label(serving::ACCOUNT_DISPLAY_NAME_LABEL)
                     .or_else(|| label(serving::ACCOUNT_NAME_LABEL)),
-                api_key_id: label("api_key_id").and_then(|id| id.parse().ok()),
+                api_key_id: label(crate::auth::API_KEY_ID_LABEL).and_then(|id| id.parse().ok()),
                 key_purpose: label("purpose"),
             },
             traffic: if dispatched { "dispatched" } else { "realtime" },

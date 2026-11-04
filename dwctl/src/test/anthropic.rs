@@ -65,8 +65,8 @@ async fn seed_model_and_key(server: &TestServer, pool: &PgPool, mock_uri: &str) 
 
     let key: serde_json::Value = server
         .post(&format!("/admin/api/v1/users/{}/api-keys", user.id))
-        .add_header(&h[0].0, &h[0].1)
-        .add_header(&h[1].0, &h[1].1)
+        .add_header("x-doubleword-user", user.external_user_id.as_deref().unwrap())
+        .add_header("x-doubleword-email", &user.email)
         .json(&serde_json::json!({ "purpose": "realtime", "name": "anthropic e2e key" }))
         .await
         .json();

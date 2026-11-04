@@ -215,8 +215,9 @@ pub struct Observation {
     pub timestamp: DateTime<Utc>,
     /// The alias the request named, as `http_analytics.model` records it.
     pub model: Option<String>,
-    /// The bearer token, resolved to the billing principal off the request path.
-    pub api_key: Option<String>,
+    /// The hash of the key the request presented, resolved to the billing
+    /// principal off the request path.
+    pub api_key: Option<crate::crypto::ApiKeyHash>,
     pub path: String,
     pub body: Option<Bytes>,
 }
@@ -383,7 +384,15 @@ impl PrefixChainRecorder {
         self.hasher.chain_for(body)
     }
 
-    async fn finish(&self, model: String, api_key: String, chain: Chain, instance_id: Uuid, correlation_id: i64, ts: DateTime<Utc>) {
+    async fn finish(
+        &self,
+        model: String,
+        api_key: crate::crypto::ApiKeyHash,
+        chain: Chain,
+        instance_id: Uuid,
+        correlation_id: i64,
+        ts: DateTime<Utc>,
+    ) {
         let principal_id = match self.principal.resolve(&api_key).await {
             Ok(Some(p)) => p,
             Ok(None) => {
@@ -449,14 +458,23 @@ pub struct PrefixChainHandler {
     /// `(instance_id, correlation_id)`.
     instance_id: Uuid,
     config: crate::config::Config,
+    /// onwards' live key set, to attribute requests made with an internal
+    /// credential (see [`crate::auth::internal_credential::InternalAuthState::captured_key_hash`]).
+    internal_auth: crate::auth::internal_credential::InternalAuthState,
 }
 
 impl PrefixChainHandler {
-    pub fn new(recorder: Arc<PrefixChainRecorder>, instance_id: Uuid, config: crate::config::Config) -> Self {
+    pub fn new(
+        recorder: Arc<PrefixChainRecorder>,
+        instance_id: Uuid,
+        config: crate::config::Config,
+        internal_auth: crate::auth::internal_credential::InternalAuthState,
+    ) -> Self {
         Self {
             recorder,
             instance_id,
             config,
+            internal_auth,
         }
     }
 }
@@ -476,10 +494,12 @@ impl outlet::RequestHandler for PrefixChainHandler {
             skipped("not_chat");
             return;
         }
-        let api_key = match crate::request_logging::serializers::Auth::from_request(&request_data, &self.config) {
+        let bearer = match crate::request_logging::serializers::Auth::from_request(&request_data, &self.config) {
             crate::request_logging::serializers::Auth::ApiKey { bearer_token } => Some(bearer_token),
             crate::request_logging::serializers::Auth::None => None,
         };
+        let carried = crate::auth::internal_credential::carried_key_hash(&response_data.extensions);
+        let api_key = self.internal_auth.captured_key_hash(bearer.as_deref(), carried);
         let model = request_data
             .body
             .as_ref()
@@ -722,7 +742,7 @@ mod tests {
             correlation_id: 7,
             timestamp: Utc::now(),
             model: model.map(String::from),
-            api_key: api_key.map(String::from),
+            api_key: api_key.map(crate::crypto::hash_api_key),
             path: path.to_string(),
             body: body.map(Bytes::from),
         }

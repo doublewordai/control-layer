@@ -142,56 +142,9 @@ describe("Organizations", () => {
     expect(within(dialog).getByText("Edit Organization")).toBeInTheDocument();
   });
 
-  it("opens and cancels delete confirmation dialog", async () => {
-    const user = userEvent.setup();
-    const { container } = render(<Organizations />, {
-      wrapper: createWrapper(),
-    });
-
-    await waitFor(() => {
-      expect(
-        within(container).getByText("Acme Corporation"),
-      ).toBeInTheDocument();
-    });
-
-    const deleteButtons = within(container).getAllByTitle(
-      "Delete organization",
-    );
-    await user.click(deleteButtons[0]);
-
-    const dialog = await screen.findByRole("dialog");
-    expect(within(dialog).getByText("Delete Organization")).toBeInTheDocument();
-    expect(within(dialog).getByText(/Acme Corporation/)).toBeInTheDocument();
-
-    // Cancel should close dialog
-    await user.click(within(dialog).getByRole("button", { name: /cancel/i }));
-    await waitFor(() => {
-      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    });
-  });
-
-  it("deletes an organization", async () => {
-    const user = userEvent.setup();
-    const { container } = render(<Organizations />, {
-      wrapper: createWrapper(),
-    });
-
-    await waitFor(() => {
-      expect(
-        within(container).getByText("Acme Corporation"),
-      ).toBeInTheDocument();
-    });
-
-    const deleteButtons = within(container).getAllByTitle(
-      "Delete organization",
-    );
-    await user.click(deleteButtons[0]);
-
-    const dialog = await screen.findByRole("dialog");
-    await user.click(within(dialog).getByRole("button", { name: /^delete$/i }));
-
-    await waitFor(() => {
-      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    });
+  it("does not offer customer organization deletion in the support view", async () => {
+    const { container } = render(<Organizations />, { wrapper: createWrapper() });
+    await within(container).findByText("Acme Corporation");
+    expect(within(container).queryByTitle("Delete organization")).not.toBeInTheDocument();
   });
 });

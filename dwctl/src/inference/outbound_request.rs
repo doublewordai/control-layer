@@ -200,7 +200,8 @@ pub async fn outbound_request_middleware(State(cfg): State<OutboundConfig>, requ
 /// policy map.
 fn unit_prices(cfg: &OutboundConfig, parts: &axum::http::request::Parts, requested: &str) -> Option<crate::pricing::UnitPrices> {
     let value = |name: &str| parts.headers.get(name).and_then(|v| v.to_str().ok()).filter(|v| !v.is_empty());
-    let secret = value(header::AUTHORIZATION.as_str())?.strip_prefix("Bearer ")?;
+    let bearer = value(header::AUTHORIZATION.as_str()).and_then(|v| v.strip_prefix("Bearer "));
+    let key = crate::auth::internal_credential::presented_key_hash(&parts.extensions, bearer)?;
     let completion_window = value("x-fusillade-batch-completion-window");
     let batch_created_at = value("x-fusillade-batch-created-at").and_then(|v| v.parse::<chrono::DateTime<chrono::Utc>>().ok());
     let cache_reads = parts.extensions.get::<crate::prompt_cache::CacheReadSource>().copied();
@@ -214,7 +215,7 @@ fn unit_prices(cfg: &OutboundConfig, parts: &axum::http::request::Parts, request
         serving_class: name.class_label(),
         cache_reads,
     };
-    cfg.key_policy.unit_prices(secret, &query)
+    cfg.key_policy.unit_prices(&key, &query)
 }
 
 /// Inject the streaming usage flags into a JSON body, returning `Some(new_bytes)`

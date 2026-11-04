@@ -2909,7 +2909,7 @@ mod integration_tests {
                 serving_class: "standard",
                 cache_reads: reads,
             };
-            let prices = keys.unit_prices(&secret, &query).unwrap();
+            let prices = keys.unit_prices(&crate::crypto::hash_api_key(&secret), &query).unwrap();
 
             // The serving stack reports `cached` cache hits; the record carries
             // them only where the cache layer reports reads.
@@ -3738,7 +3738,7 @@ mod integration_tests {
         }
         let child = {
             let mut conn = pool.acquire().await.unwrap();
-            ApiKeys::new(&mut conn).get_or_create_child_hidden_key(parent).await.unwrap().1
+            ApiKeys::new(&mut conn).get_or_create_child_hidden_key(parent).await.unwrap()
         };
         let mut realtime = create_raw_record("org-class-cap", Some(parent), 1000, 500);
         realtime.resolved_serving_class = Some("interactive".into());
@@ -3800,8 +3800,7 @@ mod integration_tests {
             .unwrap();
         let child_id = {
             let mut conn = pool.acquire().await.unwrap();
-            let (_, id) = ApiKeys::new(&mut conn).get_or_create_child_hidden_key(parent_id).await.unwrap();
-            id
+            ApiKeys::new(&mut conn).get_or_create_child_hidden_key(parent_id).await.unwrap()
         };
 
         let mut listener = PgListener::connect_with(&pool).await.expect("Failed to create listener");

@@ -5,7 +5,7 @@
 
 use crate::AppState;
 use crate::affinity;
-use crate::auth::{self, KeyHash};
+use crate::auth;
 use crate::client::HttpClient;
 use crate::errors::{ErrorResponseBody, OnwardsErrorResponse};
 use crate::inflight::{BATCH_INFLIGHT_SCOPE, InflightSlot};
@@ -504,7 +504,8 @@ pub async fn target_message_handler<T: HttpClient>(
 
     async move {
 
-    let mut rejection = RejectionContext::from_request(&state, req.headers());
+    let mut rejection =
+        RejectionContext::from_request(&state, req.headers(), auth::presented_key(&req));
     let result = async {
 
     // Track inflight requests for observability. The guard is moved into GuardedStream
@@ -608,15 +609,11 @@ pub async fn target_message_handler<T: HttpClient>(
         }
     };
 
-    // Extract bearer token for authentication and rate limiting
-    let bearer_token = req
-        .headers()
-        .get("authorization")
-        .and_then(|auth_header| auth_header.to_str().ok())
-        .and_then(|auth_value| auth_value.strip_prefix("Bearer "))
-        // Keys are held by hash: hash the token once and use the hash for
-        // validation and every per-key lookup below.
-        .map(KeyHash::of);
+    // Extract the presented key for authentication and rate limiting. Keys
+    // are held by hash: the bearer token is hashed once (or an embedder's
+    // pre-authenticated key is used as is) and the hash is used for
+    // validation and every per-key lookup below.
+    let bearer_token = auth::presented_key(&req);
 
     // Validate API key using pool-level keys
     if let Some(keys) = pool.keys() {
@@ -651,7 +648,7 @@ pub async fn target_message_handler<T: HttpClient>(
                 .is_some_and(|keys| auth::validate_bearer_token(keys, token))
         })
         .and_then(|token| state.targets.key_labels.get(token))
-            .and_then(|labels| labels.get("api_key_id").cloned())
+            .and_then(|labels| labels.get(auth::API_KEY_ID_LABEL).cloned())
         .and_then(|id| id.parse::<Uuid>().ok());
 
     let result = async move {
@@ -2396,13 +2393,8 @@ pub async fn target_message_handler<T: HttpClient>(
 
 #[instrument(skip(state, req))]
 pub async fn models<T: HttpClient>(State(state): State<AppState<T>>, req: Request) -> Response {
-    // Extract bearer token from Authorization header
-    let bearer_token = req
-        .headers()
-        .get("authorization")
-        .and_then(|auth_header| auth_header.to_str().ok())
-        .and_then(|auth_value| auth_value.strip_prefix("Bearer "))
-        .map(KeyHash::of);
+    // The presented key: the bearer token's hash, or a pre-authenticated key.
+    let bearer_token = auth::presented_key(&req);
 
     // Filter targets based on bearer token permissions using pool-level keys
     let accessible_models: Vec<String> = state
@@ -2434,7 +2426,7 @@ pub async fn models<T: HttpClient>(State(state): State<AppState<T>>, req: Reques
     let authenticated_api_key_id = bearer_token
         .as_ref()
         .and_then(|token| state.targets.key_labels.get(token))
-        .and_then(|labels| labels.get("api_key_id").cloned())
+        .and_then(|labels| labels.get(auth::API_KEY_ID_LABEL).cloned())
         .and_then(|id| id.parse::<Uuid>().ok());
 
     // Create filtered response and retain the authenticated identity for
@@ -3287,6 +3279,7 @@ mod tests {
                 key_rate_limiters: std::sync::Arc::new(dashmap::DashMap::new()),
                 key_concurrency_limiters: std::sync::Arc::new(dashmap::DashMap::new()),
                 key_labels: std::sync::Arc::new(dashmap::DashMap::new()),
+                key_ids: std::sync::Arc::new(dashmap::DashMap::new()),
                 accounts: std::sync::Arc::new(dashmap::DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,

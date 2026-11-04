@@ -46,7 +46,6 @@ import {
   useFiles,
   useBatches,
   useOrganizationMembers,
-  useUsers,
   useConfig,
 } from "../../../../api/control-layer/hooks";
 import { dwctlApi } from "../../../../api/control-layer/client";
@@ -114,55 +113,25 @@ export function Batches({
   const asyncCompletionWindow =
     appConfig?.batches?.async_requests?.completion_window ?? "1h";
 
-  // Show User column for PlatformManagers (see all batches) or in org context (see org members)
+  // Member identities are visible only within the active organization.
   const isPlatformManager = userRoles.includes("PlatformManager");
-  const showUserColumn = isPlatformManager || isOrgContext;
+  const showUserColumn = isOrgContext;
   // Context and Source columns are used by the file table only
-  const showContextColumn = isPlatformManager;
+  const showContextColumn = false;
   const showSourceColumn = hasPermission("connections");
 
-  // Member filter:
-  // - Org context (all users): show org members dropdown (client-side filtered)
-  // - Personal context (PM only): show users via server-side search
-  const showMemberFilter = isOrgContext || (isPlatformManager && !isOrgContext);
-  const useServerSideMemberSearch = isPlatformManager && !isOrgContext;
-  const { data: orgMembers } = useOrganizationMembers(
-    activeOrganizationId || "",
+  // Organization members are filtered client-side by the command menu.
+  const showMemberFilter = isOrgContext;
+  const { data: orgMembers } = useOrganizationMembers(activeOrganizationId || "");
+  const memberList = React.useMemo(
+    () =>
+      isOrgContext
+        ? (orgMembers ?? [])
+            .filter((member) => member.status === "active" && member.user)
+            .map((member) => ({ id: member.user!.id, email: member.user!.email }))
+        : [],
+    [isOrgContext, orgMembers],
   );
-
-  // Server-side user search for PM personal mode
-  const [memberSearch, setMemberSearch] = useState("");
-  const debouncedMemberSearch = useDebounce(memberSearch, 300);
-  const { data: searchedUsers } = useUsers({
-    search: debouncedMemberSearch,
-    limit: 50,
-    enabled: useServerSideMemberSearch,
-  });
-
-  const memberList = React.useMemo(() => {
-    // Org context: show org members (client-side filtered by Command)
-    if (isOrgContext && orgMembers) {
-      return orgMembers
-        .filter((m) => m.status === "active" && m.user)
-        .map((m) => ({ id: m.user!.id, email: m.user!.email }));
-    }
-    // Personal context + PM: show server-side searched users.
-    // Deduplicate by email (a user may appear twice if they have both personal
-    // and org-created individual records). The personal member_id is used under
-    // the hood — the backend expands it to cover both personal and org contexts.
-    if (useServerSideMemberSearch && searchedUsers?.data) {
-      const seen = new Set<string>();
-      return searchedUsers.data
-        .filter((u) => u.user_type !== "organization")
-        .filter((u) => {
-          if (seen.has(u.email)) return false;
-          seen.add(u.email);
-          return true;
-        })
-        .map((u) => ({ id: u.id, email: u.email }));
-    }
-    return [];
-  }, [isOrgContext, useServerSideMemberSearch, orgMembers, searchedUsers]);
 
   // Member filter — only the id is persisted. The email is PII and there's
   // no need to keep coworker addresses in localStorage on a shared
@@ -219,7 +188,6 @@ export function Batches({
       return;
     }
     setSelectedMemberId("");
-    setMemberSearch("");
     setStatusFilter("all");
     setDateRange(undefined);
     filesPagination.handleFirstPage();
@@ -639,11 +607,7 @@ export function Batches({
     !selectedMemberId
       ? "All members"
       : displayedMemberEmail || "Selected member";
-  // Show member filter: always for PM personal mode (server-side search),
-  // only when org members exist for org context (client-side filtered)
-  const showMemberCombobox =
-    showMemberFilter &&
-    (useServerSideMemberSearch || memberList.length > 0);
+  const showMemberCombobox = showMemberFilter && memberList.length > 0;
   const memberFilterCombobox = showMemberCombobox && (
     <Popover open={memberPopoverOpen} onOpenChange={setMemberPopoverOpen}>
       <PopoverTrigger asChild>
@@ -661,14 +625,8 @@ export function Batches({
         </Button>
       </PopoverTrigger>
       <PopoverContent className="w-[280px] p-0" align="start">
-        <Command shouldFilter={!useServerSideMemberSearch}>
-          <CommandInput
-            placeholder="Search by email..."
-            value={useServerSideMemberSearch ? memberSearch : undefined}
-            onValueChange={
-              useServerSideMemberSearch ? setMemberSearch : undefined
-            }
-          />
+        <Command>
+          <CommandInput placeholder="Search by email..." />
           <CommandList>
             <CommandEmpty>No members found.</CommandEmpty>
             <CommandGroup>
@@ -676,7 +634,6 @@ export function Batches({
                 value="all-members"
                 onSelect={() => {
                   setSelectedMemberId("");
-                  setMemberSearch("");
                   setMemberPopoverOpen(false);
                   batchesPagination.handleFirstPage();
                   filesPagination.handleFirstPage();
@@ -696,7 +653,6 @@ export function Batches({
                   value={member.email}
                   onSelect={() => {
                     setSelectedMemberId(member.id);
-                    setMemberSearch("");
                     setMemberPopoverOpen(false);
                     batchesPagination.handleFirstPage();
                     filesPagination.handleFirstPage();

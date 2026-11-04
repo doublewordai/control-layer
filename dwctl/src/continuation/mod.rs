@@ -58,6 +58,8 @@ use moka::future::Cache;
 use sqlx::PgPool;
 
 use crate::UserId;
+use crate::crypto::ApiKeyHash;
+#[cfg(test)]
 use crate::crypto::hash_api_key;
 use crate::db::handlers::api_keys::ApiKeys;
 use crate::db::models::api_keys::ApiKeyPurpose;
@@ -82,19 +84,25 @@ pub fn global_key_owner() -> UserId {
     uuid::Uuid::nil()
 }
 
-/// Get or create the global hidden continuation key, returning its secret.
+/// Get or create the global hidden continuation key, returning its hash.
 ///
 /// Idempotent (`ON CONFLICT` upsert keyed on owner + purpose): the startup call
-/// guarantees existence/sync, and the resume middleware calls it again to
-/// obtain the secret without caring which call created the row.
-pub async fn provision_global_key(pool: &PgPool) -> anyhow::Result<String> {
+/// guarantees existence/sync, and the resume middleware calls it again
+/// without caring which call created the row. Resume legs are in-process, so
+/// they present the key by hash (an [`onwards::auth::PresentedKey`]
+/// extension) rather than by secret.
+pub async fn provision_global_key(pool: &PgPool) -> anyhow::Result<ApiKeyHash> {
     let owner = global_key_owner();
     let mut tx = pool.begin().await?;
-    let secret = ApiKeys::new(&mut tx)
+    let id = ApiKeys::new(&mut tx)
         .get_or_create_hidden_key(owner, ApiKeyPurpose::Continuation, owner)
         .await?;
+    let hash = sqlx::query_scalar!("SELECT secret_hash FROM api_keys WHERE id = $1", id)
+        .fetch_one(&mut *tx)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("continuation key {id} has no secret hash"))?;
     tx.commit().await?;
-    Ok(secret)
+    ApiKeyHash::try_from(hash.as_slice()).map_err(|_| anyhow::anyhow!("continuation key {id} has a malformed secret hash"))
 }
 
 /// Per-model continuation route configuration, read from the composite's
@@ -425,9 +433,8 @@ impl PurposeResolver {
         }
     }
 
-    pub async fn resolve(&self, token: &str) -> Option<ApiKeyPurpose> {
-        let token_hash = hash_api_key(token);
-        if let Some(cached) = self.l1.get(&token_hash).await {
+    pub async fn resolve(&self, token_hash: &ApiKeyHash) -> Option<ApiKeyPurpose> {
+        if let Some(cached) = self.l1.get(token_hash).await {
             return cached;
         }
         // Only a SUCCESSFUL lookup is cached. A transient DB failure must not
@@ -438,12 +445,12 @@ impl PurposeResolver {
         let Ok(mut conn) = self.pools.write().acquire().await else {
             return None;
         };
-        let looked_up = ApiKeys::new(&mut conn).get_user_info_by_secret(token).await;
+        let looked_up = ApiKeys::new(&mut conn).get_user_info_by_hash(token_hash).await;
         drop(conn);
         match looked_up {
             Ok(found) => {
                 let purpose = found.map(|(_, _, purpose)| purpose);
-                self.l1.insert(token_hash, purpose.clone()).await;
+                self.l1.insert(*token_hash, purpose.clone()).await;
                 purpose
             }
             Err(_) => None,
@@ -468,10 +475,13 @@ mod tests {
         let second = provision_global_key(&pool).await.unwrap();
         assert_eq!(first, second);
 
-        let row = sqlx::query!(r#"SELECT user_id, purpose, hidden FROM api_keys WHERE secret = $1"#, first)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let row = sqlx::query!(
+            r#"SELECT user_id, purpose, hidden FROM api_keys WHERE secret_hash = $1"#,
+            &first[..]
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(row.user_id, global_key_owner());
         assert_eq!(row.purpose, "continuation");
         assert!(row.hidden);
@@ -751,10 +761,11 @@ mod tests {
         let key = crate::test::utils::create_test_api_key_for_user(&pool, user.id).await;
 
         let resolver = PurposeResolver::new(pool);
-        assert_eq!(resolver.resolve(&key.secret).await, Some(ApiKeyPurpose::Realtime));
+        let hash = hash_api_key(&key.secret);
+        assert_eq!(resolver.resolve(&hash).await, Some(ApiKeyPurpose::Realtime));
         // Second call is served from the memo — still correct.
-        assert_eq!(resolver.resolve(&key.secret).await, Some(ApiKeyPurpose::Realtime));
-        assert_eq!(resolver.resolve("not-a-real-secret").await, None);
+        assert_eq!(resolver.resolve(&hash).await, Some(ApiKeyPurpose::Realtime));
+        assert_eq!(resolver.resolve(&hash_api_key("not-a-real-secret")).await, None);
     }
 
     #[test]

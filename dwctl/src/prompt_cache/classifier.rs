@@ -35,8 +35,9 @@ pub struct ClassifyRequest<'a> {
     pub model: &'a str,
     /// The raw request body (with `cache_control` markers intact).
     pub body: &'a [u8],
-    /// The validated bearer token, or `None` (un-scopable → no caching).
-    pub api_key: Option<&'a str>,
+    /// The hash of the validated key the request presented, or `None`
+    /// (un-scopable → no caching).
+    pub api_key: Option<crate::crypto::ApiKeyHash>,
     /// Pre-resolved billing principal, bypassing the `api_key` lookup.
     ///
     /// The serving path always has the bearer token. A *historical* replay
@@ -239,7 +240,7 @@ impl Classifier {
                 let Some(api_key) = req.api_key else {
                     return Ok(ClassifyOutcome::inactive());
                 };
-                let Some(resolved) = self.principal.resolve(api_key).await? else {
+                let Some(resolved) = self.principal.resolve(&api_key).await? else {
                     return Ok(ClassifyOutcome::inactive());
                 };
                 resolved
@@ -1109,7 +1110,7 @@ mod tests {
             virtual_model: ALIAS,
             model: ALIAS,
             body,
-            api_key: Some(secret),
+            api_key: Some(crate::crypto::hash_api_key(secret)),
             principal: None,
             route_has_blocks: true,
         }

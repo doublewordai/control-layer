@@ -28,7 +28,8 @@
 use std::{collections::HashMap, fmt};
 
 use crate::{
-    crypto::hash_api_key,
+    auth::internal_credential::presented_key_hash,
+    crypto::ApiKeyHash,
     db::errors::DbError,
     db::handlers::{Credits, api_keys::ApiKeys},
     errors::Error,
@@ -72,13 +73,14 @@ pub async fn error_enrichment_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response<Body> {
-    // Extract API key from request headers before passing to onwards
-    let api_key = request
+    // The presented API key, by hash, before passing to onwards
+    let bearer = request
         .headers()
         .get("authorization")
         .and_then(|h| h.to_str().ok())
         .and_then(|auth| auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer ")))
-        .map(|token| token.trim().to_string());
+        .map(str::trim);
+    let api_key = presented_key_hash(request.extensions(), bearer);
 
     // Extract request body to get model name for potential error enrichment
     let (parts, body) = request.into_parts();
@@ -368,7 +370,7 @@ struct SpendCapState {
 }
 
 #[instrument(skip_all, name = "dwctl.get_spend_cap_state")]
-async fn get_spend_cap_state(pool: PgPool, api_key: &str) -> Result<Option<SpendCapState>, DbError> {
+async fn get_spend_cap_state(pool: PgPool, api_key: &ApiKeyHash) -> Result<Option<SpendCapState>, DbError> {
     let row = sqlx::query!(
         r#"
         SELECT root.spend_limit AS "spend_limit!",
@@ -380,7 +382,7 @@ async fn get_spend_cap_state(pool: PgPool, api_key: &str) -> Result<Option<Spend
         LEFT JOIN api_key_spend_checkpoints ck ON ck.api_key_id = root.id
         WHERE ak.secret_hash = $1 AND ak.is_deleted = false AND root.spend_limit IS NOT NULL
         "#,
-        &hash_api_key(api_key)[..]
+        &api_key[..]
     )
     .fetch_optional(&pool)
     .await?;
@@ -429,7 +431,7 @@ const FLEX_DISPATCH_PURPOSE: &str = "batch";
 /// Returns `Ok(Some(purpose))` if a matching `deny` rule exists, where `purpose` is the
 /// `api_key_purpose` string stored on the rule (e.g. "batch"). Returns `Ok(None)` otherwise.
 #[instrument(skip(pool, api_key), name = "dwctl.check_modality_blocked")]
-pub async fn check_modality_blocked(pool: PgPool, api_key: &str, model_alias: &str) -> Result<Option<String>, DbError> {
+pub async fn check_modality_blocked(pool: PgPool, api_key: &ApiKeyHash, model_alias: &str) -> Result<Option<String>, DbError> {
     let mut conn = pool.acquire().await?;
 
     let purpose = sqlx::query_scalar!(
@@ -446,7 +448,7 @@ pub async fn check_modality_blocked(pool: PgPool, api_key: &str, model_alias: &s
         LIMIT 1
         "#,
         model_alias,
-        &hash_api_key(api_key)[..],
+        &api_key[..],
     )
     .fetch_optional(&mut *conn)
     .await?;
@@ -487,11 +489,11 @@ pub async fn check_modality_blocked_for_purpose(pool: PgPool, model_alias: &str,
 }
 
 #[instrument(skip_all, name = "dwctl.get_user_id_of_api_key")]
-pub async fn get_user_id_of_api_key(pool: PgPool, api_key: &str) -> Result<UserId, DbError> {
+pub async fn get_user_id_of_api_key(pool: PgPool, api_key: &ApiKeyHash) -> Result<UserId, DbError> {
     let mut conn = pool.acquire().await?;
     let mut api_keys_repo = ApiKeys::new(&mut conn);
     api_keys_repo
-        .get_user_id_by_secret(api_key)
+        .get_user_id_by_hash(api_key)
         .await?
         .ok_or_else(|| anyhow::anyhow!("API key not found or associated user doesn't exist").into())
 }
@@ -501,7 +503,7 @@ pub async fn get_user_id_of_api_key(pool: PgPool, api_key: &str) -> Result<UserI
 /// lookups keeps the 403 enrichment path (and the Flex check) to one by-secret
 /// query instead of fanning out.
 #[instrument(skip_all, name = "dwctl.get_api_key_user_and_purpose")]
-async fn get_api_key_user_and_purpose(pool: PgPool, api_key: &str) -> Result<Option<ApiKeyOwner>, DbError> {
+async fn get_api_key_user_and_purpose(pool: PgPool, api_key: &ApiKeyHash) -> Result<Option<ApiKeyOwner>, DbError> {
     let mut conn = pool.acquire().await?;
     let row = sqlx::query!(
         r#"
@@ -510,7 +512,7 @@ async fn get_api_key_user_and_purpose(pool: PgPool, api_key: &str) -> Result<Opt
         JOIN users u ON u.id = k.user_id
         WHERE k.secret_hash = $1 AND k.is_deleted = false
         "#,
-        &hash_api_key(api_key)[..]
+        &api_key[..]
     )
     .fetch_optional(&mut *conn)
     .await?;
@@ -547,7 +549,7 @@ impl ApiKeyOwner {
 /// An exempt account must not get a misleading insufficient-credit error when
 /// onwards denies a request for another reason (for example a key spending cap).
 #[instrument(skip_all)]
-async fn get_balance_of_api_key(pool: PgPool, api_key: &str) -> Result<Option<Decimal>, DbError> {
+async fn get_balance_of_api_key(pool: PgPool, api_key: &ApiKeyHash) -> Result<Option<Decimal>, DbError> {
     let user_id = get_user_id_of_api_key(pool.clone(), api_key).await?;
     let mut conn = pool.acquire().await?;
     Credits::new(&mut conn).get_balance_for_admission(user_id).await
@@ -592,7 +594,7 @@ pub async fn check_user_has_model_access(pool: PgPool, user_id: UserId, model_al
 /// Used by the inference middleware to fail fast on Flex requests that bypass
 /// `onwards` entirely — without the modality check here, a Batch-purpose key
 /// could send a Flex request and skip a deny rule onwards would have enforced.
-pub async fn validate_api_key_model_access(pool: PgPool, api_key: &str, model: &str) -> Result<(), ModelAccessRefusal> {
+pub async fn validate_api_key_model_access(pool: PgPool, api_key: &ApiKeyHash, model: &str) -> Result<(), ModelAccessRefusal> {
     // One by-secret lookup of the key's owner + purpose, reused below.
     let ApiKeyOwner { user_id, purpose, .. } = get_api_key_user_and_purpose(pool.clone(), api_key)
         .await
@@ -706,6 +708,7 @@ async fn retirement_message(pool: PgPool, model_alias: &str) -> Result<Option<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::hash_api_key;
     use crate::db::{
         handlers::{Credits, Repository as _, api_keys::ApiKeys},
         models::{
@@ -1526,7 +1529,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = validate_api_key_model_access(pool.clone(), &api_key.secret, "blocked-model").await;
+        let result = validate_api_key_model_access(pool.clone(), &hash_api_key(&api_key.secret), "blocked-model").await;
         let err = result.expect_err("expected modality-blocked rejection");
         assert!(
             err.to_string().contains("Batch") && err.to_string().contains("blocked-model") && err.to_string().contains("administrator"),
@@ -1536,7 +1539,7 @@ mod tests {
         // Sanity: a model without the deny rule still passes.
         let other_deployment_id = crate::test::utils::create_test_model(&pool, "open-model-name", "open-model", endpoint_id, user.id).await;
         add_deployment_to_group(&pool, other_deployment_id, group.id, user.id).await;
-        validate_api_key_model_access(pool.clone(), &api_key.secret, "open-model")
+        validate_api_key_model_access(pool.clone(), &hash_api_key(&api_key.secret), "open-model")
             .await
             .expect("expected access to be granted on a model without a deny rule");
     }
@@ -1585,7 +1588,7 @@ mod tests {
         .await
         .unwrap();
 
-        validate_api_key_model_access(pool.clone(), &api_key.secret, "async-only")
+        validate_api_key_model_access(pool.clone(), &hash_api_key(&api_key.secret), "async-only")
             .await
             .expect("Flex request must be allowed despite a realtime-only deny rule");
     }
@@ -1630,7 +1633,7 @@ mod tests {
         .await
         .unwrap();
 
-        let err = validate_api_key_model_access(pool.clone(), &api_key.secret, "no-batch")
+        let err = validate_api_key_model_access(pool.clone(), &hash_api_key(&api_key.secret), "no-batch")
             .await
             .expect_err("Flex request must be blocked by a batch deny rule (Flex runs as batch)");
         assert!(
@@ -1660,7 +1663,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = validate_api_key_model_access(pool.clone(), &api_key.secret, "any-model").await;
+        let result = validate_api_key_model_access(pool.clone(), &hash_api_key(&api_key.secret), "any-model").await;
         let err = result.expect_err("expected platform-purpose rejection");
         assert!(
             err.to_string().contains("platform") && err.to_string().contains("inference"),
@@ -1691,7 +1694,7 @@ mod tests {
         // The purpose gate must NOT fire for the system (nil) user. A
         // model-access error is acceptable - we only assert the key was not
         // rejected on purpose grounds.
-        if let Err(msg) = validate_api_key_model_access(pool.clone(), &api_key.secret, "any-model").await {
+        if let Err(msg) = validate_api_key_model_access(pool.clone(), &hash_api_key(&api_key.secret), "any-model").await {
             assert!(
                 !msg.to_string().contains("cannot be used for inference requests"),
                 "system key must be exempt from the purpose gate, got: {msg}"
@@ -1726,7 +1729,7 @@ mod tests {
             .await
             .unwrap();
 
-        let refusal = validate_api_key_model_access(pool.clone(), &api_key.secret, "retired-model")
+        let refusal = validate_api_key_model_access(pool.clone(), &hash_api_key(&api_key.secret), "retired-model")
             .await
             .expect_err("a retired model must be refused");
         assert!(matches!(refusal, ModelAccessRefusal::Retired(message) if message == "The model `retired-model` was shut down."));

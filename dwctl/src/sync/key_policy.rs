@@ -30,6 +30,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::config::ONWARDS_CONFIG_CHANGED_CHANNEL;
+#[cfg(test)]
 use crate::crypto::hash_api_key;
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::metrics::errors::component;
@@ -38,7 +39,7 @@ use crate::pricing::{PriceBook, PriceQuery, UnitPrices};
 use crate::scheduling::TolerationPresets;
 
 /// SHA-256 of an API key secret, as stored in `api_keys.secret_hash`.
-type KeyHash = [u8; 32];
+type KeyHash = crate::crypto::ApiKeyHash;
 
 /// The account-level policy a key inherits from its owner (`api_keys.user_id`,
 /// the organization for an org key).
@@ -118,8 +119,8 @@ impl AccountTolerations {
 /// reads as the permissive default: not ZDR, nothing disabled, Default preset.
 #[derive(Clone)]
 pub struct KeyPolicyCache {
-    /// Keyed by `hash_api_key(secret)`: the accessors take the presented
-    /// secret and hash it, so no plaintext key is held here.
+    /// Keyed by `hash_api_key(secret)`; the accessors take the hash of the
+    /// key a request presents, so no plaintext key is held here.
     inner: Arc<ArcSwap<HashMap<KeyHash, KeyPolicy>>>,
     /// The config presets a stored `toleration_preset` id resolves against.
     /// Shared by `Arc` (the map inside is immutable after construction), so a
@@ -154,49 +155,47 @@ impl KeyPolicyCache {
         }
     }
 
-    /// The policy for the api key `secret`, or the default for an unknown key.
+    /// The policy for the api key hashing to `key`, or the default for an unknown key.
     /// Hot-path safe.
-    pub fn policy(&self, secret: &str) -> KeyPolicy {
-        self.inner.load().get(&hash_api_key(secret)).cloned().unwrap_or_default()
+    pub fn policy(&self, key: &KeyHash) -> KeyPolicy {
+        self.inner.load().get(key).cloned().unwrap_or_default()
     }
 
-    /// The policy for `secret` if the key is present in the map, or `None` when
+    /// The policy for `key` if the key is present in the map, or `None` when
     /// it is absent (a key created since the last refresh, or one auth would
     /// reject). Unlike [`Self::policy`], this distinguishes a cache miss from a
     /// cached account on the permissive default, so a caller can decide whether
     /// a DB read is warranted. Hot-path safe.
-    pub fn policy_if_known(&self, secret: &str) -> Option<KeyPolicy> {
-        self.inner.load().get(&hash_api_key(secret)).cloned()
+    pub fn policy_if_known(&self, key: &KeyHash) -> Option<KeyPolicy> {
+        self.inner.load().get(key).cloned()
     }
 
-    /// Whether the api key `secret` belongs to a ZDR account. Hot-path safe.
-    pub fn is_zdr(&self, secret: &str) -> bool {
-        self.policy(secret).zdr
+    /// Whether the api key `key` belongs to a ZDR account. Hot-path safe.
+    pub fn is_zdr(&self, key: &KeyHash) -> bool {
+        self.policy(key).zdr
     }
 
-    /// The modalities the owning account has disabled for `secret`.
-    pub fn disabled_modalities(&self, secret: &str) -> ModalitySet {
-        self.policy(secret).disabled_modalities
+    /// The modalities the owning account has disabled for `key`.
+    pub fn disabled_modalities(&self, key: &KeyHash) -> ModalitySet {
+        self.policy(key).disabled_modalities
     }
 
-    /// The toleration list the account owning `secret` is pinned to for a
+    /// The toleration list the account owning `key` is pinned to for a
     /// request to `model`: the account catalog's preset for that model, else
     /// the account's own, or `None` when neither is set ("Default"). An id the
     /// config no longer defines fails closed to the empty list. Hot path safe.
-    pub fn tolerations(&self, secret: &str, model: &str) -> Option<Arc<serde_json::Value>> {
+    pub fn tolerations(&self, key: &KeyHash, model: &str) -> Option<Arc<serde_json::Value>> {
         let map = self.inner.load();
-        self.presets.resolve(
-            map.get(&hash_api_key(secret))
-                .and_then(|policy| policy.toleration_preset_for(model)),
-        )
+        self.presets
+            .resolve(map.get(key).and_then(|policy| policy.toleration_preset_for(model)))
     }
 
     /// Everything needed to resolve the tolerations of the account owning
-    /// `secret`, for any model, when the key is present in the map. `None`
+    /// `key`, for any model, when the key is present in the map. `None`
     /// means the key is absent (a key created since the last refresh), which
     /// the caller may resolve from the DB with [`load_policy`]. Hot path safe.
-    pub fn account_tolerations_if_known(&self, secret: &str) -> Option<AccountTolerations> {
-        self.policy_if_known(secret).map(|policy| self.account_tolerations(policy))
+    pub fn account_tolerations_if_known(&self, key: &KeyHash) -> Option<AccountTolerations> {
+        self.policy_if_known(key).map(|policy| self.account_tolerations(policy))
     }
 
     /// Resolve tolerations for an account policy read directly from the DB.
@@ -220,13 +219,13 @@ impl KeyPolicyCache {
         self.presets.store(presets);
     }
 
-    /// The per-token prices a request made with `secret` is charged at, or
+    /// The per-token prices a request made with `key` is charged at, or
     /// `None` when the key is not in the map, no prices have loaded yet, or
     /// the loaded prices predate the key's account or the model (a price
     /// reload failed since they were added). Hot-path safe.
-    pub(crate) fn unit_prices(&self, secret: &str, query: &PriceQuery<'_>) -> Option<UnitPrices> {
+    pub(crate) fn unit_prices(&self, key: &KeyHash, query: &PriceQuery<'_>) -> Option<UnitPrices> {
         let map = self.inner.load();
-        let billing = map.get(&hash_api_key(secret))?.billing.as_ref()?;
+        let billing = map.get(key)?.billing.as_ref()?;
         let prices = self.prices.load();
         prices.as_ref()?.unit_prices(billing.account, &billing.purpose, query)
     }
@@ -513,16 +512,16 @@ mod tests {
     #[test]
     fn empty_cache_reads_every_key_as_non_zdr() {
         let cache = KeyPolicyCache::empty();
-        assert!(!cache.is_zdr("sk-anything"));
+        assert!(!cache.is_zdr(&hash_api_key("sk-anything")));
     }
 
     #[test]
     fn is_zdr_reflects_the_maps_flag() {
         let cache = KeyPolicyCache::from_pairs([("sk-on".to_string(), true), ("sk-off".to_string(), false)]);
-        assert!(cache.is_zdr("sk-on"));
-        assert!(!cache.is_zdr("sk-off"));
+        assert!(cache.is_zdr(&hash_api_key("sk-on")));
+        assert!(!cache.is_zdr(&hash_api_key("sk-off")));
         // Absent key (deleted/invalid, auth rejects it anyway) is non-ZDR.
-        assert!(!cache.is_zdr("sk-missing"));
+        assert!(!cache.is_zdr(&hash_api_key("sk-missing")));
     }
 
     #[test]
@@ -532,7 +531,7 @@ mod tests {
         // The integration tests rely on exactly this.
         let cache = KeyPolicyCache::empty();
         let handle = cache.clone();
-        assert!(!handle.is_zdr("sk-on"));
+        assert!(!handle.is_zdr(&hash_api_key("sk-on")));
         cache.replace(
             [(
                 hash_api_key("sk-on"),
@@ -544,7 +543,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        assert!(handle.is_zdr("sk-on"));
+        assert!(handle.is_zdr(&hash_api_key("sk-on")));
     }
 
     #[test]
@@ -558,9 +557,9 @@ mod tests {
                 ..Default::default()
             },
         )]);
-        assert!(cache.disabled_modalities("sk-no-batch").contains(Modality::Batch));
-        assert!(!cache.disabled_modalities("sk-no-batch").contains(Modality::Realtime));
-        assert!(cache.disabled_modalities("sk-missing").is_empty());
+        assert!(cache.disabled_modalities(&hash_api_key("sk-no-batch")).contains(Modality::Batch));
+        assert!(!cache.disabled_modalities(&hash_api_key("sk-no-batch")).contains(Modality::Realtime));
+        assert!(cache.disabled_modalities(&hash_api_key("sk-missing")).is_empty());
     }
 
     #[test]
@@ -611,27 +610,30 @@ mod tests {
             ],
         );
         assert_eq!(
-            cache.tolerations("sk-preset", "any/model").as_deref(),
+            cache.tolerations(&hash_api_key("sk-preset"), "any/model").as_deref(),
             Some(&serde_json::json!([{"key": "pool", "operator": "Equal", "value": "dedicated"}]))
         );
-        assert_eq!(cache.tolerations("sk-empty", "any/model").as_deref(), Some(&serde_json::json!([])));
+        assert_eq!(
+            cache.tolerations(&hash_api_key("sk-empty"), "any/model").as_deref(),
+            Some(&serde_json::json!([]))
+        );
         // The Default setting and an unknown key are both unpinned.
-        assert!(cache.tolerations("sk-default", "any/model").is_none());
-        assert!(cache.tolerations("sk-missing", "any/model").is_none());
+        assert!(cache.tolerations(&hash_api_key("sk-default"), "any/model").is_none());
+        assert!(cache.tolerations(&hash_api_key("sk-missing"), "any/model").is_none());
         // `account_tolerations_if_known` distinguishes a cached Default from a
         // key absent from the map (`None`), so the batch upload only pays for
         // a DB read on a genuine miss.
         assert!(
             cache
-                .account_tolerations_if_known("sk-default")
+                .account_tolerations_if_known(&hash_api_key("sk-default"))
                 .unwrap()
                 .for_model("any/model")
                 .is_none()
         );
-        assert!(cache.account_tolerations_if_known("sk-missing").is_none());
+        assert!(cache.account_tolerations_if_known(&hash_api_key("sk-missing")).is_none());
         assert_eq!(
             cache
-                .account_tolerations_if_known("sk-preset")
+                .account_tolerations_if_known(&hash_api_key("sk-preset"))
                 .unwrap()
                 .for_model("any/model")
                 .as_deref(),
@@ -682,15 +684,18 @@ mod tests {
             ],
         );
         let gpu = serde_json::json!([{"key": "pool", "operator": "Equal", "value": "dedicated"}]);
-        assert_eq!(cache.tolerations("sk-both", "org/pinned").as_deref(), Some(&serde_json::json!([])));
-        assert_eq!(cache.tolerations("sk-both", "org/other").as_deref(), Some(&gpu));
         assert_eq!(
-            cache.tolerations("sk-model-only", "org/pinned").as_deref(),
+            cache.tolerations(&hash_api_key("sk-both"), "org/pinned").as_deref(),
+            Some(&serde_json::json!([]))
+        );
+        assert_eq!(cache.tolerations(&hash_api_key("sk-both"), "org/other").as_deref(), Some(&gpu));
+        assert_eq!(
+            cache.tolerations(&hash_api_key("sk-model-only"), "org/pinned").as_deref(),
             Some(&serde_json::json!([]))
         );
         // "No preset" stays distinct from the empty list on other models.
-        assert!(cache.tolerations("sk-model-only", "org/other").is_none());
-        let account = cache.account_tolerations_if_known("sk-both").unwrap();
+        assert!(cache.tolerations(&hash_api_key("sk-model-only"), "org/other").is_none());
+        let account = cache.account_tolerations_if_known(&hash_api_key("sk-both")).unwrap();
         assert_eq!(account.for_model("org/pinned").as_deref(), Some(&serde_json::json!([])));
         assert_eq!(account.for_model("org/other").as_deref(), Some(&gpu));
     }
@@ -710,7 +715,7 @@ mod tests {
         // A preset an operator has dropped from config resolves to the most
         // restrictive option rather than leaving the account unpinned.
         assert_eq!(
-            cache.tolerations("sk-retired", "any/model").as_deref(),
+            cache.tolerations(&hash_api_key("sk-retired"), "any/model").as_deref(),
             Some(&serde_json::json!([]))
         );
     }
@@ -799,8 +804,8 @@ mod tests {
         });
 
         let cache = initial_cache(&pool, TolerationPresets::default()).await.unwrap();
-        assert_eq!(cache.unit_prices(&key, &query("priced-model")), priced);
-        assert!(!cache.is_zdr(&key));
+        assert_eq!(cache.unit_prices(&hash_api_key(&key), &query("priced-model")), priced);
+        assert!(!cache.is_zdr(&hash_api_key(&key)));
 
         // Change the policy, add an account with its own price and a newly
         // priced model, then make the tariff lookup fail.
@@ -820,20 +825,23 @@ mod tests {
             .unwrap();
 
         refresh(&pool, &cache).await.expect("a price load failure is not a refresh failure");
-        assert!(cache.is_zdr(&key), "the policy map was replaced");
+        assert!(cache.is_zdr(&hash_api_key(&key)), "the policy map was replaced");
         assert_eq!(
-            cache.unit_prices(&key, &query("priced-model")),
+            cache.unit_prices(&hash_api_key(&key), &query("priced-model")),
             priced,
             "the previous prices are kept"
         );
-        assert!(cache.policy_if_known(&deal_key).is_some(), "the new account's key is in the map");
+        assert!(
+            cache.policy_if_known(&hash_api_key(&deal_key)).is_some(),
+            "the new account's key is in the map"
+        );
         assert_eq!(
-            cache.unit_prices(&deal_key, &query("priced-model")),
+            cache.unit_prices(&hash_api_key(&deal_key), &query("priced-model")),
             None,
             "the kept prices hold nothing of the new account's own, so its key is not priced"
         );
         assert_eq!(
-            cache.unit_prices(&key, &query("later-model")),
+            cache.unit_prices(&hash_api_key(&key), &query("later-model")),
             None,
             "the kept prices predate the model, so it is not priced"
         );
@@ -841,9 +849,9 @@ mod tests {
         let booted = initial_cache(&pool, TolerationPresets::default())
             .await
             .expect("a price load failure does not fail startup");
-        assert!(booted.is_zdr(&key));
+        assert!(booted.is_zdr(&hash_api_key(&key)));
         assert_eq!(
-            booted.unit_prices(&key, &query("priced-model")),
+            booted.unit_prices(&hash_api_key(&key), &query("priced-model")),
             None,
             "no prices have loaded, so none are sent"
         );

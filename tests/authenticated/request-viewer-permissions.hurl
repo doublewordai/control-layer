@@ -1,74 +1,44 @@
-# Test that only users with RequestViewer role can access request endpoints
-# This test verifies that PlatformManager users cannot access analytics/requests endpoints
-
-# Create a test user with only PlatformManager role (no RequestViewer)
-POST http://localhost:3001/admin/api/v1/users
-[Cookies]
-dwctl_session: {{admin_jwt}}
-{
-  "username": "platform-manager-{{newUuid}}",
-  "email": "platform-manager-{{newUuid}}@example.org",
-  "roles": ["StandardUser", "PlatformManager"]
-}
-HTTP 201
-[Captures]
-platform_manager_user_id: jsonpath "$.id"
-
-# Generate JWT for the platform manager user
-# Note: This assumes we have a way to generate JWTs for test users
-# If not available, we'll need to use the existing user_jwt which should have StandardUser role
-
-# Test that PlatformManager without RequestViewer cannot access requests endpoint
+# Request metadata visibility is an SSO-only role, independent of platform management.
+# These identities are provisioned by scripts/seed-auth-test-users.sql.
 GET http://localhost:3001/admin/api/v1/requests
-[Cookies] 
-dwctl_session: {{user_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 HTTP 403
 
-# Create a test user with RequestViewer role
-POST http://localhost:3001/admin/api/v1/users
-[Cookies]
-dwctl_session: {{admin_jwt}}
-{
-  "username": "request-viewer-{{newUuid}}",
-  "email": "request-viewer-{{newUuid}}@example.org", 
-  "roles": ["StandardUser", "RequestViewer"]
-}
-HTTP 201
-[Captures]
-request_viewer_user_id: jsonpath "$.id"
+GET http://localhost:3001/admin/api/v1/requests/aggregate
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
+HTTP 200
 
-# Test that users with both PlatformManager and RequestViewer can access requests
-POST http://localhost:3001/admin/api/v1/users
-[Cookies]
-dwctl_session: {{admin_jwt}}
-{
-  "username": "dual-role-{{newUuid}}",
-  "email": "dual-role-{{newUuid}}@example.org",
-  "roles": ["StandardUser", "PlatformManager", "RequestViewer"]  
-}
-HTTP 201
-[Captures]
-dual_role_user_id: jsonpath "$.id"
-
-# Test that StandardUser without RequestViewer cannot access requests endpoint
-# (using the existing user_jwt which should be a StandardUser)
 GET http://localhost:3001/admin/api/v1/requests
-[Cookies]
-dwctl_session: {{user_jwt}}
+X-Doubleword-User: hurl-request-viewer
+X-Doubleword-Email: hurl-request-viewer@example.org
+HTTP 200
+
+GET http://localhost:3001/admin/api/v1/users/current
+X-Doubleword-User: hurl-request-viewer
+X-Doubleword-Email: hurl-request-viewer@example.org
+HTTP 200
+[Captures]
+viewer_id: jsonpath "$.id"
+
+POST http://localhost:3001/admin/api/v1/users/{{viewer_id}}/api-keys
+X-Doubleword-User: hurl-request-viewer
+X-Doubleword-Email: hurl-request-viewer@example.org
+{"name":"viewer ordinary key", "purpose":"platform"}
+HTTP 201
+[Captures]
+key: jsonpath "$.key"
+key_id: jsonpath "$.id"
+
+GET http://localhost:3001/admin/api/v1/requests
+Authorization: Bearer {{key}}
 HTTP 403
 
-# Clean up: Delete test users
-DELETE http://localhost:3001/admin/api/v1/users/{{platform_manager_user_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
-HTTP 204
+GET http://localhost:3001/admin/api/v1/requests/aggregate
+Authorization: Bearer {{key}}
+HTTP 403
 
-DELETE http://localhost:3001/admin/api/v1/users/{{request_viewer_user_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
-HTTP 204
-
-DELETE http://localhost:3001/admin/api/v1/users/{{dual_role_user_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+DELETE http://localhost:3001/admin/api/v1/users/{{viewer_id}}/api-keys/{{key_id}}
+Authorization: Bearer {{key}}
 HTTP 204

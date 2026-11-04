@@ -647,7 +647,7 @@ mod tests {
     ///   - the org the PM has switched into
     ///
     /// With the fix:
-    ///   - PM personal context → all three rows (PM bypass, intentional)
+    ///   - PM personal context → only the PM’s own row
     ///   - PM in org context   → only the org's row (the contract we're testing)
     #[dwctl_test_macros::test]
     #[test_log::test]
@@ -697,8 +697,7 @@ mod tests {
             .expect("insert request");
         }
 
-        // PM in personal context — `can_read_all` wins, no filter, all three
-        // rows visible. This guards the intentional PM-bypass behavior.
+        // PM in personal context is restricted to personally owned content.
         let personal_resp = app
             .get("/admin/api/v1/batches/requests")
             .add_header(&auth[0].0, &auth[0].1)
@@ -707,8 +706,8 @@ mod tests {
         personal_resp.assert_status_ok();
         let personal_body: serde_json::Value = personal_resp.json();
         assert_eq!(
-            personal_body["total_count"], 3,
-            "PM in personal context should see every row (read-all bypass)",
+            personal_body["total_count"], 1,
+            "PM in personal context should see only their own row",
         );
 
         // PM in org context — `created_by_filter = Some(org.id)`, only the

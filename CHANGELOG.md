@@ -1,5 +1,30 @@
 # Changelog
 
+## [16.0.0](https://github.com/doublewordai/control-layer/compare/v15.11.0...v16.0.0) (2026-11-03)
+
+
+### ⚠ BREAKING CHANGES
+
+* **auth:** confine platform privileges to SSO ([#2131](https://github.com/doublewordai/control-layer/issues/2131))
+
+### Features
+
+* **dwctl:** per-process internal credential for calls into /ai (DW-1009) ([#2154](https://github.com/doublewordai/control-layer/issues/2154)) ([33457cb](https://github.com/doublewordai/control-layer/commit/33457cb2bbe41f401cd06e6437a7df836aaf25c4))
+* **fusillade:** dispatch by API key id (DW-1010) ([#2156](https://github.com/doublewordai/control-layer/issues/2156)) ([1284778](https://github.com/doublewordai/control-layer/commit/12847787a11281babd5452ac4377ebf278397960))
+
+
+### Bug Fixes
+
+* **auth:** confine platform privileges to SSO ([#2131](https://github.com/doublewordai/control-layer/issues/2131)) ([bc76dbd](https://github.com/doublewordai/control-layer/commit/bc76dbd5f0f321ef326c668d1c1be28155c9ab1b))
+
+## [15.11.0](https://github.com/doublewordai/control-layer/compare/v15.10.0...v15.11.0) (2026-11-02)
+
+
+### Features
+
+* **files:** make expires_at the truth for file content (DW-992) ([#2113](https://github.com/doublewordai/control-layer/issues/2113)) ([03b5467](https://github.com/doublewordai/control-layer/commit/03b5467c9ded7271b72856b2acc50bfcb8e50b44))
+* **retention:** retire content weeks on one creation-anchored clock (DW-992) ([#2115](https://github.com/doublewordai/control-layer/issues/2115)) ([1a57f82](https://github.com/doublewordai/control-layer/commit/1a57f8267bc34198ceaa87917965960e2d0f9a6e))
+
 ## [15.10.0](https://github.com/doublewordai/control-layer/compare/v15.9.0...v15.10.0) (2026-11-01)
 
 

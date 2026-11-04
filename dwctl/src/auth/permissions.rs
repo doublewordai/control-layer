@@ -2,7 +2,7 @@
 
 use crate::{
     AppState,
-    api::models::users::{CurrentUser, Role},
+    api::models::users::{AuthMethod, CurrentUser, Role},
     errors::Error,
     types::{Operation, Resource, UserId},
 };
@@ -294,7 +294,34 @@ where
 
 /// Check if a user has permission to perform an operation on a resource
 pub fn has_permission(user: &CurrentUser, resource: Resource, operation: Operation) -> bool {
-    // Admin users have access to everything
+    // Customer content and credentials have no platform-wide override, even for admins.
+    if matches!(
+        resource,
+        Resource::Files | Resource::Batches | Resource::ApiKeys | Resource::Connections | Resource::Webhooks
+    ) && matches!(
+        operation,
+        Operation::CreateAll | Operation::ReadAll | Operation::UpdateAll | Operation::DeleteAll | Operation::SystemAccess
+    ) {
+        return false;
+    }
+    // Broad user writes permit role escalation and account takeover. Support
+    // ZDR updates are authorized field-by-field in the existing users handler.
+    if (resource == Resource::Users && matches!(operation, Operation::CreateAll | Operation::UpdateAll | Operation::DeleteAll))
+        || (resource == Resource::Organizations && matches!(operation, Operation::UpdateAll | Operation::DeleteAll))
+    {
+        return false;
+    }
+    // Apply the authentication ceiling before the legacy admin bypass. Also
+    // protects manually constructed identities and callers outside the extractor.
+    if user.auth_method != AuthMethod::TrustedSso {
+        return role_has_permission(&Role::StandardUser, resource, operation)
+            || user
+                .roles
+                .iter()
+                .filter(|role| !matches!(role, Role::PlatformManager | Role::BillingManager | Role::RequestViewer))
+                .any(|role| role_has_permission(role, resource, operation));
+    }
+    // SSO admins bypass role checks only after the ownership restrictions.
     if user.is_admin {
         return true;
     }
@@ -558,6 +585,7 @@ mod tests {
 
     fn create_user_with_roles(roles: Vec<Role>, is_admin: bool) -> CurrentUser {
         CurrentUser {
+            auth_method: crate::api::models::users::AuthMethod::TrustedSso,
             id: Uuid::new_v4(),
             username: "test".to_string(),
             email: "test@example.com".to_string(),
@@ -576,8 +604,8 @@ mod tests {
     fn test_admin_bypass() {
         let admin = create_user_with_roles(vec![Role::StandardUser], true);
 
-        // Admin should bypass all role restrictions
-        assert!(has_permission(&admin, Resource::Users, Operation::CreateAll));
+        // Admin cannot bypass identity-management restrictions
+        assert!(!has_permission(&admin, Resource::Users, Operation::CreateAll));
         assert!(has_permission(&admin, Resource::Requests, Operation::ReadAll)); // Even sensitive data
         assert!(has_permission(&admin, Resource::Models, Operation::DeleteAll));
     }
@@ -616,7 +644,7 @@ mod tests {
         let pm = create_user_with_roles(vec![Role::PlatformManager], false);
 
         // Should have full platform management permissions
-        assert!(has_permission(&pm, Resource::Users, Operation::CreateAll));
+        assert!(!has_permission(&pm, Resource::Users, Operation::CreateAll));
         assert!(has_permission(&pm, Resource::Models, Operation::DeleteAll));
         assert!(has_permission(&pm, Resource::Analytics, Operation::ReadAll));
 
@@ -757,20 +785,20 @@ mod tests {
     fn test_platform_manager_has_file_access() {
         let pm = create_user_with_roles(vec![Role::PlatformManager], false);
 
-        // Platform Manager should have full access to files
-        assert!(has_permission(&pm, Resource::Files, Operation::CreateAll));
-        assert!(has_permission(&pm, Resource::Files, Operation::ReadAll));
-        assert!(has_permission(&pm, Resource::Files, Operation::UpdateAll));
-        assert!(has_permission(&pm, Resource::Files, Operation::DeleteAll));
+        // Platform Manager cannot bypass file ownership
+        assert!(!has_permission(&pm, Resource::Files, Operation::CreateAll));
+        assert!(!has_permission(&pm, Resource::Files, Operation::ReadAll));
+        assert!(!has_permission(&pm, Resource::Files, Operation::UpdateAll));
+        assert!(!has_permission(&pm, Resource::Files, Operation::DeleteAll));
     }
 
     #[test]
-    fn test_admin_sees_deleted_files() {
+    fn test_admin_has_no_system_override_for_files() {
         let admin = create_user_with_roles(vec![Role::BatchAPIUser], true);
         let regular_user = create_user_with_roles(vec![Role::BatchAPIUser], false);
 
-        // Admin should have SystemAccess (bypass kicks in)
-        assert!(has_permission(&admin, Resource::Files, Operation::SystemAccess));
+        // The legacy admin flag does not bypass the content boundary.
+        assert!(!has_permission(&admin, Resource::Files, Operation::SystemAccess));
 
         // Regular user should not have SystemAccess
         assert!(!has_permission(&regular_user, Resource::Files, Operation::SystemAccess));
@@ -866,6 +894,7 @@ mod tests {
             .unwrap();
         let user: crate::db::models::users::UserDBResponse = user;
         CurrentUser {
+            auth_method: crate::api::models::users::AuthMethod::TrustedSso,
             id: user.id,
             username: user.username,
             email: user.email,
