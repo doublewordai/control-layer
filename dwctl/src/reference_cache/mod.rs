@@ -61,6 +61,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 use uuid::Uuid;
 
+use crate::crypto::ApiKeyHash;
 use crate::metrics::errors::component::REFERENCE_CACHE;
 use crate::prefix_chain::{ModelFilter, deserialize_model_list};
 use crate::prompt_cache::{ParseError, PrincipalResolver, TelemetryPolicy, TierPolicy, parse_chat_completions};
@@ -281,7 +282,9 @@ pub struct Completion<'a> {
     pub path: &'a str,
     /// The effective status was 2xx.
     pub success: bool,
-    pub bearer_token: Option<&'a str>,
+    /// The hash of the key the request presented. An internal credential counts as the
+    /// key it was minted for.
+    pub api_key: Option<ApiKeyHash>,
     pub model: Option<&'a str>,
     pub body: Option<&'a Bytes>,
     pub prompt_tokens: i64,
@@ -351,9 +354,9 @@ impl ReferenceCache {
         }
     }
 
-    /// The principal behind `bearer_token`, if it is allowlisted. `Err` on a lookup failure.
-    async fn covered_principal(&self, bearer_token: &str) -> Result<Option<UserId>, Unavailable> {
-        match self.principal.resolve(bearer_token).await {
+    /// The principal behind `api_key`, if it is allowlisted. `Err` on a lookup failure.
+    async fn covered_principal(&self, api_key: &ApiKeyHash) -> Result<Option<UserId>, Unavailable> {
+        match self.principal.resolve(api_key).await {
             Ok(Some(p)) if self.orgs.contains(&p) => Ok(Some(p)),
             Ok(_) => Ok(None),
             Err(e) => {
@@ -370,7 +373,7 @@ impl ReferenceCache {
 
     /// A streaming request produced its first chunk: make its prefixes visible, without
     /// token counts yet. Spawned; returns immediately.
-    pub fn observe_first_token(self: &Arc<Self>, bearer_token: String, body: Bytes) {
+    pub fn observe_first_token(self: &Arc<Self>, api_key: ApiKeyHash, body: Bytes) {
         let Ok(permit) = Arc::clone(&self.in_flight).try_acquire_owned() else {
             write_outcome("first_token", "backpressure");
             return;
@@ -378,12 +381,12 @@ impl ReferenceCache {
         let this = Arc::clone(self);
         tokio::spawn(async move {
             let _permit = permit;
-            this.first_token_write(&bearer_token, &body).await;
+            this.first_token_write(&api_key, &body).await;
         });
     }
 
-    async fn first_token_write(&self, bearer_token: &str, body: &[u8]) {
-        let principal_id = match self.covered_principal(bearer_token).await {
+    async fn first_token_write(&self, api_key: &ApiKeyHash, body: &[u8]) {
+        let principal_id = match self.covered_principal(api_key).await {
             Ok(Some(p)) => p,
             Ok(None) => return,
             Err(_) => {
@@ -436,14 +439,14 @@ impl ReferenceCache {
         if !c.path.ends_with("/chat/completions") {
             return None;
         }
-        let bearer_token = c.bearer_token?;
+        let api_key = c.api_key?;
         let model = c.model.filter(|m| self.models.allows(m))?.to_string();
         let body = c.body.cloned();
         let arrival = c.arrival;
         let (success, prompt_tokens) = (c.success, c.prompt_tokens);
 
         let result = tokio::time::timeout(self.estimate_timeout, async {
-            let Some(principal_id) = self.covered_principal(bearer_token).await? else {
+            let Some(principal_id) = self.covered_principal(&api_key).await? else {
                 return Ok(None);
             };
             if !success {

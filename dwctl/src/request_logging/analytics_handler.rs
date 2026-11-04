@@ -48,6 +48,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::auth::internal_credential::{InternalAuthState, carried_key_hash};
 use crate::config::Config;
 use crate::metrics::errors::component::ANALYTICS;
 use crate::reference_cache::{Completion, ReferenceCache};
@@ -176,8 +177,9 @@ pub struct AnalyticsHandler {
     outbox_writer: AnalyticsOutboxWriter,
     instance_id: Uuid,
     config: Config,
-    /// Shadow reference-cache estimate, when `reference_cache.enabled`.
-    reference_cache: Option<Arc<ReferenceCache>>,
+    /// Shadow reference-cache estimate, when `reference_cache.enabled`, with what
+    /// internal credentials are resolved against.
+    reference_cache: Option<(Arc<ReferenceCache>, InternalAuthState)>,
 }
 
 impl AnalyticsHandler {
@@ -198,8 +200,8 @@ impl AnalyticsHandler {
     }
 
     /// Record the reference-cache estimate on each record it covers.
-    pub fn with_reference_cache(mut self, reference_cache: Arc<ReferenceCache>) -> Self {
-        self.reference_cache = Some(reference_cache);
+    pub fn with_reference_cache(mut self, reference_cache: Arc<ReferenceCache>, internal_auth: InternalAuthState) -> Self {
+        self.reference_cache = Some((reference_cache, internal_auth));
         self
     }
 }
@@ -307,16 +309,17 @@ impl RequestHandler for AnalyticsHandler {
             // Bounded by `reference_cache.estimate_timeout_ms`; returns at once for a
             // request it does not cover.
             let reference_cached_tokens = match &self.reference_cache {
-                Some(cache) => {
+                Some((cache, internal_auth)) => {
                     let bearer_token = match Auth::from_request(&request_data, &self.config) {
                         Auth::ApiKey { bearer_token } => Some(bearer_token),
                         Auth::None => None,
                     };
+                    let api_key = internal_auth.captured_key_hash(bearer_token.as_deref(), carried_key_hash(&response_data.extensions));
                     cache
                         .complete(Completion {
                             path: request_data.uri.path(),
                             success: (200..300).contains(&metrics.status_code),
-                            bearer_token: bearer_token.as_deref(),
+                            api_key,
                             model: metrics.request_model.as_deref(),
                             body: request_data.body.as_ref(),
                             prompt_tokens: metrics.prompt_tokens,

@@ -1958,7 +1958,7 @@ pub async fn build_router(
             // response body; `AiResponse` covers each protocol's own shape.
             let mut analytics_handler = request_logging::AnalyticsHandler::new(writer, instance_id, config.as_ref().clone());
             if let Some(cache) = &reference_cache {
-                analytics_handler = analytics_handler.with_reference_cache(cache.clone());
+                analytics_handler = analytics_handler.with_reference_cache(cache.clone(), state.internal_auth_state());
             }
             multi_handler = multi_handler.with(analytics_handler);
         }

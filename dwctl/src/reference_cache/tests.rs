@@ -13,6 +13,8 @@ use tower::ServiceExt;
 
 use super::*;
 use crate::api::models::users::Role;
+use crate::auth::internal_credential::{InternalAuthState, InternalCredentials};
+use crate::crypto::hash_api_key;
 use crate::request_logging::AnalyticsHandler;
 use crate::request_logging::batcher::{AnalyticsOutboxWriter, RawAnalyticsRecord};
 use crate::test::utils::{create_test_api_key_for_user, create_test_user};
@@ -202,6 +204,7 @@ fn orgs_deserialize_from_a_list_or_a_comma_string() {
 struct Fixture {
     cache: Arc<ReferenceCache>,
     secret: String,
+    key_id: crate::types::ApiKeyId,
     principal: UserId,
     pool: sqlx::PgPool,
 }
@@ -219,6 +222,7 @@ async fn fixture(pool: sqlx::PgPool, allowlisted: bool, allowance: u32) -> Fixtu
     Fixture {
         cache: Arc::new(ReferenceCache::new(&config, pool.clone(), telemetry)),
         secret: key.secret,
+        key_id: key.id,
         principal: user.id,
         pool,
     }
@@ -230,7 +234,7 @@ impl Fixture {
             .complete(Completion {
                 path: "/ai/v1/chat/completions",
                 success: true,
-                bearer_token: Some(&self.secret),
+                api_key: Some(hash_api_key(&self.secret)),
                 model: Some(MODEL),
                 body: Some(b),
                 prompt_tokens,
@@ -334,7 +338,7 @@ async fn a_stream_is_visible_from_its_first_token(pool: sqlx::PgPool) {
     let a_arrival = Utc::now();
 
     assert_eq!(f.rows().await, 0);
-    f.cache.observe_first_token(f.secret.clone(), a.clone());
+    f.cache.observe_first_token(hash_api_key(&f.secret), a.clone());
     f.wait_for(&a, false).await;
 
     // In flight: A has produced its first token but not completed.
@@ -374,7 +378,7 @@ async fn the_estimate_never_exceeds_prompt_tokens(pool: sqlx::PgPool) {
 async fn uncovered_or_unusable_requests_record_null(pool: sqlx::PgPool) {
     let f = fixture(pool.clone(), false, 0).await;
     let a = body(&[SYSTEM, USER_1]);
-    f.cache.observe_first_token(f.secret.clone(), a.clone());
+    f.cache.observe_first_token(hash_api_key(&f.secret), a.clone());
     assert_eq!(f.complete(&a, 1_200, Utc::now()).await, None);
     assert_eq!(f.rows().await, 0);
 
@@ -387,7 +391,7 @@ async fn uncovered_or_unusable_requests_record_null(pool: sqlx::PgPool) {
                 .complete(Completion {
                     path,
                     success,
-                    bearer_token: Some(&secret),
+                    api_key: Some(hash_api_key(&secret)),
                     model: Some(MODEL),
                     body: Some(&b),
                     prompt_tokens,
@@ -476,26 +480,36 @@ async fn the_layer_writes_at_the_first_streamed_chunk(pool: sqlx::PgPool) {
     assert!(forwarded.next().await.is_none());
 }
 
-/// The analytics handler puts the estimate on the record it publishes.
+/// The analytics handler puts the estimate on the record it publishes, and counts an
+/// internal credential as the key it was minted for.
 #[dwctl_test_macros::test]
 async fn the_analytics_record_carries_the_estimate(pool: sqlx::PgPool) {
     let f = fixture(pool, true, 0).await;
+    let internal_auth = InternalAuthState {
+        credentials: InternalCredentials::generate(),
+        targets: Default::default(),
+    };
+    internal_auth
+        .targets
+        .key_ids
+        .insert(f.key_id.to_string(), onwards::auth::KeyHash::of(&f.secret));
+    let internal_token = internal_auth.credentials.mint(f.key_id, Duration::from_secs(60));
     let (tx, mut rx) = mpsc::channel::<RawAnalyticsRecord>(8);
     let handler = AnalyticsHandler::new(
         AnalyticsOutboxWriter::for_test(tx),
         Uuid::new_v4(),
         crate::config::Config::default(),
     )
-    .with_reference_cache(f.cache.clone());
+    .with_reference_cache(f.cache.clone(), internal_auth);
 
-    let send = |b: Bytes, prompt_tokens: i64| {
+    let send = |b: Bytes, prompt_tokens: i64, bearer: &str| {
         let request = RequestData {
             correlation_id: 1,
             timestamp: std::time::SystemTime::now(),
             method: Method::POST,
             uri: Uri::from_static("/ai/v1/chat/completions"),
             headers: [
-                ("authorization".to_string(), vec![Bytes::from(format!("Bearer {}", f.secret))]),
+                ("authorization".to_string(), vec![Bytes::from(format!("Bearer {bearer}"))]),
                 ("content-type".to_string(), vec![Bytes::from_static(b"application/json")]),
             ]
             .into_iter()
@@ -525,10 +539,14 @@ async fn the_analytics_record_carries_the_estimate(pool: sqlx::PgPool) {
     };
 
     let turn_1 = body(&[SYSTEM, USER_1]);
-    send(turn_1.clone(), 1_200).await;
+    send(turn_1.clone(), 1_200, &f.secret).await;
     assert_eq!(rx.recv().await.unwrap().reference_cached_tokens, Some(0));
     f.wait_for(&turn_1, true).await;
 
-    send(body(&[SYSTEM, USER_1, ASSISTANT_1, USER_2]), 1_500).await;
-    assert_eq!(rx.recv().await.unwrap().reference_cached_tokens, Some(1_200));
+    send(body(&[SYSTEM, USER_1, ASSISTANT_1, USER_2]), 1_500, &internal_token).await;
+    assert_eq!(
+        rx.recv().await.unwrap().reference_cached_tokens,
+        Some(1_200),
+        "the internal credential's turn continues its key's prefix"
+    );
 }

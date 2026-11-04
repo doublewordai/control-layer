@@ -25,6 +25,7 @@ use bytes::BytesMut;
 use http_body::{Frame, SizeHint};
 
 use super::ReferenceCache;
+use crate::auth::internal_credential::presented_key_hash;
 
 /// Bytes of an unfinished event held while waiting for its end. Opening events are small;
 /// past this the hook gives up and the completion write makes the request visible.
@@ -38,12 +39,11 @@ pub struct ReferenceLayerState {
     pub body_limit: usize,
 }
 
-fn bearer_token(req: &Request) -> Option<String> {
+fn bearer_token(req: &Request) -> Option<&str> {
     req.headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .map(String::from)
 }
 
 fn is_event_stream(response: &Response) -> bool {
@@ -59,7 +59,8 @@ pub async fn reference_cache_middleware(State(state): State<ReferenceLayerState>
     if req.method() != Method::POST || !req.uri().path().ends_with("/chat/completions") {
         return next.run(req).await;
     }
-    let Some(token) = bearer_token(&req) else {
+    // An internal credential counts as the key it was minted for.
+    let Some(api_key) = presented_key_hash(req.extensions(), bearer_token(&req)) else {
         return next.run(req).await;
     };
     let (parts, body) = req.into_parts();
@@ -83,7 +84,7 @@ pub async fn reference_cache_middleware(State(state): State<ReferenceLayerState>
     }
     let (parts, inner) = response.into_parts();
     let cache = state.cache;
-    let on_first_token: Box<dyn FnOnce() + Send> = Box::new(move || cache.observe_first_token(token, body));
+    let on_first_token: Box<dyn FnOnce() + Send> = Box::new(move || cache.observe_first_token(api_key, body));
     Response::from_parts(parts, Body::new(FirstTokenBody::new(inner, on_first_token)))
 }
 
