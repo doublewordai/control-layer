@@ -36,12 +36,15 @@ pub fn generate_api_key() -> String {
     format!("sk-{}", general_purpose::URL_SAFE_NO_PAD.encode(key_bytes))
 }
 
+/// The SHA-256 hash of an API key secret, as stored in `api_keys.secret_hash`.
+pub type ApiKeyHash = [u8; 32];
+
 /// Hashes an API key secret for storage in `api_keys.secret_hash`.
 ///
 /// Plain SHA-256 over the UTF-8 bytes, with no salt or pepper: generated keys
 /// carry 256 bits of entropy, so a slow or keyed hash adds nothing, and this
 /// form is reproducible in SQL as `sha256(convert_to(secret, 'UTF8'))`.
-pub fn hash_api_key(secret: &str) -> [u8; 32] {
+pub fn hash_api_key(secret: &str) -> ApiKeyHash {
     Sha256::digest(secret.as_bytes()).into()
 }
 

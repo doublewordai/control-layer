@@ -166,13 +166,11 @@ async fn test_strict_mode_rejects_unknown_endpoints(pool: PgPool) {
     let user = create_test_user(&pool, Role::StandardUser).await;
 
     // Create API key for the user
-    let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
-    let admin_headers = add_auth_headers(&admin_user);
 
     let key_response = server
         .post(&format!("/admin/api/v1/users/{}/api-keys", user.id))
-        .add_header(&admin_headers[0].0, &admin_headers[0].1)
-        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .add_header("x-doubleword-user", user.external_user_id.as_deref().unwrap())
+        .add_header("x-doubleword-email", &user.email)
         .json(&serde_json::json!({
             "purpose": "realtime",
             "name": "Test key"
@@ -229,13 +227,11 @@ async fn test_strict_mode_allows_models_endpoint(pool: PgPool) {
 
     // Create user with API key
     let user = create_test_user(&pool, Role::StandardUser).await;
-    let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
-    let admin_headers = add_auth_headers(&admin_user);
 
     let key_response = server
         .post(&format!("/admin/api/v1/users/{}/api-keys", user.id))
-        .add_header(&admin_headers[0].0, &admin_headers[0].1)
-        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .add_header("x-doubleword-user", user.external_user_id.as_deref().unwrap())
+        .add_header("x-doubleword-email", &user.email)
         .json(&serde_json::json!({
             "purpose": "realtime",
             "name": "Test key"
@@ -412,8 +408,8 @@ async fn test_strict_mode_allows_chat_completions(pool: PgPool) {
     // Create API key
     let key_response = server
         .post(&format!("/admin/api/v1/users/{}/api-keys", user.id))
-        .add_header(&admin_headers[0].0, &admin_headers[0].1)
-        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .add_header("x-doubleword-user", user.external_user_id.as_deref().unwrap())
+        .add_header("x-doubleword-email", &user.email)
         .json(&serde_json::json!({
             "purpose": "realtime",
             "name": "Strict mode test key"
@@ -622,8 +618,8 @@ async fn test_strict_mode_body_limit_uses_configured_max_body_size(pool: PgPool)
     // Create API key
     let key_response = server
         .post(&format!("/admin/api/v1/users/{}/api-keys", user.id))
-        .add_header(&admin_headers[0].0, &admin_headers[0].1)
-        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .add_header("x-doubleword-user", user.external_user_id.as_deref().unwrap())
+        .add_header("x-doubleword-email", &user.email)
         .json(&serde_json::json!({
             "purpose": "realtime",
             "name": "Strict mode body limit test key"
@@ -830,8 +826,8 @@ async fn test_strict_mode_allows_completions(pool: PgPool) {
     // Create API key
     let key_response = server
         .post(&format!("/admin/api/v1/users/{}/api-keys", user.id))
-        .add_header(&admin_headers[0].0, &admin_headers[0].1)
-        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .add_header("x-doubleword-user", user.external_user_id.as_deref().unwrap())
+        .add_header("x-doubleword-email", &user.email)
         .json(&serde_json::json!({
             "purpose": "realtime",
             "name": "Strict mode completions test key"
@@ -995,8 +991,8 @@ async fn test_strict_mode_allows_embeddings(pool: PgPool) {
 
     let key_response = server
         .post(&format!("/admin/api/v1/users/{}/api-keys", user.id))
-        .add_header(&admin_headers[0].0, &admin_headers[0].1)
-        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .add_header("x-doubleword-user", user.external_user_id.as_deref().unwrap())
+        .add_header("x-doubleword-email", &user.email)
         .json(&serde_json::json!({
             "purpose": "realtime",
             "name": "Embeddings test key"
@@ -1068,13 +1064,11 @@ async fn test_strict_mode_rejects_malformed_requests(pool: PgPool) {
     let (server, _bg_services) = app.into_test_server();
 
     let user = create_test_user(&pool, Role::StandardUser).await;
-    let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
-    let admin_headers = add_auth_headers(&admin_user);
 
     let key_response = server
         .post(&format!("/admin/api/v1/users/{}/api-keys", user.id))
-        .add_header(&admin_headers[0].0, &admin_headers[0].1)
-        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .add_header("x-doubleword-user", user.external_user_id.as_deref().unwrap())
+        .add_header("x-doubleword-email", &user.email)
         .json(&serde_json::json!({
             "purpose": "realtime",
             "name": "Test key"
@@ -1219,8 +1213,8 @@ async fn test_strict_mode_sanitizes_provider_errors(pool: PgPool) {
 
     let key_response = server
         .post(&format!("/admin/api/v1/users/{}/api-keys", user.id))
-        .add_header(&admin_headers[0].0, &admin_headers[0].1)
-        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .add_header("x-doubleword-user", user.external_user_id.as_deref().unwrap())
+        .add_header("x-doubleword-email", &user.email)
         .json(&serde_json::json!({
             "purpose": "realtime",
             "name": "Error sanitization test"
@@ -1388,8 +1382,8 @@ async fn test_strict_mode_upstream_rate_limit_uses_custom_message(pool: PgPool) 
 
     let key_response = server
         .post(&format!("/admin/api/v1/users/{}/api-keys", user.id))
-        .add_header(&admin_headers[0].0, &admin_headers[0].1)
-        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .add_header("x-doubleword-user", user.external_user_id.as_deref().unwrap())
+        .add_header("x-doubleword-email", &user.email)
         .json(&serde_json::json!({
             "purpose": "realtime",
             "name": "Trusted test key"
@@ -1575,8 +1569,8 @@ async fn test_strict_mode_handles_various_provider_errors(pool: PgPool) {
 
         let key_response = server
             .post(&format!("/admin/api/v1/users/{}/api-keys", user.id))
-            .add_header(&admin_headers[0].0, &admin_headers[0].1)
-            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .add_header("x-doubleword-user", user.external_user_id.as_deref().unwrap())
+            .add_header("x-doubleword-email", &user.email)
             .json(&serde_json::json!({
                 "purpose": "realtime",
                 "name": format!("Test key {}", test_name)

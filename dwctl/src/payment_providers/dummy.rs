@@ -339,6 +339,7 @@ mod tests {
         let user = crate::test::utils::create_test_user(pool, Role::StandardUser).await;
 
         CurrentUser {
+            auth_method: crate::api::models::users::AuthMethod::TrustedSso,
             id: user.id,
             username: user.username,
             email: user.email,

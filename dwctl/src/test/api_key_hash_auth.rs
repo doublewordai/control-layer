@@ -7,7 +7,7 @@
 
 use crate::api::models::users::Role;
 use crate::crypto::hash_api_key;
-use crate::test::utils::{add_auth_headers, create_test_admin_user, create_test_config, create_test_user};
+use crate::test::utils::{add_auth_headers, create_test_admin_user, create_test_api_key_for_user, create_test_config, create_test_user};
 use axum_test::TestServer;
 use sqlx::PgPool;
 
@@ -26,16 +26,17 @@ async fn replace_stored_plaintext(pool: &PgPool, secret: &str) -> String {
     decoy
 }
 
-async fn create_key(server: &TestServer, admin: &crate::api::models::users::UserResponse, user_id: uuid::Uuid, purpose: &str) -> String {
-    let h = add_auth_headers(admin);
-    let key: serde_json::Value = server
-        .post(&format!("/admin/api/v1/users/{user_id}/api-keys"))
-        .add_header(&h[0].0, &h[0].1)
-        .add_header(&h[1].0, &h[1].1)
-        .json(&serde_json::json!({ "purpose": purpose, "name": format!("{purpose} hash auth key") }))
-        .await
-        .json();
-    key["key"].as_str().unwrap().to_string()
+async fn create_key(pool: &PgPool, user_id: uuid::Uuid, purpose: &str) -> String {
+    let key = create_test_api_key_for_user(pool, user_id).await;
+    if purpose != "realtime" {
+        sqlx::query("UPDATE api_keys SET purpose = $1 WHERE id = $2")
+            .bind(purpose)
+            .bind(key.id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+    key.secret
 }
 
 #[dwctl_test_macros::test]
@@ -92,7 +93,7 @@ async fn ai_proxy_authenticates_by_hash(pool: PgPool) {
         .await
         .assert_status_success();
 
-    let api_key = create_key(&server, &admin, user.id, "realtime").await;
+    let api_key = create_key(&pool, user.id, "realtime").await;
     let decoy = replace_stored_plaintext(&pool, &api_key).await;
     bg.sync_onwards_config(&pool).await.unwrap();
     bg.sync_key_policy(&pool).await.unwrap();
@@ -133,9 +134,8 @@ async fn ai_proxy_authenticates_by_hash(pool: PgPool) {
 #[dwctl_test_macros::test]
 async fn admin_api_authenticates_platform_key_by_hash(pool: PgPool) {
     let (server, _bg) = crate::test::utils::create_test_app(pool.clone(), false).await;
-    let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
     let user = create_test_user(&pool, Role::StandardUser).await;
-    let api_key = create_key(&server, &admin, user.id, "platform").await;
+    let api_key = create_key(&pool, user.id, "platform").await;
     let decoy = replace_stored_plaintext(&pool, &api_key).await;
 
     let me = server

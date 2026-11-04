@@ -18,8 +18,8 @@
 
 # Get user IDs
 GET http://localhost:3001/admin/api/v1/users/current
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Captures]
 admin_user_id: jsonpath "$.id"
@@ -40,8 +40,8 @@ user2_id: jsonpath "$.id"
 
 # Create test endpoint for models
 POST http://localhost:3001/admin/api/v1/endpoints
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "name": "models-test-endpoint-{{newUuid}}",
   "url": "http://mock-llm-server:3000",
@@ -53,8 +53,8 @@ models_test_endpoint_id: jsonpath "$.id"
 
 # Create user1's group (user1 will have access to models in this group)
 POST http://localhost:3001/admin/api/v1/groups
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "name": "models-user1-group-{{newUuid}}",
   "description": "Group for user1 model access"
@@ -65,14 +65,14 @@ user1_group_id: jsonpath "$.id"
 
 # Add user1 to their group
 POST http://localhost:3001/admin/api/v1/groups/{{user1_group_id}}/users/{{user1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # Create user2's group (user2 will have access to models in this group)
 POST http://localhost:3001/admin/api/v1/groups
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "name": "models-user2-group-{{newUuid}}",
   "description": "Group for user2 model access"
@@ -83,14 +83,14 @@ user2_group_id: jsonpath "$.id"
 
 # Add user2 to their group
 POST http://localhost:3001/admin/api/v1/groups/{{user2_group_id}}/users/{{user2_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # Create "Everyone" group for public models
 POST http://localhost:3001/admin/api/v1/groups
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "name": "models-everyone-group-{{newUuid}}",
   "description": "Public models accessible to all users"
@@ -101,13 +101,13 @@ everyone_group_id: jsonpath "$.id"
 
 # Add all users to everyone group
 POST http://localhost:3001/admin/api/v1/groups/{{everyone_group_id}}/users/{{user1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 POST http://localhost:3001/admin/api/v1/groups/{{everyone_group_id}}/users/{{user2_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # =============================================================================
@@ -148,8 +148,8 @@ HTTP 403
 
 # Create model 1: Accessible to user1 only
 POST http://localhost:3001/admin/api/v1/models
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "type": "standard",
   "model_name": "user1-model",
@@ -179,14 +179,14 @@ user1_model_id: jsonpath "$.id"
 
 # Add model 1 to user1's group
 POST http://localhost:3001/admin/api/v1/groups/{{user1_group_id}}/models/{{user1_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # Create model 2: Accessible to user2 only
 POST http://localhost:3001/admin/api/v1/models
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "type": "standard",
   "model_name": "user2-model",
@@ -214,14 +214,14 @@ user2_model_id: jsonpath "$.id"
 
 # Add model 2 to user2's group
 POST http://localhost:3001/admin/api/v1/groups/{{user2_group_id}}/models/{{user2_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # Create model 3: Accessible to everyone
 POST http://localhost:3001/admin/api/v1/models
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "type": "standard",
   "model_name": "public-model",
@@ -249,14 +249,14 @@ public_model_id: jsonpath "$.id"
 
 # Add model 3 to everyone group
 POST http://localhost:3001/admin/api/v1/groups/{{everyone_group_id}}/models/{{public_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # Create model 4: No group access (admin only)
 POST http://localhost:3001/admin/api/v1/models
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "type": "standard",
   "model_name": "admin-only-model",
@@ -273,8 +273,8 @@ admin_only_model_id: jsonpath "$.id"
 
 # Create model 5: Will be deleted (for deleted model tests)
 POST http://localhost:3001/admin/api/v1/models
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "type": "standard",
   "model_name": "deleted-model",
@@ -291,14 +291,14 @@ deleted_model_id: jsonpath "$.id"
 
 # Add deleted model to user1's group (so user1 could see it if not deleted)
 POST http://localhost:3001/admin/api/v1/groups/{{user1_group_id}}/models/{{deleted_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # Delete model 5
 DELETE http://localhost:3001/admin/api/v1/models/{{deleted_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 
 # =============================================================================
@@ -335,8 +335,8 @@ HTTP 403
 
 # Delete model 5
 DELETE http://localhost:3001/admin/api/v1/models/{{deleted_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 
 # =============================================================================
@@ -394,8 +394,8 @@ HTTP 403
 
 # Admin updates a model - should succeed
 PATCH http://localhost:3001/admin/api/v1/models/{{user1_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "alias": "user1-model-updated"
 }
@@ -407,8 +407,8 @@ jsonpath "$.model_name" == "user1-model"
 
 # Admin updates pricing - should succeed
 PATCH http://localhost:3001/admin/api/v1/models/{{user1_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "tariffs": [{
     "api_key_purpose": "realtime",
@@ -428,8 +428,8 @@ jsonpath "$.id" == "{{user1_model_id}}"
 
 # Verify pricing was updated
 GET http://localhost:3001/admin/api/v1/models/{{user1_model_id}}?include=pricing
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{user1_model_id}}"
@@ -441,8 +441,8 @@ jsonpath "$.provider_pricing.output_price_per_token" matches "^0\\.005"
 
 # Admin sends the retired rate-limit fields - accepted and ignored
 PATCH http://localhost:3001/admin/api/v1/models/{{user2_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "requests_per_second": 500.0,
   "burst_size": 1000
@@ -463,8 +463,8 @@ jsonpath "$.burst_size" not exists
 
 # Create model with capacity for testing
 POST http://localhost:3001/admin/api/v1/models
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "type": "standard",
   "model_name": "capacity-test-model",
@@ -482,8 +482,8 @@ jsonpath "$.batch_capacity" == 10
 
 # Add to everyone group so users can access it
 POST http://localhost:3001/admin/api/v1/groups/{{everyone_group_id}}/models/{{capacity_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # -----------------------------------------------------------------------------
@@ -518,8 +518,8 @@ jsonpath "$.data[*].batch_capacity" count == 0
 
 # Admin fetches model - should see batch capacity, and the retired capacity is ignored
 GET http://localhost:3001/admin/api/v1/models/{{capacity_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.capacity" not exists
@@ -527,8 +527,8 @@ jsonpath "$.batch_capacity" == 10
 
 # Admin lists models - should see batch capacity
 GET http://localhost:3001/admin/api/v1/models
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.data[*].capacity" count == 0
@@ -536,8 +536,8 @@ jsonpath "$.data[?(@.id == '{{capacity_model_id}}')].batch_capacity" nth 0 == 10
 
 # Clean up capacity test model
 DELETE http://localhost:3001/admin/api/v1/models/{{capacity_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 
 # -----------------------------------------------------------------------------
@@ -546,8 +546,8 @@ HTTP 200
 
 # Create second endpoint for testing
 POST http://localhost:3001/admin/api/v1/endpoints
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "name": "second-endpoint-{{newUuid}}",
   "url": "http://second-llm:3000",
@@ -559,8 +559,8 @@ second_endpoint_id: jsonpath "$.id"
 
 # Clean up second endpoint
 DELETE http://localhost:3001/admin/api/v1/endpoints/{{second_endpoint_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # -----------------------------------------------------------------------------
@@ -569,8 +569,8 @@ HTTP 204
 
 # Admin can update deleted model (has is_admin/system access)
 PATCH http://localhost:3001/admin/api/v1/models/{{deleted_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "alias": "deleted-model-updated"
 }
@@ -628,8 +628,8 @@ jsonpath "$.data[0].created_by" not exists
 
 # Admin CAN see created_by (has system access)
 GET http://localhost:3001/admin/api/v1/models/{{user1_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.created_by" exists
@@ -678,8 +678,8 @@ jsonpath "$.endpoint" not exists
 
 # Admin fetches user1's model - should succeed (even though admin not in group)
 GET http://localhost:3001/admin/api/v1/models/{{user1_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{user1_model_id}}"
@@ -687,16 +687,16 @@ jsonpath "$.alias" == "user1-model-updated"
 
 # Admin fetches user2's model - should succeed
 GET http://localhost:3001/admin/api/v1/models/{{user2_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{user2_model_id}}"
 
 # Admin fetches admin-only model - should succeed
 GET http://localhost:3001/admin/api/v1/models/{{admin_only_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{admin_only_model_id}}"
@@ -707,14 +707,14 @@ jsonpath "$.id" == "{{admin_only_model_id}}"
 
 # Admin fetches deleted model without deleted=true - should get 404
 GET http://localhost:3001/admin/api/v1/models/{{deleted_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 404
 
 # Admin fetches deleted model with deleted=true - should succeed
 GET http://localhost:3001/admin/api/v1/models/{{deleted_model_id}}?deleted=true
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{deleted_model_id}}"
@@ -726,8 +726,8 @@ jsonpath "$.alias" == "deleted-model-updated"
 
 # Admin fetches with all includes - should get everything
 GET http://localhost:3001/admin/api/v1/models/{{user1_model_id}}?include=groups,metrics,pricing,status,endpoints
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{user1_model_id}}"
@@ -741,8 +741,8 @@ jsonpath "$.burst_size" not exists
 
 # Admin fetches model with just endpoints (public info) - should work
 GET http://localhost:3001/admin/api/v1/models/{{public_model_id}}?include=endpoints
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.endpoint" exists
@@ -785,8 +785,8 @@ jsonpath "$.data[0].provider_pricing" not exists
 
 # Admin fetches model with pricing - should get BOTH tariffs and provider_pricing
 GET http://localhost:3001/admin/api/v1/models/{{user1_model_id}}?include=pricing
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{user1_model_id}}"
@@ -795,8 +795,8 @@ jsonpath "$.provider_pricing" exists
 
 # Admin lists models with pricing - should get BOTH tariffs and provider_pricing
 GET http://localhost:3001/admin/api/v1/models?include=pricing
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 # Check that user1_model (which has pricing) shows both tariffs and provider_pricing
@@ -813,8 +813,8 @@ jsonpath "$.data[?(@.id == '{{user1_model_id}}')].provider_pricing" nth 0 exists
 
 # Admin GET by ID - no rate limits
 GET http://localhost:3001/admin/api/v1/models/{{user1_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{user1_model_id}}"
@@ -823,8 +823,8 @@ jsonpath "$.burst_size" not exists
 
 # Admin LIST - no rate limits on any model
 GET http://localhost:3001/admin/api/v1/models
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.data[*].requests_per_second" count == 0
@@ -957,13 +957,13 @@ jsonpath "$.data[*].id" not contains "{{deleted_model_id}}"
 
 # Remove user1 from all groups temporarily
 DELETE http://localhost:3001/admin/api/v1/groups/{{user1_group_id}}/users/{{user1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 DELETE http://localhost:3001/admin/api/v1/groups/{{everyone_group_id}}/users/{{user1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # User1 should now see empty list (not 403)
@@ -977,13 +977,13 @@ jsonpath "$.total_count" == 0
 
 # Restore user1's access
 POST http://localhost:3001/admin/api/v1/groups/{{user1_group_id}}/users/{{user1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 POST http://localhost:3001/admin/api/v1/groups/{{everyone_group_id}}/users/{{user1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # -----------------------------------------------------------------------------
@@ -1035,8 +1035,8 @@ jsonpath "$.data[0].endpoint" not exists
 
 # Admin should see all 4 active models (user1, user2, public, admin-only)
 GET http://localhost:3001/admin/api/v1/models
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.data" count == 4
@@ -1052,8 +1052,8 @@ jsonpath "$.data[*].id" not contains "{{deleted_model_id}}"
 
 # Admin requests all enriched fields - should get all of them
 GET http://localhost:3001/admin/api/v1/models?include=groups,metrics,pricing,status,endpoints
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.data[0].groups" exists
@@ -1070,8 +1070,8 @@ jsonpath "$.data[*].burst_size" count == 0
 
 # Admin with deleted=true should see all models including deleted
 GET http://localhost:3001/admin/api/v1/models?deleted=true
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.data" count == 6
@@ -1079,8 +1079,8 @@ jsonpath "$.data[*].id" contains "{{deleted_model_id}}"
 
 # Admin without deleted parameter should NOT see deleted (default behavior)
 GET http://localhost:3001/admin/api/v1/models
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.data[*].id" not contains "{{deleted_model_id}}"
@@ -1091,8 +1091,8 @@ jsonpath "$.data[*].id" not contains "{{deleted_model_id}}"
 
 # Admin with accessible=false should see all models (default)
 GET http://localhost:3001/admin/api/v1/models?accessible=false
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.data" count == 4
@@ -1100,22 +1100,22 @@ jsonpath "$.data" count == 4
 # Admin with accessible=true should see only models they have group access to
 # (admin is not in any groups, so should see only models with no group restriction)
 GET http://localhost:3001/admin/api/v1/models?accessible=true
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.data" count == 0
 
 # Add admin to user1_group
 POST http://localhost:3001/admin/api/v1/groups/{{user1_group_id}}/users/{{admin_user_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # Now admin with accessible=true should see user1_model
 GET http://localhost:3001/admin/api/v1/models?accessible=true
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.data" count >= 1
@@ -1123,8 +1123,8 @@ jsonpath "$.data[*].id" contains "{{user1_model_id}}"
 
 # Remove admin from group for cleanliness
 DELETE http://localhost:3001/admin/api/v1/groups/{{user1_group_id}}/users/{{admin_user_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # -----------------------------------------------------------------------------
@@ -1133,8 +1133,8 @@ HTTP 204
 
 # Admin searches for user1's model - should find it
 GET http://localhost:3001/admin/api/v1/models?search=user1-model
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.data" count == 1
@@ -1142,8 +1142,8 @@ jsonpath "$.data[0].id" == "{{user1_model_id}}"
 
 # Admin searches for user2's model - should find it
 GET http://localhost:3001/admin/api/v1/models?search=user2-model
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.data" count == 1
@@ -1151,8 +1151,8 @@ jsonpath "$.data[0].id" == "{{user2_model_id}}"
 
 # Admin searches for admin-only model - should find it
 GET http://localhost:3001/admin/api/v1/models?search=admin-only
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.data" count == 1
@@ -1160,8 +1160,8 @@ jsonpath "$.data[0].id" == "{{admin_only_model_id}}"
 
 # Admin searches for deleted model - should find it with deleted=true
 GET http://localhost:3001/admin/api/v1/models?search=deleted-model&deleted=true
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.data" count == 1
@@ -1173,8 +1173,8 @@ jsonpath "$.data[0].id" == "{{deleted_model_id}}"
 
 # Admin with include=endpoints should see full endpoint information
 GET http://localhost:3001/admin/api/v1/models?include=endpoints
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.data[0].endpoint" exists
@@ -1214,8 +1214,8 @@ HTTP 403
 
 # Create a temporary model to test deletion
 POST http://localhost:3001/admin/api/v1/models
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "type": "standard",
   "model_name": "temp-delete-test-model",
@@ -1230,20 +1230,20 @@ temp_delete_model_id: jsonpath "$.id"
 
 # Admin deletes the model - should succeed (soft delete)
 DELETE http://localhost:3001/admin/api/v1/models/{{temp_delete_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 
 # Verify soft delete: Model not visible without deleted=true
 GET http://localhost:3001/admin/api/v1/models/{{temp_delete_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 404
 
 # Verify soft delete: Model IS visible with deleted=true
 GET http://localhost:3001/admin/api/v1/models/{{temp_delete_model_id}}?deleted=true
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{temp_delete_model_id}}"
@@ -1254,41 +1254,41 @@ jsonpath "$.alias" == "temp-delete-alias"
 # =============================================================================
 
 DELETE http://localhost:3001/admin/api/v1/models/{{user1_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 
 DELETE http://localhost:3001/admin/api/v1/models/{{user2_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 
 DELETE http://localhost:3001/admin/api/v1/models/{{public_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 
 DELETE http://localhost:3001/admin/api/v1/models/{{admin_only_model_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 
 DELETE http://localhost:3001/admin/api/v1/groups/{{user1_group_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 DELETE http://localhost:3001/admin/api/v1/groups/{{user2_group_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 DELETE http://localhost:3001/admin/api/v1/groups/{{everyone_group_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 DELETE http://localhost:3001/admin/api/v1/endpoints/{{models_test_endpoint_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204

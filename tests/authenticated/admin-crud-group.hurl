@@ -1,7 +1,7 @@
 # Successfully creating a group with unique name
 POST http://localhost:3001/admin/api/v1/groups
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "name": "test-group-{{newUuid}}",
   "description": "Test group created by e2e tests"
@@ -13,8 +13,8 @@ group_name: jsonpath "$.name"
 
 # Creating a group with the same name gives 409 error
 POST http://localhost:3001/admin/api/v1/groups
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "name": "{{group_name}}",
   "description": "Duplicate group"
@@ -23,8 +23,8 @@ HTTP 409
 
 # Get the created group by ID
 GET http://localhost:3001/admin/api/v1/groups/{{group_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.name" == "{{group_name}}"
@@ -32,8 +32,8 @@ jsonpath "$.description" == "Test group created by e2e tests"
 
 # Update group description
 PATCH http://localhost:3001/admin/api/v1/groups/{{group_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "description": "Updated description"
 }
@@ -43,8 +43,8 @@ jsonpath "$.description" == "Updated description"
 
 # List all groups (should include our test group)
 GET http://localhost:3001/admin/api/v1/groups
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.data" isCollection
@@ -52,12 +52,12 @@ jsonpath "$.data[?(@.name == '{{group_name}}')]" count == 1
 
 # Delete the group
 DELETE http://localhost:3001/admin/api/v1/groups/{{group_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # Verify group is deleted (should return 404)
 GET http://localhost:3001/admin/api/v1/groups/{{group_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 404

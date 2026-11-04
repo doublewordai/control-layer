@@ -27,10 +27,10 @@ export async function downloadFile(
   endpoint: string,
   filename: string,
 ): Promise<void> {
+  const token = localStorage.getItem("auth_token");
   const response = await fetch(endpoint, {
-    headers: {
-      Authorization: `Bearer ${localStorage.getItem("auth_token") || ""}`,
-    },
+    credentials: "same-origin",
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
   });
 
   if (!response.ok) {

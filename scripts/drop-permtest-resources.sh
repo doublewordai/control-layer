@@ -18,28 +18,12 @@ done
 
 # Extract admin credentials from config.yaml
 ADMIN_EMAIL=$(grep 'admin_email:' config.yaml | sed 's/.*admin_email:[ ]*"\(.*\)"/\1/')
-ADMIN_PASSWORD=$(grep 'admin_password:' config.yaml | sed 's/.*admin_password:[ ]*"\(.*\)"/\1/')
-
-if [ -z "$ADMIN_EMAIL" ] || [ -z "$ADMIN_PASSWORD" ]; then
-  echo "Failed to extract admin credentials from config.yaml" >&2
-  exit 1
-fi
-
-# Generate admin JWT for authentication
-echo "Generating admin JWT..." >&2
-ADMIN_JWT=$(EMAIL=$ADMIN_EMAIL PASSWORD=$ADMIN_PASSWORD ./scripts/login.sh 2>/dev/null)
-
-if [ -z "$ADMIN_JWT" ]; then
-  echo "⚠️  Failed to generate admin JWT - server may not be ready" >&2
-  exit 0  # Exit gracefully, don't fail the test run
-fi
-
-echo "Cleaning up permission test resources..." >&2
-
+# These scripts run only against the local isolated HTTP-test stack, where
+# the harness supplies the trusted SSO headers for the configured admin.
 # Delete test files first (files from permtest JSONL files)
 echo "Fetching files..." >&2
 FILES_RESPONSE=$(curl -s -X GET "http://localhost:3001/ai/v1/files?limit=100" \
-  -b "dwctl_session=${ADMIN_JWT}")
+  -H "X-Doubleword-User: ${ADMIN_EMAIL}" -H "X-Doubleword-Email: ${ADMIN_EMAIL}")
 
 DELETED_FILES=0
 # Check if response has .data field (paginated response)
@@ -50,7 +34,7 @@ if echo "$FILES_RESPONSE" | jq -e '.data' >/dev/null 2>&1; then
     while read -r file_id; do
       echo "  Deleting file: $file_id" >&2
       if curl -s -o /dev/null -w "%{http_code}" -X DELETE "http://localhost:3001/ai/v1/files/${file_id}" \
-        -b "dwctl_session=${ADMIN_JWT}" | grep -q "200"; then
+        -H "X-Doubleword-User: ${ADMIN_EMAIL}" -H "X-Doubleword-Email: ${ADMIN_EMAIL}" | grep -q "200"; then
         ((DELETED_FILES++))
       else
         echo "    ⚠️  Failed to delete file $file_id" >&2
@@ -64,7 +48,7 @@ fi
 # Delete test models (deployments) - must be done before endpoints due to foreign key
 echo "Fetching models..." >&2
 MODELS_RESPONSE=$(curl -s -X GET "http://localhost:3001/admin/api/v1/models?limit=100" \
-  -b "dwctl_session=${ADMIN_JWT}")
+  -H "X-Doubleword-User: ${ADMIN_EMAIL}" -H "X-Doubleword-Email: ${ADMIN_EMAIL}")
 
 DELETED_MODELS=0
 # Check if response has .data field (paginated response)
@@ -76,7 +60,7 @@ if echo "$MODELS_RESPONSE" | jq -e '.data' >/dev/null 2>&1; then
       if [[ "$model_alias" =~ -permtest$ ]]; then
         echo "  Deleting model: $model_alias (ID: $model_id)" >&2
         if curl -s -o /dev/null -w "%{http_code}" -X DELETE "http://localhost:3001/admin/api/v1/models/${model_id}" \
-          -b "dwctl_session=${ADMIN_JWT}" | grep -q "20[04]"; then
+          -H "X-Doubleword-User: ${ADMIN_EMAIL}" -H "X-Doubleword-Email: ${ADMIN_EMAIL}" | grep -q "20[04]"; then
           ((DELETED_MODELS++))
         else
           echo "    ⚠️  Failed to delete model $model_alias" >&2
@@ -92,7 +76,7 @@ fi
 # Delete test endpoints
 echo "Fetching endpoints..." >&2
 ENDPOINTS_RESPONSE=$(curl -s -X GET "http://localhost:3001/admin/api/v1/endpoints?limit=100" \
-  -b "dwctl_session=${ADMIN_JWT}")
+  -H "X-Doubleword-User: ${ADMIN_EMAIL}" -H "X-Doubleword-Email: ${ADMIN_EMAIL}")
 
 DELETED_ENDPOINTS=0
 # Check if response is an array (endpoints returns array directly, not paginated)
@@ -104,7 +88,7 @@ if echo "$ENDPOINTS_RESPONSE" | jq -e 'type == "array"' >/dev/null 2>&1; then
       if [[ "$endpoint_name" =~ -permtest$ ]]; then
         echo "  Deleting endpoint: $endpoint_name (ID: $endpoint_id)" >&2
         if curl -s -o /dev/null -w "%{http_code}" -X DELETE "http://localhost:3001/admin/api/v1/endpoints/${endpoint_id}" \
-          -b "dwctl_session=${ADMIN_JWT}" | grep -q "20[04]"; then
+          -H "X-Doubleword-User: ${ADMIN_EMAIL}" -H "X-Doubleword-Email: ${ADMIN_EMAIL}" | grep -q "20[04]"; then
           ((DELETED_ENDPOINTS++))
         else
           echo "    ⚠️  Failed to delete endpoint $endpoint_name" >&2

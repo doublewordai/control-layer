@@ -92,6 +92,16 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
 /// test DB and return a small (max 4 conns) fusillade-schema pool. Use
 /// this from integration tests that drive fusillade directly without
 /// constructing the full Application.
+/// The stored plaintext secret of an API key, for tests that check what
+/// fusillade stores while it still stores key secrets (until DW-1012).
+pub async fn stored_secret(pool: &PgPool, id: crate::types::ApiKeyId) -> String {
+    sqlx::query_scalar("SELECT secret FROM api_keys WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("stored API key secret")
+}
+
 /// Insert a fusillade request template the way the production write path
 /// does: into this week's `request_templates_g2` partition with its
 /// `request_template_routes` row, so `fusillade.requests` can reference it and

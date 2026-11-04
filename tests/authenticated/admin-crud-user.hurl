@@ -1,31 +1,27 @@
-# Successfully creating a user with unique identifier
+# SSO staff may provision an ordinary identity, but cannot delete customer accounts.
 POST http://localhost:3001/admin/api/v1/users
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "username": "test-user-{{newUuid}}",
   "email": "test-{{newUuid}}@example.org",
   "roles": ["StandardUser"]
 }
 HTTP 201
+
+GET http://localhost:3001/admin/api/v1/users/current
+[Cookies]
+dwctl_session: {{user_jwt}}
+HTTP 200
 [Captures]
 user_id: jsonpath "$.id"
-user_email: jsonpath "$.email"
 
-# Creating a user w/ the same email gives 409 error
-POST http://localhost:3001/admin/api/v1/users
-[Cookies]
-dwctl_session: {{admin_jwt}}
-{
-  "username": "test-user-duplicate",
-  "email": "{{user_email}}",
-  "roles": ["StandardUser"]
-}
-HTTP 409
-
-# Delete the user
 DELETE http://localhost:3001/admin/api/v1/users/{{user_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
+HTTP 403
 
-HTTP 204
+GET http://localhost:3001/admin/api/v1/users/{{user_id}}
+[Cookies]
+dwctl_session: {{user_jwt}}
+HTTP 200

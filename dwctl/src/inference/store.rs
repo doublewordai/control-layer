@@ -201,7 +201,7 @@ pub async fn complete_response_idempotent<P: PoolProvider + Clone>(
             "Cannot synthesize request row: empty endpoint in CreateContext (x-onwards-endpoint header missing upstream)".into(),
         ));
     }
-    let created_by = lookup_created_by(dwctl_pool, create_ctx.api_key).await;
+    let created_by = lookup_created_by(dwctl_pool, create_ctx.api_key.map(hash_api_key).as_ref()).await;
     let realtime_input = fusillade::CreateRealtimeInput {
         request_id: create_ctx.request_id,
         body: create_ctx.request_body.to_string(),
@@ -324,10 +324,10 @@ pub async fn poll_until_complete<P: PoolProvider + Clone>(
 /// Look up the user ID from an API key for batch/response attribution.
 ///
 /// Returns `Some(user_id)` if the key is found, `None` otherwise.
-pub async fn lookup_created_by(pool: &sqlx::PgPool, api_key: Option<&str>) -> Option<String> {
+pub async fn lookup_created_by(pool: &sqlx::PgPool, api_key: Option<&crate::crypto::ApiKeyHash>) -> Option<String> {
     let key = api_key?;
     match sqlx::query("SELECT user_id FROM public.api_keys WHERE secret_hash = $1 AND is_deleted = false LIMIT 1")
-        .bind(&hash_api_key(key)[..])
+        .bind(&key[..])
         .fetch_optional(pool)
         .await
     {

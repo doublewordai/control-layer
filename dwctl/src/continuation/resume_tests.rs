@@ -93,6 +93,8 @@ fn done() -> Chunk {
 struct Received {
     path: String,
     headers: HeaderMap,
+    /// The key the leg presented in-process.
+    presented: Option<onwards::auth::PresentedKey>,
     body: Value,
     /// The prices the leg was sent at, as onwards would write them.
     prices: Option<BillingPrices>,
@@ -177,11 +179,13 @@ async fn leg_two_handler(
     State(fake): State<Fake>,
     headers: HeaderMap,
     prices: Option<Extension<BillingPrices>>,
+    presented: Option<Extension<onwards::auth::PresentedKey>>,
     Json(body): Json<Value>,
 ) -> Response {
     fake.received.lock().unwrap().push(Received {
         path: "/completions".to_string(),
         headers,
+        presented: presented.map(|Extension(key)| key),
         body,
         prices: prices.map(|Extension(prices)| prices),
     });
@@ -224,7 +228,7 @@ fn state(pool: PgPool, fake: &Fake, tokenizer_url: String, cfg: ContinuationConf
         tokenizer: RenderClient::new(tokenizer_url, Duration::from_secs(5)),
         inflight: Arc::new(InflightLimiter::new(cfg.max_inflight_per_model)),
         cfg: Arc::new(cfg),
-        key_secret: Arc::from(KEY),
+        key_hash: crate::crypto::hash_api_key(KEY),
         resume_target: fake.router(),
         routes: Arc::new(ContinuationRoutes::with_models([MODEL.to_string()])),
         purposes: PurposeResolver::new(pool),
@@ -516,10 +520,11 @@ async fn the_resume_leg_asks_for_exactly_the_right_thing(pool: PgPool) {
     let leg = &requests[0];
     assert_eq!(leg.path, "/completions", "a chat request resumes on the completions endpoint");
     assert_eq!(
-        leg.headers.get(header::AUTHORIZATION).unwrap(),
-        format!("Bearer {KEY}").as_str(),
+        leg.presented,
+        Some(onwards::auth::PresentedKey(onwards::auth::KeyHash::of(KEY))),
         "resume legs authenticate as the global continuation key"
     );
+    assert!(leg.headers.get(header::AUTHORIZATION).is_none(), "resume legs carry no secret");
     assert_eq!(leg.body["prompt"], json!([101, 202, 303]), "the rendered token ids, verbatim");
     assert_eq!(leg.body["model"], MODEL);
     assert_eq!(leg.body["stream"], true);

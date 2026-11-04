@@ -21,8 +21,8 @@
 
 # Get user IDs
 GET http://localhost:3001/admin/api/v1/users/current
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Captures]
 admin_user_id: jsonpath "$.id"
@@ -43,8 +43,8 @@ user2_id: jsonpath "$.id"
 
 # Create test endpoint for probes
 POST http://localhost:3001/admin/api/v1/endpoints
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "name": "test-probe-endpoint",
   "url": "http://mock-llm-server:3000",
@@ -56,8 +56,8 @@ probe_endpoint_id: jsonpath "$.id"
 
 # Create model 1 for probe 1 (unique constraint requires one probe per model)
 POST http://localhost:3001/admin/api/v1/models
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "type": "standard",
   "model_name": "test-probe-model-1",
@@ -81,8 +81,8 @@ probe_model1_id: jsonpath "$.id"
 
 # Create model 2 for probe 2
 POST http://localhost:3001/admin/api/v1/models
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "type": "standard",
   "model_name": "test-probe-model-2",
@@ -106,8 +106,8 @@ probe_model2_id: jsonpath "$.id"
 
 # Create model 3 for probe 3
 POST http://localhost:3001/admin/api/v1/models
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "type": "standard",
   "model_name": "test-probe-model-3",
@@ -165,8 +165,8 @@ HTTP 403
 
 # Admin creates probe 1
 POST http://localhost:3001/admin/api/v1/probes
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "name": "test-probe-1",
   "deployment_id": "{{probe_model1_id}}",
@@ -190,8 +190,8 @@ probe1_id: jsonpath "$.id"
 
 # Admin creates probe 2
 POST http://localhost:3001/admin/api/v1/probes
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "name": "test-probe-2",
   "deployment_id": "{{probe_model2_id}}",
@@ -206,8 +206,8 @@ probe2_id: jsonpath "$.id"
 
 # Admin creates probe 3
 POST http://localhost:3001/admin/api/v1/probes
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "name": "test-probe-3",
   "deployment_id": "{{probe_model3_id}}",
@@ -252,8 +252,8 @@ HTTP 403
 
 # Admin lists all probes - should see all 3 probes
 GET http://localhost:3001/admin/api/v1/probes
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$" isCollection
@@ -263,8 +263,8 @@ jsonpath "$[*].id" contains "{{probe3_id}}"
 
 # Admin lists active probes - should see all 3 (all are active by default)
 GET http://localhost:3001/admin/api/v1/probes?status=active
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$" isCollection
@@ -302,8 +302,8 @@ HTTP 403
 
 # Admin fetches probe1 - should succeed
 GET http://localhost:3001/admin/api/v1/probes/{{probe1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{probe1_id}}"
@@ -312,8 +312,8 @@ jsonpath "$.deployment_id" == "{{probe_model1_id}}"
 
 # Admin fetches probe2 - should succeed
 GET http://localhost:3001/admin/api/v1/probes/{{probe2_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{probe2_id}}"
@@ -321,8 +321,8 @@ jsonpath "$.name" == "test-probe-2"
 
 # Admin fetches probe3 - should succeed
 GET http://localhost:3001/admin/api/v1/probes/{{probe3_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{probe3_id}}"
@@ -369,8 +369,8 @@ HTTP 403
 
 # Admin updates probe1 - should succeed
 PATCH http://localhost:3001/admin/api/v1/probes/{{probe1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "interval_seconds": 90
 }
@@ -381,8 +381,8 @@ jsonpath "$.interval_seconds" == 90
 
 # Admin updates probe2 - should succeed
 PATCH http://localhost:3001/admin/api/v1/probes/{{probe2_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "http_method": "GET"
 }
@@ -417,8 +417,8 @@ HTTP 403
 
 # Admin deactivates probe3 - should succeed
 PATCH http://localhost:3001/admin/api/v1/probes/{{probe3_id}}/deactivate
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{probe3_id}}"
@@ -450,8 +450,8 @@ HTTP 403
 
 # Admin activates probe3 - should succeed
 PATCH http://localhost:3001/admin/api/v1/probes/{{probe3_id}}/activate
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{probe3_id}}"
@@ -483,8 +483,8 @@ HTTP 403
 
 # Admin executes probe1 - should succeed
 POST http://localhost:3001/admin/api/v1/probes/{{probe1_id}}/execute
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 201
 [Asserts]
 jsonpath "$.probe_id" == "{{probe1_id}}"
@@ -521,8 +521,8 @@ HTTP 403
 
 # Admin tests probe configuration - should succeed
 POST http://localhost:3001/admin/api/v1/probes/test/{{probe_model1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "http_method": "POST",
   "request_path": "/v1/chat/completions",
@@ -567,16 +567,16 @@ HTTP 403
 
 # Admin views probe1 results - should succeed
 GET http://localhost:3001/admin/api/v1/probes/{{probe1_id}}/results
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$" isCollection
 
 # Admin views probe1 results with limit - should succeed
 GET http://localhost:3001/admin/api/v1/probes/{{probe1_id}}/results?limit=5
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$" isCollection
@@ -607,8 +607,8 @@ HTTP 403
 
 # Admin views probe1 statistics - should succeed
 GET http://localhost:3001/admin/api/v1/probes/{{probe1_id}}/statistics
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.total_executions" exists
@@ -616,8 +616,8 @@ jsonpath "$.success_rate" exists
 
 # Admin views probe2 statistics - should succeed
 GET http://localhost:3001/admin/api/v1/probes/{{probe2_id}}/statistics
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.total_executions" exists
@@ -648,26 +648,26 @@ HTTP 403
 
 # Admin deletes probe3 - should succeed
 DELETE http://localhost:3001/admin/api/v1/probes/{{probe3_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # Verify probe3 is deleted - should get 404
 GET http://localhost:3001/admin/api/v1/probes/{{probe3_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 404
 
 # Admin deletes probe2 - should succeed
 DELETE http://localhost:3001/admin/api/v1/probes/{{probe2_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # Admin deletes probe1 - should succeed
 DELETE http://localhost:3001/admin/api/v1/probes/{{probe1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # =============================================================================
@@ -676,26 +676,26 @@ HTTP 204
 
 # Delete model 3
 DELETE http://localhost:3001/admin/api/v1/models/{{probe_model3_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 
 # Delete model 2
 DELETE http://localhost:3001/admin/api/v1/models/{{probe_model2_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 
 # Delete model 1
 DELETE http://localhost:3001/admin/api/v1/models/{{probe_model1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 
 # Delete endpoint
 DELETE http://localhost:3001/admin/api/v1/endpoints/{{probe_endpoint_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # =============================================================================

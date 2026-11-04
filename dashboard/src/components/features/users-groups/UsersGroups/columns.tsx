@@ -14,6 +14,7 @@ interface UserColumnActions {
   onViewTransactions: (user: DisplayUser) => void;
   groups: DisplayGroup[];
   showTransactions?: boolean;
+  canManageUsers?: boolean;
   /** The configured presets, for labelling the badge. */
   tolerationPresets?: SchedulingTolerationPreset[];
 }
@@ -199,14 +200,14 @@ export const createUserColumns = (
               <span className="sr-only">Manage Billing</span>
             </button>
           )}
-          <button
+          {actions.canManageUsers && <button
             onClick={() => actions.onDelete(user)}
             className="h-8 w-8 p-0 rounded text-red-600 hover:text-red-700 hover:bg-red-50 transition-all flex items-center justify-center"
             title="Delete user"
           >
             <Trash2 className="h-4 w-4" />
             <span className="sr-only">Delete</span>
-          </button>
+          </button>}
         </div>
       );
     },
