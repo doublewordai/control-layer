@@ -88,7 +88,7 @@ pub async fn list_webhooks<P: PoolProvider>(
     let webhooks = repo.list_by_user(target_user_id).await?;
     let responses: Vec<WebhookResponse> = webhooks
         .into_iter()
-        .filter(|webhook| webhook.scope != "platform" || current_user.is_sso_platform_manager())
+        .filter(|webhook| webhook.scope != "platform" || current_user.can_manage_platform())
         .map(Into::into)
         .collect();
 
@@ -169,7 +169,7 @@ pub async fn create_webhook<P: PoolProvider>(
     }
 
     // Platform scope requires PlatformManager role (fail fast before hitting DB trigger)
-    if request.scope == "platform" && !current_user.is_sso_platform_manager() {
+    if request.scope == "platform" && !current_user.can_manage_platform() {
         return Err(Error::InsufficientPermissions {
             required: Permission::Allow(Resource::Webhooks, Operation::CreateAll),
             action: Operation::CreateAll,
@@ -293,7 +293,7 @@ pub async fn get_webhook<P: PoolProvider>(
     })?;
 
     // Verify the webhook belongs to the specified user
-    if webhook.user_id != target_user_id || (webhook.scope == "platform" && !current_user.is_sso_platform_manager()) {
+    if webhook.user_id != target_user_id || (webhook.scope == "platform" && !current_user.can_manage_platform()) {
         return Err(Error::NotFound {
             resource: "Webhook".to_string(),
             id: params.webhook_id.to_string(),
@@ -396,7 +396,7 @@ pub async fn update_webhook<P: PoolProvider>(
         id: params.webhook_id.to_string(),
     })?;
 
-    if existing.user_id != target_user_id || (existing.scope == "platform" && !current_user.is_sso_platform_manager()) {
+    if existing.user_id != target_user_id || (existing.scope == "platform" && !current_user.can_manage_platform()) {
         return Err(Error::NotFound {
             resource: "Webhook".to_string(),
             id: params.webhook_id.to_string(),
@@ -486,7 +486,7 @@ pub async fn delete_webhook<P: PoolProvider>(
         id: params.webhook_id.to_string(),
     })?;
 
-    if existing.user_id != target_user_id || (existing.scope == "platform" && !current_user.is_sso_platform_manager()) {
+    if existing.user_id != target_user_id || (existing.scope == "platform" && !current_user.can_manage_platform()) {
         return Err(Error::NotFound {
             resource: "Webhook".to_string(),
             id: params.webhook_id.to_string(),
@@ -572,7 +572,7 @@ pub async fn rotate_secret<P: PoolProvider>(
         id: params.webhook_id.to_string(),
     })?;
 
-    if existing.user_id != target_user_id || (existing.scope == "platform" && !current_user.is_sso_platform_manager()) {
+    if existing.user_id != target_user_id || (existing.scope == "platform" && !current_user.can_manage_platform()) {
         return Err(Error::NotFound {
             resource: "Webhook".to_string(),
             id: params.webhook_id.to_string(),

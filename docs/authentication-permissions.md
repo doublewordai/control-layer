@@ -1,80 +1,91 @@
 # Authentication and permission boundaries
 
-Management API keys do not inherit platform privileges from their holder. The
-same account can have different effective permissions when authenticated with a
-key, a native login session, or trusted upstream SSO.
+Platform configuration, customer ownership and the reserved system credential
+have separate authorization rules. An account's effective permissions depend on
+how the request authenticates and, for API keys, the verified key purpose.
 
 ## Request authorization
 
 `CurrentUser::from_request_parts` records the successful authentication method.
-API credentials are authoritative when supplied: an invalid key is rejected,
-not retried as a cookie or proxy identity. Both the resolved roles and the shared
-permission checker enforce the authentication ceiling. Persisted account roles
-are unchanged. `/users/current` returns effective roles and the effective admin
-flag so dashboard controls follow the request's authority.
+API credentials are authoritative when supplied: an invalid or insufficient key
+is rejected, never retried as a cookie or proxy identity. Provenance and the
+resolved API key ID are internal fields; JSON cannot supply them. Both effective
+roles and the shared permission checker enforce these boundaries.
 
-Only trusted proxy SSO retains platform roles and the legacy admin flag. API keys
-and native sessions retain StandardUser and explicitly assigned ordinary
-capabilities such as BatchAPIUser, ConnectionsUser and BackgroundInferenceUser.
-Organization permissions still follow actual membership and key-management grants; a platform role supplies no membership override.
-Key purpose still determines which API surface accepts the key. In particular,
-a platform-purpose key can manage permitted personal resources but cannot grant
-credits, inspect arbitrary accounts, or change another account's retention.
+| Authentication | Effective platform authority |
+| --- | --- |
+| Trusted proxy SSO | Assigned platform roles and the legacy admin flag |
+| Platform-purpose API key | Assigned PlatformManager role, plus ordinary capabilities; no inherited legacy admin flag, BillingManager or RequestViewer role |
+| Inference-purpose API key | StandardUser and explicitly assigned ordinary capabilities |
+| Native session | StandardUser and explicitly assigned ordinary capabilities |
+| Reserved system API key | Unrestricted service authority, including customer resources and account administration |
 
-The proxy-header authentication configuration is a trust boundary. Deployments
-must strip caller-supplied identity headers, set them only after verified SSO,
-and prevent untrusted direct access to the backend. A request passing through a
-proxy is not itself proof of SSO. API-key bypass paths must leave identity headers
-empty. Deployments using forwarded trusted headers must enforce these rules at
-the authenticating upstream hop. This code does not cryptographically validate
-an upstream identity header and does not replace those deployment controls.
+Ordinary capabilities include BatchAPIUser, ConnectionsUser and
+BackgroundInferenceUser. Background inference still requires that explicit role.
+The key-purpose gate prevents ordinary platform keys from invoking inference
+routes and inference keys from invoking management routes.
+`/users/current` and self-profile update responses expose the effective roles and
+admin flag, so clients see the same authority the permission checker enforces.
+
+The proxy-header configuration is a trust boundary. Deployments must strip
+caller-supplied identity headers, set them only after verified SSO, and prevent
+untrusted direct backend access. Requests using API-key bypass paths must not
+receive trusted identity headers. The application does not cryptographically
+validate upstream identity headers.
+
+## PlatformManager automation
+
+PlatformManager platform keys can manage models, composite routing, endpoints,
+pricing, groups and entitlements, probes, system monitoring and credit
+transactions. They can inspect account and billing metadata, create new
+organizations with an assigned owner, and provision ordinary users.
+
+User creation rejects PlatformManager, BillingManager and RequestViewer role
+assignments unless the caller uses the reserved system credential. Platform
+managers cannot modify existing users' roles or general account settings, delete
+arbitrary accounts, or use provisioning to acquire another account's credentials.
+
+Platform managers authenticated through SSO or a platform key may enable another
+account's zero data retention using an enable-only PATCH payload. They cannot
+disable it or bundle unrelated settings into that update. They may manage their
+own platform-scope webhooks; that does not grant access to another account's
+webhooks. PlatformManager does not grant request-log access.
 
 ## Customer ownership
 
-Files, batches, stored responses, external connections, API credentials and webhooks have
-no platform-wide permission override, including for legacy admins. Lists are
-scoped before pagination and direct access is checked against the personal owner
-or a membership-validated active organization. Ordinary organization key-manager
-rights remain available within the organization. Staff cannot use their platform
-role to issue customer credentials or add themselves to an organization.
+Except for the reserved system credential, customer files, batches, stored
+responses, connections, API keys and webhooks require ownership or legitimate
+organization access, including for SSO admins and PlatformManager keys. Lists
+are scoped before pagination. Platform roles do not grant organization membership,
+allow staff to issue customer keys, or permit them to add themselves to an
+existing organization. Owner/member key-management permissions remain available.
 
-Organization webhook access follows membership; platform-scope webhooks additionally
-require trusted SSO platform authority, even when accessing one's own webhook.
+Personal settings and organization-owner operations retain their existing rules.
+Platform-wide organization update/delete and user update/delete permissions are
+reserved for the system credential. Traffic metadata remains subject to its
+endpoint-specific authorization and is not justification for exposing content.
 
-Broad user create/update/delete permissions and organization update/delete overrides
-are disabled. Trusted SSO platform managers can still create new organizations and
-assign their initial owner; this does not grant access to existing organizations.
-Platform role assignment and privileged account provisioning must use a separately
-controlled administrative process; they are not support actions.
+## System credential
 
-## Existing dashboard operations
+The exception requires a verified platform-purpose API key whose key ID, creator
+and account are all the reserved nil UUID. A legacy admin flag, PlatformManager
+role, matching name/email, native login, SSO identity, or a different key issued
+for the system account does not qualify. The system key may use both management
+and AI API routes. Authentication still rejects revoked keys and deleted holders.
 
-The existing credit transaction endpoint retains its permission gate; trusted
-SSO users with the appropriate platform/billing privileges may grant credits.
-API keys and native login sessions cannot inherit that privilege.
-
-The existing user and organization PATCH endpoints accept an SSO platform
-manager's cross-account update only when it contains `zero_data_retention: true`
-and no other changes. Repeating it is harmless. Staff cannot disable another
-account's retention protection, change roles, or bundle other edits into it.
-Personal-account and organization-owner settings retain their existing rules.
-The dashboard sends only the enable-ZDR field in its support view.
-
-Traffic metadata remains a separate policy concern. This change grants no new
-cross-account API-key analytics access. Status metadata is not a justification
-for returning request or response content.
+This credential can provision privileged accounts, issue customer credentials,
+change account settings, inspect customer resources and retire accounts. It must
+be treated as a fully trusted service credential. The exception does not bypass
+input validation or database integrity constraints. Internal process credentials
+used by probes and queued inference remain restricted to the AI proxy; they do
+not gain access to management endpoints.
 
 ## Rollout
 
-This is a permission-tightening change for existing credentials, not just newly
-issued keys. Before enabling it, inventory automation using platform/admin keys.
-There is no legacy or system-key exemption in this policy. Privileged automation
-using these credentials will be denied and must move to a separately designed,
-explicit service authorization mechanism before rollout; this change adds none. Also review existing
-organization memberships and credentials separately: this change does not revoke
-independently issued customer keys or undo prior membership grants.
+Existing PlatformManager platform keys regain the configuration capabilities
+listed above. The reserved system key regains service authority. Other API keys
+and native sessions retain the ordinary permission ceiling. This change does not
+rotate keys, grant stored roles or modify existing organization membership.
 
-Verify SSO header handling, native-session behavior, support workflows, ordinary
-organization access and automation in staging before production rollout. Do not
-restore broad customer-content access as a workaround for a failing support or
-automation workflow. Existing credentials are not automatically rotated.
+Verify platform automation, system provisioning, customer ownership isolation,
+credential revocation and trusted SSO header handling before deploying a release.
