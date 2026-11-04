@@ -186,14 +186,16 @@ def verify_models_schema_change(app, direct):
                 "INSERT INTO model_aliases (alias,deployed_model_id,serving_class_id) VALUES (%s,%s,%s)",
                 (synonym, model["id"], class_id),
             )
-            for reserved in (synonym, alias + ":fast"):
+            # A synonym is a reserved name (409); a class route's name is not a
+            # valid alias at all, since aliases never contain ':' (400).
+            for reserved, status in ((synonym, 409), (alias + ":fast", 400)):
                 response = session.post(
                     base + "/admin/api/v1/models",
                     json={"type": "standard", "model_name": reserved,
                           "alias": reserved, "hosted_on": endpoint},
                     timeout=20,
                 )
-                assert response.status_code == 409, (
+                assert response.status_code == status, (
                     f"reserved class name accepted: {response.status_code} {response.text[:300]}"
                 )
 
