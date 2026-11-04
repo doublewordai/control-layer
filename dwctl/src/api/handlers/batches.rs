@@ -557,10 +557,10 @@ pub async fn create_batch<P: PoolProvider>(
         });
     }
 
-    // SSO platform managers and admins can use any
+    // Platform managers, SSO admins and the system credential can use any
     // completion window that humantime can parse. Everyone else is restricted
     // to the configured allowed values.
-    let can_use_any_window = current_user.is_sso_platform_manager();
+    let can_use_any_window = current_user.can_manage_platform();
     if !is_background && !can_use_any_window && !config.batches.allowed_completion_windows.contains(&req.completion_window) {
         let allowed: Vec<&str> = config.batches.allowed_completion_windows.iter().map(|w| w.as_str()).collect();
 
