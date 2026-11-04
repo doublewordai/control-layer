@@ -604,6 +604,11 @@ async fn reserved_system_key_can_provision_and_retire_accounts(pool: PgPool) {
         .json(&json!({"name":"not-the-system-key", "purpose":"platform"}))
         .await
         .assert_status_forbidden();
+    let secondary_bearer = format!("Bearer {}", secondary.secret);
+    app.get("/admin/api/v1/users")
+        .add_header("Authorization", &secondary_bearer)
+        .await
+        .assert_status_forbidden();
     let file_id = uuid::Uuid::new_v4();
     sqlx::query("INSERT INTO fusillade.files (id, name, purpose, uploaded_by) VALUES ($1, 'private.jsonl', 'batch', $2)")
         .bind(file_id)
@@ -668,4 +673,67 @@ async fn reserved_system_key_can_provision_and_retire_accounts(pool: PgPool) {
         .add_header("Authorization", &bearer)
         .await
         .assert_status_unauthorized();
+}
+
+#[dwctl_test_macros::test]
+async fn non_admin_platform_manager_sso_keeps_credits_and_enable_only_zdr(pool: PgPool) {
+    let (app, _services) = create_test_app(pool.clone(), false).await;
+    let actor = create_test_user(&pool, Role::PlatformManager).await;
+    assert!(!actor.is_admin);
+    let customer = create_test_user(&pool, Role::BatchAPIUser).await;
+    let headers = add_auth_headers(&actor);
+    let target = format!("/admin/api/v1/users/{}", customer.id);
+    let grant = json!({"user_id": customer.id, "transaction_type": "admin_grant", "amount": "10",
+        "source_id": actor.id.to_string(), "description": "Promotional contribution"});
+    app.post("/admin/api/v1/transactions")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&grant)
+        .await
+        .assert_status(StatusCode::CREATED);
+    let zdr = app
+        .patch(&target)
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&json!({"zero_data_retention": true}))
+        .await;
+    zdr.assert_status_ok();
+    assert_eq!(zdr.json::<Value>()["zero_data_retention"], true);
+    for body in [
+        json!({"zero_data_retention": false}),
+        json!({"zero_data_retention": true, "roles": ["PlatformManager"]}),
+        json!({"zero_data_retention": true, "auto_topup_amount": 50}),
+    ] {
+        app.patch(&target)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&body)
+            .await
+            .assert_status_forbidden();
+    }
+    let org = crate::test::utils::create_test_org(&pool, customer.id).await;
+    let org_path = format!("/admin/api/v1/organizations/{}", org.id);
+    app.patch(&org_path)
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&json!({"zero_data_retention": true}))
+        .await
+        .assert_status_ok();
+    for body in [
+        json!({"zero_data_retention": false}),
+        json!({"zero_data_retention": true, "auto_join_enabled": true}),
+    ] {
+        app.patch(&org_path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&body)
+            .await
+            .assert_status_forbidden();
+    }
+    app.post(&format!("{org_path}/members"))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&json!({"user_id": actor.id, "role": "owner"}))
+        .await
+        .assert_status_forbidden();
 }

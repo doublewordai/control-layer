@@ -66,7 +66,8 @@ pub async fn list_webhooks<P: PoolProvider>(
         target_user_id == current_user.id && permissions::has_permission(&current_user, Resource::Webhooks, Operation::ReadOwn);
 
     if !can_read_all && !can_read_own {
-        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        // Authorization must observe membership revocations on the primary.
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
         let is_member = permissions::is_org_member(&current_user, target_user_id, &mut conn)
             .await
             .map_err(Error::Database)?;
@@ -137,7 +138,8 @@ pub async fn create_webhook<P: PoolProvider>(
         target_user_id == current_user.id && permissions::has_permission(&current_user, Resource::Webhooks, Operation::CreateOwn);
 
     if !can_create_all && !can_create_own {
-        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        // Authorization must observe membership revocations on the primary.
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
         let can_org = permissions::can_manage_org_resource(&current_user, target_user_id, &mut conn)
             .await
             .map_err(Error::Database)?;
@@ -268,7 +270,8 @@ pub async fn get_webhook<P: PoolProvider>(
         target_user_id == current_user.id && permissions::has_permission(&current_user, Resource::Webhooks, Operation::ReadOwn);
 
     if !can_read_all && !can_read_own {
-        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        // Authorization must observe membership revocations on the primary.
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
         let is_member = permissions::is_org_member(&current_user, target_user_id, &mut conn)
             .await
             .map_err(Error::Database)?;
@@ -347,7 +350,8 @@ pub async fn update_webhook<P: PoolProvider>(
         target_user_id == current_user.id && permissions::has_permission(&current_user, Resource::Webhooks, Operation::UpdateOwn);
 
     if !can_update_all && !can_update_own {
-        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        // Authorization must observe membership revocations on the primary.
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
         let can_org = permissions::can_manage_org_resource(&current_user, target_user_id, &mut conn)
             .await
             .map_err(Error::Database)?;
@@ -461,7 +465,8 @@ pub async fn delete_webhook<P: PoolProvider>(
         target_user_id == current_user.id && permissions::has_permission(&current_user, Resource::Webhooks, Operation::DeleteOwn);
 
     if !can_delete_all && !can_delete_own {
-        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        // Authorization must observe membership revocations on the primary.
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
         let can_org = permissions::can_manage_org_resource(&current_user, target_user_id, &mut conn)
             .await
             .map_err(Error::Database)?;
@@ -547,7 +552,8 @@ pub async fn rotate_secret<P: PoolProvider>(
         target_user_id == current_user.id && permissions::has_permission(&current_user, Resource::Webhooks, Operation::UpdateOwn);
 
     if !can_update_all && !can_update_own {
-        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        // Authorization must observe membership revocations on the primary.
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
         let can_org = permissions::can_manage_org_resource(&current_user, target_user_id, &mut conn)
             .await
             .map_err(Error::Database)?;
@@ -1068,5 +1074,45 @@ mod tests {
             .await;
 
         response.assert_status(StatusCode::CREATED);
+        let webhook: WebhookWithSecretResponse = response.json();
+        let collection = format!("/admin/api/v1/users/{}/webhooks", org.id);
+        let item = format!("{collection}/{}", webhook.id);
+
+        sqlx::query("DELETE FROM user_organizations WHERE user_id = $1 AND organization_id = $2")
+            .bind(bob.id)
+            .bind(org.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let headers = add_auth_headers(&bob);
+        for path in [&collection, &item] {
+            app.get(path)
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .await
+                .assert_status_forbidden();
+        }
+        app.post(&collection)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"url": "https://example.com/revoked"}))
+            .await
+            .assert_status_forbidden();
+        app.patch(&item)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"enabled": false}))
+            .await
+            .assert_status_forbidden();
+        app.delete(&item)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await
+            .assert_status_forbidden();
+        app.post(&format!("{item}/rotate-secret"))
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await
+            .assert_status_forbidden();
     }
 }

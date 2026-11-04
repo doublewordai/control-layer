@@ -22,8 +22,10 @@ roles and the shared permission checker enforce these boundaries.
 
 Ordinary capabilities include BatchAPIUser, ConnectionsUser and
 BackgroundInferenceUser. Background inference still requires that explicit role.
-The key-purpose gate prevents ordinary platform keys from invoking inference
-routes and inference keys from invoking management routes.
+The key-purpose gate prevents ordinary platform keys from invoking direct
+`/ai/*` inference routes and inference keys from invoking management routes.
+Platform keys can use the `/admin/api/v1/ai/*` inference proxy. The reserved
+system key is also accepted on direct `/ai/*` routes.
 `/users/current` and self-profile update responses expose the effective roles and
 admin flag, so clients see the same authority the permission checker enforces.
 
