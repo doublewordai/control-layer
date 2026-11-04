@@ -42,6 +42,10 @@ pricing, groups and entitlements, probes, system monitoring and credit
 transactions. They can inspect account and billing metadata, create new
 organizations with an assigned owner, and provision ordinary users.
 
+Only personal platform keys carry the holder's PlatformManager role.
+Organization keys keep the ordinary ceiling, because organization managers can
+issue them in another member's name and receive the secret.
+
 User creation rejects PlatformManager, BillingManager and RequestViewer role
 assignments unless the caller uses the reserved system credential. Platform
 managers cannot modify existing users' roles or general account settings, delete

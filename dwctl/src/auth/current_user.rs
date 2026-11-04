@@ -494,12 +494,14 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
 
     Some(Ok((
         CurrentUser {
+            // Only a personal platform key carries its holder's platform role:
+            // org managers can issue keys attributed to any member and keep the secret.
             auth_method: if is_system_key {
                 AuthMethod::SystemApiKey
             } else if purpose_str == "platform"
                 && !api_key_data.api_key_id.is_nil()
                 && !api_key_data.created_by.is_nil()
-                && !api_key_data.user_id.is_nil()
+                && api_key_data.created_by == api_key_data.user_id
             {
                 AuthMethod::PlatformApiKey
             } else {

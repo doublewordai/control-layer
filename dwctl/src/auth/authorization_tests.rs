@@ -579,6 +579,51 @@ async fn platform_keys_manage_configuration_without_customer_takeover(pool: PgPo
 }
 
 #[dwctl_test_macros::test]
+async fn org_issued_platform_keys_do_not_carry_member_platform_roles(pool: PgPool) {
+    let (app, _services) = create_test_app(pool.clone(), false).await;
+    let manager = create_test_user(&pool, Role::PlatformManager).await;
+    let owner = create_test_user(&pool, Role::StandardUser).await;
+    let org = crate::test::utils::create_test_org(&pool, owner.id).await;
+    let headers = add_auth_headers(&owner);
+    // Org owners add members without consent and may issue keys attributed to them.
+    app.post(&format!("/admin/api/v1/organizations/{}/members", org.id))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&json!({"user_id": manager.id}))
+        .await
+        .assert_status(StatusCode::CREATED);
+    let issued = app
+        .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&json!({"name": "attributed-platform-key", "purpose": "platform", "member_id": manager.id}))
+        .await;
+    issued.assert_status(StatusCode::CREATED);
+    let issued = issued.json::<Value>();
+    assert_eq!(issued["created_by"], json!(manager.id));
+    let bearer = format!("Bearer {}", issued["key"].as_str().unwrap());
+
+    // The secret belongs to the issuer, so it must not exercise the member's platform role.
+    let current = app.get("/admin/api/v1/users/current").add_header("Authorization", &bearer).await;
+    current.assert_status_ok();
+    assert!(
+        !current.json::<Value>()["roles"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("PlatformManager"))
+    );
+    app.get("/admin/api/v1/users")
+        .add_header("Authorization", &bearer)
+        .await
+        .assert_status_forbidden();
+    app.post("/admin/api/v1/users")
+        .add_header("Authorization", &bearer)
+        .json(&json!({"username": "via-org-key", "email": "via-org-key@example.test", "roles": ["StandardUser"]}))
+        .await
+        .assert_status_forbidden();
+}
+
+#[dwctl_test_macros::test]
 async fn reserved_system_key_can_provision_and_retire_accounts(pool: PgPool) {
     let (app, _services) = create_test_app(pool.clone(), false).await;
     let secret = crate::crypto::generate_api_key();
