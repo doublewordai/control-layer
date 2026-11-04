@@ -174,7 +174,7 @@ The check covers Chat Completions requests, including Responses and Messages req
 
 The reject list is empty by default, so the check only observes. Set it with `AppState::with_rejected_params`; in dwctl, use `onwards.rejected_params`. The list holds names, so a listed name is refused on every surface whose catalog has it: rejecting `logprobs` refuses `logprobs: true` on chat and any `logprobs` count on legacy completions. A name outside both catalogs is a configuration error.
 
-A model can be exempted from part of the reject list with `AppState::with_model_allowed_params` (in dwctl, `onwards.model_allowed_params`), keyed by the model name the client requests. The listed parameters are forwarded for that model and refused for every other. Use it for a model whose every worker honours a parameter the rest of the fleet can't. The same name check applies.
+A model can be exempted from part of the reject list with `AppState::with_model_allowed_params` (in dwctl, `onwards.model_allowed_params`), keyed by the model name the client requests. For names also present in the reject list, the listed parameters are forwarded for that model and remain refused for every other. Use it for a model whose every worker honours a parameter the rest of the fleet can't. The same name check applies.
 
 ## Comparison with response sanitization
 
