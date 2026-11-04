@@ -1460,6 +1460,12 @@ pub struct OnwardsConfig {
     /// here are refused. Names must come from `onwards::unsupported_params::params()`.
     /// Default: empty (observe only).
     pub rejected_params: Vec<String>,
+    /// Per-model exceptions to `rejected_params`, keyed by the model name the
+    /// client requests: the listed parameters are forwarded for that model
+    /// although `rejected_params` names them. For a model whose every worker
+    /// honours a parameter the rest of the fleet can't. Names must come from
+    /// `onwards::unsupported_params::params()`. Default: empty.
+    pub model_allowed_params: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 impl Default for OnwardsConfig {
@@ -1472,6 +1478,7 @@ impl Default for OnwardsConfig {
                     .to_string(),
             first_token_timeout_ms: 20_000,
             rejected_params: Vec::new(),
+            model_allowed_params: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -3830,6 +3837,16 @@ impl Config {
                 operation: format!("Config validation: onwards.rejected_params names an unknown parameter: {name}"),
             });
         }
+        if let Some((model, name)) = self.onwards.model_allowed_params.iter().find_map(|(model, params)| {
+            params
+                .iter()
+                .find(|name| onwards::unsupported_params::known_param(name).is_none())
+                .map(|name| (model, name))
+        }) {
+            return Err(Error::Internal {
+                operation: format!("Config validation: onwards.model_allowed_params.{model} names an unknown parameter: {name}"),
+            });
+        }
         // The payment provider is rebuilt from config on every request, so a
         // bad base URL must fail here rather than panic in each handler.
         if let Some(PaymentConfig::Stripe(stripe)) = &self.payment
@@ -4524,6 +4541,24 @@ mod tests {
         config.onwards.rejected_params.push("top_k".to_string());
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("onwards.rejected_params names an unknown parameter: top_k"));
+    }
+
+    #[test]
+    fn model_allowed_params_must_be_known() {
+        let mut config = Config::default();
+        config.secret_key = Some("test-secret-key".to_string());
+        config
+            .onwards
+            .model_allowed_params
+            .insert("example/model".to_string(), vec!["logprobs".to_string()]);
+        config.validate().unwrap();
+
+        config
+            .onwards
+            .model_allowed_params
+            .insert("example/model".to_string(), vec!["logprob".to_string()]);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("onwards.model_allowed_params.example/model names an unknown parameter: logprob"));
     }
 
     #[test]

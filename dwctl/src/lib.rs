@@ -4820,6 +4820,15 @@ impl Application {
             .with_batch_inflight_enforce(config.limits.batch_inflight.enforce)
             .with_rejected_params(&config.onwards.rejected_params)
             .map_err(|error| anyhow::anyhow!("onwards.rejected_params: {error}"))?;
+        onwards_app_state = onwards_app_state
+            .with_model_allowed_params(
+                config
+                    .onwards
+                    .model_allowed_params
+                    .iter()
+                    .map(|(model, params)| (model.clone(), params.iter())),
+            )
+            .map_err(|error| anyhow::anyhow!("onwards.model_allowed_params: {error}"))?;
         if config.onwards.first_token_timeout_ms > 0 {
             onwards_app_state =
                 onwards_app_state.with_first_token_timeout(std::time::Duration::from_millis(config.onwards.first_token_timeout_ms));
