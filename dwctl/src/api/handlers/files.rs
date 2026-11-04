@@ -178,6 +178,7 @@ impl OpenAIBatchRequest {
         endpoint: &str,
         api_key: String,
         accessible_models: &HashMap<String, AccessibleBatchModel>,
+        retired_models: &HashMap<String, String>,
         allowed_url_paths: &[String],
         tolerations: &AccountTolerations,
     ) -> Result<fusillade::RequestTemplateInput> {
@@ -208,9 +209,12 @@ impl OpenAIBatchRequest {
         let model = model.to_string();
 
         // Validate model access
-        let accessible_model = accessible_models.get(&model).ok_or_else(|| Error::ModelAccessDenied {
-            model_name: model.clone(),
-            message: format!("Model '{}' has not been configured or is not available to user.", model),
+        let accessible_model = accessible_models.get(&model).ok_or_else(|| match retired_models.get(&model) {
+            Some(message) => Error::Gone { message: message.clone() },
+            None => Error::ModelAccessDenied {
+                model_name: model.clone(),
+                message: format!("Model '{}' has not been configured or is not available to user.", model),
+            },
         })?;
 
         // Validate endpoint matches model type (skip if model type is unknown)
@@ -293,6 +297,10 @@ struct FileStreamConfig {
     max_request_body_size: u64,
     /// Channel buffer size for streaming
     buffer_size: usize,
+    /// Accepted range for `expires_after[seconds]`, inclusive. The upper bound
+    /// is what content retention honours; a longer request is refused rather
+    /// than recorded as a date the content will not reach.
+    expiry_seconds: std::ops::RangeInclusive<i64>,
     /// Optional image normaliser. When `Some`, each parsed template's body is
     /// walked for `image_url` fields containing HTTP(S) URLs (per the user's
     /// mode); each is ingested into the content store and replaced with an
@@ -321,6 +329,7 @@ impl std::fmt::Debug for FileStreamConfig {
             .field("max_requests_per_file", &self.max_requests_per_file)
             .field("max_request_body_size", &self.max_request_body_size)
             .field("buffer_size", &self.buffer_size)
+            .field("expiry_seconds", &self.expiry_seconds)
             .field("normalizer_enabled", &self.normalizer.is_some())
             .field("normalizer_mode", &self.normalizer_mode)
             .field("image_access_enabled", &self.access_pool.is_some())
@@ -497,6 +506,8 @@ enum FileUploadError {
     EmptyFile,
     /// User doesn't have access to a model referenced in the file
     ModelAccessDenied { model: String, line: u64 },
+    /// A line names a model that has been retired
+    ModelRetired { line: u64, message: String },
     /// Per-line validation error (custom_id, method, url, etc.)
     ValidationError { line: u64, message: String },
     /// A well-formed line whose reasoning budget cannot be processed.
@@ -528,6 +539,9 @@ enum FileUploadError {
     /// multipart parsing and aborted before the upload is committed — avoiding a
     /// 500 on read-back and preventing an orphaned file (regardless of field order).
     InvalidPurpose { purpose: String },
+    /// `expires_after[seconds]` did not parse or is outside the configured
+    /// range. Aborted before the upload is committed, like `InvalidPurpose`.
+    InvalidExpiry { value: String, min: i64, max: i64 },
 }
 
 /// Map a `BatchNormalizeError` variant to the `FileUploadError` that
@@ -566,6 +580,7 @@ const UPLOAD_REJECTION_CODES: &[&str] = &[
     "no_file",
     "empty_file",
     "model_access_denied",
+    "model_retired",
     "validation_error",
     "unprocessable_line",
     "image_transient",
@@ -574,6 +589,7 @@ const UPLOAD_REJECTION_CODES: &[&str] = &[
     "image_unfetchable",
     "image_fetch_failed",
     "invalid_purpose",
+    "invalid_expiry",
 ];
 
 /// Describes [`UPLOAD_REJECTIONS`] and registers each code at zero, so the
@@ -618,6 +634,7 @@ impl FileUploadError {
             FileUploadError::NoFile => "no_file",
             FileUploadError::EmptyFile => "empty_file",
             FileUploadError::ModelAccessDenied { .. } => "model_access_denied",
+            FileUploadError::ModelRetired { .. } => "model_retired",
             FileUploadError::ValidationError { .. } => "validation_error",
             FileUploadError::UnprocessableValidationError { .. } => "unprocessable_line",
             FileUploadError::ImageTransient { .. } => "image_transient",
@@ -626,6 +643,7 @@ impl FileUploadError {
             FileUploadError::ImageUnfetchable { .. } => "image_unfetchable",
             FileUploadError::ImageFetchFailed { .. } => "image_fetch_failed",
             FileUploadError::InvalidPurpose { .. } => "invalid_purpose",
+            FileUploadError::InvalidExpiry { .. } => "invalid_expiry",
         }
     }
 
@@ -692,6 +710,9 @@ impl FileUploadError {
                     line, model
                 ),
             },
+            FileUploadError::ModelRetired { line, message } => Error::Gone {
+                message: format!("Line {}: {}", line, message),
+            },
             FileUploadError::ValidationError { line, message } => Error::BadRequest {
                 message: format!("Line {}: {}", line, message),
             },
@@ -718,6 +739,12 @@ impl FileUploadError {
             },
             FileUploadError::InvalidPurpose { purpose } => Error::BadRequest {
                 message: format!("Invalid purpose '{}'. Only 'batch' is supported.", purpose),
+            },
+            FileUploadError::InvalidExpiry { value, min, max } => Error::BadRequest {
+                message: format!(
+                    "Invalid expires_after[seconds] '{}'. Must be an integer between {} and {}.",
+                    value, min, max
+                ),
             },
         }
     }
@@ -810,6 +837,7 @@ struct FileRequestContext {
     endpoint: String,
     api_key: String,
     accessible_models: HashMap<String, AccessibleBatchModel>,
+    retired_models: HashMap<String, String>,
     allowed_url_paths: Vec<String>,
     /// The toleration presets of the account that owns this upload, resolved
     /// per line by its model. A pinned line's list is written verbatim to
@@ -827,6 +855,10 @@ fn map_request_validation_error(error: &Error, line: u64) -> FileUploadError {
         Error::ModelAccessDenied { model_name, .. } => FileUploadError::ModelAccessDenied {
             model: model_name.clone(),
             line,
+        },
+        Error::Gone { message } => FileUploadError::ModelRetired {
+            line,
+            message: message.clone(),
         },
         Error::UnprocessableEntity { message } => FileUploadError::UnprocessableValidationError {
             line,
@@ -853,11 +885,13 @@ fn create_file_stream(
         endpoint,
         api_key,
         accessible_models,
+        retired_models,
         allowed_url_paths,
         tolerations,
     } = req_ctx;
     let normalizer = config.normalizer.clone();
     let normalizer_mode = config.normalizer_mode;
+    let expiry_seconds = config.expiry_seconds.clone();
     let access_pool = config.access_pool.clone();
     let access_attribution = config.access_attribution;
     let (tx, rx) = mpsc::channel(config.buffer_size);
@@ -932,10 +966,19 @@ fn create_file_stream(
                     }
                 }
                 "expires_after[seconds]" => {
-                    if let Ok(value) = field.text().await
-                        && let Ok(seconds) = value.parse::<i64>()
-                    {
-                        metadata.expires_after_seconds = Some(seconds);
+                    if let Ok(value) = field.text().await {
+                        // Refuse rather than record a date the content won't
+                        // reach, or silently ignore a value that didn't parse.
+                        match value.trim().parse::<i64>() {
+                            Ok(seconds) if expiry_seconds.contains(&seconds) => {
+                                metadata.expires_after_seconds = Some(seconds);
+                            }
+                            _ => abort!(FileUploadError::InvalidExpiry {
+                                value,
+                                min: *expiry_seconds.start(),
+                                max: *expiry_seconds.end(),
+                            }),
+                        }
                     }
                 }
                 "file" => {
@@ -1063,6 +1106,7 @@ fn create_file_stream(
                                                 &endpoint,
                                                 api_key.clone(),
                                                 &accessible_models,
+                                                &retired_models,
                                                 &allowed_url_paths,
                                                 &tolerations,
                                             ) {
@@ -1166,6 +1210,7 @@ fn create_file_stream(
                                         &endpoint,
                                         api_key.clone(),
                                         &accessible_models,
+                                        &retired_models,
                                         &allowed_url_paths,
                                         &tolerations,
                                     ) {
@@ -1360,6 +1405,7 @@ pub async fn upload_file<P: PoolProvider>(
         max_requests_per_file: config.limits.files.max_requests_per_file,
         max_request_body_size: config.limits.requests.max_body_size,
         buffer_size: config.batches.files.upload_buffer_size,
+        expiry_seconds: config.batches.files.min_expiry_seconds..=config.batches.files.max_expiry_seconds,
         normalizer,
         normalizer_mode,
         access_pool: Some(state.db.write().into_inner()),
@@ -1388,10 +1434,12 @@ pub async fn upload_file<P: PoolProvider>(
     // key, but keep it scope-consistent with batch creation).
     let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut api_keys_repo = ApiKeys::new(&mut conn);
-    let (user_api_key, api_key_id) = api_keys_repo
+    let api_key_id = api_keys_repo
         .resolve_batch_execution_key(target_user_id, current_user.id, current_user.api_key_id)
         .await
         .map_err(Error::Database)?;
+    // Fusillade still dispatches request templates with a stored key (until DW-1010).
+    let user_api_key = api_keys_repo.legacy_dispatch_secret(api_key_id).await.map_err(Error::Database)?;
 
     // The account's resolved scheduling tolerations, if it is pinned to a
     // preset. The hidden batch key belongs to the account that owns the batch
@@ -1406,7 +1454,10 @@ pub async fn upload_file<P: PoolProvider>(
     // account's policy straight off the users row, reusing the connection `conn`
     // this handler already holds — a cached account on Default is not a miss, so
     // an ordinary upload never takes a second connection.
-    let tolerations = match state.key_policy_cache.account_tolerations_if_known(&user_api_key) {
+    let tolerations = match state
+        .key_policy_cache
+        .account_tolerations_if_known(&crate::crypto::hash_api_key(&user_api_key))
+    {
         Some(resolved) => resolved,
         None => {
             let policy = crate::sync::key_policy::load_policy(&mut conn, target_user_id)
@@ -1444,6 +1495,9 @@ pub async fn upload_file<P: PoolProvider>(
             )
         })
         .collect();
+    let retired_models = crate::error_enrichment::retirement_messages(&mut conn)
+        .await
+        .map_err(Error::Database)?;
 
     // drop conn so it isn't persisted for entire upload process
     drop(conn);
@@ -1457,6 +1511,7 @@ pub async fn upload_file<P: PoolProvider>(
             endpoint,
             api_key: user_api_key,
             accessible_models,
+            retired_models,
             allowed_url_paths: config.batches.allowed_url_paths.clone(),
             tolerations,
         },
@@ -1909,6 +1964,7 @@ For input files, returns the original request templates. For output files, retur
     responses(
         (status = 200, description = "File content as newline-delimited JSON. Check the `X-Incomplete` header to determine if more content exists.", content_type = "application/x-ndjson"),
         (status = 404, description = "File not found or you don't have access to it."),
+        (status = 410, description = "The file has passed its `expires_at`; its content is no longer available."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
@@ -1944,6 +2000,15 @@ pub async fn get_file_content<P: PoolProvider>(
         return Err(Error::NotFound {
             resource: "File".to_string(),
             id: file_id_str,
+        });
+    }
+
+    // `expires_at` is the date the API has shown for this file; serving
+    // content past it would keep data the client was told is gone. The row
+    // may not be marked yet, so check the date, not only the status.
+    if file.status == fusillade::batch::FileStatus::Expired || file.expires_at.is_some_and(|expires_at| expires_at <= Utc::now()) {
+        return Err(Error::Gone {
+            message: format!("File {file_id_str} has expired; its content is no longer available"),
         });
     }
 
@@ -2415,6 +2480,145 @@ mod tests {
                 axum_test::multipart::Part::bytes(jsonl.as_bytes().to_vec()).file_name("reasoning-batch.jsonl"),
             ))
             .await
+    }
+
+    /// A user who can upload a one-line batch file for `gpt-4`.
+    async fn batch_uploader(pool: &PgPool) -> crate::api::models::users::UserResponse {
+        let user = create_test_user_with_roles(pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(pool).await;
+        add_user_to_group(pool, user.id, group.id).await;
+        let deployment = create_test_deployment(pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(pool, deployment.id, group.id, user.id).await;
+        user
+    }
+
+    const ONE_LINE: &str = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn upload_without_expires_after_gets_the_default_lifetime(pool: PgPool) {
+        // Not the built-in default, so this proves the setting reaches the
+        // repository rather than matching its own fallback.
+        let default_seconds = 2 * 24 * 60 * 60;
+        let mut config = create_test_config();
+        config.batches.files.default_expiry_seconds = default_seconds;
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let user = batch_uploader(&pool).await;
+
+        let before = Utc::now().timestamp();
+        let upload = upload_batch_jsonl(&app, &user, ONE_LINE).await;
+        upload.assert_status(axum::http::StatusCode::CREATED);
+        let file: FileResponse = upload.json();
+
+        let expires_at = file.expires_at.expect("uploads always carry an expiry");
+        assert!(
+            (before + default_seconds..=before + default_seconds + 5).contains(&expires_at),
+            "expires_at {expires_at} is not {default_seconds}s after upload at {before}"
+        );
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn upload_rejects_expires_after_outside_the_configured_range(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = batch_uploader(&pool).await;
+        let limits = crate::config::FilesConfig::default();
+        let before = upload_rejections("invalid_expiry");
+
+        for value in [
+            (limits.max_expiry_seconds + 1).to_string(),
+            (limits.min_expiry_seconds - 1).to_string(),
+            "-1".to_string(),
+            "soon".to_string(),
+        ] {
+            let response = app
+                .post("/ai/v1/files")
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                .multipart(
+                    axum_test::multipart::MultipartForm::new()
+                        .add_text("purpose", "batch")
+                        .add_text("expires_after[seconds]", value.clone())
+                        .add_part(
+                            "file",
+                            axum_test::multipart::Part::bytes(ONE_LINE.as_bytes().to_vec()).file_name("batch.jsonl"),
+                        ),
+                )
+                .await;
+            response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+            let body = response.text();
+            assert!(body.contains("expires_after[seconds]"), "value {value}: {body}");
+            assert!(body.contains(&limits.max_expiry_seconds.to_string()), "value {value}: {body}");
+        }
+        assert_eq!(upload_rejections("invalid_expiry"), before + 4);
+
+        let files: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fusillade.files")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(files, 0, "a refused upload leaves no file behind");
+
+        // The bounds themselves are accepted.
+        let response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_text("expires_after[seconds]", limits.max_expiry_seconds.to_string())
+                    .add_part(
+                        "file",
+                        axum_test::multipart::Part::bytes(ONE_LINE.as_bytes().to_vec()).file_name("batch.jsonl"),
+                    ),
+            )
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn downloading_an_expired_file_is_gone(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = batch_uploader(&pool).await;
+        let upload = upload_batch_jsonl(&app, &user, ONE_LINE).await;
+        upload.assert_status(axum::http::StatusCode::CREATED);
+        let file: FileResponse = upload.json();
+        let file_id = uuid::Uuid::parse_str(&file.id).unwrap();
+
+        let content = app
+            .get(&format!("/ai/v1/files/{}/content", file.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        content.assert_status_ok();
+
+        // The date alone decides, before any status is written.
+        sqlx::query("UPDATE fusillade.files SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+            .bind(file_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let content = app
+            .get(&format!("/ai/v1/files/{}/content", file.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        content.assert_status(axum::http::StatusCode::GONE);
+
+        // Metadata stays readable, and now reports the expired status.
+        let metadata = app
+            .get(&format!("/ai/v1/files/{}", file.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        metadata.assert_status_ok();
+        let status: String = sqlx::query_scalar("SELECT status FROM fusillade.files WHERE id = $1")
+            .bind(file_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "expired");
     }
 
     #[dwctl_test_macros::test]
@@ -4208,6 +4412,20 @@ mod tests {
     }
 
     #[test]
+    fn test_file_upload_error_into_http_error_model_retired() {
+        let error = super::FileUploadError::ModelRetired {
+            line: 3,
+            message: "The model `retired-model` was shut down.".to_string(),
+        };
+        match error.into_http_error() {
+            crate::errors::Error::Gone { message } => {
+                assert_eq!(message, "Line 3: The model `retired-model` was shut down.");
+            }
+            other => panic!("Expected Gone error, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_file_upload_error_into_http_error_validation_error() {
         let err = super::FileUploadError::ValidationError {
             line: 3,
@@ -4335,6 +4553,7 @@ mod tests {
             NoFile,
             EmptyFile,
             ModelAccessDenied { model: s(), line: 1 },
+            ModelRetired { line: 1, message: s() },
             ValidationError { line: 1, message: s() },
             UnprocessableValidationError { line: 1, message: s() },
             ImageTransient { line: 1, message: s() },

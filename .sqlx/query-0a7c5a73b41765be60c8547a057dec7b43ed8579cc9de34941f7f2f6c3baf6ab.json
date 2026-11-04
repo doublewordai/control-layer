@@ -1,0 +1,115 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden, spend_limit, spend_limit_interval, secret_hash, secret_prefix)\n            VALUES ($1, $2, $3, $4, $5, $6, false, $7, $8, $9, $10)\n            RETURNING id, name, description, secret, user_id, created_at, last_used, purpose, hidden, is_deleted, created_by, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "secret",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "last_used",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "purpose",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 8,
+        "name": "hidden",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 9,
+        "name": "is_deleted",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 10,
+        "name": "created_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 11,
+        "name": "spend_limit",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 12,
+        "name": "spend_limit_interval",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 13,
+        "name": "parent_api_key_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 14,
+        "name": "secret_revealed_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Text",
+        "Varchar",
+        "Varchar",
+        "Uuid",
+        "Uuid",
+        "Numeric",
+        "Text",
+        "Bytea",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "0a7c5a73b41765be60c8547a057dec7b43ed8579cc9de34941f7f2f6c3baf6ab"
+}

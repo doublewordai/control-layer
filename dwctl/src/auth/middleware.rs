@@ -15,6 +15,11 @@ use axum::{
 };
 use tracing::{debug, trace};
 
+/// How long the playground's internal credential stays valid. It is checked
+/// once, when the rewritten request enters `/ai` in this same process, so
+/// this only needs to cover that hop.
+const PLAYGROUND_CREDENTIAL_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Implementation for admin_ai_proxy_middleware. Since we only modify the request, in this
 /// middleware we can just return it from the implementation.
 pub(crate) async fn admin_ai_proxy<P: sqlx_pool_router::PoolProvider + Clone>(
@@ -55,7 +60,7 @@ pub(crate) async fn admin_ai_proxy<P: sqlx_pool_router::PoolProvider + Clone>(
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
     let mut api_key_conn = state.db.write().acquire().await.unwrap();
     let mut api_keys_repo = ApiKeys::new(&mut api_key_conn);
-    let user_api_key = api_keys_repo
+    let playground_key_id = api_keys_repo
         .get_or_create_hidden_key(target_user_id, ApiKeyPurpose::Playground, current_user.id)
         .await
         .with_context(|| {
@@ -83,11 +88,13 @@ pub(crate) async fn admin_ai_proxy<P: sqlx_pool_router::PoolProvider + Clone>(
     // Update the request URI
     *request.uri_mut() = new_uri;
 
-    // Add user-specific hidden API key as Authorization header for the AI proxy
+    // Authenticate the AI proxy request as the user's hidden playground key,
+    // with an internal credential rather than the key's secret.
+    let credential = state.internal_credentials.mint(playground_key_id, PLAYGROUND_CREDENTIAL_TTL);
     let headers = request.headers_mut();
     headers.insert(
         "authorization",
-        HeaderValue::from_str(&format!("Bearer {}", user_api_key)).with_context(|| "Failed to create authorization header value")?,
+        HeaderValue::from_str(&format!("Bearer {credential}")).with_context(|| "Failed to create authorization header value")?,
     );
 
     // Restore the body to the request
@@ -556,6 +563,7 @@ mod tests {
 
         // Create JWT session token
         let current_user = CurrentUser {
+            auth_method: crate::api::models::users::AuthMethod::TrustedSso,
             id: user.id,
             username: user.username,
             email: user.email,
@@ -576,6 +584,7 @@ mod tests {
             config: state.config,
             outlet_db: None,
             metrics_recorder: None,
+            batch_sla_metrics: state.batch_sla_metrics,
             is_leader: false,
             request_manager: state.request_manager,
             task_runner: state.task_runner,
@@ -586,6 +595,7 @@ mod tests {
             keystore: state.keystore.clone(),
             key_policy_cache: state.key_policy_cache.clone(),
             onwards_targets: None,
+            internal_credentials: state.internal_credentials.clone(),
         };
 
         let request = axum::http::Request::builder()
@@ -673,6 +683,7 @@ mod tests {
 
         // Create JWT session token for the JWT user
         let current_user = CurrentUser {
+            auth_method: crate::api::models::users::AuthMethod::TrustedSso,
             id: jwt_user.id,
             username: jwt_user.username,
             email: jwt_user.email.clone(),
@@ -693,6 +704,7 @@ mod tests {
             config: state.config,
             outlet_db: None,
             metrics_recorder: None,
+            batch_sla_metrics: state.batch_sla_metrics,
             is_leader: false,
             request_manager: state.request_manager,
             task_runner: state.task_runner,
@@ -703,6 +715,7 @@ mod tests {
             keystore: state.keystore.clone(),
             key_policy_cache: state.key_policy_cache.clone(),
             onwards_targets: None,
+            internal_credentials: state.internal_credentials.clone(),
         };
 
         let header_external_user_id = header_user.external_user_id.as_ref().unwrap_or(&header_user.username);
@@ -792,6 +805,7 @@ mod tests {
 
         // Create JWT session token
         let current_user = CurrentUser {
+            auth_method: crate::api::models::users::AuthMethod::TrustedSso,
             id: user.id,
             username: user.username.clone(),
             email: user.email.clone(),
@@ -812,6 +826,7 @@ mod tests {
             config: state.config,
             outlet_db: None,
             metrics_recorder: None,
+            batch_sla_metrics: state.batch_sla_metrics,
             is_leader: false,
             request_manager: state.request_manager,
             task_runner: state.task_runner,
@@ -822,6 +837,7 @@ mod tests {
             keystore: state.keystore.clone(),
             key_policy_cache: state.key_policy_cache.clone(),
             onwards_targets: None,
+            internal_credentials: state.internal_credentials.clone(),
         };
 
         // Request with JWT cookie - should be ignored since native auth is disabled
@@ -1000,6 +1016,7 @@ mod tests {
             config: state.config,
             outlet_db: None,
             metrics_recorder: None,
+            batch_sla_metrics: state.batch_sla_metrics,
             is_leader: false,
             request_manager: state.request_manager,
             task_runner: state.task_runner,
@@ -1010,6 +1027,7 @@ mod tests {
             keystore: state.keystore.clone(),
             key_policy_cache: state.key_policy_cache.clone(),
             onwards_targets: None,
+            internal_credentials: state.internal_credentials.clone(),
         };
 
         let external_user_id = user.external_user_id.as_ref().unwrap_or(&user.username);
@@ -1099,6 +1117,7 @@ mod tests {
 
         // Create JWT session token
         let current_user = CurrentUser {
+            auth_method: crate::api::models::users::AuthMethod::TrustedSso,
             id: user.id,
             username: user.username,
             email: user.email.clone(),
@@ -1119,6 +1138,7 @@ mod tests {
             config: state.config,
             outlet_db: None,
             metrics_recorder: None,
+            batch_sla_metrics: state.batch_sla_metrics,
             is_leader: false,
             request_manager: state.request_manager,
             task_runner: state.task_runner,
@@ -1129,6 +1149,7 @@ mod tests {
             keystore: state.keystore.clone(),
             key_policy_cache: state.key_policy_cache.clone(),
             onwards_targets: None,
+            internal_credentials: state.internal_credentials.clone(),
         };
 
         let request = axum::http::Request::builder()
@@ -1145,9 +1166,10 @@ mod tests {
             )
             .unwrap();
 
-        // Should succeed via JWT session despite invalid API key
-        let request = admin_ai_proxy(state, request).await.unwrap();
-        assert_eq!(request.uri().path(), "/ai/v1/chat/completions");
-        assert!(request.headers().get("authorization").is_some());
+        // Explicit invalid credentials must not inherit browser-session authority.
+        assert!(matches!(
+            admin_ai_proxy(state, request).await,
+            Err(crate::errors::Error::Unauthenticated { .. })
+        ));
     }
 }

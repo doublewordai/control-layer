@@ -1247,7 +1247,7 @@ mod tests {
 
         // The per-key policy sees the class preset folded over the model's.
         let key = format!("sk-{}", Uuid::new_v4());
-        sqlx::query("INSERT INTO api_keys (name, secret, user_id, created_by, purpose) VALUES ('k', $1, $2, $2, 'realtime')")
+        sqlx::query("INSERT INTO api_keys (name, secret, secret_hash, secret_prefix, user_id, created_by, purpose) VALUES ('k', $1, sha256(convert_to($1, 'UTF8')), left($1, 8), $2, $2, 'realtime')")
             .bind(&key)
             .bind(org)
             .execute(&pool)
@@ -1255,8 +1255,14 @@ mod tests {
             .unwrap();
         let cache = crate::sync::key_policy::KeyPolicyCache::empty();
         crate::sync::key_policy::refresh(&pool, &cache).await.unwrap();
-        assert_eq!(cache.policy(&key).toleration_preset_for("org/model"), Some("gpu"));
-        assert_eq!(cache.policy(&key).toleration_preset_for("org/other"), None);
+        assert_eq!(
+            cache.policy(&crate::crypto::hash_api_key(&key)).toleration_preset_for("org/model"),
+            Some("gpu")
+        );
+        assert_eq!(
+            cache.policy(&crate::crypto::hash_api_key(&key)).toleration_preset_for("org/other"),
+            None
+        );
         let mut conn = pool.acquire().await.unwrap();
         let direct = crate::sync::key_policy::load_policy(&mut conn, org).await.unwrap();
         assert_eq!(direct.toleration_preset_for("org/model"), Some("gpu"));

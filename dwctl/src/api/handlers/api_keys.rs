@@ -318,7 +318,7 @@ pub async fn list_user_api_keys<P: PoolProvider>(
         }
     }
 
-    // PlatformManagers (ReadAll) see all keys for a user; everyone else is scoped to created_by.
+    // Org managers see all keys in their organization; other members see their own keys.
     // Governance context (org mode + caller's role) for the manager bypass
     // and managed-mode gating below.
     // Primary pool: governance decisions must see a just-flipped org mode or a
@@ -1072,7 +1072,7 @@ mod tests {
         assert_eq!(window_spend, rust_decimal::Decimal::ZERO);
 
         // The resolver now routes this key's batch/flex work to the child.
-        let (_, resolved) = ApiKeys::new(&mut conn)
+        let resolved = ApiKeys::new(&mut conn)
             .resolve_batch_execution_key(user.id, user.id, Some(created.id))
             .await
             .unwrap();
@@ -1234,22 +1234,22 @@ mod tests {
             .await
             .assert_status(axum::http::StatusCode::FORBIDDEN);
 
-        // A PlatformManager can.
+        // PlatformManager is also constrained by ownership.
         let auth = add_auth_headers(&admin);
         app.patch(&format!("/admin/api/v1/users/{}/api-keys/{}", owner.id, key.id))
             .json(&json!({"spend_limit": "5"}))
             .add_header(&auth[0].0, &auth[0].1)
             .add_header(&auth[1].0, &auth[1].1)
             .await
-            .assert_status_ok();
+            .assert_status_forbidden();
 
         // System-managed keys are never PATCHable: the cap-scope child and the
         // shared hidden batch key both 404 even for their own user.
         let mut conn = pool.acquire().await.unwrap();
         let mut repo = ApiKeys::new(&mut conn);
-        let (_, child_id) = repo.get_or_create_child_hidden_key(key.id).await.unwrap();
-        let (_, shared_id) = repo
-            .get_or_create_hidden_key_with_id(owner.id, ApiKeyPurpose::Batch, owner.id)
+        let child_id = repo.get_or_create_child_hidden_key(key.id).await.unwrap();
+        let shared_id = repo
+            .get_or_create_hidden_key(owner.id, ApiKeyPurpose::Batch, owner.id)
             .await
             .unwrap();
         drop(conn);
@@ -1270,7 +1270,7 @@ mod tests {
         use crate::db::handlers::{Credits, Tariffs};
         use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
         use crate::db::models::tariffs::TariffCreateDBRequest;
-        use onwards::auth::ConstantTimeString;
+        use onwards::auth::KeyHash;
 
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
@@ -1332,7 +1332,7 @@ mod tests {
         // Under the cap: both scope keys are in the paid pool.
         let targets = crate::sync::onwards_config::load_targets_from_db(&pool, &[], false).await.unwrap();
         let has_key = |targets: &onwards::target::Targets, secret: &str| {
-            let expected = ConstantTimeString::from(secret.to_string());
+            let expected = KeyHash::from(secret.to_string());
             targets.targets.get("cap-e2e-model").is_some_and(|p| {
                 p.value()
                     .default_pool()
@@ -1431,10 +1431,7 @@ mod tests {
             .json(&api_key_data)
             .await;
 
-        response.assert_status(axum::http::StatusCode::CREATED);
-        let api_key: ApiKeyResponse = response.json();
-        assert_eq!(api_key.name, "Admin Created Key");
-        assert!(api_key.key.starts_with("sk-"));
+        response.assert_status_forbidden();
     }
 
     #[dwctl_test_macros::test]
@@ -1589,8 +1586,7 @@ mod tests {
         // Mint a cap-scope child for the visible key.
         let child_id = {
             let mut conn = pool.acquire().await.unwrap();
-            let (_, child_id) = ApiKeys::new(&mut conn).get_or_create_child_hidden_key(api_key.id).await.unwrap();
-            child_id
+            ApiKeys::new(&mut conn).get_or_create_child_hidden_key(api_key.id).await.unwrap()
         };
 
         // Children are system-managed: direct deletion is rejected (404), even
@@ -1632,19 +1628,19 @@ mod tests {
             .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
-        response.assert_status(axum::http::StatusCode::NO_CONTENT);
+        response.assert_status_forbidden();
 
-        // Verify the API key was deleted
+        // Verify the owner still has the API key
         let list_response = app
             .get(&format!("/admin/api/v1/users/{}/api-keys", regular_user.id))
-            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
-            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .add_header(&add_auth_headers(&regular_user)[0].0, &add_auth_headers(&regular_user)[0].1)
+            .add_header(&add_auth_headers(&regular_user)[1].0, &add_auth_headers(&regular_user)[1].1)
             .await;
 
         list_response.assert_status_ok();
         let paginated: PaginatedResponse<ApiKeyInfoResponse> = list_response.json();
-        assert_eq!(paginated.data.len(), 0);
-        assert_eq!(paginated.total_count, 0);
+        assert_eq!(paginated.data.len(), 1);
+        assert_eq!(paginated.total_count, 1);
     }
 
     #[dwctl_test_macros::test]
@@ -1729,8 +1725,8 @@ mod tests {
         add_user_to_group(&pool, regular_user.id, group.id).await;
 
         // Create multiple API keys for the regular user
-        let api_key1 = create_test_api_key_for_user(&pool, regular_user.id).await;
-        let api_key2 = create_test_api_key_for_user(&pool, regular_user.id).await;
+        let _api_key1 = create_test_api_key_for_user(&pool, regular_user.id).await;
+        let _api_key2 = create_test_api_key_for_user(&pool, regular_user.id).await;
 
         let response = app
             .get(&format!("/admin/api/v1/users/{}/api-keys", regular_user.id))
@@ -1738,15 +1734,7 @@ mod tests {
             .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
-        response.assert_status_ok();
-        let paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
-        assert_eq!(paginated.data.len(), 2);
-        assert_eq!(paginated.total_count, 2);
-
-        // Verify we got the correct API keys
-        let returned_ids: Vec<_> = paginated.data.iter().map(|k| k.id).collect();
-        assert!(returned_ids.contains(&api_key1.id));
-        assert!(returned_ids.contains(&api_key2.id));
+        response.assert_status_forbidden();
     }
 
     #[dwctl_test_macros::test]
@@ -1784,10 +1772,7 @@ mod tests {
             .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
-        response.assert_status_ok();
-        let returned_key: ApiKeyInfoResponse = response.json();
-        assert_eq!(returned_key.id, api_key.id);
-        assert_eq!(returned_key.name, api_key.name);
+        response.assert_status_forbidden();
     }
 
     #[dwctl_test_macros::test]
@@ -1914,14 +1899,14 @@ mod tests {
 
     #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn test_platform_manager_full_api_key_access(pool: PgPool) {
+    async fn test_platform_manager_cannot_access_customer_api_keys(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager = create_test_user(&pool, Role::PlatformManager).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
         add_user_to_group(&pool, standard_user.id, group.id).await;
 
-        // Platform manager should be able to create API keys for other users
+        // Platform manager cannot create API keys for other users
         let api_key_data = json!({
             "name": "Manager Created Key",
             "description": "Created by platform manager",
@@ -1935,29 +1920,27 @@ mod tests {
             .json(&api_key_data)
             .await;
 
-        response.assert_status(axum::http::StatusCode::CREATED);
+        response.assert_status_forbidden();
+        let api_key = create_test_api_key_for_user(&pool, standard_user.id).await;
 
-        // Platform manager should be able to list all users' API keys
+        // Platform manager cannot list all users' API keys
         let response = app
             .get(&format!("/admin/api/v1/users/{}/api-keys", standard_user.id))
             .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
             .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
 
-        response.assert_status_ok();
-        let paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
-        assert_eq!(paginated.data.len(), 1);
-        assert_eq!(paginated.total_count, 1);
+        response.assert_status_forbidden();
 
-        // Platform manager should be able to get specific API keys for other users
-        let api_key_id = paginated.data[0].id;
+        // Platform manager cannot get specific API keys for other users
+        let api_key_id = api_key.id;
         let response = app
             .get(&format!("/admin/api/v1/users/{}/api-keys/{}", standard_user.id, api_key_id))
             .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
             .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
 
-        response.assert_status_ok();
+        response.assert_status_forbidden();
 
         // The target user can also see the key created on their behalf
         let response = app
@@ -1969,16 +1952,16 @@ mod tests {
         response.assert_status_ok();
         let paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
         assert_eq!(paginated.data.len(), 1);
-        assert_eq!(paginated.data[0].name, "Manager Created Key");
+        assert_eq!(paginated.data[0].id, api_key.id);
 
-        // Platform manager should be able to delete other users' API keys
+        // Platform manager cannot delete other users' API keys
         let response = app
             .delete(&format!("/admin/api/v1/users/{}/api-keys/{}", standard_user.id, api_key_id))
             .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
             .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
 
-        response.assert_status(axum::http::StatusCode::NO_CONTENT);
+        response.assert_status_forbidden();
     }
 
     #[dwctl_test_macros::test]
@@ -2532,7 +2515,7 @@ mod tests {
 
     #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn test_platform_manager_sees_all_org_keys(pool: PgPool) {
+    async fn test_platform_manager_cannot_see_unrelated_org_keys(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let alice = create_test_user(&pool, Role::StandardUser).await;
         let bob = create_test_user(&pool, Role::StandardUser).await;
@@ -2556,15 +2539,13 @@ mod tests {
             .await
             .assert_status(axum::http::StatusCode::CREATED);
 
-        // PlatformManager lists org keys → should see all keys (bypasses created_by filter)
+        // An unrelated platform manager cannot list organization keys.
         let response = app
             .get(&format!("/admin/api/v1/users/{}/api-keys", org.id))
             .add_header(&add_auth_headers(&pm)[0].0, &add_auth_headers(&pm)[0].1)
             .add_header(&add_auth_headers(&pm)[1].0, &add_auth_headers(&pm)[1].1)
             .await;
-        response.assert_status_ok();
-        let paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
-        assert_eq!(paginated.data.len(), 2);
+        response.assert_status_forbidden();
     }
 
     // ── created_by attribution tests ──────────────────────────────────────
@@ -2628,12 +2609,7 @@ mod tests {
             .add_header(&add_auth_headers(&pm)[1].0, &add_auth_headers(&pm)[1].1)
             .json(&json!({"name": "Attributed Key", "purpose": "realtime", "member_id": alice.id}))
             .await;
-        response.assert_status(axum::http::StatusCode::CREATED);
-        let key: ApiKeyResponse = response.json();
-
-        // created_by should be Alice (the specified member), not the PM
-        assert_eq!(key.created_by, alice.id, "created_by should be the specified member_id");
-        assert_eq!(key.user_id, org.id, "user_id should be the org");
+        response.assert_status_forbidden();
     }
 
     #[dwctl_test_macros::test]
@@ -2652,7 +2628,7 @@ mod tests {
             .add_header(&add_auth_headers(&pm)[1].0, &add_auth_headers(&pm)[1].1)
             .json(&json!({"name": "Bad Key", "purpose": "realtime", "member_id": pm.id}))
             .await;
-        response.assert_status_bad_request();
+        response.assert_status_forbidden();
     }
 
     #[dwctl_test_macros::test]
@@ -2671,7 +2647,7 @@ mod tests {
             .add_header(&add_auth_headers(&pm)[1].0, &add_auth_headers(&pm)[1].1)
             .json(&json!({"name": "Bad Key", "purpose": "realtime", "member_id": outsider.id}))
             .await;
-        response.assert_status_bad_request();
+        response.assert_status_forbidden();
     }
 
     #[dwctl_test_macros::test]
@@ -2709,12 +2685,7 @@ mod tests {
             .add_header(&add_auth_headers(&pm)[1].0, &add_auth_headers(&pm)[1].1)
             .json(&json!({"name": "PM For Alice", "purpose": "realtime"}))
             .await;
-        response.assert_status(axum::http::StatusCode::CREATED);
-        let key: ApiKeyResponse = response.json();
-
-        // created_by should be Alice (the target individual) so she can see it
-        assert_eq!(key.created_by, alice.id, "created_by should be the target user for individual keys");
-        assert_eq!(key.user_id, alice.id, "user_id should be the target user");
+        response.assert_status_forbidden();
     }
 
     // ── Org key management (issuing, manage_keys grant, rotation) ─────────
@@ -2989,11 +2960,10 @@ mod tests {
             use crate::db::handlers::api_keys::ApiKeys;
             use crate::db::models::api_keys::ApiKeyPurpose;
             let mut conn = pool.acquire().await.unwrap();
-            let (_, id) = ApiKeys::new(&mut conn)
-                .get_or_create_hidden_key_with_id(user.id, ApiKeyPurpose::Batch, user.id)
+            ApiKeys::new(&mut conn)
+                .get_or_create_hidden_key(user.id, ApiKeyPurpose::Batch, user.id)
                 .await
-                .unwrap();
-            id
+                .unwrap()
         };
         let response = app
             .post(&format!("/admin/api/v1/users/current/api-keys/{}/rotate", hidden_root_id))

@@ -16,13 +16,13 @@
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# Setup: Get user IDs and grant roles for testing
+# Setup: Get pre-provisioned user IDs for testing
 # -----------------------------------------------------------------------------
 
 # Get user IDs
 GET http://localhost:3001/admin/api/v1/users/current
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Captures]
 admin_user_id: jsonpath "$.id"
@@ -35,21 +35,11 @@ HTTP 200
 user1_id: jsonpath "$.id"
 
 GET http://localhost:3001/admin/api/v1/users/current
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 HTTP 200
 [Captures]
 user2_id: jsonpath "$.id"
-
-# Temporarily grant user2 PlatformManager role (without is_admin flag)
-# This allows us to test PlatformManager permissions properly
-PATCH http://localhost:3001/admin/api/v1/users/{{user2_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
-{
-  "roles": ["PlatformManager"]
-}
-HTTP 200
 
 # =============================================================================
 # Raw Request Logs (GET /requests) - Requires Requests::ReadAll
@@ -83,26 +73,26 @@ HTTP 403
 
 # User2 (PlatformManager) tries to list requests - should be forbidden
 GET http://localhost:3001/admin/api/v1/requests
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 HTTP 403
 
 # User2 tries with pagination - should be forbidden
 GET http://localhost:3001/admin/api/v1/requests?skip=0&limit=10
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 HTTP 403
 
 # User2 tries with time filters - should be forbidden
 GET http://localhost:3001/admin/api/v1/requests?timestamp_after=2024-01-01T00:00:00Z
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 HTTP 403
 
 # User2 tries with URI pattern - should be forbidden
 GET http://localhost:3001/admin/api/v1/requests?uri_pattern=/ai/%
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 HTTP 403
 
 # =============================================================================
@@ -137,8 +127,8 @@ HTTP 403
 
 # User2 (PlatformManager) gets aggregate without filters - should succeed
 GET http://localhost:3001/admin/api/v1/requests/aggregate
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 HTTP 200
 [Asserts]
 jsonpath "$.total_requests" exists
@@ -147,8 +137,8 @@ jsonpath "$.time_series" exists
 
 # User2 gets aggregate with model filter - should succeed
 GET http://localhost:3001/admin/api/v1/requests/aggregate?model=gpt-4
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 HTTP 200
 [Asserts]
 jsonpath "$.total_requests" exists
@@ -156,8 +146,8 @@ jsonpath "$.model" == "gpt-4"
 
 # User2 gets aggregate with time range - should succeed
 GET http://localhost:3001/admin/api/v1/requests/aggregate?timestamp_after=2024-01-01T00:00:00Z&timestamp_before=2024-12-31T23:59:59Z
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 HTTP 200
 [Asserts]
 jsonpath "$.total_requests" exists
@@ -194,14 +184,14 @@ HTTP 403
 
 # User2 (PlatformManager) gets user aggregation without model - should fail (model required)
 GET http://localhost:3001/admin/api/v1/requests/aggregate-by-user
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 HTTP 400
 
 # User2 gets user aggregation with model - should succeed
 GET http://localhost:3001/admin/api/v1/requests/aggregate-by-user?model=gpt-4
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 HTTP 200
 [Asserts]
 jsonpath "$.model" == "gpt-4"
@@ -211,16 +201,16 @@ jsonpath "$.users" exists
 
 # User2 gets user aggregation with time range - should succeed
 GET http://localhost:3001/admin/api/v1/requests/aggregate-by-user?model=claude-3&start_date=2024-01-01T00:00:00Z&end_date=2024-12-31T23:59:59Z
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 HTTP 200
 [Asserts]
 jsonpath "$.model" == "claude-3"
 
 # User2 can query models they don't have access to (Analytics is platform-wide)
 GET http://localhost:3001/admin/api/v1/requests/aggregate-by-user?model=some-other-model
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 HTTP 200
 [Asserts]
 jsonpath "$.model" == "some-other-model"
@@ -231,14 +221,14 @@ jsonpath "$.model" == "some-other-model"
 
 # Verify user2 (PlatformManager) cannot bypass with query parameters
 GET http://localhost:3001/admin/api/v1/requests?skip=0&limit=1&method=POST&status_code=200
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 HTTP 403
 
 # Verify user2 cannot get specific time-filtered requests
 GET http://localhost:3001/admin/api/v1/requests?timestamp_after=2024-01-01T00:00:00Z&timestamp_before=2024-01-02T00:00:00Z
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 HTTP 403
 
 # =============================================================================
@@ -247,8 +237,8 @@ HTTP 403
 
 # Verify aggregate response doesn't contain request/response bodies
 GET http://localhost:3001/admin/api/v1/requests/aggregate
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 HTTP 200
 [Asserts]
 # Should only have aggregated metrics, not raw data
@@ -263,8 +253,8 @@ jsonpath "$[?(@.response)]" count == 0
 
 # Verify user aggregation doesn't contain request/response bodies
 GET http://localhost:3001/admin/api/v1/requests/aggregate-by-user?model=gpt-4
-[Cookies]
-dwctl_session: {{user2_jwt}}
+X-Doubleword-User: hurl-platform-manager
+X-Doubleword-Email: hurl-platform-manager@example.org
 HTTP 200
 [Asserts]
 # Should only have user statistics, not raw data
@@ -275,20 +265,3 @@ jsonpath "$.users[*][?(@.request)]" count == 0
 jsonpath "$.users[*][?(@.response)]" count == 0
 jsonpath "$.users[*][?(@.body)]" count == 0
 jsonpath "$.users[*][?(@.headers)]" count == 0
-
-# =============================================================================
-# Cleanup: Restore user2 to original roles
-# =============================================================================
-
-# Restore user2 to StandardUser + BatchAPIUser
-PATCH http://localhost:3001/admin/api/v1/users/{{user2_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
-{
-  "roles": ["StandardUser", "BatchAPIUser"]
-}
-HTTP 200
-
-# =============================================================================
-# Cleanup Complete
-# =============================================================================

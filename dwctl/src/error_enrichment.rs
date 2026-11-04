@@ -25,7 +25,11 @@
 //!    purpose (realtime/batch/playground) for the requested model
 //!    - Shows which modality and model are blocked
 
+use std::{collections::HashMap, fmt};
+
 use crate::{
+    auth::internal_credential::presented_key_hash,
+    crypto::ApiKeyHash,
     db::errors::DbError,
     db::handlers::{Credits, api_keys::ApiKeys},
     errors::Error,
@@ -43,7 +47,7 @@ use axum::{
 use onwards::{ErrorOrigin, RequestIdentity};
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use tracing::{debug, instrument};
 use uuid::Uuid;
 
@@ -68,13 +72,14 @@ pub async fn error_enrichment_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response<Body> {
-    // Extract API key from request headers before passing to onwards
-    let api_key = request
+    // The presented API key, by hash, before passing to onwards
+    let bearer = request
         .headers()
         .get("authorization")
         .and_then(|h| h.to_str().ok())
         .and_then(|auth| auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer ")))
-        .map(|token| token.trim().to_string());
+        .map(str::trim);
+    let api_key = presented_key_hash(request.extensions(), bearer);
 
     // Extract request body to get model name for potential error enrichment
     let (parts, body) = request.into_parts();
@@ -174,6 +179,9 @@ pub async fn error_enrichment_middleware(
             && let Ok(has_access) = check_user_has_model_access(pools.write().into_inner(), *user_id, model).await
             && !has_access
         {
+            if let Ok(Some(message)) = retirement_message(pools.write().into_inner(), model).await {
+                return tag(retired_model_response(&message), "model_retired");
+            }
             return tag(
                 Error::ModelAccessDenied {
                     model_name: model.clone(),
@@ -356,7 +364,7 @@ struct SpendCapState {
 }
 
 #[instrument(skip_all, name = "dwctl.get_spend_cap_state")]
-async fn get_spend_cap_state(pool: PgPool, api_key: &str) -> Result<Option<SpendCapState>, DbError> {
+async fn get_spend_cap_state(pool: PgPool, api_key: &ApiKeyHash) -> Result<Option<SpendCapState>, DbError> {
     let row = sqlx::query!(
         r#"
         SELECT root.spend_limit AS "spend_limit!",
@@ -366,9 +374,9 @@ async fn get_spend_cap_state(pool: PgPool, api_key: &str) -> Result<Option<Spend
         FROM api_keys ak
         JOIN api_keys root ON root.id = COALESCE(ak.parent_api_key_id, ak.id)
         LEFT JOIN api_key_spend_checkpoints ck ON ck.api_key_id = root.id
-        WHERE ak.secret = $1 AND ak.is_deleted = false AND root.spend_limit IS NOT NULL
+        WHERE ak.secret_hash = $1 AND ak.is_deleted = false AND root.spend_limit IS NOT NULL
         "#,
-        api_key
+        &api_key[..]
     )
     .fetch_optional(&pool)
     .await?;
@@ -417,7 +425,7 @@ const FLEX_DISPATCH_PURPOSE: &str = "batch";
 /// Returns `Ok(Some(purpose))` if a matching `deny` rule exists, where `purpose` is the
 /// `api_key_purpose` string stored on the rule (e.g. "batch"). Returns `Ok(None)` otherwise.
 #[instrument(skip(pool, api_key), name = "dwctl.check_modality_blocked")]
-pub async fn check_modality_blocked(pool: PgPool, api_key: &str, model_alias: &str) -> Result<Option<String>, DbError> {
+pub async fn check_modality_blocked(pool: PgPool, api_key: &ApiKeyHash, model_alias: &str) -> Result<Option<String>, DbError> {
     let mut conn = pool.acquire().await?;
 
     let purpose = sqlx::query_scalar!(
@@ -428,13 +436,13 @@ pub async fn check_modality_blocked(pool: PgPool, api_key: &str, model_alias: &s
         JOIN api_keys ak ON ak.purpose = mtr.api_key_purpose
         WHERE dm.alias = $1
           AND dm.deleted = false
-          AND ak.secret = $2
+          AND ak.secret_hash = $2
           AND ak.is_deleted = false
           AND mtr.action = 'deny'
         LIMIT 1
         "#,
         model_alias,
-        api_key,
+        &api_key[..],
     )
     .fetch_optional(&mut *conn)
     .await?;
@@ -475,11 +483,11 @@ pub async fn check_modality_blocked_for_purpose(pool: PgPool, model_alias: &str,
 }
 
 #[instrument(skip_all, name = "dwctl.get_user_id_of_api_key")]
-pub async fn get_user_id_of_api_key(pool: PgPool, api_key: &str) -> Result<UserId, DbError> {
+pub async fn get_user_id_of_api_key(pool: PgPool, api_key: &ApiKeyHash) -> Result<UserId, DbError> {
     let mut conn = pool.acquire().await?;
     let mut api_keys_repo = ApiKeys::new(&mut conn);
     api_keys_repo
-        .get_user_id_by_secret(api_key)
+        .get_user_id_by_hash(api_key)
         .await?
         .ok_or_else(|| anyhow::anyhow!("API key not found or associated user doesn't exist").into())
 }
@@ -489,16 +497,16 @@ pub async fn get_user_id_of_api_key(pool: PgPool, api_key: &str) -> Result<UserI
 /// lookups keeps the 403 enrichment path (and the Flex check) to one by-secret
 /// query instead of fanning out.
 #[instrument(skip_all, name = "dwctl.get_api_key_user_and_purpose")]
-async fn get_api_key_user_and_purpose(pool: PgPool, api_key: &str) -> Result<Option<ApiKeyOwner>, DbError> {
+async fn get_api_key_user_and_purpose(pool: PgPool, api_key: &ApiKeyHash) -> Result<Option<ApiKeyOwner>, DbError> {
     let mut conn = pool.acquire().await?;
     let row = sqlx::query!(
         r#"
         SELECT k.id, k.user_id, k.purpose, u.display_name, u.username
         FROM api_keys k
         JOIN users u ON u.id = k.user_id
-        WHERE k.secret = $1 AND k.is_deleted = false
+        WHERE k.secret_hash = $1 AND k.is_deleted = false
         "#,
-        api_key
+        &api_key[..]
     )
     .fetch_optional(&mut *conn)
     .await?;
@@ -535,7 +543,7 @@ impl ApiKeyOwner {
 /// An exempt account must not get a misleading insufficient-credit error when
 /// onwards denies a request for another reason (for example a key spending cap).
 #[instrument(skip_all)]
-async fn get_balance_of_api_key(pool: PgPool, api_key: &str) -> Result<Option<Decimal>, DbError> {
+async fn get_balance_of_api_key(pool: PgPool, api_key: &ApiKeyHash) -> Result<Option<Decimal>, DbError> {
     let user_id = get_user_id_of_api_key(pool.clone(), api_key).await?;
     let mut conn = pool.acquire().await?;
     Credits::new(&mut conn).get_balance_for_admission(user_id).await
@@ -580,12 +588,12 @@ pub async fn check_user_has_model_access(pool: PgPool, user_id: UserId, model_al
 /// Used by the inference middleware to fail fast on Flex requests that bypass
 /// `onwards` entirely — without the modality check here, a Batch-purpose key
 /// could send a Flex request and skip a deny rule onwards would have enforced.
-pub async fn validate_api_key_model_access(pool: PgPool, api_key: &str, model: &str) -> Result<(), String> {
+pub async fn validate_api_key_model_access(pool: PgPool, api_key: &ApiKeyHash, model: &str) -> Result<(), ModelAccessRefusal> {
     // One by-secret lookup of the key's owner + purpose, reused below.
     let ApiKeyOwner { user_id, purpose, .. } = get_api_key_user_and_purpose(pool.clone(), api_key)
         .await
-        .map_err(|_| "Invalid API key".to_string())?
-        .ok_or_else(|| "Invalid API key".to_string())?;
+        .map_err(|_| ModelAccessRefusal::Denied("Invalid API key".to_string()))?
+        .ok_or_else(|| ModelAccessRefusal::Denied("Invalid API key".to_string()))?;
 
     // Reject non-inference keys (e.g. `platform`) up front. Flex bypasses
     // onwards entirely, so this is the only place the purpose gate - mirrored
@@ -595,18 +603,23 @@ pub async fn validate_api_key_model_access(pool: PgPool, api_key: &str, model: &
     // for inference, so it is exempt here, mirroring the onwards key-sync
     // exemption.
     if user_id != uuid::Uuid::nil() && !crate::db::models::api_keys::is_inference_purpose(&purpose) {
-        return Err(format!("API keys with purpose '{purpose}' cannot be used for inference requests."));
+        return Err(ModelAccessRefusal::Denied(format!(
+            "API keys with purpose '{purpose}' cannot be used for inference requests."
+        )));
     }
 
     let has_access = check_user_has_model_access(pool.clone(), user_id, model)
         .await
-        .map_err(|e| format!("Failed to check model access: {e}"))?;
+        .map_err(|e| ModelAccessRefusal::Denied(format!("Failed to check model access: {e}")))?;
 
     if !has_access {
-        return Err(format!(
+        if let Ok(Some(message)) = retirement_message(pool.clone(), model).await {
+            return Err(ModelAccessRefusal::Retired(message));
+        }
+        return Err(ModelAccessRefusal::Denied(format!(
             "You do not have access to '{}'. Please contact your administrator to request access.",
             model
-        ));
+        )));
     }
 
     // Enforce the modality the Flex request will actually run as (`batch`), not
@@ -616,9 +629,9 @@ pub async fn validate_api_key_model_access(pool: PgPool, api_key: &str, model: &
     // `onwards` enforces when the daemon later dispatches the request.
     if let Some(purpose) = check_modality_blocked_for_purpose(pool, model, FLEX_DISPATCH_PURPOSE)
         .await
-        .map_err(|e| format!("Failed to check modality routing rules: {e}"))?
+        .map_err(|e| ModelAccessRefusal::Denied(format!("Failed to check modality routing rules: {e}")))?
     {
-        return Err(modality_blocked_message(&purpose, model));
+        return Err(ModelAccessRefusal::Denied(modality_blocked_message(&purpose, model)));
     }
 
     Ok(())
@@ -635,9 +648,61 @@ fn modality_blocked_message(purpose: &str, model: &str) -> String {
     )
 }
 
+#[derive(Debug)]
+pub enum ModelAccessRefusal {
+    Retired(String),
+    Denied(String),
+}
+
+impl fmt::Display for ModelAccessRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ModelAccessRefusal::Retired(message) | ModelAccessRefusal::Denied(message) => f.write_str(message),
+        }
+    }
+}
+
+pub fn retired_model_response(message: &str) -> Response<Body> {
+    let body = serde_json::json!({
+        "error": {
+            "message": message,
+            "type": "invalid_request_error",
+            "param": null,
+            "code": "model_not_found"
+        }
+    });
+    Response::builder()
+        .status(StatusCode::GONE)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap_or_else(|_| StatusCode::GONE.into_response())
+}
+
+pub async fn retirement_messages(conn: &mut PgConnection) -> Result<HashMap<String, String>, DbError> {
+    let messages = sqlx::query_as::<_, (String, String)>(
+        "SELECT alias, metadata->>'retirement_message' FROM deployed_models WHERE NOT deleted AND metadata->>'retirement_message' IS NOT NULL",
+    )
+    .fetch_all(conn)
+    .await?;
+    Ok(messages.into_iter().collect())
+}
+
+#[instrument(skip_all, name = "dwctl.retirement_message")]
+async fn retirement_message(pool: PgPool, model_alias: &str) -> Result<Option<String>, DbError> {
+    let mut conn = pool.acquire().await?;
+    let message = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT metadata->>'retirement_message' FROM deployed_models WHERE alias = $1 AND deleted = false LIMIT 1",
+    )
+    .bind(model_alias)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(message.flatten())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::hash_api_key;
     use crate::db::{
         handlers::{Credits, Repository as _, api_keys::ApiKeys},
         models::{
@@ -664,6 +729,66 @@ mod tests {
         // Empty string falls back to a generic label rather than producing
         // a sentence starting with " access to ...".
         assert_eq!(modality_label(""), "This");
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_error_enrichment_middleware_reports_retired_model(pool: PgPool) {
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let api_key = ApiKeys::new(&mut conn)
+            .create(&ApiKeyCreateDBRequest {
+                user_id: user.id,
+                name: "Test Key".to_string(),
+                description: None,
+                purpose: ApiKeyPurpose::Realtime,
+                created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
+            })
+            .await
+            .unwrap();
+        drop(conn);
+
+        let endpoint_id = crate::test::utils::create_test_endpoint(&pool, "test-endpoint", user.id).await;
+        let deployment_id = crate::test::utils::create_test_model(&pool, "retired-model-name", "retired-model", endpoint_id, user.id).await;
+        sqlx::query("UPDATE deployed_models SET metadata = $1 WHERE id = $2")
+            .bind(serde_json::json!({"retirement_message": "The model `retired-model` was shut down. Use `current-model` instead."}))
+            .bind(deployment_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let router = axum::Router::new()
+            .route(
+                "/ai/v1/chat/completions",
+                axum::routing::post(|| async { StatusCode::FORBIDDEN.into_response() }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                sqlx_pool_router::DynPools::new(pool.clone()),
+                error_enrichment_middleware,
+            ));
+        let server = axum_test::TestServer::new(router).expect("Failed to create test server");
+
+        let retired = server
+            .post("/ai/v1/chat/completions")
+            .add_header("authorization", &format!("Bearer {}", api_key.secret))
+            .json(&serde_json::json!({"model": "retired-model", "messages": []}))
+            .await;
+        retired.assert_status(StatusCode::GONE);
+        let body: serde_json::Value = retired.json();
+        assert_eq!(body["error"]["code"], "model_not_found");
+        assert_eq!(
+            body["error"]["message"],
+            "The model `retired-model` was shut down. Use `current-model` instead."
+        );
+
+        let unknown = server
+            .post("/ai/v1/chat/completions")
+            .add_header("authorization", &format!("Bearer {}", api_key.secret))
+            .json(&serde_json::json!({"model": "test-model", "messages": []}))
+            .await;
+        unknown.assert_status(StatusCode::FORBIDDEN);
     }
 
     /// Integration test: Error enrichment middleware enriches 403 with balance info
@@ -1398,17 +1523,17 @@ mod tests {
         .await
         .unwrap();
 
-        let result = validate_api_key_model_access(pool.clone(), &api_key.secret, "blocked-model").await;
+        let result = validate_api_key_model_access(pool.clone(), &hash_api_key(&api_key.secret), "blocked-model").await;
         let err = result.expect_err("expected modality-blocked rejection");
         assert!(
-            err.contains("Batch") && err.contains("blocked-model") && err.contains("administrator"),
+            err.to_string().contains("Batch") && err.to_string().contains("blocked-model") && err.to_string().contains("administrator"),
             "expected modality-blocked message, got: {err}"
         );
 
         // Sanity: a model without the deny rule still passes.
         let other_deployment_id = crate::test::utils::create_test_model(&pool, "open-model-name", "open-model", endpoint_id, user.id).await;
         add_deployment_to_group(&pool, other_deployment_id, group.id, user.id).await;
-        validate_api_key_model_access(pool.clone(), &api_key.secret, "open-model")
+        validate_api_key_model_access(pool.clone(), &hash_api_key(&api_key.secret), "open-model")
             .await
             .expect("expected access to be granted on a model without a deny rule");
     }
@@ -1457,7 +1582,7 @@ mod tests {
         .await
         .unwrap();
 
-        validate_api_key_model_access(pool.clone(), &api_key.secret, "async-only")
+        validate_api_key_model_access(pool.clone(), &hash_api_key(&api_key.secret), "async-only")
             .await
             .expect("Flex request must be allowed despite a realtime-only deny rule");
     }
@@ -1502,11 +1627,11 @@ mod tests {
         .await
         .unwrap();
 
-        let err = validate_api_key_model_access(pool.clone(), &api_key.secret, "no-batch")
+        let err = validate_api_key_model_access(pool.clone(), &hash_api_key(&api_key.secret), "no-batch")
             .await
             .expect_err("Flex request must be blocked by a batch deny rule (Flex runs as batch)");
         assert!(
-            err.contains("Batch") && err.contains("no-batch") && err.contains("administrator"),
+            err.to_string().contains("Batch") && err.to_string().contains("no-batch") && err.to_string().contains("administrator"),
             "expected batch modality-blocked message, got: {err}"
         );
     }
@@ -1532,10 +1657,10 @@ mod tests {
             .await
             .unwrap();
 
-        let result = validate_api_key_model_access(pool.clone(), &api_key.secret, "any-model").await;
+        let result = validate_api_key_model_access(pool.clone(), &hash_api_key(&api_key.secret), "any-model").await;
         let err = result.expect_err("expected platform-purpose rejection");
         assert!(
-            err.contains("platform") && err.contains("inference"),
+            err.to_string().contains("platform") && err.to_string().contains("inference"),
             "expected non-inference purpose message, got: {err}"
         );
     }
@@ -1563,12 +1688,55 @@ mod tests {
         // The purpose gate must NOT fire for the system (nil) user. A
         // model-access error is acceptable - we only assert the key was not
         // rejected on purpose grounds.
-        if let Err(msg) = validate_api_key_model_access(pool.clone(), &api_key.secret, "any-model").await {
+        if let Err(msg) = validate_api_key_model_access(pool.clone(), &hash_api_key(&api_key.secret), "any-model").await {
             assert!(
-                !msg.contains("cannot be used for inference requests"),
+                !msg.to_string().contains("cannot be used for inference requests"),
                 "system key must be exempt from the purpose gate, got: {msg}"
             );
         }
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_validate_api_key_model_access_reports_retired_model(pool: PgPool) {
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let api_key = ApiKeys::new(&mut conn)
+            .create(&ApiKeyCreateDBRequest {
+                user_id: user.id,
+                name: "Test Key".to_string(),
+                description: None,
+                purpose: ApiKeyPurpose::Realtime,
+                created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
+            })
+            .await
+            .unwrap();
+        drop(conn);
+
+        let endpoint_id = crate::test::utils::create_test_endpoint(&pool, "test-endpoint", user.id).await;
+        let deployment_id = crate::test::utils::create_test_model(&pool, "retired-model-name", "retired-model", endpoint_id, user.id).await;
+        sqlx::query("UPDATE deployed_models SET metadata = $1 WHERE id = $2")
+            .bind(serde_json::json!({"retirement_message": "The model `retired-model` was shut down."}))
+            .bind(deployment_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let refusal = validate_api_key_model_access(pool.clone(), &hash_api_key(&api_key.secret), "retired-model")
+            .await
+            .expect_err("a retired model must be refused");
+        assert!(matches!(refusal, ModelAccessRefusal::Retired(message) if message == "The model `retired-model` was shut down."));
+
+        let mut conn = pool.acquire().await.unwrap();
+        assert_eq!(
+            retirement_messages(&mut conn)
+                .await
+                .unwrap()
+                .get("retired-model")
+                .map(String::as_str),
+            Some("The model `retired-model` was shut down.")
+        );
     }
 
     /// Integration test: Error enrichment middleware passes through when no auth header

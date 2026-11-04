@@ -72,6 +72,7 @@ vi.mock("@/contexts", () => ({
 }));
 
 import { ApiKeys } from "./ApiKeys";
+import usersData from "../../../../api/control-layer/mocks/users.json";
 import { handlers } from "../../../../api/control-layer/mocks/handlers";
 import { toast } from "sonner";
 
@@ -582,12 +583,14 @@ describe("API Keys Component - Functional Tests", () => {
       const user = userEvent.setup();
       let apiKeys = [
         {
+          created_by: usersData[0].id,
           id: "key-1",
           name: "CI/CD Pipeline",
           description: "Automated testing and evaluation pipeline",
           created_at: "2025-04-01T10:00:00Z",
         },
         {
+          created_by: usersData[0].id,
           id: "key-2",
           name: "Batch Processing - Production",
           description: "Production batch job submissions",
@@ -1115,25 +1118,12 @@ describe("API Keys Component - Functional Tests", () => {
       };
     }
 
-    it("shows scoping controls to a PlatformManager who is only a plain org member", async () => {
-      // The default mock current user carries the PlatformManager role. A PM
-      // whose org membership is 'member' still receives an UNscoped key list
-      // server-side (ReadAll bypasses created_by scoping), so the UI must
-      // offer the same tabs/filter as managers — otherwise they get
-      // everyone's keys with no way to narrow the view.
+    it("does not grant org key management to a PlatformManager who is only a member", async () => {
       enterOrgContext("member", false);
-
       const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
-
-      expect(
-        await within(container).findByRole("tab", { name: /all keys/i }),
-      ).toBeInTheDocument();
-      expect(
-        within(container).getByRole("tab", { name: /my keys/i }),
-      ).toBeInTheDocument();
-      expect(
-        within(container).getByRole("combobox", { name: /filter by member/i }),
-      ).toBeInTheDocument();
+      await within(container).findByRole("heading", { name: /api keys/i });
+      expect(within(container).queryByRole("tab", { name: /all keys/i })).not.toBeInTheDocument();
+      expect(within(container).queryByRole("combobox", { name: /filter by member/i })).not.toBeInTheDocument();
     });
 
     it("shows scope tabs, member filter, and assignee column to an org manager", async () => {

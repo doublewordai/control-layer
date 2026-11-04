@@ -45,6 +45,7 @@
 
 use crate::AppState;
 use crate::api::models::users::CurrentUser;
+use crate::crypto::hash_api_key;
 use crate::errors::{Error, Result};
 use crate::image_normalizer::{ImageToken, TokenParseError};
 use axum::{
@@ -159,7 +160,11 @@ pub struct ImageAttribution {
 /// organization, which is repeated in `organization_id`. Returns `None` if the
 /// key is unknown/deleted.
 pub async fn resolve_image_attribution(pool: &sqlx::PgPool, api_key: &str) -> Option<ImageAttribution> {
-    try_resolve_caller(pool, api_key).await.ok().flatten().map(|c| c.attribution)
+    try_resolve_caller(pool, &hash_api_key(api_key))
+        .await
+        .ok()
+        .flatten()
+        .map(|c| c.attribution)
 }
 
 /// What an API key secret tells the image layer about the request carrying it.
@@ -181,7 +186,10 @@ pub struct ResolvedCaller {
 /// result (token signing, the flex enqueue bookkeeping that later
 /// authorisation depends on) must treat the two differently — a transient
 /// database failure is a retryable 503, never a 403.
-pub async fn try_resolve_caller(pool: &sqlx::PgPool, api_key: &str) -> std::result::Result<Option<ResolvedCaller>, sqlx::Error> {
+pub async fn try_resolve_caller(
+    pool: &sqlx::PgPool,
+    api_key: &crate::crypto::ApiKeyHash,
+) -> std::result::Result<Option<ResolvedCaller>, sqlx::Error> {
     let row = sqlx::query!(
         r#"
         SELECT
@@ -189,10 +197,10 @@ pub async fn try_resolve_caller(pool: &sqlx::PgPool, api_key: &str) -> std::resu
             user_id AS "user_id!",
             (purpose = 'batch' AND hidden) AS "is_daemon_dispatch!"
         FROM api_keys
-        WHERE secret = $1 AND is_deleted = FALSE
+        WHERE secret_hash = $1 AND is_deleted = FALSE
         LIMIT 1
         "#,
-        api_key,
+        &api_key[..],
     )
     .fetch_optional(pool)
     .await?;

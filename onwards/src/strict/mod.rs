@@ -95,6 +95,7 @@ pub fn build_strict_router<T: HttpClient + Clone + Send + Sync + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::KeyHash;
     use crate::target::{Target, Targets};
     use crate::test_utils::MockHttpClient;
     use axum::body::Body;
@@ -119,6 +120,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            key_ids: Arc::new(DashMap::new()),
             accounts: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
@@ -300,6 +302,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            key_ids: Arc::new(DashMap::new()),
             accounts: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
@@ -536,6 +539,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            key_ids: Arc::new(DashMap::new()),
             accounts: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
@@ -622,6 +626,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            key_ids: Arc::new(DashMap::new()),
             accounts: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
@@ -786,6 +791,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            key_ids: Arc::new(DashMap::new()),
             accounts: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
@@ -851,7 +857,7 @@ mod tests {
         let key_labels = Arc::new(DashMap::new());
         if let Some(purpose) = purpose {
             key_labels.insert(
-                "sk-test".to_string(),
+                KeyHash::of("sk-test"),
                 std::collections::HashMap::from([("purpose".to_string(), purpose.to_string())]),
             );
         }
@@ -861,6 +867,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels,
+            key_ids: Default::default(),
             strict_mode: true,
             http_pool_config: None,
             accounts: std::sync::Arc::new(dashmap::DashMap::new()),

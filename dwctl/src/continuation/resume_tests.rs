@@ -20,10 +20,11 @@ use axum::extract::State;
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use axum::{Json, Router, middleware};
+use axum::{Extension, Json, Router, middleware};
 use bytes::Bytes;
 use futures::StreamExt;
 use http_body_util::BodyExt;
+use onwards::serving::BillingPrices;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
@@ -92,7 +93,11 @@ fn done() -> Chunk {
 struct Received {
     path: String,
     headers: HeaderMap,
+    /// The key the leg presented in-process.
+    presented: Option<onwards::auth::PresentedKey>,
     body: Value,
+    /// The prices the leg was sent at, as onwards would write them.
+    prices: Option<BillingPrices>,
 }
 
 #[derive(Clone)]
@@ -170,11 +175,19 @@ async fn leg_one_handler(State(fake): State<Fake>) -> Response {
     stream_script(chunks)
 }
 
-async fn leg_two_handler(State(fake): State<Fake>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
+async fn leg_two_handler(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    prices: Option<Extension<BillingPrices>>,
+    presented: Option<Extension<onwards::auth::PresentedKey>>,
+    Json(body): Json<Value>,
+) -> Response {
     fake.received.lock().unwrap().push(Received {
         path: "/completions".to_string(),
         headers,
+        presented: presented.map(|Extension(key)| key),
         body,
+        prices: prices.map(|Extension(prices)| prices),
     });
     let next = fake.legs.lock().unwrap().pop();
     match next {
@@ -215,7 +228,7 @@ fn state(pool: PgPool, fake: &Fake, tokenizer_url: String, cfg: ContinuationConf
         tokenizer: RenderClient::new(tokenizer_url, Duration::from_secs(5)),
         inflight: Arc::new(InflightLimiter::new(cfg.max_inflight_per_model)),
         cfg: Arc::new(cfg),
-        key_secret: Arc::from(KEY),
+        key_hash: crate::crypto::hash_api_key(KEY),
         resume_target: fake.router(),
         routes: Arc::new(ContinuationRoutes::with_models([MODEL.to_string()])),
         purposes: PurposeResolver::new(pool),
@@ -366,6 +379,88 @@ async fn a_cut_stream_is_resumed_into_one_seamless_response(pool: PgPool) {
     );
 }
 
+/// A resume leg authenticates with the system-owned continuation key, which is
+/// priced as free, but the customer pays for its tokens through the merged usage
+/// at the original request's prices. The outbound layer below prices the
+/// original request from the customer's key and reports the prices on its
+/// response; the leg must be sent at those.
+#[dwctl_test_macros::test]
+async fn a_resume_leg_carries_the_original_requests_output_price_and_no_prompt_price(pool: PgPool) {
+    use crate::db::models::api_keys::ApiKeyPurpose;
+    use crate::inference::outbound_request::{OutboundConfig, StreamTimeouts, outbound_request_middleware};
+    use crate::pricing::{PriceBook, TariffInfo};
+    use crate::sync::key_policy::{KeyBilling, KeyPolicy, KeyPolicyCache};
+    use rust_decimal::Decimal;
+
+    let policy = |account, purpose| KeyPolicy {
+        billing: Some(KeyBilling { account, purpose }),
+        ..Default::default()
+    };
+    let customer = uuid::Uuid::new_v4();
+    let key_policy = KeyPolicyCache::from_policies([
+        ("sk-customer".to_string(), policy(customer, ApiKeyPurpose::Realtime)),
+        (KEY.to_string(), policy(uuid::Uuid::nil(), ApiKeyPurpose::Continuation)),
+    ]);
+    key_policy.replace_prices(PriceBook::from_rows(
+        [customer, uuid::Uuid::nil()],
+        [(
+            MODEL.to_string(),
+            vec![TariffInfo {
+                id: uuid::Uuid::new_v4(),
+                purpose: ApiKeyPurpose::Realtime,
+                effective_from: chrono::Utc::now() - chrono::Duration::hours(1),
+                valid_until: None,
+                input_price_per_token: Decimal::new(3, 6),
+                output_price_per_token: Decimal::new(9, 6),
+                completion_window: None,
+                account: None,
+                serving_class: None,
+            }],
+        )],
+        [],
+    ));
+    let outbound = OutboundConfig {
+        timeouts: StreamTimeouts {
+            first_chunk: Duration::from_secs(5),
+            chunk: Duration::from_secs(5),
+            body: Duration::from_secs(5),
+        },
+        key_policy,
+    };
+
+    let fake = Fake::new(
+        vec![content("chatcmpl-1", "Hello"), content("chatcmpl-1", ", wor")],
+        vec![vec![leg_text("ld!", Some("stop")), leg_usage(1012, 8), done()]],
+    );
+    let below = fake
+        .router()
+        .layer(middleware::from_fn_with_state(outbound, outbound_request_middleware));
+    let tokenizer = render_stub(vec![1, 2, 3], 1012, 12).await;
+    let mut st = state(pool, &fake, tokenizer.uri(), test_config());
+    st.resume_target = below.clone();
+    let app = below.layer(middleware::from_fn_with_state(st, continuation_middleware));
+
+    let mut request = chat_request(streaming_body());
+    request
+        .headers_mut()
+        .insert(header::AUTHORIZATION, "Bearer sk-customer".parse().unwrap());
+    let response = app.oneshot(request).await.unwrap();
+    let frames = parsed(&collect_payloads(response).await);
+    assert_eq!(contents(&frames), "Hello, world!", "the stream was resumed");
+
+    let legs = fake.resume_requests();
+    assert_eq!(legs.len(), 1);
+    assert_eq!(
+        legs[0].prices,
+        Some(BillingPrices {
+            prompt: 0.0,
+            cached: 0.0,
+            output: 9e-6,
+        }),
+        "the leg's output is billed at the customer's price, not the continuation key's; its re-prefilled prompt isn't billed"
+    );
+}
+
 /// Batch loopback: fusillade marks stream-intent with `x-fusillade-stream`
 /// while the BODY still says nothing about streaming (the outbound middleware
 /// forces `stream: true` below this layer). The header alone must arm the tee,
@@ -425,10 +520,11 @@ async fn the_resume_leg_asks_for_exactly_the_right_thing(pool: PgPool) {
     let leg = &requests[0];
     assert_eq!(leg.path, "/completions", "a chat request resumes on the completions endpoint");
     assert_eq!(
-        leg.headers.get(header::AUTHORIZATION).unwrap(),
-        format!("Bearer {KEY}").as_str(),
+        leg.presented,
+        Some(onwards::auth::PresentedKey(onwards::auth::KeyHash::of(KEY))),
         "resume legs authenticate as the global continuation key"
     );
+    assert!(leg.headers.get(header::AUTHORIZATION).is_none(), "resume legs carry no secret");
     assert_eq!(leg.body["prompt"], json!([101, 202, 303]), "the rendered token ids, verbatim");
     assert_eq!(leg.body["model"], MODEL);
     assert_eq!(leg.body["stream"], true);

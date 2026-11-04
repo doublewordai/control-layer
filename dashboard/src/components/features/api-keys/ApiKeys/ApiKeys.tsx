@@ -121,12 +121,10 @@ export const ApiKeys: React.FC = () => {
   // server-computed can_manage_keys flag decides (owners/admins are always
   // true, plain members only when granted the additive role).
   const canSelfManage = !isOrgContext || !!activeOrganization?.can_manage_keys;
-  // Anyone whose LIST is unscoped (org managers, and PlatformManagers whose
-  // ReadAll bypasses created_by scoping server-side) gets the scoping
-  // controls — otherwise a PM who is a plain member of the org sees
-  // everyone's keys with no way to narrow them.
+  // Only actual org managers can list every member's keys and need these
+  // scoping controls. Platform roles do not bypass ownership or membership.
   const showScopingControls =
-    isOrgContext && (isOrgManager || isPlatformManager);
+    isOrgContext && isOrgManager;
   const pagination = useServerPagination();
   // Scoping is applied SERVER-side (?created_by): pagination and total_count
   // then cover the filtered set, so "all of member X's keys" really is all
@@ -379,11 +377,10 @@ export const ApiKeys: React.FC = () => {
   };
 
   // Mirrors what the server permits for edit/rename/delete: a
-  // PlatformManager, an org owner/admin acting on any key of the active org,
+  // an org owner/admin acting on any key of the active org,
   // or the key's creator when they hold self-manage rights. Keep this gate in
   // lockstep with the server.
   const canManageKey = (apiKey: ApiKey) =>
-    isPlatformManager ||
     (isOrgContext && isOrgManager) ||
     (!!apiKey.created_by && apiKey.created_by === user?.id && canSelfManage);
 
@@ -412,7 +409,7 @@ export const ApiKeys: React.FC = () => {
     isPlatformManager,
     // Assignee is a manager's concept: members' views are isolated to their
     // own keys, so the column would only ever echo their own name.
-    showAssignee: isOrgContext && (isOrgManager || isPlatformManager),
+    showAssignee: isOrgContext && isOrgManager,
     resolveAssignee: isOrgContext ? resolveAssignee : undefined,
     showSelect: canSelfManage,
   });

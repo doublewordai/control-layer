@@ -7,6 +7,7 @@
 //! facade in the request_logging module.
 
 pub mod allocator;
+pub mod batch_sla;
 mod cache_info;
 pub mod error_series;
 pub mod errors;

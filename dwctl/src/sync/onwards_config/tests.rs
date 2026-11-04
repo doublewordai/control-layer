@@ -1,12 +1,13 @@
 use std::{str::FromStr, time::Duration};
 
 use onwards::{
-    auth::ConstantTimeString,
+    auth::KeyHash,
     target::{LoadBalanceStrategy as OnwardsLoadBalanceStrategy, RequestClass, RoutingAction, TargetSpecOrList},
 };
 use tokio::{sync::mpsc, time::timeout};
 use tokio_util::sync::CancellationToken;
 
+use crate::db::handlers::api_keys::ApiKeys;
 use crate::sync::onwards_config::{OnwardsTarget, SyncConfig, convert_to_config_file, parse_notify_payload};
 
 #[test]
@@ -57,6 +58,7 @@ fn create_test_target(model_name: &str, alias: &str, endpoint_url: &str) -> Onwa
         auth_header_prefix: "Bearer ".to_string(),
         endpoint_accepts_scheduling_priority: false,
         api_keys: Vec::new(),
+        has_key_grants: false,
         endpoint_kind: Default::default(),
     }
 }
@@ -67,11 +69,22 @@ const KEY_B_SECRET: &str = "sk-cache-b";
 const KEY_BATCH_SECRET: &str = "sk-cache-batch";
 
 fn pool_has_key(pools: &onwards::target::TargetPools, key: &str) -> bool {
-    let expected = ConstantTimeString::from(key.to_string());
+    pool_has_key_hash(pools, KeyHash::from(key.to_string()))
+}
+
+fn pool_has_key_hash(pools: &onwards::target::TargetPools, expected: KeyHash) -> bool {
     pools
         .default_pool()
         .keys()
         .is_some_and(|keys| keys.iter().any(|candidate| candidate == &expected))
+}
+
+/// The stored secret of `parent`'s cap-scope child key, created if missing.
+async fn child_secret(pool: &sqlx::PgPool, parent: uuid::Uuid) -> String {
+    let mut conn = pool.acquire().await.unwrap();
+    let mut keys = ApiKeys::new(&mut conn);
+    let id = keys.get_or_create_child_hidden_key(parent).await.unwrap();
+    keys.legacy_dispatch_secret(id).await.unwrap()
 }
 
 fn pool_keys_len(pools: &onwards::target::TargetPools) -> usize {
@@ -547,7 +560,10 @@ async fn test_cache_shape_zero_data_retention_label_reflects_owner(pool: sqlx::P
 
     let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
 
-    let key_a_labels = targets.key_labels.get(KEY_A_SECRET).expect("user A's key should carry labels");
+    let key_a_labels = targets
+        .key_labels
+        .get(&KeyHash::of(KEY_A_SECRET))
+        .expect("user A's key should carry labels");
     assert_eq!(
         key_a_labels.get("zdr"),
         Some(&"true".to_string()),
@@ -559,7 +575,10 @@ async fn test_cache_shape_zero_data_retention_label_reflects_owner(pool: sqlx::P
         Some(&"20000000-0000-0000-0000-0000000000a1".to_string())
     );
 
-    let key_b_labels = targets.key_labels.get(KEY_B_SECRET).expect("user B's key should carry labels");
+    let key_b_labels = targets
+        .key_labels
+        .get(&KeyHash::of(KEY_B_SECRET))
+        .expect("user B's key should carry labels");
     assert_eq!(
         key_b_labels.get("zdr"),
         Some(&"false".to_string()),
@@ -572,7 +591,7 @@ async fn test_cache_shape_key_labels_name_the_owning_account(pool: sqlx::PgPool)
     let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
 
     for (secret, username) in [(KEY_A_SECRET, "cache_user_a"), (KEY_B_SECRET, "cache_user_b")] {
-        let labels = targets.key_labels.get(secret).unwrap();
+        let labels = targets.key_labels.get(&KeyHash::of(secret)).unwrap();
         assert_eq!(labels.get(onwards::serving::ACCOUNT_NAME_LABEL).map(String::as_str), Some(username));
     }
 }
@@ -593,13 +612,13 @@ async fn test_cache_shape_key_labels_carry_account_display_name(pool: sqlx::PgPo
     let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
 
     let label = onwards::serving::ACCOUNT_DISPLAY_NAME_LABEL;
-    let a = targets.key_labels.get(KEY_A_SECRET).unwrap();
+    let a = targets.key_labels.get(&KeyHash::of(KEY_A_SECRET)).unwrap();
     assert_eq!(a.get(label).map(String::as_str), Some("Example Display Name"));
     assert_eq!(
         a.get(onwards::serving::ACCOUNT_NAME_LABEL).map(String::as_str),
         Some("cache_user_a")
     );
-    let b = targets.key_labels.get(KEY_B_SECRET).unwrap();
+    let b = targets.key_labels.get(&KeyHash::of(KEY_B_SECRET)).unwrap();
     assert_eq!(
         b.get(label).map(String::as_str),
         Some("cache_user_b"),
@@ -770,8 +789,6 @@ async fn test_allow_negative_balance_preserves_access_restrictions(pool: sqlx::P
 /// sync provides).
 #[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered", "cache_balance_user_a_positive")))]
 async fn test_spend_cap_toggles_scope_access_on_reload(pool: sqlx::PgPool) {
-    use crate::db::handlers::api_keys::ApiKeys;
-
     let key_a_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE secret = $1")
         .bind(KEY_A_SECRET)
         .fetch_one(&pool)
@@ -784,11 +801,7 @@ async fn test_spend_cap_toggles_scope_access_on_reload(pool: sqlx::PgPool) {
         .execute(&pool)
         .await
         .unwrap();
-    let child_secret = {
-        let mut conn = pool.acquire().await.unwrap();
-        let (secret, _) = ApiKeys::new(&mut conn).get_or_create_child_hidden_key(key_a_id).await.unwrap();
-        secret
-    };
+    let child_secret = child_secret(&pool, key_a_id).await;
 
     // Under the cap: both scope keys are eligible for the paid pool.
     let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
@@ -866,7 +879,7 @@ async fn test_cache_shape_batch_escalation_access_for_private_alias(pool: sqlx::
 /// them would 403 at onwards key auth.
 #[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_composite")))]
 async fn test_continuation_key_reaches_gated_and_priced_composites(pool: sqlx::PgPool) {
-    let secret = crate::continuation::provision_global_key(&pool).await.unwrap();
+    let key_hash = KeyHash::from_bytes(crate::continuation::provision_global_key(&pool).await.unwrap());
 
     let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
 
@@ -875,7 +888,7 @@ async fn test_continuation_key_reaches_gated_and_priced_composites(pool: sqlx::P
     // key fails the gates.
     let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
     assert!(
-        pool_has_key(composite.value(), &secret),
+        pool_has_key_hash(composite.value(), key_hash),
         "the continuation key must be in a gated, priced composite's keyset"
     );
 
@@ -883,7 +896,7 @@ async fn test_continuation_key_reaches_gated_and_priced_composites(pool: sqlx::P
     // exemption through the second (non-composite) keyset query.
     let private = targets.targets.get("regular-private").expect("regular-private should exist");
     assert!(
-        pool_has_key(private.value(), &secret),
+        pool_has_key_hash(private.value(), key_hash),
         "the continuation key must be in a group-restricted regular model's keyset"
     );
 }
@@ -1096,6 +1109,39 @@ async fn test_cache_shape_composite_with_all_components_disabled(pool: sqlx::PgP
         pool_entry.default_pool().is_empty(),
         "composite pool should have zero providers when all components are disabled"
     );
+}
+
+/// A deployment whose granted keys all have malformed hashes keeps an empty
+/// key set, which onwards rejects; only a deployment with no grants at all is
+/// left without keys (open to every request).
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_malformed_key_hashes_leave_an_empty_key_set(pool: sqlx::PgPool) {
+    let aliases = ["regular-private", "composite-priority"];
+    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    for alias in aliases {
+        assert!(
+            pool_keys_len(targets.targets.get(alias).unwrap().value()) > 0,
+            "{alias} starts with keys"
+        );
+    }
+
+    // Five bytes, not a SHA-256: every key is dropped from the onwards config.
+    sqlx::query("UPDATE api_keys SET secret_hash = substring(secret_hash FROM 1 FOR 5)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    for alias in aliases {
+        let keys = targets.targets.get(alias).unwrap().value().default_pool().keys().cloned();
+        assert_eq!(keys, Some(Default::default()), "{alias} must reject, not allow, every request");
+    }
+
+    sqlx::query("UPDATE api_keys SET is_deleted = true").execute(&pool).await.unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
+    for alias in aliases {
+        let keys = targets.targets.get(alias).unwrap().value().default_pool().keys().cloned();
+        assert_eq!(keys, None, "{alias} has no key grants, so no keys are configured");
+    }
 }
 
 #[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_regular_public_extra_group_assignment")))]
@@ -1446,8 +1492,8 @@ async fn test_api_keys_noop_upsert_does_not_trigger_notify(pool: sqlx::PgPool) {
     let key_id = {
         let mut tx = pool.begin().await.unwrap();
         let mut repo = ApiKeys::new(&mut tx);
-        let (_secret, id) = repo
-            .get_or_create_hidden_key_with_id(user.id, ApiKeyPurpose::Realtime, user.id)
+        let id = repo
+            .get_or_create_hidden_key(user.id, ApiKeyPurpose::Realtime, user.id)
             .await
             .unwrap();
         tx.commit().await.unwrap();
@@ -1517,7 +1563,7 @@ async fn test_api_keys_noop_upsert_does_not_trigger_notify(pool: sqlx::PgPool) {
 async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::PgPool) {
     use std::str::FromStr;
 
-    use onwards::auth::ConstantTimeString;
+    use onwards::auth::KeyHash;
 
     use crate::Role;
     use crate::db::handlers::{Deployments, InferenceEndpoints, Repository, api_keys::ApiKeys};
@@ -1693,8 +1739,8 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
     let pool_spec = composite_target.value();
 
     // Verify batch API key has access
-    // Keys are stored as ConstantTimeString in onwards
-    let batch_key_ct = ConstantTimeString::from(batch_api_key.secret.clone());
+    // onwards holds keys by hash
+    let batch_key_ct = KeyHash::from(batch_api_key.secret.clone());
     let keys = pool_spec.default_pool().keys().expect("Composite model should have keys");
     let has_batch_key = keys.iter().any(|k| k == &batch_key_ct);
 
@@ -1953,12 +1999,12 @@ async fn test_cache_shape_serving_accounts_and_overlays(pool: sqlx::PgPool) {
     let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
 
     // Every key carries its account; only accounts with settings are synced.
-    let key_a_labels = targets.key_labels.get(KEY_A_SECRET).unwrap();
+    let key_a_labels = targets.key_labels.get(&KeyHash::of(KEY_A_SECRET)).unwrap();
     assert_eq!(
         key_a_labels.get(onwards::serving::ACCOUNT_LABEL).map(String::as_str),
         Some("00000000-0000-0000-0000-0000000000a1")
     );
-    let key_b_labels = targets.key_labels.get(KEY_B_SECRET).unwrap();
+    let key_b_labels = targets.key_labels.get(&KeyHash::of(KEY_B_SECRET)).unwrap();
     assert_eq!(
         key_b_labels.get(onwards::serving::ACCOUNT_LABEL).map(String::as_str),
         Some("00000000-0000-0000-0000-0000000000b1")
@@ -2079,7 +2125,7 @@ async fn affinity_survives_database_sync(pool: sqlx::PgPool) {
 async fn test_deleted_keys_excluded_from_deployment_lookup(pool: sqlx::PgPool) {
     use crate::db::handlers::api_keys::ApiKeys;
 
-    sqlx::query("INSERT INTO api_keys (name, secret, user_id, created_by, purpose) VALUES ('revoked-system', 'sk-revoked-system', $1, $1, 'realtime')")
+    sqlx::query("INSERT INTO api_keys (name, secret, secret_hash, secret_prefix, user_id, created_by, purpose) VALUES ('revoked-system', 'sk-revoked-system', sha256(convert_to('sk-revoked-system', 'UTF8')), left('sk-revoked-system', 8), $1, $1, 'realtime')")
         .bind(uuid::Uuid::nil()).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) SELECT id, 'ALLOW_NEGATIVE_BALANCE', true FROM users")
         .execute(&pool)
@@ -2118,7 +2164,9 @@ async fn organisation_prices_gate_balance_and_capped_root_and_child(pool: sqlx::
         .unwrap();
     let child = {
         let mut db = pool.acquire().await.unwrap();
-        ApiKeys::new(&mut db).get_or_create_child_hidden_key(key_id).await.unwrap().0
+        let mut keys = ApiKeys::new(&mut db);
+        let id = keys.get_or_create_child_hidden_key(key_id).await.unwrap();
+        keys.legacy_dispatch_secret(id).await.unwrap()
     };
     // These aliases are generally free: only this customer's deal is paid.
     sqlx::query("INSERT INTO model_tariffs(deployed_model_id,user_id,name,input_price_per_token,output_price_per_token,api_key_purpose) SELECT id,$1,'org-paid',1,1,'realtime' FROM deployed_models WHERE alias IN ('regular-public','composite-priority')")
@@ -2225,7 +2273,9 @@ async fn zero_customer_deals_on_paid_models_do_not_bypass_credit_or_caps(pool: s
         .unwrap();
     let child = {
         let mut db = pool.acquire().await.unwrap();
-        ApiKeys::new(&mut db).get_or_create_child_hidden_key(key_id).await.unwrap().0
+        let mut keys = ApiKeys::new(&mut db);
+        let id = keys.get_or_create_child_hidden_key(key_id).await.unwrap();
+        keys.legacy_dispatch_secret(id).await.unwrap()
     };
     // A generally paid model stays credit-gated even when this customer's
     // all-class or class-specific deal is zero.

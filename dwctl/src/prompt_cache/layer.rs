@@ -58,7 +58,7 @@ use super::metrics as cache_metrics;
 use super::parse::{ParseError, validate_markers};
 use super::query::{self, Inject, InvalidBreakpointValue};
 use super::sse::SseBufferedStream;
-use super::stats::CacheBilling;
+use super::stats::{CacheBilling, CacheReadSource};
 use crate::inference::rejections;
 
 /// Bound on the index commit (off the response path). A slow/hung DB can't leak the
@@ -302,7 +302,7 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     let virtual_model = parsed_body
         .as_ref()
         .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(String::from));
-    let api_key = parts
+    let bearer = parts
         .headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -310,7 +310,8 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
         // (error_enrichment, image_normalizer) — else a key resolves differently here and
         // silently disables caching for that request.
         .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
-        .map(|t| t.trim().to_string());
+        .map(str::trim);
+    let api_key = crate::auth::internal_credential::presented_key_hash(&parts.extensions, bearer);
 
     // Bounded metric label (the deployed alias). Cloned before `virtual_model` is moved
     // into the classify task below; empty only for a body with no `model` field.
@@ -326,7 +327,7 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
                 .classify(ClassifyRequest {
                     virtual_model: &model,
                     body: &body,
-                    api_key: api_key.as_deref(),
+                    api_key,
                     // Serving always has the bearer token; only historical replay pre-resolves.
                     principal: None,
                     // Module breakpoints exist only on chat routes: a /completions body
@@ -345,6 +346,18 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     // stale Transfer-Encoding (sending both is invalid HTTP). `from(u64)` is the numeric ctor.
     let (stripped, had_markers) = strip_cache_control(&body_bytes, state.classifier.telemetry_policy());
     cache_metrics::record_marker_request(had_markers);
+    // Where this request's billed cache reads will come from, for pricing it
+    // before it is sent: the engine's report on an unmarked request, the
+    // module's on a marked chat request. A marked plain completion has no
+    // module reads to bill.
+    let read_source = match (had_markers, chat_route) {
+        (false, _) => Some(CacheReadSource::Engine),
+        (true, true) => Some(CacheReadSource::Module),
+        (true, false) => None,
+    };
+    if let Some(source) = read_source {
+        parts.extensions.insert(source);
+    }
     let forward = stripped.unwrap_or(body_bytes);
     parts.headers.remove(header::TRANSFER_ENCODING);
     parts

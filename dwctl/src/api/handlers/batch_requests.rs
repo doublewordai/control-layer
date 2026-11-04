@@ -647,7 +647,7 @@ mod tests {
     ///   - the org the PM has switched into
     ///
     /// With the fix:
-    ///   - PM personal context → all three rows (PM bypass, intentional)
+    ///   - PM personal context → only the PM’s own row
     ///   - PM in org context   → only the org's row (the contract we're testing)
     #[dwctl_test_macros::test]
     #[test_log::test]
@@ -697,8 +697,7 @@ mod tests {
             .expect("insert request");
         }
 
-        // PM in personal context — `can_read_all` wins, no filter, all three
-        // rows visible. This guards the intentional PM-bypass behavior.
+        // PM in personal context is restricted to personally owned content.
         let personal_resp = app
             .get("/admin/api/v1/batches/requests")
             .add_header(&auth[0].0, &auth[0].1)
@@ -707,8 +706,8 @@ mod tests {
         personal_resp.assert_status_ok();
         let personal_body: serde_json::Value = personal_resp.json();
         assert_eq!(
-            personal_body["total_count"], 3,
-            "PM in personal context should see every row (read-all bypass)",
+            personal_body["total_count"], 1,
+            "PM in personal context should see only their own row",
         );
 
         // PM in org context — `created_by_filter = Some(org.id)`, only the
@@ -812,7 +811,7 @@ mod tests {
         let visible_key_id = uuid::Uuid::new_v4();
         let child_key_id = uuid::Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO api_keys (id, name, secret, purpose, user_id, created_by, hidden) VALUES ($1, 'Member key', $2, 'realtime', $3, $4, false)",
+            "INSERT INTO api_keys (id, name, secret, secret_hash, secret_prefix, purpose, user_id, created_by, hidden) VALUES ($1, 'Member key', $2, sha256(convert_to($2, 'UTF8')), left($2, 8), 'realtime', $3, $4, false)",
         )
         .bind(visible_key_id)
         .bind(format!("sk-visible-{}", visible_key_id.simple()))
@@ -822,7 +821,7 @@ mod tests {
         .await
         .expect("insert visible key");
         sqlx::query(
-            "INSERT INTO api_keys (id, name, secret, purpose, user_id, created_by, hidden, parent_api_key_id) VALUES ($1, 'Internal batch key (cap scope)', $2, 'batch', $3, $4, true, $5)",
+            "INSERT INTO api_keys (id, name, secret, secret_hash, secret_prefix, purpose, user_id, created_by, hidden, parent_api_key_id) VALUES ($1, 'Internal batch key (cap scope)', $2, sha256(convert_to($2, 'UTF8')), left($2, 8), 'batch', $3, $4, true, $5)",
         )
         .bind(child_key_id)
         .bind(format!("sk-child-{}", child_key_id.simple()))

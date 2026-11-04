@@ -18,8 +18,8 @@
 
 # Get user IDs
 GET http://localhost:3001/admin/api/v1/users/current
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Captures]
 admin_user_id: jsonpath "$.id"
@@ -74,8 +74,8 @@ HTTP 403
 
 # Admin creates endpoint 1 (no sync)
 POST http://localhost:3001/admin/api/v1/endpoints
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "name": "test-endpoint-1",
   "description": "Test endpoint 1 for permissions testing",
@@ -93,8 +93,8 @@ endpoint1_id: jsonpath "$.id"
 
 # Admin creates endpoint 2 (no sync)
 POST http://localhost:3001/admin/api/v1/endpoints
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "name": "test-endpoint-2",
   "description": "Test endpoint 2 for permissions testing",
@@ -110,8 +110,8 @@ endpoint2_id: jsonpath "$.id"
 
 # Admin creates endpoint 3 (no sync)
 POST http://localhost:3001/admin/api/v1/endpoints
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "name": "test-endpoint-3",
   "description": "Test endpoint 3 for permissions testing",
@@ -151,8 +151,8 @@ HTTP 403
 
 # Admin lists all endpoints - should see all 3 endpoints
 GET http://localhost:3001/admin/api/v1/endpoints
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$" isCollection
@@ -192,8 +192,8 @@ HTTP 403
 
 # Admin fetches endpoint1 - should succeed
 GET http://localhost:3001/admin/api/v1/endpoints/{{endpoint1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{endpoint1_id}}"
@@ -202,8 +202,8 @@ jsonpath "$.url" == "http://mock-llm-server:3000/"
 
 # Admin fetches endpoint2 - should succeed
 GET http://localhost:3001/admin/api/v1/endpoints/{{endpoint2_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{endpoint2_id}}"
@@ -211,8 +211,8 @@ jsonpath "$.name" == "test-endpoint-2"
 
 # Admin fetches endpoint3 - should succeed
 GET http://localhost:3001/admin/api/v1/endpoints/{{endpoint3_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{endpoint3_id}}"
@@ -259,8 +259,8 @@ HTTP 403
 
 # Admin updates endpoint1 - should succeed
 PATCH http://localhost:3001/admin/api/v1/endpoints/{{endpoint1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "description": "Updated by admin"
 }
@@ -271,8 +271,8 @@ jsonpath "$.description" == "Updated by admin"
 
 # Admin updates endpoint2 name - should succeed
 PATCH http://localhost:3001/admin/api/v1/endpoints/{{endpoint2_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "name": "test-endpoint-2-renamed"
 }
@@ -325,8 +325,8 @@ HTTP 403
 
 # Admin validates a new endpoint - should succeed
 POST http://localhost:3001/admin/api/v1/endpoints/validate
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "type": "new",
   "url": "http://mock-llm-server:3000"
@@ -338,8 +338,8 @@ jsonpath "$.models" exists
 
 # Admin validates an existing endpoint - should succeed
 POST http://localhost:3001/admin/api/v1/endpoints/validate
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "type": "existing",
   "endpoint_id": "{{endpoint1_id}}"
@@ -381,26 +381,26 @@ HTTP 403
 
 # Admin deletes endpoint3 - should succeed
 DELETE http://localhost:3001/admin/api/v1/endpoints/{{endpoint3_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # Verify endpoint3 is deleted - should get 404
 GET http://localhost:3001/admin/api/v1/endpoints/{{endpoint3_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 404
 
 # Admin deletes endpoint2 - should succeed
 DELETE http://localhost:3001/admin/api/v1/endpoints/{{endpoint2_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # Admin deletes endpoint1 - should succeed
 DELETE http://localhost:3001/admin/api/v1/endpoints/{{endpoint1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 204
 
 # =============================================================================

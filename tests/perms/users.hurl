@@ -10,11 +10,11 @@
 #   - Can update own profile (display_name, avatar_url) but NOT roles (has Users::UpdateOwn)
 #   - Can see own credit balance with include=billing (has Credits::ReadOwn)
 #   - Cannot create, update roles, or delete users
-# - Admin/PlatformManager: Full access to user management
+# - Admin/PlatformManager: Read-only customer management plus enable-only ZDR
 #   - Can list all users (has Users::ReadAll)
 #   - Can read any user (has Users::ReadAll)
 #   - Can see any user's credits with include=billing (has Credits::ReadAll)
-#   - Can create, update (including roles), and delete users
+#   - Cannot create, change roles, or delete other users
 #
 # Note: Users created via registration get StandardUser, BatchAPIUser, and
 # BackgroundInferenceUser roles by default
@@ -26,8 +26,8 @@
 
 # Get user IDs
 GET http://localhost:3001/admin/api/v1/users/current
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Captures]
 admin_user_id: jsonpath "$.id"
@@ -48,8 +48,8 @@ user2_id: jsonpath "$.id"
 
 # Grant some credits to user1 for billing tests
 POST http://localhost:3001/admin/api/v1/transactions
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "user_id": "{{user1_id}}",
   "transaction_type": "admin_grant",
@@ -124,8 +124,8 @@ HTTP 403
 
 # Admin lists users - should succeed
 GET http://localhost:3001/admin/api/v1/users
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.data" isCollection
@@ -136,16 +136,16 @@ jsonpath "$.data[*].id" contains "{{admin_user_id}}"
 
 # Admin lists users with pagination - should succeed
 GET http://localhost:3001/admin/api/v1/users?skip=0&limit=5
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.data" isCollection
 
 # Admin lists users with include=groups - should succeed
 GET http://localhost:3001/admin/api/v1/users?include=groups
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.data" isCollection
@@ -153,8 +153,8 @@ jsonpath "$.data" isCollection
 
 # Admin lists users with include=billing - should succeed (has Credits::ReadAll)
 GET http://localhost:3001/admin/api/v1/users?include=billing
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.data" isCollection
@@ -163,8 +163,8 @@ jsonpath "$.data[?(@.id == '{{user1_id}}')].credit_balance" nth 0 exists
 
 # Admin lists users with multiple includes - should succeed
 GET http://localhost:3001/admin/api/v1/users?include=groups,billing
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.data" isCollection
@@ -240,32 +240,32 @@ HTTP 403
 
 # Admin gets user1's data - should succeed
 GET http://localhost:3001/admin/api/v1/users/{{user1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{user1_id}}"
 
 # Admin gets their own data - should succeed
 GET http://localhost:3001/admin/api/v1/users/{{admin_user_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{admin_user_id}}"
 
 # Admin uses /users/current - should succeed
 GET http://localhost:3001/admin/api/v1/users/current
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{admin_user_id}}"
 
 # Admin gets user2's data - should succeed
 GET http://localhost:3001/admin/api/v1/users/{{user2_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{user2_id}}"
@@ -276,8 +276,8 @@ jsonpath "$.id" == "{{user2_id}}"
 
 # Admin gets user1's data with include=billing - should succeed
 GET http://localhost:3001/admin/api/v1/users/{{user1_id}}?include=billing
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{user1_id}}"
@@ -286,16 +286,16 @@ jsonpath "$.credit_balance" >= 100.0
 
 # Admin gets their own data with include=billing - should succeed
 GET http://localhost:3001/admin/api/v1/users/{{admin_user_id}}?include=billing
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.credit_balance" exists
 
 # Admin gets user2's data with include=billing - should succeed
 GET http://localhost:3001/admin/api/v1/users/{{user2_id}}?include=billing
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{user2_id}}"
@@ -332,44 +332,31 @@ dwctl_session: {{user_jwt}}
 HTTP 403
 
 # -----------------------------------------------------------------------------
-# Admin CAN create users (has Users::CreateAll)
+# SSO admin CANNOT create users
 # -----------------------------------------------------------------------------
 
-# Admin creates a new standard user - should succeed
+# Admin cannot create a customer identity
 POST http://localhost:3001/admin/api/v1/users
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "username": "created-user-1",
   "email": "createduser1@example.com",
   "display_name": "Created User 1",
   "roles": ["StandardUser"]
 }
-HTTP 201
-[Asserts]
-jsonpath "$.id" exists
-jsonpath "$.username" == "created-user-1"
-jsonpath "$.email" == "createduser1@example.com"
-jsonpath "$.roles" contains "StandardUser"
-[Captures]
-created_user1_id: jsonpath "$.id"
+HTTP 403
 
-# Admin creates another user with multiple roles - should succeed
+# Admin cannot create a privileged customer identity
 POST http://localhost:3001/admin/api/v1/users
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "username": "created-user-2",
   "email": "createduser2@example.com",
   "roles": ["StandardUser", "BatchAPIUser"]
 }
-HTTP 201
-[Asserts]
-jsonpath "$.id" exists
-jsonpath "$.roles" contains "StandardUser"
-jsonpath "$.roles" contains "BatchAPIUser"
-[Captures]
-created_user2_id: jsonpath "$.id"
+HTTP 403
 
 # =============================================================================
 # User Update (PATCH /users/{user_id})
@@ -484,43 +471,36 @@ dwctl_session: {{user_jwt}}
 HTTP 403
 
 # -----------------------------------------------------------------------------
-# Admin CAN update any user (has Users::UpdateAll)
+# SSO admin CANNOT change customer identity or roles
 # -----------------------------------------------------------------------------
 
-# Admin updates created user1 - should succeed
-PATCH http://localhost:3001/admin/api/v1/users/{{created_user1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+# Admin cannot change a customer profile
+PATCH http://localhost:3001/admin/api/v1/users/{{user1_id}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "display_name": "Updated Display Name"
 }
-HTTP 200
-[Asserts]
-jsonpath "$.id" == "{{created_user1_id}}"
-jsonpath "$.display_name" == "Updated Display Name"
+HTTP 403
 
-# Admin updates user roles - should succeed
-PATCH http://localhost:3001/admin/api/v1/users/{{created_user2_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+# Admin cannot change customer roles
+PATCH http://localhost:3001/admin/api/v1/users/{{user2_id}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "roles": ["StandardUser", "RequestViewer"]
 }
-HTTP 200
-[Asserts]
-jsonpath "$.roles" contains "StandardUser"
-jsonpath "$.roles" contains "RequestViewer"
+HTTP 403
 
 # Admin updates their own user - should succeed
 PATCH http://localhost:3001/admin/api/v1/users/{{admin_user_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "display_name": "Admin Updated Self"
 }
 HTTP 200
 [Asserts]
-jsonpath "$.id" == "{{admin_user_id}}"
 jsonpath "$.display_name" == "Admin Updated Self"
 
 # =============================================================================
@@ -532,7 +512,7 @@ jsonpath "$.display_name" == "Admin Updated Self"
 # -----------------------------------------------------------------------------
 
 # User1 tries to delete created user - should be forbidden
-DELETE http://localhost:3001/admin/api/v1/users/{{created_user1_id}}
+DELETE http://localhost:3001/admin/api/v1/users/{{user1_id}}
 [Cookies]
 dwctl_session: {{user_jwt}}
 HTTP 403
@@ -550,84 +530,67 @@ dwctl_session: {{user_jwt}}
 HTTP 403
 
 # -----------------------------------------------------------------------------
-# Admin CAN delete users (has Users::DeleteAll)
+# SSO admin CANNOT delete users
 # -----------------------------------------------------------------------------
 
-# Admin deletes created user1 - should succeed
-DELETE http://localhost:3001/admin/api/v1/users/{{created_user1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
-HTTP 204
+# Admin cannot delete user1
+DELETE http://localhost:3001/admin/api/v1/users/{{user1_id}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
+HTTP 403
 
-# Verify user is deleted - should get 404
-GET http://localhost:3001/admin/api/v1/users/{{created_user1_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
-HTTP 404
+# Verify the customer account is still present
+GET http://localhost:3001/admin/api/v1/users/{{user1_id}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
+HTTP 200
 
-# Admin deletes created user2 - should succeed
-DELETE http://localhost:3001/admin/api/v1/users/{{created_user2_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
-HTTP 204
+# Admin cannot delete user2
+DELETE http://localhost:3001/admin/api/v1/users/{{user2_id}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
+HTTP 403
 
-# Admin tries to delete themselves - should get 400 (self-deletion protection)
+# Admin cannot delete their own account
 DELETE http://localhost:3001/admin/api/v1/users/{{admin_user_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
-HTTP 400
-[Asserts]
-body contains "cannot delete your own account"
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
+HTTP 403
 
 # =============================================================================
 # PlatformManager Self-Role-Update Tests
 # =============================================================================
-# Test that PlatformManager (admin) CAN update their own roles (has Users::UpdateAll)
+# Test that PlatformManager (admin) CANNOT update their own roles
 # =============================================================================
 
-# Admin updates their own roles - should succeed
+# Admin cannot update their own roles
 PATCH http://localhost:3001/admin/api/v1/users/{{admin_user_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "roles": ["PlatformManager", "BatchAPIUser", "RequestViewer"]
 }
-HTTP 200
-[Asserts]
-jsonpath "$.roles" contains "PlatformManager"
-jsonpath "$.roles" contains "RequestViewer"
-jsonpath "$.roles" contains "BatchAPIUser"
-jsonpath "$.roles" contains "StandardUser"
-jsonpath "$.roles" count == 4
+HTTP 403
 
-# Verify the roles persisted
+# Verify the account remains readable
 GET http://localhost:3001/admin/api/v1/users/{{admin_user_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
-[Asserts]
-jsonpath "$.roles" contains "PlatformManager"
-jsonpath "$.roles" contains "RequestViewer"
-jsonpath "$.roles" count == 4
 
-# Admin updates back their roles
+# A second attempt to set their own roles is also denied
 PATCH http://localhost:3001/admin/api/v1/users/{{admin_user_id}}
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 {
   "roles": ["PlatformManager", "BatchAPIUser"]
 }
-HTTP 200
-[Asserts]
-jsonpath "$.roles" contains "PlatformManager"
-jsonpath "$.roles" contains "BatchAPIUser"
-jsonpath "$.roles" contains "StandardUser"
-jsonpath "$.roles" count == 3
+HTTP 403
 
-# Admin can update their own billing data
+# Admin can read their own billing data
 GET http://localhost:3001/admin/api/v1/users/{{admin_user_id}}?include=billing
-[Cookies]
-dwctl_session: {{admin_jwt}}
+X-Doubleword-User: {{admin_email}}
+X-Doubleword-Email: {{admin_email}}
 HTTP 200
 [Asserts]
 jsonpath "$.credit_balance" exists

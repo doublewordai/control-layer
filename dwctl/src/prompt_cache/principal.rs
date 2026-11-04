@@ -1,13 +1,17 @@
-//! Resolve a request's (validated) bearer token to its billing principal — the
-//! cache scope's `principal_id` (= `api_keys.user_id`, the `target_user_id`: org or
-//! personal user). Two-tier, per the design:
+//! Resolve the (validated) key a request presents, by its SHA-256 hash, to its
+//! billing principal — the cache scope's `principal_id` (= `api_keys.user_id`, the
+//! `target_user_id`: org or personal user). Callers pass the hash from
+//! `presented_key_hash`, so a key authenticated by internal credential resolves
+//! like any other. Two-tier, per the design:
 //!
-//! - **L1**: an in-process memo. The `api_key -> user_id` mapping is **immutable**
+//! - **L1**: an in-process memo keyed by the key hash, so it holds no plaintext
+//!   secrets. The `api_key -> user_id` mapping is **immutable**
 //!   (a key's `user_id` never changes), so the memo needs no invalidation; a modest
-//!   TTL is kept only for memory hygiene. onwards passes only *validated* tokens and
+//!   TTL is kept only for memory hygiene. onwards passes only *validated* keys and
 //!   a deleted key fails that validation, so a stale memo entry can never be used.
-//! - **Read-through** to the DB on a miss via `get_user_id_by_secret` — one indexed
-//!   point lookup. No bulk key sync (that LISTEN/NOTIFY load is what we avoid).
+//! - **Read-through** to the DB on a miss via `get_user_id_by_hash` — one indexed
+//!   point lookup on `secret_hash`. No bulk key sync (that LISTEN/NOTIFY load is
+//!   what we avoid).
 //!
 //! Scoping on `user_id` (not the key) is deliberate: all of a customer's modalities
 //! (realtime / batch / playground keys) share one `user_id`, so their requests cache
@@ -17,24 +21,25 @@ use std::time::Duration;
 
 use moka::future::Cache;
 
+use crate::crypto::ApiKeyHash;
 use crate::db::handlers::api_keys::ApiKeys;
 use crate::types::UserId;
 
 use super::index::CacheResult;
 use super::metrics as cache_metrics;
 
-/// Resolves bearer tokens to billing principals, backed by an in-process L1 memo
+/// Resolves key hashes to billing principals, backed by an in-process L1 memo
 /// over a DB read-through.
 #[derive(Clone)]
 pub struct PrincipalResolver {
     /// Live provider (not a pinned pool): survives runtime pool swaps.
     pool: sqlx_pool_router::DynPools,
-    l1: Cache<String, Option<UserId>>,
+    l1: Cache<[u8; 32], Option<UserId>>,
 }
 
 impl PrincipalResolver {
     pub fn new(pool: impl sqlx_pool_router::PoolProvider) -> Self {
-        // 100k entries ≈ a few MB (String key + Option<Uuid>) — comfortably covers the
+        // 100k entries ≈ a few MB (32-byte hash key + Option<Uuid>) — comfortably covers the
         // active-key working set of a busy tenant; cold keys evict + take one DB miss on
         // next use (cheap, indexed point lookup). Bump via `with_capacity` if churn warrants.
         Self::with_capacity(pool, 100_000)
@@ -52,27 +57,27 @@ impl PrincipalResolver {
         }
     }
 
-    /// Resolve a validated bearer token to its billing principal. `None` => the token
-    /// is not a live key (→ un-scopable → no caching). Hits and misses are both
+    /// Resolve the hash of a validated key to its billing principal. `None` => the
+    /// hash is not a live key's (→ un-scopable → no caching). Hits and misses are both
     /// memoised; both are safe (immutable mapping; secrets are never reused).
     ///
     /// Threat model for memoising `None`: an attacker probing invalid tokens can only
     /// fill `None` entries, which grant no access — onwards validates the key *before*
     /// this is ever reached, so a polluting probe never corresponds to a request that
     /// caches or bills. The blast radius is at worst a wasted DB miss on the first real
-    /// lookup of a key that happened to collide with a probed string (negligible:
+    /// lookup of a key whose hash happened to collide with a probed one (negligible:
     /// secrets are crypto-random), and the TTL bounds even that. So caching `None` is fine.
-    pub async fn resolve(&self, token: &str) -> CacheResult<Option<UserId>> {
-        if let Some(cached) = self.l1.get(token).await {
+    pub async fn resolve(&self, token_hash: &ApiKeyHash) -> CacheResult<Option<UserId>> {
+        if let Some(cached) = self.l1.get(token_hash).await {
             // An L1 hit on a cached `None` is a cached *unknown* key, not a resolve hit —
             // count it as unknown_key so key-probe / invalid-key volume stays accurate.
             cache_metrics::record_principal_resolve(if cached.is_some() { "hit" } else { "unknown_key" });
             return Ok(cached);
         }
         let mut conn = self.pool.write().acquire().await?;
-        let user_id = ApiKeys::new(&mut conn).get_user_id_by_secret(token).await?;
+        let user_id = ApiKeys::new(&mut conn).get_user_id_by_hash(token_hash).await?;
         cache_metrics::record_principal_resolve(if user_id.is_some() { "miss" } else { "unknown_key" });
-        self.l1.insert(token.to_string(), user_id).await;
+        self.l1.insert(*token_hash, user_id).await;
         Ok(user_id)
     }
 }
@@ -89,14 +94,18 @@ mod tests {
         let key = create_test_api_key_for_user(&pool, user.id).await;
 
         let resolver = PrincipalResolver::new(pool);
-        assert_eq!(resolver.resolve(&key.secret).await.unwrap(), Some(user.id));
+        let hash = crate::crypto::hash_api_key(&key.secret);
+        assert_eq!(resolver.resolve(&hash).await.unwrap(), Some(user.id));
         // Second call is served from the L1 memo — still correct.
-        assert_eq!(resolver.resolve(&key.secret).await.unwrap(), Some(user.id));
+        assert_eq!(resolver.resolve(&hash).await.unwrap(), Some(user.id));
     }
 
     #[dwctl_test_macros::test]
     async fn unknown_token_resolves_none(pool: sqlx::PgPool) {
         let resolver = PrincipalResolver::new(pool);
-        assert_eq!(resolver.resolve("not-a-real-secret").await.unwrap(), None);
+        assert_eq!(
+            resolver.resolve(&crate::crypto::hash_api_key("not-a-real-secret")).await.unwrap(),
+            None
+        );
     }
 }

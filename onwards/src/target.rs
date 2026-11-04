@@ -15,7 +15,7 @@
 //! Provider-level configuration (url, onwards_key, weight) is specific to each provider.
 use crate::affinity::AffinityConfig;
 use crate::aimd::AimdConfig;
-use crate::auth::KeySet;
+use crate::auth::{API_KEY_ID_LABEL, KeyHash, KeySet};
 use crate::inflight::InflightLimits;
 use crate::load_balancer::{Provider, ProviderPool};
 use crate::reasoning::ReasoningTranslationConfig;
@@ -1164,7 +1164,9 @@ impl TargetPools {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyDefinition {
-    pub key: String,
+    /// The key, by hash. A config file gives the plaintext (hashed on load)
+    /// or `sha256:<hex>`; see [`KeyHash`].
+    pub key: KeyHash,
     pub rate_limit: Option<RateLimitParameters>,
     pub concurrency_limit: Option<ConcurrencyLimitParameters>,
     /// Labels for this key (e.g., {"purpose": "batch"}).
@@ -1250,12 +1252,16 @@ pub struct Targets {
     /// Map of alias names to their named pools (supports load balancing, and
     /// per-request-class pools — see [`TargetPools`])
     pub targets: Arc<DashMap<String, TargetPools>>,
-    /// Direct rate limiters per actual API key (actual key -> rate limiter)
-    pub key_rate_limiters: Arc<DashMap<String, Arc<DefaultDirectRateLimiter>>>,
-    /// Concurrency limiters per actual API key (actual key -> concurrency limiter)
-    pub key_concurrency_limiters: Arc<DashMap<String, ConcurrencyLimiter>>,
-    /// Labels per actual API key (actual key -> labels map)
-    pub key_labels: Arc<DashMap<String, HashMap<String, String>>>,
+    /// Direct rate limiters per API key (key hash -> rate limiter)
+    pub key_rate_limiters: Arc<DashMap<KeyHash, Arc<DefaultDirectRateLimiter>>>,
+    /// Concurrency limiters per API key (key hash -> concurrency limiter)
+    pub key_concurrency_limiters: Arc<DashMap<KeyHash, ConcurrencyLimiter>>,
+    /// Labels per API key (key hash -> labels map)
+    pub key_labels: Arc<DashMap<KeyHash, HashMap<String, String>>>,
+    /// Key hashes by the value of their [`API_KEY_ID_LABEL`] label, so an
+    /// embedder that authenticated a request by key id can find the key.
+    /// Kept in step with `key_labels`.
+    pub key_ids: Arc<DashMap<String, KeyHash>>,
     /// Serving account settings per account id. A key finds its account
     /// through its `account` label; only accounts with a policy are present.
     pub accounts: Arc<DashMap<String, AccountServing>>,
@@ -1544,10 +1550,11 @@ impl Targets {
         debug!("{} global keys configured", global_keys.len());
         debug!("{} key definitions configured", key_definitions.len());
 
-        // Set up rate limiters and labels keyed by actual API keys
+        // Set up rate limiters and labels keyed by API key hash
         let key_rate_limiters = Arc::new(DashMap::new());
         let key_concurrency_limiters = Arc::new(DashMap::new());
         let key_labels = Arc::new(DashMap::new());
+        let key_ids = Arc::new(DashMap::new());
 
         for (_key_id, key_def) in key_definitions {
             if let Some(ref rate_limit) = key_def.rate_limit {
@@ -1558,16 +1565,19 @@ impl Targets {
                             .unwrap_or(rate_limit.requests_per_second),
                     ),
                 ));
-                // Map the actual API key to its rate limiter
-                key_rate_limiters.insert(key_def.key.clone(), limiter);
+                // Map the key's hash to its rate limiter
+                key_rate_limiters.insert(key_def.key, limiter);
             }
             if let Some(ref concurrency_limit) = key_def.concurrency_limit {
                 let limiter =
                     ConcurrencyLimiter::with_limit(concurrency_limit.max_concurrent_requests);
-                key_concurrency_limiters.insert(key_def.key.clone(), limiter);
+                key_concurrency_limiters.insert(key_def.key, limiter);
+            }
+            if let Some(id) = key_def.labels.get(API_KEY_ID_LABEL) {
+                key_ids.insert(id.clone(), key_def.key);
             }
             if !key_def.labels.is_empty() {
-                key_labels.insert(key_def.key.clone(), key_def.labels);
+                key_labels.insert(key_def.key, key_def.labels);
             }
         }
 
@@ -1613,6 +1623,7 @@ impl Targets {
             key_rate_limiters,
             key_concurrency_limiters,
             key_labels,
+            key_ids,
             accounts,
             strict_mode: config_file.strict_mode,
             http_pool_config: config_file.http_pool,
@@ -1633,6 +1644,7 @@ impl Targets {
         let key_rate_limiters = Arc::clone(&self.key_rate_limiters);
         let key_concurrency_limiters = Arc::clone(&self.key_concurrency_limiters);
         let key_labels = Arc::clone(&self.key_labels);
+        let key_ids = Arc::clone(&self.key_ids);
         let accounts = Arc::clone(&self.accounts);
 
         let mut stream = targets_stream.stream().await?;
@@ -1677,7 +1689,7 @@ impl Targets {
                         }
 
                         // Update key rate limiters atomically (same pattern)
-                        let current_rate_limiter_keys: Vec<String> = key_rate_limiters
+                        let current_rate_limiter_keys: Vec<KeyHash> = key_rate_limiters
                             .iter()
                             .map(|entry| entry.key().clone())
                             .collect();
@@ -1695,7 +1707,7 @@ impl Targets {
                         }
 
                         // Update key concurrency limiters atomically (same pattern)
-                        let current_concurrency_limiter_keys: Vec<String> =
+                        let current_concurrency_limiter_keys: Vec<KeyHash> =
                             key_concurrency_limiters
                                 .iter()
                                 .map(|entry| entry.key().clone())
@@ -1720,7 +1732,7 @@ impl Targets {
                         }
 
                         // Update key labels atomically (same pattern)
-                        let current_label_keys: Vec<String> =
+                        let current_label_keys: Vec<KeyHash> =
                             key_labels.iter().map(|entry| entry.key().clone()).collect();
 
                         for key in current_label_keys {
@@ -1731,6 +1743,18 @@ impl Targets {
 
                         for entry in new_targets.key_labels.iter() {
                             key_labels.insert(entry.key().clone(), entry.value().clone());
+                        }
+
+                        // Key-id index: same remove-then-upsert pattern.
+                        let current_key_ids: Vec<String> =
+                            key_ids.iter().map(|entry| entry.key().clone()).collect();
+                        for id in current_key_ids {
+                            if !new_targets.key_ids.contains_key(&id) {
+                                key_ids.remove(&id);
+                            }
+                        }
+                        for entry in new_targets.key_ids.iter() {
+                            key_ids.insert(entry.key().clone(), *entry.value());
                         }
 
                         // Serving account settings: same remove-then-upsert pattern.
@@ -1760,7 +1784,7 @@ impl Targets {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::ConstantTimeString;
+    use crate::auth::KeyHash;
     use dashmap::DashMap;
     use std::collections::HashSet;
 
@@ -1834,6 +1858,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            key_ids: Arc::new(DashMap::new()),
             accounts: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
@@ -1898,6 +1923,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            key_ids: Arc::new(DashMap::new()),
             accounts: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
@@ -1964,6 +1990,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            key_ids: Arc::new(DashMap::new()),
             accounts: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
@@ -1989,14 +2016,14 @@ mod tests {
     #[test]
     fn test_from_config_merges_global_keys_with_target_keys() {
         let mut target_keys = HashSet::new();
-        target_keys.insert(ConstantTimeString::from("target-key-1".to_string()));
-        target_keys.insert(ConstantTimeString::from("target-key-2".to_string()));
-        target_keys.insert(ConstantTimeString::from("shared-key".to_string()));
+        target_keys.insert(KeyHash::from("target-key-1".to_string()));
+        target_keys.insert(KeyHash::from("target-key-2".to_string()));
+        target_keys.insert(KeyHash::from("shared-key".to_string()));
 
         let mut global_keys = HashSet::new();
-        global_keys.insert(ConstantTimeString::from("global-key-1".to_string()));
-        global_keys.insert(ConstantTimeString::from("global-key-2".to_string()));
-        global_keys.insert(ConstantTimeString::from("shared-key".to_string())); // Duplicate with target
+        global_keys.insert(KeyHash::from("global-key-1".to_string()));
+        global_keys.insert(KeyHash::from("global-key-2".to_string()));
+        global_keys.insert(KeyHash::from("shared-key".to_string())); // Duplicate with target
 
         let mut targets = HashMap::new();
         targets.insert(
@@ -2027,18 +2054,18 @@ mod tests {
         // Pool should have both its own keys and global keys (5 unique keys)
         let pool_keys = pool.keys().unwrap();
         assert_eq!(pool_keys.len(), 5);
-        assert!(pool_keys.contains(&ConstantTimeString::from("target-key-1".to_string())));
-        assert!(pool_keys.contains(&ConstantTimeString::from("target-key-2".to_string())));
-        assert!(pool_keys.contains(&ConstantTimeString::from("global-key-1".to_string())));
-        assert!(pool_keys.contains(&ConstantTimeString::from("global-key-2".to_string())));
-        assert!(pool_keys.contains(&ConstantTimeString::from("shared-key".to_string())));
+        assert!(pool_keys.contains(&KeyHash::from("target-key-1".to_string())));
+        assert!(pool_keys.contains(&KeyHash::from("target-key-2".to_string())));
+        assert!(pool_keys.contains(&KeyHash::from("global-key-1".to_string())));
+        assert!(pool_keys.contains(&KeyHash::from("global-key-2".to_string())));
+        assert!(pool_keys.contains(&KeyHash::from("shared-key".to_string())));
     }
 
     #[test]
     fn test_from_config_target_without_keys_gets_global_keys() {
         let mut global_keys = HashSet::new();
-        global_keys.insert(ConstantTimeString::from("global-key-1".to_string()));
-        global_keys.insert(ConstantTimeString::from("global-key-2".to_string()));
+        global_keys.insert(KeyHash::from("global-key-1".to_string()));
+        global_keys.insert(KeyHash::from("global-key-2".to_string()));
 
         let mut targets = HashMap::new();
         targets.insert(
@@ -2068,8 +2095,8 @@ mod tests {
         // Pool without explicit keys should get global keys
         let pool_keys = pool.keys().unwrap();
         assert_eq!(pool_keys.len(), 2);
-        assert!(pool_keys.contains(&ConstantTimeString::from("global-key-1".to_string())));
-        assert!(pool_keys.contains(&ConstantTimeString::from("global-key-2".to_string())));
+        assert!(pool_keys.contains(&KeyHash::from("global-key-1".to_string())));
+        assert!(pool_keys.contains(&KeyHash::from("global-key-2".to_string())));
     }
 
     #[test]
@@ -2193,7 +2220,7 @@ mod tests {
         key_definitions.insert(
             "basic_user".to_string(),
             KeyDefinition {
-                key: "sk-user-123".to_string(),
+                key: KeyHash::of("sk-user-123"),
                 rate_limit: Some(RateLimitParameters {
                     requests_per_second: NonZeroU32::new(10).unwrap(),
                     burst_size: Some(NonZeroU32::new(20).unwrap()),
@@ -2217,10 +2244,17 @@ mod tests {
         let targets = Targets::from_config(config_file).unwrap();
 
         // The actual API key should have a rate limiter
-        assert!(targets.key_rate_limiters.contains_key("sk-user-123"));
+        assert!(
+            targets
+                .key_rate_limiters
+                .contains_key(&KeyHash::of("sk-user-123"))
+        );
 
         // First request should be allowed
-        let limiter = targets.key_rate_limiters.get("sk-user-123").unwrap();
+        let limiter = targets
+            .key_rate_limiters
+            .get(&KeyHash::of("sk-user-123"))
+            .unwrap();
         assert!(limiter.check().is_ok());
     }
 
@@ -2239,7 +2273,11 @@ mod tests {
         let targets = Targets::from_config(config_file).unwrap();
 
         // Literal keys should not have rate limiters
-        assert!(!targets.key_rate_limiters.contains_key("sk-literal-key"));
+        assert!(
+            !targets
+                .key_rate_limiters
+                .contains_key(&KeyHash::of("sk-literal-key"))
+        );
     }
 
     #[test]
@@ -2251,7 +2289,7 @@ mod tests {
         key_definitions.insert(
             "unlimited_user".to_string(),
             KeyDefinition {
-                key: "sk-unlimited-123".to_string(),
+                key: KeyHash::of("sk-unlimited-123"),
                 rate_limit: None,
                 concurrency_limit: None,
                 labels: HashMap::new(),
@@ -2272,14 +2310,18 @@ mod tests {
         let targets = Targets::from_config(config_file).unwrap();
 
         // Key without rate limits should not have a rate limiter
-        assert!(!targets.key_rate_limiters.contains_key("sk-unlimited-123"));
+        assert!(
+            !targets
+                .key_rate_limiters
+                .contains_key(&KeyHash::of("sk-unlimited-123"))
+        );
     }
 
     #[test]
     fn test_from_config_no_global_keys() {
         let mut target_keys = HashSet::new();
-        target_keys.insert(ConstantTimeString::from("target-key-1".to_string()));
-        target_keys.insert(ConstantTimeString::from("target-key-2".to_string()));
+        target_keys.insert(KeyHash::from("target-key-1".to_string()));
+        target_keys.insert(KeyHash::from("target-key-2".to_string()));
 
         let mut targets = HashMap::new();
         targets.insert(
@@ -2316,8 +2358,8 @@ mod tests {
         let pool_with_keys = default_pool(&targets, "model-with-keys");
         let pool_keys = pool_with_keys.keys().unwrap();
         assert_eq!(pool_keys.len(), 2);
-        assert!(pool_keys.contains(&ConstantTimeString::from("target-key-1".to_string())));
-        assert!(pool_keys.contains(&ConstantTimeString::from("target-key-2".to_string())));
+        assert!(pool_keys.contains(&KeyHash::from("target-key-1".to_string())));
+        assert!(pool_keys.contains(&KeyHash::from("target-key-2".to_string())));
 
         // Pool without keys should remain None
         let pool_without_keys = default_pool(&targets, "model-without-keys");
@@ -2490,7 +2532,7 @@ mod tests {
         key_definitions.insert(
             "limited_user".to_string(),
             KeyDefinition {
-                key: "sk-limited-123".to_string(),
+                key: KeyHash::of("sk-limited-123"),
                 rate_limit: None,
                 concurrency_limit: Some(ConcurrencyLimitParameters {
                     max_concurrent_requests: 3,
@@ -2516,7 +2558,7 @@ mod tests {
         assert!(
             targets
                 .key_concurrency_limiters
-                .contains_key("sk-limited-123")
+                .contains_key(&KeyHash::of("sk-limited-123"))
         );
     }
 
@@ -2529,7 +2571,7 @@ mod tests {
         key_definitions.insert(
             "unlimited_user".to_string(),
             KeyDefinition {
-                key: "sk-unlimited-456".to_string(),
+                key: KeyHash::of("sk-unlimited-456"),
                 rate_limit: None,
                 concurrency_limit: None,
                 labels: HashMap::new(),
@@ -2553,7 +2595,7 @@ mod tests {
         assert!(
             !targets
                 .key_concurrency_limiters
-                .contains_key("sk-unlimited-456")
+                .contains_key(&KeyHash::of("sk-unlimited-456"))
         );
     }
 
@@ -3286,7 +3328,7 @@ mod tests {
         key_definitions.insert(
             "batch_user".to_string(),
             KeyDefinition {
-                key: "sk-batch-123".to_string(),
+                key: KeyHash::of("sk-batch-123"),
                 rate_limit: None,
                 concurrency_limit: None,
                 labels: HashMap::from([("purpose".to_string(), "batch".to_string())]),
@@ -3295,7 +3337,7 @@ mod tests {
         key_definitions.insert(
             "playground_user".to_string(),
             KeyDefinition {
-                key: "sk-play-456".to_string(),
+                key: KeyHash::of("sk-play-456"),
                 rate_limit: None,
                 concurrency_limit: None,
                 labels: HashMap::from([("purpose".to_string(), "playground".to_string())]),
@@ -3304,7 +3346,7 @@ mod tests {
         key_definitions.insert(
             "no_labels_user".to_string(),
             KeyDefinition {
-                key: "sk-nolabel-789".to_string(),
+                key: KeyHash::of("sk-nolabel-789"),
                 rate_limit: None,
                 concurrency_limit: None,
                 labels: HashMap::new(),
@@ -3325,14 +3367,87 @@ mod tests {
         let targets = Targets::from_config(config_file).unwrap();
 
         // Keys with labels should be in key_labels
-        let batch_labels = targets.key_labels.get("sk-batch-123").unwrap();
+        let batch_labels = targets
+            .key_labels
+            .get(&KeyHash::of("sk-batch-123"))
+            .unwrap();
         assert_eq!(batch_labels.get("purpose").unwrap(), "batch");
 
-        let play_labels = targets.key_labels.get("sk-play-456").unwrap();
+        let play_labels = targets.key_labels.get(&KeyHash::of("sk-play-456")).unwrap();
         assert_eq!(play_labels.get("purpose").unwrap(), "playground");
 
         // Key without labels should NOT be in key_labels
-        assert!(!targets.key_labels.contains_key("sk-nolabel-789"));
+        assert!(
+            !targets
+                .key_labels
+                .contains_key(&KeyHash::of("sk-nolabel-789"))
+        );
+    }
+
+    fn targets_with_labelled_keys(keys: &[(&str, &str)]) -> Targets {
+        let key_definitions = keys
+            .iter()
+            .map(|(key, id)| {
+                (
+                    id.to_string(),
+                    KeyDefinition {
+                        key: KeyHash::of(key),
+                        rate_limit: None,
+                        concurrency_limit: None,
+                        labels: HashMap::from([(API_KEY_ID_LABEL.to_string(), id.to_string())]),
+                    },
+                )
+            })
+            .collect();
+        Targets::from_config(ConfigFile {
+            targets: HashMap::new(),
+            auth: Some(Auth {
+                global_keys: std::collections::HashSet::new(),
+                key_definitions: Some(key_definitions),
+            }),
+            strict_mode: false,
+            http_pool: None,
+            accounts: Default::default(),
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_key_ids_index_keys_and_follow_updates() {
+        let targets = targets_with_labelled_keys(&[("sk-a", "id-a"), ("sk-b", "id-b")]);
+        assert_eq!(
+            targets.key_ids.get("id-a").map(|h| *h),
+            Some(KeyHash::of("sk-a"))
+        );
+        assert_eq!(
+            targets.key_ids.get("id-b").map(|h| *h),
+            Some(KeyHash::of("sk-b"))
+        );
+
+        // id-b is deleted, id-c is new.
+        let updated = targets_with_labelled_keys(&[("sk-a", "id-a"), ("sk-c", "id-c")]);
+        targets
+            .receive_updates(MockConfigWatcher::with_targets(vec![updated]))
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        while !targets.key_ids.contains_key("id-c") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "update never applied"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            targets.key_ids.get("id-a").map(|h| *h),
+            Some(KeyHash::of("sk-a"))
+        );
+        assert_eq!(
+            targets.key_ids.get("id-c").map(|h| *h),
+            Some(KeyHash::of("sk-c"))
+        );
+        assert!(!targets.key_ids.contains_key("id-b"));
     }
 
     #[test]

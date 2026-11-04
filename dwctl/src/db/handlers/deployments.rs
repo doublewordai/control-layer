@@ -144,12 +144,10 @@ impl DeploymentFilter {
 }
 
 /// Result of checking user access to a deployment
-/// Contains both deployment info and system API key for middleware optimization
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct DeploymentAccessInfo {
     pub deployment_id: DeploymentId,
     pub deployment_alias: String,
-    pub system_api_key: String,
 }
 
 // Database entity model
@@ -956,7 +954,7 @@ impl<'c> Deployments<'c> {
     }
 
     /// Check if a user has access to a deployment through group membership
-    /// Returns deployment info and system API key if access is granted
+    /// Returns deployment info if access is granted
     #[instrument(level = "debug", skip(self), fields(deployment_alias = %deployment_alias, user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn check_user_access(&mut self, deployment_alias: &str, user_id: UserId) -> Result<Option<DeploymentAccessInfo>> {
         let result = sqlx::query_as!(
@@ -964,11 +962,9 @@ impl<'c> Deployments<'c> {
             r#"
             SELECT
                 d.id as deployment_id,
-                d.alias as deployment_alias,
-                ak.secret as system_api_key
+                d.alias as deployment_alias
             FROM deployed_models d
             JOIN deployment_groups dg ON dg.deployment_id = d.id
-            JOIN api_keys ak ON ak.id = '00000000-0000-0000-0000-000000000000'::uuid
             WHERE d.alias = $1
             AND dg.group_id IN (
                 SELECT ug.group_id FROM user_groups ug WHERE ug.user_id = $2
@@ -2869,34 +2865,6 @@ mod tests {
         // Create a test user
         let user = create_test_user(&pool).await;
 
-        // The system API key should already exist from application setup,
-        // but let's verify and get its current secret for our assertions
-        let system_key_result = sqlx::query!(
-            "SELECT secret FROM api_keys WHERE id = $1",
-            uuid::Uuid::from_u128(0) // 00000000-0000-0000-0000-000000000000
-        )
-        .fetch_optional(&pool)
-        .await
-        .expect("Failed to query system API key");
-
-        let system_key_secret = if let Some(key) = system_key_result {
-            key.secret
-        } else {
-            // If system key doesn't exist in test environment, create it
-            sqlx::query!(
-                "INSERT INTO api_keys (id, name, secret, user_id, created_by) VALUES ($1, $2, $3, $4, $5)",
-                uuid::Uuid::from_u128(0), // 00000000-0000-0000-0000-000000000000
-                "System Key",
-                "test_system_secret",
-                user.id,
-                user.id
-            )
-            .execute(&pool)
-            .await
-            .expect("Failed to create system API key");
-            "test_system_secret".to_string()
-        };
-
         // Create a deployment
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
         let mut deployment_create = DeploymentCreateDBRequest::builder()
@@ -2942,7 +2910,6 @@ mod tests {
         let access_info = access_result.unwrap();
         assert_eq!(access_info.deployment_id, deployment.id);
         assert_eq!(access_info.deployment_alias, "access-test-alias");
-        assert_eq!(access_info.system_api_key, system_key_secret);
 
         // Test with non-existent user - should return None
         let nonexistent_user_id = uuid::Uuid::new_v4();

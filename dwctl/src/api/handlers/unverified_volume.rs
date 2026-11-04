@@ -82,13 +82,26 @@ pub async fn enforce_unverified_volume_limit<S: Storage>(
                 .sum_owner_batch_requests_in_window(&owner, completion_window, cutoff, true)
                 .await
         }
-        SubmissionKind::Flex => request_manager.count_owner_flex_requests_since(&owner, cutoff, true).await,
+        // Runs on every flex submission from an unverified creditor, so stop
+        // counting at cap + 1: enough to decide `current + requested > cap`
+        // exactly (requested >= 1), and bounded however much the owner has queued.
+        SubmissionKind::Flex => {
+            request_manager
+                .count_owner_flex_requests_since_capped(&owner, cutoff, true, cap.saturating_add(1))
+                .await
+        }
     }
     .map_err(|e| Error::Internal {
         operation: format!("count unverified upload volume: {e}"),
     })?;
 
     if current + requested > cap {
+        // The flex count stops at cap + 1, so past the cap it is a floor.
+        let current = if current > cap {
+            format!("more than {cap}")
+        } else {
+            current.to_string()
+        };
         return Err(Error::TooManyRequests {
             message: format!(
                 "Unverified accounts can submit at most {cap} request(s) per {completion_window} \

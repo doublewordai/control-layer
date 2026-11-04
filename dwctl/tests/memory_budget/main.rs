@@ -69,6 +69,7 @@ struct Budget {
     fixed_kib: f64,
 }
 
+#[allow(clippy::print_stdout, reason = "the measurement, shown with --nocapture")]
 fn check(name: &str, scaling: &Scaling, budget: Budget) {
     println!("{name}: {scaling}");
     let fixed_kib = scaling.fixed / 1024.0;

@@ -159,6 +159,7 @@ pub mod inference;
 pub mod keystore;
 mod leader_election;
 pub mod limits;
+pub mod log_redaction;
 mod metrics;
 /// jemalloc statistics (re-exported for the memory validation harness).
 pub use metrics::allocator as allocator_metrics;
@@ -310,6 +311,9 @@ where
     pub metrics_recorder: Option<GenAiMetrics>,
     #[builder(default = false)]
     pub is_leader: bool,
+    /// Atomically published, aggregate-only batch health.
+    #[builder(default)]
+    pub batch_sla_metrics: Arc<arc_swap::ArcSwap<metrics::batch_sla::Snapshot>>,
     pub request_manager: Arc<fusillade_arsenal::PostgresRequestManager<P>>,
     /// Background task runner for enqueuing deferred work (batch population, etc.)
     pub task_runner: Arc<tasks::TaskRunner<P>>,
@@ -338,12 +342,25 @@ where
     /// labelled from (see [`crate::inference::rejections`]). `None` labels them
     /// with neither model nor account.
     pub onwards_targets: Option<onwards::target::Targets>,
+    /// This process's signing key for internal credentials (see
+    /// [`auth::internal_credential`]). Whatever mints tokens for this
+    /// process's `/ai` (playground, probes, daemon dispatch) must share it.
+    #[builder(default)]
+    pub internal_credentials: auth::internal_credential::InternalCredentials,
 }
 
 impl<P> AppState<P>
 where
     P: PoolProvider + Clone,
 {
+    /// What internal credentials are verified and resolved against.
+    pub(crate) fn internal_auth_state(&self) -> auth::internal_credential::InternalAuthState {
+        auth::internal_credential::InternalAuthState {
+            credentials: self.internal_credentials.clone(),
+            targets: self.onwards_targets.clone().unwrap_or_default(),
+        }
+    }
+
     pub fn current_config(&self) -> Arc<Config> {
         self.config.snapshot()
     }
@@ -669,13 +686,18 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
         }
     }
 
-    // Update the system API key secret and ensure it has platform purpose
-    // (required for admin API access used by internal services like scouter)
+    // Give the system API key a fresh random secret and platform purpose.
+    // Nothing presents that secret: health probes authenticate as this key
+    // with an internal credential (see `auth::internal_credential`), so the
+    // secret is only written because the column still requires one.
     let system_api_key_id = Uuid::nil();
     let new_secret = crypto::generate_api_key();
+    let new_secret_hash = crypto::hash_api_key(&new_secret);
     sqlx::query!(
-        "UPDATE api_keys SET secret = $1, purpose = 'platform' WHERE id = $2",
+        "UPDATE api_keys SET secret = $1, secret_hash = $2, secret_prefix = $3, purpose = 'platform' WHERE id = $4",
         new_secret,
+        &new_secret_hash[..],
+        crypto::api_key_prefix(&new_secret),
         system_api_key_id
     )
     .execute(&mut *tx)
@@ -1652,6 +1674,25 @@ async fn setup_database(
     ))
 }
 
+/// The base URL of this process's own `/ai`, for the calls dwctl makes to
+/// itself (fusillade daemon dispatch).
+///
+/// Those calls can authenticate with internal credentials, which only the
+/// process that minted them accepts, so the URL must reach this process
+/// directly and never a load balancer: it is built from the address this
+/// process listens on, with an unspecified address (`0.0.0.0`, `::`) replaced
+/// by the loopback address.
+pub(crate) fn loopback_base_url(host: &str, port: u16) -> String {
+    use std::net::IpAddr;
+    let host = match host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) if ip.is_unspecified() => "127.0.0.1".to_string(),
+        Ok(IpAddr::V6(ip)) if ip.is_unspecified() => "[::1]".to_string(),
+        Ok(IpAddr::V6(ip)) => format!("[{ip}]"),
+        _ => host.to_string(),
+    };
+    format!("http://{host}:{port}/ai")
+}
+
 /// Build the base CORS layer (methods, headers, max-age, exposed headers) from
 /// configuration. Origin/credential handling differs by mode — see [`apply_cors`].
 fn create_cors_layer(cors: &CorsConfig) -> anyhow::Result<CorsLayer> {
@@ -1909,6 +1950,7 @@ pub async fn build_router(
                 recorder,
                 instance_id,
                 config.as_ref().clone(),
+                state.internal_auth_state(),
             ));
         }
 
@@ -1918,7 +1960,11 @@ pub async fn build_router(
         // sender to give the handler; without a sender the handler would
         // silently swallow rows.
         if let (Some(rms), Some(sender)) = (inference_middleware_state.as_ref(), requests_writer_sender.clone()) {
-            let fusillade_handler = crate::inference::engine::outlet_handler::FusilladeOutletHandler::new(sender, rms.dwctl_pool.clone());
+            let fusillade_handler = crate::inference::engine::outlet_handler::FusilladeOutletHandler::new(
+                sender,
+                rms.dwctl_pool.clone(),
+                state.internal_auth_state(),
+            );
             multi_handler = multi_handler.with(fusillade_handler);
         }
 
@@ -2407,6 +2453,7 @@ pub async fn build_router(
         let daemon = &state.current_config().background_services.batch_daemon;
         let outbound_config = crate::inference::outbound_request::OutboundConfig {
             timeouts: crate::inference::outbound_request::StreamTimeouts::from_daemon_config(daemon),
+            key_policy: state.key_policy_cache.clone(),
         };
         onwards_router.layer(middleware::from_fn_with_state(
             outbound_config,
@@ -2616,6 +2663,7 @@ pub async fn build_router(
     // hands to the client and can tell a disconnect from an early end.
     let onwards_router = if let Some(outlet_layer) = outlet_layer.clone() {
         onwards_router
+            .layer(middleware::from_fn(auth::internal_credential::carry_presented_key))
             .layer(middleware::from_fn(request_logging::stream_completion::track_stream_completion))
             .layer(outlet_layer)
     } else {
@@ -2647,6 +2695,15 @@ pub async fn build_router(
     // The root span records a batch request's completion window once the
     // response names a batch key.
     let onwards_router = onwards_router.layer(middleware::from_fn(crate::telemetry::carry_batch_completion_window));
+
+    // Verify internal credentials (`dwi-` bearers minted by this process for
+    // the playground, probes and daemon dispatch) before anything else reads
+    // the request's key, and hand the authenticated key on to every layer
+    // below. Inside the rejection recorder so a refused token is counted.
+    let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
+        state.internal_auth_state(),
+        auth::internal_credential::internal_credential_middleware,
+    ));
 
     // Outermost, so every layer above can count the requests it refuses
     // alongside onwards' own (`onwards_rejections_total`).
@@ -2777,6 +2834,7 @@ pub async fn build_router(
 
         // Get handle for the endpoint closure
         let endpoint_handle = get_or_install_prometheus_handle();
+        let batch_sla_metrics = state.batch_sla_metrics.clone();
 
         // Add metrics endpoint that combines both axum-prometheus and GenAI metrics
         router = router
@@ -2796,6 +2854,7 @@ pub async fn build_router(
 
                     // Combine both
                     axum_metrics.push_str(&String::from_utf8_lossy(&gen_ai_buffer));
+                    axum_metrics.push_str(&batch_sla_metrics.load().render());
                     axum_metrics
                 }),
             )
@@ -3074,6 +3133,7 @@ impl BackgroundShutdownTokens {
 }
 
 pub struct BackgroundServices {
+    pub batch_sla_metrics: Arc<arc_swap::ArcSwap<metrics::batch_sla::Snapshot>>,
     request_manager: Arc<fusillade_arsenal::PostgresRequestManager<DbPools>>,
     /// The onwards-instance daemon id registered in the `daemons` table
     /// for realtime / inline-loop attribution. The graceful-shutdown
@@ -3657,6 +3717,8 @@ pub(crate) struct BackgroundServicesInput {
     pub metrics_recorder: Option<GenAiMetrics>,
     /// Shared ZDR keystore (built once by the caller). `None` = disabled.
     pub keystore: Option<crate::keystore::Keystore>,
+    /// This process's internal-credential signing key, for health probes.
+    pub internal_credentials: auth::internal_credential::InternalCredentials,
 }
 
 async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Result<BackgroundServices> {
@@ -3670,6 +3732,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         shutdown_token,
         metrics_recorder,
         keystore,
+        internal_credentials,
     } = input;
 
     // Most background work stops as soon as HTTP draining begins. The
@@ -3798,7 +3861,8 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
     // Leader election lock ID: 0x44574354_50524F42 (DWCT_PROB in hex for "dwctl probes")
     const LEADER_LOCK_ID: i64 = 0x4457_4354_5052_4F42_i64;
 
-    let probe_scheduler = probes::ProbeScheduler::new(dyn_pools.clone(), config.clone()).with_listener_pool(direct_pools.clone());
+    let probe_scheduler =
+        probes::ProbeScheduler::new(dyn_pools.clone(), config.clone(), internal_credentials).with_listener_pool(direct_pools.clone());
 
     // Caller owns `request_manager` / `step_manager` construction —
     // see the function-level doc. `fusillade_pools` is only sampled by the
@@ -4092,6 +4156,19 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         .connect_with(pools.main.direct.write().connect_options().as_ref().clone())
         .await?;
 
+    let batch_sla_metrics = Arc::new(arc_swap::ArcSwap::from_pointee(metrics::batch_sla::Snapshot::default()));
+    if config.enable_metrics && config.background_services.batch_sla_metrics.enabled {
+        let snapshot = batch_sla_metrics.clone();
+        let main = db_pools.clone();
+        let manager = request_manager.clone();
+        let direct = pools.fusillade.direct.clone();
+        let collector_config = config.background_services.batch_sla_metrics.clone();
+        let shutdown = shutdown_token.clone();
+        background_tasks.spawn("batch-sla-metrics", async move {
+            metrics::batch_sla::run(main, manager, direct, collector_config, snapshot, shutdown).await
+        });
+    }
+
     // Start pool metrics sampler if metrics are enabled
     if config.enable_metrics {
         let mut labeled = vec![
@@ -4306,6 +4383,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
     let (background_tasks, task_names) = background_tasks.into_parts();
 
     Ok(BackgroundServices {
+        batch_sla_metrics,
         request_manager,
         task_runner,
         is_leader,
@@ -4448,7 +4526,10 @@ impl Application {
             .background_services
             .batch_daemon
             .to_fusillade_config_with_limits(Some(model_capacity_limits.clone()));
-        let retention_maintenance_config = config.background_services.batch_daemon.to_fusillade_retention_maintenance_config();
+        let retention_maintenance_config = config
+            .background_services
+            .batch_daemon
+            .to_fusillade_retention_maintenance_config(config.batches.files.max_expiry_seconds);
 
         if let Some(value) = config.background_services.batch_daemon.template_generation_writes_enabled {
             tracing::warn!(
@@ -4456,6 +4537,26 @@ impl Application {
                 "batch_daemon.template_generation_writes_enabled is deprecated and ignored: \
                  the weekly generation-2 template store is the only write path. Remove the key."
             );
+        }
+        for (key, value) in [
+            (
+                "template_retention_days",
+                config.background_services.batch_daemon.template_retention_days,
+            ),
+            (
+                "batch_archive_retention_days",
+                config.background_services.batch_daemon.batch_archive_retention_days,
+            ),
+        ] {
+            if let Some(days) = value {
+                tracing::warn!(
+                    key,
+                    days,
+                    max_expiry_seconds = config.batches.files.max_expiry_seconds,
+                    "batch_daemon.{key} is deprecated and ignored: content retention follows \
+                     batches.files.max_expiry_seconds. Remove the key."
+                );
+            }
         }
         let mut request_manager = fusillade_arsenal::PostgresRequestManager::new(
             fusillade_pools.clone(),
@@ -4480,9 +4581,14 @@ impl Application {
                 .batchless_retention_bounds_seconds(),
         )
         .with_download_buffer_size(config.batches.files.download_buffer_size)
+        .with_file_expiry(fusillade_arsenal::FileExpiry {
+            default: chrono::Duration::seconds(config.batches.files.default_expiry_seconds),
+            max: chrono::Duration::seconds(config.batches.files.max_expiry_seconds),
+        })
         .with_batch_insert_strategy(fusillade_arsenal::BatchInsertStrategy::Batched {
             batch_size: config.batches.files.batch_insert_size,
-        });
+        })
+        .with_retry_age_limit(retention_maintenance_config.retry_age_limit());
         if pools.fusillade.is_split()
             && let config::ComponentDb::Schema {
                 name,
@@ -4525,14 +4631,30 @@ impl Application {
 
         // Pre-dispatch preparation for daemon-claimed requests. MUST be installed
         // before `setup_background_services` spawns the daemon, or claims can be
-        // dispatched without it. Two steps that cannot happen on the loopback:
+        // dispatched without it. Steps that cannot happen on the loopback:
+        //   - Authentication: requests dispatch as their key id; the loopback
+        //     needs a credential for that id, minted per attempt.
         //   - ZDR decrypt: the stored body is `dwzdr1:` ciphertext, so it is not
         //     parseable JSON and every edge layer chokes before it could act.
         //   (`dw-img://` image tokens are deliberately NOT signed here: the loopback's
         //   image-normaliser layer signs them below the prompt-cache layer, so the
         //   cache keys on the stable token rather than a per-attempt signed URL.)
+        // One signing key per process for internal credentials: everything
+        // that mints tokens for this process's `/ai` and the layer that
+        // verifies them share it.
+        let internal_credentials = auth::internal_credential::InternalCredentials::generate();
+
         {
+            // Requests store the key id they run as; each dispatch attempt
+            // gets a credential for it that outlives one processing attempt.
+            let dispatch_auth = crate::inference::engine::dispatch_processor::DispatchAuth::new(
+                internal_credentials.clone(),
+                std::time::Duration::from_millis(config.background_services.batch_daemon.processing_timeout_ms),
+                &config.host,
+                config.port,
+            );
             let dispatch_processor = crate::inference::engine::dispatch_processor::DispatchProcessor::new()
+                .with_auth(dispatch_auth)
                 .with_keystore(keystore.clone())
                 .with_streamable_endpoints(config.background_services.batch_daemon.streamable_endpoints.clone());
             if let Err(e) = postgres_daemon.set_processor(Arc::new(dispatch_processor)) {
@@ -4550,6 +4672,7 @@ impl Application {
             shutdown_token: shutdown_token.clone(),
             metrics_recorder: metrics_recorder.clone(),
             keystore: keystore.clone(),
+            internal_credentials: internal_credentials.clone(),
         })
         .await?;
 
@@ -4636,15 +4759,7 @@ impl Application {
         let inference_middleware_state = crate::inference::middleware::InferenceMiddlewareState {
             request_manager: bg_services.request_manager.clone(),
             daemon_id: crate::inference::store::OnwardsDaemonId(onwards_daemon_id),
-            loopback_base_url: {
-                let addr = config.bind_address();
-                let addr = if addr.starts_with("0.0.0.0:") {
-                    addr.replacen("0.0.0.0", "127.0.0.1", 1)
-                } else {
-                    addr
-                };
-                format!("http://{addr}/ai")
-            },
+            loopback_base_url: loopback_base_url(&config.host, config.port),
             dwctl_pool: sqlx_pool_router::DynPools::new(db_pools.clone()),
             response_store: response_store.clone(),
             image_normalizer: image_normalizer.clone(),
@@ -4725,6 +4840,7 @@ impl Application {
             .db(db_pools.clone())
             .config(shared_config.clone())
             .is_leader(bg_services.is_leader)
+            .batch_sla_metrics(bg_services.batch_sla_metrics.clone())
             .request_manager(bg_services.request_manager.clone())
             .task_runner(bg_services.task_runner.clone())
             .maybe_outlet_db(outlet_pools.clone())
@@ -4735,6 +4851,7 @@ impl Application {
             .response_store(response_store)
             .image_normalizer(image_normalizer)
             .onwards_targets(bg_services.onwards_targets.clone())
+            .internal_credentials(internal_credentials)
             .build();
 
         if let Some(config_path) = config_path {
@@ -4888,6 +5005,38 @@ impl Application {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod loopback_tests {
+    use super::loopback_base_url;
+
+    /// The loopback must stay inside this process: its host is the loopback
+    /// address or the very address this process listens on, and its port is
+    /// the listen port. Never another host, so never a load balancer.
+    #[test]
+    fn loopback_base_url_targets_this_process() {
+        let cases = [
+            ("0.0.0.0", "http://127.0.0.1:3001/ai"),
+            ("127.0.0.1", "http://127.0.0.1:3001/ai"),
+            ("::", "http://[::1]:3001/ai"),
+            ("[::]", "http://[::1]:3001/ai"),
+            ("::1", "http://[::1]:3001/ai"),
+            ("10.1.2.3", "http://10.1.2.3:3001/ai"),
+            ("localhost", "http://localhost:3001/ai"),
+        ];
+        for (bind_host, expected) in cases {
+            let url = loopback_base_url(bind_host, 3001);
+            assert_eq!(url, expected, "bind host {bind_host}");
+            let parsed = url::Url::parse(&url).unwrap();
+            let host = parsed.host_str().unwrap().trim_start_matches('[').trim_end_matches(']');
+            let local = host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+                || host == "localhost"
+                || host == bind_host.trim_start_matches('[').trim_end_matches(']');
+            assert!(local, "{url} must target this process (bind host {bind_host})");
+            assert_eq!(parsed.port(), Some(3001));
+        }
     }
 }
 
