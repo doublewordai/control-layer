@@ -1,5 +1,17 @@
 # Changelog
 
+## [16.1.0](https://github.com/doublewordai/control-layer/compare/v16.0.1...v16.1.0) (2026-11-04)
+
+
+### Features
+
+* **onwards:** per-model exceptions to the parameter reject list ([#2163](https://github.com/doublewordai/control-layer/issues/2163)) ([268e458](https://github.com/doublewordai/control-layer/commit/268e45819505bdfbf2ccd601c97138f52d6ae148))
+
+
+### Continuous Integration
+
+* label release images with their commit and stop dispatching deploys ([#2166](https://github.com/doublewordai/control-layer/issues/2166)) ([6297c27](https://github.com/doublewordai/control-layer/commit/6297c276303a9885d62ec954662425e342eb9cdc))
+
 ## [16.0.1](https://github.com/doublewordai/control-layer/compare/v16.0.0...v16.0.1) (2026-11-04)
 
 
