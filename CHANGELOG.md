@@ -1,5 +1,13 @@
 # Changelog
 
+## [16.0.1](https://github.com/doublewordai/control-layer/compare/v16.0.0...v16.0.1) (2026-11-04)
+
+
+### Bug Fixes
+
+* **auth:** restore system and platform-manager key permissions ([#2164](https://github.com/doublewordai/control-layer/issues/2164)) ([24f0651](https://github.com/doublewordai/control-layer/commit/24f065149f555cd6aa058124a8666dcf2137c261))
+* **dwctl:** map Messages structured output and replayed thinking ([#2121](https://github.com/doublewordai/control-layer/issues/2121)) ([20400a2](https://github.com/doublewordai/control-layer/commit/20400a2593b0b37124b73aac1dd4397a4421b385))
+
 ## [16.0.0](https://github.com/doublewordai/control-layer/compare/v15.11.0...v16.0.0) (2026-11-03)
 
 
