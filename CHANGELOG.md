@@ -1,5 +1,17 @@
 # Changelog
 
+## [16.4.0](https://github.com/doublewordai/control-layer/compare/v16.3.0...v16.4.0) (2026-11-05)
+
+
+### Features
+
+* **api-keys:** record when each API key was last used (DW-979) ([#2162](https://github.com/doublewordai/control-layer/issues/2162)) ([ff3b78c](https://github.com/doublewordai/control-layer/commit/ff3b78c78f06d2d7f77d0f13f46d47a6d4173cf1))
+
+
+### Bug Fixes
+
+* **api-keys:** attribute keys the system key creates for another user to that user ([#2171](https://github.com/doublewordai/control-layer/issues/2171)) ([46cb7a9](https://github.com/doublewordai/control-layer/commit/46cb7a9a2ca466992c1ad19e777782127d1980ca))
+
 ## [16.3.0](https://github.com/doublewordai/control-layer/compare/v16.2.0...v16.3.0) (2026-11-05)
 
 
