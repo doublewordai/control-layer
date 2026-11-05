@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id FROM api_keys WHERE user_id = $1 AND purpose = 'batch' AND hidden = true",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "a662445c4b50fbd9204f8d6c53b4f28f0d8129cf16e13544b00fbe1c9e0bd66f"
+}

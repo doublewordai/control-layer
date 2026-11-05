@@ -240,6 +240,7 @@ pub struct RequestTemplateInput {
     pub path: String,
     pub body: String,
     pub model: String,
+    /// Ignored and not stored: requests are dispatched by API key id.
     pub api_key: String,
 }
 
@@ -465,9 +466,7 @@ pub struct BatchInput {
     pub created_by: Option<String>,
     /// API key UUID that created this batch, for per-member attribution within orgs
     pub api_key_id: Option<Uuid>,
-    /// API key secret for batch request execution. Used instead of the key in
-    /// request_templates so that billing is attributed to the batch creator,
-    /// not the file uploader.
+    /// Ignored and not stored: requests are dispatched by API key id.
     pub api_key: Option<String>,
     /// Total number of request templates in the file. Set at creation time so
     /// the batch immediately reflects the expected request count before
@@ -501,7 +500,7 @@ pub struct BackgroundBatchInput {
     pub created_by: Option<String>,
     /// API key UUID that created this batch.
     pub api_key_id: Option<Uuid>,
-    /// API key secret for batch request execution.
+    /// Ignored and not stored: requests are dispatched by API key id.
     pub api_key: Option<String>,
     /// Expected number of request templates in the source file.
     pub total_requests: Option<i64>,

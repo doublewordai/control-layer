@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO api_keys (user_id, created_by, name, secret_hash, secret_prefix, purpose) VALUES ($1, $1, 'org key', sha256(convert_to('sk-test-org-key', 'UTF8')), left('sk-test-org-key', 8), 'inference')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6b567e64a8d4f4ba81d85888b6aefe8133dc267e67c5518e9986f5b95099b04a"
+}

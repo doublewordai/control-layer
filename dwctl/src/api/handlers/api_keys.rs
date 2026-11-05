@@ -251,6 +251,9 @@ pub async fn create_user_api_key<P: PoolProvider>(
     let mut repo = ApiKeys::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
 
     let mut api_key = repo.create(&db_request).await?;
+    let secret = api_key.secret.take().ok_or_else(|| Error::Internal {
+        operation: "create API key: no secret returned".to_string(),
+    })?;
 
     // Issued to a DIFFERENT user (manager issuing to a member, or the system
     // key creating on a user's behalf): the holder gets a one-off "reveal" of
@@ -259,7 +262,7 @@ pub async fn create_user_api_key<P: PoolProvider>(
     // deliberate (e.g. to stash it in a vault) and does not count as the
     // reveal.
     if let Some(keystore) = keystore {
-        let pending_secret = wrap_pending_secret(keystore, &api_key.secret)?;
+        let pending_secret = wrap_pending_secret(keystore, &secret)?;
         repo.mark_secret_reveal_pending(api_key.id, &pending_secret).await?;
         api_key.secret_revealed_at = None;
     }
@@ -288,7 +291,7 @@ pub async fn create_user_api_key<P: PoolProvider>(
 
     Ok((
         StatusCode::CREATED,
-        Json(ApiKeyResponse::from(api_key).with_spend_state(spend_states.get(&key_id))),
+        Json(ApiKeyResponse::new(api_key, secret).with_spend_state(spend_states.get(&key_id))),
     ))
 }
 
@@ -923,7 +926,7 @@ pub async fn reveal_user_api_key<P: PoolProvider>(
     })?;
     // Unwrap before committing: if the secret can't be recovered the
     // transaction rolls back and the reveal stays available.
-    let (secret, source) = resolve_reveal(state.keystore.as_ref(), &pending).ok_or_else(|| {
+    let secret = resolve_reveal(state.keystore.as_ref(), &pending).ok_or_else(|| {
         tracing::error!(api_key_id = %api_key.id, "pending API key secret could not be recovered for reveal");
         Error::Internal {
             operation: "recover pending API key secret".to_string(),
@@ -935,10 +938,9 @@ pub async fn reveal_user_api_key<P: PoolProvider>(
         revealed_by = %current_user.id,
         api_key_id = %api_key.id,
         key_owner = %api_key.user_id,
-        source = source.as_str(),
         "api key secret revealed (one-off)"
     );
-    metrics::counter!("dwctl_api_key_reveals_total", "source" => source.as_str()).increment(1);
+    metrics::counter!("dwctl_api_key_reveals_total").increment(1);
 
     Ok(Json(ApiKeySecretResponse { key: secret }))
 }
@@ -1382,11 +1384,12 @@ mod tests {
             .add_header(&auth[1].0, &auth[1].1)
             .await
             .json();
-        let child_secret: String = sqlx::query_scalar("SELECT secret FROM api_keys WHERE parent_api_key_id = $1")
+        let child_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE parent_api_key_id = $1")
             .bind(created.id)
             .fetch_one(&pool)
             .await
             .unwrap();
+        let child_secret = crate::test::utils::bearer_for_key(&pool, child_id).await;
 
         // Under the cap: both scope keys are in the paid pool.
         let targets = crate::sync::onwards_config::load_targets_from_db(&pool, &[], false).await.unwrap();
@@ -2426,12 +2429,7 @@ mod tests {
             .expect("rotation keeps a wrapped secret");
         assert_eq!(keystore.unwrap(&rewrapped).unwrap(), rotated.key.as_bytes());
 
-        // Bob's reveal returns the CURRENT (post-rotation) secret, from the
-        // wrap rather than the plaintext column.
-        sqlx::query!("UPDATE api_keys SET secret = 'sk-not-the-secret' WHERE id = $1", issued.id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        // Bob's reveal returns the CURRENT (post-rotation) secret, from the wrap.
         let response = app
             .post(&format!("/admin/api/v1/users/{}/api-keys/{}/reveal", org.id, issued.id))
             .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
@@ -2522,9 +2520,9 @@ mod tests {
 
     #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn test_reveal_of_key_pending_before_wrapping_uses_plaintext(pool: PgPool) {
-        // A key left pending by an earlier release has no wrap; its reveal
-        // falls back to the plaintext column until the reconcile wraps it.
+    async fn test_reveal_of_key_pending_without_a_wrap_fails_and_stays_available(pool: PgPool) {
+        // Only a key's hash is stored, so a pending key with no wrap cannot
+        // be revealed. The failed reveal is not consumed.
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let bob = create_test_user(&pool, Role::StandardUser).await;
         let response = app
@@ -2550,9 +2548,14 @@ mod tests {
             .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
             .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
             .await;
-        response.assert_status_ok();
-        let revealed: ApiKeySecretResponse = response.json();
-        assert_eq!(revealed.key, key.key);
+        response.assert_status(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!response.text().contains(&key.key));
+        let revealed_at: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar!("SELECT secret_revealed_at FROM api_keys WHERE id = $1", key.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(revealed_at, None, "a failed reveal stays available");
     }
 
     #[dwctl_test_macros::test]
@@ -2759,8 +2762,7 @@ mod tests {
         // Only the reserved system credential may create keys for another
         // account (platform automation, e.g. provisioning test users).
         let system_secret = crate::crypto::generate_api_key();
-        sqlx::query("UPDATE api_keys SET secret = $1, secret_hash = $2, secret_prefix = $3, purpose = 'platform' WHERE id = $4")
-            .bind(&system_secret)
+        sqlx::query("UPDATE api_keys SET secret_hash = $1, secret_prefix = $2, purpose = 'platform' WHERE id = $3")
             .bind(&crate::crypto::hash_api_key(&system_secret)[..])
             .bind(crate::crypto::api_key_prefix(&system_secret))
             .bind(uuid::Uuid::nil())
@@ -3119,14 +3121,14 @@ mod tests {
         assert_ne!(rotated.key, key.key);
         assert!(rotated.key.starts_with("sk-"));
 
-        // The stored secret is the new value (the old one is dead for new
+        // The stored hash is the new secret's (the old one is dead for new
         // requests as soon as onwards syncs).
-        let stored: String = sqlx::query_scalar("SELECT secret FROM api_keys WHERE id = $1")
+        let stored: Vec<u8> = sqlx::query_scalar("SELECT secret_hash FROM api_keys WHERE id = $1")
             .bind(key.id)
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(stored, rotated.key);
+        assert_eq!(stored, crate::crypto::hash_api_key(&rotated.key));
 
         // Cap, attribution, and id are untouched.
         let response = app

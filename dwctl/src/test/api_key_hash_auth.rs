@@ -1,29 +1,17 @@
-//! API keys authenticate by `secret_hash`, not by the plaintext `secret`
-//! column (DW-1005).
+//! API keys authenticate by `secret_hash`, the only form of a key's secret
+//! that is stored (DW-1005).
 //!
-//! Each test replaces a key's stored plaintext with a decoy while leaving its
-//! hash alone, then shows the real key still authenticates on the AI proxy
-//! (dwctl middleware and onwards) and admin API paths, and the decoy does not.
+//! Each test shows a key authenticates on the AI proxy (dwctl middleware and
+//! onwards) and admin API paths, and an unknown key does not.
 
 use crate::api::models::users::Role;
-use crate::crypto::hash_api_key;
 use crate::test::utils::{add_auth_headers, create_test_admin_user, create_test_api_key_for_user, create_test_config, create_test_user};
 use axum_test::TestServer;
 use sqlx::PgPool;
 
-/// Overwrite the plaintext `secret` of the key whose hash matches `secret`,
-/// leaving `secret_hash` untouched. Returns the decoy now stored as `secret`.
-async fn replace_stored_plaintext(pool: &PgPool, secret: &str) -> String {
-    let decoy = format!("sk-decoy-{}", uuid::Uuid::new_v4().simple());
-    let updated = sqlx::query("UPDATE api_keys SET secret = $1 WHERE secret_hash = $2")
-        .bind(&decoy)
-        .bind(&hash_api_key(secret)[..])
-        .execute(pool)
-        .await
-        .unwrap()
-        .rows_affected();
-    assert_eq!(updated, 1, "the key's row is found by its hash");
-    decoy
+/// A well-formed key that no row holds the hash of.
+fn unknown_key() -> String {
+    crate::crypto::generate_api_key()
 }
 
 async fn create_key(pool: &PgPool, user_id: uuid::Uuid, purpose: &str) -> String {
@@ -36,7 +24,7 @@ async fn create_key(pool: &PgPool, user_id: uuid::Uuid, purpose: &str) -> String
             .await
             .unwrap();
     }
-    key.secret
+    key.secret.unwrap()
 }
 
 #[dwctl_test_macros::test]
@@ -94,7 +82,7 @@ async fn ai_proxy_authenticates_by_hash(pool: PgPool) {
         .assert_status_success();
 
     let api_key = create_key(&pool, user.id, "realtime").await;
-    let decoy = replace_stored_plaintext(&pool, &api_key).await;
+    let decoy = unknown_key();
     bg.sync_onwards_config(&pool).await.unwrap();
     bg.sync_key_policy(&pool).await.unwrap();
 
@@ -122,11 +110,11 @@ async fn ai_proxy_authenticates_by_hash(pool: PgPool) {
         .await;
     assert_eq!(models.status_code(), 200, "{}", models.text());
 
-    // The plaintext now in the `secret` column is not a valid key.
+    // A key whose hash no row holds is refused.
     let refused = chat(decoy).await;
     assert!(
         refused.status_code().is_client_error(),
-        "decoy plaintext must not authenticate: {}",
+        "unknown key must not authenticate: {}",
         refused.status_code()
     );
 }
@@ -136,7 +124,7 @@ async fn admin_api_authenticates_platform_key_by_hash(pool: PgPool) {
     let (server, _bg) = crate::test::utils::create_test_app(pool.clone(), false).await;
     let user = create_test_user(&pool, Role::StandardUser).await;
     let api_key = create_key(&pool, user.id, "platform").await;
-    let decoy = replace_stored_plaintext(&pool, &api_key).await;
+    let decoy = unknown_key();
 
     let me = server
         .get("/admin/api/v1/users/current")

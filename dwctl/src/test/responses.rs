@@ -505,7 +505,7 @@ async fn complete_response_treats_active_retained_graph_as_idempotent(pool: PgPo
         &format!("resp_{request_id}"),
         r#"{"must_not":"overwrite"}"#,
         200,
-        synthetic_context(request_id, &key.secret),
+        synthetic_context(request_id, &key.secret()),
     )
     .await
     .expect("an active retained response is an idempotent terminal write");
@@ -534,7 +534,7 @@ async fn complete_response_fails_closed_for_erased_identity_without_synthesis(po
         &format!("resp_{request_id}"),
         r#"{"must_not":"survive"}"#,
         200,
-        synthetic_context(request_id, &key.secret),
+        synthetic_context(request_id, &key.secret()),
     )
     .await
     .expect_err("an erased identity must terminate without synthesis");
@@ -587,7 +587,7 @@ async fn complete_response_rechecks_a_fence_created_after_the_initial_miss(pool:
         .await
         .unwrap();
     let task_pool = pool.clone();
-    let key_secret = key.secret;
+    let key_secret = key.secret.unwrap();
     let mut completion = tokio::spawn(async move {
         crate::inference::store::complete_response_idempotent(
             &manager,
@@ -667,7 +667,7 @@ async fn complete_response_does_not_ignore_an_unproven_synthetic_create_error(po
         &format!("resp_{request_id}"),
         r#"{"must_not":"survive"}"#,
         200,
-        synthetic_context(request_id, &key.secret),
+        synthetic_context(request_id, &key.secret()),
     )
     .await
     .expect_err("a failed create without a concurrent winner must be returned");
@@ -782,7 +782,7 @@ async fn previous_response_id_of_another_users_response_is_rejected(pool: PgPool
     let id = poll_completed_row(&pool, uuid::Uuid::nil()).await;
     let other_user = create_test_user(&pool, Role::StandardUser).await;
     let other_api_key = format!("sk-foreign-chain-{}", uuid::Uuid::new_v4());
-    sqlx::query("INSERT INTO api_keys (id, name, secret, secret_hash, secret_prefix, purpose, user_id, created_by) VALUES ($1, $2, $3, sha256(convert_to($3, 'UTF8')), left($3, 8), 'realtime', $4, $4)")
+    sqlx::query("INSERT INTO api_keys (id, name, secret_hash, secret_prefix, purpose, user_id, created_by) VALUES ($1, $2, sha256(convert_to($3, 'UTF8')), left($3, 8), 'realtime', $4, $4)")
         .bind(uuid::Uuid::new_v4())
         .bind("Foreign chain test key")
         .bind(&other_api_key)
@@ -937,7 +937,7 @@ async fn read_retained_response_preserves_public_id_and_owner(pool: PgPool) {
     assert_eq!(before_json["id"], response_id);
     let other_user = create_test_user(&pool, Role::StandardUser).await;
     let other_api_key = format!("sk-retained-owner-{}", uuid::Uuid::new_v4());
-    sqlx::query("INSERT INTO api_keys (id, name, secret, secret_hash, secret_prefix, purpose, user_id, created_by) VALUES ($1, $2, $3, sha256(convert_to($3, 'UTF8')), left($3, 8), 'realtime', $4, $4)")
+    sqlx::query("INSERT INTO api_keys (id, name, secret_hash, secret_prefix, purpose, user_id, created_by) VALUES ($1, $2, sha256(convert_to($3, 'UTF8')), left($3, 8), 'realtime', $4, $4)")
         .bind(uuid::Uuid::new_v4())
         .bind("Retained response ownership test key")
         .bind(&other_api_key)
@@ -1058,7 +1058,7 @@ async fn test_delete_response_removes_fusillade_row(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .unwrap();
-    let owner_id: uuid::Uuid = sqlx::query_scalar("SELECT user_id FROM api_keys WHERE secret = $1")
+    let owner_id: uuid::Uuid = sqlx::query_scalar("SELECT user_id FROM api_keys WHERE secret_hash = sha256(convert_to($1, 'UTF8'))")
         .bind(&api_key)
         .fetch_one(&pool)
         .await
@@ -1141,7 +1141,7 @@ async fn test_delete_response_404_for_unknown_id(pool: PgPool) {
 async fn enable_zdr_for_key(pool: &PgPool, bg: &crate::BackgroundServices, api_key: &str) {
     sqlx::query(
         "UPDATE users SET zero_data_retention = true \
-         WHERE id = (SELECT user_id FROM api_keys WHERE secret = $1)",
+         WHERE id = (SELECT user_id FROM api_keys WHERE secret_hash = sha256(convert_to($1, 'UTF8')))",
     )
     .bind(api_key)
     .execute(pool)

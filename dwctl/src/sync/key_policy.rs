@@ -738,7 +738,7 @@ mod tests {
         use rust_decimal::Decimal;
 
         let user = create_test_user(&pool, Role::StandardUser).await;
-        let key = create_test_api_key_for_user(&pool, user.id).await.secret;
+        let key = create_test_api_key_for_user(&pool, user.id).await.secret.unwrap();
         let model = deploy(&pool, user.id, "priced-model").await;
         add_tariff(&pool, model, None, 1, 3).await;
         let query = |model: &'static str| PriceQuery {
@@ -767,7 +767,7 @@ mod tests {
             .await
             .unwrap();
         let deal = create_test_user(&pool, Role::StandardUser).await;
-        let deal_key = create_test_api_key_for_user(&pool, deal.id).await.secret;
+        let deal_key = create_test_api_key_for_user(&pool, deal.id).await.secret.unwrap();
         add_tariff(&pool, model, Some(deal.id), 2, 6).await;
         let later = deploy(&pool, user.id, "later-model").await;
         add_tariff(&pool, later, None, 5, 15).await;

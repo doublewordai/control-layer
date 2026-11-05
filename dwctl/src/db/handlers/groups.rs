@@ -1171,7 +1171,7 @@ mod tests {
             .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
             .await
             .expect("Failed to get keys for deployment");
-        assert!(keys_for_deployment.iter().any(|k| k.secret == api_key.secret));
+        assert!(keys_for_deployment.iter().any(|k| k.id == api_key.id));
 
         // Remove user from group (this should CASCADE delete user_groups and api_key_deployments)
         group_repo
@@ -1203,7 +1203,7 @@ mod tests {
             .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
             .await
             .expect("Failed to get keys for deployment");
-        assert!(!keys_for_deployment.iter().any(|k| k.secret == api_key.secret));
+        assert!(!keys_for_deployment.iter().any(|k| k.id == api_key.id));
     }
 
     #[dwctl_test_macros::test]

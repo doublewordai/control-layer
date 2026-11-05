@@ -349,7 +349,8 @@ async fn zdr_sentinel_async_batch_failure_does_not_log_payload(pool: PgPool) {
             .get_or_create_hidden_key(user.id, ApiKeyPurpose::Batch, user.id)
             .await
             .expect("batch api key");
-        keys.legacy_dispatch_secret(id).await.expect("batch api key secret")
+        drop(conn);
+        crate::test::utils::bearer_for_key(&pool, id).await
     };
 
     // Mock upstream: 400 with a body that echoes the prompt sentinel — exactly the

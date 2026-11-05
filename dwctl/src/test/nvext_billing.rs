@@ -97,7 +97,7 @@ impl Fixture {
         let mut keys = Vec::new();
         for purpose in ["realtime", "batch"] {
             let key = format!("sk-{}", Uuid::new_v4());
-            sqlx::query("INSERT INTO api_keys (name,secret,secret_hash,secret_prefix,user_id,created_by,purpose) VALUES ($3,$1,sha256(convert_to($1, 'UTF8')),left($1, 8),$2,$2,$3)")
+            sqlx::query("INSERT INTO api_keys (name,secret_hash,secret_prefix,user_id,created_by,purpose) VALUES ($3,sha256(convert_to($1, 'UTF8')),left($1, 8),$2,$2,$3)")
                 .bind(&key)
                 .bind(user.id)
                 .bind(purpose)

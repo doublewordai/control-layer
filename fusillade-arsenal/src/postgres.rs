@@ -352,7 +352,6 @@ struct NewBatchRecord {
     created_by: Option<String>,
     expires_at: Option<DateTime<Utc>>,
     api_key_id: Option<Uuid>,
-    api_key: Option<String>,
     total_requests: i64,
 }
 
@@ -363,7 +362,6 @@ struct NewPendingRequest {
     endpoint: String,
     method: String,
     path: String,
-    api_key: String,
     api_key_id: Option<Uuid>,
     created_by: String,
     service_tier: &'static str,
@@ -384,7 +382,6 @@ struct ClaimedRequestRow {
     path: String,
     body: String,
     model: String,
-    api_key: String,
     api_key_id: Option<Uuid>,
     batch_expires_at: Option<DateTime<Utc>>,
     batch_id_str: String,
@@ -875,9 +872,9 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             r#"
             INSERT INTO batches (
                 file_id, endpoint, service_tier, completion_window, metadata,
-                created_by, expires_at, api_key_id, api_key, total_requests
+                created_by, expires_at, api_key_id, total_requests
             )
-            VALUES ($1, $2, $3, $4, $5, COALESCE($6, ''), $7, $8, NULLIF(TRIM($9), ''), $10)
+            VALUES ($1, $2, $3, $4, $5, COALESCE($6, ''), $7, $8, $9)
             RETURNING id, created_at
             "#,
             *input.file_id as Uuid,
@@ -888,7 +885,6 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             input.created_by,
             input.expires_at,
             input.api_key_id,
-            input.api_key,
             input.total_requests,
         )
         .fetch_one(&mut *tx)
@@ -971,7 +967,6 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             endpoint: input.endpoint,
             method: input.method,
             path: input.path,
-            api_key: input.api_key,
             api_key_id,
             created_by: input.created_by,
             service_tier: "flex",
@@ -995,7 +990,6 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             endpoint: input.endpoint,
             method: input.method,
             path: input.path,
-            api_key: input.api_key,
             api_key_id,
             created_by: input.created_by,
             service_tier: "background",
@@ -1028,7 +1022,6 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 path: &input.path,
                 body: stored_body.as_ref(),
                 model: &input.model,
-                api_key: &input.api_key,
                 api_key_id: input.api_key_id,
                 metadata: input.metadata.as_ref(),
             },
@@ -1165,7 +1158,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                     .entry("created_at".to_string())
                     .or_insert_with(|| row.batch_created_at.clone());
                 // The key the request is dispatched as, for a processor that
-                // authenticates by key id rather than with the stored key.
+                // authenticates by key id (no key secret is stored).
                 // Only the database supplies it: anything already under the
                 // reserved name is dropped, so caller metadata can never name
                 // the key a request runs as.
@@ -1205,7 +1198,8 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                         path: row.path,
                         body: row.body,
                         model: row.model,
-                        api_key: row.api_key,
+                        // Dispatched by key id: no key is stored to hand over.
+                        api_key: String::new(),
                         created_by: row.batch_created_by,
                         batch_metadata,
                     },
@@ -2893,7 +2887,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                       r.batch_id,
                       r.template_id as "template_id!", r.retry_attempt,
                       t.custom_id, t.endpoint as "endpoint!", t.method as "method!", t.path as "path!",
-                      t.body as "body!", t.model as "model!", t.api_key as "api_key!",
+                      t.body as "body!", t.model as "model!",
                       t.api_key_id,
                       tc.effective_expires_at as "batch_expires_at?",
                       ''::TEXT as "batch_id_str!",
@@ -3232,7 +3226,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                       r.batch_id,
                       r.template_id as "template_id!", r.retry_attempt,
                       t.custom_id, t.endpoint as "endpoint!", t.method as "method!", t.path as "path!",
-                      t.body as "body!", t.model as "model!", COALESCE(b.api_key, t.api_key) as "api_key!",
+                      t.body as "body!", t.model as "model!",
                       COALESCE(b.api_key_id, t.api_key_id) as "api_key_id",
                       NULL::TIMESTAMPTZ as "batch_expires_at?",
                       COALESCE(b.id::TEXT, '') as "batch_id_str!",
@@ -3904,7 +3898,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             SELECT
                 r.id as "id!", r.batch_id as "batch_id!", r.template_id as "template_id?", r.state as "state!",
                 t.custom_id as "custom_id?", t.endpoint as "endpoint?", t.method as "method?",
-                t.path as "path?", t.body as "body?", t.model as "model?", t.api_key as "api_key?",
+                t.path as "path?", t.body as "body?", t.model as "model?",
                 r.retry_attempt as "retry_attempt!", r.not_before, r.daemon_id, r.claimed_at, r.started_at,
                 r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,
                 b.expires_at as batch_expires_at, r.routed_model
@@ -3954,7 +3948,6 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 row.path,
                 row.body,
                 row.model,
-                row.api_key,
             ) {
                 (
                     Some(template_id),
@@ -3963,7 +3956,6 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                     Some(path),
                     Some(body),
                     Some(model),
-                    Some(api_key),
                 ) => RequestData {
                     id: request_id,
                     batch_id: Some(BatchId(row.batch_id)),
@@ -3974,7 +3966,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                     path,
                     body,
                     model,
-                    api_key,
+                    api_key: String::new(),
                     created_by: String::new(),
                     batch_metadata: std::collections::HashMap::new(),
                 },
@@ -4985,7 +4977,6 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             created_by: input.created_by,
             expires_at: Some(expires_at),
             api_key_id: input.api_key_id,
-            api_key: input.api_key,
             total_requests: input.total_requests.unwrap_or(0),
         })
         .await
@@ -5014,7 +5005,6 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             created_by: input.created_by,
             expires_at: None,
             api_key_id: input.api_key_id,
-            api_key: input.api_key,
             total_requests: input.total_requests.unwrap_or(0),
         })
         .await
@@ -6461,7 +6451,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             SELECT
                 r.id as "id!", r.batch_id as "batch_id!", r.template_id as "template_id?", r.state as "state!",
                 t.custom_id as "custom_id?", t.endpoint as "endpoint?", t.method as "method?",
-                t.path as "path?", t.body as "body?", t.model as "model?", t.api_key as "api_key?",
+                t.path as "path?", t.body as "body?", t.model as "model?",
                 r.retry_attempt as "retry_attempt!", r.not_before, r.daemon_id, r.claimed_at, r.started_at,
                 r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,
                 b.expires_at as batch_expires_at, r.routed_model
@@ -6514,7 +6504,6 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 row.path,
                 row.body,
                 row.model,
-                row.api_key,
             ) {
                 (
                     Some(template_id),
@@ -6523,7 +6512,6 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                     Some(path),
                     Some(body),
                     Some(model),
-                    Some(api_key),
                 ) => RequestData {
                     id: request_id,
                     batch_id: Some(BatchId(row.batch_id)),
@@ -6534,7 +6522,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                     path,
                     body,
                     model,
-                    api_key,
+                    api_key: String::new(),
                     created_by: String::new(),
                     batch_metadata: std::collections::HashMap::new(),
                 },
@@ -6761,7 +6749,6 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 path: &input.path,
                 body: stored_body.as_ref(),
                 model: &input.model,
-                api_key: &input.api_key,
                 api_key_id: None,
                 metadata: None,
             },
@@ -7121,7 +7108,6 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             let bodies: Vec<&str> = stored_bodies.iter().map(AsRef::as_ref).collect();
             let body_sizes: Vec<i64> = stored_bodies.iter().map(|b| b.len() as i64).collect();
             let models: Vec<&str> = to_insert.iter().map(|r| r.model.as_str()).collect();
-            let api_keys: Vec<&str> = to_insert.iter().map(|r| r.api_key.as_str()).collect();
             let created_bys: Vec<&str> = to_insert.iter().map(|r| r.created_by.as_str()).collect();
             let insert_response_bodies: Vec<&str> =
                 to_insert.iter().map(|r| r.response_body.as_str()).collect();
@@ -7146,16 +7132,15 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 WITH inserted AS (
                     INSERT INTO request_templates_g2 (
                         created_on, id, file_id, custom_id, endpoint, method,
-                        path, body, model, api_key, body_byte_size
+                        path, body, model, body_byte_size
                     )
                     SELECT (transaction_timestamp() AT TIME ZONE 'UTC')::date,
                            id, NULL, NULL, endpoint, method, path, body, model,
-                           api_key, body_byte_size
+                           body_byte_size
                     FROM UNNEST(
                         $1::uuid[], $2::text[], $3::text[], $4::text[],
-                        $5::text[], $6::text[], $7::text[], $8::bigint[]
-                    ) AS t(id, endpoint, method, path, body, model, api_key,
-                           body_byte_size)
+                        $5::text[], $6::text[], $7::bigint[]
+                    ) AS t(id, endpoint, method, path, body, model, body_byte_size)
                     RETURNING id, created_on
                 )
                 INSERT INTO request_template_routes (template_id, week_start)
@@ -7168,7 +7153,6 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             .bind(&paths)
             .bind(&bodies)
             .bind(&models)
-            .bind(&api_keys)
             .bind(&body_sizes)
             .execute(&mut *tx)
             .await
@@ -7542,7 +7526,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                       r.batch_id,
                       r.template_id as "template_id!", r.retry_attempt,
                       t.custom_id, t.endpoint as "endpoint!", t.method as "method!", t.path as "path!",
-                      t.body as "body!", t.model as "model!", COALESCE(b.api_key, t.api_key) as "api_key!",
+                      t.body as "body!", t.model as "model!",
                       COALESCE(b.api_key_id, t.api_key_id) as "api_key_id",
                       tc.effective_expires_at as "batch_expires_at?",
                       b.id::TEXT as "batch_id_str!",
@@ -8049,7 +8033,6 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             .collect();
         let bodies: Vec<&str> = stored_bodies.iter().map(AsRef::as_ref).collect();
         let models: Vec<&str> = templates.iter().map(|(t, _)| t.model.as_str()).collect();
-        let api_keys: Vec<&str> = templates.iter().map(|(t, _)| t.api_key.as_str()).collect();
         let line_numbers: Vec<i32> = templates.iter().map(|(_, line)| *line).collect();
         let body_byte_sizes: Vec<i64> = stored_bodies.iter().map(|b| b.len() as i64).collect();
 
@@ -8058,15 +8041,15 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             WITH inserted AS (
                 INSERT INTO request_templates_g2 (
                     created_on, file_id, custom_id, endpoint, method, path,
-                    body, model, api_key, line_number, body_byte_size
+                    body, model, line_number, body_byte_size
                 )
                 SELECT (transaction_timestamp() AT TIME ZONE 'UTC')::date,
                        $1, custom_id, endpoint, method, path, body, model,
-                       api_key, line_number, body_byte_size
+                       line_number, body_byte_size
                 FROM UNNEST(
                     $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
-                    $7::text[], $8::text[], $9::int[], $10::bigint[]
-                ) AS t(custom_id, endpoint, method, path, body, model, api_key,
+                    $7::text[], $8::int[], $9::bigint[]
+                ) AS t(custom_id, endpoint, method, path, body, model,
                        line_number, body_byte_size)
                 RETURNING id, created_on
             )
@@ -8081,7 +8064,6 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         .bind(&paths as &[&str])
         .bind(&bodies as &[&str])
         .bind(&models as &[&str])
-        .bind(&api_keys as &[&str])
         .bind(&line_numbers as &[i32])
         .bind(&body_byte_sizes as &[i64])
         .execute(&mut **tx)
@@ -8123,7 +8105,6 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                        path AS "path!",
                        body AS "body!",
                        model AS "model!",
-                       api_key AS "api_key!",
                        line_number AS "line_number!"
                 FROM request_templates_all
                 WHERE file_id = $1 AND ($2 = -1 OR line_number > $2)
@@ -8167,7 +8148,8 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                             path: row.path,
                             body: row.body,
                             model: row.model,
-                            api_key: row.api_key,
+                            // No key is stored with a template.
+                            api_key: String::new(),
                         };
                         if tx
                             .send(Ok(FileContentItem::Template(template)))
@@ -10347,8 +10329,9 @@ mod tests {
             .map(|id| id.parse().unwrap())
     }
 
-    /// Batchless requests record the key id they run as next to the stored
-    /// key, which the previous release still reads, and a claim reports both.
+    /// Batchless requests record the key id they run as and no key: the
+    /// template's key column takes its empty default, a claim reports the id
+    /// and hands over no key.
     #[sqlx::test]
     async fn batchless_requests_record_their_key_id(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
@@ -10406,11 +10389,11 @@ mod tests {
             .into_iter()
             .map(|(id, key, key_id)| (id, (key, key_id)))
             .collect();
-        assert_eq!(stored[&by_id], ("flex-secret".to_string(), Some(flex_key)));
-        assert_eq!(stored[&legacy], ("legacy-secret".to_string(), None));
+        assert_eq!(stored[&by_id], (String::new(), Some(flex_key)));
+        assert_eq!(stored[&legacy], (String::new(), None));
         assert_eq!(
             stored[&background_id],
-            ("background-secret".to_string(), Some(background_key))
+            (String::new(), Some(background_key))
         );
 
         mark_models_live_for_test(&manager, ["key-id-model"]).await;
@@ -10424,8 +10407,8 @@ mod tests {
             .map(|r| (r.data.id, (r.data.api_key.clone(), key_id_of(r))))
             .collect();
         assert_eq!(claimed.len(), 2);
-        assert_eq!(claimed[&by_id], ("flex-secret".to_string(), Some(flex_key)));
-        assert_eq!(claimed[&legacy], ("legacy-secret".to_string(), None));
+        assert_eq!(claimed[&by_id], (String::new(), Some(flex_key)));
+        assert_eq!(claimed[&legacy], (String::new(), None));
 
         let background = manager
             .claim_background_batchless_requests(1, daemon_id, &capacity, &HashMap::new())
@@ -10433,12 +10416,12 @@ mod tests {
             .unwrap();
         assert_eq!(background.len(), 1);
         assert_eq!(background[0].data.id, background_id);
-        assert_eq!(background[0].data.api_key, "background-secret");
+        assert_eq!(background[0].data.api_key, "");
         assert_eq!(key_id_of(&background[0]), Some(background_key));
     }
 
     /// A batch request reports its batch's key id; one whose batch has none
-    /// reports none and keeps its stored key.
+    /// reports none. Neither the batch nor its file stores a key.
     #[sqlx::test]
     async fn batch_requests_report_the_batch_key_id(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
@@ -10477,6 +10460,13 @@ mod tests {
             .await
             .unwrap();
         let legacy = manager.create_batch(batch_input(None, None)).await.unwrap();
+        let stored_batch_keys: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT api_key FROM batches WHERE id = ANY($1)")
+                .bind([*by_id.id, *legacy.id])
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored_batch_keys, vec![None, None]);
 
         let capacity = HashMap::from([("batch-key-model".to_string(), 10)]);
         let claimed = claim_batch_requests_for_test(
@@ -10498,11 +10488,8 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(
-            by_batch[&by_id.id],
-            ("batch-secret".to_string(), Some(batch_key))
-        );
-        assert_eq!(by_batch[&legacy.id], ("uploader-key".to_string(), None));
+        assert_eq!(by_batch[&by_id.id], (String::new(), Some(batch_key)));
+        assert_eq!(by_batch[&legacy.id], (String::new(), None));
     }
 
     /// The key id in a claimed request's metadata comes only from the

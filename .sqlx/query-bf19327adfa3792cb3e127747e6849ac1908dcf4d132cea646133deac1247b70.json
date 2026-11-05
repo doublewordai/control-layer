@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO api_keys (id, name, secret_hash, secret_prefix, purpose, user_id, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7)\n            ON CONFLICT (id) DO UPDATE SET secret_hash = $3, secret_prefix = $4",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Varchar",
+        "Bytea",
+        "Text",
+        "Varchar",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "bf19327adfa3792cb3e127747e6849ac1908dcf4d132cea646133deac1247b70"
+}

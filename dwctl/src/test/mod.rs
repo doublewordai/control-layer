@@ -1091,13 +1091,14 @@ async fn test_e2e_traffic_routing_rules(pool: PgPool) {
     // ===== Scenario 1: Deny batch purpose =====
 
     // Get batch API key (auto-created as hidden key during user setup)
-    let batch_key_secret: String = sqlx::query_scalar!(
-        "SELECT secret FROM api_keys WHERE user_id = $1 AND purpose = 'batch' AND hidden = true",
+    let hidden_key_id = sqlx::query_scalar!(
+        "SELECT id FROM api_keys WHERE user_id = $1 AND purpose = 'batch' AND hidden = true",
         regular_user.id,
     )
     .fetch_one(&pool)
     .await
     .expect("Batch hidden key should exist");
+    let batch_key_secret = crate::test::utils::bearer_for_key(&pool, hidden_key_id).await;
 
     // Add deny rule for batch purpose
     let patch_resp = server
@@ -1177,13 +1178,14 @@ async fn test_e2e_traffic_routing_rules(pool: PgPool) {
         .await;
 
     // Get playground API key (auto-created as hidden key during user setup)
-    let playground_key_secret: String = sqlx::query_scalar!(
-        "SELECT secret FROM api_keys WHERE user_id = $1 AND purpose = 'playground' AND hidden = true",
+    let hidden_key_id = sqlx::query_scalar!(
+        "SELECT id FROM api_keys WHERE user_id = $1 AND purpose = 'playground' AND hidden = true",
         regular_user.id,
     )
     .fetch_one(&pool)
     .await
     .expect("Playground hidden key should exist");
+    let playground_key_secret = crate::test::utils::bearer_for_key(&pool, hidden_key_id).await;
 
     // Add redirect rule on source model (keep existing deny rule, add playground redirect)
     let patch_resp = server
@@ -1262,11 +1264,10 @@ async fn test_database_seeding_behavior(pool: PgPool) {
     let system_api_key_id = Uuid::nil();
     let original_secret = "original_test_secret";
     sqlx::query!(
-        "INSERT INTO api_keys (id, name, secret, secret_hash, secret_prefix, purpose, user_id, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            ON CONFLICT (id) DO UPDATE SET secret = $3, secret_hash = $4, secret_prefix = $5",
+        "INSERT INTO api_keys (id, name, secret_hash, secret_prefix, purpose, user_id, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (id) DO UPDATE SET secret_hash = $3, secret_prefix = $4",
         system_api_key_id,
         "System API Key",
-        original_secret,
         &hash_api_key(original_secret)[..],
         &original_secret[..8],
         "batch",
@@ -1295,23 +1296,19 @@ async fn test_database_seeding_behavior(pool: PgPool) {
             .expect("Should be able to count endpoints");
     assert_eq!(endpoint_count, Some(2), "Should have created 2 endpoints");
 
-    // Verify API key was updated
-    let updated_secret = sqlx::query_scalar!("SELECT secret FROM api_keys WHERE id = $1", system_api_key_id)
-        .fetch_one(&pool)
-        .await
-        .expect("Should be able to get API key secret");
-    assert_ne!(updated_secret, original_secret, "API key secret should have been updated");
-    assert!(updated_secret.len() > 10, "New API key should be a reasonable length");
+    // Verify the API key was given a fresh secret, of which only the hash is stored
     let stored = sqlx::query!("SELECT secret_hash, secret_prefix FROM api_keys WHERE id = $1", system_api_key_id)
         .fetch_one(&pool)
         .await
         .expect("Should be able to get API key hash");
-    assert_eq!(
-        stored.secret_hash.as_deref(),
-        Some(&hash_api_key(&updated_secret)[..]),
-        "Seeded system key must store hash_api_key(secret)"
+    let updated_hash = stored.secret_hash.expect("seeded system key has a hash");
+    assert_ne!(
+        updated_hash,
+        hash_api_key(original_secret),
+        "API key secret should have been updated"
     );
-    assert_eq!(stored.secret_prefix.as_deref(), Some(&updated_secret[..8]));
+    assert_eq!(updated_hash.len(), 32, "Seeded system key must store a SHA-256 hash");
+    assert!(stored.secret_prefix.is_some_and(|prefix| prefix.starts_with("sk-")));
 
     // Verify seeded flag is now true
     let seeded_after_first = sqlx::query_scalar!("SELECT value FROM system_config WHERE key = 'endpoints_seeded'")
@@ -1328,8 +1325,7 @@ async fn test_database_seeding_behavior(pool: PgPool) {
 
     let manual_secret = "manually_set_secret";
     sqlx::query!(
-        "UPDATE api_keys SET secret = $1, secret_hash = $2, secret_prefix = $3 WHERE id = $4",
-        manual_secret,
+        "UPDATE api_keys SET secret_hash = $1, secret_prefix = $2 WHERE id = $3",
         &hash_api_key(manual_secret)[..],
         &manual_secret[..8],
         system_api_key_id
@@ -1350,11 +1346,15 @@ async fn test_database_seeding_behavior(pool: PgPool) {
         .expect("Should be able to get endpoint URL");
     assert_eq!(preserved_url, "http://modified-url:9999", "Manual URL change should be preserved");
 
-    let preserved_secret = sqlx::query_scalar!("SELECT secret FROM api_keys WHERE id = $1", system_api_key_id)
+    let preserved_hash = sqlx::query_scalar!("SELECT secret_hash FROM api_keys WHERE id = $1", system_api_key_id)
         .fetch_one(&pool)
         .await
-        .expect("Should be able to get API key secret");
-    assert_eq!(preserved_secret, manual_secret, "Manual API key change should be preserved");
+        .expect("Should be able to get API key hash");
+    assert_eq!(
+        preserved_hash,
+        Some(hash_api_key(manual_secret).to_vec()),
+        "Manual API key change should be preserved"
+    );
 
     // Verify endpoint count is still correct
     let final_count = sqlx::query_scalar!("SELECT COUNT(*) FROM inference_endpoints WHERE name IN ('test-endpoint-1', 'test-endpoint-2')")
@@ -1956,6 +1956,7 @@ mod openapi_access_control {
         .await
         .expect("create api key")
         .secret
+        .unwrap()
     }
 
     #[dwctl_test_macros::test]

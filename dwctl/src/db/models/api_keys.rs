@@ -103,7 +103,9 @@ pub struct ApiKeyDBResponse {
     pub id: ApiKeyId,
     pub name: String,
     pub description: Option<String>,
-    pub secret: String,
+    /// The plaintext secret, set only on the value `create` returns: only its
+    /// hash is stored, so a key read back from the database has none.
+    pub secret: Option<String>,
     pub purpose: ApiKeyPurpose,
     pub user_id: UserId,
     pub created_by: UserId,
@@ -127,6 +129,14 @@ pub struct ApiKeyDBResponse {
     /// an issued key awaiting its holder's one-off reveal; self-created keys
     /// are born revealed. Rotation never touches this.
     pub secret_revealed_at: Option<DateTime<Utc>>,
+}
+
+#[cfg(test)]
+impl ApiKeyDBResponse {
+    /// The secret of a key just returned by `create`.
+    pub fn secret(&self) -> &str {
+        self.secret.as_deref().expect("only a just-created key carries its secret")
+    }
 }
 
 /// Spend display state for one cap scope (read from `api_key_spend_checkpoints`

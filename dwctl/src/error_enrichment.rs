@@ -772,7 +772,7 @@ mod tests {
 
         let retired = server
             .post("/ai/v1/chat/completions")
-            .add_header("authorization", &format!("Bearer {}", api_key.secret))
+            .add_header("authorization", &format!("Bearer {}", api_key.secret()))
             .json(&serde_json::json!({"model": "retired-model", "messages": []}))
             .await;
         retired.assert_status(StatusCode::GONE);
@@ -785,7 +785,7 @@ mod tests {
 
         let unknown = server
             .post("/ai/v1/chat/completions")
-            .add_header("authorization", &format!("Bearer {}", api_key.secret))
+            .add_header("authorization", &format!("Bearer {}", api_key.secret()))
             .json(&serde_json::json!({"model": "test-model", "messages": []}))
             .await;
         unknown.assert_status(StatusCode::FORBIDDEN);
@@ -853,7 +853,7 @@ mod tests {
         // Make request with API key in Authorization header
         let response = server
             .post("/ai/v1/chat/completions")
-            .add_header("authorization", &format!("Bearer {}", api_key.secret))
+            .add_header("authorization", &format!("Bearer {}", api_key.secret()))
             .json(&serde_json::json!({
                 "model": "test-model",
                 "messages": [{"role": "user", "content": "Hello"}]
@@ -894,7 +894,7 @@ mod tests {
         // Make request with API key in Authorization header, using the model the user has access to
         let response = server
             .post("/ai/v1/chat/completions")
-            .add_header("authorization", &format!("Bearer {}", api_key.secret))
+            .add_header("authorization", &format!("Bearer {}", api_key.secret()))
             .json(&serde_json::json!({
                 "model": "authorized-model",
                 "messages": [{"role": "user", "content": "Hello"}]
@@ -989,7 +989,7 @@ mod tests {
         let request = || {
             server
                 .post("/ai/v1/chat/completions")
-                .add_header("authorization", &format!("Bearer {}", api_key.secret))
+                .add_header("authorization", &format!("Bearer {}", api_key.secret()))
                 .json(&serde_json::json!({
                     "model": "cap-model",
                     "messages": [{"role": "user", "content": "Hello"}]
@@ -1205,7 +1205,7 @@ mod tests {
         // Make request with API key and a model the user has access to
         let response = server
             .post("/ai/v1/chat/completions")
-            .add_header("authorization", &format!("Bearer {}", api_key.secret))
+            .add_header("authorization", &format!("Bearer {}", api_key.secret()))
             .json(&serde_json::json!({
                 "model": "authorized-model",
                 "messages": [{"role": "user", "content": "Hello"}]
@@ -1256,7 +1256,7 @@ mod tests {
                 error_enrichment_middleware,
             ));
         let request = Request::post("/ai/v1/chat/completions")
-            .header("authorization", format!("Bearer {}", api_key.secret))
+            .header("authorization", format!("Bearer {}", api_key.secret()))
             .header("content-type", "application/json")
             .body(Body::from(r#"{"model": "some-model", "messages": []}"#))
             .unwrap();
@@ -1308,7 +1308,7 @@ mod tests {
             .layer(axum::Extension(recorder("gpt-4o")));
         let identity = |model: &'static str| {
             let router = router.clone();
-            let secret = api_key.secret.clone();
+            let secret = api_key.secret().to_string();
             async move {
                 let request = Request::post("/ai/v1/chat/completions")
                     .header("authorization", format!("Bearer {secret}"))
@@ -1467,7 +1467,7 @@ mod tests {
 
         let response = server
             .post("/ai/v1/chat/completions")
-            .add_header("authorization", &format!("Bearer {}", api_key.secret))
+            .add_header("authorization", &format!("Bearer {}", api_key.secret()))
             .json(&serde_json::json!({
                 "model": "blocked-model",
                 "messages": [{"role": "user", "content": "Hello"}]
@@ -1523,7 +1523,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = validate_api_key_model_access(pool.clone(), &hash_api_key(&api_key.secret), "blocked-model").await;
+        let result = validate_api_key_model_access(pool.clone(), &hash_api_key(&api_key.secret()), "blocked-model").await;
         let err = result.expect_err("expected modality-blocked rejection");
         assert!(
             err.to_string().contains("Batch") && err.to_string().contains("blocked-model") && err.to_string().contains("administrator"),
@@ -1533,7 +1533,7 @@ mod tests {
         // Sanity: a model without the deny rule still passes.
         let other_deployment_id = crate::test::utils::create_test_model(&pool, "open-model-name", "open-model", endpoint_id, user.id).await;
         add_deployment_to_group(&pool, other_deployment_id, group.id, user.id).await;
-        validate_api_key_model_access(pool.clone(), &hash_api_key(&api_key.secret), "open-model")
+        validate_api_key_model_access(pool.clone(), &hash_api_key(&api_key.secret()), "open-model")
             .await
             .expect("expected access to be granted on a model without a deny rule");
     }
@@ -1582,7 +1582,7 @@ mod tests {
         .await
         .unwrap();
 
-        validate_api_key_model_access(pool.clone(), &hash_api_key(&api_key.secret), "async-only")
+        validate_api_key_model_access(pool.clone(), &hash_api_key(&api_key.secret()), "async-only")
             .await
             .expect("Flex request must be allowed despite a realtime-only deny rule");
     }
@@ -1627,7 +1627,7 @@ mod tests {
         .await
         .unwrap();
 
-        let err = validate_api_key_model_access(pool.clone(), &hash_api_key(&api_key.secret), "no-batch")
+        let err = validate_api_key_model_access(pool.clone(), &hash_api_key(&api_key.secret()), "no-batch")
             .await
             .expect_err("Flex request must be blocked by a batch deny rule (Flex runs as batch)");
         assert!(
@@ -1657,7 +1657,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = validate_api_key_model_access(pool.clone(), &hash_api_key(&api_key.secret), "any-model").await;
+        let result = validate_api_key_model_access(pool.clone(), &hash_api_key(&api_key.secret()), "any-model").await;
         let err = result.expect_err("expected platform-purpose rejection");
         assert!(
             err.to_string().contains("platform") && err.to_string().contains("inference"),
@@ -1688,7 +1688,7 @@ mod tests {
         // The purpose gate must NOT fire for the system (nil) user. A
         // model-access error is acceptable - we only assert the key was not
         // rejected on purpose grounds.
-        if let Err(msg) = validate_api_key_model_access(pool.clone(), &hash_api_key(&api_key.secret), "any-model").await {
+        if let Err(msg) = validate_api_key_model_access(pool.clone(), &hash_api_key(&api_key.secret()), "any-model").await {
             assert!(
                 !msg.to_string().contains("cannot be used for inference requests"),
                 "system key must be exempt from the purpose gate, got: {msg}"
@@ -1723,7 +1723,7 @@ mod tests {
             .await
             .unwrap();
 
-        let refusal = validate_api_key_model_access(pool.clone(), &hash_api_key(&api_key.secret), "retired-model")
+        let refusal = validate_api_key_model_access(pool.clone(), &hash_api_key(&api_key.secret()), "retired-model")
             .await
             .expect_err("a retired model must be refused");
         assert!(matches!(refusal, ModelAccessRefusal::Retired(message) if message == "The model `retired-model` was shut down."));

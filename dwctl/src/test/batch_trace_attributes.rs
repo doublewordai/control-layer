@@ -64,7 +64,8 @@ async fn batch_request_and_batch_finalized_spans_carry_the_account(pool: PgPool)
             .get_or_create_hidden_key(user.id, ApiKeyPurpose::Batch, user.id)
             .await
             .expect("batch api key");
-        keys.legacy_dispatch_secret(id).await.expect("batch api key secret")
+        drop(conn);
+        crate::test::utils::bearer_for_key(&pool, id).await
     };
 
     let mock_server = wiremock::MockServer::start().await;

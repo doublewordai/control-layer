@@ -204,15 +204,6 @@ pub async fn create_sample_files_for_new_user<P: PoolProvider>(state: &AppState<
 
     let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
 
-    // Get the user's batch API key
-    let mut api_keys_repo = ApiKeys::new(&mut conn);
-    let api_key_id = api_keys_repo
-        .get_or_create_hidden_key(user_id, ApiKeyPurpose::Batch, user_id)
-        .await
-        .map_err(Error::Database)?;
-    // Fusillade still dispatches request templates with a stored key (until DW-1010).
-    let api_key = api_keys_repo.legacy_dispatch_secret(api_key_id).await.map_err(Error::Database)?;
-
     // Get deployments accessible to this user
     let mut deployments_repo = Deployments::new(&mut conn);
     let filter = DeploymentFilter::new(0, i64::MAX)
@@ -228,7 +219,6 @@ pub async fn create_sample_files_for_new_user<P: PoolProvider>(state: &AppState<
     let created_files = sample_files::create_sample_files_for_user(
         state.request_manager.as_ref(),
         user_id,
-        &api_key,
         &endpoint,
         &accessible_deployments,
         &config.sample_files,
@@ -836,6 +826,13 @@ pub async fn cli_callback<P: PoolProvider>(
         .map_err(Error::Database)?
     };
 
+    // Only the create returns a key's secret.
+    let missing_secret = || Error::Internal {
+        operation: "create CLI API key: no secret returned".to_string(),
+    };
+    let inference_secret = inference_key.secret.clone().ok_or_else(missing_secret)?;
+    let platform_secret = platform_key.secret.clone().ok_or_else(missing_secret)?;
+
     // Fetch user info for the response
     let (email, display_name, org_name) = if ctx.org_id.is_some() {
         // Org context: get the individual's info from api_keys.created_by
@@ -894,9 +891,9 @@ pub async fn cli_callback<P: PoolProvider>(
     {
         let mut params = redirect_url.query_pairs_mut();
         params.append_pair("state", &query.state);
-        params.append_pair("inference_key", &inference_key.secret);
+        params.append_pair("inference_key", &inference_secret);
         params.append_pair("inference_key_id", &inference_key.id.to_string());
-        params.append_pair("platform_key", &platform_key.secret);
+        params.append_pair("platform_key", &platform_secret);
         params.append_pair("platform_key_id", &platform_key.id.to_string());
         params.append_pair("user_id", &ctx.target_user_id.to_string());
         params.append_pair("email", &email);
@@ -2590,7 +2587,7 @@ mod tests {
 
         let response = server
             .get("/admin/api/v1/auth/cli-callback?port=12345&state=s")
-            .add_header("authorization", &format!("Bearer {}", key.secret))
+            .add_header("authorization", &format!("Bearer {}", key.secret()))
             .await;
 
         response.assert_status(axum::http::StatusCode::UNAUTHORIZED);

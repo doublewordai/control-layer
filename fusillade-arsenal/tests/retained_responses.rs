@@ -1074,10 +1074,10 @@ async fn bulk_duplicate_conflicting_id_uses_first_record_without_orphans(pool: P
         .await
         .expect("the first occurrence defines a duplicate identity");
 
-    let row: (String, String, String, String, String) = sqlx::query_as(
+    let row: (String, String, String, String) = sqlx::query_as(
         r#"
         SELECT request.response_body, request.model, request.created_by,
-               template.body, template.api_key
+               template.body
         FROM requests request
         JOIN request_templates_all template ON template.id = request.template_id
         WHERE request.id = $1
@@ -1094,7 +1094,6 @@ async fn bulk_duplicate_conflicting_id_uses_first_record_without_orphans(pool: P
             "winner-model".to_owned(),
             "winner-owner".to_owned(),
             r#"{"winner":"request"}"#.to_owned(),
-            "winner-key".to_owned(),
         )
     );
     let templates: i64 = sqlx::query_scalar(

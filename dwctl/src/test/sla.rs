@@ -29,10 +29,7 @@ async fn get_batch_api_key(pool: &PgPool, user_id: Uuid) -> String {
         .get_or_create_hidden_key(user_id, ApiKeyPurpose::Batch, user_id)
         .await
         .expect("Failed to get batch API key");
-    api_keys_repo
-        .legacy_dispatch_secret(id)
-        .await
-        .expect("Failed to get batch API key secret")
+    crate::test::utils::bearer_for_key(pool, id).await
 }
 
 /// Helper to get or create a realtime API key for a user (for actual inference requests)
@@ -43,10 +40,7 @@ async fn get_realtime_api_key(pool: &PgPool, user_id: Uuid) -> String {
         .get_or_create_hidden_key(user_id, ApiKeyPurpose::Realtime, user_id)
         .await
         .expect("Failed to get realtime API key");
-    api_keys_repo
-        .legacy_dispatch_secret(id)
-        .await
-        .expect("Failed to get realtime API key secret")
+    crate::test::utils::bearer_for_key(pool, id).await
 }
 
 /// Test route-at-claim-time escalation when batch is near expiry

@@ -37,13 +37,12 @@ pub trait SampleGenerator: Send + Sync {
     ///
     /// # Arguments
     /// * `model_alias` - The model alias to use in requests
-    /// * `api_key` - The API key for request authentication
     /// * `endpoint` - The batch execution endpoint URL
     /// * `count` - Number of requests to generate
     ///
     /// # Returns
     /// A vector of RequestTemplateInput ready for file creation.
-    fn generate(&self, model_alias: &str, api_key: &str, endpoint: &str, count: usize) -> Vec<RequestTemplateInput>;
+    fn generate(&self, model_alias: &str, endpoint: &str, count: usize) -> Vec<RequestTemplateInput>;
 }
 
 /// Get all registered sample generators.

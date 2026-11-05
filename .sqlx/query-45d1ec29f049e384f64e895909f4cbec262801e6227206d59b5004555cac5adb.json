@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH ins AS (\n                INSERT INTO api_keys (name, description, purpose, user_id, created_by, hidden, secret_hash, secret_prefix)\n                VALUES ($1, $2, $3, $4, $5, true, $6, $7)\n                ON CONFLICT (user_id, created_by, purpose) WHERE hidden = true AND is_deleted = false AND parent_api_key_id IS NULL\n                DO NOTHING\n                RETURNING id\n            )\n            SELECT id FROM ins\n            UNION ALL\n            SELECT id FROM api_keys\n            WHERE user_id = $4 AND created_by = $5 AND purpose = $3\n              AND hidden = true AND is_deleted = false AND parent_api_key_id IS NULL\n            LIMIT 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Text",
+        "Varchar",
+        "Uuid",
+        "Uuid",
+        "Bytea",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "45d1ec29f049e384f64e895909f4cbec262801e6227206d59b5004555cac5adb"
+}

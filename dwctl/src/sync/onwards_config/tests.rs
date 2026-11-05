@@ -66,6 +66,9 @@ fn create_test_target(model_name: &str, alias: &str, endpoint_url: &str) -> Onwa
 const SYSTEM_KEY_SECRET: &str = "sk-placeholder-will-be-updated-on-boot";
 const KEY_A_SECRET: &str = "sk-cache-a";
 const KEY_B_SECRET: &str = "sk-cache-b";
+/// Ids of the `cache_base.sql` keys whose secrets are above.
+const KEY_A_ID: uuid::Uuid = uuid::uuid!("20000000-0000-0000-0000-0000000000a1");
+const KEY_B_ID: uuid::Uuid = uuid::uuid!("20000000-0000-0000-0000-0000000000b1");
 const KEY_BATCH_SECRET: &str = "sk-cache-batch";
 
 fn pool_has_key(pools: &onwards::target::TargetPools, key: &str) -> bool {
@@ -79,12 +82,11 @@ fn pool_has_key_hash(pools: &onwards::target::TargetPools, expected: KeyHash) ->
         .is_some_and(|keys| keys.iter().any(|candidate| candidate == &expected))
 }
 
-/// The stored secret of `parent`'s cap-scope child key, created if missing.
+/// A secret for `parent`'s cap-scope child key, created if missing.
 async fn child_secret(pool: &sqlx::PgPool, parent: uuid::Uuid) -> String {
     let mut conn = pool.acquire().await.unwrap();
-    let mut keys = ApiKeys::new(&mut conn);
-    let id = keys.get_or_create_child_hidden_key(parent).await.unwrap();
-    keys.legacy_dispatch_secret(id).await.unwrap()
+    let id = ApiKeys::new(&mut conn).get_or_create_child_hidden_key(parent).await.unwrap();
+    crate::test::utils::bearer_for_key(pool, id).await
 }
 
 fn pool_keys_len(pools: &onwards::target::TargetPools) -> usize {
@@ -723,7 +725,7 @@ async fn test_allow_negative_balance_toggles_paid_access(pool: sqlx::PgPool) {
             .get_api_keys_for_deployment_with_sufficient_credit("40000000-0000-0000-0000-000000000003".parse().unwrap())
             .await
             .unwrap();
-        assert_eq!(keys.iter().any(|key| key.secret == KEY_A_SECRET), enabled);
+        assert_eq!(keys.iter().any(|key| key.id == KEY_A_ID), enabled);
         let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
         for alias in ["metered-public", "composite-priority"] {
             assert_eq!(
@@ -746,13 +748,13 @@ async fn test_allow_negative_balance_preserves_access_restrictions(pool: sqlx::P
     assert!(pool_has_key(targets.targets.get("metered-public").unwrap().value(), KEY_B_SECRET));
     assert!(!pool_has_key(targets.targets.get("regular-private").unwrap().value(), KEY_B_SECRET));
 
-    sqlx::query("UPDATE api_keys SET spend_limit = 1 WHERE secret = $1")
+    sqlx::query("UPDATE api_keys SET spend_limit = 1 WHERE secret_hash = sha256(convert_to($1, 'UTF8'))")
         .bind(KEY_B_SECRET)
         .execute(&pool)
         .await
         .unwrap();
     sqlx::query(
-        "INSERT INTO api_key_spend_checkpoints (api_key_id, total_spend, window_spend) SELECT id, 1, 1 FROM api_keys WHERE secret = $1",
+        "INSERT INTO api_key_spend_checkpoints (api_key_id, total_spend, window_spend) SELECT id, 1, 1 FROM api_keys WHERE secret_hash = sha256(convert_to($1, 'UTF8'))",
     )
     .bind(KEY_B_SECRET)
     .execute(&pool)
@@ -761,7 +763,7 @@ async fn test_allow_negative_balance_preserves_access_restrictions(pool: sqlx::P
     let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
     assert!(!pool_has_key(targets.targets.get("metered-public").unwrap().value(), KEY_B_SECRET));
 
-    sqlx::query("UPDATE api_keys SET spend_limit = NULL, is_deleted = true WHERE secret = $1")
+    sqlx::query("UPDATE api_keys SET spend_limit = NULL, is_deleted = true WHERE secret_hash = sha256(convert_to($1, 'UTF8'))")
         .bind(KEY_B_SECRET)
         .execute(&pool)
         .await
@@ -769,7 +771,7 @@ async fn test_allow_negative_balance_preserves_access_restrictions(pool: sqlx::P
     let targets = super::load_targets_from_db(&pool, &[], false).await.unwrap();
     assert!(!pool_has_key(targets.targets.get("metered-public").unwrap().value(), KEY_B_SECRET));
 
-    sqlx::query("UPDATE api_keys SET is_deleted = false WHERE secret = $1")
+    sqlx::query("UPDATE api_keys SET is_deleted = false WHERE secret_hash = sha256(convert_to($1, 'UTF8'))")
         .bind(KEY_B_SECRET)
         .execute(&pool)
         .await
@@ -789,7 +791,7 @@ async fn test_allow_negative_balance_preserves_access_restrictions(pool: sqlx::P
 /// sync provides).
 #[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered", "cache_balance_user_a_positive")))]
 async fn test_spend_cap_toggles_scope_access_on_reload(pool: sqlx::PgPool) {
-    let key_a_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE secret = $1")
+    let key_a_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE secret_hash = sha256(convert_to($1, 'UTF8'))")
         .bind(KEY_A_SECRET)
         .fetch_one(&pool)
         .await
@@ -1740,7 +1742,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
 
     // Verify batch API key has access
     // onwards holds keys by hash
-    let batch_key_ct = KeyHash::from(batch_api_key.secret.clone());
+    let batch_key_ct = KeyHash::of(batch_api_key.secret());
     let keys = pool_spec.default_pool().keys().expect("Composite model should have keys");
     let has_batch_key = keys.iter().any(|k| k == &batch_key_ct);
 
@@ -2125,7 +2127,7 @@ async fn affinity_survives_database_sync(pool: sqlx::PgPool) {
 async fn test_deleted_keys_excluded_from_deployment_lookup(pool: sqlx::PgPool) {
     use crate::db::handlers::api_keys::ApiKeys;
 
-    sqlx::query("INSERT INTO api_keys (name, secret, secret_hash, secret_prefix, user_id, created_by, purpose) VALUES ('revoked-system', 'sk-revoked-system', sha256(convert_to('sk-revoked-system', 'UTF8')), left('sk-revoked-system', 8), $1, $1, 'realtime')")
+    sqlx::query("INSERT INTO api_keys (name, secret_hash, secret_prefix, user_id, created_by, purpose) VALUES ('revoked-system', sha256(convert_to('sk-revoked-system', 'UTF8')), left('sk-revoked-system', 8), $1, $1, 'realtime')")
         .bind(uuid::Uuid::nil()).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) SELECT id, 'ALLOW_NEGATIVE_BALANCE', true FROM users")
         .execute(&pool)
@@ -2157,7 +2159,7 @@ async fn test_deleted_keys_excluded_from_deployment_lookup(pool: sqlx::PgPool) {
 async fn organisation_prices_gate_balance_and_capped_root_and_child(pool: sqlx::PgPool) {
     use crate::db::handlers::api_keys::ApiKeys;
     let owner: uuid::Uuid = "00000000-0000-0000-0000-0000000000a1".parse().unwrap();
-    let key_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE secret=$1")
+    let key_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE secret_hash=sha256(convert_to($1,'UTF8'))")
         .bind(KEY_A_SECRET)
         .fetch_one(&pool)
         .await
@@ -2166,7 +2168,7 @@ async fn organisation_prices_gate_balance_and_capped_root_and_child(pool: sqlx::
         let mut db = pool.acquire().await.unwrap();
         let mut keys = ApiKeys::new(&mut db);
         let id = keys.get_or_create_child_hidden_key(key_id).await.unwrap();
-        keys.legacy_dispatch_secret(id).await.unwrap()
+        crate::test::utils::bearer_for_key(&pool, id).await
     };
     // These aliases are generally free: only this customer's deal is paid.
     sqlx::query("INSERT INTO model_tariffs(deployed_model_id,user_id,name,input_price_per_token,output_price_per_token,api_key_purpose) SELECT id,$1,'org-paid',1,1,'realtime' FROM deployed_models WHERE alias IN ('regular-public','composite-priority')")
@@ -2240,7 +2242,7 @@ async fn organisation_prices_gate_balance_and_capped_root_and_child(pool: sqlx::
             .unwrap();
         // This repository method covers balance only; Onwards also applies the
         // spend cap and deleted-owner guard checked above.
-        assert_eq!(keys.iter().any(|key| key.secret == KEY_A_SECRET), phase != 0);
+        assert_eq!(keys.iter().any(|key| key.id == KEY_A_ID), phase != 0);
     }
 }
 
@@ -2266,7 +2268,7 @@ async fn deleted_accounts_lose_free_and_unpriced_targets(pool: sqlx::PgPool) {
 async fn zero_customer_deals_on_paid_models_do_not_bypass_credit_or_caps(pool: sqlx::PgPool) {
     use crate::db::handlers::api_keys::ApiKeys;
     let owner: uuid::Uuid = "00000000-0000-0000-0000-0000000000a1".parse().unwrap();
-    let key_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE secret=$1")
+    let key_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE secret_hash=sha256(convert_to($1,'UTF8'))")
         .bind(KEY_A_SECRET)
         .fetch_one(&pool)
         .await
@@ -2275,7 +2277,7 @@ async fn zero_customer_deals_on_paid_models_do_not_bypass_credit_or_caps(pool: s
         let mut db = pool.acquire().await.unwrap();
         let mut keys = ApiKeys::new(&mut db);
         let id = keys.get_or_create_child_hidden_key(key_id).await.unwrap();
-        keys.legacy_dispatch_secret(id).await.unwrap()
+        crate::test::utils::bearer_for_key(&pool, id).await
     };
     // A generally paid model stays credit-gated even when this customer's
     // all-class or class-specific deal is zero.
@@ -2387,7 +2389,7 @@ async fn zero_customer_deals_on_paid_models_do_not_bypass_credit_or_caps(pool: s
             .unwrap();
         // This repository method covers balance only; Onwards also applies the
         // spend cap and deleted-owner guard checked above.
-        assert_eq!(keys.iter().any(|key| key.secret == KEY_A_SECRET), !matches!(phase, 0 | 5));
+        assert_eq!(keys.iter().any(|key| key.id == KEY_A_ID), !matches!(phase, 0 | 5));
     }
 }
 
@@ -2396,14 +2398,14 @@ async fn generally_free_models_ignore_other_accounts_paid_deals(pool: sqlx::PgPo
     use crate::db::handlers::api_keys::ApiKeys;
     let owner: uuid::Uuid = "00000000-0000-0000-0000-0000000000a1".parse().unwrap();
     // Exhausted keys and zero balances retain access to generally free models.
-    sqlx::query("UPDATE api_keys SET spend_limit=1 WHERE secret IN ($1,$2)")
+    sqlx::query("UPDATE api_keys SET spend_limit=1 WHERE secret_hash IN (sha256(convert_to($1,'UTF8')),sha256(convert_to($2,'UTF8')))")
         .bind(KEY_A_SECRET)
         .bind(KEY_B_SECRET)
         .execute(&pool)
         .await
         .unwrap();
     sqlx::query(
-        "INSERT INTO api_key_spend_checkpoints(api_key_id,total_spend,window_spend) SELECT id,1,1 FROM api_keys WHERE secret IN ($1,$2)",
+        "INSERT INTO api_key_spend_checkpoints(api_key_id,total_spend,window_spend) SELECT id,1,1 FROM api_keys WHERE secret_hash IN (sha256(convert_to($1,'UTF8')),sha256(convert_to($2,'UTF8')))",
     )
     .bind(KEY_A_SECRET)
     .bind(KEY_B_SECRET)
@@ -2452,8 +2454,8 @@ async fn generally_free_models_ignore_other_accounts_paid_deals(pool: sqlx::PgPo
                 .get_api_keys_for_deployment_with_sufficient_credit(model)
                 .await
                 .unwrap();
-            assert_eq!(keys.iter().any(|k| k.secret == KEY_A_SECRET), phase != 2);
-            assert!(keys.iter().any(|k| k.secret == KEY_B_SECRET));
+            assert_eq!(keys.iter().any(|k| k.id == KEY_A_ID), phase != 2);
+            assert!(keys.iter().any(|k| k.id == KEY_B_ID));
         }
     }
 }

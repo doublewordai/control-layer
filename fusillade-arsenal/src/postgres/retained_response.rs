@@ -479,6 +479,9 @@ struct RetainedTemplateSnapshotWire {
     path: String,
     body: String,
     model: String,
+    // No longer stored: written empty for the previous release, which
+    // requires it, and absent once that release is gone.
+    #[serde(default)]
     api_key: String,
     line_number: i32,
     body_byte_size: i64,
@@ -2168,7 +2171,7 @@ fn template_snapshot(row: &PgRow) -> MovementResult<RetainedTemplateSnapshot> {
             path: row.try_get("path")?,
             body: row.try_get("body")?,
             model: row.try_get("model")?,
-            api_key: row.try_get("api_key")?,
+            api_key: String::new(),
             line_number: row.try_get("line_number")?,
             body_byte_size: row.try_get("body_byte_size")?,
             metadata: row.try_get("metadata")?,
@@ -3264,7 +3267,7 @@ pub(crate) async fn insert_completed_realtime(
                     body_byte_size: body.len() as i64,
                     body,
                     model: record.model.clone(),
-                    api_key: record.api_key.clone(),
+                    api_key: String::new(),
                     line_number: 0,
                     metadata: None,
                     created_at: now,
@@ -3627,7 +3630,7 @@ async fn move_graph<P: PoolProvider>(
         r#"
         SELECT template.id, template.file_id, template.custom_id, template.endpoint,
                template.method, template.path, template.body, template.model,
-               template.api_key, template.line_number, template.body_byte_size,
+               template.line_number, template.body_byte_size,
                template.metadata, template.created_at, template.updated_at
         FROM request_template_routes route
         JOIN request_templates_g2 template

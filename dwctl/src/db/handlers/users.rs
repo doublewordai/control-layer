@@ -1652,7 +1652,7 @@ mod tests {
         assert_eq!(audit_record, (key_owner.id, deleted_user.id, true));
         assert!(
             ApiKeys::new(&mut conn)
-                .get_user_id_by_secret(&deleted_user_key.secret)
+                .get_user_id_by_secret(&deleted_user_key.secret())
                 .await
                 .unwrap()
                 .is_none(),

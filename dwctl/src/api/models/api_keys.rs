@@ -167,13 +167,15 @@ pub struct ListApiKeysQuery {
     pub created_by: Option<UserId>,
 }
 
-impl From<ApiKeyDBResponse> for ApiKeyResponse {
-    fn from(db: ApiKeyDBResponse) -> Self {
+impl ApiKeyResponse {
+    /// The create response: the key and its secret, which is never stored
+    /// and so must come from the create itself.
+    pub fn new(db: ApiKeyDBResponse, key: String) -> Self {
         Self {
             id: db.id,
             name: db.name,
             description: db.description,
-            key: db.secret,
+            key,
             purpose: db.purpose,
             user_id: db.user_id,
             created_by: db.created_by,
@@ -190,9 +192,7 @@ impl From<ApiKeyDBResponse> for ApiKeyResponse {
             resets_at: None,
         }
     }
-}
 
-impl ApiKeyResponse {
     /// Attach checkpoint-derived spend display fields.
     pub fn with_spend_state(mut self, state: Option<&crate::db::models::api_keys::ApiKeySpendState>) -> Self {
         if let Some(state) = state {

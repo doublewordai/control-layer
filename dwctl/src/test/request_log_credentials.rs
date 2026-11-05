@@ -86,8 +86,8 @@ async fn api_key_and_cookies_are_not_stored_in_the_request_log(pool: PgPool) {
     });
     let resp = server
         .post("/ai/v1/chat/completions")
-        .add_header("authorization", format!("Bearer {}", api_key.secret))
-        .add_header("x-api-key", &api_key.secret)
+        .add_header("authorization", format!("Bearer {}", api_key.secret()))
+        .add_header("x-api-key", api_key.secret())
         .add_header("cookie", COOKIE_VALUE)
         .json(&body)
         .await;
@@ -96,7 +96,7 @@ async fn api_key_and_cookies_are_not_stored_in_the_request_log(pool: PgPool) {
     let request_row = poll_latest_row(&pool, "outlet.http_requests").await;
     let request_text = request_row.to_string();
     assert!(
-        !request_text.contains(&api_key.secret),
+        !request_text.contains(&api_key.secret()),
         "api key persisted to http_requests: {request_text}"
     );
     assert!(
