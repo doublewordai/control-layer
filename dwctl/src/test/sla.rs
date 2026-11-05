@@ -21,15 +21,13 @@ use uuid::Uuid;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-/// Helper to get a user's batch API key
-async fn get_batch_api_key(pool: &PgPool, user_id: Uuid) -> String {
+/// Helper to get the id of a user's batch API key, which a batch runs as
+async fn get_batch_api_key_id(pool: &PgPool, user_id: Uuid) -> Uuid {
     let mut conn = pool.acquire().await.expect("Failed to acquire connection");
-    let mut api_keys_repo = ApiKeys::new(&mut conn);
-    let id = api_keys_repo
+    ApiKeys::new(&mut conn)
         .get_or_create_hidden_key(user_id, ApiKeyPurpose::Batch, user_id)
         .await
-        .expect("Failed to get batch API key");
-    crate::test::utils::bearer_for_key(pool, id).await
+        .expect("Failed to get batch API key")
 }
 
 /// Helper to get or create a realtime API key for a user (for actual inference requests)
@@ -59,7 +57,7 @@ async fn test_route_at_claim_time_escalation(pool: PgPool) {
     add_user_to_group(&pool, user.id, uuid::Uuid::nil()).await;
 
     // Create batch API key for the user
-    let user_batch_api_key = get_batch_api_key(&pool, user.id).await;
+    let batch_key_id = get_batch_api_key_id(&pool, user.id).await;
     let _user_realtime_api_key = get_realtime_api_key(&pool, user.id).await;
 
     tracing::info!("✅ Created batch and realtime API keys for user");
@@ -118,6 +116,10 @@ async fn test_route_at_claim_time_escalation(pool: PgPool) {
 
     // Step 2: Create config with route-at-claim-time escalation
     let mut config = create_test_config();
+    // The mock stands in for this process's own /ai, the only endpoint a
+    // dispatch credential is minted for.
+    config.host = "127.0.0.1".to_string();
+    config.port = mock_server.address().port();
 
     config.background_services.batch_daemon = DaemonConfig {
         enabled: DaemonEnabled::Always,
@@ -210,7 +212,7 @@ async fn test_route_at_claim_time_escalation(pool: PgPool) {
             template_id,
             Some(file_id),
             "test-model",
-            &user_batch_api_key,
+            "",
             &mock_server.uri(),
             "/v1/chat/completions",
             &serde_json::to_string(
@@ -230,14 +232,15 @@ async fn test_route_at_claim_time_escalation(pool: PgPool) {
 
     sqlx::query(
         r#"
-        INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at)
-        VALUES ($1, $2, $3, '/v1/chat/completions', '24h', $4, NOW())
+        INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at, api_key_id)
+        VALUES ($1, $2, $3, '/v1/chat/completions', '24h', $4, NOW(), $5)
         "#,
     )
     .bind(batch_id)
     .bind(user.id.to_string())
     .bind(file_id)
     .bind(expires_at)
+    .bind(batch_key_id)
     .execute(&pool)
     .await
     .expect("Failed to create batch");
@@ -350,7 +353,7 @@ async fn test_no_escalation_when_not_near_expiry(pool: PgPool) {
     let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
     add_user_to_group(&pool, user.id, uuid::Uuid::nil()).await;
 
-    let user_batch_api_key = get_batch_api_key(&pool, user.id).await;
+    let batch_key_id = get_batch_api_key_id(&pool, user.id).await;
     let _user_realtime_api_key = get_realtime_api_key(&pool, user.id).await;
 
     // Setup mock server
@@ -389,6 +392,10 @@ async fn test_no_escalation_when_not_near_expiry(pool: PgPool) {
 
     // Create config
     let mut config = create_test_config();
+    // The mock stands in for this process's own /ai, the only endpoint a
+    // dispatch credential is minted for.
+    config.host = "127.0.0.1".to_string();
+    config.port = mock_server.address().port();
     config.background_services.batch_daemon = DaemonConfig {
         enabled: DaemonEnabled::Always,
         mode: DaemonMode::Both,
@@ -469,7 +476,7 @@ async fn test_no_escalation_when_not_near_expiry(pool: PgPool) {
             template_id,
             Some(file_id),
             "test-model",
-            &user_batch_api_key,
+            "",
             &mock_server.uri(),
             "/v1/chat/completions",
             &serde_json::to_string(
@@ -486,12 +493,13 @@ async fn test_no_escalation_when_not_near_expiry(pool: PgPool) {
     let expires_at = Utc::now() + Duration::hours(24);
 
     sqlx::query(
-        "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at) VALUES ($1, $2, $3, '/v1/chat/completions', '24h', $4, NOW())",
+        "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at, api_key_id) VALUES ($1, $2, $3, '/v1/chat/completions', '24h', $4, NOW(), $5)",
     )
     .bind(batch_id)
     .bind(user.id.to_string())
     .bind(file_id)
     .bind(expires_at)
+    .bind(batch_key_id)
     .execute(&pool)
     .await
     .expect("Failed to create batch");

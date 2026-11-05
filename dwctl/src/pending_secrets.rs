@@ -4,7 +4,9 @@
 //! secret once. Only the key's hash is stored, so that secret is held in
 //! `api_keys.pending_secret`, wrapped with the keystore's wrap keyring, and
 //! cleared by the reveal. A pending key without a wrap of its current secret
-//! cannot be revealed; its issuer can rotate it, which wraps the new secret.
+//! cannot be revealed (409). With a keystore its issuer can rotate it, which
+//! wraps the new secret for the reveal. Without one, rotation spends the
+//! reveal instead: the new secret goes only to whoever rotated the key.
 //!
 //! [`run`] reconciles the wraps on every instance, at startup and then
 //! periodically: it re-wraps values sealed with a non-current wrap key (so an

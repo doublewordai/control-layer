@@ -810,14 +810,18 @@ pub async fn rotate_user_api_key<P: PoolProvider>(
         })?;
 
     let new_secret = repo.rotate_secret(api_key.id).await?;
-    // Rotation leaves a pending reveal pending, now of the new secret. Without
-    // a keystore it stays unwrapped and the reveal reads the plaintext column.
-    if api_key.secret_revealed_at.is_none()
-        && let Some(keystore) = &state.keystore
-    {
-        let pending_secret = wrap_pending_secret(keystore, &new_secret)?;
-        repo.set_pending_secret(api_key.id, &pending_secret, &hash_api_key(&new_secret))
-            .await?;
+    // Rotation leaves a pending reveal pending, now of the new secret, held
+    // wrapped for the holder. Without a keystore nothing can hold it, so the
+    // reveal is spent: the rotating caller has just received the secret.
+    if api_key.secret_revealed_at.is_none() {
+        match &state.keystore {
+            Some(keystore) => {
+                let pending_secret = wrap_pending_secret(keystore, &new_secret)?;
+                repo.set_pending_secret(api_key.id, &pending_secret, &hash_api_key(&new_secret))
+                    .await?;
+            }
+            None => repo.mark_secret_revealed(api_key.id).await?,
+        }
     }
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
@@ -857,7 +861,7 @@ pub async fn rotate_user_api_key<P: PoolProvider>(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden - insufficient permissions"),
         (status = 404, description = "API key not found (or not held by the current user)"),
-        (status = 409, description = "Conflict - the one-off reveal was already used"),
+        (status = 409, description = "Conflict - the one-off reveal was already used, or its secret is no longer held (rotate the key)"),
         (status = 500, description = "Internal server error"),
     ),
     security(
@@ -927,9 +931,10 @@ pub async fn reveal_user_api_key<P: PoolProvider>(
     // Unwrap before committing: if the secret can't be recovered the
     // transaction rolls back and the reveal stays available.
     let secret = resolve_reveal(state.keystore.as_ref(), &pending).ok_or_else(|| {
-        tracing::error!(api_key_id = %api_key.id, "pending API key secret could not be recovered for reveal");
-        Error::Internal {
-            operation: "recover pending API key secret".to_string(),
+        tracing::warn!(api_key_id = %api_key.id, "pending API key secret could not be recovered for reveal");
+        Error::Conflict {
+            message: "This key's secret is no longer held for reveal. Ask the key's issuer to rotate it.".to_string(),
+            conflicts: None,
         }
     })?;
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
@@ -2548,7 +2553,8 @@ mod tests {
             .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
             .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
             .await;
-        response.assert_status(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        response.assert_status(axum::http::StatusCode::CONFLICT);
+        assert!(response.text().contains("rotate"), "{}", response.text());
         assert!(!response.text().contains(&key.key));
         let revealed_at: Option<chrono::DateTime<chrono::Utc>> =
             sqlx::query_scalar!("SELECT secret_revealed_at FROM api_keys WHERE id = $1", key.id)
@@ -2556,6 +2562,54 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(revealed_at, None, "a failed reveal stays available");
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_rotating_a_pending_key_without_keystore_spends_the_reveal(pool: PgPool) {
+        // Without a keystore the new secret cannot be held for the holder, so
+        // the rotation, whose caller receives it, spends the reveal. A pod of
+        // an earlier release then refuses the reveal instead of handing out
+        // the stored plaintext of the rotated-away secret.
+        let mut config = create_test_config();
+        config.keystore = None;
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let auth = add_auth_headers(&bob);
+        let response = app
+            .post("/admin/api/v1/users/current/api-keys")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .json(&json!({"name": "Pending", "purpose": "realtime"}))
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let key: ApiKeyResponse = response.json();
+        // Left pending by an earlier release, with no wrap.
+        sqlx::query!("UPDATE api_keys SET secret_revealed_at = NULL WHERE id = $1", key.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let response = app
+            .post(&format!("/admin/api/v1/users/current/api-keys/{}/rotate", key.id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        response.assert_status_ok();
+        let row = sqlx::query!("SELECT secret_revealed_at, pending_secret FROM api_keys WHERE id = $1", key.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(row.secret_revealed_at.is_some(), "the rotation spends the reveal");
+        assert_eq!(row.pending_secret, None);
+
+        let response = app
+            .post(&format!("/admin/api/v1/users/current/api-keys/{}/reveal", key.id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        response.assert_status(axum::http::StatusCode::CONFLICT);
+        assert!(response.text().contains("already been used"), "{}", response.text());
     }
 
     #[dwctl_test_macros::test]

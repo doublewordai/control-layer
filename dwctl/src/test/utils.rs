@@ -153,6 +153,10 @@ pub async fn insert_fusillade_template(
     tx.commit().await.expect("commit template insert transaction");
 }
 
+/// Set up the fusillade schema in a `#[sqlx::test]`-provided isolated
+/// test DB and return a small (max 4 conns) fusillade-schema pool. Use
+/// this from integration tests that drive fusillade directly without
+/// constructing the full Application.
 pub async fn setup_fusillade_pool(pool: &PgPool) -> PgPool {
     use sqlx::Executor;
     use sqlx::postgres::PgConnectOptions;

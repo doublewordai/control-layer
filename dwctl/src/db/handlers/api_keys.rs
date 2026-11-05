@@ -697,6 +697,20 @@ impl<'c> ApiKeys<'c> {
         Ok(())
     }
 
+    /// Spend a key's pending reveal without returning anything: stamp
+    /// `secret_revealed_at` and clear any wrap. For a rotation with no
+    /// keystore, whose caller already received the new secret.
+    #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
+    pub async fn mark_secret_revealed(&mut self, id: ApiKeyId) -> Result<()> {
+        sqlx::query!(
+            "UPDATE api_keys SET secret_revealed_at = NOW(), pending_secret = NULL WHERE id = $1 AND secret_revealed_at IS NULL",
+            id
+        )
+        .execute(&mut *self.db)
+        .await?;
+        Ok(())
+    }
+
     /// Store a keystore-wrapped secret for a key whose reveal is still
     /// pending. Guarded on `secret_hash`, so a wrap of a secret that has since
     /// been rotated away is never stored. Returns whether a row was updated

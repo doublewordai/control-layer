@@ -10,7 +10,7 @@
 //! ([`crate::auth::internal_credential`]), accepted only by this process, so
 //! the loopback authenticates as the right key: spend, caps and attribution
 //! apply as for any other request. No key secret is stored, so a row without
-//! a key id dispatches with no credential and the loopback refuses it.
+//! a key id cannot be authenticated and fails here.
 //!
 //! ZDR decrypt - the stored body is a `dwzdr1:` ciphertext envelope keyed per
 //! request. It is not parseable JSON, so no middleware on the loopback can act
@@ -98,6 +98,8 @@ fn unbracket(host: &str) -> &str {
 /// Why a dispatch could not be authenticated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthRefusal {
+    /// The request names no key id (queued before dispatch by key id).
+    NoKeyId,
     /// The request names a key id, but this processor cannot mint credentials.
     NotConfigured,
     /// The request names a key id, but targets another host.
@@ -107,6 +109,7 @@ enum AuthRefusal {
 impl AuthRefusal {
     fn reason(self) -> &'static str {
         match self {
+            Self::NoKeyId => "no_key_id",
             Self::NotConfigured => "not_configured",
             Self::ForeignEndpoint => "foreign_endpoint",
         }
@@ -118,8 +121,8 @@ impl AuthRefusal {
 /// capabilities with [`with_keystore`](Self::with_keystore) /
 /// [`with_streamable_endpoints`](Self::with_streamable_endpoints).
 pub struct DispatchProcessor {
-    /// Mints the credential a request dispatches with. `None` fails every
-    /// request that names a key.
+    /// Mints the credential every request dispatches with. `None` fails
+    /// every request.
     auth: Option<DispatchAuth>,
     /// Encrypted key custody for ZDR flex bodies. `None` disables ZDR
     /// decryption (bodies pass through unchanged).
@@ -169,19 +172,16 @@ impl DispatchProcessor {
     /// Set the credential a request dispatches with: a fresh internal
     /// credential for the key id it names, minted only for this process's own
     /// endpoint. No key secret is stored, so a request without a key id
-    /// (queued before dispatch by key id) dispatches with no credential, which
-    /// this process's `/ai` refuses.
+    /// (queued before dispatch by key id) cannot be authenticated.
     fn authenticate(&self, data: &mut RequestData) -> Result<(), AuthRefusal> {
         // Never dispatch with anything but a credential minted here.
         data.api_key.clear();
         // Always taken out: the id is for this step, not a header to forward.
-        let Some(api_key_id) = data
+        let api_key_id = data
             .batch_metadata
             .remove(API_KEY_ID_METADATA_KEY)
             .and_then(|id| id.parse::<uuid::Uuid>().ok())
-        else {
-            return Ok(());
-        };
+            .ok_or(AuthRefusal::NoKeyId)?;
         let auth = self.auth.as_ref().ok_or(AuthRefusal::NotConfigured)?;
         if !auth.reaches_this_process(&data.endpoint) {
             return Err(AuthRefusal::ForeignEndpoint);
@@ -243,7 +243,7 @@ where
                 refusal.reason(),
                 Error,
                 request_id = %request.data.id.0,
-                "Request names an API key but cannot be authenticated for dispatch; failing request"
+                "Request cannot be authenticated for dispatch; failing request"
             );
             let failed = Self::failed(
                 request,
@@ -450,13 +450,16 @@ mod tests {
         assert!(data.batch_metadata.is_empty(), "the key id is not forwarded");
     }
 
-    /// A request without a key id (queued before dispatch by key id)
-    /// dispatches with no credential: whatever key it carries is dropped.
+    /// A request without a key id (queued before dispatch by key id) is
+    /// refused, and whatever key it carries is dropped.
     #[test]
-    fn a_request_without_a_key_id_has_no_credential() {
+    fn a_request_without_a_key_id_is_refused() {
         let mut data = request("http://127.0.0.1:3001/ai", None);
         data.api_key = "sk-legacy".to_string();
-        authenticating(&InternalCredentials::generate()).authenticate(&mut data).unwrap();
+        assert_eq!(
+            authenticating(&InternalCredentials::generate()).authenticate(&mut data),
+            Err(AuthRefusal::NoKeyId)
+        );
         assert_eq!(data.api_key, "");
     }
 

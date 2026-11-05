@@ -232,7 +232,7 @@ pub struct CreateRealtimeInput {
     pub method: String,
     /// API path (e.g., "/v1/responses").
     pub path: String,
-    /// Ignored and not stored: requests are dispatched by API key id.
+    /// Ignored and not stored.
     pub api_key: String,
     /// User/org ID that owns this request.
     pub created_by: String,
@@ -281,7 +281,7 @@ pub struct PersistCompletedRealtimeInput {
     pub method: String,
     /// API path (e.g., "/v1/responses").
     pub path: String,
-    /// Ignored and not stored: requests are dispatched by API key id.
+    /// Ignored and not stored.
     pub api_key: String,
     /// User/org ID that owns this request.
     pub created_by: String,
