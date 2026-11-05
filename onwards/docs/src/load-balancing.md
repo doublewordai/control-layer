@@ -49,6 +49,16 @@ Status code wildcards:
 
 When fallback triggers, the next provider is selected based on strategy (weighted random resamples from remaining pool; priority uses definition order).
 
+### When every attempt fails
+
+If no attempt succeeds, the caller gets the most useful failure from the whole chain, not just the last one. A capacity refusal tells the caller to retry shortly, so it ranks above any other failure:
+
+1. An upstream `529`, then an upstream `503`. Both reach the caller as `529` `overloaded` with `Retry-After`.
+2. An upstream `429`, or a local rate limit when `on_rate_limit` is set. Both reach the caller as `429`.
+3. Any other failure: a fallback status such as `404` or `500`, a timeout, or a network error.
+
+When two failures rank the same, the later one wins. A chain whose members all failed the same way therefore reports the last failure, as before. For example, if the first member answers `529` and the second answers `404`, the caller gets `529`. If both answer `404`, the caller gets `502`, as before. The `status` label on `onwards_upstream_failed_total{reason="retries_exhausted"}` is the upstream status of the attempt whose failure was returned.
+
 ### First-token failover
 
 A provider can accept a streamed request and then stall: the headers arrive, but no token ever does. `first_token_timeout_ms` bounds that wait, so the request fails over instead of hanging. Set a proxy-wide default with `AppState::with_first_token_timeout`; a pool's own value overrides it.
