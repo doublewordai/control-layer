@@ -1,5 +1,17 @@
 # Changelog
 
+## [16.2.0](https://github.com/doublewordai/control-layer/compare/v16.1.0...v16.2.0) (2026-11-05)
+
+
+### Features
+
+* **analytics:** shadow reference-cache estimate per allowlisted principal ([#2161](https://github.com/doublewordai/control-layer/issues/2161)) ([3aedbcb](https://github.com/doublewordai/control-layer/commit/3aedbcb52f2320adaa1ad3f267f37c2ff2c671cb))
+
+
+### Bug Fixes
+
+* **retention:** stop retried and cancelled batches mis-holding retention weeks (DW-992) ([#2159](https://github.com/doublewordai/control-layer/issues/2159)) ([3de9325](https://github.com/doublewordai/control-layer/commit/3de9325de1a487e71f963b8ac49f07845f88c4e6))
+
 ## [16.1.0](https://github.com/doublewordai/control-layer/compare/v16.0.1...v16.1.0) (2026-11-04)
 
 
