@@ -73,13 +73,14 @@ pub async fn get_response<P: PoolProvider>(
         .and_then(|s| s.strip_prefix("Bearer "))
         .ok_or_else(|| Error::Unauthenticated { message: None })?;
 
-    let owner_id: String =
-        sqlx::query_scalar("SELECT user_id::text FROM public.api_keys WHERE secret_hash = $1 AND is_deleted = false LIMIT 1")
+    let (api_key_id, owner_id): (uuid::Uuid, String) =
+        sqlx::query_as("SELECT id, user_id::text FROM public.api_keys WHERE secret_hash = $1 AND is_deleted = false LIMIT 1")
             .bind(&hash_api_key(api_key)[..])
             .fetch_optional(state.db.write())
             .await
             .map_err(|e| Error::Database(e.into()))?
             .ok_or_else(|| Error::Unauthenticated { message: None })?;
+    state.api_key_usage.record(api_key_id);
 
     // Parse the response ID: `resp_<uuid>` is the fusillade.requests id.
     let uuid_str = response_id.strip_prefix("resp_").unwrap_or(&response_id);
@@ -193,13 +194,14 @@ pub async fn delete_response<P: PoolProvider>(
         .and_then(|s| s.strip_prefix("Bearer "))
         .ok_or_else(|| Error::Unauthenticated { message: None })?;
 
-    let owner_id: String =
-        sqlx::query_scalar("SELECT user_id::text FROM public.api_keys WHERE secret_hash = $1 AND is_deleted = false LIMIT 1")
+    let (api_key_id, owner_id): (uuid::Uuid, String) =
+        sqlx::query_as("SELECT id, user_id::text FROM public.api_keys WHERE secret_hash = $1 AND is_deleted = false LIMIT 1")
             .bind(&hash_api_key(api_key)[..])
             .fetch_optional(state.db.write())
             .await
             .map_err(|e| Error::Database(e.into()))?
             .ok_or_else(|| Error::Unauthenticated { message: None })?;
+    state.api_key_usage.record(api_key_id);
 
     let uuid_str = response_id.strip_prefix("resp_").unwrap_or(&response_id);
     let response_uuid = uuid::Uuid::parse_str(uuid_str).map_err(|_| Error::NotFound {

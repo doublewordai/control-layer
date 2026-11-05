@@ -678,6 +678,9 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
             Some(Ok((mut user, last_login))) => {
                 let method = user.auth_method;
                 user = user.with_auth_method(method);
+                if let Some(api_key_id) = user.api_key_id {
+                    state.api_key_usage.record(api_key_id);
+                }
                 debug!("Authentication successful via API key");
                 trace!("Authenticated user: {}", user.id);
                 populate_org_context(&mut user, parts, &state.db.write()).await;

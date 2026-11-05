@@ -596,6 +596,7 @@ mod tests {
             key_policy_cache: state.key_policy_cache.clone(),
             onwards_targets: None,
             internal_credentials: state.internal_credentials.clone(),
+            api_key_usage: Default::default(),
         };
 
         let request = axum::http::Request::builder()
@@ -716,6 +717,7 @@ mod tests {
             key_policy_cache: state.key_policy_cache.clone(),
             onwards_targets: None,
             internal_credentials: state.internal_credentials.clone(),
+            api_key_usage: Default::default(),
         };
 
         let header_external_user_id = header_user.external_user_id.as_ref().unwrap_or(&header_user.username);
@@ -838,6 +840,7 @@ mod tests {
             key_policy_cache: state.key_policy_cache.clone(),
             onwards_targets: None,
             internal_credentials: state.internal_credentials.clone(),
+            api_key_usage: Default::default(),
         };
 
         // Request with JWT cookie - should be ignored since native auth is disabled
@@ -1028,6 +1031,7 @@ mod tests {
             key_policy_cache: state.key_policy_cache.clone(),
             onwards_targets: None,
             internal_credentials: state.internal_credentials.clone(),
+            api_key_usage: Default::default(),
         };
 
         let external_user_id = user.external_user_id.as_ref().unwrap_or(&user.username);
@@ -1150,6 +1154,7 @@ mod tests {
             key_policy_cache: state.key_policy_cache.clone(),
             onwards_targets: None,
             internal_credentials: state.internal_credentials.clone(),
+            api_key_usage: Default::default(),
         };
 
         let request = axum::http::Request::builder()

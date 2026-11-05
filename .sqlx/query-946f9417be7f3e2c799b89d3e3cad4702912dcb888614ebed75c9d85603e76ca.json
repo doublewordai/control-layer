@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH due AS (\n                SELECT ak.id, seen.last_used\n                FROM UNNEST($1::uuid[], $2::timestamptz[]) AS seen(id, last_used)\n                JOIN api_keys ak ON ak.id = seen.id\n                WHERE ak.last_used IS NULL OR ak.last_used < seen.last_used - make_interval(secs => $3)\n                ORDER BY ak.id\n                FOR UPDATE OF ak\n            )\n            UPDATE api_keys ak\n            SET last_used = due.last_used\n            FROM due\n            WHERE ak.id = due.id\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "TimestamptzArray",
+        "Float8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "946f9417be7f3e2c799b89d3e3cad4702912dcb888614ebed75c9d85603e76ca"
+}

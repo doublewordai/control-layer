@@ -108,6 +108,7 @@ pub struct ApiKeyDBResponse {
     pub user_id: UserId,
     pub created_by: UserId,
     pub created_at: DateTime<Utc>,
+    /// Written by [`crate::api_key_usage`]; see there for its precision.
     pub last_used: Option<DateTime<Utc>>,
     pub model_access: Vec<DeploymentId>,
     /// Optional spending cap (credits) for this key's cap scope. NULL = uncapped.
