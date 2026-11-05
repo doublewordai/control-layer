@@ -64,53 +64,30 @@ class PreviewWorkflowTest < Minitest::Test
     end
   end
 
-  def test_dispatches_share_the_preview_token_and_opaque_deploy_target
-    %w[ci.yaml preview-close.yml release.yml].each do |filename|
+  def test_preview_dispatches_share_the_preview_token_and_opaque_deploy_target
+    %w[ci.yaml preview-close.yml].each do |filename|
       workflow = File.read(File.join(ROOT, ".github", "workflows", filename))
 
       assert_includes workflow, "owner: '${{ secrets.DEPLOY_TARGET_OWNER }}'"
       assert_includes workflow, "repo: '${{ secrets.DEPLOY_TARGET_REPO }}'"
+      assert_includes workflow, "github-token: ${{ secrets.PREVIEW_DISPATCH_TOKEN }}"
       refute_includes workflow, "PREVIEW_DISPATCH_OWNER"
       refute_includes workflow, "PREVIEW_DISPATCH_REPOSITORY"
       refute_includes workflow, "DEPLOY_PAT"
     end
-
-    # Preview dispatches still use the shared preview token.
-    %w[ci.yaml preview-close.yml].each do |filename|
-      workflow = File.read(File.join(ROOT, ".github", "workflows", filename))
-      assert_includes workflow, "github-token: ${{ secrets.PREVIEW_DISPATCH_TOKEN }}"
-    end
-
-    release_workflow = File.read(File.join(ROOT, ".github", "workflows", "release.yml"))
-    deployment_dispatch = release_workflow[/^  notify-deploy:\n.*?(?=^  \S)/m]
-    refute_nil deployment_dispatch
-    assert_includes deployment_dispatch,
-                    "uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9"
-    refute_includes deployment_dispatch, "uses: actions/github-script@v9"
   end
 
-  def test_release_deploy_dispatch_uses_a_scoped_release_app_token
+  # The deployment side pulls releases from the registry and reads each
+  # image's source commit from its OCI labels, so a release labels its images
+  # and dispatches nothing to the deployment target.
+  def test_release_labels_its_images_and_dispatches_nothing
     release_workflow = File.read(File.join(ROOT, ".github", "workflows", "release.yml"))
-    deployment_dispatch = release_workflow[/^  notify-deploy:\n.*?(?=^  \S)/m]
-    refute_nil deployment_dispatch
 
-    # A short-lived app token, never the long-lived preview token.
-    refute_includes deployment_dispatch, "PREVIEW_DISPATCH_TOKEN"
-    assert_includes deployment_dispatch, "uses: actions/create-github-app-token@"
-    assert_includes deployment_dispatch, "github-token: ${{ steps.dispatch-token.outputs.token }}"
-
-    # Scoped to the deployment repository alone, with only contents: write.
-    assert_includes deployment_dispatch, "owner: ${{ secrets.DEPLOY_TARGET_OWNER }}"
-    assert_includes deployment_dispatch, "repositories: ${{ secrets.DEPLOY_TARGET_REPO }}"
-    assert_includes deployment_dispatch, "permission-contents: write"
-
-    # Fails closed before minting if the target is unset, since an empty
-    # repository list would widen the token to the whole installation.
-    guard = deployment_dispatch.index("Require the deployment target")
-    mint = deployment_dispatch.index("Mint deploy dispatch token")
-    refute_nil guard
-    refute_nil mint
-    assert_operator guard, :<, mint
+    assert_includes release_workflow, "labels: ${{ steps.meta.outputs.labels }}"
+    refute_includes release_workflow, "createDispatchEvent"
+    refute_includes release_workflow, "DEPLOY_TARGET_OWNER"
+    refute_includes release_workflow, "DEPLOY_TARGET_REPO"
+    refute_includes release_workflow, "PREVIEW_DISPATCH_TOKEN"
   end
 
   def test_comment_driven_staging_build_is_removed

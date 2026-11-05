@@ -1,5 +1,61 @@
 # Changelog
 
+## [16.3.0](https://github.com/doublewordai/control-layer/compare/v16.2.0...v16.3.0) (2026-11-05)
+
+
+### Features
+
+* **api-keys:** hold issued keys' pending secrets keystore-wrapped (DW-1011) ([#2153](https://github.com/doublewordai/control-layer/issues/2153)) ([c3ca16c](https://github.com/doublewordai/control-layer/commit/c3ca16c76c48b45bdd5e0d25bfd4733e335fa269))
+
+## [16.2.0](https://github.com/doublewordai/control-layer/compare/v16.1.0...v16.2.0) (2026-11-05)
+
+
+### Features
+
+* **analytics:** shadow reference-cache estimate per allowlisted principal ([#2161](https://github.com/doublewordai/control-layer/issues/2161)) ([3aedbcb](https://github.com/doublewordai/control-layer/commit/3aedbcb52f2320adaa1ad3f267f37c2ff2c671cb))
+
+
+### Bug Fixes
+
+* **retention:** stop retried and cancelled batches mis-holding retention weeks (DW-992) ([#2159](https://github.com/doublewordai/control-layer/issues/2159)) ([3de9325](https://github.com/doublewordai/control-layer/commit/3de9325de1a487e71f963b8ac49f07845f88c4e6))
+
+## [16.1.0](https://github.com/doublewordai/control-layer/compare/v16.0.1...v16.1.0) (2026-11-04)
+
+
+### Features
+
+* **onwards:** per-model exceptions to the parameter reject list ([#2163](https://github.com/doublewordai/control-layer/issues/2163)) ([268e458](https://github.com/doublewordai/control-layer/commit/268e45819505bdfbf2ccd601c97138f52d6ae148))
+
+
+### Continuous Integration
+
+* label release images with their commit and stop dispatching deploys ([#2166](https://github.com/doublewordai/control-layer/issues/2166)) ([6297c27](https://github.com/doublewordai/control-layer/commit/6297c276303a9885d62ec954662425e342eb9cdc))
+
+## [16.0.1](https://github.com/doublewordai/control-layer/compare/v16.0.0...v16.0.1) (2026-11-04)
+
+
+### Bug Fixes
+
+* **auth:** restore system and platform-manager key permissions ([#2164](https://github.com/doublewordai/control-layer/issues/2164)) ([24f0651](https://github.com/doublewordai/control-layer/commit/24f065149f555cd6aa058124a8666dcf2137c261))
+* **dwctl:** map Messages structured output and replayed thinking ([#2121](https://github.com/doublewordai/control-layer/issues/2121)) ([20400a2](https://github.com/doublewordai/control-layer/commit/20400a2593b0b37124b73aac1dd4397a4421b385))
+
+## [16.0.0](https://github.com/doublewordai/control-layer/compare/v15.11.0...v16.0.0) (2026-11-03)
+
+
+### ⚠ BREAKING CHANGES
+
+* **auth:** confine platform privileges to SSO ([#2131](https://github.com/doublewordai/control-layer/issues/2131))
+
+### Features
+
+* **dwctl:** per-process internal credential for calls into /ai (DW-1009) ([#2154](https://github.com/doublewordai/control-layer/issues/2154)) ([33457cb](https://github.com/doublewordai/control-layer/commit/33457cb2bbe41f401cd06e6437a7df836aaf25c4))
+* **fusillade:** dispatch by API key id (DW-1010) ([#2156](https://github.com/doublewordai/control-layer/issues/2156)) ([1284778](https://github.com/doublewordai/control-layer/commit/12847787a11281babd5452ac4377ebf278397960))
+
+
+### Bug Fixes
+
+* **auth:** confine platform privileges to SSO ([#2131](https://github.com/doublewordai/control-layer/issues/2131)) ([bc76dbd](https://github.com/doublewordai/control-layer/commit/bc76dbd5f0f321ef326c668d1c1be28155c9ab1b))
+
 ## [15.11.0](https://github.com/doublewordai/control-layer/compare/v15.10.0...v15.11.0) (2026-11-02)
 
 

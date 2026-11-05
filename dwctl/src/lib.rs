@@ -171,6 +171,7 @@ mod notifications;
 mod openapi;
 pub mod org_overlays;
 mod payment_providers;
+mod pending_secrets;
 pub mod prefix_chain;
 pub mod pricing;
 mod probes;
@@ -179,6 +180,7 @@ pub mod prompt_cache;
 pub mod realtime_inflight;
 pub mod reasoning;
 mod recompute;
+pub mod reference_cache;
 mod request_logging;
 pub mod sample_files;
 pub mod scheduling;
@@ -343,6 +345,11 @@ where
     /// labelled from (see [`crate::inference::rejections`]). `None` labels them
     /// with neither model nor account.
     pub onwards_targets: Option<onwards::target::Targets>,
+    /// This process's signing key for internal credentials (see
+    /// [`auth::internal_credential`]). Whatever mints tokens for this
+    /// process's `/ai` (playground, probes, daemon dispatch) must share it.
+    #[builder(default)]
+    pub internal_credentials: auth::internal_credential::InternalCredentials,
     /// Latest use of each API key, flushed to `api_keys.last_used` by
     /// [`api_key_usage::run_api_key_usage_flusher`].
     #[builder(default)]
@@ -353,6 +360,14 @@ impl<P> AppState<P>
 where
     P: PoolProvider + Clone,
 {
+    /// What internal credentials are verified and resolved against.
+    pub(crate) fn internal_auth_state(&self) -> auth::internal_credential::InternalAuthState {
+        auth::internal_credential::InternalAuthState {
+            credentials: self.internal_credentials.clone(),
+            targets: self.onwards_targets.clone().unwrap_or_default(),
+        }
+    }
+
     pub fn current_config(&self) -> Arc<Config> {
         self.config.snapshot()
     }
@@ -678,8 +693,10 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
         }
     }
 
-    // Update the system API key secret and ensure it has platform purpose
-    // (required for admin API access used by internal services like scouter)
+    // Give the system API key a fresh random secret and platform purpose.
+    // Nothing presents that secret: health probes authenticate as this key
+    // with an internal credential (see `auth::internal_credential`), so the
+    // secret is only written because the column still requires one.
     let system_api_key_id = Uuid::nil();
     let new_secret = crypto::generate_api_key();
     let new_secret_hash = crypto::hash_api_key(&new_secret);
@@ -1664,6 +1681,25 @@ async fn setup_database(
     ))
 }
 
+/// The base URL of this process's own `/ai`, for the calls dwctl makes to
+/// itself (fusillade daemon dispatch).
+///
+/// Those calls can authenticate with internal credentials, which only the
+/// process that minted them accepts, so the URL must reach this process
+/// directly and never a load balancer: it is built from the address this
+/// process listens on, with an unspecified address (`0.0.0.0`, `::`) replaced
+/// by the loopback address.
+pub(crate) fn loopback_base_url(host: &str, port: u16) -> String {
+    use std::net::IpAddr;
+    let host = match host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) if ip.is_unspecified() => "127.0.0.1".to_string(),
+        Ok(IpAddr::V6(ip)) if ip.is_unspecified() => "[::1]".to_string(),
+        Ok(IpAddr::V6(ip)) => format!("[{ip}]"),
+        _ => host.to_string(),
+    };
+    format!("http://{host}:{port}/ai")
+}
+
 /// Build the base CORS layer (methods, headers, max-age, exposed headers) from
 /// configuration. Origin/credential handling differs by mode — see [`apply_cors`].
 fn create_cors_layer(cors: &CorsConfig) -> anyhow::Result<CorsLayer> {
@@ -1872,6 +1908,20 @@ pub async fn build_router(
     let request_logging_enabled = state.outlet_db.is_some() && config.enable_request_logging;
     let analytics_enabled = config.enable_analytics;
 
+    // Shadow reference-cache estimate: one instance shared by the first-token hook (inside
+    // outlet, below) and the analytics handler that records the estimate.
+    let reference_cache = (config.reference_cache.enabled && analytics_writer.is_some()).then(|| {
+        tracing::info!(principals = config.reference_cache.orgs.len(), models = ?config.reference_cache.models, "Reference-cache estimate enabled");
+        Arc::new(crate::reference_cache::ReferenceCache::new(
+            &config.reference_cache,
+            sqlx_pool_router::DynPools::new(state.db.clone()),
+            crate::prompt_cache::TelemetryPolicy::from_config(
+                config.cache.telemetry_blocks.strip_from_prompt,
+                &config.cache.telemetry_blocks.prefixes,
+            ),
+        ))
+    });
+
     let outlet_layer = if request_logging_enabled || analytics_enabled || prefix_chain.is_some() {
         // Store the metrics recorder in state (created earlier in Application::new)
         state.metrics_recorder = metrics_recorder;
@@ -1912,7 +1962,10 @@ pub async fn build_router(
             // parse (the same value request logging stores), via `TokenMetrics::from`.
             // The outlet sits outer to translation, so it captures the foreign
             // response body; `AiResponse` covers each protocol's own shape.
-            let analytics_handler = request_logging::AnalyticsHandler::new(writer, instance_id, config.as_ref().clone());
+            let mut analytics_handler = request_logging::AnalyticsHandler::new(writer, instance_id, config.as_ref().clone());
+            if let Some(cache) = &reference_cache {
+                analytics_handler = analytics_handler.with_reference_cache(cache.clone(), state.internal_auth_state());
+            }
             multi_handler = multi_handler.with(analytics_handler);
         }
 
@@ -1921,6 +1974,7 @@ pub async fn build_router(
                 recorder,
                 instance_id,
                 config.as_ref().clone(),
+                state.internal_auth_state(),
             ));
         }
 
@@ -1930,7 +1984,11 @@ pub async fn build_router(
         // sender to give the handler; without a sender the handler would
         // silently swallow rows.
         if let (Some(rms), Some(sender)) = (inference_middleware_state.as_ref(), requests_writer_sender.clone()) {
-            let fusillade_handler = crate::inference::engine::outlet_handler::FusilladeOutletHandler::new(sender, rms.dwctl_pool.clone());
+            let fusillade_handler = crate::inference::engine::outlet_handler::FusilladeOutletHandler::new(
+                sender,
+                rms.dwctl_pool.clone(),
+                state.internal_auth_state(),
+            );
             multi_handler = multi_handler.with(fusillade_handler);
         }
 
@@ -2627,8 +2685,26 @@ pub async fn build_router(
     // (`x-onwards-response-id` / `x-fusillade-request-id`) are already set.
     // Stream completion sits just inside outlet, so it tracks the body outlet
     // hands to the client and can tell a disconnect from an early end.
+    //
+    // The reference-cache hook sits inside outlet too, so it hashes the request exactly as
+    // outlet captures it for the estimate, and sees the first chunk of the stream outlet
+    // forwards.
     let onwards_router = if let Some(outlet_layer) = outlet_layer.clone() {
+        let onwards_router = match &reference_cache {
+            Some(cache) => onwards_router.layer(middleware::from_fn_with_state(
+                crate::reference_cache::layer::ReferenceLayerState {
+                    cache: cache.clone(),
+                    body_limit: match config.limits.requests.max_body_size {
+                        0 => usize::MAX,
+                        n => usize::try_from(n).unwrap_or(usize::MAX),
+                    },
+                },
+                crate::reference_cache::reference_cache_middleware,
+            )),
+            None => onwards_router,
+        };
         onwards_router
+            .layer(middleware::from_fn(auth::internal_credential::carry_presented_key))
             .layer(middleware::from_fn(request_logging::stream_completion::track_stream_completion))
             .layer(outlet_layer)
     } else {
@@ -2667,6 +2743,15 @@ pub async fn build_router(
     // The root span records a batch request's completion window once the
     // response names a batch key.
     let onwards_router = onwards_router.layer(middleware::from_fn(crate::telemetry::carry_batch_completion_window));
+
+    // Verify internal credentials (`dwi-` bearers minted by this process for
+    // the playground, probes and daemon dispatch) before anything else reads
+    // the request's key, and hand the authenticated key on to every layer
+    // below. Inside the rejection recorder so a refused token is counted.
+    let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
+        state.internal_auth_state(),
+        auth::internal_credential::internal_credential_middleware,
+    ));
 
     // Outermost, so every layer above can count the requests it refuses
     // alongside onwards' own (`onwards_rejections_total`).
@@ -3693,6 +3778,8 @@ pub(crate) struct BackgroundServicesInput {
     pub metrics_recorder: Option<GenAiMetrics>,
     /// Shared ZDR keystore (built once by the caller). `None` = disabled.
     pub keystore: Option<crate::keystore::Keystore>,
+    /// This process's internal-credential signing key, for health probes.
+    pub internal_credentials: auth::internal_credential::InternalCredentials,
 }
 
 async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Result<BackgroundServices> {
@@ -3706,6 +3793,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         shutdown_token,
         metrics_recorder,
         keystore,
+        internal_credentials,
     } = input;
 
     // Most background work stops as soon as HTTP draining begins. The
@@ -3831,10 +3919,23 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         });
     }
 
+    // Wrap the secrets of issued keys awaiting their one-off reveal that have
+    // no keystore wrap yet (issued before it existed, or by a previous-release
+    // pod mid-rollout). Every instance runs it; its writes are idempotent.
+    {
+        let pending_secrets_pool = dyn_pools.clone();
+        let pending_secrets_keystore = keystore.clone();
+        let pending_secrets_shutdown = shutdown_token.clone();
+        background_tasks.spawn("pending-secrets-reconcile", async move {
+            pending_secrets::run(pending_secrets_pool, pending_secrets_keystore, pending_secrets_shutdown).await
+        });
+    }
+
     // Leader election lock ID: 0x44574354_50524F42 (DWCT_PROB in hex for "dwctl probes")
     const LEADER_LOCK_ID: i64 = 0x4457_4354_5052_4F42_i64;
 
-    let probe_scheduler = probes::ProbeScheduler::new(dyn_pools.clone(), config.clone()).with_listener_pool(direct_pools.clone());
+    let probe_scheduler =
+        probes::ProbeScheduler::new(dyn_pools.clone(), config.clone(), internal_credentials).with_listener_pool(direct_pools.clone());
 
     // Caller owns `request_manager` / `step_manager` construction —
     // see the function-level doc. `fusillade_pools` is only sampled by the
@@ -4266,6 +4367,18 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         });
     }
 
+    // Delete expired reference-cache entries. Every replica sweeps; SKIP LOCKED shares
+    // the work, and the table holds only minutes of entries.
+    if config.reference_cache.enabled {
+        let store = crate::reference_cache::ReferenceStore::new(dyn_pools.clone(), config.reference_cache.ttl(), 1);
+        let interval = std::time::Duration::from_secs(config.reference_cache.sweep_interval_secs);
+        let sweep_shutdown = shutdown_token.clone();
+        background_tasks.spawn("reference-cache-sweep", async move {
+            crate::reference_cache::run_sweeper(store, interval, sweep_shutdown).await;
+            Ok(())
+        });
+    }
+
     // Start analytics batcher if enabled
     let analytics_writer = if config.enable_analytics {
         let (batcher, writer) = request_logging::AnalyticsBatcher::new(dyn_pools.clone(), config.clone(), metrics_recorder);
@@ -4618,14 +4731,30 @@ impl Application {
 
         // Pre-dispatch preparation for daemon-claimed requests. MUST be installed
         // before `setup_background_services` spawns the daemon, or claims can be
-        // dispatched without it. Two steps that cannot happen on the loopback:
+        // dispatched without it. Steps that cannot happen on the loopback:
+        //   - Authentication: requests dispatch as their key id; the loopback
+        //     needs a credential for that id, minted per attempt.
         //   - ZDR decrypt: the stored body is `dwzdr1:` ciphertext, so it is not
         //     parseable JSON and every edge layer chokes before it could act.
         //   (`dw-img://` image tokens are deliberately NOT signed here: the loopback's
         //   image-normaliser layer signs them below the prompt-cache layer, so the
         //   cache keys on the stable token rather than a per-attempt signed URL.)
+        // One signing key per process for internal credentials: everything
+        // that mints tokens for this process's `/ai` and the layer that
+        // verifies them share it.
+        let internal_credentials = auth::internal_credential::InternalCredentials::generate();
+
         {
+            // Requests store the key id they run as; each dispatch attempt
+            // gets a credential for it that outlives one processing attempt.
+            let dispatch_auth = crate::inference::engine::dispatch_processor::DispatchAuth::new(
+                internal_credentials.clone(),
+                std::time::Duration::from_millis(config.background_services.batch_daemon.processing_timeout_ms),
+                &config.host,
+                config.port,
+            );
             let dispatch_processor = crate::inference::engine::dispatch_processor::DispatchProcessor::new()
+                .with_auth(dispatch_auth)
                 .with_keystore(keystore.clone())
                 .with_streamable_endpoints(config.background_services.batch_daemon.streamable_endpoints.clone());
             if let Err(e) = postgres_daemon.set_processor(Arc::new(dispatch_processor)) {
@@ -4643,6 +4772,7 @@ impl Application {
             shutdown_token: shutdown_token.clone(),
             metrics_recorder: metrics_recorder.clone(),
             keystore: keystore.clone(),
+            internal_credentials: internal_credentials.clone(),
         })
         .await?;
 
@@ -4729,15 +4859,7 @@ impl Application {
         let inference_middleware_state = crate::inference::middleware::InferenceMiddlewareState {
             request_manager: bg_services.request_manager.clone(),
             daemon_id: crate::inference::store::OnwardsDaemonId(onwards_daemon_id),
-            loopback_base_url: {
-                let addr = config.bind_address();
-                let addr = if addr.starts_with("0.0.0.0:") {
-                    addr.replacen("0.0.0.0", "127.0.0.1", 1)
-                } else {
-                    addr
-                };
-                format!("http://{addr}/ai")
-            },
+            loopback_base_url: loopback_base_url(&config.host, config.port),
             dwctl_pool: sqlx_pool_router::DynPools::new(db_pools.clone()),
             response_store: response_store.clone(),
             image_normalizer: image_normalizer.clone(),
@@ -4799,6 +4921,15 @@ impl Application {
             .with_batch_inflight_enforce(config.limits.batch_inflight.enforce)
             .with_rejected_params(&config.onwards.rejected_params)
             .map_err(|error| anyhow::anyhow!("onwards.rejected_params: {error}"))?;
+        onwards_app_state = onwards_app_state
+            .with_model_allowed_params(
+                config
+                    .onwards
+                    .model_allowed_params
+                    .iter()
+                    .map(|(model, params)| (model.clone(), params.iter())),
+            )
+            .map_err(|error| anyhow::anyhow!("onwards.model_allowed_params: {error}"))?;
         if config.onwards.first_token_timeout_ms > 0 {
             onwards_app_state =
                 onwards_app_state.with_first_token_timeout(std::time::Duration::from_millis(config.onwards.first_token_timeout_ms));
@@ -4830,6 +4961,7 @@ impl Application {
             .response_store(response_store)
             .image_normalizer(image_normalizer)
             .onwards_targets(bg_services.onwards_targets.clone())
+            .internal_credentials(internal_credentials)
             .api_key_usage(bg_services.api_key_usage.clone())
             .build();
 
@@ -4984,6 +5116,38 @@ impl Application {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod loopback_tests {
+    use super::loopback_base_url;
+
+    /// The loopback must stay inside this process: its host is the loopback
+    /// address or the very address this process listens on, and its port is
+    /// the listen port. Never another host, so never a load balancer.
+    #[test]
+    fn loopback_base_url_targets_this_process() {
+        let cases = [
+            ("0.0.0.0", "http://127.0.0.1:3001/ai"),
+            ("127.0.0.1", "http://127.0.0.1:3001/ai"),
+            ("::", "http://[::1]:3001/ai"),
+            ("[::]", "http://[::1]:3001/ai"),
+            ("::1", "http://[::1]:3001/ai"),
+            ("10.1.2.3", "http://10.1.2.3:3001/ai"),
+            ("localhost", "http://localhost:3001/ai"),
+        ];
+        for (bind_host, expected) in cases {
+            let url = loopback_base_url(bind_host, 3001);
+            assert_eq!(url, expected, "bind host {bind_host}");
+            let parsed = url::Url::parse(&url).unwrap();
+            let host = parsed.host_str().unwrap().trim_start_matches('[').trim_end_matches(']');
+            let local = host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+                || host == "localhost"
+                || host == bind_host.trim_start_matches('[').trim_end_matches(']');
+            assert!(local, "{url} must target this process (bind host {bind_host})");
+            assert_eq!(parsed.port(), Some(3001));
+        }
     }
 }
 

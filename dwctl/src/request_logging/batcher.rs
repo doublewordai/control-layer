@@ -105,6 +105,12 @@ pub struct RawAnalyticsRecord {
     /// (upstream hit passed through as an implicit discount). `None` when the billed read
     /// is zero. See `serializers::extract_cache_read_source`.
     pub cache_read_source: Option<String>,
+    /// Shadow estimate of the prompt tokens an ideal per-principal prefix cache would
+    /// have served (see `crate::reference_cache`). `None` unless the principal is
+    /// allowlisted and the estimate succeeded. Observational, never priced. Defaulted so
+    /// outbox rows written before this field existed still deserialise.
+    #[serde(default)]
+    pub reference_cached_tokens: Option<i64>,
     /// Content-free request parameters (stream, max_tokens, sampling, message and tool
     /// counts). See `serializers::RequestParams`.
     pub request_params: RequestParams,
@@ -853,6 +859,7 @@ where
         let mut user_agent_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
         let mut submitted_at_vec: Vec<Option<DateTime<Utc>>> = Vec::with_capacity(records.len());
         let mut engine_cached_vec: Vec<Option<i64>> = Vec::with_capacity(records.len());
+        let mut reference_cached_vec: Vec<Option<i64>> = Vec::with_capacity(records.len());
         let mut cache_read_source_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
         let mut stream_vec: Vec<Option<bool>> = Vec::with_capacity(records.len());
         let mut max_tokens_vec: Vec<Option<i64>> = Vec::with_capacity(records.len());
@@ -916,6 +923,7 @@ where
             // queue delay (timestamp - submitted_at) survives past this process.
             submitted_at_vec.push(record.raw.batch_created_at);
             engine_cached_vec.push(record.raw.engine_cached_tokens);
+            reference_cached_vec.push(record.raw.reference_cached_tokens);
             cache_read_source_vec.push(record.raw.cache_read_source.clone());
             let p = &record.raw.request_params;
             stream_vec.push(p.stream);
@@ -940,7 +948,7 @@ where
                 total_cost, uncached_cost, served_by, finish_reason, user_agent, submitted_at,
                 engine_cached_tokens, stream, max_tokens, temperature, top_p, n, tool_count, message_count,
                 cache_read_source, requested_serving_class, resolved_serving_class, gateway_span_id,
-                x_request_id
+                x_request_id, reference_cached_tokens
             )
             SELECT * FROM UNNEST(
                 $1::uuid[], $2::bigint[], $3::timestamptz[], $4::text[], $5::text[], $6::text[],
@@ -953,7 +961,7 @@ where
                 $32::numeric[], $33::numeric[], $34::text[], $35::text[], $36::text[],
                 $37::timestamptz[],
                 $38::bigint[], $39::boolean[], $40::bigint[], $41::real[], $42::real[], $43::int[], $44::int[], $45::int[],
-                $46::text[], $47::text[], $48::text[], $49::text[], $50::uuid[]
+                $46::text[], $47::text[], $48::text[], $49::text[], $50::uuid[], $51::bigint[]
             )
             ON CONFLICT DO NOTHING
             RETURNING id, instance_id, correlation_id
@@ -1008,6 +1016,7 @@ where
             &resolved_class_vec as &[Option<String>],
             &gateway_span_ids as &[Option<String>],
             &x_request_ids as &[Option<Uuid>],
+            &reference_cached_vec as &[Option<i64>],
         )
         .fetch_all(&mut **tx)
         .await?;
@@ -1773,6 +1782,7 @@ mod tests {
             finish_reason: None,
             user_agent: None,
             engine_cached_tokens: None,
+            reference_cached_tokens: None,
             cache_read_source: None,
             request_params: RequestParams::default(),
             server_address: "localhost".to_string(),
@@ -1850,6 +1860,7 @@ mod tests {
             finish_reason: None,
             user_agent: None,
             engine_cached_tokens: None,
+            reference_cached_tokens: None,
             cache_read_source: None,
             request_params: RequestParams::default(),
             server_address: "x".to_string(),
@@ -2146,6 +2157,7 @@ mod integration_tests {
             finish_reason: None,
             user_agent: None,
             engine_cached_tokens: None,
+            reference_cached_tokens: None,
             cache_read_source: None,
             request_params: RequestParams::default(),
             server_address: "api.test.com".to_string(),
@@ -2801,7 +2813,7 @@ mod integration_tests {
                 serving_class: "standard",
                 cache_reads: reads,
             };
-            let prices = keys.unit_prices(&secret, &query).unwrap();
+            let prices = keys.unit_prices(&crate::crypto::hash_api_key(&secret), &query).unwrap();
 
             // The serving stack reports `cached` cache hits; the record carries
             // them only where the cache layer reports reads.
@@ -3628,7 +3640,7 @@ mod integration_tests {
         }
         let child = {
             let mut conn = pool.acquire().await.unwrap();
-            ApiKeys::new(&mut conn).get_or_create_child_hidden_key(parent).await.unwrap().1
+            ApiKeys::new(&mut conn).get_or_create_child_hidden_key(parent).await.unwrap()
         };
         let mut realtime = create_raw_record("org-class-cap", Some(parent), 1000, 500);
         realtime.resolved_serving_class = Some("interactive".into());
@@ -3690,8 +3702,7 @@ mod integration_tests {
             .unwrap();
         let child_id = {
             let mut conn = pool.acquire().await.unwrap();
-            let (_, id) = ApiKeys::new(&mut conn).get_or_create_child_hidden_key(parent_id).await.unwrap();
-            id
+            ApiKeys::new(&mut conn).get_or_create_child_hidden_key(parent_id).await.unwrap()
         };
 
         let mut listener = PgListener::connect_with(&pool).await.expect("Failed to create listener");

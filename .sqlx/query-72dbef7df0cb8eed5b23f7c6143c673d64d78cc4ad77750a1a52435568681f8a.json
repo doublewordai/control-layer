@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, pending_secret, secret_hash, secret AS \"secret?\"\n            FROM api_keys\n            WHERE secret_revealed_at IS NULL\n              AND is_deleted = false AND hidden = false AND parent_api_key_id IS NULL\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "pending_secret",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 2,
+        "name": "secret_hash",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 3,
+        "name": "secret?",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "72dbef7df0cb8eed5b23f7c6143c673d64d78cc4ad77750a1a52435568681f8a"
+}

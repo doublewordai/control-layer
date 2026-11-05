@@ -332,10 +332,10 @@ dwctl_session: {{user_jwt}}
 HTTP 403
 
 # -----------------------------------------------------------------------------
-# SSO admin CANNOT create users
+# SSO admin CAN provision ordinary users, but CANNOT assign privileged roles
 # -----------------------------------------------------------------------------
 
-# Admin cannot create a customer identity
+# Admin can create an ordinary customer identity
 POST http://localhost:3001/admin/api/v1/users
 X-Doubleword-User: {{admin_email}}
 X-Doubleword-Email: {{admin_email}}
@@ -345,7 +345,7 @@ X-Doubleword-Email: {{admin_email}}
   "display_name": "Created User 1",
   "roles": ["StandardUser"]
 }
-HTTP 403
+HTTP 201
 
 # Admin cannot create a privileged customer identity
 POST http://localhost:3001/admin/api/v1/users
@@ -354,7 +354,7 @@ X-Doubleword-Email: {{admin_email}}
 {
   "username": "created-user-2",
   "email": "createduser2@example.com",
-  "roles": ["StandardUser", "BatchAPIUser"]
+  "roles": ["StandardUser", "PlatformManager"]
 }
 HTTP 403
 

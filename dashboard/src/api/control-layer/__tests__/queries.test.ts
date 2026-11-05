@@ -1,4 +1,5 @@
 import { beforeAll, afterEach, afterAll, describe, it, expect } from "vitest";
+import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { handlers } from "../mocks/handlers";
 import { dwctlApi } from "../client";
@@ -234,6 +235,44 @@ describe("dwctlApi.users", () => {
 
         expect(createdKey).toHaveProperty("key");
         expect(createdKey.name).toBe(keyData.name);
+      });
+
+      it("should surface the server's JSON message when creation is refused", async () => {
+        const userId = "550e8400-e29b-41d4-a716-446655440001";
+        server.use(
+          http.post(`/admin/api/v1/users/${userId}/api-keys`, () =>
+            HttpResponse.json(
+              { message: "No keystore configured" },
+              { status: 501 },
+            ),
+          ),
+        );
+
+        await expect(
+          dwctlApi.users.apiKeys.create(
+            { name: "Issued Key", purpose: "realtime" },
+            userId,
+          ),
+        ).rejects.toThrow(
+          /^Failed to create API key: 501 - No keystore configured$/,
+        );
+      });
+
+      it("should surface a plain-text error body as is", async () => {
+        const userId = "550e8400-e29b-41d4-a716-446655440001";
+        server.use(
+          http.post(
+            `/admin/api/v1/users/${userId}/api-keys`,
+            () => new HttpResponse("Bad name", { status: 400 }),
+          ),
+        );
+
+        await expect(
+          dwctlApi.users.apiKeys.create(
+            { name: "Issued Key", purpose: "realtime" },
+            userId,
+          ),
+        ).rejects.toThrow(/^Failed to create API key: 400 - Bad name$/);
       });
     });
 

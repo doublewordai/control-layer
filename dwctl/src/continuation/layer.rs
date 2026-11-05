@@ -45,7 +45,9 @@ use onwards::strict::stream_end::interrupted_event;
 use serde_json::Value;
 use tracing::{debug, warn};
 
+use crate::auth::internal_credential::presented_key_hash;
 use crate::config::ContinuationConfig;
+use crate::crypto::ApiKeyHash;
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::inference::rejections;
 use crate::inference::store::ONWARDS_RESPONSE_ID_HEADER;
@@ -65,11 +67,12 @@ use super::{ContinuationRoutes, InflightGuard, InflightLimiter, PurposeResolver,
 #[derive(Clone)]
 pub struct ContinuationState {
     pub cfg: Arc<ContinuationConfig>,
-    /// Secret of the global hidden `continuation` key. Resume legs authenticate
-    /// with it; its purpose is what lets them carry a scheduling `priority`
-    /// (onwards strips that field from every other caller). Routing is by
-    /// request path, not by purpose.
-    pub key_secret: Arc<str>,
+    /// Hash of the global hidden `continuation` key. Resume legs present it
+    /// in-process (an [`onwards::auth::PresentedKey`] extension); its purpose
+    /// is what lets them carry a scheduling `priority` (onwards strips that
+    /// field from every other caller). Routing is by request path, not by
+    /// purpose.
+    pub key_hash: ApiKeyHash,
     pub tokenizer: RenderClient,
     /// The router clone taken at this layer's own insertion point — the resume
     /// leg's entry into the stack. See the module docs.
@@ -97,7 +100,7 @@ impl ContinuationState {
         body_limit: usize,
         sse_buffer_limit: usize,
     ) -> anyhow::Result<Self> {
-        let key_secret = super::provision_global_key(&pools.write()).await?;
+        let key_hash = super::provision_global_key(&pools.write()).await?;
         let tokenizer_url = cfg.tokenizer_url.clone().unwrap_or_else(|| cache_tokenizer_url.to_string());
         let routes = Arc::new(ContinuationRoutes::new());
         // Seed synchronously so the first request after boot sees the real set
@@ -115,7 +118,7 @@ impl ContinuationState {
 
         Ok(Self {
             cfg: Arc::new(cfg.clone()),
-            key_secret: Arc::from(key_secret),
+            key_hash,
             tokenizer: RenderClient::new(tokenizer_url, Duration::from_secs(cfg.resume_deadline_secs)),
             resume_target,
             routes,
@@ -257,12 +260,15 @@ fn is_sse(response: &Response) -> bool {
         .is_some_and(|ct| ct.trim().eq_ignore_ascii_case("text/event-stream"))
 }
 
-fn bearer(req: &Request) -> Option<String> {
-    req.headers()
+/// The hash of the key the request presents.
+fn presented_key(req: &Request) -> Option<ApiKeyHash> {
+    let bearer = req
+        .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
-        .map(|t| t.trim().to_string())
+        .map(str::trim);
+    presented_key_hash(req.extensions(), bearer)
 }
 
 /// The middleware. Anything that fails a gate is forwarded untouched — this
@@ -287,7 +293,7 @@ pub async fn continuation_middleware(State(state): State<ContinuationState>, req
         .get(ONWARDS_RESPONSE_ID_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let token = bearer(&request);
+    let token = presented_key(&request);
 
     let (parts, body) = request.into_parts();
     let body_bytes = match axum::body::to_bytes(body, state.body_limit).await {
@@ -397,7 +403,7 @@ pub async fn continuation_middleware(State(state): State<ContinuationState>, req
     // lookup only ever runs for valid keys — an unauthenticated caller
     // rotating garbage tokens gets its 401 from onwards without ever costing
     // this layer a database query.
-    let origin = Origin::from_purpose(match token.as_deref() {
+    let origin = Origin::from_purpose(match token.as_ref() {
         Some(t) => state.purposes.resolve(t).await,
         None => None,
     });

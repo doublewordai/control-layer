@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO reference_cache_entries AS e\n                (principal_id, virtual_model, prefix_hash, cumulative_bytes,\n                 tokens_per_byte, exact_tokens, visible_at, expires_at)\n            SELECT $1, $2, b.prefix_hash, b.cumulative_bytes, $6::real, b.exact_tokens,\n                   now(), now() + make_interval(secs => $7::float8)\n            FROM UNNEST($3::bytea[], $4::bigint[], $5::int[]) AS b(prefix_hash, cumulative_bytes, exact_tokens)\n            WHERE NOT EXISTS (\n                SELECT 1 FROM reference_cache_entries x\n                WHERE x.principal_id = $1 AND x.virtual_model = $2 AND x.prefix_hash = b.prefix_hash\n                  AND x.expires_at > now()\n                  AND (x.tokens_per_byte IS NOT NULL OR $6::real IS NULL)\n                  AND (x.exact_tokens IS NOT NULL OR b.exact_tokens IS NULL)\n            )\n            ON CONFLICT (principal_id, virtual_model, prefix_hash) DO UPDATE SET\n                cumulative_bytes = EXCLUDED.cumulative_bytes,\n                tokens_per_byte = CASE WHEN e.expires_at <= now() THEN EXCLUDED.tokens_per_byte\n                                       ELSE COALESCE(e.tokens_per_byte, EXCLUDED.tokens_per_byte) END,\n                exact_tokens    = CASE WHEN e.expires_at <= now() THEN EXCLUDED.exact_tokens\n                                       ELSE COALESCE(e.exact_tokens, EXCLUDED.exact_tokens) END,\n                visible_at      = CASE WHEN e.expires_at <= now() THEN EXCLUDED.visible_at\n                                       ELSE e.visible_at END,\n                expires_at      = GREATEST(e.expires_at, EXCLUDED.expires_at)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "ByteaArray",
+        "Int8Array",
+        "Int4Array",
+        "Float4",
+        "Float8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "672a57d809d960eddedcb394fe55bf52854024fd07955e3740795a0b5e958305"
+}

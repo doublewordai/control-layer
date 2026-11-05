@@ -273,7 +273,7 @@ pub async fn execute_probe(
     Path(id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<ProbeResult>), Error> {
     let config = state.current_config();
-    let result = ProbeManager::execute_probe(&state.db.write(), id, &config).await?;
+    let result = ProbeManager::execute_probe(&state.db.write(), id, &config, &state.internal_credentials).await?;
     Ok((StatusCode::CREATED, Json(result)))
 }
 
@@ -313,7 +313,16 @@ pub async fn test_probe(
         (None, None, None)
     };
 
-    let result = ProbeManager::test_probe(&state.db.write(), deployment_id, &config, http_method, request_path, request_body).await?;
+    let result = ProbeManager::test_probe(
+        &state.db.write(),
+        deployment_id,
+        &config,
+        &state.internal_credentials,
+        http_method,
+        request_path,
+        request_body,
+    )
+    .await?;
     Ok((StatusCode::OK, Json(result)))
 }
 

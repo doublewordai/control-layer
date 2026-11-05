@@ -15,7 +15,7 @@
 //! Provider-level configuration (url, onwards_key, weight) is specific to each provider.
 use crate::affinity::AffinityConfig;
 use crate::aimd::AimdConfig;
-use crate::auth::{KeyHash, KeySet};
+use crate::auth::{API_KEY_ID_LABEL, KeyHash, KeySet};
 use crate::inflight::InflightLimits;
 use crate::load_balancer::{Provider, ProviderPool};
 use crate::reasoning::ReasoningTranslationConfig;
@@ -1258,6 +1258,10 @@ pub struct Targets {
     pub key_concurrency_limiters: Arc<DashMap<KeyHash, ConcurrencyLimiter>>,
     /// Labels per API key (key hash -> labels map)
     pub key_labels: Arc<DashMap<KeyHash, HashMap<String, String>>>,
+    /// Key hashes by the value of their [`API_KEY_ID_LABEL`] label, so an
+    /// embedder that authenticated a request by key id can find the key.
+    /// Kept in step with `key_labels`.
+    pub key_ids: Arc<DashMap<String, KeyHash>>,
     /// Serving account settings per account id. A key finds its account
     /// through its `account` label; only accounts with a policy are present.
     pub accounts: Arc<DashMap<String, AccountServing>>,
@@ -1550,6 +1554,7 @@ impl Targets {
         let key_rate_limiters = Arc::new(DashMap::new());
         let key_concurrency_limiters = Arc::new(DashMap::new());
         let key_labels = Arc::new(DashMap::new());
+        let key_ids = Arc::new(DashMap::new());
 
         for (_key_id, key_def) in key_definitions {
             if let Some(ref rate_limit) = key_def.rate_limit {
@@ -1567,6 +1572,9 @@ impl Targets {
                 let limiter =
                     ConcurrencyLimiter::with_limit(concurrency_limit.max_concurrent_requests);
                 key_concurrency_limiters.insert(key_def.key, limiter);
+            }
+            if let Some(id) = key_def.labels.get(API_KEY_ID_LABEL) {
+                key_ids.insert(id.clone(), key_def.key);
             }
             if !key_def.labels.is_empty() {
                 key_labels.insert(key_def.key, key_def.labels);
@@ -1615,6 +1623,7 @@ impl Targets {
             key_rate_limiters,
             key_concurrency_limiters,
             key_labels,
+            key_ids,
             accounts,
             strict_mode: config_file.strict_mode,
             http_pool_config: config_file.http_pool,
@@ -1635,6 +1644,7 @@ impl Targets {
         let key_rate_limiters = Arc::clone(&self.key_rate_limiters);
         let key_concurrency_limiters = Arc::clone(&self.key_concurrency_limiters);
         let key_labels = Arc::clone(&self.key_labels);
+        let key_ids = Arc::clone(&self.key_ids);
         let accounts = Arc::clone(&self.accounts);
 
         let mut stream = targets_stream.stream().await?;
@@ -1733,6 +1743,18 @@ impl Targets {
 
                         for entry in new_targets.key_labels.iter() {
                             key_labels.insert(entry.key().clone(), entry.value().clone());
+                        }
+
+                        // Key-id index: same remove-then-upsert pattern.
+                        let current_key_ids: Vec<String> =
+                            key_ids.iter().map(|entry| entry.key().clone()).collect();
+                        for id in current_key_ids {
+                            if !new_targets.key_ids.contains_key(&id) {
+                                key_ids.remove(&id);
+                            }
+                        }
+                        for entry in new_targets.key_ids.iter() {
+                            key_ids.insert(entry.key().clone(), *entry.value());
                         }
 
                         // Serving account settings: same remove-then-upsert pattern.
@@ -1836,6 +1858,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            key_ids: Arc::new(DashMap::new()),
             accounts: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
@@ -1900,6 +1923,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            key_ids: Arc::new(DashMap::new()),
             accounts: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
@@ -1966,6 +1990,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            key_ids: Arc::new(DashMap::new()),
             accounts: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
@@ -3357,6 +3382,72 @@ mod tests {
                 .key_labels
                 .contains_key(&KeyHash::of("sk-nolabel-789"))
         );
+    }
+
+    fn targets_with_labelled_keys(keys: &[(&str, &str)]) -> Targets {
+        let key_definitions = keys
+            .iter()
+            .map(|(key, id)| {
+                (
+                    id.to_string(),
+                    KeyDefinition {
+                        key: KeyHash::of(key),
+                        rate_limit: None,
+                        concurrency_limit: None,
+                        labels: HashMap::from([(API_KEY_ID_LABEL.to_string(), id.to_string())]),
+                    },
+                )
+            })
+            .collect();
+        Targets::from_config(ConfigFile {
+            targets: HashMap::new(),
+            auth: Some(Auth {
+                global_keys: std::collections::HashSet::new(),
+                key_definitions: Some(key_definitions),
+            }),
+            strict_mode: false,
+            http_pool: None,
+            accounts: Default::default(),
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_key_ids_index_keys_and_follow_updates() {
+        let targets = targets_with_labelled_keys(&[("sk-a", "id-a"), ("sk-b", "id-b")]);
+        assert_eq!(
+            targets.key_ids.get("id-a").map(|h| *h),
+            Some(KeyHash::of("sk-a"))
+        );
+        assert_eq!(
+            targets.key_ids.get("id-b").map(|h| *h),
+            Some(KeyHash::of("sk-b"))
+        );
+
+        // id-b is deleted, id-c is new.
+        let updated = targets_with_labelled_keys(&[("sk-a", "id-a"), ("sk-c", "id-c")]);
+        targets
+            .receive_updates(MockConfigWatcher::with_targets(vec![updated]))
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        while !targets.key_ids.contains_key("id-c") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "update never applied"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            targets.key_ids.get("id-a").map(|h| *h),
+            Some(KeyHash::of("sk-a"))
+        );
+        assert_eq!(
+            targets.key_ids.get("id-c").map(|h| *h),
+            Some(KeyHash::of("sk-c"))
+        );
+        assert!(!targets.key_ids.contains_key("id-b"));
     }
 
     #[test]

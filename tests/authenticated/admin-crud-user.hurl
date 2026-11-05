@@ -1,4 +1,4 @@
-# SSO staff cannot provision another identity or delete a customer's account.
+# SSO staff may provision an ordinary identity, but cannot delete customer accounts.
 POST http://localhost:3001/admin/api/v1/users
 X-Doubleword-User: {{admin_email}}
 X-Doubleword-Email: {{admin_email}}
@@ -7,7 +7,7 @@ X-Doubleword-Email: {{admin_email}}
   "email": "test-{{newUuid}}@example.org",
   "roles": ["StandardUser"]
 }
-HTTP 403
+HTTP 201
 
 GET http://localhost:3001/admin/api/v1/users/current
 [Cookies]

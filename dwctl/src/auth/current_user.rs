@@ -422,10 +422,12 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
         .map(|uri| uri.path().to_owned());
     let path = path.as_deref().unwrap_or_else(|| parts.uri.path());
     let purpose_str = &api_key_data.purpose;
+    let is_system_key =
+        purpose_str == "platform" && api_key_data.api_key_id.is_nil() && api_key_data.created_by.is_nil() && api_key_data.user_id.is_nil();
 
     // Validate purpose for the endpoint
     debug!(path, purpose = purpose_str.as_str(), "API key purpose check");
-    let is_valid = if matches!(path, "/admin/openapi.json" | "/admin/docs" | "/ai/openapi.json" | "/ai/docs") {
+    let is_valid = if is_system_key || matches!(path, "/admin/openapi.json" | "/admin/docs" | "/ai/openapi.json" | "/ai/docs") {
         // OpenAPI spec / docs routes accept any key purpose so platform-key
         // holders can read the AI spec and inference-key holders can be
         // properly rejected (with a permission error from the handler's
@@ -492,7 +494,19 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
 
     Some(Ok((
         CurrentUser {
-            auth_method: AuthMethod::ApiKey,
+            // Only a personal platform key carries its holder's platform role:
+            // org managers can issue keys attributed to any member and keep the secret.
+            auth_method: if is_system_key {
+                AuthMethod::SystemApiKey
+            } else if purpose_str == "platform"
+                && !api_key_data.api_key_id.is_nil()
+                && !api_key_data.created_by.is_nil()
+                && api_key_data.created_by == api_key_data.user_id
+            {
+                AuthMethod::PlatformApiKey
+            } else {
+                AuthMethod::ApiKey
+            },
             id: api_key_data.created_by,
             username: api_key_data.username,
             email: api_key_data.email,
@@ -662,7 +676,8 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
         // lag must not reject a just-created key or accept a just-deleted one.
         match try_api_key_auth(parts, &state.db.write()).await {
             Some(Ok((mut user, last_login))) => {
-                user = user.with_auth_method(AuthMethod::ApiKey);
+                let method = user.auth_method;
+                user = user.with_auth_method(method);
                 if let Some(api_key_id) = user.api_key_id {
                     state.api_key_usage.record(api_key_id);
                 }

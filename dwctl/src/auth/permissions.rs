@@ -294,6 +294,11 @@ where
 
 /// Check if a user has permission to perform an operation on a resource
 pub fn has_permission(user: &CurrentUser, resource: Resource, operation: Operation) -> bool {
+    // The reserved system credential is an explicitly trusted service principal.
+    // Check the verified credential identity before ownership and role restrictions.
+    if user.is_system() {
+        return true;
+    }
     // Customer content and credentials have no platform-wide override, even for admins.
     if matches!(
         resource,
@@ -306,7 +311,7 @@ pub fn has_permission(user: &CurrentUser, resource: Resource, operation: Operati
     }
     // Broad user writes permit role escalation and account takeover. Support
     // ZDR updates are authorized field-by-field in the existing users handler.
-    if (resource == Resource::Users && matches!(operation, Operation::CreateAll | Operation::UpdateAll | Operation::DeleteAll))
+    if (resource == Resource::Users && matches!(operation, Operation::UpdateAll | Operation::DeleteAll))
         || (resource == Resource::Organizations && matches!(operation, Operation::UpdateAll | Operation::DeleteAll))
     {
         return false;
@@ -318,7 +323,11 @@ pub fn has_permission(user: &CurrentUser, resource: Resource, operation: Operati
             || user
                 .roles
                 .iter()
-                .filter(|role| !matches!(role, Role::PlatformManager | Role::BillingManager | Role::RequestViewer))
+                .filter(|role| match role {
+                    Role::PlatformManager => user.auth_method == AuthMethod::PlatformApiKey,
+                    Role::BillingManager | Role::RequestViewer => false,
+                    _ => true,
+                })
                 .any(|role| role_has_permission(role, resource, operation));
     }
     // SSO admins bypass role checks only after the ownership restrictions.
@@ -604,8 +613,8 @@ mod tests {
     fn test_admin_bypass() {
         let admin = create_user_with_roles(vec![Role::StandardUser], true);
 
-        // Admin cannot bypass identity-management restrictions
-        assert!(!has_permission(&admin, Resource::Users, Operation::CreateAll));
+        // Admins may provision users, subject to the handler's role allowlist.
+        assert!(has_permission(&admin, Resource::Users, Operation::CreateAll));
         assert!(has_permission(&admin, Resource::Requests, Operation::ReadAll)); // Even sensitive data
         assert!(has_permission(&admin, Resource::Models, Operation::DeleteAll));
     }
@@ -644,7 +653,7 @@ mod tests {
         let pm = create_user_with_roles(vec![Role::PlatformManager], false);
 
         // Should have full platform management permissions
-        assert!(!has_permission(&pm, Resource::Users, Operation::CreateAll));
+        assert!(has_permission(&pm, Resource::Users, Operation::CreateAll));
         assert!(has_permission(&pm, Resource::Models, Operation::DeleteAll));
         assert!(has_permission(&pm, Resource::Analytics, Operation::ReadAll));
 

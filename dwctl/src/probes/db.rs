@@ -7,6 +7,7 @@
 //! Background scheduling is handled separately by the `ProbeScheduler`.
 
 use crate::api::models::probes::{CreateProbe, ProbeStatistics, UpdateProbeRequest};
+use crate::auth::internal_credential::InternalCredentials;
 use crate::db::models::probes::{Probe, ProbeExecution, ProbeResult};
 use crate::errors::Error as AppError;
 use crate::probes::executor::{ProbeExecutionContext, ProbeExecutor};
@@ -28,6 +29,16 @@ type DeploymentStatus = (
 
 /// Map of deployment IDs to their status information.
 type DeploymentStatusMap = std::collections::HashMap<Uuid, DeploymentStatus>;
+
+/// How long a probe's credential stays valid. It is checked once, when the
+/// probe's request reaches `/ai`, which happens as soon as it is sent.
+const PROBE_CREDENTIAL_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The credential a probe presents to this process's `/ai`: a short-lived
+/// internal credential for the system API key (the nil UUID).
+fn probe_api_key(credentials: &InternalCredentials) -> Option<String> {
+    Some(credentials.mint(Uuid::nil(), PROBE_CREDENTIAL_TTL))
+}
 
 /// Database access layer for probes.
 ///
@@ -301,6 +312,7 @@ impl ProbeManager {
         pool: &PgPool,
         deployment_id: Uuid,
         config: &crate::config::Config,
+        credentials: &InternalCredentials,
         http_method: Option<String>,
         request_path: Option<String>,
         request_body: Option<serde_json::Value>,
@@ -310,11 +322,9 @@ impl ProbeManager {
             r#"
             SELECT
                 d.alias,
-                d.type as model_type,
-                ak.secret as system_api_key
+                d.type as model_type
             FROM deployed_models d
-            CROSS JOIN api_keys ak
-            WHERE d.id = $1 AND ak.id = '00000000-0000-0000-0000-000000000000'::uuid
+            WHERE d.id = $1
             "#,
             deployment_id
         )
@@ -324,11 +334,10 @@ impl ProbeManager {
 
         let model_name = context.alias;
         let model_type_str = context.model_type;
-        let system_api_key = context.system_api_key;
 
         // Route through control layer's normal AI proxy (not admin path)
         let endpoint_url = format!("http://localhost:{}/ai", config.port);
-        let api_key = Some(system_api_key);
+        let api_key = probe_api_key(credentials);
 
         // Parse model type - use auto-detection if not specified
         let model_type = match model_type_str.as_deref() {
@@ -376,7 +385,12 @@ impl ProbeManager {
     }
 
     /// Execute a probe and store the result
-    pub async fn execute_probe(pool: &PgPool, id: Uuid, config: &crate::config::Config) -> Result<ProbeResult, AppError> {
+    pub async fn execute_probe(
+        pool: &PgPool,
+        id: Uuid,
+        config: &crate::config::Config,
+        credentials: &InternalCredentials,
+    ) -> Result<ProbeResult, AppError> {
         // Note: We allow executing inactive probes manually via "Run Now"
         let _probe = Self::get_probe(pool, id).await?;
 
@@ -389,12 +403,10 @@ impl ProbeManager {
                 p.request_path,
                 p.request_body,
                 d.alias,
-                d.type as model_type,
-                ak.secret as system_api_key
+                d.type as model_type
             FROM probes p
             JOIN deployed_models d ON p.deployment_id = d.id
-            CROSS JOIN api_keys ak
-            WHERE p.id = $1 AND ak.id = '00000000-0000-0000-0000-000000000000'::uuid
+            WHERE p.id = $1
             "#,
             id
         )
@@ -408,11 +420,10 @@ impl ProbeManager {
         let request_body = context.request_body;
         let model_name = context.alias;
         let model_type_str = context.model_type;
-        let system_api_key = context.system_api_key;
 
         // Route through control layer's normal AI proxy (not admin path)
         let endpoint_url = format!("http://localhost:{}/ai", config.port);
-        let api_key = Some(system_api_key);
+        let api_key = probe_api_key(credentials);
 
         // Parse model type - use auto-detection if not specified
         let model_type = match model_type_str.as_deref() {

@@ -92,6 +92,16 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
 /// test DB and return a small (max 4 conns) fusillade-schema pool. Use
 /// this from integration tests that drive fusillade directly without
 /// constructing the full Application.
+/// The stored plaintext secret of an API key, for tests that check what
+/// fusillade stores while it still stores key secrets (until DW-1012).
+pub async fn stored_secret(pool: &PgPool, id: crate::types::ApiKeyId) -> String {
+    sqlx::query_scalar("SELECT secret FROM api_keys WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("stored API key secret")
+}
+
 /// Insert a fusillade request template the way the production write path
 /// does: into this week's `request_templates_g2` partition with its
 /// `request_template_routes` row, so `fusillade.requests` can reference it and
@@ -263,6 +273,7 @@ pub fn create_test_config() -> crate::config::Config {
         database_pooled_url: None,
         clickhouse: None,
         prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),
+        reference_cache: crate::reference_cache::ReferenceCacheConfig::default(),
         scheduling: Default::default(),
         database_url: None,
         database_replica_url: None,
@@ -436,9 +447,15 @@ pub fn create_test_config() -> crate::config::Config {
         cache: Default::default(),
         continuation: Default::default(),
         heap_profiling: Default::default(),
-        keystore: None,
+        // Issuing a key to another user needs a keystore to wrap its pending
+        // secret. Its Redis is never dialled unless a test sends ZDR flex
+        // traffic, so the URL can be unreachable.
+        keystore: Some(crate::keystore::test_keystore_config("test-1", TEST_WRAP_KEYS)),
     }
 }
+
+/// Wrap keyring of the keystore in [`create_test_config`].
+pub const TEST_WRAP_KEYS: &[(&str, &str)] = &[("test-1", "test-wrap-secret")];
 
 /// A test user on a caller-chosen email domain.
 ///
