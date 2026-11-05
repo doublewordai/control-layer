@@ -207,11 +207,17 @@ pub async fn create_user_api_key<P: PoolProvider>(
         }
     }
 
-    // Attribute the key: an organization key to the named member (or the
-    // caller); a personal key only ever belongs to its caller, since no
-    // platform role may issue keys for another account.
+    // Determine created_by based on target type:
+    // - Organization target: attribute to specified member_id, or current user
+    // - Individual target (system key creating on behalf): attribute to the target user
+    //   so the key is visible to them, and so API-key auth does not treat it
+    //   as an organization key whose creator must be a member
+    // - Self: attribute to current user
+    let creating_for_other = can_create_all && target_user_id != current_user.id;
     let created_by = if target_is_org {
         data.member_id.unwrap_or(current_user.id)
+    } else if creating_for_other {
+        target_user_id
     } else {
         current_user.id
     };
@@ -246,8 +252,8 @@ pub async fn create_user_api_key<P: PoolProvider>(
 
     let mut api_key = repo.create(&db_request).await?;
 
-    // Issued to a DIFFERENT user (an org manager issuing to a member): the
-    // holder gets a one-off "reveal" of
+    // Issued to a DIFFERENT user (manager issuing to a member, or the system
+    // key creating on a user's behalf): the holder gets a one-off "reveal" of
     // the secret from their own account (migration 131), held wrapped until
     // then. The issuer still receives the secret in this response — that is
     // deliberate (e.g. to stash it in a vault) and does not count as the
@@ -2742,6 +2748,50 @@ mod tests {
         // created_by should be the PM, not the org — this is the original bug regression test
         assert_eq!(key.created_by, pm.id, "created_by should be the PM, not the org");
         assert_eq!(key.user_id, org.id, "user_id should be the org");
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_system_key_issued_for_another_user_belongs_to_and_authenticates_as_them(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let keystore = test_keystore("test-1", TEST_WRAP_KEYS);
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        // Only the reserved system credential may create keys for another
+        // account (platform automation, e.g. provisioning test users).
+        let system_secret = crate::crypto::generate_api_key();
+        sqlx::query("UPDATE api_keys SET secret = $1, secret_hash = $2, secret_prefix = $3, purpose = 'platform' WHERE id = $4")
+            .bind(&system_secret)
+            .bind(&crate::crypto::hash_api_key(&system_secret)[..])
+            .bind(crate::crypto::api_key_prefix(&system_secret))
+            .bind(uuid::Uuid::nil())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", alice.id))
+            .add_header("Authorization", format!("Bearer {system_secret}"))
+            .json(&json!({"name": "On behalf", "purpose": "platform"}))
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let key: ApiKeyResponse = response.json();
+
+        // Attributed to Alice, so it is a personal key, not an organization
+        // key whose creator must be a member of the owning account.
+        assert_eq!(key.created_by, alice.id);
+        assert_eq!(key.user_id, alice.id);
+        // Alice still gets her one-off reveal, held wrapped until then.
+        assert!(key.secret_revealed_at.is_none());
+        let wrapped = stored_pending_secret(&pool, key.id).await.expect("held wrapped");
+        assert_eq!(keystore.unwrap(&wrapped).unwrap(), key.key.as_bytes());
+
+        // The secret the issuer received authenticates as Alice.
+        let response = app
+            .get("/admin/api/v1/users/current")
+            .add_header("Authorization", format!("Bearer {}", key.key))
+            .await;
+        response.assert_status_ok();
+        assert_eq!(response.json::<serde_json::Value>()["id"], alice.id.to_string());
     }
 
     #[dwctl_test_macros::test]
