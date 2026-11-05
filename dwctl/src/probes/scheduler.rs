@@ -4,6 +4,7 @@
 //! on the leader replica. It periodically polls the database for active probes
 //! and manages background tasks that execute each probe at its configured interval.
 
+use crate::auth::internal_credential::InternalCredentials;
 use crate::metrics::errors::component::PROBE_SCHEDULER;
 use crate::probes::db::ProbeManager;
 use std::collections::HashMap;
@@ -24,17 +25,20 @@ pub struct ProbeScheduler {
     /// Direct connections for the probe-changes LISTEN session.
     listener_pool: sqlx_pool_router::DynPools,
     config: crate::config::Config,
+    /// Signs the credential each probe call to this process's `/ai` presents.
+    credentials: InternalCredentials,
     schedulers: Arc<RwLock<HashMap<Uuid, JoinHandle<()>>>>,
 }
 
 impl ProbeScheduler {
     /// Create a new ProbeScheduler instance
-    pub fn new(pool: impl sqlx_pool_router::PoolProvider, config: crate::config::Config) -> Self {
+    pub fn new(pool: impl sqlx_pool_router::PoolProvider, config: crate::config::Config, credentials: InternalCredentials) -> Self {
         let pool = sqlx_pool_router::DynPools::new(pool);
         Self {
             listener_pool: pool.clone(),
             pool,
             config,
+            credentials,
             schedulers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -84,6 +88,7 @@ impl ProbeScheduler {
 
         let pool = self.pool.clone();
         let config = self.config.clone();
+        let credentials = self.credentials.clone();
 
         // Spawn the scheduler task
         let handle = tokio::spawn(async move {
@@ -170,7 +175,7 @@ impl ProbeScheduler {
                 }
 
                 // Execute the probe
-                match ProbeManager::execute_probe(&pool.write(), probe_id, &config).await {
+                match ProbeManager::execute_probe(&pool.write(), probe_id, &config, &credentials).await {
                     Ok(result) => {
                         if result.success {
                             tracing::debug!(
@@ -537,7 +542,7 @@ mod tests {
         .unwrap();
 
         let config = create_test_config();
-        let scheduler = ProbeScheduler::new(pool, config);
+        let scheduler = ProbeScheduler::new(pool, config, InternalCredentials::generate());
 
         scheduler.initialize(CancellationToken::new()).await.unwrap();
 
@@ -551,7 +556,7 @@ mod tests {
         let deployment_id = setup_test_deployment(&pool).await;
 
         let config = create_test_config();
-        let scheduler = ProbeScheduler::new(pool.clone(), config);
+        let scheduler = ProbeScheduler::new(pool.clone(), config, InternalCredentials::generate());
 
         // Initially no schedulers
         scheduler.initialize(CancellationToken::new()).await.unwrap();
@@ -599,7 +604,7 @@ mod tests {
         .unwrap();
 
         let config = create_test_config();
-        let scheduler = ProbeScheduler::new(pool.clone(), config);
+        let scheduler = ProbeScheduler::new(pool.clone(), config, InternalCredentials::generate());
 
         scheduler.initialize(CancellationToken::new()).await.unwrap();
         assert_eq!(scheduler.schedulers.read().await.len(), 1);
@@ -633,7 +638,7 @@ mod tests {
         }
 
         let config = create_test_config();
-        let scheduler = ProbeScheduler::new(pool, config);
+        let scheduler = ProbeScheduler::new(pool, config, InternalCredentials::generate());
 
         scheduler.initialize(CancellationToken::new()).await.unwrap();
         assert_eq!(scheduler.schedulers.read().await.len(), 3);
@@ -665,7 +670,7 @@ mod tests {
         ProbeManager::deactivate_probe(&pool, probe.id).await.unwrap();
 
         let config = create_test_config();
-        let scheduler = ProbeScheduler::new(pool, config);
+        let scheduler = ProbeScheduler::new(pool, config, InternalCredentials::generate());
 
         scheduler.initialize(CancellationToken::new()).await.unwrap();
 

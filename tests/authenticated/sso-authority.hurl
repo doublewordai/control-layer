@@ -1,5 +1,5 @@
-# API credentials cannot inherit platform authority or fall back to SSO.
-# Credit grants and enable-only ZDR use the existing endpoints through SSO.
+# Platform-purpose keys retain PlatformManager configuration authority.
+# Invalid credentials cannot fall back to SSO; customer ownership still applies.
 GET http://localhost:3001/admin/api/v1/users/current
 X-Doubleword-User: hurl-support-customer
 X-Doubleword-Email: hurl-support-customer@example.org
@@ -7,7 +7,7 @@ HTTP 200
 [Captures]
 customer_id: jsonpath "$.id"
 
-# manager: owner-created platform-purpose key remains an ordinary credential.
+# Manager platform keys retain platform authority without a legacy admin flag.
 GET http://localhost:3001/admin/api/v1/users/current
 X-Doubleword-User: hurl-platform-manager
 X-Doubleword-Email: hurl-platform-manager@example.org
@@ -30,13 +30,13 @@ HTTP 200
 [Asserts]
 jsonpath "$.is_admin" == false
 jsonpath "$.roles" contains "StandardUser"
-jsonpath "$.roles" not contains "PlatformManager"
+jsonpath "$.roles" contains "PlatformManager"
 
 GET http://localhost:3001/admin/api/v1/users
 Authorization: Bearer {{manager_key}}
 X-Doubleword-User: hurl-platform-manager
 X-Doubleword-Email: hurl-platform-manager@example.org
-HTTP 403
+HTTP 200
 
 GET http://localhost:3001/admin/api/v1/users
 Authorization: Bearer invalid-key
@@ -46,13 +46,13 @@ HTTP 401
 
 POST http://localhost:3001/admin/api/v1/transactions
 Authorization: Bearer {{manager_key}}
-{"user_id":"{{customer_id}}", "transaction_type":"admin_grant", "amount":"1", "source_id":"{{manager_id}}"}
-HTTP 403
+{"user_id":"{{customer_id}}", "transaction_type":"admin_grant", "amount":"1", "source_id":"{{manager_id}}-api"}
+HTTP 201
 
 PATCH http://localhost:3001/admin/api/v1/users/{{customer_id}}
 Authorization: Bearer {{manager_key}}
 {"zero_data_retention":true}
-HTTP 403
+HTTP 200
 
 POST http://localhost:3001/admin/api/v1/transactions
 X-Doubleword-User: hurl-platform-manager
@@ -86,7 +86,7 @@ DELETE http://localhost:3001/admin/api/v1/users/{{manager_id}}/api-keys/{{manage
 Authorization: Bearer {{manager_key}}
 HTTP 204
 
-# admin: owner-created platform-purpose key remains an ordinary credential.
+# An admin account with PlatformManager retains that role, not its admin flag.
 GET http://localhost:3001/admin/api/v1/users/current
 X-Doubleword-User: {{admin_email}}
 X-Doubleword-Email: {{admin_email}}
@@ -109,13 +109,13 @@ HTTP 200
 [Asserts]
 jsonpath "$.is_admin" == false
 jsonpath "$.roles" contains "StandardUser"
-jsonpath "$.roles" not contains "PlatformManager"
+jsonpath "$.roles" contains "PlatformManager"
 
 GET http://localhost:3001/admin/api/v1/users
 Authorization: Bearer {{admin_key}}
 X-Doubleword-User: {{admin_email}}
 X-Doubleword-Email: {{admin_email}}
-HTTP 403
+HTTP 200
 
 GET http://localhost:3001/admin/api/v1/users
 Authorization: Bearer invalid-key
@@ -125,13 +125,13 @@ HTTP 401
 
 POST http://localhost:3001/admin/api/v1/transactions
 Authorization: Bearer {{admin_key}}
-{"user_id":"{{customer_id}}", "transaction_type":"admin_grant", "amount":"1", "source_id":"{{admin_id}}"}
-HTTP 403
+{"user_id":"{{customer_id}}", "transaction_type":"admin_grant", "amount":"1", "source_id":"{{admin_id}}-api"}
+HTTP 201
 
 PATCH http://localhost:3001/admin/api/v1/users/{{customer_id}}
 Authorization: Bearer {{admin_key}}
 {"zero_data_retention":true}
-HTTP 403
+HTTP 200
 
 POST http://localhost:3001/admin/api/v1/transactions
 X-Doubleword-User: {{admin_email}}

@@ -1255,8 +1255,14 @@ mod tests {
             .unwrap();
         let cache = crate::sync::key_policy::KeyPolicyCache::empty();
         crate::sync::key_policy::refresh(&pool, &cache).await.unwrap();
-        assert_eq!(cache.policy(&key).toleration_preset_for("org/model"), Some("gpu"));
-        assert_eq!(cache.policy(&key).toleration_preset_for("org/other"), None);
+        assert_eq!(
+            cache.policy(&crate::crypto::hash_api_key(&key)).toleration_preset_for("org/model"),
+            Some("gpu")
+        );
+        assert_eq!(
+            cache.policy(&crate::crypto::hash_api_key(&key)).toleration_preset_for("org/other"),
+            None
+        );
         let mut conn = pool.acquire().await.unwrap();
         let direct = crate::sync::key_policy::load_policy(&mut conn, org).await.unwrap();
         assert_eq!(direct.toleration_preset_for("org/model"), Some("gpu"));

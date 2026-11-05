@@ -533,6 +533,43 @@ async fn an_unfinished_batch_on_input_from_another_week_does_not_block(pool: PgP
     );
 }
 
+/// A batch cancelled while its requests were still being created never
+/// freezes: its rows cannot add up to total_requests. Nothing claims a
+/// cancelled batch's requests, so it must not hold its input week.
+#[sqlx::test]
+async fn a_cancelled_unfrozen_batch_does_not_hold_its_input_week(pool: PgPool) {
+    use fusillade_arsenal::manager::{DaemonStorage, RetainedResponseRetirementOutcome};
+
+    let week = monday(&pool, -60).await;
+    sqlx::query("SELECT ensure_request_template_partition($1, NULL)")
+        .bind(week)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let file = file_uploaded_in(&pool, week).await;
+    insert_g2_template(&pool, week, file).await;
+    sqlx::query(
+        "INSERT INTO batches (file_id, endpoint, completion_window, expires_at, created_at, \
+                              total_requests, cancelling_at, cancelled_at) \
+         VALUES ($1, '/v1/x', '24h', NOW() + INTERVAL '24 hours', \
+                 ($2::timestamp AT TIME ZONE 'UTC') + INTERVAL '1 day', 100, \
+                 ($2::timestamp AT TIME ZONE 'UTC') + INTERVAL '1 day', \
+                 ($2::timestamp AT TIME ZONE 'UTC') + INTERVAL '1 day')",
+    )
+    .bind(file)
+    .bind(week)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let outcome = retirement_manager(&pool)
+        .await
+        .retire_expired_template_partition(true, 30)
+        .await
+        .unwrap();
+    assert_eq!(outcome, RetainedResponseRetirementOutcome::Retired);
+}
+
 #[sqlx::test]
 async fn an_unowned_template_row_fails_the_gate_closed(pool: PgPool) {
     use fusillade_arsenal::manager::{DaemonStorage, RetainedResponseRetirementOutcome};

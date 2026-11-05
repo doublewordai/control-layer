@@ -302,7 +302,7 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     let virtual_model = parsed_body
         .as_ref()
         .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(String::from));
-    let api_key = parts
+    let bearer = parts
         .headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -310,7 +310,8 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
         // (error_enrichment, image_normalizer) — else a key resolves differently here and
         // silently disables caching for that request.
         .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
-        .map(|t| t.trim().to_string());
+        .map(str::trim);
+    let api_key = crate::auth::internal_credential::presented_key_hash(&parts.extensions, bearer);
 
     // Bounded metric label (the deployed alias). Cloned before `virtual_model` is moved
     // into the classify task below; empty only for a body with no `model` field.
@@ -326,7 +327,7 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
                 .classify(ClassifyRequest {
                     virtual_model: &model,
                     body: &body,
-                    api_key: api_key.as_deref(),
+                    api_key,
                     // Serving always has the bearer token; only historical replay pre-resolves.
                     principal: None,
                     // Module breakpoints exist only on chat routes: a /completions body

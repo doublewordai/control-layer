@@ -44,7 +44,8 @@ pub struct MessagesRequest {
     /// `reasoning_effort` on the request, together with `output_config.effort`.
     #[serde(default)]
     pub thinking: Option<Value>,
-    /// Output settings. Only `effort` is read; it maps to `reasoning_effort`.
+    /// Output settings. `effort` maps to `reasoning_effort` and `format` to
+    /// `response_format`.
     #[serde(default)]
     pub output_config: Option<Value>,
     /// Processing-tier hint. Anthropic's standard values (`auto`,
@@ -107,9 +108,16 @@ pub enum ContentBlock {
         #[serde(default)]
         cache_control: Option<Value>,
     },
-    /// Forward-compat catch-all. Inbound `thinking` blocks land here and are
-    /// intentionally dropped: OpenAI-spec backends do not consume reasoning as
-    /// input, so there is nothing downstream to forward them to.
+    /// Reasoning from an earlier assistant turn, replayed as `reasoning_content`
+    /// so that the model's chat template decides whether to keep it. The
+    /// signature only means something to Anthropic and is ignored. Clients
+    /// that hide thinking send it empty.
+    Thinking {
+        #[serde(default)]
+        thinking: String,
+    },
+    /// Forward-compat catch-all. `redacted_thinking` blocks land here and are
+    /// dropped: Anthropic encrypts their reasoning, so no other model can use it.
     #[serde(other)]
     Other,
 }

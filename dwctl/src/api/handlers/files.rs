@@ -1434,10 +1434,12 @@ pub async fn upload_file<P: PoolProvider>(
     // key, but keep it scope-consistent with batch creation).
     let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut api_keys_repo = ApiKeys::new(&mut conn);
-    let (user_api_key, api_key_id) = api_keys_repo
+    let api_key_id = api_keys_repo
         .resolve_batch_execution_key(target_user_id, current_user.id, current_user.api_key_id)
         .await
         .map_err(Error::Database)?;
+    // Fusillade still dispatches request templates with a stored key (until DW-1010).
+    let user_api_key = api_keys_repo.legacy_dispatch_secret(api_key_id).await.map_err(Error::Database)?;
 
     // The account's resolved scheduling tolerations, if it is pinned to a
     // preset. The hidden batch key belongs to the account that owns the batch
@@ -1452,7 +1454,10 @@ pub async fn upload_file<P: PoolProvider>(
     // account's policy straight off the users row, reusing the connection `conn`
     // this handler already holds — a cached account on Default is not a miss, so
     // an ordinary upload never takes a second connection.
-    let tolerations = match state.key_policy_cache.account_tolerations_if_known(&user_api_key) {
+    let tolerations = match state
+        .key_policy_cache
+        .account_tolerations_if_known(&crate::crypto::hash_api_key(&user_api_key))
+    {
         Some(resolved) => resolved,
         None => {
             let policy = crate::sync::key_policy::load_policy(&mut conn, target_user_id)

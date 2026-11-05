@@ -557,10 +557,10 @@ pub async fn create_batch<P: PoolProvider>(
         });
     }
 
-    // SSO platform managers and admins can use any
+    // Platform managers, SSO admins and the system credential can use any
     // completion window that humantime can parse. Everyone else is restricted
     // to the configured allowed values.
-    let can_use_any_window = current_user.is_sso_platform_manager();
+    let can_use_any_window = current_user.can_manage_platform();
     if !is_background && !can_use_any_window && !config.batches.allowed_completion_windows.contains(&req.completion_window) {
         let allowed: Vec<&str> = config.batches.allowed_completion_windows.iter().map(|w| w.as_str()).collect();
 
@@ -815,8 +815,13 @@ pub async fn create_batch<P: PoolProvider>(
     // batch's spend counts against the authenticating key's spending cap.
     let (batch_api_key, api_key_id, target_verified) = {
         let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
-        let (secret, key_id) = ApiKeys::new(&mut conn)
+        let key_id = ApiKeys::new(&mut conn)
             .resolve_batch_execution_key(target_user_id, attribution_user_id, authenticating_key_id)
+            .await
+            .map_err(Error::Database)?;
+        // Fusillade still dispatches batches with a stored key (until DW-1010).
+        let secret = ApiKeys::new(&mut conn)
+            .legacy_dispatch_secret(key_id)
             .await
             .map_err(Error::Database)?;
         // A capped authenticating key can resolve to a different billing

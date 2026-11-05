@@ -59,10 +59,12 @@ async fn batch_request_and_batch_finalized_spans_carry_the_account(pool: PgPool)
     add_user_to_group(&pool, user.id, uuid::Uuid::nil()).await;
     let batch_api_key = {
         let mut conn = pool.acquire().await.expect("acquire");
-        ApiKeys::new(&mut conn)
+        let mut keys = ApiKeys::new(&mut conn);
+        let id = keys
             .get_or_create_hidden_key(user.id, ApiKeyPurpose::Batch, user.id)
             .await
-            .expect("batch api key")
+            .expect("batch api key");
+        keys.legacy_dispatch_secret(id).await.expect("batch api key secret")
     };
 
     let mock_server = wiremock::MockServer::start().await;
