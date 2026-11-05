@@ -795,7 +795,9 @@ pub async fn target_message_handler<T: HttpClient>(
         let rejected: Vec<&'static str> = flagged_params
             .iter()
             .copied()
-            .filter(|param| state.rejects_param(&model_name, param))
+            // A class route is served by its model's workers, so it takes the
+            // model's exceptions.
+            .filter(|param| state.rejects_param(&metric_model, param))
             .collect();
         for param in &flagged_params {
             let action = if rejected.contains(param) {
@@ -809,7 +811,7 @@ pub async fn target_message_handler<T: HttpClient>(
                 "onwards_unsupported_params_total",
                 "param" => *param,
                 "model" => metric_model.clone(),
- "serving_class" => metric_class.clone(),
+                "serving_class" => metric_class.clone(),
                 "traffic" => traffic,
                 "action" => action,
             )
@@ -872,7 +874,7 @@ pub async fn target_message_handler<T: HttpClient>(
             "reason" => "no_providers",
             "status" => "529",
             "model" => metric_model.clone(),
- "serving_class" => metric_class.clone(),
+            "serving_class" => metric_class.clone(),
             "traffic" => traffic,
         )
         .increment(1);
@@ -887,7 +889,7 @@ pub async fn target_message_handler<T: HttpClient>(
             metrics::gauge!(
                 "onwards_inflight_account_limit",
                 "model" => metric_model.clone(),
- "serving_class" => metric_class.clone(),
+                "serving_class" => metric_class.clone(),
                 "account" => account.to_string(),
                 "account_name" => account_name.clone(),
             )
@@ -895,7 +897,7 @@ pub async fn target_message_handler<T: HttpClient>(
             metrics::counter!(
                 "onwards_inflight_limit_checks_total",
                 "model" => metric_model.clone(),
- "serving_class" => metric_class.clone(),
+                "serving_class" => metric_class.clone(),
                 "account" => account.to_string(),
                 "account_name" => account_name.clone(),
             )
@@ -914,7 +916,7 @@ pub async fn target_message_handler<T: HttpClient>(
                     metrics::counter!(
                         "onwards_inflight_limit_refusals_total",
                         "model" => metric_model.clone(),
- "serving_class" => metric_class.clone(),
+                        "serving_class" => metric_class.clone(),
                         "account" => account.to_string(),
                         "account_name" => account_name,
                     )
@@ -951,7 +953,7 @@ pub async fn target_message_handler<T: HttpClient>(
                 metrics::counter!(
                     "onwards_batch_inflight_refusals_total",
                     "model" => metric_model.clone(),
- "serving_class" => metric_class.clone(),
+                    "serving_class" => metric_class.clone(),
                 )
                 .increment(1);
                 record_response_status(529);
@@ -1004,7 +1006,7 @@ pub async fn target_message_handler<T: HttpClient>(
                         "reason" => "model_at_capacity",
                         "status" => "529",
                         "model" => metric_model.clone(),
- "serving_class" => metric_class.clone(),
+                        "serving_class" => metric_class.clone(),
                         "traffic" => traffic,
                     )
                     .increment(1);
@@ -1083,7 +1085,7 @@ pub async fn target_message_handler<T: HttpClient>(
         metrics::counter!(
             "onwards_self_hosted_only_skips_total",
             "model" => metric_model.clone(),
- "serving_class" => metric_class.clone(),
+            "serving_class" => metric_class.clone(),
         )
         .increment(ineligible_members.len() as u64);
     }
@@ -1545,7 +1547,7 @@ pub async fn target_message_handler<T: HttpClient>(
                     metrics::counter!(
                         "onwards_first_token_breaches_total",
                         "model" => metric_model.clone(),
- "serving_class" => metric_class.clone(),
+                        "serving_class" => metric_class.clone(),
                         "pool" => resolved_pool_name.unwrap_or("default"),
                         "role" => provider_role,
                     )
@@ -1800,7 +1802,7 @@ pub async fn target_message_handler<T: HttpClient>(
                         metrics::counter!(
                             "onwards_first_token_breaches_total",
                             "model" => metric_model.clone(),
- "serving_class" => metric_class.clone(),
+                            "serving_class" => metric_class.clone(),
                             "pool" => resolved_pool_name.unwrap_or("default"),
                             "role" => provider_role,
                         )
@@ -1838,7 +1840,7 @@ pub async fn target_message_handler<T: HttpClient>(
                     metrics::histogram!(
                         "onwards_first_token_seconds",
                         "model" => metric_model.clone(),
- "serving_class" => metric_class.clone(),
+                        "serving_class" => metric_class.clone(),
                         "pool" => resolved_pool_name.unwrap_or("default"),
                         "role" => provider_role,
                     )
@@ -2293,7 +2295,7 @@ pub async fn target_message_handler<T: HttpClient>(
             // enough to see one.
             "status" => last_upstream_status.unwrap_or(status).to_string(),
             "model" => metric_model.clone(),
- "serving_class" => metric_class.clone(),
+            "serving_class" => metric_class.clone(),
             "traffic" => traffic,
         )
         .increment(1);
@@ -2311,7 +2313,7 @@ pub async fn target_message_handler<T: HttpClient>(
             "reason" => "no_eligible_provider",
             "status" => "503",
             "model" => metric_model.clone(),
- "serving_class" => metric_class.clone(),
+            "serving_class" => metric_class.clone(),
             "traffic" => traffic,
         )
         .increment(1);
@@ -2333,7 +2335,7 @@ pub async fn target_message_handler<T: HttpClient>(
             "reason" => "all_at_capacity",
             "status" => "529",
             "model" => metric_model.clone(),
- "serving_class" => metric_class.clone(),
+            "serving_class" => metric_class.clone(),
             "traffic" => traffic,
         )
         .increment(1);
@@ -2348,7 +2350,7 @@ pub async fn target_message_handler<T: HttpClient>(
             "reason" => "empty_pool_late",
             "status" => status.to_string(),
             "model" => metric_model.clone(),
- "serving_class" => metric_class.clone(),
+            "serving_class" => metric_class.clone(),
             "traffic" => traffic,
         )
         .increment(1);
