@@ -79,6 +79,8 @@ pub struct ApiKeyResponse {
     #[schema(value_type = String, format = "uuid")]
     pub created_by: UserId,
     pub created_at: DateTime<Utc>,
+    /// When the key last authenticated a request, up to two minutes behind.
+    /// Null if the key has not been used since use tracking began.
     pub last_used: Option<DateTime<Utc>>,
     #[schema(value_type = Vec<String>)]
     pub model_access: Vec<DeploymentId>,
@@ -115,6 +117,8 @@ pub struct ApiKeyInfoResponse {
     #[schema(value_type = String, format = "uuid")]
     pub created_by: UserId,
     pub created_at: DateTime<Utc>,
+    /// When the key last authenticated a request, up to two minutes behind.
+    /// Null if the key has not been used since use tracking began.
     pub last_used: Option<DateTime<Utc>>,
     #[schema(value_type = Vec<String>)]
     pub model_access: Vec<DeploymentId>,

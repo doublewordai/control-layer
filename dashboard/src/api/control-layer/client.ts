@@ -255,7 +255,29 @@ const userApi = {
         body: JSON.stringify(data),
       });
       if (!response.ok) {
-        throw new Error(`Failed to create API key: ${response.status}`);
+        // Surface the backend's message (e.g. issuing a key to another user
+        // with no keystore configured) instead of a bare status code. Most
+        // errors are JSON with a `message`; some are plain text.
+        const text = await response.text().catch(() => "");
+        let message = text;
+        try {
+          const parsed: unknown = JSON.parse(text);
+          if (
+            typeof parsed === "object" &&
+            parsed !== null &&
+            "message" in parsed &&
+            typeof parsed.message === "string"
+          ) {
+            message = parsed.message;
+          }
+        } catch {
+          // Not JSON: keep the raw text.
+        }
+        throw new Error(
+          message
+            ? `Failed to create API key: ${response.status} - ${message}`
+            : `Failed to create API key: ${response.status}`,
+        );
       }
       return response.json();
     },

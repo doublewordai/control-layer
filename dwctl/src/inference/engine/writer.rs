@@ -1125,7 +1125,7 @@ mod tests {
     async fn test_writer_accepts_completion_while_http_server_drains(pool: sqlx::PgPool) {
         let (writer, sender, manager) = build_writer(pool).await;
         let shutdown = BackgroundShutdownTokens::new(CancellationToken::new());
-        let writer_shutdown = shutdown.responses_writer();
+        let writer_shutdown = shutdown.after_http_drain();
         let handle = tokio::spawn(writer.run(writer_shutdown.clone()));
 
         // SIGTERM stops the other background services immediately, but Axum

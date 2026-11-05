@@ -36,10 +36,13 @@ pub mod component {
     pub const USAGE_REFRESH: &str = "usage_refresh";
     pub const TASK_RETENTION: &str = "task_retention";
     pub const PROMPT_CACHE_RETENTION: &str = "prompt_cache_retention";
+    pub const REFERENCE_CACHE: &str = "reference_cache";
     pub const CONTINUATION: &str = "continuation";
     pub const ALLOCATOR_METRICS: &str = "allocator_metrics";
     pub const HEAP_PROFILING: &str = "heap_profiling";
     pub const REALTIME_INFLIGHT: &str = "realtime_inflight";
+    pub const API_KEY_USAGE: &str = "api_key_usage";
+    pub const PENDING_SECRETS: &str = "pending_secrets";
 }
 
 /// Increment `dwctl_background_errors_total`. `component`/`reason`/`severity` are `&'static str`

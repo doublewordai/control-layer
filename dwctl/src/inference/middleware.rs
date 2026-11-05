@@ -88,6 +88,8 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     /// Pending-byte limit for an unfinished SSE event (`onwards.sse_buffer_limit`),
     /// used when applying the client's usage choice to a realtime stream.
     pub sse_buffer_limit: usize,
+    /// Notes the client's key on queued submissions, which skip onwards.
+    pub api_key_usage: crate::api_key_usage::ApiKeyUsage,
 }
 
 /// Middleware that routes inference requests based on service_tier and background.
@@ -538,7 +540,12 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     };
     let queued_batch_key = if is_daemon_processed {
         match resolve_flex_batch_api_key(&state.dwctl_pool.write(), key_hash.as_ref()).await {
-            Ok(Some(key)) => Some(key),
+            Ok(Some(key)) => {
+                // Queued requests skip onwards, so note the client's key here,
+                // before later checks can refuse the request.
+                state.api_key_usage.record(key.client_key_id);
+                Some(key)
+            }
             Ok(None) => {
                 tracing::warn!(service_tier = %service_tier, "Queued API key disappeared before hidden batch-key resolution");
                 let response = Response::builder()
@@ -858,6 +865,8 @@ enum ServiceTier {
 struct FlexBatchApiKey {
     /// The key the request is dispatched as.
     id: ApiKeyId,
+    /// The client's key, which `id` is dispatched on behalf of.
+    client_key_id: ApiKeyId,
     secret: String,
     key_owner_id: uuid::Uuid,
     /// The key owner's `users.verified` flag (organizations are `users` rows
@@ -888,7 +897,7 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&ApiKey
     // any other caller key.)
     let row = sqlx::query(
         r#"
-        SELECT ak.user_id, ak.created_by, u.verified, child.id AS child_id
+        SELECT ak.id, ak.user_id, ak.created_by, u.verified, child.id AS child_id
         FROM api_keys ak
         LEFT JOIN users u ON u.id = ak.user_id
         LEFT JOIN api_keys child
@@ -907,6 +916,7 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&ApiKey
     let Some(row) = row else {
         return Ok(None);
     };
+    let client_key_id: ApiKeyId = sqlx::Row::get(&row, "id");
     let key_owner_id: uuid::Uuid = sqlx::Row::get(&row, "user_id");
     let created_by: uuid::Uuid = sqlx::Row::get(&row, "created_by");
     // NULL when the LEFT JOIN found no user row; a missing row counts as
@@ -932,6 +942,7 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&ApiKey
 
     Ok(Some(FlexBatchApiKey {
         id: key_id,
+        client_key_id,
         secret,
         key_owner_id,
         verified,
@@ -1090,11 +1101,17 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
             "output": [],
         });
 
+        // The client gets the 202 below, not onwards' response, so note the
+        // key onwards authenticated here rather than in `record_proxy_key_use`.
+        let api_key_usage = state.api_key_usage.clone();
         // Spawned tasks do not inherit the current span; keep the background
         // dispatch under the gateway span so its provider attempts stay in the trace.
         tokio::spawn(
             async move {
                 let response = next.run(req).await;
+                if let Some(onwards::AuthenticatedApiKeyId(api_key_id)) = response.extensions().get() {
+                    api_key_usage.record(*api_key_id);
+                }
                 let (_parts, body) = response.into_parts();
                 let _ = axum::body::to_bytes(body, usize::MAX).await;
             }

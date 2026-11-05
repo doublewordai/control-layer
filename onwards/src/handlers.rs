@@ -795,10 +795,16 @@ pub async fn target_message_handler<T: HttpClient>(
         let rejected: Vec<&'static str> = flagged_params
             .iter()
             .copied()
-            .filter(|param| state.rejected_params.contains(param))
+            .filter(|param| state.rejects_param(&model_name, param))
             .collect();
         for param in &flagged_params {
-            let action = if rejected.contains(param) { "rejected" } else { "logged" };
+            let action = if rejected.contains(param) {
+                "rejected"
+            } else if state.rejected_params.contains(param) {
+                "allowed"
+            } else {
+                "logged"
+            };
             metrics::counter!(
                 "onwards_unsupported_params_total",
                 "param" => *param,
@@ -3293,6 +3299,7 @@ mod tests {
             first_token_timeout: None,
             first_token_timeout_exempt_header: None,
             rejected_params: Vec::new(),
+            model_allowed_params: std::collections::HashMap::new(),
             inflight_limiter: std::sync::Arc::new(crate::inflight::LocalInflightLimiter::default()),
             batch_inflight_enforce: false,
             batch_inflight_limiter: std::sync::Arc::new(

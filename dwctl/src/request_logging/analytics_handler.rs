@@ -46,12 +46,15 @@
 //! ```
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use crate::auth::internal_credential::{InternalAuthState, carried_key_hash};
 use crate::config::Config;
 use crate::metrics::errors::component::ANALYTICS;
+use crate::reference_cache::{Completion, ReferenceCache};
 use crate::request_logging::batcher::{AnalyticsOutboxWriter, RawAnalyticsRecord};
 use crate::request_logging::models::{AiResponse, ChatCompletionChunk};
-use crate::request_logging::serializers::{UsageMetrics, parse_ai_response};
+use crate::request_logging::serializers::{Auth, UsageMetrics, parse_ai_response};
 use crate::request_logging::stream_completion::client_disconnected;
 use crate::request_logging::utils::{extract_header_as_string, extract_header_as_uuid};
 use axum::http::StatusCode;
@@ -174,6 +177,9 @@ pub struct AnalyticsHandler {
     outbox_writer: AnalyticsOutboxWriter,
     instance_id: Uuid,
     config: Config,
+    /// Shadow reference-cache estimate, when `reference_cache.enabled`, with what
+    /// internal credentials are resolved against.
+    reference_cache: Option<(Arc<ReferenceCache>, InternalAuthState)>,
 }
 
 impl AnalyticsHandler {
@@ -189,7 +195,14 @@ impl AnalyticsHandler {
             outbox_writer,
             instance_id,
             config,
+            reference_cache: None,
         }
+    }
+
+    /// Record the reference-cache estimate on each record it covers.
+    pub fn with_reference_cache(mut self, reference_cache: Arc<ReferenceCache>, internal_auth: InternalAuthState) -> Self {
+        self.reference_cache = Some((reference_cache, internal_auth));
+        self
     }
 }
 
@@ -293,6 +306,30 @@ impl RequestHandler for AnalyticsHandler {
 
             let api_key_id = response_data.extensions.get::<AuthenticatedApiKeyId>().map(|id| id.0);
 
+            // Bounded by `reference_cache.estimate_timeout_ms`; returns at once for a
+            // request it does not cover.
+            let reference_cached_tokens = match &self.reference_cache {
+                Some((cache, internal_auth)) => {
+                    let bearer_token = match Auth::from_request(&request_data, &self.config) {
+                        Auth::ApiKey { bearer_token } => Some(bearer_token),
+                        Auth::None => None,
+                    };
+                    let api_key = internal_auth.captured_key_hash(bearer_token.as_deref(), carried_key_hash(&response_data.extensions));
+                    cache
+                        .complete(Completion {
+                            path: request_data.uri.path(),
+                            success: (200..300).contains(&metrics.status_code),
+                            api_key,
+                            model: metrics.request_model.as_deref(),
+                            body: request_data.body.as_ref(),
+                            prompt_tokens: metrics.prompt_tokens,
+                            arrival: chrono::DateTime::<chrono::Utc>::from(request_data.timestamp),
+                        })
+                        .await
+                }
+                None => None,
+            };
+
             // Build the raw record (no DB enrichment)
             // Note: request_origin is computed in the batcher after api_key_purpose is resolved
             let record = RawAnalyticsRecord {
@@ -320,6 +357,7 @@ impl RequestHandler for AnalyticsHandler {
                 // is one, else whoever is on the wire. See `resolve_user_agent`.
                 user_agent: resolve_user_agent(&request_data),
                 engine_cached_tokens: metrics.engine_cached_tokens,
+                reference_cached_tokens,
                 cache_read_source: metrics.cache_read_source.clone(),
                 request_params: metrics.request_params,
                 server_address: metrics.server_address,

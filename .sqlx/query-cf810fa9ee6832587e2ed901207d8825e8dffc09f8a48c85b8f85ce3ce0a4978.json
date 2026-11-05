@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE api_keys SET pending_secret = NULL\n            WHERE pending_secret IS NOT NULL\n              AND (secret_revealed_at IS NOT NULL OR is_deleted OR hidden OR parent_api_key_id IS NOT NULL)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "cf810fa9ee6832587e2ed901207d8825e8dffc09f8a48c85b8f85ce3ce0a4978"
+}

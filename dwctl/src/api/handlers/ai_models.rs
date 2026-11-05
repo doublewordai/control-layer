@@ -186,9 +186,9 @@ pub async fn list_ai_models<P: PoolProvider>(
 
     // Resolve the key on the primary: replica lag must not reject a just-created
     // key or accept a just-deleted one. The model listing below stays on the replica.
-    let user_id = sqlx::query_scalar::<_, uuid::Uuid>(
+    let key = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid)>(
         r#"
-        SELECT ak.user_id
+        SELECT ak.id, ak.user_id
         FROM api_keys ak
         INNER JOIN users u ON u.id = ak.user_id
         WHERE ak.secret_hash = $1
@@ -203,7 +203,7 @@ pub async fn list_ai_models<P: PoolProvider>(
     .await
     .map_err(|e| database_error("lookup_api_key", e))?;
 
-    let Some(user_id) = user_id else {
+    let Some((api_key_id, user_id)) = key else {
         // See INVALID_API_KEY_MESSAGE: a wrong-region key looks identical to an
         // invalid one, so the copy nudges users to check their regional endpoint.
         let response = openai_error(
@@ -214,6 +214,7 @@ pub async fn list_ai_models<P: PoolProvider>(
         );
         return Err(rejections::refuse(origin, response, "invalid_api_key", None, None));
     };
+    state.api_key_usage.record(api_key_id);
 
     let mut conn = state
         .db
