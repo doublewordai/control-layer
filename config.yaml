@@ -418,6 +418,16 @@ scheduling:
 # in plaintext. Non-ZDR flex requests are unaffected. Realtime ZDR needs no
 # keystore - it is non-persistence (bodies are suppressed, not encrypted).
 #
+# Also REQUIRED to issue an API key to another user (an org manager issuing to a
+# member): the key's
+# secret is held in Postgres, wrapped with these wrap keys, until the holder's
+# one-off reveal. Without this section such requests are refused (501);
+# self-created keys are unaffected. Those wrapped secrets have no TTL: a
+# background task re-wraps them with each instance's current wrap key every 15
+# minutes. During a rolling rotation an instance still on the old current key
+# re-wraps with it, so keep a retired wrap key until every instance uses the new
+# current key and a reconcile has completed after that.
+#
 # Local dev: run `just redis-start`, then uncomment the block below.
 keystore:
  # Redis holding the wrapped per-request keys (single instance, AOF on).

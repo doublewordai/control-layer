@@ -12,9 +12,12 @@ use crate::{
         can_create_all_resources, can_create_own_resource, can_delete_all_resources, can_delete_own_resource, can_read_all_resources,
         can_read_own_resource, can_update_all_resources, can_update_own_resource, is_org_member, resolve_key_capabilities,
     },
+    crypto::hash_api_key,
     db::handlers::{Repository, api_keys::ApiKeyFilter, api_keys::ApiKeys},
     db::models::api_keys::{ApiKeyCreateDBRequest, ApiKeyPurpose, ApiKeyUpdateDBRequest},
     errors::{Error, Result},
+    keystore::Keystore,
+    pending_secrets::resolve_reveal,
     types::{ApiKeyId, Operation, Permission, Resource, UserIdOrCurrent},
 };
 use rust_decimal::Decimal;
@@ -29,6 +32,20 @@ use sqlx::Acquire;
 
 /// Valid spend-cap reset periods (calendar-aligned UTC; see migration 122/123).
 const VALID_CAP_INTERVALS: [&str; 3] = ["daily", "weekly", "monthly"];
+
+/// Shown when a key is issued to another user on a server with no keystore:
+/// the holder's one-off reveal needs the secret held wrapped until then.
+const NO_KEYSTORE_FOR_ISSUED_KEY: &str = "Issuing an API key to another user needs a keystore to hold its secret until the holder reveals it, and this server has none configured. Create the key from the holder's own account instead, or ask an administrator to configure the keystore.";
+
+/// Wrap an issued key's secret for its pending reveal.
+fn wrap_pending_secret(keystore: &Keystore, secret: &str) -> Result<Vec<u8>> {
+    keystore.wrap(secret.as_bytes()).map_err(|e| {
+        tracing::error!(error = %e, "failed to wrap pending API key secret");
+        Error::Internal {
+            operation: "wrap pending API key secret".to_string(),
+        }
+    })
+}
 
 /// Validate a (spend_limit, spend_limit_interval) pair as submitted via the
 /// API. Mirrors the DB CHECK constraints so users get a 400 with a message
@@ -75,6 +92,7 @@ fn validate_cap_fields(spend_limit: Option<&Decimal>, spend_limit_interval: Opti
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden - can only manage own API keys unless admin"),
         (status = 500, description = "Internal server error"),
+        (status = 501, description = "Issuing a key to another user needs a keystore, and none is configured"),
     ),
     security(
         ("BearerAuth" = []),
@@ -189,18 +207,26 @@ pub async fn create_user_api_key<P: PoolProvider>(
         }
     }
 
-    // Determine created_by based on target type:
-    // - Organization target: attribute to specified member_id, or current user
-    // - Individual target (PM creating on behalf): attribute to the target user
-    //   so the key is visible to them
-    // - Self: attribute to current user
-    let pm_creating_for_other = can_create_all && target_user_id != current_user.id;
+    // Attribute the key: an organization key to the named member (or the
+    // caller); a personal key only ever belongs to its caller, since no
+    // platform role may issue keys for another account.
     let created_by = if target_is_org {
         data.member_id.unwrap_or(current_user.id)
-    } else if pm_creating_for_other {
-        target_user_id
     } else {
         current_user.id
+    };
+
+    // An issued key's secret is held keystore-wrapped until its holder's
+    // one-off reveal; without a keystore there is nowhere to hold it.
+    let issued_to_other = created_by != current_user.id;
+    let keystore = match (&state.keystore, issued_to_other) {
+        (Some(keystore), true) => Some(keystore),
+        (None, true) => {
+            return Err(Error::NotImplemented {
+                message: NO_KEYSTORE_FOR_ISSUED_KEY.to_string(),
+            });
+        }
+        (_, false) => None,
     };
 
     // The validation reads above used a plain connection; release it before
@@ -220,13 +246,15 @@ pub async fn create_user_api_key<P: PoolProvider>(
 
     let mut api_key = repo.create(&db_request).await?;
 
-    // Issued to a DIFFERENT user (manager issuing to a member, or a PM
-    // creating on a user's behalf): the holder gets a one-off "reveal" of
-    // the secret from their own account (migration 131). The issuer still
-    // receives the secret in this response — that is deliberate (e.g. to
-    // stash it in a vault) and does not count as the reveal.
-    if created_by != current_user.id {
-        repo.mark_secret_reveal_pending(api_key.id).await?;
+    // Issued to a DIFFERENT user (an org manager issuing to a member): the
+    // holder gets a one-off "reveal" of
+    // the secret from their own account (migration 131), held wrapped until
+    // then. The issuer still receives the secret in this response — that is
+    // deliberate (e.g. to stash it in a vault) and does not count as the
+    // reveal.
+    if let Some(keystore) = keystore {
+        let pending_secret = wrap_pending_secret(keystore, &api_key.secret)?;
+        repo.mark_secret_reveal_pending(api_key.id, &pending_secret).await?;
         api_key.secret_revealed_at = None;
     }
 
@@ -341,9 +369,7 @@ pub async fn list_user_api_keys<P: PoolProvider>(
     let skip = query.pagination.skip();
     let limit = query.pagination.limit();
 
-    // Scope to keys created by this user, unless they have ReadAll (PlatformManager).
-    // PM-created keys on behalf of users have created_by = target_user_id, so the target
-    // user can always see them. PMs bypass the filter to see all keys for any user.
+    // Scope to keys created by this user, unless they manage the organization.
     //
     // ?created_by narrows the list to one holder SERVER-SIDE, so pagination
     // and total_count cover the filtered set ("all of member X's keys" — an
@@ -775,6 +801,15 @@ pub async fn rotate_user_api_key<P: PoolProvider>(
         })?;
 
     let new_secret = repo.rotate_secret(api_key.id).await?;
+    // Rotation leaves a pending reveal pending, now of the new secret. Without
+    // a keystore it stays unwrapped and the reveal reads the plaintext column.
+    if api_key.secret_revealed_at.is_none()
+        && let Some(keystore) = &state.keystore
+    {
+        let pending_secret = wrap_pending_secret(keystore, &new_secret)?;
+        repo.set_pending_secret(api_key.id, &pending_secret, &hash_api_key(&new_secret))
+            .await?;
+    }
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
     tracing::info!(
@@ -876,9 +911,17 @@ pub async fn reveal_user_api_key<P: PoolProvider>(
 
     // Atomic consume: the IS NULL guard in the UPDATE means exactly one
     // reveal ever succeeds, even under concurrent requests.
-    let secret = repo.reveal_secret_once(api_key.id).await?.ok_or_else(|| Error::Conflict {
+    let pending = repo.reveal_secret_once(api_key.id).await?.ok_or_else(|| Error::Conflict {
         message: "This key's one-off reveal has already been used. Rotate the key to get a fresh secret.".to_string(),
         conflicts: None,
+    })?;
+    // Unwrap before committing: if the secret can't be recovered the
+    // transaction rolls back and the reveal stays available.
+    let (secret, source) = resolve_reveal(state.keystore.as_ref(), &pending).ok_or_else(|| {
+        tracing::error!(api_key_id = %api_key.id, "pending API key secret could not be recovered for reveal");
+        Error::Internal {
+            operation: "recover pending API key secret".to_string(),
+        }
     })?;
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
@@ -886,9 +929,10 @@ pub async fn reveal_user_api_key<P: PoolProvider>(
         revealed_by = %current_user.id,
         api_key_id = %api_key.id,
         key_owner = %api_key.user_id,
+        source = source.as_str(),
         "api key secret revealed (one-off)"
     );
-    metrics::counter!("dwctl_api_key_reveals_total").increment(1);
+    metrics::counter!("dwctl_api_key_reveals_total", "source" => source.as_str()).increment(1);
 
     Ok(Json(ApiKeySecretResponse { key: secret }))
 }
@@ -1005,9 +1049,18 @@ mod tests {
     use crate::api::models::api_keys::{ApiKeyInfoResponse, ApiKeyResponse, ApiKeySecretResponse};
     use crate::api::models::pagination::PaginatedResponse;
     use crate::api::models::users::Role;
+    use crate::crypto::hash_api_key;
+    use crate::keystore::test_keystore;
     use crate::test::utils::*;
     use serde_json::json;
     use sqlx::PgPool;
+
+    async fn stored_pending_secret(pool: &PgPool, id: uuid::Uuid) -> Option<Vec<u8>> {
+        sqlx::query_scalar!("SELECT pending_secret FROM api_keys WHERE id = $1", id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
 
     /// PATCH helper: send an update body for a key as a given user.
     async fn patch_key(
@@ -2308,6 +2361,7 @@ mod tests {
     #[test_log::test]
     async fn test_issued_key_first_reveal_flow(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let keystore = test_keystore("test-1", TEST_WRAP_KEYS);
         let alice = create_test_user(&pool, Role::StandardUser).await;
         let bob = create_test_user(&pool, Role::StandardUser).await;
         let org = create_test_org(&pool, alice.id).await;
@@ -2326,6 +2380,12 @@ mod tests {
         let issued: ApiKeyResponse = response.json();
         assert!(issued.key.starts_with("sk-"), "issuer still gets the secret at creation");
         assert!(issued.secret_revealed_at.is_none(), "issued key must be born unrevealed");
+        // The secret is held wrapped for the reveal, never in the clear.
+        let wrapped = stored_pending_secret(&pool, issued.id)
+            .await
+            .expect("issued key holds a wrapped secret");
+        assert!(!wrapped.windows(issued.key.len()).any(|w| w == issued.key.as_bytes()));
+        assert_eq!(keystore.unwrap(&wrapped).unwrap(), issued.key.as_bytes());
 
         // Bob sees the pending reveal on his org list.
         let response = app
@@ -2354,8 +2414,18 @@ mod tests {
             .await;
         response.assert_status_ok();
         let rotated: ApiKeySecretResponse = response.json();
+        // …and re-wraps the pending secret to the new one.
+        let rewrapped = stored_pending_secret(&pool, issued.id)
+            .await
+            .expect("rotation keeps a wrapped secret");
+        assert_eq!(keystore.unwrap(&rewrapped).unwrap(), rotated.key.as_bytes());
 
-        // …and Bob's reveal returns the CURRENT (post-rotation) secret.
+        // Bob's reveal returns the CURRENT (post-rotation) secret, from the
+        // wrap rather than the plaintext column.
+        sqlx::query!("UPDATE api_keys SET secret = 'sk-not-the-secret' WHERE id = $1", issued.id)
+            .execute(&pool)
+            .await
+            .unwrap();
         let response = app
             .post(&format!("/admin/api/v1/users/{}/api-keys/{}/reveal", org.id, issued.id))
             .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
@@ -2364,6 +2434,7 @@ mod tests {
         response.assert_status_ok();
         let revealed: ApiKeySecretResponse = response.json();
         assert_eq!(revealed.key, rotated.key);
+        assert_eq!(stored_pending_secret(&pool, issued.id).await, None, "the reveal clears the wrap");
 
         // The reveal is consumed: stamped on the list, and a second attempt
         // conflicts.
@@ -2397,6 +2468,85 @@ mod tests {
             .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
             .await;
         response.assert_status(axum::http::StatusCode::CONFLICT);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_issuing_key_without_keystore_is_refused(pool: PgPool) {
+        let mut config = create_test_config();
+        config.keystore = None;
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+
+        // An org manager issuing a key to a member: no keystore to hold the
+        // pending secret, so refused before anything is created.
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&alice)[0].0, &add_auth_headers(&alice)[0].1)
+            .add_header(&add_auth_headers(&alice)[1].0, &add_auth_headers(&alice)[1].1)
+            .json(&json!({"name": "Issued", "purpose": "realtime", "member_id": bob.id}))
+            .await;
+        response.assert_status(axum::http::StatusCode::NOT_IMPLEMENTED);
+        assert!(response.maybe_header("retry-after").is_none(), "retrying cannot help");
+        assert!(response.text().contains("keystore"), "error says why: {}", response.text());
+        let keys: i64 = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) AS "count!" FROM api_keys WHERE user_id IN ($1, $2) AND hidden = false"#,
+            org.id,
+            bob.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(keys, 0);
+
+        // Self-created keys are unaffected.
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .json(&json!({"name": "Self", "purpose": "realtime"}))
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let self_key: ApiKeyResponse = response.json();
+        assert_eq!(stored_pending_secret(&pool, self_key.id).await, None);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_reveal_of_key_pending_before_wrapping_uses_plaintext(pool: PgPool) {
+        // A key left pending by an earlier release has no wrap; its reveal
+        // falls back to the plaintext column until the reconcile wraps it.
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let response = app
+            .post("/admin/api/v1/users/current/api-keys")
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .json(&json!({"name": "Legacy", "purpose": "realtime"}))
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let key: ApiKeyResponse = response.json();
+        sqlx::query!("UPDATE api_keys SET secret_revealed_at = NULL WHERE id = $1", key.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let stored_hash: Option<Vec<u8>> = sqlx::query_scalar!("SELECT secret_hash FROM api_keys WHERE id = $1", key.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored_hash.as_deref(), Some(&hash_api_key(&key.key)[..]));
+
+        let response = app
+            .post(&format!("/admin/api/v1/users/current/api-keys/{}/reveal", key.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .await;
+        response.assert_status_ok();
+        let revealed: ApiKeySecretResponse = response.json();
+        assert_eq!(revealed.key, key.key);
     }
 
     #[dwctl_test_macros::test]

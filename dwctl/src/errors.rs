@@ -182,6 +182,12 @@ pub enum Error {
     /// permanent 4xx/5xx.
     #[error("Service temporarily unavailable: {message}")]
     ServiceUnavailable { message: String },
+
+    /// The request needs a capability this deployment is not configured
+    /// for (e.g. a keystore). Produces 501: retrying cannot help until an
+    /// operator changes the configuration.
+    #[error("Not implemented on this server: {message}")]
+    NotImplemented { message: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -221,6 +227,7 @@ impl Error {
             Error::ModalityDisabled { .. } => StatusCode::FORBIDDEN,
             Error::TooManyRequests { .. } => StatusCode::TOO_MANY_REQUESTS,
             Error::ServiceUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Error::NotImplemented { .. } => StatusCode::NOT_IMPLEMENTED,
         }
     }
 
@@ -286,6 +293,7 @@ impl Error {
             Error::ModalityDisabled { modality } => modality.disabled_message(),
             Error::TooManyRequests { message } => message.clone(),
             Error::ServiceUnavailable { message } => message.clone(),
+            Error::NotImplemented { message } => message.clone(),
         }
     }
 }
@@ -337,6 +345,9 @@ impl IntoResponse for Error {
             }
             Error::ServiceUnavailable { .. } => {
                 tracing::warn!("Service temporarily unavailable: {}", self);
+            }
+            Error::NotImplemented { .. } => {
+                tracing::warn!("Not implemented on this server: {}", self);
             }
         }
 
