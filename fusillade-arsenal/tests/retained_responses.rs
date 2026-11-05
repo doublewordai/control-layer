@@ -964,7 +964,7 @@ async fn erase_racing_same_id_create_rolls_back_request_and_template(pool: PgPoo
     assert_write_error(&error, RetainedResponseWriteError::NotFound);
     assert_eq!(count_ids(&pool, "requests", &graph.request_ids).await, 0);
     let leaked: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM request_templates_all WHERE body = 'must_not_survive' OR api_key = 'must-not-survive'",
+        "SELECT COUNT(*) FROM request_templates_all WHERE body = 'must_not_survive'",
     )
     .fetch_one(&pool)
     .await
@@ -1299,7 +1299,7 @@ async fn late_request_writers_treat_an_active_retained_graph_as_terminal(pool: P
 
     assert_wholly_retained(&pool, &graph).await;
     let orphan_templates: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM request_templates_all WHERE body LIKE '%must_not%' OR api_key = 'must-not-survive'",
+        "SELECT COUNT(*) FROM request_templates_all WHERE body LIKE '%must_not%'",
     )
     .fetch_one(&pool)
     .await
@@ -1510,7 +1510,7 @@ async fn late_synthesis_is_fenced_after_the_retained_partition_disappears(pool: 
     assert_write_error(&error, RetainedResponseWriteError::NotFound);
     assert_eq!(count_ids(&pool, "requests", &graph.request_ids).await, 0);
     let orphan_templates: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM request_templates_all WHERE body LIKE '%must_not%' OR api_key = 'must-not-survive'",
+        "SELECT COUNT(*) FROM request_templates_all WHERE body LIKE '%must_not%'",
     )
     .fetch_one(&pool)
     .await
@@ -1570,7 +1570,7 @@ async fn retiring_route_blocks_late_synthesis_after_archive_fence_expiry(pool: P
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM request_templates_all \
-             WHERE body LIKE '%must_not%' OR api_key = 'must-not-survive'",
+             WHERE body LIKE '%must_not%'",
         )
         .fetch_one(&pool)
         .await
@@ -2057,11 +2057,11 @@ async fn insert_request(
         WITH inserted AS (
             INSERT INTO request_templates_g2 (
                 created_on, id, file_id, custom_id, endpoint, method, path, body, model,
-                api_key, line_number, body_byte_size, metadata, created_at, updated_at
+                line_number, body_byte_size, metadata, created_at, updated_at
             ) VALUES (
                 (statement_timestamp() AT TIME ZONE 'UTC')::date,
                 $1, NULL, $2, 'http://retention.invalid', 'POST', '/v1/responses',
-                $3, $4, 'secret-test-key', 7, $5, $6,
+                $3, $4, 7, $5, $6,
                 $7 - INTERVAL '1 hour', $7 - INTERVAL '30 minutes'
             )
             RETURNING id, created_on
@@ -4764,12 +4764,12 @@ async fn erase_in_overlap_state_removes_both_copies_and_stays_erased(pool: PgPoo
         r#"
         WITH inserted AS (
             INSERT INTO request_templates_g2 (
-                created_on, id, file_id, endpoint, method, path, body, model, api_key,
+                created_on, id, file_id, endpoint, method, path, body, model,
                 line_number, body_byte_size, created_at, updated_at
             ) VALUES (
                 (statement_timestamp() AT TIME ZONE 'UTC')::date,
                 $1, NULL, 'http://retention.invalid', 'POST', '/v1/responses',
-                '{"prompt":"duplicate"}', $2, 'secret-test-key', 0, 22,
+                '{"prompt":"duplicate"}', $2, 0, 22,
                 '2026-08-01 08:00:00Z', '2026-08-01 10:00:00Z'
             )
             RETURNING id, created_on
@@ -4910,12 +4910,12 @@ async fn read_mixed_live_and_retained_rows_do_not_double_count_or_split_demand(p
         r#"
         WITH inserted AS (
             INSERT INTO request_templates_g2 (
-                created_on, id, file_id, endpoint, method, path, body, model, api_key,
+                created_on, id, file_id, endpoint, method, path, body, model,
                 line_number, body_byte_size, created_at, updated_at
             ) VALUES (
                 (statement_timestamp() AT TIME ZONE 'UTC')::date,
                 $1, NULL, 'http://retention.invalid', 'POST', '/v1/responses',
-                '{"prompt":"duplicate"}', $2, 'secret-test-key', 0, 22,
+                '{"prompt":"duplicate"}', $2, 0, 22,
                 '2026-08-01 08:00:00Z', '2026-08-01 10:00:00Z'
             )
             RETURNING id, created_on

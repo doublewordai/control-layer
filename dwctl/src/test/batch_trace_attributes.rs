@@ -118,7 +118,6 @@ async fn batch_request_and_batch_finalized_spans_carry_the_account(pool: PgPool)
         template_id,
         Some(file_id),
         "trace-batch",
-        "",
         &mock_server.uri(),
         "/v1/chat/completions",
         &serde_json::json!({"model": "trace-batch", "messages": [{"role": "user", "content": "hi"}]}).to_string(),

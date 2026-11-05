@@ -276,7 +276,6 @@ mod tests {
             template_id,
             None,
             "m",
-            "k",
             "http://x",
             uri,
             r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,

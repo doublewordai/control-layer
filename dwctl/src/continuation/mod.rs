@@ -99,8 +99,7 @@ pub async fn provision_global_key(pool: &PgPool) -> anyhow::Result<ApiKeyHash> {
         .await?;
     let hash = sqlx::query_scalar!("SELECT secret_hash FROM api_keys WHERE id = $1", id)
         .fetch_one(&mut *tx)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("continuation key {id} has no secret hash"))?;
+        .await?;
     tx.commit().await?;
     ApiKeyHash::try_from(hash.as_slice()).map_err(|_| anyhow::anyhow!("continuation key {id} has a malformed secret hash"))
 }

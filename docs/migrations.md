@@ -222,6 +222,7 @@ before its expand step fails against the contracted schema.
 |--------------|------------------------|-----|
 | 15.8.0 | 15.6.0 | `api_keys.secret_hash` must be non-NULL; releases before 15.6.0 create keys without it |
 | 16.5.0 | 16.3.0 | Keys created from 16.5.0 store a placeholder in `api_keys.secret`, and fusillade work stores no key: before 16.3.0 a one-off reveal can hand out the placeholder, and before 16.0.0 dispatch sends no credential |
+| 16.6.0 | 16.5.0 | `api_keys.secret` and Fusillade's stored `api_key` columns are dropped; releases before 16.5.0 read and write them |
 
 ## Checklist before opening a PR
 

@@ -10329,9 +10329,8 @@ mod tests {
             .map(|id| id.parse().unwrap())
     }
 
-    /// Batchless requests record the key id they run as and no key: the
-    /// template's key column takes its empty default, a claim reports the id
-    /// and hands over no key.
+    /// Batchless requests record the key id they run as and no key; a claim
+    /// reports the id and hands over no key.
     #[sqlx::test]
     async fn batchless_requests_record_their_key_id(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
@@ -10378,23 +10377,18 @@ mod tests {
             .await
             .unwrap();
 
-        let stored: HashMap<Uuid, (String, Option<Uuid>)> =
-            sqlx::query_as::<_, (Uuid, String, Option<Uuid>)>(
-                "SELECT r.id, t.api_key, t.api_key_id FROM requests r
+        let stored: HashMap<Uuid, Option<Uuid>> = sqlx::query_as::<_, (Uuid, Option<Uuid>)>(
+            "SELECT r.id, t.api_key_id FROM requests r
              JOIN request_templates_all t ON t.id = r.template_id",
-            )
-            .fetch_all(&pool)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|(id, key, key_id)| (id, (key, key_id)))
-            .collect();
-        assert_eq!(stored[&by_id], (String::new(), Some(flex_key)));
-        assert_eq!(stored[&legacy], (String::new(), None));
-        assert_eq!(
-            stored[&background_id],
-            (String::new(), Some(background_key))
-        );
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+        assert_eq!(stored[&by_id], Some(flex_key));
+        assert_eq!(stored[&legacy], None);
+        assert_eq!(stored[&background_id], Some(background_key));
 
         mark_models_live_for_test(&manager, ["key-id-model"]).await;
         let capacity = HashMap::from([("key-id-model".to_string(), 10)]);
@@ -10460,13 +10454,6 @@ mod tests {
             .await
             .unwrap();
         let legacy = manager.create_batch(batch_input(None, None)).await.unwrap();
-        let stored_batch_keys: Vec<Option<String>> =
-            sqlx::query_scalar("SELECT api_key FROM batches WHERE id = ANY($1)")
-                .bind([*by_id.id, *legacy.id])
-                .fetch_all(&pool)
-                .await
-                .unwrap();
-        assert_eq!(stored_batch_keys, vec![None, None]);
 
         let capacity = HashMap::from([("batch-key-model".to_string(), 10)]);
         let claimed = claim_batch_requests_for_test(

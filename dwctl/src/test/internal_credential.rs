@@ -321,8 +321,7 @@ async fn dispatched_as(pool: &PgPool, request_filter: &str, bind: Uuid) -> Optio
     }
 }
 
-/// Batch and flex requests record the key id they run as and no key secret,
-/// and the daemon's dispatch authenticates as that key with a fresh internal
+/// Batch and flex requests record the key id they run as, and the daemon's dispatch authenticates as that key with a fresh internal
 /// credential: a flex request as the caller's hidden batch key (or the
 /// caller's cap-scope child), a batch as the key the batch names.
 #[dwctl_test_macros::test]
@@ -346,16 +345,11 @@ async fn daemon_dispatches_batch_and_flex_requests_as_their_key_id(pool: PgPool)
     let response = flex().await;
     assert_eq!(response.status_code(), 200, "flex: {}", response.text());
     assert_eq!(response.json::<serde_json::Value>()["choices"][0]["message"]["content"], "hi");
-    let stored: Vec<(String, Option<Uuid>)> =
-        sqlx::query_as("SELECT api_key, api_key_id FROM fusillade.request_templates_all WHERE file_id IS NULL")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-    assert_eq!(
-        stored,
-        vec![(String::new(), Some(batch_key))],
-        "flex stores the key id and no secret"
-    );
+    let stored: Vec<Option<Uuid>> = sqlx::query_scalar("SELECT api_key_id FROM fusillade.request_templates_all WHERE file_id IS NULL")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, vec![Some(batch_key)], "flex stores the key id");
     assert_eq!(
         dispatched_as(&pool, "api_key_id = $1", batch_key).await,
         Some(batch_key),
@@ -406,15 +400,13 @@ async fn daemon_dispatches_batch_and_flex_requests_as_their_key_id(pool: PgPool)
         .trim_start_matches("batch_")
         .parse()
         .unwrap();
-    let (stored_key, named_key): (Option<String>, Option<Uuid>) =
-        sqlx::query_as("SELECT api_key, api_key_id FROM fusillade.batches WHERE id = $1")
-            .bind(batch_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let named_key: Option<Uuid> = sqlx::query_scalar("SELECT api_key_id FROM fusillade.batches WHERE id = $1")
+        .bind(batch_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     let named_key = named_key.expect("the batch names its key");
     assert_eq!(named_key, batch_key, "the batch runs as the hidden batch key");
-    assert_eq!(stored_key, None, "batches store the key id and no secret");
     assert_eq!(
         dispatched_as(&pool, "fusillade_batch_id = $1", batch_id).await,
         Some(named_key),

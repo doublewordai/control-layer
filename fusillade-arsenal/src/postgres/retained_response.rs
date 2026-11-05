@@ -461,7 +461,6 @@ pub(crate) struct RetainedTemplateSnapshot {
     pub(crate) path: String,
     pub(crate) body: String,
     pub(crate) model: String,
-    pub(crate) api_key: String,
     pub(crate) line_number: i32,
     pub(crate) body_byte_size: i64,
     pub(crate) metadata: Option<serde_json::Value>,
@@ -479,10 +478,6 @@ struct RetainedTemplateSnapshotWire {
     path: String,
     body: String,
     model: String,
-    // No longer stored: written empty for the previous release, which
-    // requires it, and absent once that release is gone.
-    #[serde(default)]
-    api_key: String,
     line_number: i32,
     body_byte_size: i64,
     metadata: Option<serde_json::Value>,
@@ -508,7 +503,6 @@ impl<'de> Deserialize<'de> for RetainedTemplateSnapshot {
             path: wire.path,
             body: wire.body,
             model: wire.model,
-            api_key: wire.api_key,
             line_number: wire.line_number,
             body_byte_size: wire.body_byte_size,
             metadata: wire.metadata,
@@ -530,7 +524,6 @@ impl fmt::Debug for RetainedTemplateSnapshot {
             .field("has_path", &!self.path.is_empty())
             .field("has_body", &!self.body.is_empty())
             .field("has_model", &!self.model.is_empty())
-            .field("has_api_key", &!self.api_key.is_empty())
             .field("has_metadata", &self.metadata.is_some())
             .finish()
     }
@@ -2171,7 +2164,6 @@ fn template_snapshot(row: &PgRow) -> MovementResult<RetainedTemplateSnapshot> {
             path: row.try_get("path")?,
             body: row.try_get("body")?,
             model: row.try_get("model")?,
-            api_key: String::new(),
             line_number: row.try_get("line_number")?,
             body_byte_size: row.try_get("body_byte_size")?,
             metadata: row.try_get("metadata")?,
@@ -3267,7 +3259,6 @@ pub(crate) async fn insert_completed_realtime(
                     body_byte_size: body.len() as i64,
                     body,
                     model: record.model.clone(),
-                    api_key: String::new(),
                     line_number: 0,
                     metadata: None,
                     created_at: now,
@@ -5127,7 +5118,6 @@ mod tests {
                 path: "/v1/responses".to_owned(),
                 body: "prompt-body-secret".to_owned(),
                 model: "template-routing-model".to_owned(),
-                api_key: "api-key-secret".to_owned(),
                 line_number: 42,
                 body_byte_size: 18,
                 metadata: Some(json!({"request_source": "metadata-secret"})),
@@ -5240,6 +5230,8 @@ mod tests {
             .expect("request fixture must encode");
         let mut future_payload = row.payload.clone();
         future_payload["future_additive_field"] = json!({"marker": "future-secret"});
+        // Releases that stored API keys wrote one into every template snapshot.
+        future_payload["template"]["api_key"] = json!("api-key-secret");
         let decoded = RetainedResponseObjectRow {
             payload: future_payload,
             ..row
@@ -5291,7 +5283,6 @@ mod tests {
         assert_eq!(decoded.template.method, "POST");
         assert_eq!(decoded.template.path, "/v1/responses");
         assert_eq!(decoded.template.model, "template-routing-model");
-        assert_eq!(decoded.template.api_key, "api-key-secret");
         assert_eq!(decoded.template.line_number, 42);
         assert_eq!(decoded.template.body_byte_size, 18);
         assert_eq!(
