@@ -79,7 +79,7 @@ impl fmt::Debug for PrefixChainConfig {
 /// `models` accepts a sequence (YAML) or a comma-separated string (env override).
 /// Absent stays `None`. An empty string becomes an empty list, which validation rejects
 /// with the same message as an empty YAML list.
-fn deserialize_model_list<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
+pub(crate) fn deserialize_model_list<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum Raw {
@@ -279,7 +279,7 @@ impl fmt::Debug for PrefixChainRecorder {
 /// A fixed, content-free name for a parse failure. `ParseError`'s Display can echo the
 /// client's own value (an invalid TTL string, an unsupported content type), so logs and
 /// labels use this instead.
-fn parse_error_kind(e: &ParseError) -> &'static str {
+pub(crate) fn parse_error_kind(e: &ParseError) -> &'static str {
     match e {
         ParseError::Json(_) => "json",
         ParseError::TooManyBreakpoints => "too_many_breakpoints",

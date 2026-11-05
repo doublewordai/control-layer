@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE reference_cache_entries SET expires_at = now() + interval '10 seconds' WHERE principal_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3449165fe16a816a3763447ea2ef159ad30b6ad5788a58a23bfc81350193525b"
+}
