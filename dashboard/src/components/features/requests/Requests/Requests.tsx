@@ -55,7 +55,7 @@ export function Requests() {
   // Initialize with last 24 hours as default
   const getDefaultDateRange = () => {
     const now = new Date();
-    const from = new Date(now.getTime() - 31 * 24 * 60 * 60 * 1000);
+    const from = new Date(now.getTime() - 24 * 60 * 60 * 1000);
     return { from, to: now };
   };
   const [dateRange, setDateRange] = useState<
