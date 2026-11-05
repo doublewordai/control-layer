@@ -235,7 +235,9 @@ store.create_background(CreateBackgroundInput {
     endpoint: "https://api.example.com".to_string(),
     method: "POST".to_string(),
     path: "/v1/responses".to_string(),
+    api_key_id: Uuid::new_v4(),
     created_by: "user-id".to_string(),
+    metadata: None,
 }).await?;
 ```
 

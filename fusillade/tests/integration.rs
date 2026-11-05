@@ -93,6 +93,7 @@ async fn seed_leak_work(store: &TestStore) {
                 endpoint: "https://api.example.com".into(),
                 method: "POST".into(),
                 path: "/test".into(),
+                api_key_id: uuid::Uuid::new_v4(),
                 created_by: "alice".into(),
                 metadata: None,
             })
@@ -421,6 +422,7 @@ async fn default_claims_start_while_weekly_partition_ddl_is_blocked(pool: sqlx::
             endpoint: "https://api.example.com".to_string(),
             method: "POST".to_string(),
             path: "/v1/ddl-independent".to_string(),
+            api_key_id: uuid::Uuid::new_v4(),
             created_by: "ddl-independent-owner".to_string(),
             metadata: None,
         })
@@ -493,6 +495,7 @@ async fn background_tier_end_to_end(pool: sqlx::PgPool) {
                 endpoint: "https://api.example.com".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/background-test".to_string(),
+                api_key_id: uuid::Uuid::new_v4(),
                 created_by: format!("sla-owner-{sequence}"),
                 metadata: None,
             })
@@ -537,6 +540,7 @@ async fn background_tier_end_to_end(pool: sqlx::PgPool) {
             endpoint: "https://api.example.com".to_string(),
             method: "POST".to_string(),
             path: "/v1/background-test".to_string(),
+            api_key_id: uuid::Uuid::new_v4(),
             created_by: "background-request-owner".to_string(),
             metadata: None,
         })
@@ -594,6 +598,7 @@ async fn background_tier_end_to_end(pool: sqlx::PgPool) {
             endpoint: "https://api.example.com".to_string(),
             method: "POST".to_string(),
             path: "/v1/background-test".to_string(),
+            api_key_id: uuid::Uuid::new_v4(),
             created_by: "late-sla-owner".to_string(),
             metadata: None,
         })
@@ -1260,6 +1265,7 @@ async fn adaptive_concurrency_grows_past_the_configured_limit(pool: sqlx::PgPool
                 endpoint: "https://api.example.com".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/grow".to_string(),
+                api_key_id: uuid::Uuid::new_v4(),
                 created_by: format!("owner-{index}"),
                 metadata: None,
             })
@@ -1371,6 +1377,7 @@ async fn background_529_does_not_throttle_foreground_claims(pool: sqlx::PgPool) 
             endpoint: "https://api.example.com".to_string(),
             method: "POST".to_string(),
             path: "/v1/adaptive-shared".to_string(),
+            api_key_id: uuid::Uuid::new_v4(),
             created_by: "background-owner".to_string(),
             metadata: None,
         })
@@ -1411,6 +1418,7 @@ async fn background_529_does_not_throttle_foreground_claims(pool: sqlx::PgPool) 
                 endpoint: "https://api.example.com".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/adaptive-shared".to_string(),
+                api_key_id: uuid::Uuid::new_v4(),
                 created_by: format!("foreground-owner-{index}"),
                 metadata: None,
             })
@@ -3770,6 +3778,7 @@ mod service_tier {
                 endpoint: "http://localhost".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
+                api_key_id: uuid::Uuid::new_v4(),
                 created_by: "tier-user".to_string(),
                 metadata: None,
             })
@@ -3863,6 +3872,7 @@ mod unverified_volume_counts {
                 endpoint: "http://localhost".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
+                api_key_id: uuid::Uuid::new_v4(),
                 created_by: creditor.to_string(),
                 metadata: None,
             })

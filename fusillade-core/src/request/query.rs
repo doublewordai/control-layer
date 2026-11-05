@@ -305,6 +305,8 @@ pub struct CreateFlexInput {
     pub method: String,
     /// API path (e.g., "/v1/responses").
     pub path: String,
+    /// The API key the request is dispatched as.
+    pub api_key_id: Uuid,
     /// User/org ID that owns this request.
     pub created_by: String,
     /// Provenance for the dispatched request, stored on the template.
@@ -336,6 +338,8 @@ pub struct CreateBackgroundInput {
     pub method: String,
     /// API path (e.g., "/v1/responses").
     pub path: String,
+    /// The API key the request is dispatched as.
+    pub api_key_id: Uuid,
     /// User/org ID that owns this request.
     pub created_by: String,
     /// Provenance for the dispatched request, stored on the template. See
@@ -370,6 +374,7 @@ mod background_tests {
             endpoint: "http://localhost:3001".to_string(),
             method: "POST".to_string(),
             path: "/v1/responses".to_string(),
+            api_key_id: uuid::Uuid::new_v4(),
             created_by: "user-a".to_string(),
             metadata: None,
         };

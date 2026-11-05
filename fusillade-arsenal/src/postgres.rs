@@ -362,7 +362,7 @@ struct NewPendingRequest {
     endpoint: String,
     method: String,
     path: String,
-    api_key_id: Option<Uuid>,
+    api_key_id: Uuid,
     created_by: String,
     service_tier: &'static str,
     /// Provenance stored on the template, standing in for the batch metadata a
@@ -951,53 +951,6 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         })
     }
 
-    /// [`Storage::create_flex`], recording the API key the request is
-    /// dispatched as. A claim reports it under
-    /// [`API_KEY_ID_METADATA_KEY`] in the request's batch metadata.
-    #[tracing::instrument(level = "debug", skip(self, input))]
-    pub async fn create_flex_as(
-        &self,
-        input: CreateFlexInput,
-        api_key_id: Option<Uuid>,
-    ) -> Result<RequestId> {
-        self.insert_batchless_pending_request(NewPendingRequest {
-            request_id: input.request_id,
-            body: input.body,
-            model: input.model,
-            endpoint: input.endpoint,
-            method: input.method,
-            path: input.path,
-            api_key_id,
-            created_by: input.created_by,
-            service_tier: "flex",
-            metadata: input.metadata,
-        })
-        .await
-    }
-
-    /// [`Storage::create_background`], recording the API key the request is
-    /// dispatched as. See [`Self::create_flex_as`].
-    #[tracing::instrument(level = "debug", skip(self, input))]
-    pub async fn create_background_as(
-        &self,
-        input: CreateBackgroundInput,
-        api_key_id: Option<Uuid>,
-    ) -> Result<RequestId> {
-        self.insert_batchless_pending_request(NewPendingRequest {
-            request_id: input.request_id,
-            body: input.body,
-            model: input.model,
-            endpoint: input.endpoint,
-            method: input.method,
-            path: input.path,
-            api_key_id,
-            created_by: input.created_by,
-            service_tier: "background",
-            metadata: input.metadata,
-        })
-        .await
-    }
-
     async fn insert_batchless_pending_request(
         &self,
         input: NewPendingRequest,
@@ -1022,7 +975,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 path: &input.path,
                 body: stored_body.as_ref(),
                 model: &input.model,
-                api_key_id: input.api_key_id,
+                api_key_id: Some(input.api_key_id),
                 metadata: input.metadata.as_ref(),
             },
         )
@@ -6798,14 +6751,41 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Ok(RequestId(input.request_id))
     }
 
+    /// Records the API key the request is dispatched as; a claim reports it
+    /// under [`API_KEY_ID_METADATA_KEY`] in the request's batch metadata.
     #[tracing::instrument(level = "debug", skip(self, input))]
     async fn create_flex(&self, input: CreateFlexInput) -> Result<RequestId> {
-        self.create_flex_as(input, None).await
+        self.insert_batchless_pending_request(NewPendingRequest {
+            request_id: input.request_id,
+            body: input.body,
+            model: input.model,
+            endpoint: input.endpoint,
+            method: input.method,
+            path: input.path,
+            api_key_id: input.api_key_id,
+            created_by: input.created_by,
+            service_tier: "flex",
+            metadata: input.metadata,
+        })
+        .await
     }
 
+    /// See [`Storage::create_flex`].
     #[tracing::instrument(level = "debug", skip(self, input))]
     async fn create_background(&self, input: CreateBackgroundInput) -> Result<RequestId> {
-        self.create_background_as(input, None).await
+        self.insert_batchless_pending_request(NewPendingRequest {
+            request_id: input.request_id,
+            body: input.body,
+            model: input.model,
+            endpoint: input.endpoint,
+            method: input.method,
+            path: input.path,
+            api_key_id: input.api_key_id,
+            created_by: input.created_by,
+            service_tier: "background",
+            metadata: input.metadata,
+        })
+        .await
     }
 
     async fn complete_request(
@@ -10280,6 +10260,7 @@ mod tests {
                 endpoint: "https://api.example.com".to_string(),
                 method: "POST".to_string(),
                 path: "/test".to_string(),
+                api_key_id: uuid::Uuid::new_v4(),
                 created_by: owner.to_string(),
                 metadata: None,
             })
@@ -10338,35 +10319,32 @@ mod tests {
         });
         let flex_key = Uuid::new_v4();
         let background_key = Uuid::new_v4();
-        let flex = || CreateFlexInput {
-            request_id: Uuid::new_v4(),
-            body: "{}".to_string(),
-            model: "key-id-model".to_string(),
-            endpoint: "https://api.example.com".to_string(),
-            method: "POST".to_string(),
-            path: "/test".to_string(),
-            created_by: "owner".to_string(),
-            metadata: None,
-        };
         let by_id = manager
-            .create_flex_as(flex(), Some(flex_key))
+            .create_flex(CreateFlexInput {
+                request_id: Uuid::new_v4(),
+                body: "{}".to_string(),
+                model: "key-id-model".to_string(),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                api_key_id: flex_key,
+                created_by: "owner".to_string(),
+                metadata: None,
+            })
             .await
             .unwrap();
-        let legacy = manager.create_flex(flex()).await.unwrap();
         let background_id = manager
-            .create_background_as(
-                CreateBackgroundInput {
-                    request_id: Uuid::new_v4(),
-                    body: "{}".to_string(),
-                    model: "key-id-model".to_string(),
-                    endpoint: "https://api.example.com".to_string(),
-                    method: "POST".to_string(),
-                    path: "/test".to_string(),
-                    created_by: "owner".to_string(),
-                    metadata: None,
-                },
-                Some(background_key),
-            )
+            .create_background(CreateBackgroundInput {
+                request_id: Uuid::new_v4(),
+                body: "{}".to_string(),
+                model: "key-id-model".to_string(),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                api_key_id: background_key,
+                created_by: "owner".to_string(),
+                metadata: None,
+            })
             .await
             .unwrap();
 
@@ -10380,7 +10358,6 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(stored[&by_id], Some(flex_key));
-        assert_eq!(stored[&legacy], None);
         assert_eq!(stored[&background_id], Some(background_key));
 
         mark_models_live_for_test(&manager, ["key-id-model"]).await;
@@ -10393,9 +10370,8 @@ mod tests {
             .iter()
             .map(|r| (r.data.id, (r.data.api_key.clone(), key_id_of(r))))
             .collect();
-        assert_eq!(claimed.len(), 2);
+        assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[&by_id], (String::new(), Some(flex_key)));
-        assert_eq!(claimed[&legacy], (String::new(), None));
 
         let background = manager
             .claim_background_batchless_requests(1, daemon_id, &capacity, &HashMap::new())
@@ -10515,7 +10491,8 @@ mod tests {
             .create_batch(batch_input(Some(batch_key)))
             .await
             .unwrap();
-        let legacy_flex = manager
+        let flex_key = Uuid::new_v4();
+        let keyed_flex = manager
             .create_flex(CreateFlexInput {
                 request_id: Uuid::new_v4(),
                 body: "{}".to_string(),
@@ -10523,6 +10500,7 @@ mod tests {
                 endpoint: "https://api.example.com".to_string(),
                 method: "POST".to_string(),
                 path: "/test".to_string(),
+                api_key_id: flex_key,
                 created_by: "owner".to_string(),
                 metadata: Some(spoofed.clone()),
             })
@@ -10558,8 +10536,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(flex.len(), 1);
-        assert_eq!(flex[0].data.id, legacy_flex);
-        assert_eq!(key_id_of(&flex[0]), None);
+        assert_eq!(flex[0].data.id, keyed_flex);
+        assert_eq!(key_id_of(&flex[0]), Some(flex_key));
     }
 
     #[sqlx::test]
@@ -10818,6 +10796,7 @@ mod tests {
                 endpoint: "http://localhost:3001/ai".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
+                api_key_id: uuid::Uuid::new_v4(),
                 created_by: "user-123".to_string(),
                 metadata: None,
             })
@@ -12057,6 +12036,7 @@ mod tests {
                 endpoint: "https://api.example.com".to_string(),
                 method: "POST".to_string(),
                 path: "/test".to_string(),
+                api_key_id: uuid::Uuid::new_v4(),
                 created_by: "foreground-owner".to_string(),
                 metadata: None,
             })
@@ -12113,6 +12093,7 @@ mod tests {
                 endpoint: "https://api.example.com".to_string(),
                 method: "POST".to_string(),
                 path: "/test".to_string(),
+                api_key_id: uuid::Uuid::new_v4(),
                 created_by: "sla-owner".to_string(),
                 metadata: None,
             })
@@ -12166,6 +12147,7 @@ mod tests {
                 endpoint: "https://api.example.com".to_string(),
                 method: "POST".to_string(),
                 path: "/test".to_string(),
+                api_key_id: uuid::Uuid::new_v4(),
                 created_by: "sla-owner".to_string(),
                 metadata: None,
             })
@@ -12454,6 +12436,7 @@ mod tests {
                 endpoint: "https://api.example.com".to_string(),
                 method: "POST".to_string(),
                 path: "/test".to_string(),
+                api_key_id: uuid::Uuid::new_v4(),
                 created_by: "sla-owner".to_string(),
                 metadata: None,
             })
@@ -12544,6 +12527,7 @@ mod tests {
                 endpoint: "https://api.example.com".to_string(),
                 method: "POST".to_string(),
                 path: "/test".to_string(),
+                api_key_id: uuid::Uuid::new_v4(),
                 created_by: "user".to_string(),
                 metadata: None,
             })
@@ -12593,6 +12577,7 @@ mod tests {
                 endpoint: "https://api.example.com".to_string(),
                 method: "POST".to_string(),
                 path: "/test".to_string(),
+                api_key_id: uuid::Uuid::new_v4(),
                 created_by: "user".to_string(),
                 metadata: Some(serde_json::json!({
                     "dw_user_agent": "claude-cli/1.2.3",
@@ -12717,6 +12702,7 @@ mod tests {
                 endpoint: "https://api.example.com".to_string(),
                 method: "POST".to_string(),
                 path: "/test".to_string(),
+                api_key_id: uuid::Uuid::new_v4(),
                 created_by: "user".to_string(),
                 metadata: None,
             })
@@ -13410,6 +13396,7 @@ mod tests {
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
                     path: "/test".to_string(),
+                    api_key_id: uuid::Uuid::new_v4(),
                     created_by: "user".to_string(),
                     metadata: None,
                 })
@@ -19856,7 +19843,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: r#"{"test": 1}"#.to_string(),
                         model: "model-a".to_string(),
-                        api_key: "test-key".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: Some("req2".to_string()),
@@ -19865,7 +19851,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: r#"{"test": 2}"#.to_string(),
                         model: "model-a".to_string(),
-                        api_key: "test-key".to_string(),
                     },
                 ],
             )
@@ -19881,7 +19866,6 @@ mod tests {
                 endpoint: "/v1/chat/completions".to_string(),
                 metadata: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -21433,6 +21417,7 @@ mod tests {
                 endpoint: "https://api.example.com".to_string(),
                 method: "POST".to_string(),
                 path: "/test".to_string(),
+                api_key_id: uuid::Uuid::new_v4(),
                 created_by: user.to_string(),
                 metadata: None,
             })
@@ -24245,6 +24230,7 @@ mod tests {
                 endpoint: "http://localhost".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
+                api_key_id: uuid::Uuid::new_v4(),
                 created_by: "queue-user".to_string(),
                 metadata: None,
             })
@@ -24307,6 +24293,7 @@ mod tests {
                 endpoint: "http://localhost".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
+                api_key_id: uuid::Uuid::new_v4(),
                 created_by: "queue-user".to_string(),
                 metadata: None,
             })
@@ -26033,6 +26020,7 @@ mod tests {
                 endpoint: "http://localhost:3001/ai".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
+                api_key_id: uuid::Uuid::new_v4(),
                 created_by: "user-123".to_string(),
                 metadata: None,
             })
@@ -26066,6 +26054,7 @@ mod tests {
                 endpoint: "http://localhost:3001/ai".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
+                api_key_id: uuid::Uuid::new_v4(),
                 created_by: "user-a".to_string(),
                 metadata: None,
             })

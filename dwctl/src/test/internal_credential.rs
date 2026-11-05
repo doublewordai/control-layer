@@ -321,9 +321,10 @@ async fn dispatched_as(pool: &PgPool, request_filter: &str, bind: Uuid) -> Optio
     }
 }
 
-/// Batch and flex requests record the key id they run as, and the daemon's dispatch authenticates as that key with a fresh internal
-/// credential: a flex request as the caller's hidden batch key (or the
-/// caller's cap-scope child), a batch as the key the batch names.
+/// Batch and flex requests record the key id they run as, and the daemon's
+/// dispatch authenticates as that key with a fresh internal credential: a
+/// flex request as the caller's hidden batch key (or the caller's cap-scope
+/// child), a batch as the key the batch names.
 #[dwctl_test_macros::test]
 async fn daemon_dispatches_batch_and_flex_requests_as_their_key_id(pool: PgPool) {
     let h = Harness::start_with(&pool, |config| {

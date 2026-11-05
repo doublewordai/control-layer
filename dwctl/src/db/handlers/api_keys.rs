@@ -104,7 +104,7 @@ impl From<(Vec<DeploymentId>, ApiKey)> for ApiKeyDBResponse {
 pub struct PendingReveal {
     pub id: ApiKeyId,
     pub pending_secret: Option<Vec<u8>>,
-    pub secret_hash: Option<Vec<u8>>,
+    pub secret_hash: Vec<u8>,
 }
 
 // Manual Debug so the wrapped secret is never printed.
@@ -758,7 +758,7 @@ impl<'c> ApiKeys<'c> {
             UPDATE api_keys ak SET secret_revealed_at = NOW(), pending_secret = NULL
             FROM pending
             WHERE ak.id = pending.id
-            RETURNING ak.id, pending.pending_secret, ak.secret_hash
+            RETURNING ak.id, pending.pending_secret, ak.secret_hash AS "secret_hash!"
             "#,
             id
         )
@@ -5128,7 +5128,7 @@ mod tests {
 
     /// The revealed secret is the key's current one, recovered from its wrap.
     fn assert_reveals(keystore: &crate::keystore::Keystore, reveal: &PendingReveal, secret: &str) {
-        assert_eq!(reveal.secret_hash.as_deref(), Some(&hash_api_key(secret)[..]));
+        assert_eq!(reveal.secret_hash, hash_api_key(secret));
         assert_eq!(
             crate::pending_secrets::resolve_reveal(Some(keystore), reveal),
             Some(secret.to_string())
