@@ -1929,7 +1929,6 @@ mod tests {
             .await
             .expect("create realtime key")
             .secret
-            .unwrap()
         };
 
         let flex_key = resolve_flex_batch_api_key(&pool, Some(&hash_api_key(&realtime_key)))
@@ -1990,7 +1989,6 @@ mod tests {
                 .await
                 .expect("create organization key")
                 .secret
-                .unwrap()
         };
 
         assert_eq!(
@@ -2039,7 +2037,6 @@ mod tests {
                 .await
                 .expect("create key")
                 .secret
-                .unwrap()
         };
 
         assert_eq!(
@@ -2086,7 +2083,7 @@ mod tests {
             }
             let response = server
                 .post("/ai/v1/responses")
-                .add_header("Authorization", &format!("Bearer {}", key.secret()))
+                .add_header("Authorization", &format!("Bearer {}", key.secret))
                 .json(&request)
                 .await;
 

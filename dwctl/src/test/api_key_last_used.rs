@@ -95,7 +95,7 @@ async fn every_authentication_path_records_last_used(pool: PgPool) {
     let chat = || {
         server
             .post("/ai/v1/chat/completions")
-            .add_header("Authorization", bearer(realtime.secret()))
+            .add_header("Authorization", bearer(&realtime.secret))
             .json(&json!({ "model": "gpt-4", "messages": [ { "role": "user", "content": "hi" } ] }))
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -109,7 +109,7 @@ async fn every_authentication_path_records_last_used(pool: PgPool) {
     // Flex, accepted by the inference middleware without reaching onwards.
     let queued = server
         .post("/ai/v1/responses")
-        .add_header("Authorization", bearer(flex.secret()))
+        .add_header("Authorization", bearer(&flex.secret))
         .json(&json!({ "model": "gpt-4", "input": "hi", "service_tier": "flex", "background": true }))
         .await;
     queued.assert_status(axum::http::StatusCode::ACCEPTED);
@@ -118,7 +118,7 @@ async fn every_authentication_path_records_last_used(pool: PgPool) {
     // Realtime background: the client gets a 202 while onwards runs detached.
     server
         .post("/ai/v1/responses")
-        .add_header("Authorization", bearer(background.secret()))
+        .add_header("Authorization", bearer(&background.secret))
         .json(&json!({ "model": "gpt-4", "input": "hi", "background": true }))
         .await
         .assert_status(axum::http::StatusCode::ACCEPTED);
@@ -126,28 +126,28 @@ async fn every_authentication_path_records_last_used(pool: PgPool) {
     // Response retrieval, which checks the key itself.
     server
         .get(&format!("/ai/v1/responses/{response_id}"))
-        .add_header("Authorization", bearer(retrieve.secret()))
+        .add_header("Authorization", bearer(&retrieve.secret))
         .await
         .assert_status_ok();
 
     // Files, authenticated by the CurrentUser extractor.
     server
         .get("/ai/v1/files")
-        .add_header("Authorization", bearer(files.secret()))
+        .add_header("Authorization", bearer(&files.secret))
         .await
         .assert_status_ok();
 
     // Model listing, answered by dwctl.
     server
         .get("/ai/v1/models")
-        .add_header("Authorization", bearer(models.secret()))
+        .add_header("Authorization", bearer(&models.secret))
         .await
         .assert_status_ok();
 
     // Management API with a platform key.
     server
         .get("/admin/api/v1/users/current")
-        .add_header("Authorization", bearer(platform.secret()))
+        .add_header("Authorization", bearer(&platform.secret))
         .await
         .assert_status_ok();
 

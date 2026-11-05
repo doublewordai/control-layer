@@ -829,7 +829,7 @@ mod tests {
         );
         H {
             classifier,
-            secret: key.secret.unwrap(),
+            secret: key.secret,
             principal_id: user.id,
             pool: pool.clone(),
             _server: server,
@@ -923,7 +923,7 @@ mod tests {
         );
         H {
             classifier,
-            secret: key.secret.unwrap(),
+            secret: key.secret,
             principal_id: user.id,
             pool: pool.clone(),
             _server: server,

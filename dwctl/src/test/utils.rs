@@ -18,7 +18,7 @@ use crate::{
     db::{
         handlers::{Deployments, Groups, Users, api_keys::ApiKeys},
         models::{
-            api_keys::{ApiKeyCreateDBRequest, ApiKeyDBResponse},
+            api_keys::ApiKeyCreateDBRequest,
             deployments::{DeploymentCreateDBRequest, DeploymentDBResponse, ModelType},
             groups::{GroupCreateDBRequest, GroupDBResponse},
             users::UserCreateDBRequest,
@@ -641,7 +641,7 @@ pub async fn add_user_to_group(pool: &PgPool, user_id: UserId, group_id: GroupId
         .expect("Failed to add user to group");
 }
 
-pub async fn create_test_api_key_for_user(pool: &PgPool, user_id: UserId) -> ApiKeyDBResponse {
+pub async fn create_test_api_key_for_user(pool: &PgPool, user_id: UserId) -> crate::db::models::api_keys::CreatedApiKey {
     let mut conn = pool.acquire().await.expect("Failed to acquire connection");
     let mut api_key_repo = ApiKeys::new(&mut conn);
     let request = ApiKeyCreateDBRequest::new(

@@ -340,7 +340,7 @@ async fn daemon_dispatches_batch_and_flex_requests_as_their_key_id(pool: PgPool)
     let flex = || {
         h.server
             .post("/ai/v1/chat/completions")
-            .add_header("Authorization", format!("Bearer {}", caller.secret()))
+            .add_header("Authorization", format!("Bearer {}", caller.secret))
             .json(&serde_json::json!({ "model": MODEL, "service_tier": "flex", "messages": [ { "role": "user", "content": "hi" } ] }))
     };
     let response = flex().await;

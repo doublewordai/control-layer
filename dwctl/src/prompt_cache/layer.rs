@@ -899,7 +899,7 @@ mod tests {
         // First request: nothing cached yet → all-creation, response carries zeroed read.
         let r1 = server
             .post("/v1/chat/completions")
-            .add_header("authorization", format!("Bearer {}", key.secret()))
+            .add_header("authorization", format!("Bearer {}", key.secret))
             .json(&body())
             .await;
         r1.assert_status_ok();
@@ -925,7 +925,7 @@ mod tests {
         // Second identical request → now a read hit on the committed prefix.
         let r2 = server
             .post("/v1/chat/completions")
-            .add_header("authorization", format!("Bearer {}", key.secret()))
+            .add_header("authorization", format!("Bearer {}", key.secret))
             .json(&body())
             .await;
         let v2: serde_json::Value = r2.json();
@@ -1012,7 +1012,7 @@ mod tests {
         // edited with the all-creation cache fields (deltas + [DONE] preserved).
         let r1 = server
             .post("/v1/chat/completions")
-            .add_header("authorization", format!("Bearer {}", key.secret()))
+            .add_header("authorization", format!("Bearer {}", key.secret))
             .json(&body_streaming())
             .await;
         r1.assert_status_ok();
@@ -1042,7 +1042,7 @@ mod tests {
         // Second identical stream → a read hit, injected into the terminal frame.
         let r2 = server
             .post("/v1/chat/completions")
-            .add_header("authorization", format!("Bearer {}", key.secret()))
+            .add_header("authorization", format!("Bearer {}", key.secret))
             .json(&body_streaming())
             .await;
         let t2 = r2.text();
@@ -1116,7 +1116,7 @@ mod tests {
         // Drain the stream: a mid-stream error frame and no usage frame → veto.
         let r = server
             .post("/v1/chat/completions")
-            .add_header("authorization", format!("Bearer {}", key.secret()))
+            .add_header("authorization", format!("Bearer {}", key.secret))
             .json(&body_streaming())
             .await;
         let _ = r.text();
@@ -1267,7 +1267,7 @@ mod tests {
 
         let r = server
             .post("/v1/chat/completions")
-            .add_header("authorization", format!("Bearer {}", key.secret()))
+            .add_header("authorization", format!("Bearer {}", key.secret))
             .json(&serde_json::json!({"model": ALIAS, "messages": [{"role":"user","content":"hi"}]}))
             .await;
         r.assert_status_ok();
@@ -1318,7 +1318,7 @@ mod tests {
 
         let r = server
             .post("/v1/chat/completions")
-            .add_header("authorization", format!("Bearer {}", key.secret()))
+            .add_header("authorization", format!("Bearer {}", key.secret))
             .json(&serde_json::json!({"model": ALIAS, "stream": true, "messages": [{"role":"user","content":"hi"}]}))
             .await;
         r.assert_status_ok();
@@ -1376,7 +1376,7 @@ mod tests {
 
         let r = server
             .post("/v1/chat/completions")
-            .add_header("authorization", format!("Bearer {}", key.secret()))
+            .add_header("authorization", format!("Bearer {}", key.secret))
             .json(&serde_json::json!({"model": ALIAS, "messages": [{"role":"user","content":"hi"}]}))
             .await;
         r.assert_status_ok();
@@ -1414,7 +1414,7 @@ mod tests {
 
         let r = server
             .post("/v1/chat/completions")
-            .add_header("authorization", format!("Bearer {}", key.secret()))
+            .add_header("authorization", format!("Bearer {}", key.secret))
             .json(&serde_json::json!({"model": ALIAS, "stream": true, "messages": [{"role":"user","content":"hi"}]}))
             .await;
         r.assert_status_ok();
@@ -1472,7 +1472,7 @@ mod tests {
 
         let r = server
             .post("/v1/completions")
-            .add_header("authorization", format!("Bearer {}", key.secret()))
+            .add_header("authorization", format!("Bearer {}", key.secret))
             .json(&serde_json::json!({"model": ALIAS, "prompt": "continue this"}))
             .await;
         r.assert_status_ok();
@@ -1498,7 +1498,7 @@ mod tests {
 
         let r = server
             .post("/v1/completions")
-            .add_header("authorization", format!("Bearer {}", key.secret()))
+            .add_header("authorization", format!("Bearer {}", key.secret))
             .json(&serde_json::json!({
                 "model": ALIAS, "prompt": "continue this",
                 "cache_control": {"type": "ephemeral", "ttl": "1h"}
@@ -1532,7 +1532,7 @@ mod tests {
         for _ in 0..2 {
             let r = server
                 .post("/v1/completions")
-                .add_header("authorization", format!("Bearer {}", key.secret()))
+                .add_header("authorization", format!("Bearer {}", key.secret))
                 .json(&body)
                 .await;
             r.assert_status_ok();
@@ -1564,7 +1564,7 @@ mod tests {
 
         let r = server
             .post("/v1/completions")
-            .add_header("authorization", format!("Bearer {}", key.secret()))
+            .add_header("authorization", format!("Bearer {}", key.secret))
             .json(&serde_json::json!({"model": ALIAS, "prompt": "continue this"}))
             .await;
         r.assert_status_ok();
@@ -1641,7 +1641,7 @@ mod tests {
         let r = server
             .post("/v1/completions")
             .add_query_param("cacheBreakpoint", "lastUserMessage")
-            .add_header("authorization", format!("Bearer {}", key.secret()))
+            .add_header("authorization", format!("Bearer {}", key.secret))
             .json(&serde_json::json!({"model": ALIAS, "prompt": "continue this"}))
             .await;
         r.assert_status_ok();
@@ -1767,7 +1767,7 @@ mod tests {
         let r1 = server
             .post(route)
             .add_query_param("cacheBreakpoint", "lastUserMessage")
-            .add_header("authorization", format!("Bearer {}", key.secret()))
+            .add_header("authorization", format!("Bearer {}", key.secret))
             .json(&request_body)
             .await;
         r1.assert_status_ok();
@@ -1797,7 +1797,7 @@ mod tests {
         let r2 = server
             .post(route)
             .add_query_param("cacheBreakpoint", "lastUserMessage")
-            .add_header("authorization", format!("Bearer {}", key.secret()))
+            .add_header("authorization", format!("Bearer {}", key.secret))
             .json(&request_body)
             .await;
         r2.assert_status_ok();
@@ -2151,7 +2151,7 @@ mod tests {
         let r = server
             .post("/v1/chat/completions")
             .add_query_param("cacheBreakpoint", "lastUserMessage")
-            .add_header("authorization", format!("Bearer {}", key.secret()))
+            .add_header("authorization", format!("Bearer {}", key.secret))
             .json(&body)
             .await;
         r.assert_status_ok();

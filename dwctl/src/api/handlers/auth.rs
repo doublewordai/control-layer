@@ -826,13 +826,6 @@ pub async fn cli_callback<P: PoolProvider>(
         .map_err(Error::Database)?
     };
 
-    // Only the create returns a key's secret.
-    let missing_secret = || Error::Internal {
-        operation: "create CLI API key: no secret returned".to_string(),
-    };
-    let inference_secret = inference_key.secret.clone().ok_or_else(missing_secret)?;
-    let platform_secret = platform_key.secret.clone().ok_or_else(missing_secret)?;
-
     // Fetch user info for the response
     let (email, display_name, org_name) = if ctx.org_id.is_some() {
         // Org context: get the individual's info from api_keys.created_by
@@ -891,9 +884,9 @@ pub async fn cli_callback<P: PoolProvider>(
     {
         let mut params = redirect_url.query_pairs_mut();
         params.append_pair("state", &query.state);
-        params.append_pair("inference_key", &inference_secret);
+        params.append_pair("inference_key", &inference_key.secret);
         params.append_pair("inference_key_id", &inference_key.id.to_string());
-        params.append_pair("platform_key", &platform_secret);
+        params.append_pair("platform_key", &platform_key.secret);
         params.append_pair("platform_key_id", &platform_key.id.to_string());
         params.append_pair("user_id", &ctx.target_user_id.to_string());
         params.append_pair("email", &email);
@@ -2587,7 +2580,7 @@ mod tests {
 
         let response = server
             .get("/admin/api/v1/auth/cli-callback?port=12345&state=s")
-            .add_header("authorization", &format!("Bearer {}", key.secret()))
+            .add_header("authorization", &format!("Bearer {}", key.secret))
             .await;
 
         response.assert_status(axum::http::StatusCode::UNAUTHORIZED);

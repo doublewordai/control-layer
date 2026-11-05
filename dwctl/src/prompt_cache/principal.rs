@@ -94,7 +94,7 @@ mod tests {
         let key = create_test_api_key_for_user(&pool, user.id).await;
 
         let resolver = PrincipalResolver::new(pool);
-        let hash = crate::crypto::hash_api_key(&key.secret());
+        let hash = crate::crypto::hash_api_key(&key.secret);
         assert_eq!(resolver.resolve(&hash).await.unwrap(), Some(user.id));
         // Second call is served from the L1 memo — still correct.
         assert_eq!(resolver.resolve(&hash).await.unwrap(), Some(user.id));

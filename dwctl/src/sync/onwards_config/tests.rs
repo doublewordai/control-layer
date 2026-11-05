@@ -1742,7 +1742,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
 
     // Verify batch API key has access
     // onwards holds keys by hash
-    let batch_key_ct = KeyHash::of(batch_api_key.secret());
+    let batch_key_ct = KeyHash::of(&batch_api_key.secret);
     let keys = pool_spec.default_pool().keys().expect("Composite model should have keys");
     let has_batch_key = keys.iter().any(|k| k == &batch_key_ct);
 

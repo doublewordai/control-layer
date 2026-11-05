@@ -98,14 +98,11 @@ pub struct ApiKeyUpdateDBRequest {
 }
 
 /// Database response for an API key
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ApiKeyDBResponse {
     pub id: ApiKeyId,
     pub name: String,
     pub description: Option<String>,
-    /// The plaintext secret, set only on the value `create` returns: only its
-    /// hash is stored, so a key read back from the database has none.
-    pub secret: Option<String>,
     pub purpose: ApiKeyPurpose,
     pub user_id: UserId,
     pub created_by: UserId,
@@ -132,51 +129,34 @@ pub struct ApiKeyDBResponse {
     pub secret_revealed_at: Option<DateTime<Utc>>,
 }
 
-// Manual Debug so the create-time secret is never printed.
-impl std::fmt::Debug for ApiKeyDBResponse {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self {
-            id,
-            name,
-            description,
-            secret,
-            purpose,
-            user_id,
-            created_by,
-            created_at,
-            last_used,
-            model_access,
-            spend_limit,
-            spend_limit_interval,
-            parent_api_key_id,
-            hidden,
-            secret_revealed_at,
-        } = self;
-        f.debug_struct("ApiKeyDBResponse")
-            .field("id", id)
-            .field("name", name)
-            .field("description", description)
-            .field("secret", &secret.as_ref().map(|_| "<redacted>"))
-            .field("purpose", purpose)
-            .field("user_id", user_id)
-            .field("created_by", created_by)
-            .field("created_at", created_at)
-            .field("last_used", last_used)
-            .field("model_access", model_access)
-            .field("spend_limit", spend_limit)
-            .field("spend_limit_interval", spend_limit_interval)
-            .field("parent_api_key_id", parent_api_key_id)
-            .field("hidden", hidden)
-            .field("secret_revealed_at", secret_revealed_at)
-            .finish()
+/// A newly created key and its secret. Only the secret's hash is stored, so
+/// this is the one place it is available. Derefs to the key.
+#[derive(Clone)]
+pub struct CreatedApiKey {
+    pub key: ApiKeyDBResponse,
+    pub secret: String,
+}
+
+impl std::ops::Deref for CreatedApiKey {
+    type Target = ApiKeyDBResponse;
+    fn deref(&self) -> &ApiKeyDBResponse {
+        &self.key
     }
 }
 
-#[cfg(test)]
-impl ApiKeyDBResponse {
-    /// The secret of a key just returned by `create`.
-    pub fn secret(&self) -> &str {
-        self.secret.as_deref().expect("only a just-created key carries its secret")
+impl std::ops::DerefMut for CreatedApiKey {
+    fn deref_mut(&mut self) -> &mut ApiKeyDBResponse {
+        &mut self.key
+    }
+}
+
+// Manual Debug so the secret is never printed.
+impl std::fmt::Debug for CreatedApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreatedApiKey")
+            .field("key", &self.key)
+            .field("secret", &"<redacted>")
+            .finish()
     }
 }
 

@@ -5207,7 +5207,7 @@ mod tests {
         let resp = app
             .post("/ai/v1/batches")
             .json(&create_req)
-            .add_header("authorization", &format!("Bearer {}", key.secret()))
+            .add_header("authorization", &format!("Bearer {}", key.secret))
             .await;
         resp.assert_status(StatusCode::PAYMENT_REQUIRED);
         let body = resp.text();

@@ -24,7 +24,7 @@ async fn create_key(pool: &PgPool, user_id: uuid::Uuid, purpose: &str) -> String
             .await
             .unwrap();
     }
-    key.secret.unwrap()
+    key.secret
 }
 
 #[dwctl_test_macros::test]

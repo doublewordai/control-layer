@@ -42,7 +42,7 @@ async fn ai_models_pricing_is_opt_in_and_preserves_inference_access(pool: PgPool
     for query in ["", "?include=unknown"] {
         let response = server
             .get(&format!("/ai/v1/models{query}"))
-            .add_header("authorization", format!("Bearer {}", key.secret()))
+            .add_header("authorization", format!("Bearer {}", key.secret))
             .await;
         response.assert_status_ok();
         let body: Value = response.json();
@@ -55,7 +55,7 @@ async fn ai_models_pricing_is_opt_in_and_preserves_inference_access(pool: PgPool
 
     let response = server
         .get("/ai/v1/models?include=pricing")
-        .add_header("authorization", format!("Bearer {}", key.secret()))
+        .add_header("authorization", format!("Bearer {}", key.secret))
         .await;
     response.assert_status_ok();
     let body: Value = response.json();
@@ -74,7 +74,7 @@ async fn ai_models_pricing_is_opt_in_and_preserves_inference_access(pool: PgPool
     // Inference keys still cannot use management operations.
     let response = server
         .get("/admin/api/v1/models?include=pricing")
-        .add_header("authorization", format!("Bearer {}", key.secret()))
+        .add_header("authorization", format!("Bearer {}", key.secret))
         .await;
     response.assert_status_forbidden();
 
@@ -89,7 +89,7 @@ async fn ai_models_pricing_is_opt_in_and_preserves_inference_access(pool: PgPool
     // Pricing discovery composes with existing optional model capabilities.
     let response = server
         .get("/ai/v1/models?include=unknown,%20pricing%20&include_reasoning_capabilities=true&available_for_realtime=true")
-        .add_header("authorization", format!("Bearer {}", key.secret()))
+        .add_header("authorization", format!("Bearer {}", key.secret))
         .await;
     response.assert_status_ok();
     let body: Value = response.json();
@@ -154,7 +154,7 @@ async fn ai_models_pricing_filters_unavailable_models_tariffs_and_keys(pool: PgP
             .unwrap();
         let response = server
             .get("/ai/v1/models?include=pricing")
-            .add_header("authorization", format!("Bearer {}", key.secret()))
+            .add_header("authorization", format!("Bearer {}", key.secret))
             .await;
         response.assert_status_ok();
         let body: Value = response.json();
@@ -177,7 +177,7 @@ async fn ai_models_pricing_filters_unavailable_models_tariffs_and_keys(pool: PgP
     ] {
         let response = server
             .get(&format!("/ai/v1/models?include=pricing&{query}"))
-            .add_header("authorization", format!("Bearer {}", key.secret()))
+            .add_header("authorization", format!("Bearer {}", key.secret))
             .await;
         response.assert_status_ok();
         let body: Value = response.json();
@@ -194,7 +194,7 @@ async fn ai_models_pricing_filters_unavailable_models_tariffs_and_keys(pool: PgP
             .unwrap();
         let response = server
             .get("/ai/v1/models?include=pricing")
-            .add_header("authorization", format!("Bearer {}", key.secret()))
+            .add_header("authorization", format!("Bearer {}", key.secret))
             .await;
         response.assert_status_unauthorized();
     }
@@ -258,8 +258,8 @@ async fn ai_models_pricing_uses_billing_account_without_operator_details(pool: P
     }
 
     for (case, key, price, multiplier) in [
-        ("manager personal", personal_key.secret(), 4, 3),
-        ("organization", org_key.secret(), 2, 2),
+        ("manager personal", personal_key.secret, 4, 3),
+        ("organization", org_key.secret, 2, 2),
     ] {
         let response = server
             .get("/ai/v1/models?include=pricing,endpoints,groups,metrics,components,provider_pricing")

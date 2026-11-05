@@ -37,7 +37,6 @@ async fn create_org_api_key(pool: &PgPool, org_id: UserId, member_id: UserId) ->
         .await
         .unwrap()
         .secret
-        .unwrap()
 }
 
 async fn set_disabled(pool: &PgPool, org_id: UserId, disabled: &[Modality]) {

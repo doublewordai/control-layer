@@ -4,9 +4,10 @@
 //! secret once. Only the key's hash is stored, so that secret is held in
 //! `api_keys.pending_secret`, wrapped with the keystore's wrap keyring, and
 //! cleared by the reveal. A pending key without a wrap of its current secret
-//! cannot be revealed (409). With a keystore its issuer can rotate it, which
-//! wraps the new secret for the reveal. Without one, rotation spends the
-//! reveal instead: the new secret goes only to whoever rotated the key.
+//! cannot be revealed (409); its holder can rotate it to get a fresh secret.
+//! With a keystore a rotation by its issuer wraps the new secret for the
+//! reveal; without one any rotation spends the reveal, since the new secret
+//! goes only to whoever rotated the key.
 //!
 //! [`run`] reconciles the wraps on every instance, at startup and then
 //! periodically: it re-wraps values sealed with a non-current wrap key (so an
@@ -104,15 +105,17 @@ async fn rewrap_rows(
     Ok(())
 }
 
-/// Re-read every pending key and count those whose reveal is not verified to
-/// work from its wrap. Only this count feeds the gauge, so a write lost to a
-/// concurrent rotation shows up instead of being assumed settled.
+/// Re-read every pending key and count those whose reveal cannot succeed. A
+/// valid wrap under an older wrap key still in the keyring is revealable (and
+/// is normal during a rolling wrap-key rotation), so it is not counted. Only
+/// this count feeds the gauge, so a write lost to a concurrent rotation shows
+/// up instead of being assumed settled.
 async fn count_unrecoverable(repo: &mut ApiKeys<'_>, keystore: Option<&Keystore>) -> anyhow::Result<u64> {
     Ok(repo
         .list_pending_reveals()
         .await?
         .iter()
-        .filter(|row| !matches!(pending_state(keystore, row), PendingState::Verified))
+        .filter(|row| matches!(pending_state(keystore, row), PendingState::Unrecoverable))
         .count() as u64)
 }
 
@@ -157,7 +160,7 @@ pub async fn run<P: PoolProvider>(db: P, keystore: Option<Keystore>, shutdown: C
                         Warning,
                         count = report.unrecoverable,
                         keystore_configured = keystore.is_some(),
-                        "issued API keys awaiting reveal have no usable wrapped secret; their reveal fails until the key is rotated"
+                        "issued API keys awaiting reveal have no usable wrapped secret; their reveal fails until the key is rotated (by its holder, for example)"
                     );
                 }
             }
@@ -239,7 +242,7 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
-        (key.id, key.secret.unwrap())
+        (key.id, key.secret)
     }
 
     async fn stored_wrap(pool: &PgPool, id: ApiKeyId) -> Option<Vec<u8>> {
@@ -313,6 +316,18 @@ mod tests {
                 ..Default::default()
             }
         );
+    }
+
+    #[dwctl_test_macros::test]
+    async fn a_wrap_under_an_older_wrap_key_is_not_unrecoverable(pool: PgPool) {
+        // Mid wrap-key rotation: another instance still wraps with k1 while
+        // this one's current key is k2. The wrap reveals, so it is not counted.
+        let k1 = test_keystore("k1", &[("k1", "wrap-one")]);
+        let ks = test_keystore("k2", &[("k1", "wrap-one"), ("k2", "wrap-two")]);
+        let (id, secret) = pending_key(&pool).await;
+        set_wrap(&pool, id, k1.wrap(secret.as_bytes()).unwrap()).await;
+        let mut conn = pool.acquire().await.unwrap();
+        assert_eq!(count_unrecoverable(&mut ApiKeys::new(&mut conn), Some(&ks)).await.unwrap(), 0);
     }
 
     #[dwctl_test_macros::test]

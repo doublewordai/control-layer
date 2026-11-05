@@ -14,7 +14,7 @@ use crate::{
     },
     crypto::hash_api_key,
     db::handlers::{Repository, api_keys::ApiKeyFilter, api_keys::ApiKeys},
-    db::models::api_keys::{ApiKeyCreateDBRequest, ApiKeyPurpose, ApiKeyUpdateDBRequest},
+    db::models::api_keys::{ApiKeyCreateDBRequest, ApiKeyPurpose, ApiKeyUpdateDBRequest, CreatedApiKey},
     errors::{Error, Result},
     keystore::Keystore,
     pending_secrets::resolve_reveal,
@@ -250,10 +250,7 @@ pub async fn create_user_api_key<P: PoolProvider>(
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = ApiKeys::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
 
-    let mut api_key = repo.create(&db_request).await?;
-    let secret = api_key.secret.take().ok_or_else(|| Error::Internal {
-        operation: "create API key: no secret returned".to_string(),
-    })?;
+    let CreatedApiKey { key: mut api_key, secret } = repo.create(&db_request).await?;
 
     // Issued to a DIFFERENT user (manager issuing to a member, or the system
     // key creating on a user's behalf): the holder gets a one-off "reveal" of
@@ -933,7 +930,7 @@ pub async fn reveal_user_api_key<P: PoolProvider>(
     let secret = resolve_reveal(state.keystore.as_ref(), &pending).ok_or_else(|| {
         tracing::warn!(api_key_id = %api_key.id, "pending API key secret could not be recovered for reveal");
         Error::Conflict {
-            message: "This key's secret is no longer held for reveal. Ask the key's issuer to rotate it.".to_string(),
+            message: "This key's secret is no longer held for reveal. Rotate the key to get a fresh secret.".to_string(),
             conflicts: None,
         }
     })?;
@@ -2554,7 +2551,7 @@ mod tests {
             .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
             .await;
         response.assert_status(axum::http::StatusCode::CONFLICT);
-        assert!(response.text().contains("rotate"), "{}", response.text());
+        assert!(response.text().contains("Rotate the key"), "{}", response.text());
         assert!(!response.text().contains(&key.key));
         let revealed_at: Option<chrono::DateTime<chrono::Utc>> =
             sqlx::query_scalar!("SELECT secret_revealed_at FROM api_keys WHERE id = $1", key.id)
@@ -2562,6 +2559,16 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(revealed_at, None, "a failed reveal stays available");
+
+        // The holder follows the advice: rotating gives them a fresh secret.
+        let response = app
+            .post(&format!("/admin/api/v1/users/current/api-keys/{}/rotate", key.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .await;
+        response.assert_status_ok();
+        let rotated: ApiKeySecretResponse = response.json();
+        assert_ne!(rotated.key, key.key);
     }
 
     #[dwctl_test_macros::test]

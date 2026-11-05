@@ -1141,7 +1141,7 @@ mod tests {
                 spend_limit_interval: None,
             },
         );
-        repo.create(&request).await.expect("create org key").secret.unwrap()
+        repo.create(&request).await.expect("create org key").secret
     }
 
     /// The key the daemon dispatches with: the user's hidden `batch` key, as
@@ -1270,9 +1270,9 @@ mod tests {
         let user = create_test_user(&pool, Role::StandardUser).await;
         let key = create_test_api_key_for_user(&pool, user.id).await;
         let state = state_with_pool(&pool);
-        let token = ingest_for_key(&pool, &state, &key.secret()).await;
+        let token = ingest_for_key(&pool, &state, &key.secret).await;
 
-        let (status, echoed) = post_json_as(build_router(state), Some(&key.secret()), body_with_token(token)).await;
+        let (status, echoed) = post_json_as(build_router(state), Some(&key.secret), body_with_token(token)).await;
 
         assert_eq!(status, StatusCode::OK, "{echoed}");
         let (url, ttl) = signed_url_and_ttl(&echoed);
@@ -1316,9 +1316,9 @@ mod tests {
         let other = create_test_user(&pool, Role::StandardUser).await;
         let other_key = create_test_api_key_for_user(&pool, other.id).await;
         let state = state_with_pool(&pool);
-        let token = ingest_for_key(&pool, &state, &owner_key.secret()).await;
+        let token = ingest_for_key(&pool, &state, &owner_key.secret).await;
 
-        let (status, body) = post_json_as(build_router(state), Some(&other_key.secret()), body_with_token(token)).await;
+        let (status, body) = post_json_as(build_router(state), Some(&other_key.secret), body_with_token(token)).await;
 
         assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
         assert_eq!(body["error"]["code"], "image_token_forbidden");
@@ -1334,7 +1334,7 @@ mod tests {
         let owner = create_test_user(&pool, Role::StandardUser).await;
         let owner_key = create_test_api_key_for_user(&pool, owner.id).await;
         let state = state_with_pool(&pool);
-        let token = ingest_for_key(&pool, &state, &owner_key.secret()).await;
+        let token = ingest_for_key(&pool, &state, &owner_key.secret).await;
 
         let (status, body) = post_json_as(build_router(state), None, body_with_token(token)).await;
 

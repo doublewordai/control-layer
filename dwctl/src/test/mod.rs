@@ -1956,7 +1956,6 @@ mod openapi_access_control {
         .await
         .expect("create api key")
         .secret
-        .unwrap()
     }
 
     #[dwctl_test_macros::test]

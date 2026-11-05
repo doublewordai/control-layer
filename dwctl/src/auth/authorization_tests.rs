@@ -55,7 +55,7 @@ async fn legacy_admin_keys_are_ordinary_but_sso_keeps_credits_and_zdr(pool: PgPo
         .execute(&pool)
         .await
         .unwrap();
-    let bearer = format!("Bearer {}", key.secret());
+    let bearer = format!("Bearer {}", key.secret);
     let headers = add_auth_headers(&actor);
     let grant = json!({"user_id": customer.id, "transaction_type": "admin_grant", "amount": "10",
         "source_id": actor.id.to_string(), "description": "Promotional contribution"});
@@ -276,9 +276,9 @@ async fn customer_content_requires_ownership_for_sso_and_keys(pool: PgPool) {
                         format!(
                             "Bearer {}",
                             if path.starts_with("/admin") {
-                                platform_key.secret()
+                                &platform_key.secret
                             } else {
-                                key.secret()
+                                &key.secret
                             }
                         ),
                     )
@@ -345,7 +345,7 @@ async fn keys_require_live_accounts_and_active_org_membership(pool: PgPool) {
             .execute(&pool)
             .await
             .unwrap();
-        let bearer = format!("Bearer {}", key.secret());
+        let bearer = format!("Bearer {}", key.secret);
         app.get("/ai/v1/files")
             .add_header("Authorization", &bearer)
             .await
@@ -476,7 +476,7 @@ async fn platform_keys_manage_configuration_without_customer_takeover(pool: PgPo
         .execute(&pool)
         .await
         .unwrap();
-    let bearer = format!("Bearer {}", key.secret());
+    let bearer = format!("Bearer {}", key.secret);
     let own = app.get("/admin/api/v1/users/current").add_header("Authorization", &bearer).await;
     own.assert_status_ok();
     assert_eq!(own.json::<Value>()["is_admin"], false);
@@ -567,7 +567,7 @@ async fn platform_keys_manage_configuration_without_customer_takeover(pool: PgPo
     // Supplying SSO headers cannot make an inference key into a platform key.
     let inference_key = create_test_api_key_for_user(&pool, actor.id).await;
     let headers = add_auth_headers(&actor);
-    for credential in [format!("Bearer {}", inference_key.secret()), "Bearer invalid".to_string()] {
+    for credential in [format!("Bearer {}", inference_key.secret), "Bearer invalid".to_string()] {
         let response = app
             .get("/admin/api/v1/users")
             .add_header("Authorization", &credential)
@@ -651,11 +651,11 @@ async fn reserved_system_key_can_provision_and_retire_accounts(pool: PgPool) {
         .await
         .unwrap();
     app.post(&format!("{target}/api-keys"))
-        .add_header("Authorization", &format!("Bearer {}", secondary.secret()))
+        .add_header("Authorization", &format!("Bearer {}", secondary.secret))
         .json(&json!({"name":"not-the-system-key", "purpose":"platform"}))
         .await
         .assert_status_forbidden();
-    let secondary_bearer = format!("Bearer {}", secondary.secret());
+    let secondary_bearer = format!("Bearer {}", secondary.secret);
     app.get("/admin/api/v1/users")
         .add_header("Authorization", &secondary_bearer)
         .await

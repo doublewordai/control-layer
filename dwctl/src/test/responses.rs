@@ -505,7 +505,7 @@ async fn complete_response_treats_active_retained_graph_as_idempotent(pool: PgPo
         &format!("resp_{request_id}"),
         r#"{"must_not":"overwrite"}"#,
         200,
-        synthetic_context(request_id, &key.secret()),
+        synthetic_context(request_id, &key.secret),
     )
     .await
     .expect("an active retained response is an idempotent terminal write");
@@ -534,7 +534,7 @@ async fn complete_response_fails_closed_for_erased_identity_without_synthesis(po
         &format!("resp_{request_id}"),
         r#"{"must_not":"survive"}"#,
         200,
-        synthetic_context(request_id, &key.secret()),
+        synthetic_context(request_id, &key.secret),
     )
     .await
     .expect_err("an erased identity must terminate without synthesis");
@@ -587,7 +587,7 @@ async fn complete_response_rechecks_a_fence_created_after_the_initial_miss(pool:
         .await
         .unwrap();
     let task_pool = pool.clone();
-    let key_secret = key.secret.unwrap();
+    let key_secret = key.secret;
     let mut completion = tokio::spawn(async move {
         crate::inference::store::complete_response_idempotent(
             &manager,
@@ -667,7 +667,7 @@ async fn complete_response_does_not_ignore_an_unproven_synthetic_create_error(po
         &format!("resp_{request_id}"),
         r#"{"must_not":"survive"}"#,
         200,
-        synthetic_context(request_id, &key.secret()),
+        synthetic_context(request_id, &key.secret),
     )
     .await
     .expect_err("a failed create without a concurrent winner must be returned");

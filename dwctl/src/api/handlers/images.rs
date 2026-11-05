@@ -381,7 +381,7 @@ mod tests {
             spend_limit_interval: None,
         };
         let req = ApiKeyCreateDBRequest::new(org_id, member_id, create);
-        ApiKeys::new(&mut conn).create(&req).await.unwrap().secret.unwrap()
+        ApiKeys::new(&mut conn).create(&req).await.unwrap().secret
     }
 
     /// Grants are per PRINCIPAL: the same member submitting the same image
@@ -519,7 +519,7 @@ mod tests {
         // Personal key: created_by == user_id -> no org.
         let person = create_test_user(&pool, Role::StandardUser).await;
         let personal_key = create_test_api_key_for_user(&pool, person.id).await;
-        let attr = resolve_image_attribution(&pool, &personal_key.secret()).await.expect("known key");
+        let attr = resolve_image_attribution(&pool, &personal_key.secret).await.expect("known key");
         assert_eq!(attr.user_id, person.id);
         assert_eq!(attr.organization_id, None);
 

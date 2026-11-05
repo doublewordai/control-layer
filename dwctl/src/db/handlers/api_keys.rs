@@ -6,7 +6,9 @@ use crate::crypto::{ApiKeyHash, api_key_prefix, generate_api_key, hash_api_key};
 use crate::db::errors::DbError;
 use crate::db::errors::Result;
 use crate::db::handlers::repository::Repository;
-use crate::db::models::api_keys::{ApiKeyCreateDBRequest, ApiKeyDBResponse, ApiKeyPurpose, ApiKeySpendState, ApiKeyUpdateDBRequest};
+use crate::db::models::api_keys::{
+    ApiKeyCreateDBRequest, ApiKeyDBResponse, ApiKeyPurpose, ApiKeySpendState, ApiKeyUpdateDBRequest, CreatedApiKey,
+};
 use crate::types::{ApiKeyId, DeploymentId, UserId, abbrev_uuid};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -82,7 +84,6 @@ impl From<(Vec<DeploymentId>, ApiKey)> for ApiKeyDBResponse {
             id: api_key.id,
             name: api_key.name,
             description: api_key.description,
-            secret: None,
             hidden: api_key.hidden,
             purpose,
             user_id: api_key.user_id,
@@ -125,11 +126,12 @@ impl<'c> Repository for ApiKeys<'c> {
     type CreateRequest = ApiKeyCreateDBRequest;
     type UpdateRequest = ApiKeyUpdateDBRequest;
     type Response = ApiKeyDBResponse;
+    type Created = CreatedApiKey;
     type Id = ApiKeyId;
     type Filter = ApiKeyFilter;
 
     #[instrument(level = "debug", skip(self, request), fields(name = %request.name), err)]
-    async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
+    async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Created> {
         // Generate a secure API key. Only its hash is stored; the secret
         // itself is returned to this caller and nowhere else.
         let secret = generate_api_key();
@@ -165,9 +167,8 @@ impl<'c> Repository for ApiKeys<'c> {
         .fetch_one(&mut *self.db)
         .await?;
 
-        let mut response = ApiKeyDBResponse::from((self.get_api_key_deployments(api_key.id).await?, api_key));
-        response.secret = Some(secret);
-        Ok(response)
+        let key = ApiKeyDBResponse::from((self.get_api_key_deployments(api_key.id).await?, api_key));
+        Ok(CreatedApiKey { key, secret })
     }
 
     #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
@@ -1279,7 +1280,7 @@ mod tests {
         }
         assert_eq!(api_key.name, "Test API Key");
         assert_eq!(api_key.user_id, userid);
-        assert!(api_key.secret().starts_with("sk-"));
+        assert!(api_key.secret.starts_with("sk-"));
     }
 
     /// Helper: create a user and return its id.
@@ -1301,7 +1302,7 @@ mod tests {
 
     /// Helper: create a visible key owned by `user_id`, created by `created_by`
     /// (equal for personal keys, org/member for org-context keys).
-    async fn create_visible_key(pool: &PgPool, user_id: crate::types::UserId, created_by: crate::types::UserId) -> ApiKeyDBResponse {
+    async fn create_visible_key(pool: &PgPool, user_id: crate::types::UserId, created_by: crate::types::UserId) -> CreatedApiKey {
         let mut conn = pool.acquire().await.unwrap();
         ApiKeys::new(&mut conn)
             .create(&ApiKeyCreateDBRequest {
@@ -1344,7 +1345,7 @@ mod tests {
         // create: the secret is returned once
         let key = create_visible_key(&pool, user, user).await;
         let mut conn = pool.acquire().await.unwrap();
-        assert_only_hash_stored(&mut conn, key.id, Some(key.secret()), "create").await;
+        assert_only_hash_stored(&mut conn, key.id, Some(&key.secret), "create").await;
 
         // get_or_create_hidden_key: insert path. The secret is never handed out.
         let hidden_id = ApiKeys::new(&mut conn)
@@ -1368,7 +1369,7 @@ mod tests {
 
         // rotate_secret replaces hash and prefix together
         let rotated = ApiKeys::new(&mut conn).rotate_secret(key.id).await.unwrap();
-        assert_ne!(rotated, key.secret());
+        assert_ne!(rotated, key.secret);
         assert_only_hash_stored(&mut conn, key.id, Some(&rotated), "rotate_secret").await;
     }
 
@@ -3081,7 +3082,6 @@ mod tests {
         assert_eq!(retrieved_key1.name, "Bulk Key 1");
         assert_eq!(retrieved_key1.description, Some("First bulk key".to_string()));
         assert_eq!(retrieved_key1.user_id, user.id);
-        assert!(retrieved_key1.secret.is_none(), "a read key carries no secret");
 
         let retrieved_key2 = &bulk_results[&key2.id];
         assert_eq!(retrieved_key2.name, "Bulk Key 2");
@@ -3389,9 +3389,6 @@ mod tests {
 
         assert_eq!(retrieved_key2.user_id, user2.id);
         assert_eq!(retrieved_key2.name, "User2 Bulk Key");
-
-        // Only the create response carries a secret
-        assert!(retrieved_key1.secret.is_none() && retrieved_key2.secret.is_none());
     }
 
     // Helper struct to hold test setup data for credit filtering tests
@@ -4484,7 +4481,7 @@ mod tests {
         // Look up user by API key secret
         let mut pool_conn = pool.acquire().await.unwrap();
         let mut api_repo = ApiKeys::new(&mut pool_conn);
-        let result = api_repo.get_user_id_by_secret(&api_key.secret()).await.unwrap();
+        let result = api_repo.get_user_id_by_secret(&api_key.secret).await.unwrap();
 
         // Should return the correct user ID
         assert_eq!(result, Some(user.id));
@@ -5074,12 +5071,12 @@ mod tests {
     }
 
     /// An issued key awaiting its reveal, with its secret wrapped.
-    async fn wrapped_pending_key(pool: &PgPool, keystore: &crate::keystore::Keystore) -> ApiKeyDBResponse {
+    async fn wrapped_pending_key(pool: &PgPool, keystore: &crate::keystore::Keystore) -> CreatedApiKey {
         let user = create_user(pool, &format!("holder-{}", &uuid::Uuid::new_v4().to_string()[..8])).await;
         let key = create_visible_key(pool, user, user).await;
         let mut conn = pool.acquire().await.unwrap();
         ApiKeys::new(&mut conn)
-            .mark_secret_reveal_pending(key.id, &keystore.wrap(key.secret().as_bytes()).unwrap())
+            .mark_secret_reveal_pending(key.id, &keystore.wrap(key.secret.as_bytes()).unwrap())
             .await
             .unwrap();
         key
@@ -5155,7 +5152,7 @@ mod tests {
         assert!(!second.is_finished());
         first_tx.commit().await.unwrap();
 
-        assert_reveals(&keystore, &first.expect("first reveal succeeds"), &key.secret());
+        assert_reveals(&keystore, &first.expect("first reveal succeeds"), &key.secret);
         assert!(second.await.unwrap().is_none(), "the second reveal must not succeed");
         assert_eq!(stored_pending_secret(&pool, key.id).await, None);
     }
@@ -5192,12 +5189,13 @@ mod tests {
 
         let mut rotate_conn = pool.acquire().await.unwrap();
         let pid = backend_pid(&mut rotate_conn).await;
+        let key_id = key.id;
         let rotation = tokio::spawn(async move {
             let mut tx = rotate_conn.begin().await.unwrap();
             let mut repo = ApiKeys::new(&mut tx);
-            let rotated = repo.rotate_secret(key.id).await.unwrap();
+            let rotated = repo.rotate_secret(key_id).await.unwrap();
             let rewrapped = repo
-                .set_pending_secret(key.id, b"wrap-of-new-secret", &hash_api_key(&rotated))
+                .set_pending_secret(key_id, b"wrap-of-new-secret", &hash_api_key(&rotated))
                 .await
                 .unwrap();
             tx.commit().await.unwrap();
@@ -5207,7 +5205,7 @@ mod tests {
         assert!(!rotation.is_finished());
         reveal_tx.commit().await.unwrap();
 
-        assert_reveals(&keystore, &revealed.expect("reveal succeeds"), &key.secret());
+        assert_reveals(&keystore, &revealed.expect("reveal succeeds"), &key.secret);
         assert!(!rotation.await.unwrap(), "a revealed key gets no new wrap");
         assert_eq!(stored_pending_secret(&pool, key.id).await, None);
         let mut conn = pool.acquire().await.unwrap();

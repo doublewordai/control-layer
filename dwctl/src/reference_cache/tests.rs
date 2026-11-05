@@ -221,7 +221,7 @@ async fn fixture(pool: sqlx::PgPool, allowlisted: bool, allowance: u32) -> Fixtu
     let (_, telemetry) = policies();
     Fixture {
         cache: Arc::new(ReferenceCache::new(&config, pool.clone(), telemetry)),
-        secret: key.secret.unwrap(),
+        secret: key.secret.clone(),
         key_id: key.id,
         principal: user.id,
         pool,
