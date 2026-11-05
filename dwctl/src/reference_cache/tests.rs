@@ -244,19 +244,30 @@ impl Fixture {
     }
 
     /// Poll until the spawned write for `b` has landed: its final boundary is live with
-    /// an exact count (`exact`) or provisionally (`!exact`).
+    /// an exact count (`exact`) or provisionally (`!exact`). Then wait until this
+    /// process's clock has passed the entry's `visible_at`, which the database clock
+    /// stamps: a request arriving next (stamped with this clock) must see it even when
+    /// the database clock runs slightly ahead.
     async fn wait_for(&self, b: &Bytes, exact: bool) {
         let last = bounds(b).hashes.pop().unwrap();
         for _ in 0..500 {
             let row = sqlx::query!(
-                "SELECT exact_tokens FROM reference_cache_entries WHERE principal_id = $1 AND prefix_hash = $2 AND expires_at > now()",
+                "SELECT exact_tokens, visible_at FROM reference_cache_entries WHERE principal_id = $1 AND prefix_hash = $2 AND expires_at > now()",
                 self.principal,
                 last
             )
             .fetch_optional(&self.pool)
             .await
             .unwrap();
-            if row.is_some_and(|r| r.exact_tokens.is_some() == exact) {
+            if let Some(row) = row.filter(|r| r.exact_tokens.is_some() == exact) {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while Utc::now() <= row.visible_at {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "database clock is far ahead of this process's"
+                    );
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;

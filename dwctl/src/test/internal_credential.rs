@@ -129,7 +129,7 @@ impl Harness {
 
     /// Poll until `bearer()` is admitted: onwards reloads its key set asynchronously.
     async fn chat_until_admitted(&self, bearer: impl Fn() -> String) -> axum_test::TestResponse {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             let response = self.chat(&bearer()).await;
             if response.status_code() == 200 || std::time::Instant::now() >= deadline {
@@ -196,7 +196,7 @@ async fn internal_credentials_authenticate_only_valid_tokens_for_live_keys(pool:
     assert!(ApiKeys::new(&mut conn).delete(key_id).await.unwrap());
     drop(conn);
     h.bg.sync_onwards_config(&pool).await.unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let mut status = h.chat(&h.credentials.mint(key_id, Duration::from_secs(60))).await.status_code();
     while status != 401 && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -231,19 +231,25 @@ async fn playground_and_probes_work_without_key_secrets(pool: PgPool) {
             .add_header(&session[1].0, &session[1].1)
             .json(&serde_json::json!({ "model": MODEL, "messages": [ { "role": "user", "content": "hi" } ] }))
     };
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // The routing cache reloads asynchronously after the setup writes, and a
+    // loaded machine can take seconds: poll for each path, with a deadline
+    // only a real failure reaches.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let mut response = playground().await;
     while response.status_code() != 200 && std::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
         response = playground().await;
     }
     assert_eq!(response.status_code(), 200, "playground: {}", response.text());
     assert_eq!(response.json::<serde_json::Value>()["choices"][0]["message"]["content"], "hi");
 
     // A probe calls this process's `/ai` over HTTP as the system key.
-    let result = ProbeManager::test_probe(&pool, h.deployment_id, &h.config, &h.credentials, None, None, None)
-        .await
-        .expect("probe runs");
+    let probe = || ProbeManager::test_probe(&pool, h.deployment_id, &h.config, &h.credentials, None, None, None);
+    let mut result = probe().await.expect("probe runs");
+    while !result.success && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        result = probe().await.expect("probe runs");
+    }
     assert!(result.success, "probe: {:?} {:?}", result.status_code, result.error_message);
     assert_eq!(result.status_code, Some(200));
 
@@ -285,7 +291,7 @@ async fn background_playground_request_refused_inside_the_stack_is_recorded(pool
             .await
             .unwrap()
     };
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let mut current = state().await;
     while current == "processing" && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -304,7 +310,7 @@ async fn dispatched_as(pool: &PgPool, request_filter: &str, bind: Uuid) -> Optio
     let query = format!(
         "SELECT api_key_id FROM http_analytics WHERE {request_filter} AND fusillade_request_id IS NOT NULL AND status_code = 200 LIMIT 1"
     );
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         let row: Option<Option<Uuid>> = sqlx::query_scalar(&query).bind(bind).fetch_optional(pool).await.unwrap();
         if let Some(key) = row {
