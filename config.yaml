@@ -640,9 +640,10 @@ onwards:
   # Names come from onwards::unsupported_params::params(), e.g. [n, logprobs].
   # Set via environment: DWCTL_ONWARDS__REJECTED_PARAMS='[n,logprobs]'
   rejected_params: []
-  # Per-model exceptions to rejected_params, keyed by the model name the client
-  # requests: the listed parameters are forwarded for that model anyway. For a
-  # model whose every worker honours a parameter the rest of the fleet can't.
+  # Per-model exceptions to rejected_params, keyed by model alias (never a
+  # model:<class> name): the listed parameters are forwarded for that model and
+  # each of its serving classes anyway. For a model whose every worker honours a
+  # parameter the rest of the fleet can't.
   # e.g. {"example/model": [logprobs, top_logprobs]}
   model_allowed_params: {}
 
