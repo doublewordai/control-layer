@@ -310,8 +310,8 @@ fn key_labels(api_key: &OnwardsApiKey) -> HashMap<String, String> {
 
 /// The onwards key hash for a stored `api_keys.secret_hash`. `None` (the key is
 /// left out of the onwards config, so it cannot authenticate) when the hash is
-/// missing or malformed; the `secret_hash IS NOT NULL` check makes a missing
-/// hash unreachable for rows written by any supported release. Callers still
+/// missing or malformed; the column is NOT NULL, so a missing hash is
+/// unreachable. Callers still
 /// record the grant (`has_key_grants`), so a deployment whose keys are all
 /// dropped rejects every request instead of being treated as having no keys
 /// configured, which onwards would leave open.

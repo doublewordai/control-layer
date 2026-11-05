@@ -1073,7 +1073,6 @@ mod pooled_schema_tests {
                 endpoint: "https://example.invalid".into(),
                 method: "POST".into(),
                 path: "/v1/responses".into(),
-                api_key: "test-key".into(),
                 created_by: "test-owner".into(),
                 started_at: now - chrono::Duration::hours(2),
                 completed_at: now - chrono::Duration::hours(1),

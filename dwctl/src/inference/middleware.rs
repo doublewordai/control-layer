@@ -617,8 +617,6 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 endpoint: state.loopback_base_url.clone(),
                 method: "POST".to_string(),
                 path: endpoint.clone(),
-                // The presented key is never stored.
-                api_key: String::new(),
                 created_by: created_by.unwrap_or_default(),
             };
             let client_usage = super::stream_usage::requested_usage(&endpoint, &request_value);
@@ -787,7 +785,6 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                     endpoint: state.loopback_base_url.clone(),
                     method: "POST".to_string(),
                     path: endpoint.clone(),
-                    api_key: String::new(),
                     created_by: queued_created_by,
                     metadata: queued_metadata,
                 };
@@ -811,7 +808,6 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 endpoint: state.loopback_base_url.clone(),
                 method: "POST".to_string(),
                 path: endpoint.clone(),
-                api_key: String::new(),
                 created_by: queued_created_by,
                 metadata: queued_metadata,
             };

@@ -8148,8 +8148,6 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                             path: row.path,
                             body: row.body,
                             model: row.model,
-                            // No key is stored with a template.
-                            api_key: String::new(),
                         };
                         if tx
                             .send(Ok(FileContentItem::Template(template)))
@@ -10250,7 +10248,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: "{}".to_string(),
                     model: model.to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -10263,7 +10260,6 @@ mod tests {
                 metadata: None,
                 created_by: Some(owner.to_string()),
                 api_key_id: None,
-                api_key: None,
                 total_requests: Some(1),
             })
             .await
@@ -10284,7 +10280,6 @@ mod tests {
                 endpoint: "https://api.example.com".to_string(),
                 method: "POST".to_string(),
                 path: "/test".to_string(),
-                api_key: "key".to_string(),
                 created_by: owner.to_string(),
                 metadata: None,
             })
@@ -10343,22 +10338,21 @@ mod tests {
         });
         let flex_key = Uuid::new_v4();
         let background_key = Uuid::new_v4();
-        let flex = |api_key: &str| CreateFlexInput {
+        let flex = || CreateFlexInput {
             request_id: Uuid::new_v4(),
             body: "{}".to_string(),
             model: "key-id-model".to_string(),
             endpoint: "https://api.example.com".to_string(),
             method: "POST".to_string(),
             path: "/test".to_string(),
-            api_key: api_key.to_string(),
             created_by: "owner".to_string(),
             metadata: None,
         };
         let by_id = manager
-            .create_flex_as(flex("flex-secret"), Some(flex_key))
+            .create_flex_as(flex(), Some(flex_key))
             .await
             .unwrap();
-        let legacy = manager.create_flex(flex("legacy-secret")).await.unwrap();
+        let legacy = manager.create_flex(flex()).await.unwrap();
         let background_id = manager
             .create_background_as(
                 CreateBackgroundInput {
@@ -10368,7 +10362,6 @@ mod tests {
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
                     path: "/test".to_string(),
-                    api_key: "background-secret".to_string(),
                     created_by: "owner".to_string(),
                     metadata: None,
                 },
@@ -10433,27 +10426,25 @@ mod tests {
                     path: "/test".to_string(),
                     body: "{}".to_string(),
                     model: "batch-key-model".to_string(),
-                    api_key: "uploader-key".to_string(),
                 }],
             )
             .await
             .unwrap();
         let batch_key = Uuid::new_v4();
-        let batch_input = |api_key_id, api_key: Option<&str>| crate::batch::BatchInput {
+        let batch_input = |api_key_id| crate::batch::BatchInput {
             file_id,
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
             created_by: Some("owner".to_string()),
             api_key_id,
-            api_key: api_key.map(str::to_string),
             total_requests: None,
         };
         let by_id = manager
-            .create_batch(batch_input(Some(batch_key), Some("batch-secret")))
+            .create_batch(batch_input(Some(batch_key)))
             .await
             .unwrap();
-        let legacy = manager.create_batch(batch_input(None, None)).await.unwrap();
+        let legacy = manager.create_batch(batch_input(None)).await.unwrap();
 
         let capacity = HashMap::from([("batch-key-model".to_string(), 10)]);
         let claimed = claim_batch_requests_for_test(
@@ -10505,7 +10496,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: "{}".to_string(),
                     model: "spoof-model".to_string(),
-                    api_key: "uploader-key".to_string(),
                 }],
             )
             .await
@@ -10518,7 +10508,6 @@ mod tests {
             metadata: Some(spoofed.clone()),
             created_by: Some("owner".to_string()),
             api_key_id,
-            api_key: None,
             total_requests: None,
         };
         let legacy_batch = manager.create_batch(batch_input(None)).await.unwrap();
@@ -10534,7 +10523,6 @@ mod tests {
                 endpoint: "https://api.example.com".to_string(),
                 method: "POST".to_string(),
                 path: "/test".to_string(),
-                api_key: "flex-secret".to_string(),
                 created_by: "owner".to_string(),
                 metadata: Some(spoofed.clone()),
             })
@@ -10830,7 +10818,6 @@ mod tests {
                 endpoint: "http://localhost:3001/ai".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                api_key: "test-key".to_string(),
                 created_by: "user-123".to_string(),
                 metadata: None,
             })
@@ -10883,7 +10870,6 @@ mod tests {
                         path: "/v1/completions".to_string(),
                         body: r#"{"model":"gpt-4"}"#.to_string(),
                         model: "gpt-4".to_string(),
-                        api_key: "key1".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: None,
@@ -10892,7 +10878,6 @@ mod tests {
                         path: "/v1/completions".to_string(),
                         body: r#"{"model":"gpt-3.5"}"#.to_string(),
                         model: "gpt-3.5".to_string(),
-                        api_key: "key2".to_string(),
                     },
                 ],
             )
@@ -10971,7 +10956,6 @@ mod tests {
                             path: "/v1/completions".to_string(),
                             body: "{}".to_string(),
                             model: "test-model".to_string(),
-                            api_key: "key".to_string(),
                         }],
                     )
                     .await
@@ -11028,7 +11012,6 @@ mod tests {
                 path: "/v1/completions".to_string(),
                 body: format!(r#"{{"prompt":"test {}"}}"#, i),
                 model: "gpt-4".to_string(),
-                api_key: "key".to_string(),
             })
             .collect();
 
@@ -11079,7 +11062,6 @@ mod tests {
                 path: "/v1/completions".to_string(),
                 body: format!(r#"{{"prompt":"test {}","data":{}}}"#, i, "x".repeat(100)),
                 model: "gpt-4".to_string(),
-                api_key: "key".to_string(),
             })
             .collect();
 
@@ -11150,7 +11132,6 @@ mod tests {
                     i
                 ),
                 model: "gpt-4".to_string(),
-                api_key: "test-key".to_string(),
             })
             .collect();
 
@@ -11217,7 +11198,6 @@ mod tests {
                 path: "/v1/completions".to_string(),
                 body: format!(r#"{{"n":{}}}"#, i),
                 model: "gpt-4".to_string(),
-                api_key: "key".to_string(),
             }));
         }
 
@@ -11337,7 +11317,6 @@ mod tests {
                 path: "/v1/completions".to_string(),
                 body: format!(r#"{{"n":{}}}"#, i),
                 model: "gpt-4".to_string(),
-                api_key: "key".to_string(),
             }));
         }
 
@@ -11353,7 +11332,6 @@ mod tests {
                 path: "/v1/completions".to_string(),
                 body: format!(r#"{{"n":{}}}"#, i),
                 model: "gpt-4".to_string(),
-                api_key: "key".to_string(),
             }));
         }
 
@@ -11391,7 +11369,6 @@ mod tests {
                 path: "/v1/completions".to_string(),
                 body: r#"{"a":1}"#.to_string(), // 7 bytes
                 model: "gpt-4".to_string(),
-                api_key: "key".to_string(),
             },
             RequestTemplateInput {
                 custom_id: Some("large".to_string()),
@@ -11400,7 +11377,6 @@ mod tests {
                 path: "/v1/completions".to_string(),
                 body: format!(r#"{{"data":"{}"}}"#, "x".repeat(5000)), // ~5010 bytes
                 model: "gpt-4".to_string(),
-                api_key: "key".to_string(),
             },
             RequestTemplateInput {
                 custom_id: Some("unicode".to_string()),
@@ -11409,7 +11385,6 @@ mod tests {
                 path: "/v1/completions".to_string(),
                 body: unicode_body.to_string(),
                 model: "gpt-4".to_string(),
-                api_key: "key".to_string(),
             },
         ];
 
@@ -11473,7 +11448,6 @@ mod tests {
                 path: "/v1/completions".to_string(),
                 body: format!(r#"{{"prompt":"test {}","data":{}}}"#, i, "x".repeat(50)),
                 model: "gpt-4".to_string(),
-                api_key: "key".to_string(),
             })
             .collect();
 
@@ -11536,7 +11510,6 @@ mod tests {
                     i
                 ),
                 model: "gpt-4".to_string(),
-                api_key: "test-key".to_string(),
             })
             .collect();
 
@@ -11625,7 +11598,6 @@ mod tests {
                         path: "/v1/test".to_string(),
                         body: r#"{"prompt":"1"}"#.to_string(),
                         model: "gpt-4".to_string(),
-                        api_key: "key".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: None,
@@ -11634,7 +11606,6 @@ mod tests {
                         path: "/v1/test".to_string(),
                         body: r#"{"prompt":"2"}"#.to_string(),
                         model: "gpt-4".to_string(),
-                        api_key: "key".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: None,
@@ -11643,7 +11614,6 @@ mod tests {
                         path: "/v1/test".to_string(),
                         body: r#"{"prompt":"3"}"#.to_string(),
                         model: "gpt-4".to_string(),
-                        api_key: "key".to_string(),
                     },
                 ],
             )
@@ -11659,7 +11629,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -11708,7 +11677,6 @@ mod tests {
                     path: "/v1/responses".to_string(),
                     body: r#"{"model":"model-a","input":"hello"}"#.to_string(),
                     model: "model-a".to_string(),
-                    api_key: "template-key".to_string(),
                 }],
             )
             .await
@@ -11721,7 +11689,6 @@ mod tests {
                 metadata: Some(serde_json::json!({"kind": "background"})),
                 created_by: Some("user-a".to_string()),
                 api_key_id: None,
-                api_key: Some("batch-key".to_string()),
                 total_requests: Some(1),
             })
             .await
@@ -11768,7 +11735,6 @@ mod tests {
                 metadata: None,
                 created_by: Some("user-a".to_string()),
                 api_key_id: None,
-                api_key: None,
                 total_requests: Some(0),
             })
             .await;
@@ -11818,7 +11784,6 @@ mod tests {
                     path: "/v1/test".to_string(),
                     body: r#"{"prompt":"1"}"#.to_string(),
                     model: "gpt-4".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -11832,7 +11797,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -12093,7 +12057,6 @@ mod tests {
                 endpoint: "https://api.example.com".to_string(),
                 method: "POST".to_string(),
                 path: "/test".to_string(),
-                api_key: "key".to_string(),
                 created_by: "foreground-owner".to_string(),
                 metadata: None,
             })
@@ -12150,7 +12113,6 @@ mod tests {
                 endpoint: "https://api.example.com".to_string(),
                 method: "POST".to_string(),
                 path: "/test".to_string(),
-                api_key: "key".to_string(),
                 created_by: "sla-owner".to_string(),
                 metadata: None,
             })
@@ -12204,7 +12166,6 @@ mod tests {
                 endpoint: "https://api.example.com".to_string(),
                 method: "POST".to_string(),
                 path: "/test".to_string(),
-                api_key: "key".to_string(),
                 created_by: "sla-owner".to_string(),
                 metadata: None,
             })
@@ -12246,7 +12207,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: "{}".to_string(),
                     model: "batch-blocked-model".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -12259,7 +12219,6 @@ mod tests {
                 metadata: None,
                 created_by: Some("sla-owner".to_string()),
                 api_key_id: None,
-                api_key: None,
                 total_requests: Some(1),
             })
             .await
@@ -12483,7 +12442,6 @@ mod tests {
                 endpoint: "https://api.example.com".to_string(),
                 method: "POST".to_string(),
                 path: "/test".to_string(),
-                api_key: "key".to_string(),
                 created_by: "active-owner".to_string(),
             })
             .await
@@ -12496,7 +12454,6 @@ mod tests {
                 endpoint: "https://api.example.com".to_string(),
                 method: "POST".to_string(),
                 path: "/test".to_string(),
-                api_key: "key".to_string(),
                 created_by: "sla-owner".to_string(),
                 metadata: None,
             })
@@ -12561,7 +12518,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: "{}".to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -12574,7 +12530,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -12589,7 +12544,6 @@ mod tests {
                 endpoint: "https://api.example.com".to_string(),
                 method: "POST".to_string(),
                 path: "/test".to_string(),
-                api_key: "key".to_string(),
                 created_by: "user".to_string(),
                 metadata: None,
             })
@@ -12639,7 +12593,6 @@ mod tests {
                 endpoint: "https://api.example.com".to_string(),
                 method: "POST".to_string(),
                 path: "/test".to_string(),
-                api_key: "key".to_string(),
                 created_by: "user".to_string(),
                 metadata: Some(serde_json::json!({
                     "dw_user_agent": "claude-cli/1.2.3",
@@ -12703,7 +12656,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: "{}".to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -12719,7 +12671,6 @@ mod tests {
                 })),
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -12766,7 +12717,6 @@ mod tests {
                 endpoint: "https://api.example.com".to_string(),
                 method: "POST".to_string(),
                 path: "/test".to_string(),
-                api_key: "key".to_string(),
                 created_by: "user".to_string(),
                 metadata: None,
             })
@@ -12830,7 +12780,6 @@ mod tests {
                             path: "/test".into(),
                             body: "{}".into(),
                             model: model.into(),
-                            api_key: "key".into(),
                         })
                         .collect(),
                 )
@@ -12844,7 +12793,6 @@ mod tests {
                     metadata: None,
                     created_by: Some(user.into()),
                     api_key_id: None,
-                    api_key: None,
                     total_requests: None,
                 })
                 .await
@@ -12959,7 +12907,6 @@ mod tests {
                             path: "/test".into(),
                             body: "{}".into(),
                             model: "large".into(),
-                            api_key: "key".into(),
                         })
                         .collect(),
                 )
@@ -12973,7 +12920,6 @@ mod tests {
                     metadata: None,
                     created_by: Some(user.into()),
                     api_key_id: None,
-                    api_key: None,
                     total_requests: None,
                 })
                 .await
@@ -13036,7 +12982,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: "{}".to_string(),
                         model: model.to_string(),
-                        api_key: "key".to_string(),
                     }],
                 )
                 .await
@@ -13049,7 +12994,6 @@ mod tests {
                     metadata: None,
                     created_by: None,
                     api_key_id: None,
-                    api_key: None,
                     total_requests: None,
                 })
                 .await
@@ -13149,7 +13093,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: "{}".to_string(),
                     model: "ramp-model".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -13162,7 +13105,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -13259,7 +13201,6 @@ mod tests {
                             path: "/test".to_string(),
                             body: "{}".to_string(),
                             model: model.to_string(),
-                            api_key: "key".to_string(),
                         }],
                     )
                     .await
@@ -13272,7 +13213,6 @@ mod tests {
                         metadata: None,
                         created_by: None,
                         api_key_id: None,
-                        api_key: None,
                         total_requests: None,
                     })
                     .await
@@ -13441,7 +13381,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: format!(r#"{{"n":{}}}"#, i),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     })
                     .collect(),
             )
@@ -13456,7 +13395,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -13472,7 +13410,6 @@ mod tests {
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
                     path: "/test".to_string(),
-                    api_key: "key".to_string(),
                     created_by: "user".to_string(),
                     metadata: None,
                 })
@@ -13544,7 +13481,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: r#"{"n":0}"#.to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -13558,7 +13494,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -13658,7 +13593,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: r#"{"n":0}"#.to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -13671,7 +13605,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -13744,7 +13677,6 @@ mod tests {
                 path: "/test".to_string(),
                 body: "{}".to_string(),
                 model: "test".to_string(),
-                api_key: "key".to_string(),
             })
             .collect();
         let file_id = manager
@@ -13759,7 +13691,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -14523,7 +14454,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: r#"{"n":0}"#.to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -14537,7 +14467,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -14619,7 +14548,6 @@ mod tests {
                 path: "/test".to_string(),
                 body: "{}".to_string(),
                 model: "freeze-test".to_string(),
-                api_key: "key".to_string(),
             })
             .collect();
         let file_id = manager
@@ -14634,7 +14562,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -17001,7 +16928,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: format!(r#"{{"n":{}}}"#, i),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     })
                     .collect(),
             )
@@ -17016,7 +16942,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -17066,7 +16991,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: format!(r#"{{"n":{}}}"#, i),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     })
                     .collect(),
             )
@@ -17081,7 +17005,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -17205,7 +17128,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: format!(r#"{{"n":{}}}"#, i),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     })
                     .collect(),
             )
@@ -17220,7 +17142,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -17317,7 +17238,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: format!(r#"{{"n":{}}}"#, i),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     })
                     .collect(),
             )
@@ -17332,7 +17252,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -17374,7 +17293,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: r#"{"n":1}"#.to_string(),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: None,
@@ -17383,7 +17301,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: r#"{"n":2}"#.to_string(),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     },
                 ],
             )
@@ -17399,7 +17316,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -17469,7 +17385,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: format!(r#"{{"n":{}}}"#, i),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     })
                     .collect(),
             )
@@ -17484,7 +17399,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -17588,7 +17502,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: "{}".to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -17603,7 +17516,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -17616,7 +17528,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -17629,7 +17540,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -17674,7 +17584,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: r#"{"n":1}"#.to_string(),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: None,
@@ -17683,7 +17592,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: r#"{"n":2}"#.to_string(),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     },
                 ],
             )
@@ -17699,7 +17607,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -17754,7 +17661,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: r#"{"n":1}"#.to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -17811,7 +17717,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: "{}".to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -17825,7 +17730,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -17894,7 +17798,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: "{}".to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -17908,7 +17811,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -17985,7 +17887,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: "{}".to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -17999,7 +17900,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -18087,7 +17987,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: "{}".to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -18101,7 +18000,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -18189,7 +18087,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: r#"{"n":1}"#.to_string(),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: None,
@@ -18198,7 +18095,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: r#"{"n":2}"#.to_string(),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     },
                 ],
             )
@@ -18213,7 +18109,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -18301,7 +18196,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: r#"{"n":1}"#.to_string(),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: None,
@@ -18310,7 +18204,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: r#"{"n":2}"#.to_string(),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     },
                 ],
             )
@@ -18325,7 +18218,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -18391,7 +18283,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: "{}".to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -18405,7 +18296,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -18472,7 +18362,6 @@ mod tests {
                         path: "/v1/chat/completions".to_string(),
                         body: r#"{"prompt":"first"}"#.to_string(),
                         model: "gpt-4".to_string(),
-                        api_key: "key".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: Some("req-2".to_string()),
@@ -18481,7 +18370,6 @@ mod tests {
                         path: "/v1/chat/completions".to_string(),
                         body: r#"{"prompt":"second"}"#.to_string(),
                         model: "gpt-4".to_string(),
-                        api_key: "key".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: Some("req-3".to_string()),
@@ -18490,7 +18378,6 @@ mod tests {
                         path: "/v1/chat/completions".to_string(),
                         body: r#"{"prompt":"third"}"#.to_string(),
                         model: "gpt-4".to_string(),
-                        api_key: "key".to_string(),
                     },
                 ],
             )
@@ -18506,7 +18393,6 @@ mod tests {
                 metadata: None,
                 created_by: Some("test-user".to_string()),
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -18940,7 +18826,6 @@ mod tests {
                 path: "/v1/completions".to_string(),
                 body: r#"{"prompt":"first"}"#.to_string(),
                 model: "gpt-4".to_string(),
-                api_key: "key1".to_string(),
             }),
             FileStreamItem::Template(RequestTemplateInput {
                 custom_id: Some("stream-2".to_string()),
@@ -18949,7 +18834,6 @@ mod tests {
                 path: "/v1/completions".to_string(),
                 body: r#"{"prompt":"second"}"#.to_string(),
                 model: "gpt-3.5".to_string(),
-                api_key: "key2".to_string(),
             }),
         ];
 
@@ -19016,7 +18900,6 @@ mod tests {
                 path: "/test".to_string(),
                 body: r#"{"n":1}"#.to_string(),
                 model: "test".to_string(),
-                api_key: "key".to_string(),
             }),
             FileStreamItem::Metadata(FileMetadata {
                 filename: Some("late-metadata".to_string()),
@@ -19036,7 +18919,6 @@ mod tests {
                 path: "/test".to_string(),
                 body: r#"{"n":2}"#.to_string(),
                 model: "test".to_string(),
-                api_key: "key".to_string(),
             }),
         ];
 
@@ -19078,7 +18960,6 @@ mod tests {
                 path: "/test".to_string(),
                 body: r#"{"n":1}"#.to_string(),
                 model: "test".to_string(),
-                api_key: "key".to_string(),
             }),
             FileStreamItem::Abort,
             FileStreamItem::Template(RequestTemplateInput {
@@ -19088,7 +18969,6 @@ mod tests {
                 path: "/test".to_string(),
                 body: r#"{"n":2}"#.to_string(),
                 model: "test".to_string(),
-                api_key: "key".to_string(),
             }),
         ];
 
@@ -19128,7 +19008,6 @@ mod tests {
                 path: "/test".to_string(),
                 body: r#"{"n":1}"#.to_string(),
                 model: "test".to_string(),
-                api_key: "key".to_string(),
             }),
             FileStreamItem::Error("Invalid JSON on line 2".to_string()),
         ];
@@ -19172,7 +19051,6 @@ mod tests {
                     path: "/v1/completions".to_string(),
                     body: r#"{"prompt":"test"}"#.to_string(),
                     model: "gpt-4".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -19185,7 +19063,6 @@ mod tests {
             metadata: Some(serde_json::json!({"project": "test"})),
             created_by: Some("test-user".to_string()),
             api_key_id: None,
-            api_key: None,
             total_requests: None,
         };
 
@@ -19257,7 +19134,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: format!(r#"{{"n":{}}}"#, i),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     })
                     .collect(),
             )
@@ -19272,7 +19148,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -19332,7 +19207,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: format!(r#"{{"n":{}}}"#, i),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     })
                     .collect(),
             )
@@ -19347,7 +19221,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -19434,7 +19307,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: format!(r#"{{"n":{}}}"#, i),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     })
                     .collect(),
             )
@@ -19449,7 +19321,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -19548,7 +19419,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: r#"{"test":1}"#.to_string(),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: Some("my-custom-id-2".to_string()),
@@ -19557,7 +19427,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: r#"{"test":2}"#.to_string(),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     },
                 ],
             )
@@ -19572,7 +19441,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -19620,7 +19488,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: r#"{}"#.to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -19634,7 +19501,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -19693,7 +19559,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: format!(r#"{{"model":"{}","n":{}}}"#, model, n),
                     model: model.to_string(),
-                    api_key: "key".to_string(),
                 });
             }
         }
@@ -19711,7 +19576,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -19823,7 +19687,6 @@ mod tests {
                 path: "/test".to_string(),
                 body: "{}".to_string(),
                 model: "test".to_string(),
-                api_key: "key".to_string(),
             }),
             // Real filename arrives
             FileStreamItem::Metadata(FileMetadata {
@@ -19838,7 +19701,6 @@ mod tests {
                 path: "/test".to_string(),
                 body: "{}".to_string(),
                 model: "test".to_string(),
-                api_key: "key".to_string(),
             }),
         ];
 
@@ -19897,7 +19759,6 @@ mod tests {
                 path: "/test".to_string(),
                 body: "{}".to_string(),
                 model: "test".to_string(),
-                api_key: "key".to_string(),
             }),
         ];
 
@@ -20167,7 +20028,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: "{}".to_string(),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: Some("req-2".to_string()),
@@ -20176,7 +20036,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: "{}".to_string(),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: Some("req-3".to_string()),
@@ -20185,7 +20044,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: "{}".to_string(),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     },
                 ],
             )
@@ -20200,7 +20058,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -20319,7 +20176,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: "{}".to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -20333,7 +20189,6 @@ mod tests {
                 metadata: None,
                 created_by: Some("user1".to_string()),
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -20408,7 +20263,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: "{}".to_string(),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     }],
                 )
                 .await
@@ -20422,7 +20276,6 @@ mod tests {
                     metadata: None,
                     created_by: Some("user1".to_string()),
                     api_key_id: None,
-                    api_key: None,
                     total_requests: None,
                 })
                 .await
@@ -20540,7 +20393,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: "{}".to_string(),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     })
                     .collect(),
             )
@@ -20555,7 +20407,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -20654,7 +20505,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: "{}".to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -20668,7 +20518,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -20756,7 +20605,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: "{}".to_string(),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: None,
@@ -20765,7 +20613,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: "{}".to_string(),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     },
                 ],
             )
@@ -20831,7 +20678,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: r#"{"no_sla":true}"#.to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -20845,7 +20691,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -20868,7 +20713,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: r#"{"medium":true}"#.to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -20882,7 +20726,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -20912,7 +20755,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: r#"{"urgent":true}"#.to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -20926,7 +20768,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -21017,7 +20858,6 @@ mod tests {
                             path: "/test".to_string(),
                             body: "{}".to_string(),
                             model: "test-fifo".to_string(),
-                            api_key: "key".to_string(),
                         })
                         .collect(),
                 )
@@ -21032,7 +20872,6 @@ mod tests {
                     metadata: None,
                     created_by: None,
                     api_key_id: None,
-                    api_key: None,
                     total_requests: None,
                 })
                 .await
@@ -21064,7 +20903,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: "{}".to_string(),
                         model: "test-fifo".to_string(),
-                        api_key: "key".to_string(),
                     })
                     .collect(),
             )
@@ -21079,7 +20917,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -21137,7 +20974,6 @@ mod tests {
                             path: "/test".to_string(),
                             body: "{}".to_string(),
                             model: "fair-test".to_string(),
-                            api_key: "key".to_string(),
                         },
                         RequestTemplateInput {
                             custom_id: Some(format!("{}-req-2", user)),
@@ -21146,7 +20982,6 @@ mod tests {
                             path: "/test".to_string(),
                             body: "{}".to_string(),
                             model: "fair-test".to_string(),
-                            api_key: "key".to_string(),
                         },
                     ],
                 )
@@ -21161,7 +20996,6 @@ mod tests {
                     metadata: None,
                     created_by: Some(user.to_string()),
                     api_key_id: None,
-                    api_key: None,
                     total_requests: None,
                 })
                 .await
@@ -21245,7 +21079,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: "{}".to_string(),
                     model: "deadline-test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -21262,7 +21095,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: "{}".to_string(),
                     model: "deadline-test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -21277,7 +21109,6 @@ mod tests {
                 metadata: None,
                 created_by: Some("same-user".to_string()),
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -21292,7 +21123,6 @@ mod tests {
                 metadata: None,
                 created_by: Some("same-user".to_string()),
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -21338,7 +21168,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: "{}".to_string(),
                         model: "urgency-test".to_string(),
-                        api_key: "key".to_string(),
                     }],
                 )
                 .await
@@ -21352,7 +21181,6 @@ mod tests {
                     metadata: None,
                     created_by: Some(user.to_string()),
                     api_key_id: None,
-                    api_key: None,
                     total_requests: None,
                 })
                 .await
@@ -21474,7 +21302,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: "{}".to_string(),
                     model: model.to_string(),
-                    api_key: "key".to_string(),
                 })
                 .collect();
             let file_id = manager
@@ -21489,7 +21316,6 @@ mod tests {
                     metadata: None,
                     created_by: Some(format!("{label}-user")),
                     api_key_id: None,
-                    api_key: None,
                     total_requests: None,
                 })
                 .await
@@ -21607,7 +21433,6 @@ mod tests {
                 endpoint: "https://api.example.com".to_string(),
                 method: "POST".to_string(),
                 path: "/test".to_string(),
-                api_key: "key".to_string(),
                 created_by: user.to_string(),
                 metadata: None,
             })
@@ -22442,7 +22267,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: "{}".to_string(),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: None,
@@ -22451,7 +22275,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: "{}".to_string(),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     },
                 ],
             )
@@ -22466,7 +22289,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -22532,7 +22354,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: "{}".to_string(),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: Some("req-2".to_string()),
@@ -22541,7 +22362,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: "{}".to_string(),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: Some("req-3".to_string()),
@@ -22550,7 +22370,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: "{}".to_string(),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     },
                 ],
             )
@@ -22565,7 +22384,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -22923,7 +22741,6 @@ mod tests {
                 path: "/v1/completions".to_string(),
                 body: "{}".to_string(),
                 model: "gpt-4".to_string(),
-                api_key: "key".to_string(),
             })
         };
 
@@ -22990,7 +22807,6 @@ mod tests {
                 metadata: None,
                 created_by: Some("owner".to_string()),
                 api_key_id: None,
-                api_key: None,
                 total_requests: Some(0),
             })
             .await
@@ -23112,7 +22928,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: r#"{"n":1}"#.to_string(),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: None,
@@ -23121,7 +22936,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: r#"{"n":2}"#.to_string(),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     },
                 ],
             )
@@ -23181,7 +22995,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: r#"{"n":1}"#.to_string(),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: None,
@@ -23190,7 +23003,6 @@ mod tests {
                         path: "/test".to_string(),
                         body: r#"{"n":2}"#.to_string(),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     },
                 ],
             )
@@ -23206,7 +23018,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -23258,7 +23069,6 @@ mod tests {
             path: "/test".to_string(),
             body: format!("{{\"n\":{n}}}"),
             model: "test".to_string(),
-            api_key: "key".to_string(),
         };
         let mut batches = Vec::new();
         for name in ["purge-explicit", "purge-retention"] {
@@ -23274,7 +23084,6 @@ mod tests {
                     metadata: None,
                     created_by: None,
                     api_key_id: None,
-                    api_key: None,
                     total_requests: None,
                 })
                 .await
@@ -23370,7 +23179,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: r#"{"n":1}"#.to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -23385,7 +23193,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -23444,7 +23251,6 @@ mod tests {
                 path: "/test".to_string(),
                 body: format!(r#"{{"n":{}}}"#, i),
                 model: "test".to_string(),
-                api_key: "key".to_string(),
             })
             .collect();
 
@@ -23507,7 +23313,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: r#"{"n":1}"#.to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -23522,7 +23327,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -23617,7 +23421,6 @@ mod tests {
                 path: "/test".to_string(),
                 body: format!(r#"{{"n":{}}}"#, i),
                 model: "test".to_string(),
-                api_key: "key".to_string(),
             })
             .collect();
 
@@ -23635,7 +23438,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -23691,7 +23493,6 @@ mod tests {
                 endpoint: "http://localhost:3001/ai".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                api_key: String::new(),
                 created_by: "user-1".to_string(),
             })
             .await
@@ -23747,7 +23548,6 @@ mod tests {
                 endpoint: "http://localhost:3001/ai".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                api_key: String::new(),
                 created_by: "user-1".to_string(),
             })
             .await
@@ -23760,7 +23560,6 @@ mod tests {
                 endpoint: "http://localhost:3001/ai".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                api_key: String::new(),
                 created_by: "user-1".to_string(),
             })
             .await
@@ -23805,7 +23604,6 @@ mod tests {
                 endpoint: "http://localhost:3001/ai".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                api_key: String::new(),
                 created_by: "user-1".to_string(),
             })
             .await
@@ -23867,7 +23665,6 @@ mod tests {
                     path: "/test".to_string(),
                     body: r#"{"n":1}"#.to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -23881,7 +23678,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -23939,7 +23735,6 @@ mod tests {
                         path: "/v1/chat/completions".to_string(),
                         body: r#"{"input":"a1"}"#.to_string(),
                         model: "model-a".to_string(),
-                        api_key: "k".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: Some("a2".to_string()),
@@ -23948,7 +23743,6 @@ mod tests {
                         path: "/v1/chat/completions".to_string(),
                         body: r#"{"input":"a2"}"#.to_string(),
                         model: "model-a".to_string(),
-                        api_key: "k".to_string(),
                     },
                 ],
             )
@@ -23963,7 +23757,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -23982,7 +23775,6 @@ mod tests {
                         path: "/v1/chat/completions".to_string(),
                         body: r#"{"input":"b1"}"#.to_string(),
                         model: "model-b".to_string(),
-                        api_key: "k".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: Some("b2".to_string()),
@@ -23991,7 +23783,6 @@ mod tests {
                         path: "/v1/chat/completions".to_string(),
                         body: r#"{"input":"b2"}"#.to_string(),
                         model: "model-b".to_string(),
-                        api_key: "k".to_string(),
                     },
                 ],
             )
@@ -24006,7 +23797,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -24147,7 +23937,6 @@ mod tests {
                         path: "/v1/chat/completions".to_string(),
                         body: r#"{"input":"a1"}"#.to_string(),
                         model: "model-a".to_string(),
-                        api_key: "k".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: Some("b1".to_string()),
@@ -24156,7 +23945,6 @@ mod tests {
                         path: "/v1/chat/completions".to_string(),
                         body: r#"{"input":"b1"}"#.to_string(),
                         model: "model-b".to_string(),
-                        api_key: "k".to_string(),
                     },
                 ],
             )
@@ -24171,7 +23959,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -24324,7 +24111,6 @@ mod tests {
                         path: "/v1/chat/completions".to_string(),
                         body: r#"{"input":"x"}"#.to_string(),
                         model: "model-a".to_string(),
-                        api_key: "k".to_string(),
                     }],
                 )
                 .await
@@ -24338,7 +24124,6 @@ mod tests {
                     metadata: None,
                     created_by: None,
                     api_key_id: None,
-                    api_key: None,
                     total_requests: None,
                 })
                 .await
@@ -24460,7 +24245,6 @@ mod tests {
                 endpoint: "http://localhost".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                api_key: String::new(),
                 created_by: "queue-user".to_string(),
                 metadata: None,
             })
@@ -24523,7 +24307,6 @@ mod tests {
                 endpoint: "http://localhost".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                api_key: String::new(),
                 created_by: "queue-user".to_string(),
                 metadata: None,
             })
@@ -24667,7 +24450,6 @@ mod tests {
                 endpoint: "http://localhost".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                api_key: String::new(),
                 created_by: "queue-user".to_string(),
             })
             .await
@@ -24759,7 +24541,6 @@ mod tests {
                     path: "/v1/test".to_string(),
                     body: "{}".to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -24777,7 +24558,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: Some(key_a),
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -24791,7 +24571,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: Some(key_b),
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -24805,7 +24584,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -24879,7 +24657,6 @@ mod tests {
                     path: "/v1/test".to_string(),
                     body: "{}".to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -24893,7 +24670,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -24986,7 +24762,6 @@ mod tests {
                     path: "/v1/test".to_string(),
                     body: "{}".to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -25000,7 +24775,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -25063,7 +24837,6 @@ mod tests {
                     path: "/v1/test".to_string(),
                     body: "{}".to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -25077,7 +24850,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -25130,7 +24902,6 @@ mod tests {
                     path: "/v1/test".to_string(),
                     body: "{}".to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -25144,7 +24915,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -25190,7 +24960,6 @@ mod tests {
                     path: "/v1/test".to_string(),
                     body: "{}".to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -25204,7 +24973,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -25218,7 +24986,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -25286,7 +25053,6 @@ mod tests {
                     path: "/v1/test".to_string(),
                     body: "{}".to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -25300,7 +25066,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -25357,7 +25122,6 @@ mod tests {
                     path: "/v1/test".to_string(),
                     body: "{}".to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -25372,7 +25136,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -25394,7 +25157,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -25416,7 +25178,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -25485,7 +25246,6 @@ mod tests {
                     path: "/v1/test".to_string(),
                     body: "{}".to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }),
             ]))
             .await
@@ -25507,7 +25267,6 @@ mod tests {
                     path: "/v1/test".to_string(),
                     body: "{}".to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }),
             ]))
             .await
@@ -25588,7 +25347,6 @@ mod tests {
                     path: "/v1/test".to_string(),
                     body: "{}".to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -25606,7 +25364,6 @@ mod tests {
                     metadata: None,
                     created_by: None,
                     api_key_id: None,
-                    api_key: None,
                     total_requests: None,
                 })
                 .await
@@ -25712,7 +25469,6 @@ mod tests {
                     path: "/v1/test".to_string(),
                     body: "{}".to_string(),
                     model: "test".to_string(),
-                    api_key: "key".to_string(),
                 }],
             )
             .await
@@ -25730,7 +25486,6 @@ mod tests {
                     metadata: None,
                     created_by: None,
                     api_key_id: None,
-                    api_key: None,
                     total_requests: None,
                 })
                 .await
@@ -25830,7 +25585,6 @@ mod tests {
             path: "/v1/chat/completions".to_string(),
             body: "{}".to_string(),
             model: "gpt-4".to_string(),
-            api_key: "key".to_string(),
         };
 
         // Create a 1h batch
@@ -25846,7 +25600,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -25865,7 +25618,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -25971,7 +25723,6 @@ mod tests {
                     endpoint: "http://localhost:3001/ai".to_string(),
                     method: "POST".to_string(),
                     path: "/v1/responses".to_string(),
-                    api_key: String::new(),
                     created_by: "test-user".to_string(),
                 })
                 .await
@@ -26009,7 +25760,6 @@ mod tests {
                     endpoint: "http://localhost".to_string(),
                     method: "POST".to_string(),
                     path: "/v1/responses".to_string(),
-                    api_key: String::new(),
                     created_by: "pagination-user".to_string(),
                 })
                 .await
@@ -26073,7 +25823,6 @@ mod tests {
                     endpoint: "http://localhost".to_string(),
                     method: "POST".to_string(),
                     path: "/v1/responses".to_string(),
-                    api_key: String::new(),
                     created_by: "af-user".to_string(),
                 })
                 .await
@@ -26132,7 +25881,6 @@ mod tests {
                 endpoint: "http://localhost:3001/ai".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                api_key: String::new(),
                 created_by: "test-user-id".to_string(),
             })
             .await
@@ -26164,7 +25912,6 @@ mod tests {
                 endpoint: "http://localhost".into(),
                 method: "POST".into(),
                 path: "/".into(),
-                api_key: String::new(),
                 created_by: "owner".into(),
             })
             .await
@@ -26224,7 +25971,6 @@ mod tests {
                 endpoint: "http://localhost:3001/ai".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                api_key: String::new(),
                 created_by: "test-user".to_string(),
             })
             .await
@@ -26287,7 +26033,6 @@ mod tests {
                 endpoint: "http://localhost:3001/ai".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                api_key: String::new(),
                 created_by: "user-123".to_string(),
                 metadata: None,
             })
@@ -26321,7 +26066,6 @@ mod tests {
                 endpoint: "http://localhost:3001/ai".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                api_key: String::new(),
                 created_by: "user-a".to_string(),
                 metadata: None,
             })
@@ -26358,7 +26102,6 @@ mod tests {
                 metadata: None,
                 created_by: Some("filter-owner".to_string()),
                 api_key_id: None,
-                api_key: None,
                 total_requests: Some(1),
             })
             .await
@@ -26459,7 +26202,6 @@ mod tests {
                 endpoint: "http://localhost:3001/ai".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                api_key: String::new(),
                 created_by: "user-456".to_string(),
             })
             .await
@@ -26492,7 +26234,6 @@ mod tests {
                 endpoint: "http://localhost:3001/ai".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                api_key: String::new(),
                 created_by: "user-789".to_string(),
             })
             .await
@@ -26536,7 +26277,6 @@ mod tests {
                 endpoint: "http://localhost:3001/ai".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                api_key: String::new(),
                 created_by: "user-789".to_string(),
             })
             .await
@@ -26584,7 +26324,6 @@ mod tests {
                 endpoint: "http://localhost:3001/ai".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                api_key: String::new(),
                 created_by: "user-abc".to_string(),
             })
             .await
@@ -26652,7 +26391,6 @@ mod tests {
                 endpoint: "http://localhost:3001/ai".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                api_key: String::new(),
                 created_by: "user-1".to_string(),
                 started_at,
                 completed_at,
@@ -26712,7 +26450,6 @@ mod tests {
                 endpoint: "http://localhost:3001/ai".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                api_key: String::new(),
                 created_by: "user-2".to_string(),
             })
             .await
@@ -26739,7 +26476,6 @@ mod tests {
                 endpoint: String::new(),
                 method: String::new(),
                 path: String::new(),
-                api_key: String::new(),
                 created_by: "this-user-should-be-ignored".to_string(),
                 // Ignored on the UPDATE path (row keeps create_realtime's timing).
                 started_at: Utc::now(),
@@ -26785,7 +26521,6 @@ mod tests {
                 endpoint: "http://localhost:3001/ai".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                api_key: String::new(),
                 created_by: "user-bg".to_string(),
             })
             .await
@@ -26803,7 +26538,6 @@ mod tests {
                     endpoint: String::new(),
                     method: String::new(),
                     path: String::new(),
-                    api_key: String::new(),
                     created_by: String::new(),
                     started_at: Utc::now(),
                     completed_at: Utc::now(),
@@ -26817,7 +26551,6 @@ mod tests {
                     endpoint: "http://localhost:3001/ai".to_string(),
                     method: "POST".to_string(),
                     path: "/v1/responses".to_string(),
-                    api_key: String::new(),
                     created_by: "user-nonbg".to_string(),
                     started_at: Utc::now(),
                     completed_at: Utc::now(),
@@ -26871,7 +26604,6 @@ mod tests {
                 endpoint: "http://localhost:3001/ai".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                api_key: String::new(),
                 created_by: "user-3".to_string(),
             })
             .await
@@ -26895,7 +26627,6 @@ mod tests {
                 endpoint: "http://localhost:3001/ai".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                api_key: String::new(),
                 created_by: "user-3".to_string(),
                 started_at: Utc::now(),
                 completed_at: Utc::now(),
@@ -26933,7 +26664,6 @@ mod tests {
             path: "/v1/chat/completions".to_string(),
             body: r#"{"model":"gpt-4"}"#.to_string(),
             model: "gpt-4".to_string(),
-            api_key: "key".to_string(),
         };
         let file_id = manager
             .create_file("batched".to_string(), None, vec![template])
@@ -26947,7 +26677,6 @@ mod tests {
                 metadata: None,
                 created_by: Some("batched-user".to_string()),
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -26963,7 +26692,6 @@ mod tests {
                 endpoint: "http://localhost".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                api_key: String::new(),
                 created_by: "realtime-user".to_string(),
             })
             .await
@@ -26993,7 +26721,6 @@ mod tests {
                 endpoint: "http://localhost/ai".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                api_key: String::new(),
                 created_by: user.to_string(),
             })
             .await
@@ -27101,7 +26828,6 @@ mod tests {
                         path: "/v1/chat/completions".to_string(),
                         body: "{}".to_string(),
                         model: "test".to_string(),
-                        api_key: "key".to_string(),
                     }],
                 )
                 .await
@@ -27122,7 +26848,6 @@ mod tests {
                     metadata: None,
                     created_by: Some(user.to_string()),
                     api_key_id: None,
-                    api_key: None,
                     total_requests: None,
                 })
                 .await
@@ -27272,7 +26997,6 @@ mod tests {
                         path: "/v1/c".to_string(),
                         body: "{}".to_string(),
                         model: "m".to_string(),
-                        api_key: "k".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: None,
@@ -27281,7 +27005,6 @@ mod tests {
                         path: "/v1/c".to_string(),
                         body: "{}".to_string(),
                         model: "m".to_string(),
-                        api_key: "k".to_string(),
                     },
                 ],
             )

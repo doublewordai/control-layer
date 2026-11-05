@@ -218,7 +218,7 @@ pub struct RequestDetail {
 /// `processing` state with `batch_id = NULL` and `daemon_id = Uuid::nil()`.
 /// The proxy completes/fails the row directly via `complete_request` /
 /// `fail_request`; the daemon never claims it.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct CreateRealtimeInput {
     /// Pre-generated request ID. Becomes the request's primary key.
     pub request_id: Uuid,
@@ -232,21 +232,9 @@ pub struct CreateRealtimeInput {
     pub method: String,
     /// API path (e.g., "/v1/responses").
     pub path: String,
-    /// Ignored and not stored.
-    pub api_key: String,
     /// User/org ID that owns this request.
     pub created_by: String,
 }
-
-debug_with_redacted_api_key!(CreateRealtimeInput {
-    request_id,
-    body,
-    model,
-    endpoint,
-    method,
-    path,
-    created_by,
-});
 
 /// Input for persisting a batch of already-completed realtime responses.
 ///
@@ -263,7 +251,7 @@ debug_with_redacted_api_key!(CreateRealtimeInput {
 /// `completed_at`, etc.) are only consulted on the INSERT path. On the UPDATE
 /// path only `request_id`, `response_body`, and `status_code` are used — the
 /// pre-existing row already carries a real `started_at` from `create_realtime`.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct PersistCompletedRealtimeInput {
     /// The request UUID (primary key).
     pub request_id: Uuid,
@@ -281,8 +269,6 @@ pub struct PersistCompletedRealtimeInput {
     pub method: String,
     /// API path (e.g., "/v1/responses").
     pub path: String,
-    /// Ignored and not stored.
-    pub api_key: String,
     /// User/org ID that owns this request.
     pub created_by: String,
     /// Wall-clock instant the request arrived, as recorded by the caller.
@@ -300,26 +286,12 @@ pub struct PersistCompletedRealtimeInput {
     pub completed_at: DateTime<Utc>,
 }
 
-debug_with_redacted_api_key!(PersistCompletedRealtimeInput {
-    request_id,
-    response_body,
-    status_code,
-    request_body,
-    model,
-    endpoint,
-    method,
-    path,
-    created_by,
-    started_at,
-    completed_at,
-});
-
 /// Input for creating a flex (async) response that the daemon will process.
 ///
 /// Inserts a request template (no parent file) and a request row in `pending`
 /// state with `batch_id = NULL`. The daemon claims and processes it like any
 /// other pending request.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct CreateFlexInput {
     /// Pre-generated request ID. Becomes the request's primary key.
     pub request_id: Uuid,
@@ -333,8 +305,6 @@ pub struct CreateFlexInput {
     pub method: String,
     /// API path (e.g., "/v1/responses").
     pub path: String,
-    /// Ignored and not stored: requests are dispatched by API key id.
-    pub api_key: String,
     /// User/org ID that owns this request.
     pub created_by: String,
     /// Provenance for the dispatched request, stored on the template.
@@ -347,23 +317,12 @@ pub struct CreateFlexInput {
     pub metadata: Option<serde_json::Value>,
 }
 
-debug_with_redacted_api_key!(CreateFlexInput {
-    request_id,
-    body,
-    model,
-    endpoint,
-    method,
-    path,
-    created_by,
-    metadata,
-});
-
 /// Input for creating a background response that the daemon will process only
 /// when the target model has spare live capacity.
 ///
 /// Inserts a request template (no parent file) and a request row in `pending`
 /// state with `batch_id = NULL` and `service_tier = 'background'`.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct CreateBackgroundInput {
     /// Pre-generated request ID. Becomes the request's primary key.
     pub request_id: Uuid,
@@ -377,25 +336,12 @@ pub struct CreateBackgroundInput {
     pub method: String,
     /// API path (e.g., "/v1/responses").
     pub path: String,
-    /// Ignored and not stored: requests are dispatched by API key id.
-    pub api_key: String,
     /// User/org ID that owns this request.
     pub created_by: String,
     /// Provenance for the dispatched request, stored on the template. See
     /// [`CreateFlexInput::metadata`].
     pub metadata: Option<serde_json::Value>,
 }
-
-debug_with_redacted_api_key!(CreateBackgroundInput {
-    request_id,
-    body,
-    model,
-    endpoint,
-    method,
-    path,
-    created_by,
-    metadata,
-});
 
 /// Result of a paginated request list query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -424,7 +370,6 @@ mod background_tests {
             endpoint: "http://localhost:3001".to_string(),
             method: "POST".to_string(),
             path: "/v1/responses".to_string(),
-            api_key: "test-key".to_string(),
             created_by: "user-a".to_string(),
             metadata: None,
         };

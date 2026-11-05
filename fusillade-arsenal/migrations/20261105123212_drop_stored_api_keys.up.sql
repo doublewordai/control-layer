@@ -1,9 +1,11 @@
--- Drop the stored API key secrets (contract step 2 of 2).
+-- Drop the API key secrets stored on request templates (contract step 2 of 2).
 --
 -- Requests are dispatched by API key id, and the previous release neither
--- reads nor writes these columns: new templates took the empty default and
--- new batches left the key NULL. Dropping them removes every stored copy of a
--- key secret.
+-- reads nor writes this column: new templates took the empty default. This
+-- removes the column from the live schema; batches.api_key goes in
+-- 20261105143830. DROP COLUMN rewrites nothing: the old bytes stay in table
+-- pages until rows are rewritten or their weekly partition retires, and in
+-- WAL and backups until they expire.
 --
 -- CREATE OR REPLACE cannot remove a view column, so the views that project
 -- api_key are recreated without it first. Every statement is metadata-only;
@@ -45,4 +47,3 @@ WHERE false
 WITH CASCADED CHECK OPTION;
 
 ALTER TABLE request_templates_g2 DROP COLUMN api_key;
-ALTER TABLE batches DROP COLUMN api_key;

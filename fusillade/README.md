@@ -54,7 +54,6 @@ let file_id = store.create_file(
             path: "/v1/chat/completions".to_string(),
             body: r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}"#.to_string(),
             model: "gpt-4".to_string(),
-            api_key: env::var("OPENAI_API_KEY")?,
         },
     ],
 ).await?;
@@ -67,7 +66,6 @@ let batch = store.create_batch(BatchInput {
     metadata: None,
     created_by: None,
     api_key_id: None,
-    api_key: None,
     total_requests: None,
 }).await?;
 
@@ -75,6 +73,10 @@ let batch = store.create_batch(BatchInput {
 let status = store.get_batch_status(batch.id).await?;
 println!("Completed: {}/{}", status.completed_requests, status.total_requests);
 ```
+
+No credential is stored with a request. A `RequestProcessor` sets each
+dispatch's bearer credential (`RequestData::api_key`), for example from the
+batch's `api_key_id`.
 
 ### Concurrency Control
 
@@ -215,7 +217,6 @@ let batch = store.create_background_batch(BackgroundBatchInput {
     metadata: None,
     created_by: Some("user-id".to_string()),
     api_key_id: None,
-    api_key: None,
     total_requests: None,
 }).await?;
 ```
@@ -234,7 +235,6 @@ store.create_background(CreateBackgroundInput {
     endpoint: "https://api.example.com".to_string(),
     method: "POST".to_string(),
     path: "/v1/responses".to_string(),
-    api_key: "key".to_string(),
     created_by: "user-id".to_string(),
 }).await?;
 ```

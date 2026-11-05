@@ -125,7 +125,6 @@ impl SampleGenerator for ChatGenerator {
                     method: "POST".to_string(),
                     path: "/v1/chat/completions".to_string(),
                     model: model_alias.to_string(),
-                    api_key: String::new(),
                     body: body.to_string(),
                 }
             })
@@ -157,7 +156,6 @@ mod tests {
             assert_eq!(req.method, "POST");
             assert_eq!(req.path, "/v1/chat/completions");
             assert_eq!(req.model, "gpt-4");
-            assert!(req.api_key.is_empty());
             assert_eq!(req.endpoint, "https://api.example.com");
 
             // Verify body is valid JSON with expected structure

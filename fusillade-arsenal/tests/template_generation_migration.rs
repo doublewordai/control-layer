@@ -271,7 +271,6 @@ async fn file_writes_land_with_routes_and_erase_with_them(pool: PgPool) {
         path: "/v1/x".to_string(),
         body: format!("{{\"cut\":{n}}}"),
         model: "test-model".to_string(),
-        api_key: "test-key".to_string(),
     };
 
     let manager = PostgresRequestManager::new(
@@ -619,7 +618,6 @@ async fn a_batch_materializes_requests_from_generation_two_templates(pool: PgPoo
                 path: "/v1/x".to_string(),
                 body: "{\"gen\":2}".to_string(),
                 model: "test-model".to_string(),
-                api_key: "test-key".to_string(),
             }],
         )
         .await
@@ -635,7 +633,6 @@ async fn a_batch_materializes_requests_from_generation_two_templates(pool: PgPoo
             metadata: None,
             created_by: None,
             api_key_id: None,
-            api_key: None,
             total_requests: None,
         })
         .await

@@ -910,7 +910,6 @@ pub async fn create_batch<P: PoolProvider>(
                 metadata,
                 created_by: Some(target_user_id.to_string()),
                 api_key_id: Some(api_key_id),
-                api_key: None,
                 total_requests: Some(total_requests),
             })
             .await
@@ -942,7 +941,6 @@ pub async fn create_batch<P: PoolProvider>(
             metadata,
             created_by: Some(target_user_id.to_string()),
             api_key_id: Some(api_key_id),
-            api_key: None,
             total_requests: Some(total_requests),
         };
 
@@ -4420,7 +4418,6 @@ mod tests {
                 path: "/v1/chat/completions".to_string(),
                 body: format!(r#"{{"model":"{alias}","messages":[{{"role":"user","content":"hello"}}]}}"#),
                 model: alias.to_string(),
-                api_key: "key".to_string(),
             })
             .collect();
 
@@ -4438,7 +4435,6 @@ mod tests {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await

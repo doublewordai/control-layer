@@ -438,7 +438,6 @@ async fn seed_archivable_response(pool: &PgPool, manager: &PostgresRequestManage
             endpoint: "https://example.invalid".to_owned(),
             method: "POST".to_owned(),
             path: "/v1/responses".to_owned(),
-            api_key: "store-test-key".to_owned(),
             created_by: owner.to_owned(),
         })
         .await
@@ -472,7 +471,6 @@ async fn response_context_treats_zdr_ciphertext_as_unavailable(pool: PgPool) {
             endpoint: "https://example.invalid".to_owned(),
             method: "POST".to_owned(),
             path: "/v1/responses".to_owned(),
-            api_key: "store-test-key".to_owned(),
             created_by: user.id.to_string(),
         })
         .await

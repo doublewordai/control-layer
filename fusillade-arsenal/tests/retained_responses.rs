@@ -940,7 +940,6 @@ async fn erase_racing_same_id_create_rolls_back_request_and_template(pool: PgPoo
                 endpoint: "https://example.invalid".to_owned(),
                 method: "POST".to_owned(),
                 path: "/v1/responses".to_owned(),
-                api_key: "must-not-survive".to_owned(),
                 created_by: OWNER.to_owned(),
             })
             .await
@@ -982,7 +981,6 @@ fn late_realtime_record(request_id: Uuid) -> PersistCompletedRealtimeInput {
         endpoint: "https://example.invalid".to_owned(),
         method: "POST".to_owned(),
         path: "/v1/responses".to_owned(),
-        api_key: "must-not-survive".to_owned(),
         created_by: OWNER.to_owned(),
         started_at: Utc::now(),
         completed_at: Utc::now(),
@@ -1060,13 +1058,11 @@ async fn bulk_duplicate_conflicting_id_uses_first_record_without_orphans(pool: P
     first.request_body = r#"{"winner":"request"}"#.to_owned();
     first.response_body = r#"{"winner":"response"}"#.to_owned();
     first.model = "winner-model".to_owned();
-    first.api_key = "winner-key".to_owned();
     first.created_by = "winner-owner".to_owned();
     let mut second = first.clone();
     second.request_body = r#"{"loser":"request"}"#.to_owned();
     second.response_body = r#"{"loser":"response"}"#.to_owned();
     second.model = "loser-model".to_owned();
-    second.api_key = "loser-key".to_owned();
     second.created_by = "loser-owner".to_owned();
 
     manager
@@ -1146,7 +1142,6 @@ async fn bulk_mixed_fenced_batch_rolls_back_live_and_fresh_siblings(pool: PgPool
             endpoint: "https://example.invalid".to_owned(),
             method: "POST".to_owned(),
             path: "/v1/responses".to_owned(),
-            api_key: "bulk-live-key".to_owned(),
             created_by: OWNER.to_owned(),
         })
         .await
@@ -1233,7 +1228,6 @@ async fn late_request_writers_cannot_resurrect_an_erased_graph(pool: PgPool) {
                 endpoint: "https://example.invalid".to_owned(),
                 method: "POST".to_owned(),
                 path: "/v1/responses".to_owned(),
-                api_key: "must-not-survive".to_owned(),
                 created_by: OWNER.to_owned(),
             })
             .await
@@ -1284,7 +1278,6 @@ async fn late_request_writers_treat_an_active_retained_graph_as_terminal(pool: P
                 endpoint: "https://example.invalid".to_owned(),
                 method: "POST".to_owned(),
                 path: "/v1/responses".to_owned(),
-                api_key: "must-not-survive".to_owned(),
                 created_by: OWNER.to_owned(),
             })
             .await
@@ -1502,7 +1495,6 @@ async fn late_synthesis_is_fenced_after_the_retained_partition_disappears(pool: 
             endpoint: "https://example.invalid".to_owned(),
             method: "POST".to_owned(),
             path: "/v1/responses".to_owned(),
-            api_key: "must-not-survive".to_owned(),
             created_by: OWNER.to_owned(),
         })
         .await
@@ -1560,7 +1552,6 @@ async fn retiring_route_blocks_late_synthesis_after_archive_fence_expiry(pool: P
             endpoint: "https://example.invalid".to_owned(),
             method: "POST".to_owned(),
             path: "/v1/responses".to_owned(),
-            api_key: "must-not-survive".to_owned(),
             created_by: OWNER.to_owned(),
         })
         .await
@@ -5712,7 +5703,6 @@ async fn direct_realtime_retained_mixed_processing_and_fresh_records(pool: PgPoo
             endpoint: existing.endpoint.clone(),
             method: existing.method.clone(),
             path: existing.path.clone(),
-            api_key: existing.api_key.clone(),
             created_by: OWNER.into(),
         })
         .await

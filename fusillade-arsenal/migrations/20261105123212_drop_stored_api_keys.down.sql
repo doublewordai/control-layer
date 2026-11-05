@@ -1,9 +1,8 @@
 SET LOCAL lock_timeout = '5s';
 
--- Restore the columns (empty, as the previous release writes them) and the
+-- Restore the column (empty, as the previous release writes it) and the
 -- views' previous definitions (20261102120000, 20261008130000). The secrets
 -- themselves are gone.
-ALTER TABLE batches ADD COLUMN api_key TEXT;
 ALTER TABLE request_templates_g2 ADD COLUMN api_key TEXT NOT NULL DEFAULT '';
 
 DROP VIEW active_request_templates;
