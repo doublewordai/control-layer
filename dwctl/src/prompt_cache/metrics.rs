@@ -17,7 +17,7 @@
 //!   `errors.rs`); histograms use the recorder's default buckets unless tuned in the
 //!   recorder builder.
 
-use metrics::{counter, histogram};
+use metrics::{counter, gauge, histogram};
 
 // ── Adoption ──────────────────────────────────────────────────────────────────
 
@@ -37,8 +37,9 @@ pub fn record_marker_request(marked: bool) {
 
 /// Request-level cache behaviour across ALL traffic. `outcome` ∈ `read` | `create_only` |
 /// `read_and_create` | `zero_active` (enabled but nothing cached) | `inactive` (model not
-/// enabled / no key) | `aborted` (streaming request whose client disconnected before classify was
-/// joined — the outcome is unknown, including whether it would even have been cache-active).
+/// enabled / no key) | `aborted` (classify was cancelled before it resolved — a client disconnect,
+/// or a downstream failure that made waiting for it pointless — so the outcome is unknown, including
+/// whether it would even have been cache-active).
 /// **No `model` label** — `inactive` covers unknown/typo models (raw input → unbounded); per-model
 /// volumes are on `record_token_volumes` (enabled-only).
 pub fn record_request_outcome(outcome: &'static str) {
@@ -66,9 +67,11 @@ pub fn record_token_volumes(model: &str, read: u64, creation_5m: u64, creation_1
 // ── Classify path ─────────────────────────────────────────────────────────────
 
 /// Classify-join result. `outcome` ∈ `ok` | `deadline_exceeded` | `error` | `panicked` |
-/// `abandoned` (streaming request whose client disconnected before the join, so the task was
-/// aborted un-joined). `deadline_exceeded` is the primary "tokenizer/index outage is adding
-/// latency" signal; a high `abandoned` rate flags wasted classify work from client disconnects.
+/// `abandoned` (the client disconnected before the join, so the task was aborted un-joined) |
+/// `downstream_failed` (the upstream response failed — non-2xx or a body transport error — while
+/// classify was still running, so it was aborted rather than waited for). `deadline_exceeded` is
+/// the primary "tokenizer/index outage is adding latency" signal; a high `abandoned` rate flags
+/// wasted classify work from client disconnects.
 pub fn record_classify(outcome: &'static str) {
     counter!("dwctl_cache_classify_total", "outcome" => outcome).increment(1);
 }
@@ -96,12 +99,17 @@ pub fn record_skip(reason: &'static str) {
 
 // ── Tokenizer-svc ─────────────────────────────────────────────────────────────
 
-/// `outcome` ∈ `ok` | `http_error` | `unmapped_422` | `transport_error` (timeout/connection).
+/// A LOGICAL tokenizer operation (one `tokenize()`/`render()` call, across ALL of its serving-scope
+/// attempts). `outcome` ∈ `ok` | `http_error` | `unmapped_422` | `transport_error` (timeout/connection).
+/// Contrast with [`record_tokenizer_attempt`], which counts each HTTP attempt inside one such call.
 pub fn record_tokenizer_request(outcome: &'static str) {
     counter!("dwctl_cache_tokenizer_requests_total", "outcome" => outcome).increment(1);
 }
 
-/// tokenizer-svc round-trip latency, attributable per model and payload size.
+/// LOGICAL tokenizer-svc operation latency (one `tokenize()`/`render()` call, wall-time across all
+/// of its attempts, including retry backoff/budget waits), attributable per model and payload size.
+/// For the per-attempt view use [`record_tokenizer_attempt`]; for retry queueing use
+/// [`record_tokenizer_retry_budget_wait`].
 ///
 /// Labels (added after the 2026-07 deadline-miss investigation, where the unlabelled series
 /// couldn't answer "which model / how big"): `model` is the virtual-model alias — bounded by
@@ -127,6 +135,55 @@ pub fn tokenize_size_bucket(total_bytes: usize) -> &'static str {
         65_536..=262_143 => "64k_256k",
         _ => "gte256k",
     }
+}
+
+// ── Tokenizer-svc retries (serving scope) ─────────────────────────────────────
+// `op` ∈ `tokenize` | `render` | `models`. Every label here is `&'static str`, so retry series
+// cannot multiply with model/request-id/URL/body cardinality. Callers live in
+// `tokenizer.rs`/`tokenizer_retry.rs`.
+
+/// Every completed tokenizer-svc HTTP attempt made by a logical operation (any scope).
+/// `op` ∈ `tokenize` | `render` | `models`; `attempt` ∈ `first` | `retry`; `result` ∈ `ok` |
+/// `overloaded_503` | `http_error` | `transport_error`. This is the per-ATTEMPT counter: a logical
+/// call that succeeds after two 503s emits `first/overloaded_503`, `retry/overloaded_503`,
+/// `retry/ok`. Non-serving callers (recompute/replay/prefix-chain) are single-attempt and so emit
+/// only `attempt="first"`. The 5s per-attempt timeout is a `transport_error` here; malformed 2xx
+/// and non-503 statuses are `http_error`.
+pub fn record_tokenizer_attempt(op: &'static str, attempt: &'static str, result: &'static str) {
+    counter!(
+        "dwctl_cache_tokenizer_attempts_total",
+        "op" => op,
+        "attempt" => attempt,
+        "result" => result
+    )
+    .increment(1);
+}
+
+/// A LOGICAL operation (one `tokenize()`/`render()` call) that succeeded after at least one 503
+/// retry. Dividing this by the logical-operation counters gives the share of calls the retry loop
+/// rescued; it is deliberately not derivable from the per-attempt counter alone.
+pub fn record_tokenizer_retry_recovered(op: &'static str) {
+    counter!("dwctl_cache_tokenizer_retry_recovered_total", "op" => op).increment(1);
+}
+
+/// Time a retry spent waiting for the shared budget (rate token + concurrency permit) before
+/// its HTTP attempt started. Recorded once per retry attempt (0 when no wait). The companion
+/// `..._waits_total` counts only the non-zero waits, so
+/// `waits_total / retry-attempts` is the fraction of retries that queue, while the histogram
+/// p50/p95 is the actual queue depth. A rising p95 is the first sign the shared budget (not
+/// tokenizer-svc itself) is throttling recovery.
+pub fn record_tokenizer_retry_budget_wait(op: &'static str, seconds: f64) {
+    histogram!("dwctl_cache_tokenizer_retry_budget_wait_seconds", "op" => op).record(seconds);
+    if seconds > 0.0 {
+        counter!("dwctl_cache_tokenizer_retry_budget_waits_total", "op" => op).increment(1);
+    }
+}
+
+/// Current number of in-flight retry HTTP attempts (process-wide). Gauge, not a counter: it
+/// saturates at `cache.tokenizer_retry.max_concurrent_retries` by construction, so a flat top
+/// means the concurrency permit is the bottleneck.
+pub fn set_tokenizer_retry_inflight(n: usize) {
+    gauge!("dwctl_cache_tokenizer_retry_inflight").set(n as f64);
 }
 
 /// alias→version moka cache. `result` ∈ `hit` | `miss`.
