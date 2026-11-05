@@ -80,7 +80,7 @@ async fn backfill_hashes_existing_keys_like_hash_api_key(pool: PgPool) {
             .unwrap(),
         Some(user)
     );
-    let info = keys.get_user_info_by_secret(unicode_secret).await.unwrap().unwrap();
+    let info = keys.get_user_info_by_hash(&hash_api_key(unicode_secret)).await.unwrap().unwrap();
     assert_eq!(info.0, user);
     assert_eq!(keys.get_user_id_by_secret("sk-not-a-key").await.unwrap(), None);
     drop(conn);

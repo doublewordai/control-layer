@@ -253,6 +253,10 @@ pub enum AuthMethod {
     #[default]
     NativeSession,
     ApiKey,
+    /// Verified platform-purpose API key. Inference keys never receive this authority.
+    PlatformApiKey,
+    /// Verified reserved key, creator and account IDs, with platform purpose.
+    SystemApiKey,
     TrustedSso,
 }
 
@@ -314,10 +318,13 @@ impl CurrentUser {
     /// Direct role checks must see the same ceiling as RequiresPermission.
     pub fn with_auth_method(mut self, method: AuthMethod) -> Self {
         self.auth_method = method;
-        if method != AuthMethod::TrustedSso {
+        if method != AuthMethod::TrustedSso && !self.is_system() {
             self.is_admin = false;
-            self.roles
-                .retain(|role| !matches!(role, Role::PlatformManager | Role::BillingManager | Role::RequestViewer));
+            self.roles.retain(|role| match role {
+                Role::PlatformManager => method == AuthMethod::PlatformApiKey,
+                Role::BillingManager | Role::RequestViewer => false,
+                _ => true,
+            });
             if !self.roles.contains(&Role::StandardUser) {
                 self.roles.push(Role::StandardUser);
             }
@@ -327,6 +334,19 @@ impl CurrentUser {
 
     pub fn is_sso_platform_manager(&self) -> bool {
         self.auth_method == AuthMethod::TrustedSso && (self.is_admin || self.roles.contains(&Role::PlatformManager))
+    }
+
+    /// Only the reserved system key authenticating its reserved principal is unrestricted.
+    /// Account roles, a system-like name, or another key created by that principal
+    /// cannot confer this authority.
+    pub fn is_system(&self) -> bool {
+        self.auth_method == AuthMethod::SystemApiKey && self.id.is_nil() && self.api_key_id == Some(uuid::Uuid::nil())
+    }
+
+    pub fn can_manage_platform(&self) -> bool {
+        self.is_system()
+            || self.is_sso_platform_manager()
+            || (self.auth_method == AuthMethod::PlatformApiKey && self.roles.contains(&Role::PlatformManager))
     }
 
     #[cfg(test)]

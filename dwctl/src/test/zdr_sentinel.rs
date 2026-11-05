@@ -344,10 +344,12 @@ async fn zdr_sentinel_async_batch_failure_does_not_log_payload(pool: PgPool) {
     add_user_to_group(&pool, user.id, uuid::Uuid::nil()).await;
     let batch_api_key = {
         let mut conn = pool.acquire().await.expect("acquire");
-        ApiKeys::new(&mut conn)
+        let mut keys = ApiKeys::new(&mut conn);
+        let id = keys
             .get_or_create_hidden_key(user.id, ApiKeyPurpose::Batch, user.id)
             .await
-            .expect("batch api key")
+            .expect("batch api key");
+        keys.legacy_dispatch_secret(id).await.expect("batch api key secret")
     };
 
     // Mock upstream: 400 with a body that echoes the prompt sentinel — exactly the

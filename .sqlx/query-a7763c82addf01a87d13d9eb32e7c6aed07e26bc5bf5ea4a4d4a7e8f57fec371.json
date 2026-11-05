@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                p.id as probe_id,\n                p.http_method,\n                p.request_path,\n                p.request_body,\n                d.alias,\n                d.type as model_type,\n                ak.secret as system_api_key\n            FROM probes p\n            JOIN deployed_models d ON p.deployment_id = d.id\n            CROSS JOIN api_keys ak\n            WHERE p.id = $1 AND ak.id = '00000000-0000-0000-0000-000000000000'::uuid\n            ",
+  "query": "\n            SELECT\n                p.id as probe_id,\n                p.http_method,\n                p.request_path,\n                p.request_body,\n                d.alias,\n                d.type as model_type\n            FROM probes p\n            JOIN deployed_models d ON p.deployment_id = d.id\n            WHERE p.id = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -32,11 +32,6 @@
         "ordinal": 5,
         "name": "model_type",
         "type_info": "Varchar"
-      },
-      {
-        "ordinal": 6,
-        "name": "system_api_key",
-        "type_info": "Varchar"
       }
     ],
     "parameters": {
@@ -50,9 +45,8 @@
       true,
       true,
       false,
-      true,
-      false
+      true
     ]
   },
-  "hash": "3601be380296ace35547317125bdbc17a2906a92361208b19ff0119cd3c71818"
+  "hash": "a7763c82addf01a87d13d9eb32e7c6aed07e26bc5bf5ea4a4d4a7e8f57fec371"
 }

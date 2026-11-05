@@ -447,8 +447,8 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
         let triggered_by = sync_op.triggered_by;
 
         let mut conn = dwctl.write().acquire().await?;
-        let (_secret, key_id) = ApiKeys::new(&mut conn)
-            .get_or_create_hidden_key_with_id(owner_id, ApiKeyPurpose::Batch, triggered_by)
+        let key_id = ApiKeys::new(&mut conn)
+            .get_or_create_hidden_key(owner_id, ApiKeyPurpose::Batch, triggered_by)
             .await
             .map_err(|e| anyhow::anyhow!("resolve file API key: {e}"))?;
 
@@ -1112,8 +1112,14 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
         let conn_name = connection.name.clone();
         let triggered_by = sync_op.triggered_by;
 
-        let (secret, key_id) = ApiKeys::new(&mut conn)
-            .get_or_create_hidden_key_with_id(owner_id, ApiKeyPurpose::Batch, triggered_by)
+        let mut keys = ApiKeys::new(&mut conn);
+        let key_id = keys
+            .get_or_create_hidden_key(owner_id, ApiKeyPurpose::Batch, triggered_by)
+            .await
+            .map_err(|e| anyhow::anyhow!("resolve batch API key: {e}"))?;
+        // Fusillade still dispatches batches with a stored key (until DW-1010).
+        let secret = keys
+            .legacy_dispatch_secret(key_id)
             .await
             .map_err(|e| anyhow::anyhow!("resolve batch API key: {e}"))?;
 

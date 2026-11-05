@@ -27,10 +27,12 @@ use axum::http::{Method, Request, StatusCode, header};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http_body_util::BodyExt;
+use onwards::auth::PresentedKey;
 use onwards::serving::BillingPrices;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
+use crate::crypto::ApiKeyHash;
 use crate::prompt_cache::sse::SseBufferedStream;
 
 use super::layer::{ContinuationState, RequestContext};
@@ -154,16 +156,21 @@ fn leg_prices(original: BillingPrices) -> BillingPrices {
     }
 }
 
-fn build_leg_request(path: &str, key_secret: &str, body: &Value, prices: Option<BillingPrices>) -> Request<Body> {
+/// A resume leg. It re-enters the stack below the internal-credential layer,
+/// in-process, so it presents the global continuation key by hash rather than
+/// with a bearer token.
+fn build_leg_request(path: &str, key_hash: &ApiKeyHash, body: &Value, prices: Option<BillingPrices>) -> Request<Body> {
     let bytes = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
     let mut request = Request::builder()
         .method(Method::POST)
         .uri(resume_path(path))
-        .header(header::AUTHORIZATION, format!("Bearer {key_secret}"))
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::ACCEPT, "text/event-stream")
         .body(Body::from(bytes))
         .expect("a POST with static headers always builds");
+    request
+        .extensions_mut()
+        .insert(PresentedKey(onwards::auth::KeyHash::from_bytes(*key_hash)));
     if let Some(prices) = prices {
         request.extensions_mut().insert(prices);
     }
@@ -220,7 +227,7 @@ pub async fn attempt(state: &ContinuationState, ctx: &RequestContext, continuati
     // [`super::RouteInfo::strip_leading_bos`]: BOS-prepending is a per-MEMBER
     // property, and this body is built once, before onwards picks a member.
     let body = build_leg_body(ctx, &render.token_ids, max_tokens, state.cfg.priority);
-    let request = build_leg_request(&ctx.path, &state.key_secret, &body, ctx.prices.map(leg_prices));
+    let request = build_leg_request(&ctx.path, &state.key_hash, &body, ctx.prices.map(leg_prices));
 
     // Dispatch accounting happens BEFORE the await: a leg that times out,
     // 4xxs, or comes back non-streaming still re-prefilled the prompt
@@ -331,14 +338,16 @@ mod tests {
     #[test]
     fn leg_request_carries_the_global_key_and_asks_for_a_stream() {
         let body = build_leg_body(&ctx(json!({})), &[1], None, 100);
-        let request = build_leg_request("/v1/chat/completions", "dw-continuation-secret", &body, None);
+        let key = crate::crypto::hash_api_key("dw-continuation-secret");
+        let request = build_leg_request("/v1/chat/completions", &key, &body, None);
         assert_eq!(request.method(), Method::POST);
         assert_eq!(request.uri().path(), "/v1/completions");
         assert_eq!(
-            request.headers().get(header::AUTHORIZATION).unwrap(),
-            "Bearer dw-continuation-secret",
+            request.extensions().get::<PresentedKey>(),
+            Some(&PresentedKey(onwards::auth::KeyHash::from_bytes(key))),
             "the leg authenticates as the global continuation key, not as the customer"
         );
+        assert!(request.headers().get(header::AUTHORIZATION).is_none(), "no secret on the leg");
         assert_eq!(request.headers().get(header::CONTENT_TYPE).unwrap(), "application/json");
         assert_eq!(request.headers().get(header::ACCEPT).unwrap(), "text/event-stream");
         assert!(request.extensions().get::<BillingPrices>().is_none());
@@ -348,7 +357,7 @@ mod tests {
             cached: 1e-7,
             output: 3e-6,
         };
-        let request = build_leg_request("/v1/chat/completions", "dw-continuation-secret", &body, Some(prices));
+        let request = build_leg_request("/v1/chat/completions", &key, &body, Some(prices));
         assert_eq!(
             request.extensions().get::<BillingPrices>(),
             Some(&prices),

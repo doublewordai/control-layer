@@ -197,21 +197,21 @@ pub async fn image_normalizer_middleware(
     // dispatch loopback. The lookup error is kept: a database blip must
     // become a retryable 503 on the token path, not a 403.
     // The concrete error is logged here; clients only ever see a generic one.
-    let caller_lookup: Result<Option<crate::api::handlers::images::ResolvedCaller>, ()> =
-        match (state.pool.as_ref(), extract_bearer_token(&request)) {
-            (Some(pool), Some(bearer)) => crate::api::handlers::images::try_resolve_caller(&pool.write(), &bearer)
-                .await
-                .map_err(|e| warn!(error = %e, "Caller lookup failed in image_normalizer middleware")),
-            _ => Ok(None),
-        };
+    let presented_key =
+        crate::auth::internal_credential::presented_key_hash(request.extensions(), extract_bearer_token(&request).as_deref());
+    let caller_lookup: Result<Option<crate::api::handlers::images::ResolvedCaller>, ()> = match (state.pool.as_ref(), presented_key) {
+        (Some(pool), Some(key)) => crate::api::handlers::images::try_resolve_caller(&pool.write(), &key)
+            .await
+            .map_err(|e| warn!(error = %e, "Caller lookup failed in image_normalizer middleware")),
+        _ => Ok(None),
+    };
     let attribution_for_access = caller_lookup.as_ref().ok().copied().flatten().map(|c| c.attribution);
 
     // ZDR is decided from the per-key policy and the dispatch marker alone, NOT
     // from the caller lookup, so a lookup failure can never downgrade a ZDR
     // request into storing its images in plaintext.
     let zdr_dispatch_id = zdr_dispatch_request_id(&request);
-    let zdr = zdr_dispatch_id.is_some()
-        || crate::inference::zdr::is_zdr_request(&state.key_policy_cache, extract_bearer_token(&request).as_deref());
+    let zdr = zdr_dispatch_id.is_some() || crate::inference::zdr::is_zdr_request(&state.key_policy_cache, presented_key.as_ref());
 
     let normalizer = state.normalizer.clone();
     // Every signed URL this request produces — a signed token, or a freshly
@@ -1152,11 +1152,11 @@ mod tests {
 
         let mut conn = pool.acquire().await.expect("acquire");
         let mut repo = ApiKeys::new(&mut conn);
-        let (secret, _) = repo
-            .get_or_create_hidden_key_with_id(user, ApiKeyPurpose::Batch, user)
+        let id = repo
+            .get_or_create_hidden_key(user, ApiKeyPurpose::Batch, user)
             .await
             .expect("hidden batch key");
-        secret
+        repo.legacy_dispatch_secret(id).await.expect("hidden batch key secret")
     }
 
     /// Put an image in the store WITHOUT any `image_access` row — the state a

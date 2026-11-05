@@ -587,13 +587,13 @@ pub async fn get_organization<P: PoolProvider>(
 }
 
 /// Update an organization as an actual owner/admin. Only owners may disable ZDR.
-/// Trusted SSO support may enable ZDR cross-account, with no other fields.
+/// Platform support may enable ZDR cross-account, with no other fields.
 #[utoipa::path(
     patch,
     path = "/organizations/{id}",
     tag = "organizations",
     summary = "Update organization",
-    description = "Update organization details as an owner/admin. Only owners may change zero data retention in either direction. Trusted SSO platform managers/admins may enable zero data retention for another organization only with an enable-only payload containing no other changes. Platform roles do not otherwise bypass membership.",
+    description = "Update organization details as an owner/admin. Only owners may change zero data retention in either direction. PlatformManager platform keys and trusted SSO platform managers/admins may enable zero data retention for another organization only with an enable-only payload containing no other changes. The system credential has full administrative access. Other platform roles do not bypass membership.",
     params(
         ("id" = String, Path, description = "Organization ID (UUID)"),
     ),
@@ -618,7 +618,7 @@ pub async fn update_organization<P: PoolProvider>(
 ) -> Result<Json<OrganizationResponse>> {
     let can_all = crate::auth::permissions::has_permission(&current_user, Resource::Organizations, Operation::UpdateAll);
 
-    let support_zdr = current_user.is_sso_platform_manager() && data.is_enable_zdr_only();
+    let support_zdr = current_user.can_manage_platform() && data.is_enable_zdr_only();
     let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
 
     let caller_org_role = if can_all || support_zdr {
@@ -637,7 +637,7 @@ pub async fn update_organization<P: PoolProvider>(
     };
 
     // SECURITY: Organization admins can manage ordinary org fields, but only
-    // owners may toggle this setting. SSO support may only enable it.
+    // owners may toggle this setting. Platform support may only enable it.
     if !can_all && !support_zdr && data.zero_data_retention.is_some() && caller_org_role.as_deref() != Some("owner") {
         return Err(Error::InsufficientPermissions {
             required: Permission::Allow(Resource::Organizations, Operation::UpdateOwn),

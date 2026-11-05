@@ -8,7 +8,7 @@ use crate::{
     api::models::{
         groups::GroupResponse,
         pagination::PaginatedResponse,
-        users::{CurrentUser, GetUserQuery, ListUsersQuery, UserCreate, UserResponse, UserUpdate},
+        users::{CurrentUser, GetUserQuery, ListUsersQuery, Role, UserCreate, UserResponse, UserUpdate},
     },
     auth::permissions::{self as permissions, RequiresPermission, can_read_all_resources, can_read_own_resource, operation, resource},
     db::{
@@ -384,9 +384,24 @@ pub async fn get_user<P: PoolProvider>(
 #[tracing::instrument(skip_all)]
 pub async fn create_user<P: PoolProvider>(
     State(state): State<AppState<P>>,
-    _: RequiresPermission<resource::Users, operation::CreateAll>,
+    actor: RequiresPermission<resource::Users, operation::CreateAll>,
     Json(user_data): Json<UserCreate>,
 ) -> Result<(StatusCode, Json<UserResponse>)> {
+    // Provisioning ordinary users must not become a route to platform-role escalation.
+    if !actor.is_system()
+        && user_data.roles.iter().any(|role| {
+            !matches!(
+                role,
+                Role::StandardUser | Role::BatchAPIUser | Role::ConnectionsUser | Role::BackgroundInferenceUser
+            )
+        })
+    {
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Allow(Resource::Users, Operation::SystemAccess),
+            action: Operation::CreateAll,
+            resource: "privileged user roles".to_string(),
+        });
+    }
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
 
     let mut repo = Users::new(&mut tx);
@@ -441,7 +456,7 @@ pub async fn update_user<P: PoolProvider>(
     let can_update_all_users = permissions::can_update_all_resources(&current_user, Resource::Users);
     let can_update_own_user = permissions::can_update_own_resource(&current_user, Resource::Users, user_id);
 
-    let support_zdr = current_user.is_sso_platform_manager() && user_data.is_enable_zdr_only();
+    let support_zdr = current_user.can_manage_platform() && user_data.is_enable_zdr_only();
     if !can_update_all_users && !can_update_own_user && !support_zdr {
         return Err(Error::InsufficientPermissions {
             required: Permission::Any(vec![
@@ -909,7 +924,8 @@ mod tests {
             .json(&new_user)
             .await;
 
-        response.assert_status_forbidden();
+        response.assert_status(StatusCode::CREATED);
+        assert_eq!(response.json::<serde_json::Value>()["email"], "newuser@example.com");
     }
 
     #[dwctl_test_macros::test]
@@ -1656,7 +1672,7 @@ mod tests {
             .await;
         response.assert_status_ok();
 
-        // PlatformManager cannot create users
+        // PlatformManager may provision ordinary users
         let new_user = json!({
             "username": "created_by_pm",
             "email": "createdbypm@example.com",
@@ -1669,7 +1685,7 @@ mod tests {
             .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .json(&new_user)
             .await;
-        response.assert_status_forbidden();
+        response.assert_status(StatusCode::CREATED);
 
         // PlatformManager cannot update unrelated user settings
         let update_data = json!({"display_name": "Updated by PM"});
@@ -1738,7 +1754,7 @@ mod tests {
             .await;
         response.assert_status_forbidden();
 
-        // User with PlatformManager + RequestViewer cannot bypass customer mutation restrictions
+        // Adding PlatformManager permits ordinary provisioning, not customer account mutation.
         let full_admin = create_test_user_with_roles(&pool, vec![Role::PlatformManager, Role::RequestViewer]).await;
 
         let response = app
@@ -1754,7 +1770,7 @@ mod tests {
             .add_header(&add_auth_headers(&full_admin)[1].0, &add_auth_headers(&full_admin)[1].1)
             .json(&new_user)
             .await;
-        response.assert_status_forbidden();
+        response.assert_status(StatusCode::CREATED);
     }
 
     #[dwctl_test_macros::test]
@@ -1799,7 +1815,7 @@ mod tests {
         let role_tests = vec![
             (vec![Role::StandardUser], false, true, false, "StandardUser only"),
             (vec![Role::RequestViewer], false, true, false, "RequestViewer only"),
-            (vec![Role::PlatformManager], true, true, false, "PlatformManager only"),
+            (vec![Role::PlatformManager], true, true, true, "PlatformManager only"),
             (
                 vec![Role::StandardUser, Role::RequestViewer],
                 false,
@@ -1811,19 +1827,19 @@ mod tests {
                 vec![Role::PlatformManager, Role::RequestViewer],
                 true,
                 true,
-                false,
+                true,
                 "PlatformManager + RequestViewer",
             ),
             (
                 vec![Role::PlatformManager, Role::StandardUser],
                 true,
                 true,
-                false,
+                true,
                 "PlatformManager + StandardUser",
             ),
         ];
 
-        for (roles, can_list_users, can_read_own, can_manage_users, _description) in role_tests {
+        for (roles, can_list_users, can_read_own, can_create_users, _description) in role_tests {
             let user = create_test_user_with_roles(&pool, roles).await;
 
             // Test list users access
@@ -1866,15 +1882,15 @@ mod tests {
                 .json(&new_user)
                 .await;
 
-            if can_manage_users {
+            if can_create_users {
                 response.assert_status(axum::http::StatusCode::CREATED);
-                // Clean up created user
+                // Provisioning does not grant permission to delete accounts.
                 let created_user: UserResponse = response.json();
                 app.delete(&format!("/admin/api/v1/users/{}", created_user.id))
                     .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
                     .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
                     .await
-                    .assert_status(axum::http::StatusCode::NO_CONTENT);
+                    .assert_status_forbidden();
             } else {
                 response.assert_status_forbidden();
             }

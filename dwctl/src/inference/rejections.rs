@@ -18,12 +18,12 @@
 //! upstream's) is not recorded again.
 
 use axum::{
-    http::{HeaderMap, Request, header::AUTHORIZATION, request::Parts},
+    http::{Extensions, HeaderMap, Request, header::AUTHORIZATION, request::Parts},
     response::Response,
 };
-use onwards::{rejections::RejectionContext, strict::schema_mismatch::SchemaMismatch, target::Targets};
+use onwards::{auth::KeyHash, rejections::RejectionContext, strict::schema_mismatch::SchemaMismatch, target::Targets};
 
-use crate::inference::translation::anthropic;
+use crate::{auth::internal_credential::presented_key_hash, inference::translation::anthropic};
 
 /// Header the fusillade daemon stamps on every request it dispatches, and
 /// only on those. onwards uses it to tell dispatched from realtime traffic.
@@ -71,24 +71,38 @@ impl RejectionCode {
 pub(crate) struct Origin<'a> {
     recorder: Option<&'a Recorder>,
     headers: &'a HeaderMap,
+    /// The request's extensions, for a key it was pre-authenticated as.
+    extensions: Option<&'a Extensions>,
     path: &'a str,
 }
 
 impl<'a> Origin<'a> {
     pub(crate) fn new(recorder: Option<&'a Recorder>, headers: &'a HeaderMap, path: &'a str) -> Self {
-        Self { recorder, headers, path }
+        Self {
+            recorder,
+            headers,
+            extensions: None,
+            path,
+        }
+    }
+
+    fn with_extensions(extensions: &'a Extensions, headers: &'a HeaderMap, path: &'a str) -> Self {
+        Self {
+            extensions: Some(extensions),
+            ..Self::new(extensions.get(), headers, path)
+        }
     }
 }
 
 impl<'a> From<&'a Parts> for Origin<'a> {
     fn from(parts: &'a Parts) -> Self {
-        Self::new(parts.extensions.get(), &parts.headers, parts.uri.path())
+        Self::with_extensions(&parts.extensions, &parts.headers, parts.uri.path())
     }
 }
 
 impl<'a, B> From<&'a Request<B>> for Origin<'a> {
     fn from(request: &'a Request<B>) -> Self {
-        Self::new(request.extensions().get(), request.headers(), request.uri().path())
+        Self::with_extensions(request.extensions(), request.headers(), request.uri().path())
     }
 }
 
@@ -128,9 +142,14 @@ impl Scope {
     pub(crate) fn of<'a>(origin: impl Into<Origin<'a>>) -> Self {
         let origin = origin.into();
         let caller = origin.recorder.map(|recorder| {
-            let context = RejectionContext::for_api_key(
+            let bearer = api_key(origin.path, origin.headers);
+            let key = match origin.extensions {
+                Some(extensions) => presented_key_hash(extensions, bearer),
+                None => bearer.map(crate::crypto::hash_api_key),
+            };
+            let context = RejectionContext::for_key(
                 &recorder.targets,
-                api_key(origin.path, origin.headers),
+                key.map(KeyHash::from_bytes).as_ref(),
                 origin.headers.contains_key(DISPATCHED_HEADER),
             );
             (recorder.targets.clone(), context)

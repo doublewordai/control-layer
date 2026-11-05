@@ -1,8 +1,17 @@
 //! Pre-dispatch preparation for daemon-claimed requests.
 //!
-//! A thin [`RequestProcessor`] that performs the one dwctl-side step which must
+//! A thin [`RequestProcessor`] that performs the dwctl-side steps which must
 //! happen AFTER a row is claimed from fusillade's DB but BEFORE the dispatch HTTP
 //! request exists, then delegates to [`DefaultRequestProcessor`]:
+//!
+//! Authentication - requests record the id of the API key they run as, and
+//! fusillade reports it under [`fusillade::API_KEY_ID_METADATA_KEY`]. Each
+//! dispatch attempt gets a fresh internal credential for that key id
+//! ([`crate::auth::internal_credential`]), accepted only by this process, so
+//! the loopback authenticates as the right key: spend, caps and attribution
+//! apply as for any other request. Rows without a key id dispatch with their
+//! stored key. (The key secret is still stored next to the id so the previous
+//! release can serve these rows; DW-1012 stops storing it.)
 //!
 //! ZDR decrypt - the stored body is a `dwzdr1:` ciphertext envelope keyed per
 //! request. It is not parseable JSON, so no middleware on the loopback can act
@@ -33,15 +42,87 @@
 //! and drops fusillade's ZDR hooks. Once the decrypt has an edge home, this
 //! processor and the dwctl-injects-into-fusillade seam can go away entirely.
 
+use std::{net::IpAddr, time::Duration};
+
 use async_trait::async_trait;
-use fusillade::request::{Claimed, Failed, FailureReason, Request, RequestCompletionResult};
+use fusillade::API_KEY_ID_METADATA_KEY;
+use fusillade::request::{Claimed, Failed, FailureReason, Request, RequestCompletionResult, RequestData};
 use fusillade::{CancellationFuture, DefaultRequestProcessor, HttpClient, ProcessContext, RequestProcessor, ShouldRetry, Storage};
+
+use crate::auth::internal_credential::InternalCredentials;
+
+/// Mints the internal credential a dispatch authenticates with.
+#[derive(Clone)]
+pub struct DispatchAuth {
+    credentials: InternalCredentials,
+    /// Lifetime of each credential. The credential is checked once, when the
+    /// dispatch reaches this process's `/ai`, so it only has to outlive one
+    /// processing attempt.
+    ttl: Duration,
+    /// The address this process listens on.
+    bind_host: String,
+    port: u16,
+}
+
+impl DispatchAuth {
+    pub fn new(credentials: InternalCredentials, ttl: Duration, bind_host: &str, port: u16) -> Self {
+        Self {
+            credentials,
+            ttl,
+            bind_host: unbracket(bind_host).to_string(),
+            port,
+        }
+    }
+
+    /// Whether `endpoint` is this process's own `/ai`. A credential is only
+    /// ever sent there: any other host would receive a bearer it could replay
+    /// against this process until it expires.
+    fn reaches_this_process(&self, endpoint: &str) -> bool {
+        let Ok(url) = url::Url::parse(endpoint) else {
+            return false;
+        };
+        let Some(host) = url.host_str().map(unbracket) else {
+            return false;
+        };
+        let local = match host.parse::<IpAddr>() {
+            Ok(ip) => ip.is_loopback() || ip.is_unspecified() || host == self.bind_host,
+            Err(_) => host.eq_ignore_ascii_case("localhost") || host == self.bind_host,
+        };
+        url.scheme() == "http" && local && url.port_or_known_default() == Some(self.port)
+    }
+}
+
+fn unbracket(host: &str) -> &str {
+    host.trim_start_matches('[').trim_end_matches(']')
+}
+
+/// Why a dispatch could not be authenticated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthRefusal {
+    /// The request names a key id and stores no key, but this processor
+    /// cannot mint credentials.
+    NotConfigured,
+    /// The request names a key id and stores no key, but targets another host.
+    ForeignEndpoint,
+}
+
+impl AuthRefusal {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::NotConfigured => "not_configured",
+            Self::ForeignEndpoint => "foreign_endpoint",
+        }
+    }
+}
 
 /// Prepares a claimed request for dispatch, then delegates to the default
 /// processor. Construct with [`DispatchProcessor::new`] and wire the optional
 /// capabilities with [`with_keystore`](Self::with_keystore) /
 /// [`with_streamable_endpoints`](Self::with_streamable_endpoints).
 pub struct DispatchProcessor {
+    /// Mints the credential a request without a stored key dispatches with.
+    /// `None` leaves such requests unauthenticated, which fails them.
+    auth: Option<DispatchAuth>,
     /// Encrypted key custody for ZDR flex bodies. `None` disables ZDR
     /// decryption (bodies pass through unchanged).
     keystore: Option<crate::keystore::Keystore>,
@@ -63,6 +144,7 @@ impl Default for DispatchProcessor {
 impl DispatchProcessor {
     pub fn new() -> Self {
         Self {
+            auth: None,
             keystore: None,
             streamable_endpoints: Vec::new(),
             default: DefaultRequestProcessor,
@@ -78,6 +160,38 @@ impl DispatchProcessor {
     /// Whether a dispatch to this path is marked for streaming and reassembly.
     fn should_mark(&self, path: &str) -> bool {
         self.streamable_endpoints.iter().any(|e| e == path)
+    }
+
+    /// Authenticate dispatches that store no key with internal credentials.
+    pub fn with_auth(mut self, auth: DispatchAuth) -> Self {
+        self.auth = Some(auth);
+        self
+    }
+
+    /// Set the credential a request dispatches with. A request that names a
+    /// key id gets a fresh internal credential for it, in place of any stored
+    /// key. A request without one (queued before dispatch by key id)
+    /// dispatches with its stored key, or unauthenticated if it has none, as
+    /// it always did. A credential is minted only for this process's own
+    /// endpoint; elsewhere the stored key, if any, is used as before.
+    fn authenticate(&self, data: &mut RequestData) -> Result<(), AuthRefusal> {
+        // Always taken out: the id is for this step, not a header to forward.
+        let Some(api_key_id) = data
+            .batch_metadata
+            .remove(API_KEY_ID_METADATA_KEY)
+            .and_then(|id| id.parse::<uuid::Uuid>().ok())
+        else {
+            return Ok(());
+        };
+        match &self.auth {
+            Some(auth) if auth.reaches_this_process(&data.endpoint) => {
+                data.api_key = auth.credentials.mint(api_key_id, auth.ttl);
+                Ok(())
+            }
+            _ if !data.api_key.is_empty() => Ok(()),
+            None => Err(AuthRefusal::NotConfigured),
+            Some(_) => Err(AuthRefusal::ForeignEndpoint),
+        }
     }
 
     /// Wire in the keystore so ZDR request bodies are decrypted before dispatch.
@@ -125,6 +239,26 @@ where
         cancellation: CancellationFuture,
         ctx: ProcessContext,
     ) -> fusillade::Result<RequestCompletionResult> {
+        // Authenticate first: the edge refuses a dispatch without a credential,
+        // and nothing below can recover one. A refusal never succeeds on retry.
+        if let Err(refusal) = self.authenticate(&mut request.data) {
+            crate::background_error!(
+                crate::metrics::errors::component::DISPATCH_AUTH,
+                refusal.reason(),
+                Error,
+                request_id = %request.data.id.0,
+                "Request names an API key but cannot be authenticated for dispatch; failing request"
+            );
+            let failed = Self::failed(
+                request,
+                FailureReason::RequestBuilderError {
+                    error: "Request could not be authenticated".to_string(),
+                },
+            );
+            storage.persist(&failed).await?;
+            return Ok(RequestCompletionResult::Failed(failed));
+        }
+
         // ZDR: the stored request body is a self-describing ciphertext envelope.
         // Decrypt it here, before dispatch, so the rest of the flow (and the
         // whole loopback edge) sees plaintext. The response is
@@ -276,5 +410,111 @@ mod tests {
     #[test]
     fn no_configuration_marks_nothing() {
         assert!(!DispatchProcessor::new().should_mark("/v1/chat/completions"));
+    }
+
+    const PORT: u16 = 3001;
+
+    fn authenticating(credentials: &InternalCredentials) -> DispatchProcessor {
+        DispatchProcessor::new().with_auth(DispatchAuth::new(credentials.clone(), Duration::from_secs(60), "0.0.0.0", PORT))
+    }
+
+    /// A claimed request as fusillade hands it over: a stored key (possibly
+    /// empty) and, when it has one, its key id in the batch metadata.
+    fn request(endpoint: &str, api_key: &str, api_key_id: Option<uuid::Uuid>) -> RequestData {
+        RequestData {
+            id: fusillade::RequestId(uuid::Uuid::new_v4()),
+            batch_id: None,
+            template_id: fusillade::TemplateId(uuid::Uuid::new_v4()),
+            custom_id: None,
+            endpoint: endpoint.to_string(),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            body: "{}".to_string(),
+            model: "model".to_string(),
+            api_key: api_key.to_string(),
+            created_by: String::new(),
+            batch_metadata: api_key_id
+                .map(|id| (API_KEY_ID_METADATA_KEY.to_string(), id.to_string()))
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    /// A request that names a key dispatches with a credential for that key,
+    /// even when it also stores the key's secret. The credential is accepted
+    /// by this process and nothing else, and the id is not forwarded.
+    #[test]
+    fn a_key_id_gets_a_credential_even_when_a_secret_is_stored() {
+        let credentials = InternalCredentials::generate();
+        let key = uuid::Uuid::new_v4();
+        for stored in ["", "sk-stored"] {
+            let mut data = request("http://0.0.0.0:3001/ai", stored, Some(key));
+            authenticating(&credentials).authenticate(&mut data).unwrap();
+            assert_eq!(credentials.verify(&data.api_key), Ok(key), "stored {stored:?}");
+            assert!(InternalCredentials::generate().verify(&data.api_key).is_err());
+            assert!(data.batch_metadata.is_empty(), "the key id is not forwarded");
+        }
+    }
+
+    /// Rows without a key id (queued before dispatch by key id) keep their
+    /// stored key, and a request with neither dispatches as it always did.
+    #[test]
+    fn a_request_without_a_key_id_keeps_its_stored_key() {
+        for stored in ["sk-legacy", ""] {
+            let mut data = request("http://127.0.0.1:3001/ai", stored, None);
+            authenticating(&InternalCredentials::generate()).authenticate(&mut data).unwrap();
+            assert_eq!(data.api_key, stored);
+        }
+    }
+
+    /// A credential never leaves this process. A request whose endpoint is
+    /// elsewhere, or that this processor cannot mint for, dispatches with its
+    /// stored key if it has one, exactly as before, and is refused otherwise.
+    #[test]
+    fn a_credential_is_only_minted_for_this_process() {
+        let credentials = InternalCredentials::generate();
+        for endpoint in [
+            "http://10.0.0.5:3001/ai",
+            "http://api.example.com:3001/ai",
+            "https://127.0.0.1:3001/ai",
+            "http://127.0.0.1:3002/ai",
+            "not a url",
+        ] {
+            let mut data = request(endpoint, "", Some(uuid::Uuid::new_v4()));
+            assert_eq!(
+                authenticating(&credentials).authenticate(&mut data),
+                Err(AuthRefusal::ForeignEndpoint),
+                "{endpoint}"
+            );
+            assert_eq!(data.api_key, "", "{endpoint}");
+
+            let mut data = request(endpoint, "sk-stored", Some(uuid::Uuid::new_v4()));
+            authenticating(&credentials).authenticate(&mut data).unwrap();
+            assert_eq!(data.api_key, "sk-stored", "{endpoint}");
+        }
+
+        let mut data = request("http://127.0.0.1:3001/ai", "", Some(uuid::Uuid::new_v4()));
+        assert_eq!(DispatchProcessor::new().authenticate(&mut data), Err(AuthRefusal::NotConfigured));
+        let mut data = request("http://127.0.0.1:3001/ai", "sk-stored", Some(uuid::Uuid::new_v4()));
+        DispatchProcessor::new().authenticate(&mut data).unwrap();
+        assert_eq!(data.api_key, "sk-stored");
+    }
+
+    /// Every address a dispatch can use to reach this process: the loopback,
+    /// the unspecified address uploads record (`http://{host}:{port}/ai` with
+    /// a `0.0.0.0` bind), `localhost`, and the bind address itself.
+    #[test]
+    fn this_process_is_recognised_by_every_local_address() {
+        let auth = DispatchAuth::new(InternalCredentials::generate(), Duration::from_secs(60), "10.1.2.3", PORT);
+        for endpoint in [
+            "http://127.0.0.1:3001/ai",
+            "http://[::1]:3001/ai",
+            "http://0.0.0.0:3001/ai",
+            "http://localhost:3001/ai",
+            "http://10.1.2.3:3001/ai",
+        ] {
+            assert!(auth.reaches_this_process(endpoint), "{endpoint}");
+        }
+        assert!(!auth.reaches_this_process("http://10.1.2.4:3001/ai"));
     }
 }
