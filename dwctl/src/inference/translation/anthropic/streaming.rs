@@ -59,8 +59,8 @@ pub struct AnthropicStreamReframer {
     matched_stop: Option<String>,
     input_tokens: u64,
     output_tokens: u64,
-    cache_read: Option<u64>,
-    cache_creation: Option<u64>,
+    cache_read: u64,
+    cache_creation: u64,
     cache_creation_breakdown: Option<super::model::CacheCreation>,
 }
 
@@ -261,16 +261,14 @@ impl StreamReframer for AnthropicStreamReframer {
             Some(s) => ("stop_sequence", json!(s)),
             None => (self.stop_reason.unwrap_or("end_turn"), Value::Null),
         };
-        // input_tokens is non-standard on message_delta but included so the count
-        // is not lost (message_start could only carry 0). See module docs. Cache
-        // counts are added only when present.
+        // The current Messages schema carries input_tokens and the cache fields on
+        // `message_delta.usage` (older SDKs typed them Optional), and our
+        // message_start could only carry 0 — upstream OpenAI SSE reveals usage in
+        // its final chunk. Emit the full set here; the cache scalars are always
+        // present (0 when unused), matching the live Anthropic API.
         let mut usage = json!({ "input_tokens": self.input_tokens, "output_tokens": self.output_tokens });
-        if let Some(cache_read) = self.cache_read {
-            usage["cache_read_input_tokens"] = json!(cache_read);
-        }
-        if let Some(cache_creation) = self.cache_creation {
-            usage["cache_creation_input_tokens"] = json!(cache_creation);
-        }
+        usage["cache_read_input_tokens"] = json!(self.cache_read);
+        usage["cache_creation_input_tokens"] = json!(self.cache_creation);
         if let Some(breakdown) = &self.cache_creation_breakdown {
             // Per-TTL breakdown: billing prices each tier at its own write
             // premium, and the analytics extractor reads this exact object.
