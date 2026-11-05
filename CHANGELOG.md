@@ -1,5 +1,12 @@
 # Changelog
 
+## [16.3.0](https://github.com/doublewordai/control-layer/compare/v16.2.0...v16.3.0) (2026-11-05)
+
+
+### Features
+
+* **api-keys:** hold issued keys' pending secrets keystore-wrapped (DW-1011) ([#2153](https://github.com/doublewordai/control-layer/issues/2153)) ([c3ca16c](https://github.com/doublewordai/control-layer/commit/c3ca16c76c48b45bdd5e0d25bfd4733e335fa269))
+
 ## [16.2.0](https://github.com/doublewordai/control-layer/compare/v16.1.0...v16.2.0) (2026-11-05)
 
 
