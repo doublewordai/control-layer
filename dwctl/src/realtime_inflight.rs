@@ -107,8 +107,8 @@ impl SharedRedis {
         let redis = Arc::clone(self);
         tokio::spawn(async move {
             let config = ConnectionManagerConfig::new()
-                .set_connection_timeout(CONNECT_TIMEOUT)
-                .set_response_timeout(RESPONSE_TIMEOUT)
+                .set_connection_timeout(Some(CONNECT_TIMEOUT))
+                .set_response_timeout(Some(RESPONSE_TIMEOUT))
                 .set_number_of_retries(0);
             loop {
                 match ConnectionManager::new_with_config(redis.client.clone(), config.clone()).await {
