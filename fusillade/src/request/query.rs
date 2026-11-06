@@ -230,8 +230,6 @@ pub struct CreateRealtimeInput {
     pub method: String,
     /// API path (e.g., "/v1/responses").
     pub path: String,
-    /// API key for the request.
-    pub api_key: String,
     /// User/org ID that owns this request.
     pub created_by: String,
 }
@@ -268,8 +266,6 @@ pub struct PersistCompletedRealtimeInput {
     pub method: String,
     /// API path (e.g., "/v1/responses").
     pub path: String,
-    /// API key for the request.
-    pub api_key: String,
     /// User/org ID that owns this request.
     pub created_by: String,
 }
@@ -293,8 +289,6 @@ pub struct CreateFlexInput {
     pub method: String,
     /// API path (e.g., "/v1/responses").
     pub path: String,
-    /// API key for the request.
-    pub api_key: String,
     /// User/org ID that owns this request.
     pub created_by: String,
 }

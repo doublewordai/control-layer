@@ -213,7 +213,6 @@ pub struct RequestTemplate {
     pub path: String,
     pub body: String,
     pub model: String,
-    pub api_key: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -227,7 +226,6 @@ pub struct RequestTemplateInput {
     pub path: String,
     pub body: String,
     pub model: String,
-    pub api_key: String,
 }
 
 /// Batch output item - represents a completed request in OpenAI format.
@@ -439,10 +437,6 @@ pub struct BatchInput {
     pub created_by: Option<String>,
     /// API key UUID that created this batch, for per-member attribution within orgs
     pub api_key_id: Option<Uuid>,
-    /// API key secret for batch request execution. Used instead of the key in
-    /// request_templates so that billing is attributed to the batch creator,
-    /// not the file uploader.
-    pub api_key: Option<String>,
     /// Total number of request templates in the file. Set at creation time so
     /// the batch immediately reflects the expected request count before
     /// population completes.

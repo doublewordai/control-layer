@@ -49,7 +49,6 @@ async fn batch(
             Uuid::new_v4(),
             Some(file),
             model,
-            "SECRET-SENTINEL",
             "https://example.invalid",
             "/v1/chat/completions",
             "PAYLOAD-SENTINEL",
@@ -58,11 +57,23 @@ async fn batch(
         .await;
     }
     let time = |seconds| now + chrono::Duration::seconds(seconds);
-    sqlx::query("INSERT INTO fusillade.batches (file_id, completion_window, created_at, expires_at, completed_at, failed_at,
-        cancelled_at, cancelling_at, deleted_at, created_by, api_key, service_tier) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'OWNER-SENTINEL','SECRET-SENTINEL',$10)")
-        .bind(file).bind(expiry.map(|_| window)).bind(time(created)).bind(expiry.map(time))
-        .bind(terminal[0].map(time)).bind(terminal[1].map(time)).bind(terminal[2].map(time))
-        .bind(cancelling.then_some(now)).bind(deleted.then_some(now)).bind(expiry.is_none().then_some("background")).execute(pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO fusillade.batches (file_id, completion_window, created_at, expires_at, completed_at, failed_at,
+        cancelled_at, cancelling_at, deleted_at, created_by, service_tier) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'OWNER-SENTINEL',$10)",
+    )
+    .bind(file)
+    .bind(expiry.map(|_| window))
+    .bind(time(created))
+    .bind(expiry.map(time))
+    .bind(terminal[0].map(time))
+    .bind(terminal[1].map(time))
+    .bind(terminal[2].map(time))
+    .bind(cancelling.then_some(now))
+    .bind(deleted.then_some(now))
+    .bind(expiry.is_none().then_some("background"))
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 #[dwctl_test_macros::test]
@@ -244,13 +255,7 @@ async fn aggregate_queries_match_legacy_alerts_and_preserve_privacy(pool: PgPool
         .await
         .unwrap();
     let rendered = snapshot.render();
-    for forbidden in [
-        "private-model",
-        "PAYLOAD-SENTINEL",
-        "SECRET-SENTINEL",
-        "OWNER-SENTINEL",
-        "CUSTOM-ID-SENTINEL",
-    ] {
+    for forbidden in ["private-model", "PAYLOAD-SENTINEL", "OWNER-SENTINEL", "CUSTOM-ID-SENTINEL"] {
         assert!(!rendered.contains(forbidden), "leaked {forbidden}");
     }
     // A replacement empty snapshot drops the old model series rather than leaving stale alerts.

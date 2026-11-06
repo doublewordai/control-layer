@@ -7,6 +7,8 @@ use crate::db::handlers::api_keys::ApiKeys;
 
 /// The last migration of the release that added `secret_hash` without a backfill.
 const BEFORE_BACKFILL: i64 = 20261029120030;
+/// The migration validating the `secret_hash` NOT NULL check, after the backfill.
+const BACKFILL_VALIDATED: i64 = 20261029130020;
 
 /// Rows written before the hash column was populated: the seeded system key,
 /// several backfill batches' worth of generated keys, and a non-ASCII secret
@@ -47,7 +49,7 @@ async fn backfill_hashes_existing_keys_like_hash_api_key(pool: PgPool) {
     .await
     .unwrap();
 
-    apply(&target, &pool).await.unwrap();
+    target.run_to(BACKFILL_VALIDATED, &pool).await.unwrap();
 
     let rows: Vec<(Uuid, String, Option<Vec<u8>>, Option<String>)> =
         sqlx::query_as("SELECT id, secret, secret_hash, secret_prefix FROM api_keys")
@@ -99,15 +101,35 @@ async fn backfill_hashes_existing_keys_like_hash_api_key(pool: PgPool) {
     .await
     .unwrap_err();
     assert_eq!(error.as_database_error().unwrap().code().as_deref(), Some("23514"));
+
+    // The plaintext column is dropped and secret_hash becomes NOT NULL.
+    apply(&target, &pool).await.unwrap();
+    let plaintext_columns: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'api_keys' AND column_name = 'secret'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(plaintext_columns, 0);
+    let error = sqlx::query("INSERT INTO api_keys (name, user_id, created_by, purpose) VALUES ('no-hash', $1, $1, 'realtime')")
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert_eq!(error.as_database_error().unwrap().code().as_deref(), Some("23502"));
+    let mut conn = pool.acquire().await.unwrap();
+    assert_eq!(
+        ApiKeys::new(&mut conn).get_user_id_by_secret(unicode_secret).await.unwrap(),
+        Some(user)
+    );
 }
 
-/// Rotating a key's hash reloads the onwards cache; changing only the plaintext
-/// column (which nothing reads for lookups any more) does not.
+/// Rotating a key's hash reloads the onwards cache; a metadata-only update
+/// does not.
 #[dwctl_test_macros::test]
-async fn api_keys_notify_fires_on_secret_hash_not_secret(pool: PgPool) {
+async fn api_keys_notify_fires_on_secret_hash_not_metadata(pool: PgPool) {
     let key: Uuid = sqlx::query_scalar(
-        "INSERT INTO api_keys (name, secret, secret_hash, secret_prefix, user_id, created_by, purpose)
-         VALUES ('notify', 'sk-notify', sha256('sk-notify'::bytea), 'sk-notif', $1, $1, 'realtime') RETURNING id",
+        "INSERT INTO api_keys (name, secret_hash, secret_prefix, user_id, created_by, purpose)
+         VALUES ('notify', sha256('sk-notify'::bytea), 'sk-notif', $1, $1, 'realtime') RETURNING id",
     )
     .bind(Uuid::nil())
     .fetch_one(&pool)
@@ -125,9 +147,9 @@ async fn api_keys_notify_fires_on_secret_hash_not_secret(pool: PgPool) {
             .to_string()
     };
 
-    // Notifications arrive in commit order: if the plaintext-only update
+    // Notifications arrive in commit order: if the metadata-only update
     // notified, its payload would arrive before the marker.
-    sqlx::query("UPDATE api_keys SET secret = 'sk-plaintext-only' WHERE id = $1")
+    sqlx::query("UPDATE api_keys SET description = 'metadata only' WHERE id = $1")
         .bind(key)
         .execute(&pool)
         .await
@@ -142,6 +164,6 @@ async fn api_keys_notify_fires_on_secret_hash_not_secret(pool: PgPool) {
         .await
         .unwrap();
 
-    assert_eq!(next_payload().await, "marker", "a plaintext-only update must not notify");
+    assert_eq!(next_payload().await, "marker", "a metadata-only update must not notify");
     assert!(next_payload().await.starts_with("api_keys:"), "a hash change notifies");
 }

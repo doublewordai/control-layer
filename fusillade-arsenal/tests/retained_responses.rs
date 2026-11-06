@@ -940,7 +940,6 @@ async fn erase_racing_same_id_create_rolls_back_request_and_template(pool: PgPoo
                 endpoint: "https://example.invalid".to_owned(),
                 method: "POST".to_owned(),
                 path: "/v1/responses".to_owned(),
-                api_key: "must-not-survive".to_owned(),
                 created_by: OWNER.to_owned(),
             })
             .await
@@ -964,7 +963,7 @@ async fn erase_racing_same_id_create_rolls_back_request_and_template(pool: PgPoo
     assert_write_error(&error, RetainedResponseWriteError::NotFound);
     assert_eq!(count_ids(&pool, "requests", &graph.request_ids).await, 0);
     let leaked: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM request_templates_all WHERE body = 'must_not_survive' OR api_key = 'must-not-survive'",
+        "SELECT COUNT(*) FROM request_templates_all WHERE body = 'must_not_survive'",
     )
     .fetch_one(&pool)
     .await
@@ -982,7 +981,6 @@ fn late_realtime_record(request_id: Uuid) -> PersistCompletedRealtimeInput {
         endpoint: "https://example.invalid".to_owned(),
         method: "POST".to_owned(),
         path: "/v1/responses".to_owned(),
-        api_key: "must-not-survive".to_owned(),
         created_by: OWNER.to_owned(),
         started_at: Utc::now(),
         completed_at: Utc::now(),
@@ -1060,13 +1058,11 @@ async fn bulk_duplicate_conflicting_id_uses_first_record_without_orphans(pool: P
     first.request_body = r#"{"winner":"request"}"#.to_owned();
     first.response_body = r#"{"winner":"response"}"#.to_owned();
     first.model = "winner-model".to_owned();
-    first.api_key = "winner-key".to_owned();
     first.created_by = "winner-owner".to_owned();
     let mut second = first.clone();
     second.request_body = r#"{"loser":"request"}"#.to_owned();
     second.response_body = r#"{"loser":"response"}"#.to_owned();
     second.model = "loser-model".to_owned();
-    second.api_key = "loser-key".to_owned();
     second.created_by = "loser-owner".to_owned();
 
     manager
@@ -1146,7 +1142,6 @@ async fn bulk_mixed_fenced_batch_rolls_back_live_and_fresh_siblings(pool: PgPool
             endpoint: "https://example.invalid".to_owned(),
             method: "POST".to_owned(),
             path: "/v1/responses".to_owned(),
-            api_key: "bulk-live-key".to_owned(),
             created_by: OWNER.to_owned(),
         })
         .await
@@ -1233,7 +1228,6 @@ async fn late_request_writers_cannot_resurrect_an_erased_graph(pool: PgPool) {
                 endpoint: "https://example.invalid".to_owned(),
                 method: "POST".to_owned(),
                 path: "/v1/responses".to_owned(),
-                api_key: "must-not-survive".to_owned(),
                 created_by: OWNER.to_owned(),
             })
             .await
@@ -1284,7 +1278,6 @@ async fn late_request_writers_treat_an_active_retained_graph_as_terminal(pool: P
                 endpoint: "https://example.invalid".to_owned(),
                 method: "POST".to_owned(),
                 path: "/v1/responses".to_owned(),
-                api_key: "must-not-survive".to_owned(),
                 created_by: OWNER.to_owned(),
             })
             .await
@@ -1299,7 +1292,7 @@ async fn late_request_writers_treat_an_active_retained_graph_as_terminal(pool: P
 
     assert_wholly_retained(&pool, &graph).await;
     let orphan_templates: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM request_templates_all WHERE body LIKE '%must_not%' OR api_key = 'must-not-survive'",
+        "SELECT COUNT(*) FROM request_templates_all WHERE body LIKE '%must_not%'",
     )
     .fetch_one(&pool)
     .await
@@ -1502,7 +1495,6 @@ async fn late_synthesis_is_fenced_after_the_retained_partition_disappears(pool: 
             endpoint: "https://example.invalid".to_owned(),
             method: "POST".to_owned(),
             path: "/v1/responses".to_owned(),
-            api_key: "must-not-survive".to_owned(),
             created_by: OWNER.to_owned(),
         })
         .await
@@ -1510,7 +1502,7 @@ async fn late_synthesis_is_fenced_after_the_retained_partition_disappears(pool: 
     assert_write_error(&error, RetainedResponseWriteError::NotFound);
     assert_eq!(count_ids(&pool, "requests", &graph.request_ids).await, 0);
     let orphan_templates: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM request_templates_all WHERE body LIKE '%must_not%' OR api_key = 'must-not-survive'",
+        "SELECT COUNT(*) FROM request_templates_all WHERE body LIKE '%must_not%'",
     )
     .fetch_one(&pool)
     .await
@@ -1560,7 +1552,6 @@ async fn retiring_route_blocks_late_synthesis_after_archive_fence_expiry(pool: P
             endpoint: "https://example.invalid".to_owned(),
             method: "POST".to_owned(),
             path: "/v1/responses".to_owned(),
-            api_key: "must-not-survive".to_owned(),
             created_by: OWNER.to_owned(),
         })
         .await
@@ -1570,7 +1561,7 @@ async fn retiring_route_blocks_late_synthesis_after_archive_fence_expiry(pool: P
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM request_templates_all \
-             WHERE body LIKE '%must_not%' OR api_key = 'must-not-survive'",
+             WHERE body LIKE '%must_not%'",
         )
         .fetch_one(&pool)
         .await
@@ -2057,11 +2048,11 @@ async fn insert_request(
         WITH inserted AS (
             INSERT INTO request_templates_g2 (
                 created_on, id, file_id, custom_id, endpoint, method, path, body, model,
-                api_key, line_number, body_byte_size, metadata, created_at, updated_at
+                line_number, body_byte_size, metadata, created_at, updated_at
             ) VALUES (
                 (statement_timestamp() AT TIME ZONE 'UTC')::date,
                 $1, NULL, $2, 'http://retention.invalid', 'POST', '/v1/responses',
-                $3, $4, 'secret-test-key', 7, $5, $6,
+                $3, $4, 7, $5, $6,
                 $7 - INTERVAL '1 hour', $7 - INTERVAL '30 minutes'
             )
             RETURNING id, created_on
@@ -4764,12 +4755,12 @@ async fn erase_in_overlap_state_removes_both_copies_and_stays_erased(pool: PgPoo
         r#"
         WITH inserted AS (
             INSERT INTO request_templates_g2 (
-                created_on, id, file_id, endpoint, method, path, body, model, api_key,
+                created_on, id, file_id, endpoint, method, path, body, model,
                 line_number, body_byte_size, created_at, updated_at
             ) VALUES (
                 (statement_timestamp() AT TIME ZONE 'UTC')::date,
                 $1, NULL, 'http://retention.invalid', 'POST', '/v1/responses',
-                '{"prompt":"duplicate"}', $2, 'secret-test-key', 0, 22,
+                '{"prompt":"duplicate"}', $2, 0, 22,
                 '2026-08-01 08:00:00Z', '2026-08-01 10:00:00Z'
             )
             RETURNING id, created_on
@@ -4910,12 +4901,12 @@ async fn read_mixed_live_and_retained_rows_do_not_double_count_or_split_demand(p
         r#"
         WITH inserted AS (
             INSERT INTO request_templates_g2 (
-                created_on, id, file_id, endpoint, method, path, body, model, api_key,
+                created_on, id, file_id, endpoint, method, path, body, model,
                 line_number, body_byte_size, created_at, updated_at
             ) VALUES (
                 (statement_timestamp() AT TIME ZONE 'UTC')::date,
                 $1, NULL, 'http://retention.invalid', 'POST', '/v1/responses',
-                '{"prompt":"duplicate"}', $2, 'secret-test-key', 0, 22,
+                '{"prompt":"duplicate"}', $2, 0, 22,
                 '2026-08-01 08:00:00Z', '2026-08-01 10:00:00Z'
             )
             RETURNING id, created_on
@@ -5712,7 +5703,6 @@ async fn direct_realtime_retained_mixed_processing_and_fresh_records(pool: PgPoo
             endpoint: existing.endpoint.clone(),
             method: existing.method.clone(),
             path: existing.path.clone(),
-            api_key: existing.api_key.clone(),
             created_by: OWNER.into(),
         })
         .await

@@ -245,7 +245,6 @@ async fn customer_content_requires_ownership_for_sso_and_keys(pool: PgPool) {
                 template,
                 None,
                 "test-model",
-                "test-key",
                 "http://test",
                 "/v1/chat/completions",
                 r#"{"model":"test-model","messages":[{"role":"user","content":"private content"}]}"#,

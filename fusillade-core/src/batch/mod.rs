@@ -203,7 +203,7 @@ pub struct File {
 ///
 /// Templates are mutable, but requests snapshot the template state
 /// at execution time.
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RequestTemplate {
     pub id: TemplateId,
     pub file_id: FileId,
@@ -213,26 +213,12 @@ pub struct RequestTemplate {
     pub path: String,
     pub body: String,
     pub model: String,
-    pub api_key: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
-debug_with_redacted_api_key!(RequestTemplate {
-    id,
-    file_id,
-    custom_id,
-    endpoint,
-    method,
-    path,
-    body,
-    model,
-    created_at,
-    updated_at,
-});
-
 /// Input for creating a new request template.
-#[derive(Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct RequestTemplateInput {
     pub custom_id: Option<String>, // OpenAI Batch API custom identifier
     pub endpoint: String,
@@ -240,18 +226,7 @@ pub struct RequestTemplateInput {
     pub path: String,
     pub body: String,
     pub model: String,
-    /// Ignored and not stored: requests are dispatched by API key id.
-    pub api_key: String,
 }
-
-debug_with_redacted_api_key!(RequestTemplateInput {
-    custom_id,
-    endpoint,
-    method,
-    path,
-    body,
-    model,
-});
 
 /// Batch output item - represents a completed request in OpenAI format.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -452,7 +427,7 @@ pub enum FileStreamResult {
 }
 
 /// Input parameters for creating a new batch.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchInput {
     /// The file containing request templates
     pub file_id: FileId,
@@ -466,29 +441,17 @@ pub struct BatchInput {
     pub created_by: Option<String>,
     /// API key UUID that created this batch, for per-member attribution within orgs
     pub api_key_id: Option<Uuid>,
-    /// Ignored and not stored: requests are dispatched by API key id.
-    pub api_key: Option<String>,
     /// Total number of request templates in the file. Set at creation time so
     /// the batch immediately reflects the expected request count before
     /// population completes.
     pub total_requests: Option<i64>,
 }
 
-debug_with_redacted_api_key!(BatchInput {
-    file_id,
-    endpoint,
-    completion_window,
-    metadata,
-    created_by,
-    api_key_id,
-    total_requests,
-});
-
 /// Input parameters for creating a file-backed background batch.
 ///
 /// Background batches deliberately have no completion window. They use the
 /// ordinary batch lifecycle but are dispatched only by the background daemon.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackgroundBatchInput {
     /// The file containing request templates.
     pub file_id: FileId,
@@ -500,20 +463,9 @@ pub struct BackgroundBatchInput {
     pub created_by: Option<String>,
     /// API key UUID that created this batch.
     pub api_key_id: Option<Uuid>,
-    /// Ignored and not stored: requests are dispatched by API key id.
-    pub api_key: Option<String>,
     /// Expected number of request templates in the source file.
     pub total_requests: Option<i64>,
 }
-
-debug_with_redacted_api_key!(BackgroundBatchInput {
-    file_id,
-    endpoint,
-    metadata,
-    created_by,
-    api_key_id,
-    total_requests,
-});
 
 /// A batch represents one execution of all of a file's templates.
 #[derive(Debug, Clone, Serialize)]
@@ -677,7 +629,6 @@ mod background_tests {
             metadata: None,
             created_by: Some("user-a".to_string()),
             api_key_id: None,
-            api_key: Some("test-key".to_string()),
             total_requests: Some(2),
         };
 

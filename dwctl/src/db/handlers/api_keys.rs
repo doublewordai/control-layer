@@ -104,7 +104,7 @@ impl From<(Vec<DeploymentId>, ApiKey)> for ApiKeyDBResponse {
 pub struct PendingReveal {
     pub id: ApiKeyId,
     pub pending_secret: Option<Vec<u8>>,
-    pub secret_hash: Option<Vec<u8>>,
+    pub secret_hash: Vec<u8>,
 }
 
 // Manual Debug so the wrapped secret is never printed.
@@ -420,8 +420,7 @@ impl<'c> ApiKeys<'c> {
     pub async fn get_secret_hash(&mut self, id: ApiKeyId) -> Result<Option<ApiKeyHash>> {
         let hash = sqlx::query_scalar!("SELECT secret_hash FROM api_keys WHERE id = $1 AND is_deleted = false", id)
             .fetch_optional(&mut *self.db)
-            .await?
-            .flatten();
+            .await?;
         Ok(hash.and_then(|bytes| ApiKeyHash::try_from(bytes.as_slice()).ok()))
     }
 
@@ -759,7 +758,7 @@ impl<'c> ApiKeys<'c> {
             UPDATE api_keys ak SET secret_revealed_at = NOW(), pending_secret = NULL
             FROM pending
             WHERE ak.id = pending.id
-            RETURNING ak.id, pending.pending_secret, ak.secret_hash
+            RETURNING ak.id, pending.pending_secret, ak.secret_hash AS "secret_hash!"
             "#,
             id
         )
@@ -1318,16 +1317,14 @@ mod tests {
             .unwrap()
     }
 
-    /// Assert the row stores the hash and prefix of `secret` (when the caller
-    /// knows it) and never the plaintext: the deprecated `secret` column holds
-    /// its placeholder default, which is no API key.
+    /// Assert the row stores the hash and prefix of `secret`, when the caller
+    /// knows it (only the hash of a key is stored).
     async fn assert_only_hash_stored(conn: &mut PgConnection, id: ApiKeyId, secret: Option<&str>, path: &str) {
-        let row = sqlx::query!("SELECT secret, secret_hash, secret_prefix FROM api_keys WHERE id = $1", id)
+        let row = sqlx::query!("SELECT secret_hash, secret_prefix FROM api_keys WHERE id = $1", id)
             .fetch_one(&mut *conn)
             .await
             .unwrap();
-        assert!(row.secret.starts_with("unset-"), "{path}: plaintext column holds a placeholder");
-        let hash = row.secret_hash.unwrap_or_else(|| panic!("{path}: secret_hash"));
+        let hash = row.secret_hash;
         let prefix = row.secret_prefix.unwrap_or_else(|| panic!("{path}: secret_prefix"));
         assert!(prefix.starts_with("sk-"), "{path}: secret_prefix");
         if let Some(secret) = secret {
@@ -5131,7 +5128,7 @@ mod tests {
 
     /// The revealed secret is the key's current one, recovered from its wrap.
     fn assert_reveals(keystore: &crate::keystore::Keystore, reveal: &PendingReveal, secret: &str) {
-        assert_eq!(reveal.secret_hash.as_deref(), Some(&hash_api_key(secret)[..]));
+        assert_eq!(reveal.secret_hash, hash_api_key(secret));
         assert_eq!(
             crate::pending_secrets::resolve_reveal(Some(keystore), reveal),
             Some(secret.to_string())

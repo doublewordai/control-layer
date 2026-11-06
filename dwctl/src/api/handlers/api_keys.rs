@@ -2539,11 +2539,11 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let stored_hash: Option<Vec<u8>> = sqlx::query_scalar!("SELECT secret_hash FROM api_keys WHERE id = $1", key.id)
+        let stored_hash: Vec<u8> = sqlx::query_scalar!("SELECT secret_hash FROM api_keys WHERE id = $1", key.id)
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(stored_hash.as_deref(), Some(&hash_api_key(&key.key)[..]));
+        assert_eq!(stored_hash, hash_api_key(&key.key));
 
         let response = app
             .post(&format!("/admin/api/v1/users/current/api-keys/{}/reveal", key.id))

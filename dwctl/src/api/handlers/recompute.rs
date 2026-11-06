@@ -191,7 +191,6 @@ mod tests {
             template_id,
             None,
             "m",
-            "k",
             "http://x",
             "/messages",
             r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":16}"#,

@@ -1301,7 +1301,7 @@ async fn test_database_seeding_behavior(pool: PgPool) {
         .fetch_one(&pool)
         .await
         .expect("Should be able to get API key hash");
-    let updated_hash = stored.secret_hash.expect("seeded system key has a hash");
+    let updated_hash = stored.secret_hash;
     assert_ne!(
         updated_hash,
         hash_api_key(original_secret),
@@ -1352,7 +1352,7 @@ async fn test_database_seeding_behavior(pool: PgPool) {
         .expect("Should be able to get API key hash");
     assert_eq!(
         preserved_hash,
-        Some(hash_api_key(manual_secret).to_vec()),
+        hash_api_key(manual_secret).to_vec(),
         "Manual API key change should be preserved"
     );
 

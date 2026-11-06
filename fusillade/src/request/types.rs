@@ -99,7 +99,8 @@ pub struct RequestData {
     /// it here provides more flexibility for routing and resource management.
     pub model: String,
 
-    /// API key for authentication (sent in Authorization: Bearer header)
+    /// Credential for this dispatch, sent in the `Authorization: Bearer`
+    /// header. Never read from storage: a request processor sets it.
     pub api_key: String,
 
     /// User who created the batch this request belongs to.

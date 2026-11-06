@@ -286,12 +286,11 @@ async fn load(pool: &PgPool) -> Result<HashMap<KeyHash, KeyPolicy>, sqlx::Error>
     .await?;
     let model_presets = load_model_presets(pool, None).await?;
 
-    // A row without a hash cannot authenticate, so it needs no policy; the
-    // `secret_hash IS NOT NULL` check makes that unreachable in practice.
+    // A malformed hash cannot authenticate, so it needs no policy.
     Ok(rows
         .into_iter()
         .filter_map(|r| {
-            let hash = r.secret_hash.as_deref().and_then(|bytes| KeyHash::try_from(bytes).ok())?;
+            let hash = KeyHash::try_from(r.secret_hash.as_slice()).ok()?;
             Some((
                 hash,
                 KeyPolicy {

@@ -39,7 +39,7 @@ async fn shutdown_marks_onwards_daemon_dead_and_releases_rows(pool: PgPool) {
     .expect("insert daemon");
 
     // Create a template + request_processing row owned by this daemon.
-    crate::test::utils::insert_fusillade_template(&pool, template_id, None, "m", "", "http://upstream", "/v1/responses", "{}", None).await;
+    crate::test::utils::insert_fusillade_template(&pool, template_id, None, "m", "http://upstream", "/v1/responses", "{}", None).await;
     sqlx::query(
         "INSERT INTO requests \
          (id, batch_id, template_id, model, custom_id, state, daemon_id, claimed_at, started_at, created_by) \
@@ -118,7 +118,7 @@ async fn drain_does_not_touch_other_daemons_rows(pool: PgPool) {
         .await
         .unwrap();
     }
-    crate::test::utils::insert_fusillade_template(&pool, template_id, None, "m", "", "http://upstream", "/v1/responses", "{}", None).await;
+    crate::test::utils::insert_fusillade_template(&pool, template_id, None, "m", "http://upstream", "/v1/responses", "{}", None).await;
     sqlx::query(
         "INSERT INTO requests \
          (id, batch_id, template_id, model, custom_id, state, daemon_id, claimed_at, started_at, created_by) \

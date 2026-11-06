@@ -66,7 +66,6 @@ async fn seed_leak_work(store: &TestStore) {
                         path: "/test".into(),
                         body: "{}".into(),
                         model: model.into(),
-                        api_key: "key".into(),
                     })
                     .collect(),
             )
@@ -80,7 +79,6 @@ async fn seed_leak_work(store: &TestStore) {
                 metadata: None,
                 created_by: Some("alice".into()),
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -95,7 +93,7 @@ async fn seed_leak_work(store: &TestStore) {
                 endpoint: "https://api.example.com".into(),
                 method: "POST".into(),
                 path: "/test".into(),
-                api_key: "key".into(),
+                api_key_id: uuid::Uuid::new_v4(),
                 created_by: "alice".into(),
                 metadata: None,
             })
@@ -424,7 +422,7 @@ async fn default_claims_start_while_weekly_partition_ddl_is_blocked(pool: sqlx::
             endpoint: "https://api.example.com".to_string(),
             method: "POST".to_string(),
             path: "/v1/ddl-independent".to_string(),
-            api_key: "test-key".to_string(),
+            api_key_id: uuid::Uuid::new_v4(),
             created_by: "ddl-independent-owner".to_string(),
             metadata: None,
         })
@@ -497,7 +495,7 @@ async fn background_tier_end_to_end(pool: sqlx::PgPool) {
                 endpoint: "https://api.example.com".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/background-test".to_string(),
-                api_key: "key".to_string(),
+                api_key_id: uuid::Uuid::new_v4(),
                 created_by: format!("sla-owner-{sequence}"),
                 metadata: None,
             })
@@ -517,7 +515,6 @@ async fn background_tier_end_to_end(pool: sqlx::PgPool) {
                 body: r#"{"kind":"background-batch","nvext":{"agent_hints":{"priority":999}}}"#
                     .to_string(),
                 model: "spare-model".to_string(),
-                api_key: "key".to_string(),
             }],
         )
         .await
@@ -529,7 +526,6 @@ async fn background_tier_end_to_end(pool: sqlx::PgPool) {
             metadata: None,
             created_by: Some("background-batch-owner".to_string()),
             api_key_id: None,
-            api_key: None,
             total_requests: Some(1),
         })
         .await
@@ -544,7 +540,7 @@ async fn background_tier_end_to_end(pool: sqlx::PgPool) {
             endpoint: "https://api.example.com".to_string(),
             method: "POST".to_string(),
             path: "/v1/background-test".to_string(),
-            api_key: "key".to_string(),
+            api_key_id: uuid::Uuid::new_v4(),
             created_by: "background-request-owner".to_string(),
             metadata: None,
         })
@@ -602,7 +598,7 @@ async fn background_tier_end_to_end(pool: sqlx::PgPool) {
             endpoint: "https://api.example.com".to_string(),
             method: "POST".to_string(),
             path: "/v1/background-test".to_string(),
-            api_key: "key".to_string(),
+            api_key_id: uuid::Uuid::new_v4(),
             created_by: "late-sla-owner".to_string(),
             metadata: None,
         })
@@ -712,7 +708,6 @@ async fn test_daemon_claims_and_completes_request(pool: sqlx::PgPool) {
                 path: "/v1/test".to_string(),
                 body: r#"{"prompt":"test"}"#.to_string(),
                 model: "test-model".to_string(),
-                api_key: "test-key".to_string(),
             }],
         )
         .await
@@ -726,7 +721,6 @@ async fn test_daemon_claims_and_completes_request(pool: sqlx::PgPool) {
             metadata: None,
             created_by: None,
             api_key_id: None,
-            api_key: None,
             total_requests: None,
         })
         .await
@@ -881,7 +875,6 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
                     path: "/v1/test".to_string(),
                     body: r#"{"prompt":"test1"}"#.to_string(),
                     model: "gpt-4".to_string(),
-                    api_key: "test-key".to_string(),
                 },
                 fusillade::RequestTemplateInput {
                     custom_id: None,
@@ -890,7 +883,6 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
                     path: "/v1/test".to_string(),
                     body: r#"{"prompt":"test2"}"#.to_string(),
                     model: "gpt-4".to_string(),
-                    api_key: "test-key".to_string(),
                 },
                 fusillade::RequestTemplateInput {
                     custom_id: None,
@@ -899,7 +891,6 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
                     path: "/v1/test".to_string(),
                     body: r#"{"prompt":"test3"}"#.to_string(),
                     model: "gpt-4".to_string(),
-                    api_key: "test-key".to_string(),
                 },
                 fusillade::RequestTemplateInput {
                     custom_id: None,
@@ -908,7 +899,6 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
                     path: "/v1/test".to_string(),
                     body: r#"{"prompt":"test4"}"#.to_string(),
                     model: "gpt-4".to_string(),
-                    api_key: "test-key".to_string(),
                 },
                 fusillade::RequestTemplateInput {
                     custom_id: None,
@@ -917,7 +907,6 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
                     path: "/v1/test".to_string(),
                     body: r#"{"prompt":"test5"}"#.to_string(),
                     model: "gpt-4".to_string(),
-                    api_key: "test-key".to_string(),
                 },
             ],
         )
@@ -932,7 +921,6 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
             metadata: None,
             created_by: None,
             api_key_id: None,
-            api_key: None,
             total_requests: None,
         })
         .await
@@ -1137,7 +1125,6 @@ async fn test_daemon_cuts_claim_capacity_after_escalated_model_529(pool: sqlx::P
             path: "/v1/test".to_string(),
             body: format!(r#"{{"prompt":"test-{index}"}}"#),
             model: "source-model".to_string(),
-            api_key: "test-key".to_string(),
         })
         .collect();
     let file_id = manager
@@ -1152,7 +1139,6 @@ async fn test_daemon_cuts_claim_capacity_after_escalated_model_529(pool: sqlx::P
             metadata: None,
             created_by: None,
             api_key_id: None,
-            api_key: None,
             total_requests: None,
         })
         .await
@@ -1279,7 +1265,7 @@ async fn adaptive_concurrency_grows_past_the_configured_limit(pool: sqlx::PgPool
                 endpoint: "https://api.example.com".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/grow".to_string(),
-                api_key: "key".to_string(),
+                api_key_id: uuid::Uuid::new_v4(),
                 created_by: format!("owner-{index}"),
                 metadata: None,
             })
@@ -1391,7 +1377,7 @@ async fn background_529_does_not_throttle_foreground_claims(pool: sqlx::PgPool) 
             endpoint: "https://api.example.com".to_string(),
             method: "POST".to_string(),
             path: "/v1/adaptive-shared".to_string(),
-            api_key: "key".to_string(),
+            api_key_id: uuid::Uuid::new_v4(),
             created_by: "background-owner".to_string(),
             metadata: None,
         })
@@ -1432,7 +1418,7 @@ async fn background_529_does_not_throttle_foreground_claims(pool: sqlx::PgPool) 
                 endpoint: "https://api.example.com".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/adaptive-shared".to_string(),
-                api_key: "key".to_string(),
+                api_key_id: uuid::Uuid::new_v4(),
                 created_by: format!("foreground-owner-{index}"),
                 metadata: None,
             })
@@ -1564,7 +1550,6 @@ async fn test_daemon_retries_configured_and_default_statuses(pool: sqlx::PgPool)
                 path: "/v1/test".to_string(),
                 body: r#"{"prompt":"test"}"#.to_string(),
                 model: "test-model".to_string(),
-                api_key: "test-key".to_string(),
             }],
         )
         .await
@@ -1578,7 +1563,6 @@ async fn test_daemon_retries_configured_and_default_statuses(pool: sqlx::PgPool)
             metadata: None,
             created_by: None,
             api_key_id: None,
-            api_key: None,
             total_requests: None,
         })
         .await
@@ -1702,7 +1686,6 @@ async fn test_batch_capacity_529_does_not_spend_a_retry_attempt(pool: sqlx::PgPo
                 path: "/v1/test".to_string(),
                 body: r#"{"prompt":"test"}"#.to_string(),
                 model: "test-model".to_string(),
-                api_key: "test-key".to_string(),
             }],
         )
         .await
@@ -1716,7 +1699,6 @@ async fn test_batch_capacity_529_does_not_spend_a_retry_attempt(pool: sqlx::PgPo
             metadata: None,
             created_by: None,
             api_key_id: None,
-            api_key: None,
             total_requests: None,
         })
         .await
@@ -1838,7 +1820,6 @@ async fn test_batch_capacity_529_reschedules_even_when_should_retry_rejects_529(
                 path: "/v1/test".to_string(),
                 body: r#"{"prompt":"test"}"#.to_string(),
                 model: "test-model".to_string(),
-                api_key: "test-key".to_string(),
             }],
         )
         .await
@@ -1852,7 +1833,6 @@ async fn test_batch_capacity_529_reschedules_even_when_should_retry_rejects_529(
             metadata: None,
             created_by: None,
             api_key_id: None,
-            api_key: None,
             total_requests: None,
         })
         .await
@@ -1958,7 +1938,6 @@ async fn test_daemon_dynamically_updates_concurrency_limits(pool: sqlx::PgPool) 
             path: "/v1/test".to_string(),
             body: format!(r#"{{"prompt":"test{}"}}"#, i),
             model: "gpt-4".to_string(),
-            api_key: "test-key".to_string(),
         })
         .collect();
 
@@ -1979,7 +1958,6 @@ async fn test_daemon_dynamically_updates_concurrency_limits(pool: sqlx::PgPool) 
             metadata: None,
             created_by: None,
             api_key_id: None,
-            api_key: None,
             total_requests: None,
         })
         .await
@@ -2125,7 +2103,6 @@ async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
                 path: "/v1/test".to_string(),
                 body: r#"{"prompt":"test"}"#.to_string(),
                 model: "test-model".to_string(),
-                api_key: "test-key".to_string(),
             }],
         )
         .await
@@ -2139,7 +2116,6 @@ async fn test_deadline_aware_retry_stops_before_deadline(pool: sqlx::PgPool) {
             metadata: None,
             created_by: None,
             api_key_id: None,
-            api_key: None,
             total_requests: None,
         })
         .await
@@ -2274,7 +2250,6 @@ async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
                 path: "/v1/test".to_string(),
                 body: r#"{"prompt":"test"}"#.to_string(),
                 model: "test-model".to_string(),
-                api_key: "test-key".to_string(),
             }],
         )
         .await
@@ -2288,7 +2263,6 @@ async fn test_retry_stops_at_deadline_when_no_limits_set(pool: sqlx::PgPool) {
             metadata: None,
             created_by: None,
             api_key_id: None,
-            api_key: None,
             total_requests: None,
         })
         .await
@@ -2434,7 +2408,6 @@ async fn test_route_at_claim_time_escalation(pool: sqlx::PgPool) {
                 path: "/v1/test".to_string(),
                 body: r#"{"prompt":"test"}"#.to_string(),
                 model: "gpt-4".to_string(),
-                api_key: "original-key".to_string(),
             }],
         )
         .await
@@ -2449,7 +2422,6 @@ async fn test_route_at_claim_time_escalation(pool: sqlx::PgPool) {
             metadata: None,
             created_by: None,
             api_key_id: None,
-            api_key: None,
             total_requests: None,
         })
         .await
@@ -2577,7 +2549,6 @@ async fn test_route_at_claim_time_no_escalation_when_enough_time(pool: sqlx::PgP
                 path: "/v1/test".to_string(),
                 body: r#"{"prompt":"test"}"#.to_string(),
                 model: "gpt-4".to_string(),
-                api_key: "original-key".to_string(),
             }],
         )
         .await
@@ -2592,7 +2563,6 @@ async fn test_route_at_claim_time_no_escalation_when_enough_time(pool: sqlx::PgP
             metadata: None,
             created_by: None,
             api_key_id: None,
-            api_key: None,
             total_requests: None,
         })
         .await
@@ -2707,7 +2677,6 @@ mod batch_results_stream {
                         path: "/v1/test".to_string(),
                         body: r#"{"prompt":"test1"}"#.to_string(),
                         model: "gpt-4".to_string(),
-                        api_key: "test-key".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: Some("req-2".to_string()),
@@ -2716,7 +2685,6 @@ mod batch_results_stream {
                         path: "/v1/test".to_string(),
                         body: r#"{"prompt":"test2"}"#.to_string(),
                         model: "gpt-4".to_string(),
-                        api_key: "test-key".to_string(),
                     },
                 ],
             )
@@ -2731,7 +2699,6 @@ mod batch_results_stream {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -2821,7 +2788,6 @@ mod batch_results_stream {
                     path: "/v1/test".to_string(),
                     body: r#"{"prompt":"test"}"#.to_string(),
                     model: "gpt-4".to_string(),
-                    api_key: "test-key".to_string(),
                 }],
             )
             .await
@@ -2835,7 +2801,6 @@ mod batch_results_stream {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -2942,7 +2907,6 @@ mod batch_results_stream {
                     path: "/v1/test".to_string(),
                     body: r#"{"prompt":"test"}"#.to_string(),
                     model: "gpt-4".to_string(),
-                    api_key: "test-key".to_string(),
                 }],
             )
             .await
@@ -2956,7 +2920,6 @@ mod batch_results_stream {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -3072,7 +3035,6 @@ mod batch_results_stream {
                 path: "/v1/test".to_string(),
                 body: format!(r#"{{"prompt":"test{}"}}"#, i),
                 model: "gpt-4".to_string(),
-                api_key: "test-key".to_string(),
             })
             .collect();
 
@@ -3089,7 +3051,6 @@ mod batch_results_stream {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -3193,7 +3154,6 @@ mod batch_results_stream {
                 path: "/v1/test".to_string(),
                 body: format!(r#"{{"prompt":"test{}"}}"#, i),
                 model: "gpt-4".to_string(),
-                api_key: "test-key".to_string(),
             })
             .collect();
 
@@ -3210,7 +3170,6 @@ mod batch_results_stream {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -3303,7 +3262,6 @@ mod batch_results_stream {
                         path: "/v1/test".to_string(),
                         body: r#"{"prompt":"test"}"#.to_string(),
                         model: "gpt-4".to_string(),
-                        api_key: "test-key".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: Some("Beta-Request".to_string()),
@@ -3312,7 +3270,6 @@ mod batch_results_stream {
                         path: "/v1/test".to_string(),
                         body: r#"{"prompt":"test"}"#.to_string(),
                         model: "gpt-4".to_string(),
-                        api_key: "test-key".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: Some("Gamma-Item".to_string()),
@@ -3321,7 +3278,6 @@ mod batch_results_stream {
                         path: "/v1/test".to_string(),
                         body: r#"{"prompt":"test"}"#.to_string(),
                         model: "gpt-4".to_string(),
-                        api_key: "test-key".to_string(),
                     },
                 ],
             )
@@ -3336,7 +3292,6 @@ mod batch_results_stream {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -3465,7 +3420,6 @@ mod batch_results_stream {
                 path: "/v1/test".to_string(),
                 body: r#"{"test":"data"}"#.to_string(),
                 model: "test-model".to_string(),
-                api_key: "test-key".to_string(),
             })
             .collect();
 
@@ -3482,7 +3436,6 @@ mod batch_results_stream {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -3575,7 +3528,6 @@ mod queue_counts {
                         path: "/v1/test".to_string(),
                         body: "{}".to_string(),
                         model: "gpt-4".to_string(),
-                        api_key: "k".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: None,
@@ -3584,7 +3536,6 @@ mod queue_counts {
                         path: "/v1/test".to_string(),
                         body: "{}".to_string(),
                         model: "gpt-4".to_string(),
-                        api_key: "k".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: None,
@@ -3593,7 +3544,6 @@ mod queue_counts {
                         path: "/v1/test".to_string(),
                         body: "{}".to_string(),
                         model: "gpt-3.5".to_string(),
-                        api_key: "k".to_string(),
                     },
                 ],
             )
@@ -3608,7 +3558,6 @@ mod queue_counts {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -3627,7 +3576,6 @@ mod queue_counts {
                         path: "/v1/test".to_string(),
                         body: "{}".to_string(),
                         model: "gpt-4".to_string(),
-                        api_key: "k".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: None,
@@ -3636,7 +3584,6 @@ mod queue_counts {
                         path: "/v1/test".to_string(),
                         body: "{}".to_string(),
                         model: "gpt-3.5".to_string(),
-                        api_key: "k".to_string(),
                     },
                     RequestTemplateInput {
                         custom_id: None,
@@ -3645,7 +3592,6 @@ mod queue_counts {
                         path: "/v1/test".to_string(),
                         body: "{}".to_string(),
                         model: "gpt-3.5".to_string(),
-                        api_key: "k".to_string(),
                     },
                 ],
             )
@@ -3660,7 +3606,6 @@ mod queue_counts {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -3749,7 +3694,6 @@ mod service_tier {
             path: "/v1/test".to_string(),
             body: r#"{"prompt":"test"}"#.to_string(),
             model: "test-model".to_string(),
-            api_key: "test-key".to_string(),
         };
 
         // Create a batch with completion_window = "1h" → service_tier = "flex"
@@ -3765,7 +3709,6 @@ mod service_tier {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -3795,7 +3738,6 @@ mod service_tier {
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -3836,7 +3778,7 @@ mod service_tier {
                 endpoint: "http://localhost".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                api_key: String::new(),
+                api_key_id: uuid::Uuid::new_v4(),
                 created_by: "tier-user".to_string(),
                 metadata: None,
             })
@@ -3850,7 +3792,6 @@ mod service_tier {
                 endpoint: "http://localhost".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                api_key: String::new(),
                 created_by: "tier-user".to_string(),
             })
             .await
@@ -3898,7 +3839,6 @@ mod unverified_volume_counts {
                 path: "/v1/test".to_string(),
                 body: "{}".to_string(),
                 model: "test-model".to_string(),
-                api_key: "k".to_string(),
             })
             .collect();
         let file_id = manager
@@ -3917,7 +3857,6 @@ mod unverified_volume_counts {
                 metadata: None,
                 created_by: Some(creditor.to_string()),
                 api_key_id: None,
-                api_key: None,
                 total_requests: None,
             })
             .await
@@ -3933,7 +3872,7 @@ mod unverified_volume_counts {
                 endpoint: "http://localhost".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                api_key: String::new(),
+                api_key_id: uuid::Uuid::new_v4(),
                 created_by: creditor.to_string(),
                 metadata: None,
             })
@@ -4022,7 +3961,6 @@ mod unverified_volume_counts {
                 endpoint: "http://localhost".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
-                api_key: String::new(),
                 created_by: "user-a".to_string(),
             })
             .await

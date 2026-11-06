@@ -541,8 +541,6 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> RequestsWriter<P> {
                         endpoint: String::new(),
                         method: "POST".to_string(),
                         path: record.endpoint.clone(),
-                        // Realtime rows are never dispatched; no key is stored.
-                        api_key: String::new(),
                         created_by: record.created_by.clone(),
                         started_at: record.started_at,
                         completed_at: record.completed_at,

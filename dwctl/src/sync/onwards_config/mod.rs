@@ -382,11 +382,12 @@ fn key_labels(api_key: &OnwardsApiKey) -> HashMap<String, String> {
 
 /// The onwards key hash for a stored `api_keys.secret_hash`. `None` (the key is
 /// left out of the onwards config, so it cannot authenticate) when the hash is
-/// missing or malformed; the `secret_hash IS NOT NULL` check makes a missing
-/// hash unreachable for rows written by any supported release. Callers still
-/// record the grant (`has_key_grants`), so a deployment whose keys are all
-/// dropped rejects every request instead of being treated as having no keys
-/// configured, which onwards would leave open.
+/// malformed. A missing hash is unreachable in practice: the column is NOT
+/// NULL and the sync query only reads it for a joined key; the `Option` comes
+/// from the query's nullable projection and is handled defensively. Callers
+/// still record the grant (`has_key_grants`), so a deployment whose keys are
+/// all dropped rejects every request instead of being treated as having no
+/// keys configured, which onwards would leave open.
 fn key_hash(api_key_id: ApiKeyId, secret_hash: Option<Vec<u8>>) -> Option<KeyHash> {
     let hash = secret_hash.as_deref().and_then(|bytes| KeyHash::try_from(bytes).ok());
     if hash.is_none() {

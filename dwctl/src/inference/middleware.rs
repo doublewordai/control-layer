@@ -32,6 +32,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use fusillade::Storage as _;
 use fusillade_arsenal::PostgresRequestManager;
 use sqlx_pool_router::PoolProvider;
 
@@ -629,8 +630,6 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 endpoint: state.loopback_base_url.clone(),
                 method: "POST".to_string(),
                 path: endpoint.clone(),
-                // The presented key is never stored.
-                api_key: String::new(),
                 created_by: created_by.unwrap_or_default(),
             };
             let client_usage = super::stream_usage::requested_usage(&endpoint, &request_value);
@@ -771,13 +770,25 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
 
             // The daemon dispatches as the hidden batch key (or the caller's
             // cap-scope child), authenticating each attempt from its id. No
-            // key secret is stored.
-            let queued_api_key_id = queued_batch_key.as_ref().map(|key| key.id);
-            let queued_created_by = queued_batch_key
-                .as_ref()
-                .map(|key| key.key_owner_id.to_string())
-                .or_else(|| created_by.clone())
-                .unwrap_or_default();
+            // key secret is stored. Resolved above for every queued tier.
+            let Some(queued_batch_key) = queued_batch_key else {
+                tracing::error!(service_tier = %service_tier, "Queued request has no execution key");
+                return Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "error": {
+                                "message": "Failed to prepare queued request",
+                                "type": "server_error",
+                                "code": 500,
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap();
+            };
+            let queued_created_by = queued_batch_key.key_owner_id.to_string();
             // Provenance for the dispatched request. This is the last moment the caller's
             // client is knowable: the daemon picks this request up minutes to hours from
             // now, over an HTTP client that sends no User-Agent, so without stashing it
@@ -799,11 +810,11 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                     endpoint: state.loopback_base_url.clone(),
                     method: "POST".to_string(),
                     path: endpoint.clone(),
-                    api_key: String::new(),
+                    api_key_id: queued_batch_key.id,
                     created_by: queued_created_by,
                     metadata: queued_metadata,
                 };
-                return handle_background(&state, background_input, queued_api_key_id, &resp_id, model).await;
+                return handle_background(&state, background_input, &resp_id, model).await;
             }
 
             // INVARIANT: the daemon dispatches this job back through the loopback
@@ -823,20 +834,17 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 endpoint: state.loopback_base_url.clone(),
                 method: "POST".to_string(),
                 path: endpoint.clone(),
-                api_key: String::new(),
+                api_key_id: queued_batch_key.id,
                 created_by: queued_created_by,
                 metadata: queued_metadata,
             };
 
             match (is_chat_completions_api, flex_stream) {
-                (true, true) => {
-                    handle_chat_completion_flex_streaming(&state, flex_input, queued_api_key_id, request_id, flex_stream_include_usage)
-                        .await
-                }
-                (true, false) => handle_chat_completion_flex(&state, flex_input, queued_api_key_id, request_id).await,
+                (true, true) => handle_chat_completion_flex_streaming(&state, flex_input, request_id, flex_stream_include_usage).await,
+                (true, false) => handle_chat_completion_flex(&state, flex_input, request_id).await,
                 // Responses (embeddings flex was downgraded to realtime above).
-                (false, true) => handle_responses_flex_streaming(&state, flex_input, queued_api_key_id, request_id).await,
-                (false, false) => handle_flex(&state, flex_input, queued_api_key_id, &resp_id, model, background).await,
+                (false, true) => handle_responses_flex_streaming(&state, flex_input, request_id).await,
+                (false, false) => handle_flex(&state, flex_input, &resp_id, model, background).await,
             }
         }
     }
@@ -1119,13 +1127,12 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
 async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &InferenceMiddlewareState<P>,
     flex_input: fusillade::CreateFlexInput,
-    api_key_id: Option<ApiKeyId>,
     resp_id: &str,
     model: &str,
     background: bool,
 ) -> Response {
     // Flex needs the row created synchronously (daemon must find it).
-    if let Err(e) = state.request_manager.create_flex_as(flex_input, api_key_id).await {
+    if let Err(e) = state.request_manager.create_flex(flex_input).await {
         tracing::error!(error = %e, "Failed to create flex row in fusillade");
         return Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -1206,11 +1213,10 @@ fn background_submission_body(resp_id: &str, model: &str) -> serde_json::Value {
 async fn handle_background<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &InferenceMiddlewareState<P>,
     input: fusillade::CreateBackgroundInput,
-    api_key_id: Option<ApiKeyId>,
     resp_id: &str,
     model: &str,
 ) -> Response {
-    if let Err(e) = state.request_manager.create_background_as(input, api_key_id).await {
+    if let Err(e) = state.request_manager.create_background(input).await {
         tracing::error!(error = %e, "Failed to create background row in fusillade");
         return Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -1243,10 +1249,9 @@ async fn handle_background<P: PoolProvider + Clone + Send + Sync + 'static>(
 async fn handle_chat_completion_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &InferenceMiddlewareState<P>,
     flex_input: fusillade::CreateFlexInput,
-    api_key_id: Option<ApiKeyId>,
     request_id: uuid::Uuid,
 ) -> Response {
-    if let Err(e) = state.request_manager.create_flex_as(flex_input, api_key_id).await {
+    if let Err(e) = state.request_manager.create_flex(flex_input).await {
         tracing::error!(error = %e, "Failed to create flex chat-completions batch in fusillade");
         return Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -1312,14 +1317,12 @@ async fn handle_chat_completion_flex<P: PoolProvider + Clone + Send + Sync + 'st
 async fn handle_chat_completion_flex_streaming<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &InferenceMiddlewareState<P>,
     flex_input: fusillade::CreateFlexInput,
-    api_key_id: Option<ApiKeyId>,
     request_id: uuid::Uuid,
     include_usage: bool,
 ) -> Response {
     flex_stream_response(
         state.request_manager.clone(),
         flex_input,
-        api_key_id,
         request_id,
         true,
         state.keystore.clone(),
@@ -1357,13 +1360,11 @@ async fn handle_chat_completion_flex_streaming<P: PoolProvider + Clone + Send + 
 async fn handle_responses_flex_streaming<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &InferenceMiddlewareState<P>,
     flex_input: fusillade::CreateFlexInput,
-    api_key_id: Option<ApiKeyId>,
     request_id: uuid::Uuid,
 ) -> Response {
     flex_stream_response(
         state.request_manager.clone(),
         flex_input,
-        api_key_id,
         request_id,
         false,
         state.keystore.clone(),

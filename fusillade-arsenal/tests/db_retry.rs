@@ -163,7 +163,6 @@ async fn postgres_manager_retries_pool_acquisition_for_sqlx_queries() {
                 path: "/v1/chat/completions".to_string(),
                 body: "{}".to_string(),
                 model: "test-model".to_string(),
-                api_key: "test-key".to_string(),
             }],
         )
         .await
@@ -176,7 +175,6 @@ async fn postgres_manager_retries_pool_acquisition_for_sqlx_queries() {
             metadata: None,
             created_by: None,
             api_key_id: None,
-            api_key: None,
             total_requests: Some(1),
         })
         .await

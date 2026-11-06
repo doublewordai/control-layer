@@ -68,7 +68,6 @@ async fn submit_one_request(manager: &Arc<TestStore>) -> fusillade::request::Req
         path: "/v1/test".into(),
         body: r#"{"hello":"world"}"#.into(),
         model: "test-model".into(),
-        api_key: "test-key".into(),
     };
     let file_id = manager
         .create_file("test_file".into(), None, vec![template])
@@ -82,7 +81,6 @@ async fn submit_one_request(manager: &Arc<TestStore>) -> fusillade::request::Req
             metadata: None,
             created_by: Some("tester".into()),
             api_key_id: None,
-            api_key: None,
             total_requests: None,
         })
         .await

@@ -2817,12 +2817,12 @@ async fn activate_composite_classes(pool: &sqlx::PgPool, with_standard: bool) {
 #[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn a_priced_class_does_not_lock_accounts_out_of_a_free_one(pool: sqlx::PgPool) {
     // Key A's spend cap is exhausted: it keeps generally free targets only.
-    sqlx::query("UPDATE api_keys SET spend_limit=1 WHERE secret = $1")
+    sqlx::query("UPDATE api_keys SET spend_limit=1 WHERE secret_hash = sha256(convert_to($1, 'UTF8'))")
         .bind(KEY_A_SECRET)
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query("INSERT INTO api_key_spend_checkpoints(api_key_id,total_spend,window_spend) SELECT id,1,1 FROM api_keys WHERE secret = $1")
+    sqlx::query("INSERT INTO api_key_spend_checkpoints(api_key_id,total_spend,window_spend) SELECT id,1,1 FROM api_keys WHERE secret_hash = sha256(convert_to($1, 'UTF8'))")
         .bind(KEY_A_SECRET)
         .execute(&pool)
         .await
