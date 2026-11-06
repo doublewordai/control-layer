@@ -66,11 +66,12 @@ impl<'c> Repository for Groups<'c> {
     type CreateRequest = GroupCreateDBRequest;
     type UpdateRequest = GroupUpdateDBRequest;
     type Response = GroupDBResponse;
+    type Created = GroupDBResponse;
     type Id = GroupId;
     type Filter = GroupFilter;
 
     #[instrument(level = "debug", skip(self, request), fields(name = %request.name), err)]
-    async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
+    async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Created> {
         // all groups created via handler/api are native, sso groups use the sync function instead
         // created_at and updated_at use database DEFAULT NOW() for consistency
         let group = sqlx::query_as!(
@@ -1171,7 +1172,7 @@ mod tests {
             .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
             .await
             .expect("Failed to get keys for deployment");
-        assert!(keys_for_deployment.iter().any(|k| k.secret == api_key.secret));
+        assert!(keys_for_deployment.iter().any(|k| k.id == api_key.id));
 
         // Remove user from group (this should CASCADE delete user_groups and api_key_deployments)
         group_repo
@@ -1203,7 +1204,7 @@ mod tests {
             .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
             .await
             .expect("Failed to get keys for deployment");
-        assert!(!keys_for_deployment.iter().any(|k| k.secret == api_key.secret));
+        assert!(!keys_for_deployment.iter().any(|k| k.id == api_key.id));
     }
 
     #[dwctl_test_macros::test]

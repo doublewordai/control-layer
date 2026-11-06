@@ -82,7 +82,7 @@ pub struct Request<T: RequestState> {
 /// Like every metadata entry it rides out as an `x-fusillade-batch-api-key-id`
 /// header unless a request processor removes it. A processor that
 /// authenticates dispatches by key id takes it out and sets
-/// [`RequestData::api_key`] from it, in preference to a stored key.
+/// [`RequestData::api_key`] from it.
 pub const API_KEY_ID_METADATA_KEY: &str = "api_key_id";
 
 /// User-supplied data for a request to be processed by the fusillade system.
@@ -122,7 +122,8 @@ pub struct RequestData {
     /// it here provides more flexibility for routing and resource management.
     pub model: String,
 
-    /// API key for authentication (sent in Authorization: Bearer header)
+    /// Credential for this dispatch, sent in the `Authorization: Bearer`
+    /// header. Never read from storage: a request processor sets it.
     pub api_key: String,
 
     /// User who created the batch this request belongs to.

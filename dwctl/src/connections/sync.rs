@@ -632,7 +632,7 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
                             path: url,
                             body,
                             model,
-                            api_key: String::new(), // Set at batch activation via batch.api_key
+                            api_key: String::new(), // Dispatched as the batch's api_key_id
                         };
 
                         if tx.send(FileStreamItem::Template(template)).await.is_err() {
@@ -1098,7 +1098,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
     };
 
     // 5. Resolve the connection owner's hidden batch API key.
-    let (batch_owner, batch_api_key, api_key_id, connection_name) = {
+    let (batch_owner, api_key_id, connection_name) = {
         use crate::db::handlers::api_keys::ApiKeys;
         use crate::db::models::api_keys::ApiKeyPurpose;
 
@@ -1117,13 +1117,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
             .get_or_create_hidden_key(owner_id, ApiKeyPurpose::Batch, triggered_by)
             .await
             .map_err(|e| anyhow::anyhow!("resolve batch API key: {e}"))?;
-        // Fusillade still dispatches batches with a stored key (until DW-1010).
-        let secret = keys
-            .legacy_dispatch_secret(key_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("resolve batch API key: {e}"))?;
-
-        (owner_id, secret, key_id, conn_name)
+        (owner_id, key_id, conn_name)
     };
 
     // 6. Create or reuse batch record.
@@ -1157,7 +1151,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
             metadata: Some(metadata),
             created_by: Some(batch_owner.to_string()),
             api_key_id: Some(api_key_id),
-            api_key: Some(batch_api_key),
+            api_key: None,
             total_requests: Some(input.template_count as i64),
         };
 

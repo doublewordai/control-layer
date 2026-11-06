@@ -103,7 +103,6 @@ pub struct ApiKeyDBResponse {
     pub id: ApiKeyId,
     pub name: String,
     pub description: Option<String>,
-    pub secret: String,
     pub purpose: ApiKeyPurpose,
     pub user_id: UserId,
     pub created_by: UserId,
@@ -125,8 +124,40 @@ pub struct ApiKeyDBResponse {
     pub hidden: bool,
     /// When the key's holder first fetched the secret (migration 131). NULL =
     /// an issued key awaiting its holder's one-off reveal; self-created keys
-    /// are born revealed. Rotation never touches this.
+    /// are born revealed. Rotation leaves it alone, except that rotating a
+    /// pending key with no keystore configured spends the reveal.
     pub secret_revealed_at: Option<DateTime<Utc>>,
+}
+
+/// A newly created key and its secret. Only the secret's hash is stored, so
+/// this is the one place it is available. Derefs to the key.
+#[derive(Clone)]
+pub struct CreatedApiKey {
+    pub key: ApiKeyDBResponse,
+    pub secret: String,
+}
+
+impl std::ops::Deref for CreatedApiKey {
+    type Target = ApiKeyDBResponse;
+    fn deref(&self) -> &ApiKeyDBResponse {
+        &self.key
+    }
+}
+
+impl std::ops::DerefMut for CreatedApiKey {
+    fn deref_mut(&mut self) -> &mut ApiKeyDBResponse {
+        &mut self.key
+    }
+}
+
+// Manual Debug so the secret is never printed.
+impl std::fmt::Debug for CreatedApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreatedApiKey")
+            .field("key", &self.key)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Spend display state for one cap scope (read from `api_key_spend_checkpoints`

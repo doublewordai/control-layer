@@ -1314,7 +1314,7 @@ mod tests {
             .layer(axum::Extension(recorder("gpt-4o")));
         let identity = |model: &'static str| {
             let router = router.clone();
-            let secret = api_key.secret.clone();
+            let secret = api_key.secret.to_string();
             async move {
                 let request = Request::post("/ai/v1/chat/completions")
                     .header("authorization", format!("Bearer {secret}"))

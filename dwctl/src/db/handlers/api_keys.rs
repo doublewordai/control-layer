@@ -6,7 +6,9 @@ use crate::crypto::{ApiKeyHash, api_key_prefix, generate_api_key, hash_api_key};
 use crate::db::errors::DbError;
 use crate::db::errors::Result;
 use crate::db::handlers::repository::Repository;
-use crate::db::models::api_keys::{ApiKeyCreateDBRequest, ApiKeyDBResponse, ApiKeyPurpose, ApiKeySpendState, ApiKeyUpdateDBRequest};
+use crate::db::models::api_keys::{
+    ApiKeyCreateDBRequest, ApiKeyDBResponse, ApiKeyPurpose, ApiKeySpendState, ApiKeyUpdateDBRequest, CreatedApiKey,
+};
 use crate::types::{ApiKeyId, DeploymentId, UserId, abbrev_uuid};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -45,7 +47,6 @@ struct ApiKey {
     pub id: ApiKeyId,
     pub name: String,
     pub description: Option<String>,
-    pub secret: String,
     pub purpose: String,
     pub user_id: UserId,
     pub created_by: UserId,
@@ -83,7 +84,6 @@ impl From<(Vec<DeploymentId>, ApiKey)> for ApiKeyDBResponse {
             id: api_key.id,
             name: api_key.name,
             description: api_key.description,
-            secret: api_key.secret,
             hidden: api_key.hidden,
             purpose,
             user_id: api_key.user_id,
@@ -99,17 +99,15 @@ impl From<(Vec<DeploymentId>, ApiKey)> for ApiKeyDBResponse {
     }
 }
 
-/// A key's one-off reveal as stored: the wrapped pending secret, the hash it
-/// must match, and (until the plaintext column is dropped) the plaintext
-/// secret for keys issued before pending secrets were wrapped.
+/// A key's one-off reveal as stored: the wrapped pending secret and the hash
+/// it must match.
 pub struct PendingReveal {
     pub id: ApiKeyId,
     pub pending_secret: Option<Vec<u8>>,
     pub secret_hash: Option<Vec<u8>>,
-    pub secret: Option<String>,
 }
 
-// Manual Debug so neither secret is ever printed.
+// Manual Debug so the wrapped secret is never printed.
 impl std::fmt::Debug for PendingReveal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PendingReveal")
@@ -128,12 +126,14 @@ impl<'c> Repository for ApiKeys<'c> {
     type CreateRequest = ApiKeyCreateDBRequest;
     type UpdateRequest = ApiKeyUpdateDBRequest;
     type Response = ApiKeyDBResponse;
+    type Created = CreatedApiKey;
     type Id = ApiKeyId;
     type Filter = ApiKeyFilter;
 
     #[instrument(level = "debug", skip(self, request), fields(name = %request.name), err)]
-    async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
-        // Generate a secure API key
+    async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Created> {
+        // Generate a secure API key. Only its hash is stored; the secret
+        // itself is returned to this caller and nowhere else.
         let secret = generate_api_key();
         let secret_hash = hash_api_key(&secret);
         let secret_prefix = api_key_prefix(&secret);
@@ -150,13 +150,12 @@ impl<'c> Repository for ApiKeys<'c> {
         let api_key = sqlx::query_as!(
             ApiKey,
             r#"
-            INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden, spend_limit, spend_limit_interval, secret_hash, secret_prefix)
-            VALUES ($1, $2, $3, $4, $5, $6, false, $7, $8, $9, $10)
-            RETURNING id, name, description, secret, user_id, created_at, last_used, purpose, hidden, is_deleted, created_by, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at
+            INSERT INTO api_keys (name, description, purpose, user_id, created_by, hidden, spend_limit, spend_limit_interval, secret_hash, secret_prefix)
+            VALUES ($1, $2, $3, $4, $5, false, $6, $7, $8, $9)
+            RETURNING id, name, description, user_id, created_at, last_used, purpose, hidden, is_deleted, created_by, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at
             "#,
             request.name,
             request.description,
-            secret,
             purpose_str,
             request.user_id,
             request.created_by,
@@ -168,14 +167,15 @@ impl<'c> Repository for ApiKeys<'c> {
         .fetch_one(&mut *self.db)
         .await?;
 
-        Ok(ApiKeyDBResponse::from((self.get_api_key_deployments(api_key.id).await?, api_key)))
+        let key = ApiKeyDBResponse::from((self.get_api_key_deployments(api_key.id).await?, api_key));
+        Ok(CreatedApiKey { key, secret })
     }
 
     #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let api_key = sqlx::query_as!(
             ApiKey,
-            "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at FROM api_keys WHERE id = $1 AND is_deleted = false",
+            "SELECT id, name, description, purpose, user_id, created_by, created_at, last_used, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at FROM api_keys WHERE id = $1 AND is_deleted = false",
             id
         )
             .fetch_optional(&mut *self.db)
@@ -191,7 +191,7 @@ impl<'c> Repository for ApiKeys<'c> {
     async fn get_bulk(&mut self, ids: Vec<Self::Id>) -> Result<HashMap<Self::Id, Self::Response>> {
         let api_keys = sqlx::query_as!(
             ApiKey,
-            "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at FROM api_keys WHERE id = ANY($1) AND is_deleted = false",
+            "SELECT id, name, description, purpose, user_id, created_by, created_at, last_used, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at FROM api_keys WHERE id = ANY($1) AND is_deleted = false",
             &ids
         )
             .fetch_all(&mut *self.db)
@@ -209,7 +209,7 @@ impl<'c> Repository for ApiKeys<'c> {
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
         let api_keys = sqlx::query_as!(
             ApiKey,
-            r#"SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at
+            r#"SELECT id, name, description, purpose, user_id, created_by, created_at, last_used, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at
             FROM api_keys
             WHERE hidden = false AND is_deleted = false
               AND ($1::uuid IS NULL OR user_id = $1)
@@ -272,7 +272,7 @@ impl<'c> Repository for ApiKeys<'c> {
                     ELSE description
                 END
             WHERE id = $1
-            RETURNING id, name, description, secret, user_id, created_at, last_used, purpose, hidden, is_deleted, created_by, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at
+            RETURNING id, name, description, user_id, created_at, last_used, purpose, hidden, is_deleted, created_by, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at
             "#,
             id,
             request.name,
@@ -386,8 +386,8 @@ impl<'c> ApiKeys<'c> {
         let id = sqlx::query_scalar!(
             r#"
             WITH ins AS (
-                INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden, secret_hash, secret_prefix)
-                VALUES ($1, $2, $3, $4, $5, $6, true, $7, $8)
+                INSERT INTO api_keys (name, description, purpose, user_id, created_by, hidden, secret_hash, secret_prefix)
+                VALUES ($1, $2, $3, $4, $5, true, $6, $7)
                 ON CONFLICT (user_id, created_by, purpose) WHERE hidden = true AND is_deleted = false AND parent_api_key_id IS NULL
                 DO NOTHING
                 RETURNING id
@@ -395,13 +395,12 @@ impl<'c> ApiKeys<'c> {
             SELECT id FROM ins
             UNION ALL
             SELECT id FROM api_keys
-            WHERE user_id = $5 AND created_by = $6 AND purpose = $4
+            WHERE user_id = $4 AND created_by = $5 AND purpose = $3
               AND hidden = true AND is_deleted = false AND parent_api_key_id IS NULL
             LIMIT 1
             "#,
             name,
             description,
-            secret,
             purpose_str,
             user_id,
             created_by,
@@ -415,19 +414,15 @@ impl<'c> ApiKeys<'c> {
         Ok(id)
     }
 
-    /// The stored plaintext secret of a hidden key, for work that fusillade
-    /// still dispatches with a stored key (batches, flex and background
-    /// requests). Transitional: removed once fusillade dispatches by key id
-    /// (DW-1010). Nothing else may read a hidden key's secret.
+    /// The stored hash of a live key, for lookups keyed by hash (the key
+    /// policy map) when only the key's id is at hand.
     #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
-    pub async fn legacy_dispatch_secret(&mut self, id: ApiKeyId) -> Result<String> {
-        sqlx::query_scalar!(
-            "SELECT secret FROM api_keys WHERE id = $1 AND hidden = true AND is_deleted = false",
-            id
-        )
-        .fetch_optional(&mut *self.db)
-        .await?
-        .ok_or(DbError::NotFound)
+    pub async fn get_secret_hash(&mut self, id: ApiKeyId) -> Result<Option<ApiKeyHash>> {
+        let hash = sqlx::query_scalar!("SELECT secret_hash FROM api_keys WHERE id = $1 AND is_deleted = false", id)
+            .fetch_optional(&mut *self.db)
+            .await?
+            .flatten();
+        Ok(hash.and_then(|bytes| ApiKeyHash::try_from(bytes.as_slice()).ok()))
     }
 
     /// Get or create the hidden batch-purpose CHILD key for a capped visible key.
@@ -456,23 +451,22 @@ impl<'c> ApiKeys<'c> {
         let id = sqlx::query_scalar!(
             r#"
             WITH ins AS (
-                INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden, parent_api_key_id, secret_hash, secret_prefix)
+                INSERT INTO api_keys (name, description, purpose, user_id, created_by, hidden, parent_api_key_id, secret_hash, secret_prefix)
                 SELECT
                     'Internal batch key (cap scope ' || p.id::text || ')',
                     'Automatically managed internal API key executing batch/flex traffic for a capped API key. Not visible to users.',
-                    $1,
                     'batch',
                     p.user_id,
                     p.created_by,
                     true,
                     p.id,
-                    $3,
-                    $4
+                    $2,
+                    $3
                 FROM api_keys p
                 -- Parent must be a root visible key: no children of hidden
                 -- keys and no grandchildren (a child's parent is never itself
                 -- a valid parent).
-                WHERE p.id = $2 AND p.is_deleted = false AND p.hidden = false AND p.parent_api_key_id IS NULL
+                WHERE p.id = $1 AND p.is_deleted = false AND p.hidden = false AND p.parent_api_key_id IS NULL
                 ON CONFLICT (parent_api_key_id, purpose) WHERE hidden = true AND is_deleted = false AND parent_api_key_id IS NOT NULL
                 DO NOTHING
                 RETURNING id
@@ -480,11 +474,10 @@ impl<'c> ApiKeys<'c> {
             SELECT id FROM ins
             UNION ALL
             SELECT id FROM api_keys
-            WHERE parent_api_key_id = $2 AND purpose = 'batch'
+            WHERE parent_api_key_id = $1 AND purpose = 'batch'
               AND hidden = true AND is_deleted = false
             LIMIT 1
             "#,
-            secret,
             parent_id,
             &secret_hash[..],
             secret_prefix
@@ -659,7 +652,8 @@ impl<'c> ApiKeys<'c> {
     ///
     /// Clears any wrapped pending secret, which holds the old secret; a caller
     /// with a keystore re-wraps the new one with
-    /// [`ApiKeys::set_pending_secret`] in the same transaction.
+    /// [`ApiKeys::set_pending_secret`] in the same transaction. The new
+    /// secret is returned once and only its hash is stored.
     #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
     pub async fn rotate_secret(&mut self, id: ApiKeyId) -> Result<String> {
         let secret = generate_api_key();
@@ -667,11 +661,10 @@ impl<'c> ApiKeys<'c> {
         let secret_prefix = api_key_prefix(&secret);
         let result = sqlx::query!(
             r#"
-            UPDATE api_keys SET secret = $2, secret_hash = $3, secret_prefix = $4, pending_secret = NULL
+            UPDATE api_keys SET secret_hash = $2, secret_prefix = $3, pending_secret = NULL
             WHERE id = $1 AND is_deleted = false AND hidden = false AND parent_api_key_id IS NULL
             "#,
             id,
-            secret,
             &secret_hash[..],
             secret_prefix
         )
@@ -702,6 +695,20 @@ impl<'c> ApiKeys<'c> {
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound);
         }
+        Ok(())
+    }
+
+    /// Spend a key's pending reveal without returning anything: stamp
+    /// `secret_revealed_at` and clear any wrap. For a rotation with no
+    /// keystore, whose caller already received the new secret.
+    #[instrument(level = "debug", skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
+    pub async fn mark_secret_revealed(&mut self, id: ApiKeyId) -> Result<()> {
+        sqlx::query!(
+            "UPDATE api_keys SET secret_revealed_at = NOW(), pending_secret = NULL WHERE id = $1 AND secret_revealed_at IS NULL",
+            id
+        )
+        .execute(&mut *self.db)
+        .await?;
         Ok(())
     }
 
@@ -743,7 +750,7 @@ impl<'c> ApiKeys<'c> {
             PendingReveal,
             r#"
             WITH pending AS (
-                SELECT id, pending_secret, secret
+                SELECT id, pending_secret
                 FROM api_keys
                 WHERE id = $1 AND secret_revealed_at IS NULL
                   AND is_deleted = false AND hidden = false AND parent_api_key_id IS NULL
@@ -752,7 +759,7 @@ impl<'c> ApiKeys<'c> {
             UPDATE api_keys ak SET secret_revealed_at = NOW(), pending_secret = NULL
             FROM pending
             WHERE ak.id = pending.id
-            RETURNING ak.id, pending.pending_secret, ak.secret_hash, pending.secret AS "secret?"
+            RETURNING ak.id, pending.pending_secret, ak.secret_hash
             "#,
             id
         )
@@ -762,13 +769,13 @@ impl<'c> ApiKeys<'c> {
     }
 
     /// Every visible root key whose one-off reveal is still pending, with what
-    /// the pending-secret reconcile needs to wrap or re-wrap it.
+    /// the pending-secret reconcile needs to re-wrap it.
     #[instrument(level = "debug", skip(self), err)]
     pub async fn list_pending_reveals(&mut self) -> Result<Vec<PendingReveal>> {
         let rows = sqlx::query_as!(
             PendingReveal,
             r#"
-            SELECT id, pending_secret, secret_hash, secret AS "secret?"
+            SELECT id, pending_secret, secret_hash
             FROM api_keys
             WHERE secret_revealed_at IS NULL
               AND is_deleted = false AND hidden = false AND parent_api_key_id IS NULL
@@ -975,7 +982,6 @@ impl<'c> ApiKeys<'c> {
                 ak.id as "id!",
                 ak.name as "name!",
                 ak.description,
-                ak.secret as "secret!",
                 ak.purpose as "purpose!",
                 ak.user_id as "user_id!",
                 ak.created_by as "created_by!",
@@ -996,7 +1002,6 @@ impl<'c> ApiKeys<'c> {
                 ak.id as "id!",
                 ak.name as "name!",
                 ak.description,
-                ak.secret as "secret!",
                 ak.purpose as "purpose!",
                 ak.user_id as "user_id!",
                 ak.created_by as "created_by!",
@@ -1044,7 +1049,6 @@ impl<'c> ApiKeys<'c> {
                 ak.id as "id!",
                 ak.name as "name!",
                 ak.description,
-                ak.secret as "secret!",
                 ak.purpose as "purpose!",
                 ak.user_id as "user_id!",
                 ak.created_by as "created_by!",
@@ -1298,7 +1302,7 @@ mod tests {
 
     /// Helper: create a visible key owned by `user_id`, created by `created_by`
     /// (equal for personal keys, org/member for org-context keys).
-    async fn create_visible_key(pool: &PgPool, user_id: crate::types::UserId, created_by: crate::types::UserId) -> ApiKeyDBResponse {
+    async fn create_visible_key(pool: &PgPool, user_id: crate::types::UserId, created_by: crate::types::UserId) -> CreatedApiKey {
         let mut conn = pool.acquire().await.unwrap();
         ApiKeys::new(&mut conn)
             .create(&ApiKeyCreateDBRequest {
@@ -1314,35 +1318,36 @@ mod tests {
             .unwrap()
     }
 
-    /// Assert the row's stored hash and prefix match `secret` and the plaintext
-    /// column still holds it (lookups use it until the hash switch-over).
-    async fn assert_secret_hash_stored(conn: &mut PgConnection, id: ApiKeyId, secret: &str, path: &str) {
+    /// Assert the row stores the hash and prefix of `secret` (when the caller
+    /// knows it) and never the plaintext: the deprecated `secret` column holds
+    /// its placeholder default, which is no API key.
+    async fn assert_only_hash_stored(conn: &mut PgConnection, id: ApiKeyId, secret: Option<&str>, path: &str) {
         let row = sqlx::query!("SELECT secret, secret_hash, secret_prefix FROM api_keys WHERE id = $1", id)
             .fetch_one(&mut *conn)
             .await
             .unwrap();
-        assert_eq!(row.secret, secret, "{path}: plaintext secret");
-        assert_eq!(
-            row.secret_hash.as_deref(),
-            Some(&hash_api_key(secret)[..]),
-            "{path}: secret_hash must be hash_api_key(secret)"
-        );
-        assert_eq!(row.secret_prefix.as_deref(), Some(&secret[..8]), "{path}: secret_prefix");
+        assert!(row.secret.starts_with("unset-"), "{path}: plaintext column holds a placeholder");
+        let hash = row.secret_hash.unwrap_or_else(|| panic!("{path}: secret_hash"));
+        let prefix = row.secret_prefix.unwrap_or_else(|| panic!("{path}: secret_prefix"));
+        assert!(prefix.starts_with("sk-"), "{path}: secret_prefix");
+        if let Some(secret) = secret {
+            assert_eq!(hash, hash_api_key(secret), "{path}: secret_hash must be hash_api_key(secret)");
+            assert_eq!(prefix, secret[..8], "{path}: secret_prefix");
+        }
     }
 
     #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn test_every_secret_write_stores_hash_and_prefix(pool: PgPool) {
+    async fn test_every_secret_write_stores_only_the_hash(pool: PgPool) {
         let user = create_user(&pool, "hash-writes").await;
         let other = create_user(&pool, "hash-writes-other").await;
 
-        // create
+        // create: the secret is returned once
         let key = create_visible_key(&pool, user, user).await;
         let mut conn = pool.acquire().await.unwrap();
-        assert_secret_hash_stored(&mut conn, key.id, &key.secret, "create").await;
+        assert_only_hash_stored(&mut conn, key.id, Some(&key.secret), "create").await;
 
-        // get_or_create_hidden_key: insert path. The secret is never handed
-        // out; read the stored one to check its hash.
+        // get_or_create_hidden_key: insert path. The secret is never handed out.
         let hidden_id = ApiKeys::new(&mut conn)
             .get_or_create_hidden_key(user, ApiKeyPurpose::Playground, other)
             .await
@@ -1356,18 +1361,16 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(hidden_id, expected_id);
-        let hidden_secret = ApiKeys::new(&mut conn).legacy_dispatch_secret(hidden_id).await.unwrap();
-        assert_secret_hash_stored(&mut conn, hidden_id, &hidden_secret, "get_or_create_hidden_key").await;
+        assert_only_hash_stored(&mut conn, hidden_id, None, "get_or_create_hidden_key").await;
 
         // get_or_create_child_hidden_key: insert path
         let child_id = ApiKeys::new(&mut conn).get_or_create_child_hidden_key(key.id).await.unwrap();
-        let child_secret = ApiKeys::new(&mut conn).legacy_dispatch_secret(child_id).await.unwrap();
-        assert_secret_hash_stored(&mut conn, child_id, &child_secret, "get_or_create_child_hidden_key").await;
+        assert_only_hash_stored(&mut conn, child_id, None, "get_or_create_child_hidden_key").await;
 
-        // rotate_secret replaces secret, hash and prefix together
+        // rotate_secret replaces hash and prefix together
         let rotated = ApiKeys::new(&mut conn).rotate_secret(key.id).await.unwrap();
         assert_ne!(rotated, key.secret);
-        assert_secret_hash_stored(&mut conn, key.id, &rotated, "rotate_secret").await;
+        assert_only_hash_stored(&mut conn, key.id, Some(&rotated), "rotate_secret").await;
     }
 
     #[dwctl_test_macros::test]
@@ -1777,7 +1780,7 @@ mod tests {
             .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
             .await
             .unwrap();
-        assert!(keys_for_deployment.iter().any(|k| k.secret == api_key.secret));
+        assert!(keys_for_deployment.iter().any(|k| k.id == api_key.id));
 
         // API key should show the deployment in model_access
         assert!(api_key.model_access.contains(&deployment.id));
@@ -1908,7 +1911,7 @@ mod tests {
             .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
             .await
             .unwrap();
-        assert!(keys_for_deployment.iter().any(|k| k.secret == api_key.secret));
+        assert!(keys_for_deployment.iter().any(|k| k.id == api_key.id));
 
         // Remove user from group
         let mut group_conn = pool.acquire().await.unwrap();
@@ -1920,7 +1923,7 @@ mod tests {
             .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
             .await
             .unwrap();
-        assert!(!keys_for_deployment.iter().any(|k| k.secret == api_key.secret));
+        assert!(!keys_for_deployment.iter().any(|k| k.id == api_key.id));
 
         // API key should show no model access
         let api_key_details = api_key_repo.get_by_id(api_key.id).await.unwrap().unwrap();
@@ -2053,7 +2056,7 @@ mod tests {
             .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
             .await
             .unwrap();
-        assert!(keys_for_deployment.iter().any(|k| k.secret == api_key.secret));
+        assert!(keys_for_deployment.iter().any(|k| k.id == api_key.id));
 
         // Remove deployment from group
         let mut group_conn = pool.acquire().await.unwrap();
@@ -2065,7 +2068,7 @@ mod tests {
             .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
             .await
             .unwrap();
-        assert!(!keys_for_deployment.iter().any(|k| k.secret == api_key.secret));
+        assert!(!keys_for_deployment.iter().any(|k| k.id == api_key.id));
 
         // API key should show no model access
         let api_key_details = api_key_repo.get_by_id(api_key.id).await.unwrap().unwrap();
@@ -2248,8 +2251,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(keys_for_deployment.iter().any(|k| k.secret == api_key1.secret));
-        assert!(keys_for_deployment.iter().any(|k| k.secret == api_key2.secret));
+        assert!(keys_for_deployment.iter().any(|k| k.id == api_key1.id));
+        assert!(keys_for_deployment.iter().any(|k| k.id == api_key2.id));
         // Each user gets 3 keys: 1 Realtime (explicit) + 1 Batch (auto) + 1 Playground (auto)
         // Plus 1 system key
         assert_eq!(keys_for_deployment.len(), (2 * 3) + 1); // 2 users * 3 keys each + 1 system = 7
@@ -2264,8 +2267,8 @@ mod tests {
             .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
             .await
             .unwrap();
-        assert!(!keys_for_deployment.iter().any(|k| k.secret == api_key1.secret));
-        assert!(keys_for_deployment.iter().any(|k| k.secret == api_key2.secret));
+        assert!(!keys_for_deployment.iter().any(|k| k.id == api_key1.id));
+        assert!(keys_for_deployment.iter().any(|k| k.id == api_key2.id));
         // User 2 gets 3 keys (Realtime + Batch + Playground) + 1 system key
         assert_eq!(keys_for_deployment.len(), 3 + 1); // 3 keys for user2 + 1 system = 4
     }
@@ -2414,8 +2417,8 @@ mod tests {
             .get_api_keys_for_deployment_with_sufficient_credit(deployment2.id)
             .await
             .unwrap();
-        assert!(keys_for_deployment1.iter().any(|k| k.secret == api_key.secret));
-        assert!(keys_for_deployment2.iter().any(|k| k.secret == api_key.secret));
+        assert!(keys_for_deployment1.iter().any(|k| k.id == api_key.id));
+        assert!(keys_for_deployment2.iter().any(|k| k.id == api_key.id));
 
         // API key should show both deployments in model_access
         assert!(api_key.model_access.contains(&deployment1.id));
@@ -2436,8 +2439,8 @@ mod tests {
             .get_api_keys_for_deployment_with_sufficient_credit(deployment2.id)
             .await
             .unwrap();
-        assert!(!keys_for_deployment1.iter().any(|k| k.secret == api_key.secret));
-        assert!(keys_for_deployment2.iter().any(|k| k.secret == api_key.secret));
+        assert!(!keys_for_deployment1.iter().any(|k| k.id == api_key.id));
+        assert!(keys_for_deployment2.iter().any(|k| k.id == api_key.id));
 
         // API key should only show deployment 2 in model_access
         let api_key_details = api_key_repo.get_by_id(api_key.id).await.unwrap().unwrap();
@@ -2552,7 +2555,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !keys_for_deployment.iter().any(|k| k.secret == api_key.secret),
+            !keys_for_deployment.iter().any(|k| k.id == api_key.id),
             "API key should not have access before user is added to group"
         );
 
@@ -2575,7 +2578,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            keys_for_deployment.iter().any(|k| k.secret == api_key.secret),
+            keys_for_deployment.iter().any(|k| k.id == api_key.id),
             "API key should gain access after user is added to group"
         );
 
@@ -2593,7 +2596,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !keys_for_deployment.iter().any(|k| k.secret == api_key.secret),
+            !keys_for_deployment.iter().any(|k| k.id == api_key.id),
             "API key should lose access after user is removed from group"
         );
 
@@ -2779,7 +2782,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            keys_for_deployment.iter().any(|k| k.secret == api_key.secret),
+            keys_for_deployment.iter().any(|k| k.id == api_key.id),
             "API key should have access through Everyone group"
         );
 
@@ -2795,7 +2798,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            all_keys.iter().any(|k| k.secret == api_key.secret),
+            all_keys.iter().any(|k| k.id == api_key.id),
             "get_api_keys_for_deployment should include API keys with Everyone group access"
         );
     }
@@ -3079,7 +3082,6 @@ mod tests {
         assert_eq!(retrieved_key1.name, "Bulk Key 1");
         assert_eq!(retrieved_key1.description, Some("First bulk key".to_string()));
         assert_eq!(retrieved_key1.user_id, user.id);
-        assert!(retrieved_key1.secret.starts_with("sk-"));
 
         let retrieved_key2 = &bulk_results[&key2.id];
         assert_eq!(retrieved_key2.name, "Bulk Key 2");
@@ -3387,11 +3389,6 @@ mod tests {
 
         assert_eq!(retrieved_key2.user_id, user2.id);
         assert_eq!(retrieved_key2.name, "User2 Bulk Key");
-
-        // Verify they have different secrets
-        assert_ne!(retrieved_key1.secret, retrieved_key2.secret);
-        assert!(retrieved_key1.secret.starts_with("sk-"));
-        assert!(retrieved_key2.secret.starts_with("sk-"));
     }
 
     // Helper struct to hold test setup data for credit filtering tests
@@ -3690,24 +3687,19 @@ mod tests {
 
         println!("Keys returned: {}", keys_for_deployment.len());
         for key in &keys_for_deployment {
-            println!(
-                "  - {} (user: {}, secret: {}...)",
-                key.name,
-                abbrev_uuid(&key.user_id),
-                &key.secret[..10]
-            );
+            println!("  - {} (user: {}, id: {})", key.name, abbrev_uuid(&key.user_id), key.id);
         }
-        println!("Expected key_with_credits secret: {}...", &key_with_credits.secret[..10]);
-        println!("Expected key_without_credits secret: {}...", &key_without_credits.secret[..10]);
+        println!("Expected key_with_credits id: {}", key_with_credits.id);
+        println!("Expected key_without_credits id: {}", key_without_credits.id);
 
         // Should include system user key + key_with_credits, but NOT key_without_credits
         assert!(
-            keys_for_deployment.iter().any(|k| k.secret == key_with_credits.secret),
+            keys_for_deployment.iter().any(|k| k.id == key_with_credits.id),
             "User with sufficient credits should have access"
         );
 
         assert!(
-            !keys_for_deployment.iter().any(|k| k.secret == key_without_credits.secret),
+            !keys_for_deployment.iter().any(|k| k.id == key_without_credits.id),
             "User with insufficient credits (balance = 0) should NOT have access"
         );
     }
@@ -3768,7 +3760,7 @@ mod tests {
 
         // Platform Manager should NOT have access with zero credits
         assert!(
-            !keys_for_deployment.iter().any(|k| k.secret == platform_key.secret),
+            !keys_for_deployment.iter().any(|k| k.id == platform_key.id),
             "Platform Manager should be filtered when they have zero credits"
         );
 
@@ -3801,7 +3793,7 @@ mod tests {
 
         // Platform Manager should now have access with positive credits
         assert!(
-            keys_for_deployment.iter().any(|k| k.secret == platform_key.secret),
+            keys_for_deployment.iter().any(|k| k.id == platform_key.id),
             "Platform Manager should have access when they have positive credits"
         );
     }
@@ -3864,7 +3856,7 @@ mod tests {
 
         // User without transactions should be excluded (balance considered 0)
         assert!(
-            !keys_for_deployment.iter().any(|k| k.secret == key_no_transactions.secret),
+            !keys_for_deployment.iter().any(|k| k.id == key_no_transactions.id),
             "User without credit transactions should be excluded (balance considered 0)"
         );
     }
@@ -3956,7 +3948,7 @@ mod tests {
 
         // User with negative balance should be excluded
         assert!(
-            !keys_for_deployment.iter().any(|k| k.secret == key_negative.secret),
+            !keys_for_deployment.iter().any(|k| k.id == key_negative.id),
             "User with negative balance should be excluded"
         );
     }
@@ -4016,7 +4008,7 @@ mod tests {
         }
 
         assert!(
-            !keys_no_access.iter().any(|k| k.secret == key.secret),
+            !keys_no_access.iter().any(|k| k.id == key.id),
             "User with zero balance should NOT have access"
         );
 
@@ -4048,7 +4040,7 @@ mod tests {
         }
 
         assert!(
-            keys_with_access.iter().any(|k| k.secret == key.secret),
+            keys_with_access.iter().any(|k| k.id == key.id),
             "User should regain access after adding credits"
         );
     }
@@ -4166,7 +4158,7 @@ mod tests {
 
         // Zero-credit user SHOULD have access to free models
         assert!(
-            keys_for_deployment.iter().any(|k| k.secret == key_no_credits.secret),
+            keys_for_deployment.iter().any(|k| k.id == key_no_credits.id),
             "User with zero credits SHOULD have access to FREE models"
         );
     }
@@ -4304,7 +4296,7 @@ mod tests {
 
         // Zero-credit user should NOT have access to paid models
         assert!(
-            !keys_for_deployment.iter().any(|k| k.secret == key_no_credits.secret),
+            !keys_for_deployment.iter().any(|k| k.id == key_no_credits.id),
             "User with zero credits should NOT have access to PAID models"
         );
     }
@@ -4442,7 +4434,7 @@ mod tests {
 
         // Zero-credit user SHOULD have access to models with explicit $0.00 pricing
         assert!(
-            keys_for_deployment.iter().any(|k| k.secret == key_no_credits.secret),
+            keys_for_deployment.iter().any(|k| k.id == key_no_credits.id),
             "User with zero credits SHOULD have access to models with explicit $0.00 pricing"
         );
     }
@@ -5079,7 +5071,7 @@ mod tests {
     }
 
     /// An issued key awaiting its reveal, with its secret wrapped.
-    async fn wrapped_pending_key(pool: &PgPool, keystore: &crate::keystore::Keystore) -> ApiKeyDBResponse {
+    async fn wrapped_pending_key(pool: &PgPool, keystore: &crate::keystore::Keystore) -> CreatedApiKey {
         let user = create_user(pool, &format!("holder-{}", &uuid::Uuid::new_v4().to_string()[..8])).await;
         let key = create_visible_key(pool, user, user).await;
         let mut conn = pool.acquire().await.unwrap();
@@ -5142,7 +5134,7 @@ mod tests {
         assert_eq!(reveal.secret_hash.as_deref(), Some(&hash_api_key(secret)[..]));
         assert_eq!(
             crate::pending_secrets::resolve_reveal(Some(keystore), reveal),
-            Some((secret.to_string(), crate::pending_secrets::RevealSource::Wrapped))
+            Some(secret.to_string())
         );
     }
 
@@ -5197,12 +5189,13 @@ mod tests {
 
         let mut rotate_conn = pool.acquire().await.unwrap();
         let pid = backend_pid(&mut rotate_conn).await;
+        let key_id = key.id;
         let rotation = tokio::spawn(async move {
             let mut tx = rotate_conn.begin().await.unwrap();
             let mut repo = ApiKeys::new(&mut tx);
-            let rotated = repo.rotate_secret(key.id).await.unwrap();
+            let rotated = repo.rotate_secret(key_id).await.unwrap();
             let rewrapped = repo
-                .set_pending_secret(key.id, b"wrap-of-new-secret", &hash_api_key(&rotated))
+                .set_pending_secret(key_id, b"wrap-of-new-secret", &hash_api_key(&rotated))
                 .await
                 .unwrap();
             tx.commit().await.unwrap();

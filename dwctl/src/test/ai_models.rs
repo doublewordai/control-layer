@@ -258,8 +258,8 @@ async fn ai_models_pricing_uses_billing_account_without_operator_details(pool: P
     }
 
     for (case, key, price, multiplier) in [
-        ("manager personal", &personal_key.secret, 4, 3),
-        ("organization", &org_key.secret, 2, 2),
+        ("manager personal", personal_key.secret, 4, 3),
+        ("organization", org_key.secret, 2, 2),
     ] {
         let response = server
             .get("/ai/v1/models?include=pricing,endpoints,groups,metrics,components,provider_pricing")

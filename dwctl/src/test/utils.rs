@@ -18,7 +18,7 @@ use crate::{
     db::{
         handlers::{Deployments, Groups, Users, api_keys::ApiKeys},
         models::{
-            api_keys::{ApiKeyCreateDBRequest, ApiKeyDBResponse},
+            api_keys::ApiKeyCreateDBRequest,
             deployments::{DeploymentCreateDBRequest, DeploymentDBResponse, ModelType},
             groups::{GroupCreateDBRequest, GroupDBResponse},
             users::UserCreateDBRequest,
@@ -88,18 +88,19 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
         .build()
 }
 
-/// Set up the fusillade schema in a `#[sqlx::test]`-provided isolated
-/// test DB and return a small (max 4 conns) fusillade-schema pool. Use
-/// this from integration tests that drive fusillade directly without
-/// constructing the full Application.
-/// The stored plaintext secret of an API key, for tests that check what
-/// fusillade stores while it still stores key secrets (until DW-1012).
-pub async fn stored_secret(pool: &PgPool, id: crate::types::ApiKeyId) -> String {
-    sqlx::query_scalar("SELECT secret FROM api_keys WHERE id = $1")
+/// A bearer secret that authenticates as API key `id`. Only a key's hash is
+/// stored, so this gives the key a fresh secret (replacing its hash) for a
+/// test that must present a key it did not create, such as a hidden key.
+pub async fn bearer_for_key(pool: &PgPool, id: crate::types::ApiKeyId) -> String {
+    let secret = crate::crypto::generate_api_key();
+    sqlx::query("UPDATE api_keys SET secret_hash = $2, secret_prefix = $3 WHERE id = $1")
         .bind(id)
-        .fetch_one(pool)
+        .bind(&crate::crypto::hash_api_key(&secret)[..])
+        .bind(crate::crypto::api_key_prefix(&secret))
+        .execute(pool)
         .await
-        .expect("stored API key secret")
+        .expect("set API key secret hash");
+    secret
 }
 
 /// Insert a fusillade request template the way the production write path
@@ -152,6 +153,10 @@ pub async fn insert_fusillade_template(
     tx.commit().await.expect("commit template insert transaction");
 }
 
+/// Set up the fusillade schema in a `#[sqlx::test]`-provided isolated
+/// test DB and return a small (max 4 conns) fusillade-schema pool. Use
+/// this from integration tests that drive fusillade directly without
+/// constructing the full Application.
 pub async fn setup_fusillade_pool(pool: &PgPool) -> PgPool {
     use sqlx::Executor;
     use sqlx::postgres::PgConnectOptions;
@@ -636,7 +641,7 @@ pub async fn add_user_to_group(pool: &PgPool, user_id: UserId, group_id: GroupId
         .expect("Failed to add user to group");
 }
 
-pub async fn create_test_api_key_for_user(pool: &PgPool, user_id: UserId) -> ApiKeyDBResponse {
+pub async fn create_test_api_key_for_user(pool: &PgPool, user_id: UserId) -> crate::db::models::api_keys::CreatedApiKey {
     let mut conn = pool.acquire().await.expect("Failed to acquire connection");
     let mut api_key_repo = ApiKeys::new(&mut conn);
     let request = ApiKeyCreateDBRequest::new(

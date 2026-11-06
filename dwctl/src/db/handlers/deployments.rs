@@ -281,11 +281,12 @@ impl<'c> Repository for Deployments<'c> {
     type CreateRequest = DeploymentCreateDBRequest;
     type UpdateRequest = DeploymentUpdateDBRequest;
     type Response = DeploymentDBResponse;
+    type Created = DeploymentDBResponse;
     type Id = DeploymentId;
     type Filter = DeploymentFilter;
 
     #[instrument(level = "debug", skip(self, request), fields(model_name = %request.model_name, alias = %request.alias), err)]
-    async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
+    async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Created> {
         let mut tx = self.db.begin().await?;
         lock_model_names(&mut tx).await?;
         validate_model_name(&mut tx, None, request.alias.trim()).await?;

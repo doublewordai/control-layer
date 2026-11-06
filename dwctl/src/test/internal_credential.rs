@@ -129,7 +129,7 @@ impl Harness {
 
     /// Poll until `bearer()` is admitted: onwards reloads its key set asynchronously.
     async fn chat_until_admitted(&self, bearer: impl Fn() -> String) -> axum_test::TestResponse {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             let response = self.chat(&bearer()).await;
             if response.status_code() == 200 || std::time::Instant::now() >= deadline {
@@ -196,7 +196,7 @@ async fn internal_credentials_authenticate_only_valid_tokens_for_live_keys(pool:
     assert!(ApiKeys::new(&mut conn).delete(key_id).await.unwrap());
     drop(conn);
     h.bg.sync_onwards_config(&pool).await.unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let mut status = h.chat(&h.credentials.mint(key_id, Duration::from_secs(60))).await.status_code();
     while status != 401 && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -231,19 +231,25 @@ async fn playground_and_probes_work_without_key_secrets(pool: PgPool) {
             .add_header(&session[1].0, &session[1].1)
             .json(&serde_json::json!({ "model": MODEL, "messages": [ { "role": "user", "content": "hi" } ] }))
     };
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // The routing cache reloads asynchronously after the setup writes, and a
+    // loaded machine can take seconds: poll for each path, with a deadline
+    // only a real failure reaches.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let mut response = playground().await;
     while response.status_code() != 200 && std::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
         response = playground().await;
     }
     assert_eq!(response.status_code(), 200, "playground: {}", response.text());
     assert_eq!(response.json::<serde_json::Value>()["choices"][0]["message"]["content"], "hi");
 
     // A probe calls this process's `/ai` over HTTP as the system key.
-    let result = ProbeManager::test_probe(&pool, h.deployment_id, &h.config, &h.credentials, None, None, None)
-        .await
-        .expect("probe runs");
+    let probe = || ProbeManager::test_probe(&pool, h.deployment_id, &h.config, &h.credentials, None, None, None);
+    let mut result = probe().await.expect("probe runs");
+    while !result.success && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        result = probe().await.expect("probe runs");
+    }
     assert!(result.success, "probe: {:?} {:?}", result.status_code, result.error_message);
     assert_eq!(result.status_code, Some(200));
 
@@ -285,7 +291,7 @@ async fn background_playground_request_refused_inside_the_stack_is_recorded(pool
             .await
             .unwrap()
     };
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let mut current = state().await;
     while current == "processing" && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -304,7 +310,7 @@ async fn dispatched_as(pool: &PgPool, request_filter: &str, bind: Uuid) -> Optio
     let query = format!(
         "SELECT api_key_id FROM http_analytics WHERE {request_filter} AND fusillade_request_id IS NOT NULL AND status_code = 200 LIMIT 1"
     );
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         let row: Option<Option<Uuid>> = sqlx::query_scalar(&query).bind(bind).fetch_optional(pool).await.unwrap();
         if let Some(key) = row {
@@ -315,27 +321,10 @@ async fn dispatched_as(pool: &PgPool, request_filter: &str, bind: Uuid) -> Optio
     }
 }
 
-/// Replace a key's stored plaintext with a decoy, keeping its hash. The key
-/// still authenticates, but a dispatch that presented the stored secret
-/// would now be refused, so only a dispatch by key id can succeed.
-async fn plant_decoy_secret(pool: &PgPool, id: Uuid) -> String {
-    let decoy = format!("sk-decoy-{}", Uuid::new_v4().simple());
-    sqlx::query("UPDATE api_keys SET secret = $2 WHERE id = $1")
-        .bind(id)
-        .bind(&decoy)
-        .execute(pool)
-        .await
-        .unwrap();
-    decoy
-}
-
-/// Batch and flex requests record the key id they run as (next to the key's
-/// secret, which the previous release still dispatches with), and the
-/// daemon's dispatch authenticates as that key with a fresh internal
+/// Batch and flex requests record the key id they run as and no key secret,
+/// and the daemon's dispatch authenticates as that key with a fresh internal
 /// credential: a flex request as the caller's hidden batch key (or the
-/// caller's cap-scope child), a batch as the key the batch names. Each
-/// key's stored secret is a decoy, so the requests only succeed if the
-/// dispatch authenticates by key id rather than with what is stored.
+/// caller's cap-scope child), a batch as the key the batch names.
 #[dwctl_test_macros::test]
 async fn daemon_dispatches_batch_and_flex_requests_as_their_key_id(pool: PgPool) {
     let h = Harness::start_with(&pool, |config| {
@@ -345,7 +334,6 @@ async fn daemon_dispatches_batch_and_flex_requests_as_their_key_id(pool: PgPool)
     .await;
     let caller = crate::test::utils::create_test_api_key_for_user(&pool, h.user.id).await;
     let batch_key = hidden_key(&pool, h.user.id, ApiKeyPurpose::Batch).await;
-    let batch_secret = plant_decoy_secret(&pool, batch_key).await;
     h.bg.sync_onwards_config(&pool).await.unwrap();
 
     // Flex: the caller's key is resolved to the hidden batch key at submit.
@@ -365,8 +353,8 @@ async fn daemon_dispatches_batch_and_flex_requests_as_their_key_id(pool: PgPool)
             .unwrap();
     assert_eq!(
         stored,
-        vec![(batch_secret, Some(batch_key))],
-        "flex stores the key id and, for now, the (decoy) secret"
+        vec![(String::new(), Some(batch_key))],
+        "flex stores the key id and no secret"
     );
     assert_eq!(
         dispatched_as(&pool, "api_key_id = $1", batch_key).await,
@@ -379,7 +367,6 @@ async fn daemon_dispatches_batch_and_flex_requests_as_their_key_id(pool: PgPool)
         let mut conn = pool.acquire().await.unwrap();
         ApiKeys::new(&mut conn).get_or_create_child_hidden_key(caller.id).await.unwrap()
     };
-    plant_decoy_secret(&pool, child).await;
     h.bg.sync_onwards_config(&pool).await.unwrap();
     let response = flex().await;
     assert_eq!(response.status_code(), 200, "capped flex: {}", response.text());
@@ -426,15 +413,8 @@ async fn daemon_dispatches_batch_and_flex_requests_as_their_key_id(pool: PgPool)
             .await
             .unwrap();
     let named_key = named_key.expect("the batch names its key");
-    assert_eq!(
-        named_key, batch_key,
-        "the batch runs as the hidden batch key, whose secret is a decoy"
-    );
-    assert_eq!(
-        stored_key,
-        Some(crate::test::utils::stored_secret(&pool, named_key).await),
-        "batches store the key id and, for now, its secret"
-    );
+    assert_eq!(named_key, batch_key, "the batch runs as the hidden batch key");
+    assert_eq!(stored_key, None, "batches store the key id and no secret");
     assert_eq!(
         dispatched_as(&pool, "fusillade_batch_id = $1", batch_id).await,
         Some(named_key),

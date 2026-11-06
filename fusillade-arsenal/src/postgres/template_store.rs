@@ -69,7 +69,6 @@ pub(crate) struct DedicatedTemplate<'a> {
     pub(crate) path: &'a str,
     pub(crate) body: &'a str,
     pub(crate) model: &'a str,
-    pub(crate) api_key: &'a str,
     pub(crate) api_key_id: Option<Uuid>,
     pub(crate) metadata: Option<&'a serde_json::Value>,
 }
@@ -85,11 +84,11 @@ pub(crate) async fn insert_dedicated_template(
         WITH inserted AS (
             INSERT INTO request_templates_g2 (
                 created_on, id, file_id, custom_id, endpoint, method, path,
-                body, model, api_key, api_key_id, body_byte_size, metadata
+                body, model, api_key_id, body_byte_size, metadata
             )
             VALUES (
                 (transaction_timestamp() AT TIME ZONE 'UTC')::date, $1, NULL, NULL,
-                $2, $3, $4, $5, $6, $7, $8, $9, $10
+                $2, $3, $4, $5, $6, $7, $8, $9
             )
             RETURNING id, created_on
         )
@@ -103,7 +102,6 @@ pub(crate) async fn insert_dedicated_template(
     .bind(template.path)
     .bind(template.body)
     .bind(template.model)
-    .bind(template.api_key)
     .bind(template.api_key_id)
     .bind(template.body.len() as i64)
     .bind(template.metadata)
@@ -269,7 +267,6 @@ mod tests {
                 path: "/test",
                 body: "{}",
                 model: "test-model",
-                api_key: "test-key",
                 api_key_id: None,
                 metadata: None,
             },

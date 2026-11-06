@@ -342,14 +342,12 @@ async fn zdr_sentinel_async_batch_failure_does_not_log_payload(pool: PgPool) {
     // A user allowed to run batches, in the everyone-group, with a batch key.
     let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
     add_user_to_group(&pool, user.id, uuid::Uuid::nil()).await;
-    let batch_api_key = {
+    let batch_key_id = {
         let mut conn = pool.acquire().await.expect("acquire");
-        let mut keys = ApiKeys::new(&mut conn);
-        let id = keys
+        ApiKeys::new(&mut conn)
             .get_or_create_hidden_key(user.id, ApiKeyPurpose::Batch, user.id)
             .await
-            .expect("batch api key");
-        keys.legacy_dispatch_secret(id).await.expect("batch api key secret")
+            .expect("batch api key")
     };
 
     // Mock upstream: 400 with a body that echoes the prompt sentinel — exactly the
@@ -373,8 +371,11 @@ async fn zdr_sentinel_async_batch_failure_does_not_log_payload(pool: PgPool) {
     let deployment_id = create_test_model(&pool, "pikachu-async-model", "pikachu-async", endpoint_id, user.id).await;
     add_deployment_to_group(&pool, deployment_id, uuid::Uuid::nil(), user.id).await;
 
-    // App with the real batch daemon running.
+    // App with the real batch daemon running. The mock stands in for this
+    // process's own /ai, the only endpoint a dispatch credential is minted for.
     let mut config = create_test_config();
+    config.host = "127.0.0.1".to_string();
+    config.port = mock_server.address().port();
     config.background_services.batch_daemon = DaemonConfig {
         enabled: DaemonEnabled::Always,
         claim_interval_ms: 100,
@@ -409,7 +410,7 @@ async fn zdr_sentinel_async_batch_failure_does_not_log_payload(pool: PgPool) {
         template_id,
         Some(file_id),
         "pikachu-async",
-        &batch_api_key,
+        "",
         &mock_server.uri(),
         "/v1/chat/completions",
         &request_body,
@@ -419,13 +420,14 @@ async fn zdr_sentinel_async_batch_failure_does_not_log_payload(pool: PgPool) {
 
     let batch_id = uuid::Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at)
-         VALUES ($1, $2, $3, '/v1/chat/completions', '24h', $4, NOW())",
+        "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at, api_key_id)
+         VALUES ($1, $2, $3, '/v1/chat/completions', '24h', $4, NOW(), $5)",
     )
     .bind(batch_id)
     .bind(user.id.to_string())
     .bind(file_id)
     .bind(chrono::Utc::now() + chrono::Duration::hours(24))
+    .bind(batch_key_id)
     .execute(&pool)
     .await
     .expect("insert batch");

@@ -132,12 +132,19 @@ async fn postgres_manager_stores_configured_db_retry_cadence() {
 
 #[tokio::test]
 async fn postgres_manager_retries_pool_acquisition_for_sqlx_queries() {
-    let pool = PgPoolOptions::new()
+    // Opening the pool's one connection can take longer than the short
+    // acquire timeout under load; only acquisitions after setup are under test.
+    let options = PgPoolOptions::new()
         .max_connections(1)
-        .acquire_timeout(Duration::from_millis(50))
-        .connect(&database_url())
-        .await
-        .unwrap();
+        .acquire_timeout(Duration::from_millis(50));
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let pool = loop {
+        match options.clone().connect(&database_url()).await {
+            Ok(pool) => break pool,
+            Err(sqlx::Error::PoolTimedOut) if std::time::Instant::now() < deadline => continue,
+            Err(error) => panic!("connect: {error}"),
+        }
+    };
     let manager = PostgresRequestManager::new(LazyPools(pool.clone()), Default::default())
         .with_db_retry_config(DbRetryConfig::new(vec![
             Duration::from_millis(25),

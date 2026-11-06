@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT exact_tokens, visible_at FROM reference_cache_entries WHERE principal_id = $1 AND prefix_hash = $2 AND expires_at > now()",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exact_tokens",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "visible_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      true,
+      false
+    ]
+  },
+  "hash": "13e6ad08466c22189c47b96261676794b0d534bb503a669bb5e90101785b674c"
+}

@@ -936,7 +936,6 @@ jobs:
             id,
             name,
             description,
-            secret,
             secret_hash,
             secret_prefix,
             purpose,
@@ -949,7 +948,6 @@ jobs:
             '10000000-0000-0000-0000-000000000004',
             'Open Responses compliance key',
             'Realtime key for Open Responses compliance tests',
-            :'test_api_key',
             sha256(convert_to(:'test_api_key', 'UTF8')),
             left(:'test_api_key', 8),
             'realtime',
@@ -959,7 +957,6 @@ jobs:
             200
           )
           ON CONFLICT (id) DO UPDATE SET
-            secret = EXCLUDED.secret,
             secret_hash = EXCLUDED.secret_hash,
             secret_prefix = EXCLUDED.secret_prefix,
             purpose = EXCLUDED.purpose,
@@ -1031,7 +1028,7 @@ jobs:
           SELECT
             dm.alias,
             dg.group_id,
-            ak.secret,
+            ak.secret_prefix,
             ub.balance
           FROM deployed_models dm
           LEFT JOIN deployment_groups dg ON dg.deployment_id = dm.id

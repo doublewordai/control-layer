@@ -2907,11 +2907,12 @@ mod integration_tests {
             ("unpriced", realtime, user, None, engine, 2000, 500, 1200),
         ];
         for (i, (model, key, account, window, reads, prompt, completion, cached)) in cases.into_iter().enumerate() {
-            let secret: String = sqlx::query_scalar("SELECT secret FROM api_keys WHERE id = $1")
+            let hash: Vec<u8> = sqlx::query_scalar("SELECT secret_hash FROM api_keys WHERE id = $1")
                 .bind(key)
                 .fetch_one(&pool)
                 .await
                 .unwrap();
+            let hash: crate::crypto::ApiKeyHash = hash.try_into().unwrap();
             let created_at = window.map(|_| Utc::now());
             let query = crate::pricing::PriceQuery {
                 model,
@@ -2921,7 +2922,7 @@ mod integration_tests {
                 serving_class: "standard",
                 cache_reads: reads,
             };
-            let prices = keys.unit_prices(&crate::crypto::hash_api_key(&secret), &query).unwrap();
+            let prices = keys.unit_prices(&hash, &query).unwrap();
 
             // The serving stack reports `cached` cache hits; the record carries
             // them only where the cache layer reports reads.
